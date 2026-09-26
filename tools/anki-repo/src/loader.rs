@@ -38,6 +38,28 @@ pub const DECK_TYPE: &str = "Deck";
 /// [`ErrorCode::InvalidJson`], [`ErrorCode::RootNotDeck`] или
 /// [`ErrorCode::SchemaInvalid`].
 pub fn load_export(export_dir: &Path) -> Result<LoadedExport, DomainError> {
+    let (deck_json, raw) = read_deck_json(export_dir)?;
+    let value = parse_deck_json(&raw, &deck_json)?;
+    let root = typed_root(value, &deck_json)?;
+
+    Ok(LoadedExport {
+        export_dir: export_dir.to_path_buf(),
+        deck_json,
+        root,
+    })
+}
+
+/// Читает текст `deck.json` из каталога экспорта.
+///
+/// Единая точка проверки каталога и чтения файла: `op::validate` разбирает
+/// содержимое сам (ошибки JSON становятся issues, а не domain error), но
+/// путь, сообщения и коды ошибок должны совпадать с [`load_export`].
+///
+/// # Errors
+///
+/// Возвращает [`ErrorCode::InputUnreadable`], если каталог недоступен или не
+/// является каталогом, и [`ErrorCode::DeckJsonMissing`], если файла нет.
+pub fn read_deck_json(export_dir: &Path) -> Result<(PathBuf, String), DomainError> {
     let metadata = fs::metadata(export_dir).map_err(|error| {
         DomainError::with_details(
             ErrorCode::InputUnreadable,
@@ -88,14 +110,7 @@ pub fn load_export(export_dir: &Path) -> Result<LoadedExport, DomainError> {
         }
     })?;
 
-    let value = parse_deck_json(&raw, &deck_json)?;
-    let root = typed_root(&value, &deck_json)?;
-
-    Ok(LoadedExport {
-        export_dir: export_dir.to_path_buf(),
-        deck_json,
-        root,
-    })
+    Ok((deck_json, raw))
 }
 
 /// Разбирает текст `deck.json` в JSON-значение.
@@ -169,14 +184,17 @@ pub fn ensure_deck_root(value: &Value, path: &Path) -> Result<(), DomainError> {
 
 /// Приводит проверенное JSON-значение к типизированному корню экспорта.
 ///
+/// Значение передаётся по владению: `serde_json::from_value` потребляет его
+/// целиком, поэтому копия многомегабайтного дерева не нужна.
+///
 /// # Errors
 ///
 /// Возвращает [`ErrorCode::SchemaInvalid`], если типизированное ядро не
 /// собирается из валидного JSON.
-pub fn typed_root(value: &Value, path: &Path) -> Result<DeckNode, DomainError> {
-    ensure_deck_root(value, path)?;
+pub fn typed_root(value: Value, path: &Path) -> Result<DeckNode, DomainError> {
+    ensure_deck_root(&value, path)?;
 
-    serde_json::from_value::<DeckNode>(value.clone()).map_err(|error| {
+    serde_json::from_value::<DeckNode>(value).map_err(|error| {
         DomainError::with_details(
             ErrorCode::SchemaInvalid,
             format!(

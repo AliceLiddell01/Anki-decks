@@ -2,6 +2,7 @@
 name = "anki-repo"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Read-only CLI для детерминированного анализа CrowdAnki-экспортов репозитория Anki-decks"
 publish = false
 

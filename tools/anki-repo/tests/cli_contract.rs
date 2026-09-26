@@ -2,8 +2,14 @@
 
 mod common;
 
-use common::{TempDir, base_export, export_with, parse_json, run_cli, run_cli_in, words_deck};
-use serde_json::json;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+use std::process::{Command, Stdio};
+
+use common::{
+    TempDir, base_export, cli_binary, export_with, parse_json, run_cli, run_cli_in, words_deck,
+};
+use serde_json::{Value, json};
 
 const DECK: &str = "decks/japanese/words/Words__N1";
 
@@ -53,6 +59,24 @@ fn conflicting_or_incomplete_criteria_are_usage_errors() {
             "аргументы {args:?}: stdout не должен быть пустым"
         );
     }
+}
+
+/// Ошибки, которые ловит сам clap, не становятся JSON-конвертом даже при
+/// `--json`: команда ещё не определена, поэтому текст идёт в stderr. Ошибку
+/// несовместимых аргументов находит сам инструмент, и она отдаётся конвертом.
+#[test]
+fn clap_usage_error_is_text_in_stderr_even_in_json_mode() {
+    let (code, stdout, stderr) =
+        run_cli(&["--json", "find", DECK, "--word", "x", "--limit", "900"]);
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(!stderr.is_empty());
+
+    let (code, stdout, stderr) =
+        run_cli(&["--json", "find", DECK, "--word", "x", "--match", "exact"]);
+    assert_eq!(code, 2);
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["error"]["code"], json!("usage"));
 }
 
 #[test]
@@ -404,4 +428,89 @@ fn unknown_field_and_deck_are_reported() {
     let (code, _, stderr) = run_cli(&["find", DECK, "--word", "偶然", "--deck", "Нет::Такой"]);
     assert_eq!(code, 3);
     assert!(stderr.contains("unknown_deck"));
+}
+
+/// Закрытый читателем pipe не должен приводить ни к panic, ни к внутренней
+/// ошибке: команда уже выполнилась, сохраняется её собственный exit code.
+#[test]
+fn closed_stdout_pipe_keeps_the_command_exit_code() {
+    let dir = TempDir::new("closed-stdout");
+    let long_value = "偶然".repeat(60);
+    let notes: Vec<Value> = (0..500)
+        .map(|index| {
+            json!({
+                "__type__": "Note",
+                "guid": format!("guid-{index}"),
+                "note_model_uuid": "model-1",
+                "tags": [],
+                "fields": [long_value, "случайность", "偶然の一致"],
+            })
+        })
+        .collect();
+    let mut value = base_export();
+    value["notes"] = Value::Array(notes);
+    dir.write_export(&value);
+    dir.write_media(&["a.mp3"]);
+
+    // Вывод заведомо больше буфера pipe, поэтому запись не сможет завершиться
+    // успешно после закрытия читающего конца.
+    let export_dir = dir.path().to_string_lossy().into_owned();
+    let mut child = Command::new(cli_binary())
+        .args([
+            "find",
+            &export_dir,
+            "--field",
+            "Слово",
+            "--value",
+            "偶然",
+            "--json",
+            "--limit",
+            "500",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("anki-repo должен запускаться");
+    drop(child.stdout.take());
+
+    let output = child.wait_with_output().expect("ожидание процесса");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "процесс не должен паниковать: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "читающий конец закрыт, данных в stdout быть не может"
+    );
+}
+
+/// Отказ записи вывода по другой причине — это внутренняя ошибка: `ENOSPC`
+/// получается записью в `/dev/full`.
+#[test]
+#[cfg(target_os = "linux")]
+fn unwritable_stdout_is_an_internal_error() {
+    let dir = TempDir::new("unwritable-stdout");
+    dir.write_export(&base_export());
+    dir.write_media(&["a.mp3"]);
+
+    let export_dir = dir.path().to_string_lossy().into_owned();
+    let full = File::options()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full должен открываться на запись");
+
+    let output = Command::new(cli_binary())
+        .args(["inspect", &export_dir, "--json"])
+        .stdout(Stdio::from(full))
+        .stderr(Stdio::piped())
+        .output()
+        .expect("anki-repo должен запускаться");
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

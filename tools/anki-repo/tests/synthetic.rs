@@ -7,8 +7,8 @@ mod common;
 
 use std::path::Path;
 
-use common::{TempDir, base_export, export_with};
-use serde_json::json;
+use common::{TempDir, base_export, export_with, parse_json, run_cli};
+use serde_json::{Value, json};
 
 use anki_repo::error::ErrorCode;
 use anki_repo::loader::load_export;
@@ -20,6 +20,14 @@ fn run_validate(dir: &TempDir) -> ValidateResult {
 
 fn has_issue(result: &ValidateResult, code: &str) -> bool {
     result.issues.iter().any(|issue| issue.code == code)
+}
+
+fn count_issues(result: &ValidateResult, code: &str) -> usize {
+    result
+        .issues
+        .iter()
+        .filter(|issue| issue.code == code)
+        .count()
 }
 
 fn severity_of(result: &ValidateResult, code: &str) -> Option<Severity> {
@@ -162,6 +170,11 @@ fn duplicate_and_missing_guids_are_errors() {
     assert_eq!(
         severity_of(&result, "duplicate_note_guid"),
         Some(Severity::Error)
+    );
+    assert_eq!(
+        count_issues(&result, "duplicate_note_guid"),
+        1,
+        "один и тот же дубликат guid должен репортиться ровно один раз"
     );
 
     let dir = TempDir::new("guid-missing");
@@ -392,7 +405,32 @@ fn complex_template_construct_is_only_a_warning() {
 }
 
 #[test]
-fn unterminated_template_construct_is_an_unresolved_error() {
+fn template_field_of_another_model_is_not_a_known_field() {
+    let dir = TempDir::new("template-foreign-field");
+    dir.write_export(&export_with(|value| {
+        let mut second = value["note_models"][0].clone();
+        second["crowdanki_uuid"] = json!("model-2");
+        second["name"] = json!("Другая модель");
+        second["flds"] = json!([{"name": "Другое поле", "ord": 0}]);
+        second["tmpls"][0]["qfmt"] = json!("{{Слово}}");
+        second["tmpls"][0]["afmt"] = json!("{{Слово}}");
+        value["note_models"]
+            .as_array_mut()
+            .expect("note_models")
+            .push(second);
+    }));
+    dir.write_media(&["a.mp3"]);
+
+    let result = run_validate(&dir);
+    assert_eq!(
+        severity_of(&result, "template_field_unresolved"),
+        Some(Severity::Error),
+        "поле «Слово» принадлежит другой модели и не должно считаться известным"
+    );
+}
+
+#[test]
+fn unterminated_template_construct_is_only_a_warning() {
     let dir = TempDir::new("template-unterminated");
     dir.write_export(&export_with(|value| {
         value["note_models"][0]["tmpls"][0]["afmt"] = json!("{{НетТакого}");
@@ -401,9 +439,11 @@ fn unterminated_template_construct_is_an_unresolved_error() {
 
     let result = run_validate(&dir);
     assert_eq!(
-        severity_of(&result, "template_field_unresolved"),
-        Some(Severity::Error)
+        severity_of(&result, "template_construct_unchecked"),
+        Some(Severity::Warning)
     );
+    assert!(!has_issue(&result, "template_field_unresolved"));
+    assert!(result.valid, "issues: {:?}", result.issues);
 }
 
 #[test]
@@ -517,6 +557,154 @@ fn empty_field_values_are_reported_as_info() {
         Some(Severity::Info)
     );
     assert!(result.valid);
+}
+
+#[test]
+fn documented_validation_codes_are_reachable_with_expected_severity() {
+    type Mutation = fn(&mut Value);
+
+    let cases: [(&str, Severity, Mutation); 12] = [
+        ("schema_invalid", Severity::Error, |value| {
+            value["notes"] = json!({"это": "не массив"});
+        }),
+        ("node_not_deck", Severity::Error, |value| {
+            value["children"] = json!([
+                {"__type__": "Note", "name": "Не колода", "deck_config_uuid": "cfg-1"}
+            ]);
+        }),
+        ("note_model_identity_missing", Severity::Error, |value| {
+            value["note_models"][0]
+                .as_object_mut()
+                .expect("model object")
+                .remove("crowdanki_uuid");
+        }),
+        ("deck_config_identity_missing", Severity::Error, |value| {
+            value["deck_configurations"][0]
+                .as_object_mut()
+                .expect("config object")
+                .remove("crowdanki_uuid");
+        }),
+        ("media_files_duplicate", Severity::Warning, |value| {
+            value["media_files"] = json!(["a.mp3", "a.mp3"]);
+        }),
+        ("deck_name_missing", Severity::Warning, |value| {
+            value["name"] = json!("");
+        }),
+        ("deck_config_uuid_missing", Severity::Warning, |value| {
+            value["deck_config_uuid"] = Value::Null;
+        }),
+        (
+            "conflicting_deck_config_definition",
+            Severity::Warning,
+            |value| {
+                value["children"] = json!([{
+                    "__type__": "Deck",
+                    "name": "Ребёнок",
+                    "children": [],
+                    "deck_config_uuid": "cfg-1",
+                    "note_models": [],
+                    "deck_configurations": [
+                        {"__type__": "DeckConfig", "crowdanki_uuid": "cfg-1", "name": "Другое имя"}
+                    ],
+                    "media_files": [],
+                    "notes": []
+                }]);
+            },
+        ),
+        ("template_ord_invalid", Severity::Warning, |value| {
+            value["note_models"][0]["tmpls"][0]["ord"] = json!("не целое");
+        }),
+        ("template_ord_duplicate", Severity::Warning, |value| {
+            let copy = value["note_models"][0]["tmpls"][0].clone();
+            value["note_models"][0]["tmpls"]
+                .as_array_mut()
+                .expect("tmpls")
+                .push(copy);
+        }),
+        ("note_model_unused", Severity::Info, |value| {
+            let mut unused = value["note_models"][0].clone();
+            unused["crowdanki_uuid"] = json!("model-unused");
+            value["note_models"]
+                .as_array_mut()
+                .expect("note_models")
+                .push(unused);
+        }),
+        ("deck_config_unused", Severity::Info, |value| {
+            let mut unused = value["deck_configurations"][0].clone();
+            unused["crowdanki_uuid"] = json!("cfg-unused");
+            value["deck_configurations"]
+                .as_array_mut()
+                .expect("deck_configurations")
+                .push(unused);
+        }),
+    ];
+
+    for (code, severity, mutate) in cases {
+        let dir = TempDir::new(code);
+        dir.write_export(&export_with(mutate));
+        dir.write_media(&["a.mp3"]);
+
+        let result = run_validate(&dir);
+        assert_eq!(
+            severity_of(&result, code),
+            Some(severity),
+            "код {code}: issues {:?}",
+            result.issues
+        );
+        assert_eq!(
+            result.valid,
+            severity != Severity::Error,
+            "код {code}: valid = {}, severity = {severity:?}",
+            result.valid
+        );
+
+        if severity == Severity::Error {
+            let dir_path = dir.path().to_string_lossy().into_owned();
+            let (exit, _, _) = run_cli(&["validate", &dir_path]);
+            assert_eq!(exit, 6, "код {code}: ERROR должен давать exit code 6");
+        }
+    }
+}
+
+#[test]
+fn typed_core_failure_is_a_domain_error_for_load_export() {
+    let dir = TempDir::new("schema-invalid-domain");
+    dir.write_export(&export_with(|value| {
+        value["notes"] = json!({"это": "не массив"});
+    }));
+
+    let error = load_export(dir.path()).expect_err("типизированное ядро не собирается");
+    assert_eq!(error.code, ErrorCode::SchemaInvalid);
+}
+
+#[test]
+fn empty_guid_is_missing_but_not_a_duplicate() {
+    let dir = TempDir::new("guid-empty");
+    dir.write_export(&export_with(|value| {
+        value["notes"][0]["guid"] = json!("");
+        value["notes"][1]["guid"] = json!("");
+    }));
+    dir.write_media(&["a.mp3"]);
+
+    let result = run_validate(&dir);
+    assert_eq!(count_issues(&result, "note_guid_missing"), 2);
+    assert_eq!(
+        count_issues(&result, "duplicate_note_guid"),
+        0,
+        "пустой guid не является дубликатом"
+    );
+
+    // Пустой guid не попадает в индекс: его нельзя найти и он не считается
+    // уникальным идентификатором в машинном выводе inspect.
+    let dir_path = dir.path().to_string_lossy().into_owned();
+    let (exit, _, _) = run_cli(&["find", &dir_path, "--guid", ""]);
+    assert_eq!(exit, 4, "поиск по пустому guid не находит заметок");
+
+    let (exit, stdout, _) = run_cli(&["--json", "inspect", &dir_path, "--verbose"]);
+    assert_eq!(exit, 0);
+    let parsed = parse_json(&stdout);
+    assert_eq!(parsed["result"]["verbose"]["guids_unique"], json!(0));
+    assert_eq!(parsed["result"]["verbose"]["guid_duplicates"], json!(0));
 }
 
 #[test]

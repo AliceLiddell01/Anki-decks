@@ -66,6 +66,9 @@ pub struct ExportIndex<'a> {
     /// Конфигурации колод, объединённые по всему дереву.
     pub configs: Vec<&'a DeckConfig>,
     /// Индекс `guid` → позиции заметок в [`ExportIndex::notes`].
+    ///
+    /// Пустые `guid` не индексируются: отсутствующий идентификатор — это
+    /// отдельный дефект, а не повод сообщать о дубликате пустой строки.
     pub guids: BTreeMap<&'a str, Vec<usize>>,
     models_by_uuid: BTreeMap<&'a str, usize>,
     configs_by_uuid: BTreeMap<&'a str, usize>,
@@ -121,8 +124,11 @@ impl<'a> ExportIndex<'a> {
 
         let mut guids: BTreeMap<&'a str, Vec<usize>> = BTreeMap::new();
         for (position, entry) in notes.iter().enumerate() {
-            if let Some(guid) = entry.note.guid.as_deref() {
-                guids.entry(guid).or_default().push(position);
+            match entry.note.guid.as_deref() {
+                Some(guid) if !guid.is_empty() => {
+                    guids.entry(guid).or_default().push(position);
+                }
+                _ => {}
             }
         }
 

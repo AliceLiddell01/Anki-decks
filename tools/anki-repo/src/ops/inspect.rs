@@ -76,9 +76,10 @@ pub struct InspectVerbose {
     pub nodes: Vec<NodeSummary>,
     /// Шаблоны по моделям в порядке объявления моделей.
     pub model_templates: Vec<ModelTemplates>,
-    /// Сколько заметок имеют уникальный `guid`.
+    /// Сколько различных непустых `guid` встречается в экспорте; повторы
+    /// считаются один раз.
     pub guids_unique: usize,
-    /// Сколько заметок имеют `guid`, встречающийся более одного раза.
+    /// Сколько различных `guid` встречается в экспорте более одного раза.
     pub guid_duplicates: usize,
     /// Выборка объявленного media без физического файла.
     pub media_missing_physical_sample: Vec<String>,

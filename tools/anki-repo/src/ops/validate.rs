@@ -6,15 +6,14 @@
 //! экспорт невалидным.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::details;
-use crate::error::{DomainError, ErrorCode};
+use crate::error::DomainError;
 use crate::index::ExportIndex;
-use crate::loader::{DECK_JSON, DECK_TYPE, ensure_deck_root};
+use crate::loader::{DECK_JSON, DECK_TYPE, ensure_deck_root, read_deck_json};
 use crate::media::{MEDIA_DIR, collect_media, extract_media_references, normalize_media_name};
 use crate::model::{DeckNode, FieldValue, NoteModel, Ord};
 
@@ -201,8 +200,7 @@ impl ValidateResult {
 /// отсутствующий `deck.json`. Проблемы содержимого становятся issues
 /// результата, а не ошибкой.
 pub fn validate(export_dir: &Path) -> Result<ValidateResult, DomainError> {
-    let deck_json = export_dir.join(DECK_JSON);
-    let raw = read_export(export_dir, &deck_json)?;
+    let (deck_json, raw) = read_deck_json(export_dir)?;
 
     let value: Value = match serde_json::from_str(&raw) {
         Ok(value) => value,
@@ -263,53 +261,6 @@ pub fn validate(export_dir: &Path) -> Result<ValidateResult, DomainError> {
     check_summary_diagnostics(&index, &mut issues);
 
     Ok(finish(issues))
-}
-
-fn read_export(export_dir: &Path, deck_json: &Path) -> Result<String, DomainError> {
-    let metadata = fs::metadata(export_dir).map_err(|error| {
-        DomainError::with_details(
-            ErrorCode::InputUnreadable,
-            format!(
-                "каталог экспорта {} недоступен: {error}",
-                export_dir.display()
-            ),
-            details! {
-                "path" => export_dir.display().to_string(),
-                "io_error" => error.to_string(),
-            },
-        )
-    })?;
-
-    if !metadata.is_dir() {
-        return Err(DomainError::with_details(
-            ErrorCode::InputUnreadable,
-            format!("{} не является каталогом", export_dir.display()),
-            details! {
-                "path" => export_dir.display().to_string(),
-            },
-        ));
-    }
-
-    fs::read_to_string(deck_json).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            DomainError::with_details(
-                ErrorCode::DeckJsonMissing,
-                format!("в каталоге {} нет {DECK_JSON}", export_dir.display()),
-                details! {
-                    "path" => deck_json.display().to_string(),
-                },
-            )
-        } else {
-            DomainError::with_details(
-                ErrorCode::InputUnreadable,
-                format!("не удалось прочитать {}: {error}", deck_json.display()),
-                details! {
-                    "path" => deck_json.display().to_string(),
-                    "io_error" => error.to_string(),
-                },
-            )
-        }
-    })
 }
 
 fn push(
@@ -478,8 +429,6 @@ fn check_deck_node_notes(
     index: &ExportIndex<'_>,
     issues: &mut Vec<Issue>,
 ) {
-    let mut guid_seen: BTreeMap<&str, usize> = BTreeMap::new();
-
     for (position, note) in node.notes.iter().enumerate() {
         let location = format!("notes[{position}]");
 
@@ -493,22 +442,10 @@ fn check_deck_node_notes(
                 "у заметки нет guid",
                 details! {},
             ),
-            Some(guid) => {
-                if let Some(first) = guid_seen.insert(guid, position) {
-                    push(
-                        issues,
-                        Severity::Error,
-                        error_codes::DUPLICATE_NOTE_GUID,
-                        Some(path),
-                        location.clone(),
-                        format!("guid {guid:?} уже встречается в этом узле на позиции {first}"),
-                        details! {
-                            "guid" => guid,
-                            "first_position" => first,
-                        },
-                    );
-                }
-            }
+            // Повторяющиеся guid собирает check_note_guids по всему экспорту;
+            // отдельная проверка внутри узла давала бы вторую issue на тот же
+            // дефект.
+            Some(_) => {}
         }
 
         for (field_position, value) in note.fields.iter().enumerate() {
@@ -866,18 +803,15 @@ fn check_note_guids(index: &ExportIndex<'_>, issues: &mut Vec<Issue>) {
 }
 
 fn check_templates(index: &ExportIndex<'_>, issues: &mut Vec<Issue>) {
-    let mut field_names: BTreeSet<&str> = BTreeSet::new();
-    for &model in &index.models {
-        for field in &model.flds {
-            field_names.insert(field.name.as_str());
-        }
-    }
-
+    // Набор полей берётся у конкретной модели: объединение по всем моделям
+    // скрывало бы ссылку шаблона на поле, которого у его собственной модели нет.
     for &model in &index.models {
         let Some(uuid) = model.crowdanki_uuid.as_deref() else {
             continue;
         };
         let base = format!("note_models[{uuid}]");
+        let field_names: BTreeSet<&str> =
+            model.flds.iter().map(|field| field.name.as_str()).collect();
 
         let mut ords: BTreeMap<i64, usize> = BTreeMap::new();
         for (position, template) in model.tmpls.iter().enumerate() {
@@ -921,7 +855,14 @@ fn check_templates(index: &ExportIndex<'_>, issues: &mut Vec<Issue>) {
         for (position, template) in model.tmpls.iter().enumerate() {
             for (side, text) in [("qfmt", &template.qfmt), ("afmt", &template.afmt)] {
                 for construct in scan_template(text) {
-                    match classify_template_token(&construct.token, &field_names) {
+                    // Незакрытый `{{` — это сломанный текст шаблона, а не
+                    // доказанная ссылка на отсутствующее поле.
+                    let classification = if is_closed(&construct) {
+                        classify_template_token(&construct.token, &field_names)
+                    } else {
+                        TemplateToken::Unchecked
+                    };
+                    match classification {
                         TemplateToken::Known => {}
                         TemplateToken::Unresolved => push(
                             issues,
@@ -1153,9 +1094,21 @@ fn check_summary_diagnostics(index: &ExportIndex<'_>, issues: &mut Vec<Issue>) {
 #[derive(Debug, Clone)]
 pub struct TemplateConstruct {
     /// Исходный текст construct'а вместе со скобками.
+    ///
+    /// Для закрытой конструкции это `{{` + содержимое + `}}`; для
+    /// незакрытого хвоста шаблона — остаток текста, в котором закрывающих
+    /// `}}` уже нет.
     pub raw: String,
     /// Содержимое без скобок и ведущих сигналов.
     pub token: String,
+}
+
+/// Проверяет, что construct шаблона был закрыт.
+///
+/// Незакрытый `{{` не даёт оснований утверждать, что шаблон ссылается именно
+/// на поле: такой случай остаётся `template_construct_unchecked`.
+fn is_closed(construct: &TemplateConstruct) -> bool {
+    construct.raw.ends_with("}}")
 }
 
 /// Находит очевидные `{{ ... }}` constructs. Полноценный parser не используется.

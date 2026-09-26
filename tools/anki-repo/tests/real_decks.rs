@@ -78,6 +78,9 @@ fn physical_media(dir: &Path) -> BTreeSet<String> {
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
+                // Фильтр совпадает с collect_media: каталоги внутри media/ не
+                // считаются физическими media-файлами.
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .collect()
         })
@@ -86,6 +89,70 @@ fn physical_media(dir: &Path) -> BTreeSet<String> {
 
 fn basename(name: &str) -> String {
     name.rsplit(['/', '\\']).next().unwrap_or(name).to_string()
+}
+
+/// Состав моделей из сырого JSON: `crowdanki_uuid` → (имя поля → `ord`).
+fn raw_models(value: &Value) -> BTreeMap<String, BTreeMap<String, i64>> {
+    fn walk(value: &Value, out: &mut BTreeMap<String, BTreeMap<String, i64>>) {
+        if let Some(models) = value.get("note_models").and_then(Value::as_array) {
+            for model in models {
+                let Some(uuid) = model.get("crowdanki_uuid").and_then(Value::as_str) else {
+                    continue;
+                };
+                let mut fields = BTreeMap::new();
+                if let Some(flds) = model.get("flds").and_then(Value::as_array) {
+                    for field in flds {
+                        let name = field
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let ord = field.get("ord").and_then(Value::as_i64).unwrap_or_default();
+                        fields.insert(name.to_string(), ord);
+                    }
+                }
+                out.insert(uuid.to_string(), fields);
+            }
+        }
+        if let Some(children) = value.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk(child, out);
+            }
+        }
+    }
+
+    let mut models = BTreeMap::new();
+    walk(value, &mut models);
+    models
+}
+
+/// Возвращает `ord` поля заметки так, как он задан её моделью в сыром JSON.
+///
+/// Позиция в `fields` не предполагается равной `ord`: она всегда разрешается
+/// через `note_model_uuid`.
+fn raw_field_ord(
+    models: &BTreeMap<String, BTreeMap<String, i64>>,
+    note: &Value,
+    name: &str,
+) -> i64 {
+    let uuid = note
+        .get("note_model_uuid")
+        .and_then(Value::as_str)
+        .expect("у заметки должен быть note_model_uuid");
+    models
+        .get(uuid)
+        .unwrap_or_else(|| panic!("модель {uuid} не найдена в note_models"))
+        .get(name)
+        .unwrap_or_else(|| panic!("поле {name} не найдено в модели {uuid}"))
+        .to_owned()
+}
+
+/// Позиция поля заметки в массиве `fields`, вычисленная по `ord` модели.
+fn raw_field_position(
+    models: &BTreeMap<String, BTreeMap<String, i64>>,
+    note: &Value,
+    name: &str,
+) -> usize {
+    usize::try_from(raw_field_ord(models, note, name)).expect("ord должен быть неотрицательным")
 }
 
 /// Все уровни N1–N5 должны существовать и содержать `deck.json`.
@@ -263,6 +330,7 @@ fn stats_agree_with_inspect() {
 fn group_by_matches_independently_recomputed_distribution() {
     for level in LEVELS {
         let value = raw_json(level);
+        let models = raw_models(&value);
         let mut notes = Vec::new();
         collect_notes(&value, &mut notes);
 
@@ -271,7 +339,7 @@ fn group_by_matches_independently_recomputed_distribution() {
             let raw = note
                 .get("fields")
                 .and_then(Value::as_array)
-                .and_then(|fields| fields.get(1))
+                .and_then(|fields| fields.get(raw_field_position(&models, note, "Часть речи")))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
@@ -350,6 +418,13 @@ fn canonical_decks_have_no_errors_and_only_expected_media_warnings() {
             .iter()
             .filter(|issue| issue.code == "media_physical_missing")
             .count();
+        assert!(
+            !result
+                .issues
+                .iter()
+                .any(|issue| issue.code == "issues_truncated"),
+            "N{level}: issues усечены, сравнение количества некорректно"
+        );
         assert_eq!(
             missing, expected_missing,
             "N{level}: число отсутствующих физически media"
@@ -544,10 +619,18 @@ fn json_render_is_valid_and_keeps_ordered_fields() {
     assert_eq!(parsed["command"], Value::from("find"));
 
     // Порядок ключей проверяется по фактическому тексту: при повторном разборе
-    // в serde_json::Value порядок объекта нормализуется.
-    let positions: Vec<usize> = EXPECTED_FIELDS
+    // в serde_json::Value порядок объекта нормализуется. Ожидаемый порядок
+    // берётся из ord модели, а не из порядка массива `fields`.
+    let models = raw_models(&value);
+    let mut by_ord: Vec<(i64, &str)> = EXPECTED_FIELDS
         .iter()
-        .map(|name| {
+        .map(|name| (raw_field_ord(&models, notes[0], name), *name))
+        .collect();
+    by_ord.sort_by_key(|(ord, _)| *ord);
+
+    let positions: Vec<usize> = by_ord
+        .iter()
+        .map(|(_, name)| {
             text.find(&format!("\"{name}\":"))
                 .unwrap_or_else(|| panic!("в выводе нет ключа {name}"))
         })
@@ -562,13 +645,14 @@ fn json_render_is_valid_and_keeps_ordered_fields() {
     let fields = parsed["result"]["notes"][0]["fields"]
         .as_object()
         .expect("fields — объект");
-    assert_eq!(fields.len(), EXPECTED_FIELDS.len());
+    assert_eq!(fields.len(), by_ord.len());
 
     let raw_fields = notes[0]
         .get("fields")
         .and_then(Value::as_array)
         .expect("fields");
-    for (position, name) in EXPECTED_FIELDS.iter().enumerate() {
+    for (ord, name) in &by_ord {
+        let position = usize::try_from(*ord).expect("ord должен быть неотрицательным");
         assert_eq!(
             fields[*name], raw_fields[position],
             "поле {name} должно совпадать с сырым JSON"
