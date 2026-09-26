@@ -17,6 +17,11 @@
 | `01-PROJECT-MAP.md` | структура репозитория, расположение колод и агентского контекста |
 | `02-CROWDANKI-JSON.md` | устройство CrowdAnki JSON, связи сущностей и безопасная навигация |
 | `03-VERIFICATION.md` | минимальные проверки JSON и структурных инвариантов после изменения |
+| `tools/anki-repo/README.md` | контракт read-only toolkit `anki-repo`: команды, вывод, exit codes |
+
+## Инструменты
+
+`tools/anki-repo` — самостоятельный read-only Rust CLI для одного CrowdAnki-экспорта. Он разрешает связи `note_model_uuid` → `flds[].ord` → `fields` и умеет `inspect`, `find`, `stats`, `validate` с человекочитаемым и JSON-выводом. Предпочитай его ручному чтению многомегабайтного `deck.json`.
 
 ## Что здесь не хранить
 

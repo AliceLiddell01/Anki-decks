@@ -1,0 +1,188 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+language: ru-RU
+
+early_access: false
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary_instructions: >-
+    Суммируй изменения по фактическим областям репозитория: данные CrowdAnki,
+    Rust tooling, тесты и репозиторные контракты/документация. Объясняй, что
+    изменено, зачем и какой наблюдаемый эффект это имеет. Если задача или Scope
+    явно заданы в PR, issue или локальном контексте, сверяй diff именно с ними.
+    Не придумывай отсутствующий Scope и не представляй предположение как факт.
+    Отдельно отмечай случайные массовые изменения JSON, изменение идентичности
+    сущностей Anki/CrowdAnki и изменения публичного контракта tools/anki-repo.
+  high_level_summary_in_walkthrough: true
+  review_details: true
+  fail_commit_status: false
+  suggested_labels: false
+  suggested_reviewers: false
+  in_progress_fortune: false
+  enable_prompt_for_ai_agents: true
+
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        Сначала сверяй AGENTS.md и применимые документы из .codex/context с
+        фактическим diff. Эти version-controlled контракты имеют приоритет над
+        общими best practices. Сообщай применимые correctness, data-integrity,
+        maintainability, determinism, regression и test-coverage findings вне
+        зависимости от severity, если finding конкретен и actionable. Не
+        предлагай несвязанный cleanup или архитектурную переделку только ради
+        вкуса. Перед рекомендацией проверь фактические call sites, тесты,
+        форматы данных и существующий контракт. При недостатке evidence явно
+        укажи неопределённость вместо выдуманного дефекта.
+
+    - path: "decks/**/deck.json"
+      instructions: >-
+        Рассматривай deck.json как версионируемый исходник CrowdAnki, а не как
+        произвольный JSON. Флагай необоснованные изменения crowdanki_uuid,
+        guid, note_model_uuid и deck_config_uuid; неразрешимые ссылки на модели
+        или конфигурации; несоответствие числа Note.fields модели; ошибки в
+        порядке note_models[].flds[].ord; удаление неизвестных ключей;
+        непреднамеренные изменения templates, CSS, scheduler/config semantics;
+        случайное массовое переформатирование или переупорядочивание. Для
+        content-only правок структура и идентичность должны сохраняться. Media
+        references проверяй отдельно, но отсутствие физического media-файла не
+        объявляй безусловной ошибкой: политика хранения media в репозитории пока
+        не определена. Учитывай контракт validate из tools/anki-repo.
+
+    - path: "decks/japanese/words/**/deck.json"
+      instructions: >-
+        Перед интерпретацией Note.fields разреши note_model_uuid и фактический
+        порядок полей модели. Для знакомой словарной модели ожидаются поля:
+        Слово, Часть речи, Значение, Ударение, Пример, Похожие слова, но всегда
+        проверяй реальную модель в JSON. Лингвистические замечания по японскому
+        или русскому содержимому делай только при конкретной доказуемой ошибке;
+        не выдавай вкусовую переформулировку за correctness issue. Следи, чтобы
+        правка содержимого не смешивалась без необходимости с изменением модели
+        карточки, HTML/CSS, шаблонов или настроек планировщика.
+
+    - path: "tools/anki-repo/src/**/*.rs"
+      instructions: >-
+        Сохраняй основной контракт anki-repo: CLI только читает один CrowdAnki
+        export за вызов и не мутирует deck.json, media или настройки Anki.
+        Проверяй детерминированность, стабильность JSON output contract,
+        schema_version, command/error codes, exit codes, порядок вывода,
+        semantics inspect/find/stats/validate и разделение stdout/stderr.
+        Учитывай Rust edition 2024 и запрет unsafe_code. Новые panic paths,
+        недетерминированные HashMap/FS iteration effects, неограниченный вывод,
+        чтение media по небезопасным путям и скрытые filesystem mutations
+        считай существенными дефектами. Изменение наблюдаемого CLI-контракта
+        должно сопровождаться соответствующими тестами и обновлением README.
+
+    - path: "tools/anki-repo/tests/**/*.rs"
+      instructions: >-
+        Проверяй, что тесты защищают публичный контракт, а не только текущую
+        реализацию. Synthetic tests должны покрывать доменные ошибки и ветви
+        validation; CLI tests — аргументы, exit codes и stdout/stderr; real deck
+        tests — пересчитывать ожидаемые значения из исходного JSON/media там,
+        где это является контрактом, а не закреплять хрупкие случайные числа.
+        Не допускай ослабления assertions ради прохождения тестов. Тесты не
+        должны мутировать канонические колоды и должны оставаться
+        детерминированными.
+
+    - path: "tools/anki-repo/Cargo.toml"
+      instructions: >-
+        Проверяй необходимость новых зависимостей и features, совместимость с
+        Rust edition 2024 и заявленным toolchain около rustc/cargo 1.98.1,
+        сохранение publish=false и unsafe_code=forbid. Новая зависимость должна
+        решать конкретную задачу и не дублировать уже имеющуюся возможность.
+
+    - path: "tools/anki-repo/Cargo.lock"
+      instructions: >-
+        Cargo.lock должен меняться только как следствие осознанного изменения
+        зависимостей или воспроизводимого обновления lockfile. Флагай
+        необъяснимый lockfile churn и рассинхронизацию с Cargo.toml.
+
+    - path: ".codex/context/**"
+      instructions: >-
+        Контекст должен описывать долговременные репозиторные контракты и
+        фактическое текущее устройство проекта. Не закрепляй в нём временный
+        номер PR, commit SHA, разовый план, transient review result или факт,
+        который уже расходится с кодом/JSON. Изменения структуры CrowdAnki и
+        verification workflow должны оставаться согласованными с AGENTS.md и
+        tools/anki-repo/README.md.
+
+    - path: "AGENTS.md"
+      instructions: >-
+        Проверяй инструкции как authoritative repository contract. Новое правило
+        не должно противоречить фактической структуре репозитория, CrowdAnki
+        данным или tools/anki-repo. Не превращай временную задачу, ветку, PR или
+        локальный workaround в постоянный глобальный контракт.
+
+    - path: "**/README.md"
+      instructions: >-
+        Документация должна совпадать с реально существующими командами,
+        аргументами, путями, exit codes, ограничениями и read-only поведением.
+        Флагай устаревшие примеры и обещания функциональности, которой код не
+        предоставляет.
+
+  tools:
+    clippy:
+      enabled: true
+
+  auto_review:
+    enabled: false
+    auto_incremental_review: false
+    auto_pause_after_reviewed_commits: 0
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+
+chat:
+  art: false
+  auto_reply: false
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - files: AGENTS.md
+        applyTo: "**/*"
+      - files: .codex/context/01-PROJECT-MAP.md
+        applyTo: "**/*"
+      - files: .codex/context/02-CROWDANKI-JSON.md
+        applyTo: "decks/**/*"
+      - files: .codex/context/03-VERIFICATION.md
+        applyTo: "decks/**/*,tools/anki-repo/**/*"
+      - files: tools/anki-repo/README.md
+        applyTo: "tools/anki-repo/**/*"
+  learnings:
+    scope: local
+    approval_delay: 30
+  issues:
+    scope: local
+  jira:
+    usage: disabled
+  linear:
+    usage: disabled
+  pull_requests:
+    scope: local
+  mcp:
+    usage: disabled
+
+issue_enrichment:
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
