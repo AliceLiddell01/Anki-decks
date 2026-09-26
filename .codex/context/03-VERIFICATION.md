@@ -1,5 +1,27 @@
 # Проверка изменений CrowdAnki JSON
 
+## Автоматическая проверка toolkit'ом
+
+Read-only toolkit `tools/anki-repo` покрывает минимум ниже и позволяет не читать
+JSON вручную:
+
+```bash
+cd tools/anki-repo
+cargo run --quiet -- inspect  ../../decks/japanese/words/Words__N3
+cargo run --quiet -- stats    ../../decks/japanese/words/Words__N3
+cargo run --quiet -- validate ../../decks/japanese/words/Words__N3
+```
+
+`validate` возвращает exit code `0`, если в экспорте нет ни одного issue уровня
+`ERROR`, и `6`, если хотя бы один есть. Отсутствие физического media-файла — это
+`WARNING`, а не `ERROR`. Полный список кодов и контракт вывода —
+`tools/anki-repo/README.md`.
+
+Перед правкой зафиксируй `inspect`/`stats` (число заметок, узлов, моделей,
+распределение по полям), после правки повтори и сравни. Для точечной работы с
+одной заметкой используй `find --guid`, для поиска по значению поля —
+`find --field` или сокращение `find --word`.
+
 ## Минимум после любой правки JSON
 
 1. JSON успешно парсится стандартным парсером.

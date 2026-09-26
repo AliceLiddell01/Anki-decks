@@ -30,6 +30,10 @@
 Схема и безопасная навигация по CrowdAnki JSON — `.codex/context/02-CROWDANKI-JSON.md`.
 Проверки после изменения — `.codex/context/03-VERIFICATION.md`.
 
+Для структурного анализа экспорта используй read-only toolkit `tools/anki-repo`
+(`inspect`, `find`, `stats`, `validate`) вместо ручного чтения многомегабайтного
+`deck.json`. Его контракт описан в `tools/anki-repo/README.md`.
+
 ## 4. Инварианты CrowdAnki
 
 - Не меняй `crowdanki_uuid`, `guid`, `note_model_uuid` и `deck_config_uuid` без явной причины.
