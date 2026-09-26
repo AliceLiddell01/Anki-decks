@@ -1,0 +1,8 @@
+# Normalize text files in the repository.
+* text=auto
+
+# Repository text formats use LF on all platforms.
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
