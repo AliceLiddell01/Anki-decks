@@ -161,9 +161,9 @@ Agent-режим отдаёт поток событий (в документац
 
 Review считается **authoritative завершённым** только если поток дошёл до
 terminal события, у которого нет признаков неполного/проваленного review (в
-документированном контракте это `outcome`, `message` и
-`unreviewedFileCount`/`unreviewed_file_count`; положительное число
-не reviewed файлов означает неполный review), и при этом не было `error`.
+документированном контракте это `outcome`, `message` и `unreviewedFileCount`;
+положительное число не reviewed файлов означает неполный review), и при этом не
+было `error`.
 
 Не полагайся только на exit code: официальная документация связывает код `1` с
 failed или incomplete review **начиная с CLI 0.7.7**, а установленная версия
@@ -171,9 +171,21 @@ failed или incomplete review **начиная с CLI 0.7.7**, а устано
 Если findings пришли, но review не завершён — это не completed iteration, а
 provider failure: повтори **ту же** iteration.
 
-Отсутствие изменений (`review_skipped` и `findings: 0` с сообщением вида
-«No changes detected») — это терминальный результат review, а не ошибка, и оно
-обрабатывается по правилам clean iteration из `SKILL.md`.
+Не путай два разных исхода. Clean review — это review, который **реально был
+выполнен** и вернул `0 findings`; его обрабатывают по правилам clean iteration из
+`SKILL.md`.
+
+Отсутствие изменений — другой случай. Когда выбранный review scope не содержит
+изменений файлов, поток всё равно приходит к terminal событию, но с
+`status: "review_skipped"` и `findings: 0` с сообщением вида «No changes
+detected», а в plain mode CLI вообще не начинает review. Такой прогон не является
+ни ошибкой, ни review результатом: он **не** даёт clean pass, **не** увеличивает
+счётчик completed iterations и **не** закрывается marker commit'ом. Пустой diff
+означает, что candidate или base выбраны неверно либо проверять действительно
+нечего: сначала выясни причину, а не превращай пропуск в успешную iteration.
+
+Отдельно: пропуск scope из-за слишком большого числа файлов — это не
+`review_skipped`, а failure с `error`-событием; он также не является iteration.
 
 `coderabbit review findings` полезен как дополнительное повторное чтение
 сохранённых findings в текущем review context (review directory + branch + base),

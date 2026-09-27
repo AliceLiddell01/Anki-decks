@@ -95,7 +95,11 @@ target_iterations = explicit_user_count ?? 3
 Не считается iteration: rate limit до завершения review; auth failure;
 network/provider failure; invalid или malformed provider result; запуск в
 неправильном repository; любой failure до фактического получения review
-результата.
+результата; пропущенный review, когда review scope не содержит изменений.
+
+Marker commit требует реально выполненного review. Пропуск review без изменений —
+не clean pass: он не расходует iteration и означает, что candidate или base
+выбраны неверно либо проверять нечего.
 
 ## Clean iteration
 
