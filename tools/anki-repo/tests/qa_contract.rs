@@ -228,7 +228,11 @@ fn canonical_decks_report_independently_recomputed_counts() {
         let mut notes = Vec::new();
         collect_notes(&raw, &mut notes);
 
-        let (code, parsed) = qa_json(&export.to_string_lossy(), &["--max-per-code", "200"]);
+        // Предел печати — аргумент теста, а не факт о колоде: сколько findings
+        // вернётся и была ли выборка обрезана, считается из oracle'а.
+        const LIMIT: usize = 200;
+        let limit = LIMIT.to_string();
+        let (code, parsed) = qa_json(&export.to_string_lossy(), &["--max-per-code", &limit]);
         assert_eq!(code, 0, "N{level}");
         assert_eq!(
             parsed["result"]["notes_total"],
@@ -265,12 +269,22 @@ fn canonical_decks_report_independently_recomputed_counts() {
             "N{level}"
         );
 
-        // Показанные findings не обрезаны, поэтому каждый адрес проверяется
-        // прямо по сырым заметкам.
-        assert_eq!(parsed["result"]["truncated"], false, "N{level}");
+        // Печать ограничена кодом, у которого findings больше предела; адрес
+        // каждого показанного finding проверяется прямо по сырым заметкам.
+        let widest = QA_CODES
+            .iter()
+            .map(|code| expected[code])
+            .max()
+            .expect("реестр не пуст");
         assert_eq!(
-            parsed["result"]["findings_returned"], parsed["result"]["findings_total"],
-            "N{level}"
+            parsed["result"]["truncated"],
+            widest > LIMIT,
+            "N{level}: признак усечения следует из oracle'а"
+        );
+        assert_eq!(
+            parsed["result"]["findings_returned"],
+            expected.values().sum::<usize>().min(LIMIT * QA_CODES.len()),
+            "N{level}: показано не больше предела на код"
         );
         for finding in parsed["result"]["findings"].as_array().expect("findings") {
             assert_finding_matches_raw(&raw, finding, level);
@@ -399,17 +413,24 @@ fn empty_field_findings_point_at_a_real_empty_value() {
     collect_notes(&raw, &mut notes);
     let expected = raw_qa_counts(&raw)["empty_field_value"];
 
+    const LIMIT: usize = 200;
+    let limit = LIMIT.to_string();
     let (code, parsed) = qa_json(
         &export.to_string_lossy(),
-        &["--code", "empty_field_value", "--max-per-code", "200"],
+        &["--code", "empty_field_value", "--max-per-code", &limit],
     );
     assert_eq!(code, 0);
 
     let findings = parsed["result"]["findings"].as_array().expect("findings");
-    assert_eq!(findings.len(), expected, "показаны все findings правила");
     assert_eq!(
-        parsed["result"]["truncated"], false,
-        "предел выше числа findings"
+        findings.len(),
+        expected.min(LIMIT),
+        "показаны ровно те findings правила, что помещаются в предел печати"
+    );
+    assert_eq!(
+        parsed["result"]["truncated"],
+        expected > LIMIT,
+        "признак усечения следует из oracle'а"
     );
 
     // Адрес каждого finding разрешается по сырому deck.json: заметка берётся из

@@ -627,13 +627,16 @@ fn single_note_qa_code_does_not_pull_unrelated_notes() {
             .is_empty(),
         "у заметки вне группы нет group_membership"
     );
+    // Item несёт *все* findings заметки, а не только отобравший его код
+    // (см. `qa_findings_in_an_item_are_bounded`), поэтому здесь важно лишь то,
+    // что причина попадания заметки в batch не потеряна.
     assert!(
         item["qa_findings"]
             .as_array()
             .expect("qa_findings")
             .iter()
-            .all(|finding| finding["code"] == "empty_field_value"),
-        "в item попадают только findings, по которым он выбран"
+            .any(|finding| finding["code"] == "empty_field_value"),
+        "item обязан нести finding, по которому выбран"
     );
 }
 

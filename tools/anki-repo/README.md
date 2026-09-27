@@ -222,10 +222,11 @@ anki-repo --json qa decks/japanese/words/Words__N5 > findings.json
   структурную причину называет `validate`, а `qa` не выдаёт неисполнимый адрес за
   обычную цель `edit`.
 - Правила-дубликаты описывают группу целиком: `group_size` — число участников,
-  `related_note_indices` и `related_guids` — все участники, включая владельца
-  finding (порядок — канонический порядок findings). Список ограничен 20
-  участниками (`MAX_RELATED_NOTES`), и тогда `related_truncated: true`: группа
-  никогда не обрезается молча.
+  `related_note_indices` и `related_guids` — участники группы в каноническом
+  порядке findings, причём владелец finding входит в список (`review` в своём
+  `related` владельца наоборот исключает). Список ограничен 20 участниками
+  (`MAX_RELATED_NOTES`), и тогда `related_truncated: true`: группа никогда не
+  обрезается молча.
 
 Каждый finding адресуется позицией заметки в экспорте (`note_index`), `guid`,
 путём колоды, моделью и парой «имя поля + `ord`», а `evidence` несёт ограниченные
@@ -284,11 +285,16 @@ anki-repo review decks/japanese/words/Words__N3 --guid 'D!TAYVuHi,'
   `excluded_unaddressable`; `notes_total` при этом описывает экспорт целиком, а не
   страницу. Пустая страница из-за этого исключения не молчит: счётчик объясняет
   причину.
-- `--qa-code` для правил-дубликатов приводит **всех** участников группы, а не
-  только владельца finding: иначе группа потеряла бы остальных заметок на пути
-  `qa → review`. Владелец несёт сам finding (с `group_size` и `related` — всеми
+- `--qa-code` для правил-дубликатов приводит участников группы, а не только
+  владельца finding: иначе группа потеряла бы остальных заметок на пути
+  `qa → review`. Владелец несёт сам finding (с `group_size` и `related` —
   участниками, кроме себя), а каждый участник — `group_membership` со ссылкой на
   владельца (`code`, `owner_note_index`, `owner_guid`, `group_size`).
+  Список участников приходит из domain-результата и ограничен
+  `MAX_RELATED_NOTES` (20): в группе из 30 заметок batch получит владельца и 20
+  участников, а `related_truncated: true` в finding'е владельца покажет, что
+  список неполон. Обещать «всех участников» для группы больше предела нельзя:
+  чтобы увидеть остальных, нужен отдельный обход (`review --all` или `--field`).
 - `--all`, `--guid`, `--word` и `--field` группы не расширяют: они отбирают ровно
   то, что означает их критерий.
 
@@ -393,12 +399,15 @@ anki-repo validate decks/japanese/words/Words__N1
 `counts` и сам `edit_request` не усекаются: усечение затрагивает только печать, и
 человеческий вывод говорит об этом прямо, не обещая «полного списка в `--json`».
 
-Проблемы уровня всего документа остаются доменными ошибками `invalid_request` с
-exit code 3 (пока документ не разобран, проверять нечего) и различаются по
-`details.reason`: `malformed_proposals` (структурно некорректный или чужая форма),
-`unsupported_schema_version`, `empty_proposals`, `too_many_proposals` (больше
-20 000), `proposals_too_large` (больше 8 МиБ), `duplicate_proposal_id` и
-`duplicate_edit_target` (повтор пары «`guid`, поле»).
+Проблемы уровня всего документа остаются доменными ошибками с exit code 3 (пока
+документ не разобран, проверять нечего). Собственный словарь предложений даёт
+`invalid_request` с `details.reason`: `malformed_proposals` (структурно
+некорректный или чужая форма), `unsupported_schema_version`, `empty_proposals`,
+`too_many_proposals` (больше 20 000), `proposals_too_large` (больше 8 МиБ) и
+`duplicate_proposal_id`. Проверки, общие с запросом `edit`
+(`edit::validate_request`), добавляют к ним `empty_guid` и `empty_field`, а повтор
+пары «`guid`, поле» — это отдельный код `duplicate_edit_target`, а не `reason`
+внутри `invalid_request`.
 
 ### Типовой конвейер
 
@@ -708,8 +717,8 @@ exit code.
 | `unknown_field` | 3 | Указанного поля нет ни в одной модели экспорта; для `edit` — также если поля нет в модели целевой заметки |
 | `unknown_deck` | 3 | Указанная колода не найдена |
 | `unknown_qa_code` | 3 | Указанного кода QA нет в реестре правил (`qa --code`, `review --qa-code`) |
-| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id` или чужая `schema_version`; `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large` или `duplicate_proposal_id` |
-| `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды |
+| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id`, чужая `schema_version`, пустой `guid` (`empty_guid`) или пустое имя поля (`empty_field`); `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large`, `duplicate_proposal_id`, `empty_guid` или `empty_field` |
+| `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды (отдельный код, а не `details.reason` внутри `invalid_request`) |
 | `proposal_not_executable` (`details.reason`) | — | Не отдельный код: `review-check` сообщает о неисполнимом предложении статусом `invalid` внутри отчёта, а не ошибкой команды |
 | `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме; `review-check`: тот же блокер в `source_blockers`, запрос не выпущен |
 | `export_invalid` | 6 | `edit`: в исходном экспорте есть `ERROR` (в том числе `duplicate_note_guid` — повтор `guid` делает адресацию правки неоднозначной); либо кандидат правки получил новый `ERROR` (проверка до записи). `review-check` называет этот блокер в `source_blockers` и возвращает `6` вместо итогового кода отчёта |
@@ -813,8 +822,9 @@ cargo nextest run
 - `tests/review_contract.rs` — контракт `review`: размер страницы, полный обход
   пагинации без потерь и повторов, пустая страница за концом выборки, компактность
   batch, ограничение findings внутри заметки, совпадение ошибок `--guid` с `find`,
-  приведение всех участников группы правил-дубликатов и исключение неадресуемых
-  заметок с видимым `excluded_unaddressable`;
+  приведение участников группы правил-дубликатов (в пределах
+  `MAX_RELATED_NOTES`) и исключение неадресуемых заметок с видимым
+  `excluded_unaddressable`;
 - `tests/review_check_contract.rs` — контракт `review-check`: все пять статусов
   предложения, приоритет `stale`/`invalid` (5 → 4 → 3) в exit codes, отказ на
   документе чужой формы (`edits`) и на устаревшем флаге `--request`, все причины
