@@ -45,7 +45,7 @@ fn check_json(export: &str, request: &Value, name: &str) -> (i32, Value) {
 #[test]
 fn valid_proposals_produce_a_stage_two_request() {
     let temp = TempDir::new("review-check-valid");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("guid-2", "Пример", "", "пример-2"),
@@ -87,7 +87,7 @@ fn valid_proposals_produce_a_stage_two_request() {
 #[test]
 fn review_check_never_touches_the_export() {
     let temp = TempDir::new("review-check-readonly");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let deck = temp.path().join("deck.json");
     let before = fs::read(&deck).expect("deck.json");
 
@@ -113,7 +113,7 @@ fn review_check_never_touches_the_export() {
 #[test]
 fn mismatched_expected_value_is_a_conflict_and_blocks_the_request() {
     let temp = TempDir::new("review-check-conflict");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[("guid-1", "Пример", "устаревшее", "новое")]);
     let (code, parsed) = check_json(&temp.path().to_string_lossy(), &request, "p.json");
 
@@ -129,7 +129,7 @@ fn mismatched_expected_value_is_a_conflict_and_blocks_the_request() {
 #[test]
 fn no_request_is_emitted_when_nothing_is_effective() {
     let temp = TempDir::new("review-check-noop");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[
         ("guid-1", "Пример", "", ""),                   // значение не меняется
         ("guid-2", "Значение", "значение", "значение"), // тоже без изменения
@@ -147,7 +147,7 @@ fn no_request_is_emitted_when_nothing_is_effective() {
 #[test]
 fn duplicate_targets_are_rejected_by_the_shared_request_validator() {
     let temp = TempDir::new("review-check-duplicate");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("guid-1", "Пример", "", "пример-2"),
@@ -164,7 +164,7 @@ fn duplicate_targets_are_rejected_by_the_shared_request_validator() {
 #[test]
 fn unknown_guid_is_reported_per_proposal_while_valid_ones_survive() {
     let temp = TempDir::new("review-check-invalid");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("нет-такого", "Пример", "", "пример-2"),
@@ -196,7 +196,7 @@ fn unknown_guid_is_reported_per_proposal_while_valid_ones_survive() {
 #[test]
 fn ambiguous_guid_outranks_the_other_invalid_kinds() {
     let temp = TempDir::new("review-check-ambiguous");
-    temp.write_export(&common::export_with(|value| {
+    temp.write_canonical_deck_json(&common::export_with(|value| {
         let mut duplicate = value["notes"][0].clone();
         duplicate["fields"] = json!(["слово", "значение", ""]);
         value["notes"][0]["fields"] = json!(["слово", "значение", ""]);
@@ -211,8 +211,17 @@ fn ambiguous_guid_outranks_the_other_invalid_kinds() {
     ]);
     let (code, parsed) = check_json(&temp.path().to_string_lossy(), &request, "p.json");
 
-    assert_eq!(code, 5, "ambiguous важнее note_not_found");
-    assert_eq!(parsed["result"]["counts"]["invalid"], 2);
+    let result = &parsed["result"];
+    // Порядок внутри отчёта не изменился: ambiguous важнее note_not_found.
+    assert_eq!(result["counts"]["invalid"], 2);
+    assert_eq!(result["proposals"][0]["problem"], "ambiguous_guid");
+    assert_eq!(result["proposals"][1]["problem"], "note_not_found");
+    // Но повтор `guid` — это ERROR экспорта, поэтому запрос не выпускается и
+    // код возврата называет причину блокировки исходника.
+    assert_eq!(code, 6, "невалидный исходник блокирует запрос");
+    assert_eq!(result["source_editable"], Value::Bool(false));
+    assert_eq!(result["source_blockers"][0]["code"], "export_invalid");
+    assert_eq!(result["edit_request"], Value::Null);
 }
 
 #[test]
@@ -246,7 +255,7 @@ fn already_applied_proposals_are_reported_without_a_request() {
 #[test]
 fn report_is_bounded_while_counts_stay_complete() {
     let temp = TempDir::new("review-check-bounded");
-    temp.write_export(&common::export_with(|value| {
+    temp.write_canonical_deck_json(&common::export_with(|value| {
         let template = value["notes"][0].clone();
         for index in 0..60 {
             let mut copy = template.clone();
@@ -293,7 +302,7 @@ fn report_is_bounded_while_counts_stay_complete() {
 #[test]
 fn proposals_can_be_read_from_stdin() {
     let temp = TempDir::new("review-check-stdin");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     let raw = serde_json::to_vec(&request).expect("сериализация");
 
@@ -317,7 +326,7 @@ fn proposals_can_be_read_from_stdin() {
 #[test]
 fn non_string_field_value_is_invalid_not_an_error() {
     let temp = TempDir::new("review-check-non-string");
-    temp.write_export(&common::export_with(|value| {
+    temp.write_canonical_deck_json(&common::export_with(|value| {
         value["notes"][0]["fields"][2] = json!(7);
     }));
     let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
@@ -325,8 +334,8 @@ fn non_string_field_value_is_invalid_not_an_error() {
 
     // Значение поля, которое нельзя править как строку, — неисполнимое
     // предложение, а не внутренняя ошибка инструмента.
-    assert_eq!(code, 3);
-    let proposal = &parsed["result"]["proposals"][0];
+    let result = &parsed["result"];
+    let proposal = &result["proposals"][0];
     assert_eq!(proposal["status"], "invalid");
     assert_eq!(proposal["problem"], "field_not_resolvable");
     assert!(
@@ -335,13 +344,69 @@ fn non_string_field_value_is_invalid_not_an_error() {
             .is_some_and(|message| message.contains("строкового значения")),
         "{proposal}"
     );
-    assert_eq!(parsed["result"]["edit_request"], Value::Null);
+    // Такой экспорт `validate` уже считает невалидным, поэтому он же назван и
+    // как блокировка записи; отчёт по предложению при этом сохранён.
+    assert_eq!(code, 6);
+    assert_eq!(result["source_blockers"][0]["code"], "export_invalid");
+    assert_eq!(result["edit_request"], Value::Null);
+}
+
+#[test]
+fn noncanonical_source_keeps_the_report_and_withholds_the_request() {
+    let temp = TempDir::new("review-check-noncanonical");
+    // Форма файла — часть предусловия записи: `edit` такой файл переписать
+    // отказывается, значит и запрос выпускать не из чего.
+    temp.write_export(&proposals_export());
+    let request = proposals_document(&[
+        ("guid-1", "Пример", "", "пример-1"),
+        ("guid-2", "Пример", "", "пример-2"),
+    ]);
+    let (code, parsed) = check_json(&temp.path().to_string_lossy(), &request, "p.json");
+
+    let result = &parsed["result"];
+    assert_eq!(code, 3, "неканонический исходник — это код границы записи");
+    assert_eq!(result["outcome"], "ok", "статусы предложений не пострадали");
+    assert_eq!(result["counts"]["valid"], 2);
+    assert_eq!(result["effective_proposals"], 2);
+    assert_eq!(result["source_editable"], Value::Bool(false));
+    assert_eq!(result["source_blockers"][0]["code"], "source_not_canonical");
+    assert!(
+        result["source_blockers"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("канонической")),
+        "{result}"
+    );
+    assert_eq!(result["edit_request"], Value::Null);
+}
+
+#[test]
+fn human_mode_names_the_source_blocker() {
+    let temp = TempDir::new("review-check-human-blocker");
+    temp.write_export(&proposals_export());
+    let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
+    let path = write_proposals(&temp, "p.json", &request);
+    let (code, stdout, stderr) = run_cli(&[
+        "review-check",
+        &temp.path().to_string_lossy(),
+        "--proposals",
+        &path.to_string_lossy(),
+    ]);
+
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(
+        stdout.contains("source_not_canonical"),
+        "причина блокировки должна быть названа\n{stdout}"
+    );
+    assert!(
+        stdout.contains("исходник нельзя править") || stdout.contains("править нельзя"),
+        "{stdout}"
+    );
 }
 
 #[test]
 fn broken_document_is_a_usage_class_error_before_any_report() {
     let temp = TempDir::new("review-check-broken");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let export = temp.path().to_string_lossy().to_string();
 
     let valid = json!({"proposal_id": "p0", "guid": "guid-1", "field": "Пример",
@@ -412,7 +477,7 @@ fn broken_document_is_a_usage_class_error_before_any_report() {
 #[test]
 fn missing_proposals_file_is_an_input_error() {
     let temp = TempDir::new("review-check-missing");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let missing = temp.path().join("нет.json");
     let (code, stdout, stderr) = run_cli(&[
         "--json",
@@ -434,7 +499,7 @@ fn missing_proposals_file_is_an_input_error() {
 #[test]
 fn human_mode_explains_statuses_and_the_missing_request() {
     let temp = TempDir::new("review-check-human");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("guid-2", "Пример", "не то", "пример-2"),
@@ -468,7 +533,7 @@ fn human_mode_explains_statuses_and_the_missing_request() {
 #[test]
 fn review_check_rejects_the_edit_style_flag_and_names_its_own() {
     let temp = TempDir::new("review-check-alias");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     let path = write_proposals(&temp, "p.json", &request);
 
@@ -506,7 +571,7 @@ fn review_check_rejects_the_edit_style_flag_and_names_its_own() {
 #[test]
 fn proposal_metadata_is_reported_but_never_enters_the_request() {
     let temp = TempDir::new("review-check-metadata");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let mut document = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     document["proposals"][0]["reason"] = json!("в колоде пустой пример");
     let path = write_proposals(&temp, "p.json", &document);
@@ -652,7 +717,7 @@ fn full_pipeline_applies_exactly_one_reviewed_change() {
 #[test]
 fn pipeline_stdout_can_be_piped_through_shell_redirection() {
     let temp = TempDir::new("pipeline-pipe");
-    temp.write_export(&proposals_export());
+    temp.write_canonical_deck_json(&proposals_export());
     let export = temp.path().to_string_lossy().to_string();
     let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     let path = write_proposals(&temp, "p.json", &request);
@@ -679,7 +744,7 @@ fn pipeline_stdout_can_be_piped_through_shell_redirection() {
 #[test]
 fn human_report_does_not_promise_a_full_list_in_json() {
     let temp = TempDir::new("review-check-human-truncated");
-    temp.write_export(&common::export_with(|value| {
+    temp.write_canonical_deck_json(&common::export_with(|value| {
         let template = value["notes"][0].clone();
         for index in 0..60 {
             let mut copy = template.clone();

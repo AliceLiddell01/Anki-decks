@@ -317,15 +317,18 @@ pub fn collect_notes<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
     }
 }
 
-/// Состав моделей из сырого JSON: `crowdanki_uuid` → (имя поля → `ord`).
-pub fn raw_models(value: &Value) -> BTreeMap<String, BTreeMap<String, i64>> {
-    fn walk(value: &Value, out: &mut BTreeMap<String, BTreeMap<String, i64>>) {
+/// Все модели экспорта в порядке `flds`: `(crowdanki_uuid, [(имя, ord)])`.
+///
+/// Порядок `flds` сохраняется: именно он задаёт порядок полей заметки, а не
+/// алфавит имён и не позиция значения в `fields`.
+pub fn raw_all_models(value: &Value) -> Vec<(String, Vec<(String, i64)>)> {
+    fn walk(value: &Value, out: &mut Vec<(String, Vec<(String, i64)>)>) {
         if let Some(models) = value.get("note_models").and_then(Value::as_array) {
             for model in models {
                 let Some(uuid) = model.get("crowdanki_uuid").and_then(Value::as_str) else {
                     continue;
                 };
-                let mut fields = BTreeMap::new();
+                let mut fields = Vec::new();
                 if let Some(flds) = model.get("flds").and_then(Value::as_array) {
                     for field in flds {
                         let name = field
@@ -333,10 +336,10 @@ pub fn raw_models(value: &Value) -> BTreeMap<String, BTreeMap<String, i64>> {
                             .and_then(Value::as_str)
                             .unwrap_or_default();
                         let ord = field.get("ord").and_then(Value::as_i64).unwrap_or_default();
-                        fields.insert(name.to_string(), ord);
+                        fields.push((name.to_string(), ord));
                     }
                 }
-                out.insert(uuid.to_string(), fields);
+                out.push((uuid.to_string(), fields));
             }
         }
         if let Some(children) = value.get("children").and_then(Value::as_array) {
@@ -346,9 +349,30 @@ pub fn raw_models(value: &Value) -> BTreeMap<String, BTreeMap<String, i64>> {
         }
     }
 
-    let mut models = BTreeMap::new();
+    let mut models = Vec::new();
     walk(value, &mut models);
     models
+}
+
+/// Состав моделей из сырого JSON: `crowdanki_uuid` → (имя поля → `ord`).
+pub fn raw_models(value: &Value) -> BTreeMap<String, BTreeMap<String, i64>> {
+    raw_all_models(value)
+        .into_iter()
+        .map(|(uuid, fields)| (uuid, fields.into_iter().collect()))
+        .collect()
+}
+
+/// Поля модели конкретной заметки в порядке `flds`: `(имя, ord)`.
+pub fn raw_note_model_fields(raw: &Value, note: &Value) -> Vec<(String, i64)> {
+    let uuid = note
+        .get("note_model_uuid")
+        .and_then(Value::as_str)
+        .expect("у заметки должен быть note_model_uuid");
+    raw_all_models(raw)
+        .into_iter()
+        .find(|(model_uuid, _)| model_uuid == uuid)
+        .unwrap_or_else(|| panic!("модель {uuid} не найдена в note_models"))
+        .1
 }
 
 /// Возвращает `ord` поля заметки так, как он задан её моделью в сыром JSON.
@@ -466,7 +490,11 @@ pub fn raw_qa_counts(value: &Value) -> BTreeMap<&'static str, usize> {
             if text.ends_with(char::is_whitespace) {
                 trailing += 1;
             }
-            spans += raw_white_spans(text);
+            // Правило срабатывает на значение поля, а не на каждое
+            // совпадение внутри него: один finding на пару (заметка, поле).
+            if has_white_span(text) {
+                spans += 1;
+            }
         }
     }
 
@@ -532,10 +560,12 @@ fn raw_primary_duplicate_groups(
 /// Упрощённый независимый скан: теги обходятся как текст, а `style`
 /// разбирается по `;` и `:`. Этого достаточно, чтобы пересчитать ожидаемое
 /// число findings правила `forbidden_white_span`, не вызывая сам toolkit.
-fn raw_white_spans(text: &str) -> usize {
+///
+/// Отвечает именно на вопрос правила — «есть ли в значении белый `<span>`», —
+/// потому что findings у этого правила по одному на пару (заметка, поле).
+fn has_white_span(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let mut rest = lower.as_str();
-    let mut found = 0;
 
     while let Some(start) = rest.find("<span") {
         let after = &rest[start..];
@@ -546,12 +576,12 @@ fn raw_white_spans(text: &str) -> usize {
         let Some(end) = after.find('>') else { break };
         let tag = &after[..=end];
         if is_tag && tag_declares_white_color(tag) {
-            found += 1;
+            return true;
         }
         rest = &after[end + 1..];
     }
 
-    found
+    false
 }
 
 /// Объявлен ли в теге `<span>` белый `color`.

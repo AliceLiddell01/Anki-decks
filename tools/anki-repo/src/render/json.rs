@@ -954,8 +954,17 @@ struct ReviewCheckDto<'a> {
     counts: CheckCountsDto,
     effective_proposals: usize,
     proposals_truncated: bool,
+    source_editable: bool,
+    source_blockers: Vec<SourceBlockerDto>,
     proposals: Vec<CheckedProposalDto<'a>>,
     edit_request: Option<EditRequestDto>,
+}
+
+/// Причина, по которой текущий исходник нельзя править.
+#[derive(Serialize)]
+struct SourceBlockerDto {
+    code: &'static str,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -1019,6 +1028,15 @@ impl<'a> From<&'a ReviewCheckResult> for ReviewCheckDto<'a> {
             },
             effective_proposals: result.effective_proposals,
             proposals_truncated: result.proposals_truncated,
+            source_editable: result.source_editable,
+            source_blockers: result
+                .source_blockers
+                .iter()
+                .map(|blocker| SourceBlockerDto {
+                    code: blocker.code,
+                    message: blocker.message.clone(),
+                })
+                .collect(),
             proposals: result
                 .proposals
                 .iter()

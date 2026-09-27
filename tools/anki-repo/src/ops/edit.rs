@@ -452,18 +452,14 @@ pub fn edit(
 ) -> Result<EditResult, DomainError> {
     validate_request(request)?;
 
-    let (deck_json, source) = loader::read_deck_json_bytes(export_dir)?;
-    let mut value = loader::parse_deck_json_bytes(&source, &deck_json)?;
-    let source_root = loader::typed_root(
-        loader::parse_deck_json_bytes(&source, &deck_json)?,
-        &deck_json,
-    )?;
+    let EditableSource {
+        deck_json,
+        source,
+        mut value,
+        root: source_root,
+        before,
+    } = load_editable_source(export_dir)?;
     let index = ExportIndex::build(&source_root);
-
-    ensure_source_is_canonical(&value, &source, &deck_json)?;
-
-    let before = validate::validate_document(&source_root, export_dir);
-    ensure_mutable(&before, &deck_json)?;
 
     let value_notes = collect_value_notes(&value)?;
     ensure_note_correspondence(&index, &value_notes)?;
@@ -1007,6 +1003,84 @@ fn conflicts_error(conflicts: &[EditConflict], total: usize, deck_json: &Path) -
     )
 }
 
+/// Разобранный исходник без предварительных проверок границы записи.
+///
+/// Один и тот же набор проверок нужен двум командам: `edit` пишет по этому
+/// исходнику, а `review-check` обещает агенту запрос, который граница записи
+/// обязана принять. Держать эти проверки в одном месте — единственный способ
+/// не разойтись в том, какой экспорт вообще можно править.
+pub(crate) struct EditableSource {
+    /// Полный путь к `deck.json`.
+    pub deck_json: PathBuf,
+    /// Сырые байты `deck.json`: каноничность проверяется побайтово.
+    pub source: Vec<u8>,
+    /// Разобранное значение: `edit` меняет именно его.
+    pub value: Value,
+    /// Типизированный корень того же файла.
+    pub root: crate::model::DeckNode,
+    /// Проверки экспорта до правки: `edit` сравнивает с ними результат.
+    pub before: ValidateResult,
+}
+
+/// Читает и разбирает `deck.json` без оценки права на запись.
+///
+/// # Errors
+///
+/// Возвращает ошибки чтения и разбора [`loader::read_deck_json_bytes`] и
+/// [`loader::parse_deck_json_bytes`].
+pub(crate) fn read_source(export_dir: &Path) -> Result<EditableSource, DomainError> {
+    let (deck_json, source) = loader::read_deck_json_bytes(export_dir)?;
+    let value = loader::parse_deck_json_bytes(&source, &deck_json)?;
+    let root = loader::typed_root(
+        loader::parse_deck_json_bytes(&source, &deck_json)?,
+        &deck_json,
+    )?;
+    let before = validate::validate_document(&root, export_dir);
+
+    Ok(EditableSource {
+        deck_json,
+        source,
+        value,
+        root,
+        before,
+    })
+}
+
+/// Собирает причины, по которым этот исходник нельзя править.
+///
+/// Проверки ровно те же, на которых `edit` останавливается до классификации
+/// правок. `edit` берёт первую причину и отказывается работать;
+/// `review-check` называет их все, потому что его отчёт обязан объяснить, из-за
+/// чего запрос не выпущен. Порядок причин фиксирован: каноническая форма,
+/// `ERROR` экспорта, неоднозначный порядок полей модели.
+#[must_use]
+pub(crate) fn source_blockers(source: &EditableSource) -> Vec<DomainError> {
+    let mut blockers = Vec::new();
+
+    if let Err(error) = ensure_source_is_canonical(&source.value, &source.source, &source.deck_json)
+    {
+        blockers.push(error);
+    }
+    blockers.extend(mutable_blockers(&source.before, &source.deck_json));
+
+    blockers
+}
+
+/// Читает `deck.json` и требует, чтобы исходник можно было править.
+///
+/// # Errors
+///
+/// Возвращает ошибки чтения и разбора [`read_source`], а также первую из
+/// [`source_blockers`].
+pub(crate) fn load_editable_source(export_dir: &Path) -> Result<EditableSource, DomainError> {
+    let source = read_source(export_dir)?;
+
+    match source_blockers(&source).into_iter().next() {
+        Some(blocker) => Err(blocker),
+        None => Ok(source),
+    }
+}
+
 /// Отклоняет исходник, который не в канонической форме.
 fn ensure_source_is_canonical(
     value: &Value,
@@ -1034,11 +1108,15 @@ fn ensure_source_is_canonical(
     ))
 }
 
-/// Отклоняет экспорт, который нельзя безопасно править.
-fn ensure_mutable(before: &ValidateResult, deck_json: &Path) -> Result<(), DomainError> {
+/// Причины, по которым экспорт нельзя безопасно править.
+///
+/// Возвращает `ERROR`-экспорт и неоднозначный порядок полей модели в
+/// фиксированном порядке: сначала непригодный экспорт, затем небезопасный.
+fn mutable_blockers(before: &ValidateResult, deck_json: &Path) -> Vec<DomainError> {
+    let mut blockers = Vec::new();
     let errors: Vec<&str> = distinct_codes(before, Severity::Error);
     if !errors.is_empty() {
-        return Err(DomainError::with_details(
+        blockers.push(DomainError::with_details(
             ErrorCode::ExportInvalid,
             format!(
                 "экспорт содержит ERROR ({}); правка значений полей возможна только в валидном экспорте",
@@ -1059,7 +1137,7 @@ fn ensure_mutable(before: &ValidateResult, deck_json: &Path) -> Result<(), Domai
         .iter()
         .any(|issue| issue.severity == Severity::Warning && issue.code == blocked)
     {
-        return Err(DomainError::with_details(
+        blockers.push(DomainError::with_details(
             ErrorCode::ExportNotMutable,
             format!(
                 "экспорт содержит WARNING {blocked}: порядок полей неоднозначен, правка по имени поля небезопасна"
@@ -1072,7 +1150,7 @@ fn ensure_mutable(before: &ValidateResult, deck_json: &Path) -> Result<(), Domai
         ));
     }
 
-    Ok(())
+    blockers
 }
 
 /// Уникальные коды issues указанной серьёзности.

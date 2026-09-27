@@ -25,9 +25,17 @@
 //!   `replacement`: оптимистичное предусловие нарушено;
 //! - `invalid` — предложение не удалось разрешить в этом экспорте.
 //!
-//! `edit_request` выпускается только при `outcome = "ok"` и только из `valid`
-//! предложений: `expected` в нём равен фактическому текущему значению, поэтому
-//! запрос гарантированно принимается `edit` при неизменном источнике.
+//! `edit_request` выпускается только при `outcome = "ok"`, только из `valid`
+//! предложений и только тогда, когда сам исходник проходит предварительные
+//! проверки границы записи (`source_editable`). `expected` в нём равен
+//! фактическому текущему значению, поэтому такой запрос гарантированно
+//! принимается `edit` при неизменном источнике.
+//!
+//! Если исходник нельзя править (неканоническая форма, `ERROR` экспорта или
+//! неоднозначный порядок полей модели), отчёт по предложениям всё равно
+//! печатается: он остаётся полезным агенту, а `source_blockers` называет
+//! причины, по которым запрос не выпущен. Проверки берутся у `edit`
+//! ([`crate::ops::edit::source_blockers`]), а не повторяются здесь.
 
 use std::path::Path;
 
@@ -150,6 +158,15 @@ pub struct CheckedProposal {
     pub message: Option<String>,
 }
 
+/// Причина, по которой по текущему исходнику нельзя выпустить запрос.
+#[derive(Debug)]
+pub struct SourceBlocker {
+    /// Стабильный код ошибки границы записи (`source_not_canonical` и т.п.).
+    pub code: &'static str,
+    /// Пояснение из той же ошибки, ограниченное по длине.
+    pub message: String,
+}
+
 /// Результат `review-check`.
 #[derive(Debug)]
 pub struct ReviewCheckResult {
@@ -169,13 +186,24 @@ pub struct ReviewCheckResult {
     pub proposals: Vec<CheckedProposal>,
     /// Был ли отчёт по предложениям обрезан.
     pub proposals_truncated: bool,
-    /// Готовый запрос для Stage 2, если отчёт чистый и есть эффективные правки.
+    /// Проходит ли исходник предварительные проверки границы записи.
+    pub source_editable: bool,
+    /// Почему исходник нельзя править (пусто, если можно).
+    pub source_blockers: Vec<SourceBlocker>,
+    /// Готовый запрос для Stage 2: чистый отчёт, эффективные правки и
+    /// правимый исходник.
     pub edit_request: Option<EditRequest>,
-    /// Process exit code, соответствующий итогу.
+    /// Process exit code: причина блокировки исходника важнее итога по
+    /// предложениям, потому что без правки исходника запрос неисполним.
     pub exit_code: u8,
 }
 
 /// Проверяет документ предложений против текущего состояния экспорта.
+///
+/// `source_blockers` — причины, по которым исходник нельзя править; их считает
+/// общая с `edit` проверка ([`crate::ops::edit::source_blockers`]). Они не
+/// отменяют отчёт: агент видит и статусы предложений, и то, что запрос пока
+/// неисполним.
 ///
 /// # Errors
 ///
@@ -186,6 +214,7 @@ pub fn review_check(
     export_dir: &Path,
     index: &ExportIndex<'_>,
     document: &ProposalDocument,
+    source_blockers: &[DomainError],
 ) -> Result<ReviewCheckResult, DomainError> {
     // Документ проверяется ещё раз, а не только при разборе: функция публична, и
     // её контракт не должен зависеть от того, что документ пришёл из
@@ -245,15 +274,28 @@ pub fn review_check(
         ReviewOutcome::Ok
     };
 
-    let exit_code = match outcome {
+    let outcome_exit_code = match outcome {
         ReviewOutcome::Ok => 0,
         ReviewOutcome::Stale => 7,
         ReviewOutcome::Invalid if saw_ambiguous => 5,
         ReviewOutcome::Invalid if saw_not_found => 4,
         ReviewOutcome::Invalid => 3,
     };
+    // Неправимый исходник делает неисполнимым любой запрос, поэтому его код
+    // важнее итога по предложениям: агент не должен принять «ok» за готовность
+    // к записи.
+    let exit_code = source_blockers
+        .first()
+        .map_or(outcome_exit_code, |blocker| blocker.code.exit_code());
 
-    let edit_request = build_edit_request(outcome, &effective)?;
+    let edit_request = build_edit_request(outcome, &effective, source_blockers)?;
+    let blockers: Vec<SourceBlocker> = source_blockers
+        .iter()
+        .map(|blocker| SourceBlocker {
+            code: blocker.code.as_str(),
+            message: bounded_sample(&blocker.message),
+        })
+        .collect();
 
     Ok(ReviewCheckResult {
         export_dir: export_dir.display().to_string(),
@@ -264,6 +306,8 @@ pub fn review_check(
         effective_proposals: effective.len(),
         proposals_truncated: document.proposals.len() > proposals.len(),
         proposals,
+        source_editable: blockers.is_empty(),
+        source_blockers: blockers,
         edit_request,
         exit_code,
     })
@@ -278,8 +322,9 @@ pub fn review_check(
 fn build_edit_request(
     outcome: ReviewOutcome,
     effective: &[EditSpec],
+    source_blockers: &[DomainError],
 ) -> Result<Option<EditRequest>, DomainError> {
-    if outcome != ReviewOutcome::Ok || effective.is_empty() {
+    if outcome != ReviewOutcome::Ok || effective.is_empty() || !source_blockers.is_empty() {
         return Ok(None);
     }
 
@@ -403,13 +448,53 @@ mod tests {
     fn check(json: &str, request: &ProposalDocument) -> ReviewCheckResult {
         let node = deck_node(json);
         let index = ExportIndex::build(&node);
-        review_check(Path::new("."), &index, request).expect("review-check")
+        review_check(Path::new("."), &index, request, &[]).expect("review-check")
     }
 
     fn check_error(json: &str, request: &ProposalDocument) -> DomainError {
         let node = deck_node(json);
         let index = ExportIndex::build(&node);
-        review_check(Path::new("."), &index, request).expect_err("ожидалась ошибка")
+        review_check(Path::new("."), &index, request, &[]).expect_err("ожидалась ошибка")
+    }
+
+    /// Блокер исходника из той же ошибки, что вернула бы граница записи.
+    fn source_blocker(code: ErrorCode) -> DomainError {
+        DomainError::new(code, "исходник нельзя править")
+    }
+
+    #[test]
+    fn uneditable_source_blocks_the_request_but_keeps_the_report() {
+        let node = deck_node(MINIMAL_EXPORT);
+        let index = ExportIndex::build(&node);
+        let document = request(vec![("guid-1", "Значение", "случайность", "случайно")]);
+        let blockers = vec![
+            source_blocker(ErrorCode::SourceNotCanonical),
+            source_blocker(ErrorCode::ExportInvalid),
+        ];
+
+        let result = review_check(Path::new("."), &index, &document, &blockers)
+            .expect("отчёт всё равно строится");
+
+        assert_eq!(result.counts.valid, 1, "статус предложения не теряется");
+        assert_eq!(result.outcome, ReviewOutcome::Ok);
+        assert!(!result.source_editable);
+        assert_eq!(
+            result
+                .source_blockers
+                .iter()
+                .map(|blocker| blocker.code)
+                .collect::<Vec<_>>(),
+            vec!["source_not_canonical", "export_invalid"]
+        );
+        assert!(
+            result.edit_request.is_none(),
+            "неправимый исходник не даёт запроса"
+        );
+        assert_eq!(
+            result.exit_code,
+            ErrorCode::SourceNotCanonical.exit_code(),
+            "код блокировки важнее итога по предложениям"
+        );
     }
 
     #[test]
@@ -628,9 +713,11 @@ mod tests {
         .as_bytes();
         let parsed = crate::proposal::parse_proposal_bytes(raw, "тест").expect("разбор документа");
 
-        let loaded = loader::load_export(&export).expect("загрузка экспорта");
-        let index = ExportIndex::build(&loaded.root);
-        let result = review_check(&export, &index, &parsed).expect("проверка");
+        let source = edit::read_source(&export).expect("загрузка экспорта");
+        let blockers = edit::source_blockers(&source);
+        assert!(blockers.is_empty(), "фикстура должна быть правимой");
+        let index = ExportIndex::build(&source.root);
+        let result = review_check(&export, &index, &parsed, &blockers).expect("проверка");
         let emitted = result.edit_request.expect("запрос");
 
         let dry_run = edit::edit(&export, &emitted, false).expect("dry-run Stage 2");

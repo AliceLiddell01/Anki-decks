@@ -13,7 +13,7 @@ mod common;
 
 use common::{
     QA_CODES, TempDir, collect_notes, export_with, parse_json, raw_field_position, raw_json,
-    raw_models, raw_qa_counts, run_cli, words_deck,
+    raw_models, raw_note_model_fields, raw_qa_counts, run_cli, words_deck,
 };
 use serde_json::{Value, json};
 
@@ -394,23 +394,43 @@ fn assert_finding_matches_raw(raw: &Value, finding: &Value, level: u8) {
 #[test]
 fn empty_field_findings_point_at_a_real_empty_value() {
     let export = words_deck(1);
-    let (code, parsed) = qa_json(&export.to_string_lossy(), &["--code", "empty_field_value"]);
+    let raw = raw_json(1);
+    let mut notes = Vec::new();
+    collect_notes(&raw, &mut notes);
+    let expected = raw_qa_counts(&raw)["empty_field_value"];
+
+    let (code, parsed) = qa_json(
+        &export.to_string_lossy(),
+        &["--code", "empty_field_value", "--max-per-code", "200"],
+    );
     assert_eq!(code, 0);
 
     let findings = parsed["result"]["findings"].as_array().expect("findings");
-    assert!(!findings.is_empty(), "в N1 есть пустые «Ударение»");
+    assert_eq!(findings.len(), expected, "показаны все findings правила");
+    assert_eq!(
+        parsed["result"]["truncated"], false,
+        "предел выше числа findings"
+    );
 
-    // Проверяем адрес каждого показанного finding прямо по сырому deck.json.
-    let text = std::fs::read_to_string(export.join("deck.json")).expect("deck.json");
-    let raw: Value = serde_json::from_str(&text).expect("JSON");
-    let notes = raw["notes"].as_array().expect("notes");
+    // Адрес каждого finding разрешается по сырому deck.json: заметка берётся из
+    // preorder-обхода (а не из корневого массива), а имя поля — из модели этой
+    // заметки, а не из исторического содержимого колоды.
     for finding in findings {
-        let index = finding["note_index"].as_u64().expect("note_index") as usize;
-        let ord = finding["field_ord"].as_u64().expect("field_ord") as usize;
-        assert_eq!(finding["field"], "Ударение");
+        let index =
+            usize::try_from(finding["note_index"].as_u64().expect("note_index")).expect("usize");
+        let ord =
+            usize::try_from(finding["field_ord"].as_u64().expect("field_ord")).expect("usize");
+        let note = &notes[index];
+        let (name, declared_ord) = raw_note_model_fields(&raw, note)
+            .into_iter()
+            .find(|(_, model_ord)| usize::try_from(*model_ord).ok() == Some(ord))
+            .expect("поле модели с таким ord");
+
+        assert_eq!(finding["field"], name, "finding называет поле модели");
+        assert_eq!(declared_ord, i64::try_from(ord).expect("i64"));
         assert_eq!(finding["severity"], "warning");
         assert_eq!(
-            notes[index]["fields"][ord], "",
+            note["fields"][ord], "",
             "finding должен указывать на пустое значение"
         );
         assert_eq!(finding["evidence"]["value_chars"], 0);

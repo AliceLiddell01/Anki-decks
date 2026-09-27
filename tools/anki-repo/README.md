@@ -362,12 +362,27 @@ anki-repo validate decks/japanese/words/Words__N1
 | `stale` | есть хотя бы один `conflict`: представление агента устарело | `7` |
 | `invalid` | есть хотя бы один `invalid`; при неоднозначном `guid` — `5`, иначе при отсутствующей заметке — `4`, иначе `3` | `5` / `4` / `3` |
 
-`edit_request` присутствует только при `outcome: ok` и хотя бы одном `valid`
-предложении: пустой `edits` нарушил бы контракт `edit`, а запрос, собранный из
-частично неверного документа, был бы молчаливой правкой «чего получилось».
-`expected` в выпущенном запросе переносится из предложения агента, и это
-безопасно: статус `valid` получают только предложения, чей `expected` уже совпал с
-фактическим текущим значением.
+`edit_request` присутствует только при `outcome: ok`, хотя бы одном `valid`
+предложении и правимом исходнике (`source_editable: true`): пустой `edits`
+нарушил бы контракт `edit`, а запрос, собранный из частично неверного документа,
+был бы молчаливой правкой «чего получилось». `expected` в выпущенном запросе
+переносится из предложения агента, и это безопасно: статус `valid` получают
+только предложения, чей `expected` уже совпал с фактическим текущим значением.
+
+Поэтому `review-check` проверяет ещё и сам исходник — ровно теми же условиями,
+на которых останавливается `edit` (общая функция, а не вторая реализация):
+
+| Блокер | Код в `source_blockers` | Exit |
+|---|---|---|
+| `deck.json` не в канонической форме | `source_not_canonical` | `3` |
+| в экспорте есть `ERROR` | `export_invalid` | `6` |
+| неоднозначный порядок полей модели (`WARNING conflicting_note_model_definition`) | `export_not_mutable` | `6` |
+
+Отчёт по предложениям в этом случае всё равно печатается: статусы, счётчики и
+`proposals` остаются полезными агенту, а `source_editable: false` и
+`source_blockers` объясняют, почему запрос не выпущен. Код возврата при этом
+называет причину блокировки — неправимый исходник делает неисполнимым любой
+запрос, и принимать такой `ok` за готовность к записи нельзя.
 
 `stale` и `invalid` — это результат проверки, а не отказ команды, поэтому и в
 обычном, и в JSON-режиме отчёт формируется полностью (в JSON он лежит в
@@ -420,7 +435,7 @@ anki-repo validate "$EXPORT"
 |---|---|
 | `qa` | `export_dir`, `notes_total`, `findings_total`, `findings_returned`, `unaddressable_findings`, `truncated`, `max_per_code`, `codes`, `by_code`, `rules`, `findings` |
 | `review` | `export_dir`, `selection`, `notes_total`, `total_selected`, `excluded_unaddressable`, `offset`, `limit`, `returned`, `truncated`, `next_offset`, `items` |
-| `review-check` | `export_dir`, `deck_json`, `outcome`, `proposals_total`, `counts`, `effective_proposals`, `proposals_truncated`, `proposals`, `edit_request` |
+| `review-check` | `export_dir`, `deck_json`, `outcome`, `proposals_total`, `counts`, `effective_proposals`, `proposals_truncated`, `source_editable`, `source_blockers`, `proposals`, `edit_request` |
 
 В `items` команды `review` поля заметки лежат в `fields` — объекте в порядке `ord`
 модели, как и в `find`. В `findings` команды `qa` поле `field_ord` равно `null`
@@ -666,10 +681,10 @@ tool, поэтому завершается кодом `internal_error` (70) б�
 | `0` | Успех |
 | `1` | Зарезервировано |
 | `2` | Ошибка использования CLI (неизвестный аргумент, несовместимая комбинация, значение вне диапазона) |
-| `3` | Неверный ввод, из-за которого команда не может начать работу: нет каталога, передан не каталог, нет `deck.json`, `deck.json` не читается; для `inspect`, `find`, `stats` и `edit` — также невалидный JSON (`invalid_json`), корень не `Deck` (`root_not_deck`) или несоответствие типизированному ядру (`schema_invalid`); для `find`, `review` и `qa` — ещё и неизвестное поле, колода или код QA в критерии, а для `review-check` — неразбираемый документ предложений |
+| `3` | Неверный ввод, из-за которого команда не может начать работу: нет каталога, передан не каталог, нет `deck.json`, `deck.json` не читается; для `inspect`, `find`, `stats` и `edit` — также невалидный JSON (`invalid_json`), корень не `Deck` (`root_not_deck`) или несоответствие типизированному ядру (`schema_invalid`); для `find`, `review` и `qa` — ещё и неизвестное поле, колода или код QA в критерии, а для `review-check` — неразбираемый документ предложений или неканонический `deck.json` (`source_not_canonical`) |
 | `4` | Совпадений не найдено: `find` не нашёл ни одной заметки по заданному критерию, `review --guid` не нашёл заметку с запрошенным `guid`, либо `edit` не нашёл такую заметку (`note_not_found`); для `review-check` — так же, если хотя бы одно предложение ссылается на несуществующую заметку и ни одно на неоднозначный `guid` |
 | `5` | `find --guid` или `review --guid` нашёл несколько заметок с одним `guid`; для `review-check` — если среди `invalid`-предложений есть хотя бы одно с неоднозначным `guid` |
-| `6` | `validate` нашёл хотя бы один `ERROR` issue, в том числе `invalid_json`, `root_not_deck` или `schema_invalid`; `edit` отказался править экспорт с `ERROR` или с неоднозначным определением модели. Повтор `guid` (`duplicate_note_guid`) — это `ERROR`, поэтому `edit` на таком экспорте завершается кодом `6`, а не `5`: проверка валидности исходника идёт раньше разрешения правки |
+| `6` | `validate` нашёл хотя бы один `ERROR` issue, в том числе `invalid_json`, `root_not_deck` или `schema_invalid`; `edit` отказался править экспорт с `ERROR` или с неоднозначным определением модели. Повтор `guid` (`duplicate_note_guid`) — это `ERROR`, поэтому `edit` на таком экспорте завершается кодом `6`, а не `5`: проверка валидности исходника идёт раньше разрешения правки. `review-check` называет тот же блокер (`export_invalid` / `export_not_mutable`) и возвращает `6` вместо итогового кода отчёта — запрос он не выпускает |
 | `7` | `edit` обнаружил конфликт предусловия: текущее значение поля не совпало с `expected` (`expected_mismatch`) либо `deck.json` изменился между проверкой и заменой файла (`source_changed`); `review-check` обнаружил хотя бы одно предложение со статусом `conflict` (`stale`) |
 | `8` | `edit` не смог заменить `deck.json`: отказ файловой системы при записи кандидата |
 | `70` | Неожиданная внутренняя ошибка, включая нарушение внутреннего инварианта правки и отказ записи вывода (нет места на диске, негодный дескриптор) |
@@ -696,15 +711,15 @@ exit code.
 | `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id` или чужая `schema_version`; `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large` или `duplicate_proposal_id` |
 | `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды |
 | `proposal_not_executable` (`details.reason`) | — | Не отдельный код: `review-check` сообщает о неисполнимом предложении статусом `invalid` внутри отчёта, а не ошибкой команды |
-| `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме |
-| `export_invalid` | 6 | `edit`: в исходном экспорте есть `ERROR` (в том числе `duplicate_note_guid` — повтор `guid` делает адресацию правки неоднозначной); либо кандидат правки получил новый `ERROR` (проверка до записи) |
-| `export_not_mutable` | 6 | `edit`: в экспорте есть `conflicting_note_model_definition` |
+| `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме; `review-check`: тот же блокер в `source_blockers`, запрос не выпущен |
+| `export_invalid` | 6 | `edit`: в исходном экспорте есть `ERROR` (в том числе `duplicate_note_guid` — повтор `guid` делает адресацию правки неоднозначной); либо кандидат правки получил новый `ERROR` (проверка до записи). `review-check` называет этот блокер в `source_blockers` и возвращает `6` вместо итогового кода отчёта |
+| `export_not_mutable` | 6 | `edit`: в экспорте есть `conflicting_note_model_definition`; `review-check` — тот же блокер в `source_blockers` |
 | `expected_mismatch` | 7 | `edit`: текущее значение не совпало с `expected` |
 | `source_changed` | 7 | `edit`: `deck.json` изменился (или исчез) между чтением исходника и заменой файла; правка отменена, файл не тронут |
 | `write_failed` | 8 | `edit`: не удалось записать кандидат или заменить `deck.json` |
 | `not_found` | 4 | `find` и `review --guid`: нет совпадений по заданному критерию |
 | `note_not_found` | 4 | `edit`: в экспорте нет заметки с указанным `guid`; в отчёте `review-check` — код проблемы предложения (доменной ошибкой не является) |
-| `ambiguous` | 5 | `find --guid` и `review --guid`: `guid` не разрешается однозначно. Для `edit` эта ветка недостижима: повтор `guid` отсекается раньше как `export_invalid` (6) |
+| `ambiguous` | 5 | `find --guid` и `review --guid`: `guid` не разрешается однозначно. Для `edit` и `review-check` эта ветка недостижима как *код возврата*: повтор `guid` отсекается раньше как `export_invalid` (6), а в отчёте `review-check` он остаётся статусом предложения `invalid`/`ambiguous_guid` |
 | `internal_error` | 70 | Внутренняя ошибка, включая нарушение байтового инварианта правки |
 
 ## Детерминированность
@@ -756,6 +771,12 @@ exit code.
 - `review-check` проверяет предложение против текущего состояния экспорта, но не
   резервирует его: между проверкой и `edit --apply` содержимое может измениться, и
   тогда конфликт предусловия поймает уже `edit`.
+- Неразрешимая цель предложения (`field_not_resolvable`, `ambiguous_guid`) на
+  реальном пути почти недостижима: нестроковое значение поля, отсутствие поля и
+  повтор `guid` — это уже `ERROR` уровня `validate`, поэтому такой экспорт
+  блокирует запрос раньше классификации (`export_invalid`). Проверка остаётся в
+  коде как честная классификация для исходника, который прошёл предпроверку, и
+  покрыта контрактными тестами.
 - Уровни и коды правил QA не настраиваются: реестр правил фиксирован и расширяется
   только кодом, вместе с тестами.
 

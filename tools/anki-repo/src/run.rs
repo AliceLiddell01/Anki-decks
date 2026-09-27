@@ -215,9 +215,14 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             )?;
             let document = proposal::parse_proposal_bytes(&raw, &label)?;
 
-            let loaded = load_export(export_dir)?;
-            let index = ExportIndex::build(&loaded.root);
-            let result = review_check_op::review_check(&loaded.export_dir, &index, &document)?;
+            // Тот же набор проверок исходника, что и в мутирующем `edit`:
+            // запрос выпускается только там, где граница записи приняла бы этот
+            // экспорт. Иначе `review-check` обещал бы запрос, который `edit`
+            // отклонит из-за неканонического или невалидного источника.
+            let source = edit_op::read_source(export_dir)?;
+            let blockers = edit_op::source_blockers(&source);
+            let index = ExportIndex::build(&source.root);
+            let result = review_check_op::review_check(export_dir, &index, &document, &blockers)?;
             Ok(Rendered {
                 command: "review-check",
                 stdout: if cli.json {

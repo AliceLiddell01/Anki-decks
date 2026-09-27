@@ -3,7 +3,8 @@
 mod common;
 
 use common::{
-    TempDir, collect_notes, export_with, parse_json, raw_json, raw_qa_counts, run_cli, words_deck,
+    TempDir, collect_notes, export_with, parse_json, raw_json, raw_note_model_fields, run_cli,
+    words_deck,
 };
 use serde_json::{Value, json};
 
@@ -314,7 +315,9 @@ fn canonical_deck_review_is_bounded_per_note() {
     let raw = raw_json(3);
     let mut notes = Vec::new();
     collect_notes(&raw, &mut notes);
-    let expected_selected = raw_qa_counts(&raw)["empty_field_value"];
+    // `review` выбирает заметки, а не findings: заметка с двумя пустыми полями
+    // даёт два finding и один item. Поэтому ожидание считается по заметкам.
+    let expected_selected = count_notes_with_empty_field(&raw);
 
     let (code, parsed) = review_json(
         &export.to_string_lossy(),
@@ -331,10 +334,13 @@ fn canonical_deck_review_is_bounded_per_note() {
 
     let item = &result["items"][0];
     let fields = item["fields"].as_object().expect("fields");
+    let note_index =
+        usize::try_from(item["note_index"].as_u64().expect("note_index")).expect("usize");
+    let model_fields = model_field_names(&raw, notes[note_index]);
     assert_eq!(
         fields.len(),
-        6,
-        "batch несёт только именованные поля заметки"
+        model_fields.len(),
+        "batch несёт ровно именованные поля модели этой заметки"
     );
     assert!(
         item["qa_findings"]
@@ -344,10 +350,62 @@ fn canonical_deck_review_is_bounded_per_note() {
             .any(|finding| finding["code"] == "empty_field_value"),
         "item обязан нести finding, по которому выбран"
     );
-    assert_eq!(
-        fields["Ударение"], "",
+    // Значение поля берётся из сырого deck.json по тому же адресу, а не
+    // сравнивается с историческим содержимым колоды.
+    let raw_fields = notes[note_index]["fields"]
+        .as_array()
+        .expect("fields заметки");
+    let empty: Vec<&String> = model_fields
+        .iter()
+        .filter(|(_, ord)| {
+            raw_fields
+                .get(*ord)
+                .and_then(Value::as_str)
+                .is_some_and(str::is_empty)
+        })
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        !empty.is_empty(),
         "выбранная заметка действительно содержит пустое поле"
     );
+    for name in empty {
+        assert_eq!(fields[name], "", "пустое поле перенесено в batch");
+    }
+}
+
+/// Сколько заметок экспорта имеют хотя бы одно пустое значение поля.
+fn count_notes_with_empty_field(raw: &Value) -> usize {
+    let mut notes = Vec::new();
+    collect_notes(raw, &mut notes);
+    notes
+        .iter()
+        .filter(|note| {
+            model_field_ords(raw, note).iter().any(|ord| {
+                note["fields"]
+                    .as_array()
+                    .and_then(|fields| fields.get(*ord))
+                    .and_then(Value::as_str)
+                    .is_some_and(str::is_empty)
+            })
+        })
+        .count()
+}
+
+/// Имена и позиции значений полей заметки в порядке модели.
+fn model_field_names(raw: &Value, note: &Value) -> Vec<(String, usize)> {
+    raw_note_model_fields(raw, note)
+        .into_iter()
+        .filter_map(|(name, ord)| Some((name, usize::try_from(ord).ok()?)))
+        .collect()
+}
+
+/// `ord` полей модели заметки (в порядке `flds`).
+fn model_field_ords(raw: &Value, note: &Value) -> Vec<usize> {
+    model_field_names(raw, note)
+        .into_iter()
+        .map(|(_, ord)| ord)
+        .collect()
 }
 
 /// Экспорт с одной группой из трёх одинаковых заметок и одной уникальной.

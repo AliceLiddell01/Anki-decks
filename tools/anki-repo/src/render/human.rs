@@ -792,6 +792,11 @@ pub fn review(result: &ReviewResult) -> String {
 
 /// Печатает результат `review-check`.
 pub fn review_check(result: &ReviewCheckResult) -> String {
+    let blockers: Vec<&str> = result
+        .source_blockers
+        .iter()
+        .map(|blocker| blocker.code)
+        .collect();
     let mut out = Out::default();
 
     out.line(format!("Экспорт: {}", result.export_dir));
@@ -817,10 +822,22 @@ pub fn review_check(result: &ReviewCheckResult) -> String {
         "Готовый запрос для Stage 2: {}",
         match &result.edit_request {
             Some(request) => format!("да, правок {}", request.edits.len()),
+            None if !result.source_blockers.is_empty() => {
+                format!("нет: исходник нельзя править ({})", blockers.join(", "))
+            }
             None if result.outcome == ReviewOutcome::Ok => "нет: нечего применять".to_string(),
             None => "нет: отчёт не ok".to_string(),
         }
     ));
+    if !result.source_blockers.is_empty() {
+        out.line(format!(
+            "Исходник: править нельзя ({}); отчёт по предложениям всё равно показан ниже",
+            blockers.join(", ")
+        ));
+        for blocker in &result.source_blockers {
+            out.line(format!("  {} — {}", blocker.code, blocker.message));
+        }
+    }
 
     out.blank();
     out.line(format!("Предложения ({}):", result.proposals.len()));
