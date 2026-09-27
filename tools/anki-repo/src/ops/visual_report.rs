@@ -2028,6 +2028,71 @@ mod tests {
         );
     }
 
+    /// Колонки «было» и «стало» — это значения поля, а не одна и та же смесь
+    /// токенов: удалённый фрагмент принадлежит только состоянию «до».
+    #[test]
+    fn changed_note_diff_keeps_each_side_apart() {
+        let dir = TempDir::new("visual-report-diff-sides");
+        let before_dir = dir.path().join("before");
+        let after_dir = dir.path().join("after");
+        let out = dir.path().join("out");
+
+        // Токен «然» удалён из значения поля; остальное значение не менялось.
+        let after = export_with(MINIMAL_EXPORT, |value| {
+            let notes = value["notes"].as_array_mut().expect("notes");
+            notes[0]["fields"][0] = serde_json::json!("[sound:a.mp3]偶");
+        });
+
+        write_export(&before_dir, MINIMAL_EXPORT);
+        write_export(&after_dir, &after);
+
+        let result = report(&ReportRequest::new(&before_dir, &after_dir, &out)).expect("отчёт");
+        assert_eq!(result.counts.changed, 1);
+
+        let index = fs::read_to_string(&result.index_html).expect("index.html");
+        let (before_cell, after_cell) = diff_row(&index, "Заголовок");
+
+        assert_eq!(strip_markup(&before_cell), "[sound:a.mp3]偶然");
+        assert_eq!(strip_markup(&after_cell), "[sound:a.mp3]偶");
+        assert!(
+            before_cell.contains("report-token-del"),
+            "удалённый фрагмент помечен в колонке «было»"
+        );
+        assert!(
+            !after_cell.contains("report-token-del"),
+            "колонка «стало» не воспроизводит удалённый фрагмент"
+        );
+    }
+
+    /// Возвращает html двух колонок diff для указанного поля.
+    fn diff_row(index: &str, field: &str) -> (String, String) {
+        let marker = format!("<td>{field}</td>");
+        let start = index.find(&marker).expect("строка diff изменённого поля");
+        let rest = &index[start + marker.len()..];
+        let row = &rest[..rest.find("</tr>").expect("конец строки diff")];
+        let mut cells = row
+            .split("<td>")
+            .skip(1)
+            .map(|cell| cell[..cell.find("</td>").expect("закрытие ячейки")].to_string());
+        (
+            cells.next().expect("колонка «было»"),
+            cells.next().expect("колонка «стало»"),
+        )
+    }
+
+    /// Текст ячейки так, как его увидит читатель.
+    fn strip_markup(cell: &str) -> String {
+        let mut out = String::new();
+        let mut rest = cell;
+        while let Some(start) = rest.find('<') {
+            out.push_str(&rest[..start]);
+            let end = rest[start..].find('>').expect("закрытая скобка тега");
+            rest = &rest[start + end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     #[test]
     fn identical_states_produce_no_changes() {
         let dir = TempDir::new("visual-report-identical");

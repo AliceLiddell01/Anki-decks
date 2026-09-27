@@ -473,15 +473,21 @@ fn render_card(out: &mut String, card: &ReportCard) {
     out.push_str("</article>\n");
 }
 
-/// Рендерит фрагменты diff: для колонки «было» удалённые, для «стало» — добавленные.
+/// Рендерит фрагменты diff для одной колонки: «было» показывает общие и
+/// удалённые фрагменты, «стало» — общие и добавленные.
+///
+/// Колонка обязана читаться как фактическое значение поля, поэтому чужие для неё
+/// фрагменты не просто помечаются, а не выводятся вовсе: удалённый фрагмент в
+/// колонке «стало» означал бы, что текст, которого в новом значении нет, всё ещё
+/// там есть, — то есть противоположное тому, что изменилось.
 fn tokens_html(tokens: &[(DiffMark, String)], before_side: bool) -> String {
     let mut out = String::new();
     for (mark, text) in tokens {
         let class = match (mark, before_side) {
+            (DiffMark::Deleted, false) | (DiffMark::Inserted, true) => continue,
             (DiffMark::Equal, _) => "",
             (DiffMark::Deleted, true) => " class=\"report-token-del\"",
             (DiffMark::Inserted, false) => " class=\"report-token-ins\"",
-            _ => "",
         };
         let _ = write!(out, "<span{class}>{}</span>", escape_html(text));
     }
@@ -580,5 +586,47 @@ mod tests {
         assert!(!before.contains("report-token-ins"));
         assert!(after.contains("report-token-ins"));
         assert!(!after.contains("report-token-del"));
+    }
+
+    /// Колонки diff обязаны показывать свои значения, а не смесь обеих сторон:
+    /// удалённый токен не может появиться в колонке «стало», а добавленный — в
+    /// колонке «было». Маркировка классом этого не заменяет: текст колонки — это
+    /// и есть значение поля, и читатель отчёта сверяется именно с ним.
+    #[test]
+    fn diff_columns_reconstruct_their_own_side() {
+        let tokens = vec![
+            (DiffMark::Equal, "a".to_string()),
+            (DiffMark::Deleted, "b".to_string()),
+            (DiffMark::Inserted, "c".to_string()),
+            (DiffMark::Equal, "d".to_string()),
+        ];
+        assert_eq!(plain_text(&tokens_html(&tokens, true)), "abd");
+        assert_eq!(plain_text(&tokens_html(&tokens, false)), "acd");
+    }
+
+    /// Удаление — самый частый исход правки: колонка «стало» не должна
+    /// воспроизводить удалённый фрагмент.
+    #[test]
+    fn deleted_only_token_is_absent_from_the_after_column() {
+        let tokens = vec![
+            (DiffMark::Equal, "осталось".to_string()),
+            (DiffMark::Deleted, "удалено".to_string()),
+        ];
+        assert_eq!(plain_text(&tokens_html(&tokens, true)), "осталосьудалено");
+        assert_eq!(plain_text(&tokens_html(&tokens, false)), "осталось");
+    }
+
+    /// Склеивает текст колонки так, как его увидит читатель: разметка фрагментов
+    /// не должна добавлять или убирать содержимое.
+    fn plain_text(html: &str) -> String {
+        let mut out = String::new();
+        let mut rest = html;
+        while let Some(start) = rest.find('<') {
+            out.push_str(&rest[..start]);
+            let end = rest[start..].find('>').expect("закрытая скобка тега");
+            rest = &rest[start + end + 1..];
+        }
+        out.push_str(rest);
+        out
     }
 }
