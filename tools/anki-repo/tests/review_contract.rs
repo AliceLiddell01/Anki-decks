@@ -543,3 +543,65 @@ fn guid_lookup_of_an_unresolvable_note_reports_the_exclusion() {
         "пустая страница объяснена, а не молчалива"
     );
 }
+
+/// Обычные одиночные правила не расширяют выборку до чужих заметок.
+#[test]
+fn single_note_qa_code_does_not_pull_unrelated_notes() {
+    let temp = TempDir::new("review-single-code");
+    temp.write_export(&content_group_export());
+
+    let (code, parsed) = review_json(
+        &temp.path().to_string_lossy(),
+        &["--qa-code", "empty_field_value", "--limit", "10"],
+    );
+    assert_eq!(code, 0);
+    let result = &parsed["result"];
+    assert_eq!(
+        result["total_selected"], 1,
+        "группа дубликатов содержимого не относится к правилу пустого поля"
+    );
+    let item = &result["items"][0];
+    assert_eq!(item["guid"], "guid-2");
+    assert!(
+        item["group_membership"]
+            .as_array()
+            .expect("group_membership")
+            .is_empty(),
+        "у заметки вне группы нет group_membership"
+    );
+    assert!(
+        item["qa_findings"]
+            .as_array()
+            .expect("qa_findings")
+            .iter()
+            .all(|finding| finding["code"] == "empty_field_value"),
+        "в item попадают только findings, по которым он выбран"
+    );
+}
+
+/// Исключение неадресуемых заметок видно и в человеческом выводе.
+#[test]
+fn human_mode_explains_which_notes_were_excluded() {
+    let temp = TempDir::new("review-human-excluded");
+    temp.write_export(&export_with(|value| {
+        let notes = value["notes"].as_array_mut().expect("notes");
+        let mut no_guid = notes[0].clone();
+        no_guid["guid"] = json!(null);
+        notes.push(no_guid);
+    }));
+
+    let (code, stdout, stderr) = run_cli(&[
+        "review",
+        &temp.path().to_string_lossy(),
+        "--all",
+        "--limit",
+        "10",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for needle in ["Исключено неадресуемых заметок: 1", "guid"] {
+        assert!(
+            stdout.contains(needle),
+            "нет фрагмента {needle:?}\n{stdout}"
+        );
+    }
+}
