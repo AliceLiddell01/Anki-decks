@@ -8,7 +8,7 @@
 .
 ├── AGENTS.md
 ├── .agents/
-│   └── skills/              # будущие агентские skills
+│   └── skills/              # repository skills
 ├── .codex/
 │   └── context/             # долговременный контекст для работы с колодами
 ├── decks/
@@ -32,7 +32,9 @@
 
 `.codex/context/` содержит карту репозитория и краткую схему CrowdAnki JSON, чтобы агент не начинал каждую задачу с полного чтения многомегабайтного экспорта.
 
-`.agents/skills/` зарезервирован под будущие специализированные skills. На текущем этапе skills намеренно не добавляются.
+`.agents/skills/` содержит repository skills: по каталогу
+`.agents/skills/<name>/SKILL.md` на skill. Процедуру каждого workflow владеет сам
+skill, а не README.
 
 ## Инструменты
 

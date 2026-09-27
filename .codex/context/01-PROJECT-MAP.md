@@ -29,7 +29,8 @@ tools/
 - `decks/` — сами версионируемые колоды.
 - `decks/japanese/words/` — японская словарная колода.
 - `.codex/context/` — долговременные карты формата и рабочего процесса.
-- `.agents/skills/` — место для будущих специализированных skills; пока пусто.
+- `.agents/skills/` — repository skills, по каталогу на skill; процедуру владеет
+  сам skill, а не этот файл.
 - `tools/anki-repo/` — самостоятельный Rust package `anki-repo` для анализа
   экспорта и одной строго ограниченной правки его значений (`edit`); его контракт
   описан в `tools/anki-repo/README.md`.
