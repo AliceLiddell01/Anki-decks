@@ -2,7 +2,48 @@
 //!
 //! Компилируется только в test-режиме и не входит в публичный контракт.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::model::DeckNode;
+
+/// Временный каталог для unit tests, удаляемый вместе со значением.
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    /// Создаёт пустой временный каталог.
+    ///
+    /// # Panics
+    ///
+    /// Паникует, если каталог невозможно создать: это ошибка окружения.
+    #[must_use]
+    pub fn new(label: &str) -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "anki-repo-unit-{}-{label}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("временный каталог должен создаваться");
+        Self { path }
+    }
+
+    /// Путь каталога.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 /// Разбирает CrowdAnki JSON из строки.
 ///

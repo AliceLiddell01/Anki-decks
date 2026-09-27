@@ -8,10 +8,11 @@ use serde::ser::{SerializeMap, Serializer};
 
 use crate::error::DomainError;
 use crate::ops::NamedField;
+use crate::ops::edit::EditResult;
 use crate::ops::find::FindResult;
 use crate::ops::inspect::{InspectResult, InspectVerbose, ModelSummary};
 use crate::ops::stats::StatsResult;
-use crate::ops::validate::ValidateResult;
+use crate::ops::validate::{SeverityCounts, ValidateResult};
 
 /// Версия machine-readable контракта.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -110,6 +111,145 @@ pub fn stats_json(result: &StatsResult) -> String {
 /// JSON-представление результата `validate`.
 pub fn validate_json(result: &ValidateResult) -> String {
     to_json("validate", ValidateDto::from(result))
+}
+
+/// JSON-представление результата `edit`.
+pub fn edit_json(result: &EditResult) -> String {
+    to_json("edit", EditDto::from(result))
+}
+
+#[derive(Serialize)]
+struct EditDto {
+    export_dir: String,
+    deck_json: String,
+    dry_run: bool,
+    applied: bool,
+    source_bytes: usize,
+    candidate_bytes: usize,
+    byte_delta: i64,
+    changed_lines: usize,
+    first_changed_line: Option<usize>,
+    edits_total: usize,
+    effective_edits: usize,
+    summaries: EditSummariesDto,
+    outcomes: Vec<EditOutcomeDto>,
+    outcomes_truncated: bool,
+    validation: ValidationDeltaDto,
+    checks: EditChecksDto,
+}
+
+#[derive(Serialize)]
+struct EditSummariesDto {
+    applied: usize,
+    dry_run: usize,
+    noop_identical: usize,
+    already_applied: usize,
+}
+
+#[derive(Serialize)]
+struct EditOutcomeDto {
+    edit_index: usize,
+    edit_id: Option<String>,
+    guid: String,
+    field: String,
+    field_ord: usize,
+    note_index: usize,
+    deck_path: String,
+    status: &'static str,
+    old_len: usize,
+    new_len: usize,
+    old_sample: String,
+    new_sample: String,
+}
+
+#[derive(Serialize)]
+struct ValidationDeltaDto {
+    before: SeverityCountsDto,
+    after: SeverityCountsDto,
+    new_error_codes: Vec<String>,
+    new_warning_codes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SeverityCountsDto {
+    errors: usize,
+    warnings: usize,
+    info: usize,
+}
+
+#[derive(Serialize)]
+struct EditChecksDto {
+    source_canonical: bool,
+    candidate_reparsed: bool,
+    semantic_targets_verified: bool,
+    diff_shape_is_exactly_requested: bool,
+    byte_delta_matches_token_delta: bool,
+}
+
+impl From<&EditResult> for EditDto {
+    fn from(result: &EditResult) -> Self {
+        Self {
+            export_dir: result.export_dir.display().to_string(),
+            deck_json: result.deck_json.display().to_string(),
+            dry_run: result.dry_run,
+            applied: result.applied,
+            source_bytes: result.source_bytes,
+            candidate_bytes: result.candidate_bytes,
+            byte_delta: result.byte_delta,
+            changed_lines: result.changed_lines,
+            first_changed_line: result.first_changed_line,
+            edits_total: result.edits_total,
+            effective_edits: result.effective_edits,
+            summaries: EditSummariesDto {
+                applied: result.summaries.applied,
+                dry_run: result.summaries.dry_run,
+                noop_identical: result.summaries.noop_identical,
+                already_applied: result.summaries.already_applied,
+            },
+            outcomes: result
+                .outcomes
+                .iter()
+                .map(|outcome| EditOutcomeDto {
+                    edit_index: outcome.edit_index,
+                    edit_id: outcome.edit_id.clone(),
+                    guid: outcome.guid.clone(),
+                    field: outcome.field.clone(),
+                    field_ord: outcome.field_ord,
+                    note_index: outcome.note_index,
+                    deck_path: outcome.deck_path.clone(),
+                    status: outcome.status.as_str(),
+                    old_len: outcome.old_len,
+                    new_len: outcome.new_len,
+                    old_sample: outcome.old_sample.clone(),
+                    new_sample: outcome.new_sample.clone(),
+                })
+                .collect(),
+            outcomes_truncated: result.outcomes_truncated,
+            validation: ValidationDeltaDto {
+                before: SeverityCountsDto::from(result.validation.before),
+                after: SeverityCountsDto::from(result.validation.after),
+                new_error_codes: result.validation.new_error_codes.clone(),
+                new_warning_codes: result.validation.new_warning_codes.clone(),
+            },
+            checks: EditChecksDto {
+                source_canonical: result.checks.source_canonical,
+                candidate_reparsed: result.checks.candidate_reparsed,
+                semantic_targets_verified: result.checks.semantic_targets_verified,
+                diff_shape_is_exactly_requested: result.checks.diff_shape_is_exactly_requested,
+                byte_delta_matches_token_delta: result.checks.byte_delta_matches_token_delta,
+            },
+        }
+    }
+}
+
+impl From<SeverityCounts> for SeverityCountsDto {
+    fn from(counts: SeverityCounts) -> Self {
+        Self {
+            errors: counts.errors,
+            warnings: counts.warnings,
+            info: counts.info,
+        }
+    }
 }
 
 #[derive(Serialize)]

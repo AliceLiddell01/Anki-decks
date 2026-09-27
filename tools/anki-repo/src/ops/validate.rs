@@ -249,7 +249,17 @@ pub fn validate(export_dir: &Path) -> Result<ValidateResult, DomainError> {
         }
     };
 
-    let index = ExportIndex::build(&root);
+    Ok(validate_document(&root, export_dir))
+}
+
+/// Выполняет проверки по уже разобранному документу.
+///
+/// Отделено от [`validate`] ради мутирующего пути: `edit` проверяет не только
+/// исходный экспорт, но и кандидат, а читать `deck.json` с диска для этого не
+/// нужно. Физический каталог `media/` при этом берётся реальный: значения
+/// полей на набор media-имён не влияют, а media-проверки не дают ERROR.
+pub fn validate_document(root: &DeckNode, export_dir: &Path) -> ValidateResult {
+    let index = ExportIndex::build(root);
     let mut issues: Vec<Issue> = Vec::new();
 
     check_deck_nodes(&index, &mut issues);
@@ -260,7 +270,7 @@ pub fn validate(export_dir: &Path) -> Result<ValidateResult, DomainError> {
     check_media(export_dir, &index, &mut issues);
     check_summary_diagnostics(&index, &mut issues);
 
-    Ok(finish(issues))
+    finish(issues)
 }
 
 fn push(

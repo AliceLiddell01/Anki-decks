@@ -25,15 +25,17 @@ pub enum MatchArg {
     Exact,
 }
 
-/// Read-only toolkit для CrowdAnki-экспортов репозитория Anki-decks.
+/// Toolkit для CrowdAnki-экспортов репозитория Anki-decks.
 #[derive(Debug, Parser)]
 #[command(
     name = "anki-repo",
     version,
-    about = "Read-only анализ CrowdAnki-экспортов: inspect, find, stats, validate",
-    long_about = "Read-only CLI для детерминированного анализа одного CrowdAnki-экспорта.\n\
-                  Tool не является редактором: он никогда не изменяет deck.json, media\n\
-                  или любые другие данные репозитория.",
+    about = "Анализ и точечная правка CrowdAnki-экспортов: inspect, find, stats, validate, edit",
+    long_about = "Анализ и точечная правка одного CrowdAnki-экспорта.\n\
+                  inspect, find, stats и validate только читают.\n\
+                  edit меняет значения существующих полей существующих заметок и\n\
+                  пишет только по явному --apply, только для канонического deck.json\n\
+                  и только после проверок предусловий.",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -54,6 +56,7 @@ impl Cli {
             Command::Find { .. } => "find",
             Command::Stats { .. } => "stats",
             Command::Validate { .. } => "validate",
+            Command::Edit { .. } => "edit",
         }
     }
 }
@@ -137,5 +140,41 @@ pub enum Command {
     Validate {
         /// Каталог экспорта, например decks/japanese/words/Words__N3.
         export_dir: PathBuf,
+    },
+
+    /// Точечная правка значений существующих полей существующих заметок.
+    #[command(group(
+        clap::ArgGroup::new("request")
+            .required(true)
+            .multiple(false)
+            .args(["request_file", "guid"])
+    ))]
+    Edit {
+        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        export_dir: PathBuf,
+
+        /// JSON-файл с запросом на правки; `-` читает запрос со stdin.
+        #[arg(long = "request", value_name = "PATH")]
+        request_file: Option<PathBuf>,
+
+        /// `guid` заметки для одиночной правки.
+        #[arg(long, requires_all = ["field", "set", "expect"])]
+        guid: Option<String>,
+
+        /// Имя поля модели заметки.
+        #[arg(long, requires = "guid")]
+        field: Option<String>,
+
+        /// Новое значение поля.
+        #[arg(long, requires = "guid")]
+        set: Option<String>,
+
+        /// Ожидаемое текущее значение поля: без совпадения правка отклоняется.
+        #[arg(long = "expect", requires = "guid")]
+        expect: Option<String>,
+
+        /// Записать изменения в deck.json. Без флага выполняется только dry-run.
+        #[arg(long)]
+        apply: bool,
     },
 }

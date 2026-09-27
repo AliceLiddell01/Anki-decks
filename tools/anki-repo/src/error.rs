@@ -30,6 +30,24 @@ pub enum ErrorCode {
     NotFound,
     /// `find` по идентичности нашёл больше одного совпадения.
     Ambiguous,
+    /// `edit`: исходный `deck.json` не в канонической форме.
+    SourceNotCanonical,
+    /// `edit`: запрос правки структурно некорректен.
+    InvalidRequest,
+    /// `edit`: одна пара «guid — поле» запрошена дважды.
+    DuplicateEditTarget,
+    /// `edit`: в экспорте нет заметки с таким `guid`.
+    NoteNotFound,
+    /// Экспорт содержит ERROR (до или после предполагаемой правки).
+    ExportInvalid,
+    /// `edit`: экспорт пригоден по ERROR, но не подходит для правки.
+    ExportNotMutable,
+    /// `edit`: текущее значение поля не совпало с `expected`.
+    ExpectedMismatch,
+    /// `edit`: `deck.json` изменился между проверкой и заменой файла.
+    SourceChanged,
+    /// `edit`: не удалось атомарно заменить `deck.json`.
+    WriteFailed,
     /// Непредвиденный внутренний сбой.
     Internal,
 }
@@ -48,6 +66,15 @@ impl ErrorCode {
             Self::UnknownDeck => "unknown_deck",
             Self::NotFound => "not_found",
             Self::Ambiguous => "ambiguous",
+            Self::SourceNotCanonical => "source_not_canonical",
+            Self::InvalidRequest => "invalid_request",
+            Self::DuplicateEditTarget => "duplicate_edit_target",
+            Self::NoteNotFound => "note_not_found",
+            Self::ExportInvalid => "export_invalid",
+            Self::ExportNotMutable => "export_not_mutable",
+            Self::ExpectedMismatch => "expected_mismatch",
+            Self::SourceChanged => "source_changed",
+            Self::WriteFailed => "write_failed",
             Self::Internal => "internal_error",
         }
     }
@@ -62,9 +89,15 @@ impl ErrorCode {
             | Self::RootNotDeck
             | Self::SchemaInvalid
             | Self::UnknownField
-            | Self::UnknownDeck => 3,
-            Self::NotFound => 4,
+            | Self::UnknownDeck
+            | Self::SourceNotCanonical
+            | Self::InvalidRequest
+            | Self::DuplicateEditTarget => 3,
+            Self::NotFound | Self::NoteNotFound => 4,
             Self::Ambiguous => 5,
+            Self::ExportInvalid | Self::ExportNotMutable => 6,
+            Self::ExpectedMismatch | Self::SourceChanged => 7,
+            Self::WriteFailed => 8,
             Self::Internal => 70,
         }
     }
@@ -149,6 +182,64 @@ mod tests {
     }
 
     #[test]
+    fn edit_codes_match_process_contract() {
+        assert_eq!(ErrorCode::SourceNotCanonical.exit_code(), 3);
+        assert_eq!(ErrorCode::InvalidRequest.exit_code(), 3);
+        assert_eq!(ErrorCode::DuplicateEditTarget.exit_code(), 3);
+        assert_eq!(ErrorCode::NoteNotFound.exit_code(), 4);
+        assert_eq!(ErrorCode::ExportInvalid.exit_code(), 6);
+        assert_eq!(ErrorCode::ExportNotMutable.exit_code(), 6);
+        assert_eq!(ErrorCode::ExpectedMismatch.exit_code(), 7);
+        assert_eq!(ErrorCode::SourceChanged.exit_code(), 7);
+        assert_eq!(ErrorCode::WriteFailed.exit_code(), 8);
+        assert_eq!(
+            ErrorCode::SourceNotCanonical.as_str(),
+            "source_not_canonical"
+        );
+        assert_eq!(ErrorCode::InvalidRequest.as_str(), "invalid_request");
+        assert_eq!(
+            ErrorCode::DuplicateEditTarget.as_str(),
+            "duplicate_edit_target"
+        );
+        assert_eq!(ErrorCode::NoteNotFound.as_str(), "note_not_found");
+        assert_eq!(ErrorCode::ExportInvalid.as_str(), "export_invalid");
+        assert_eq!(ErrorCode::ExportNotMutable.as_str(), "export_not_mutable");
+        assert_eq!(ErrorCode::ExpectedMismatch.as_str(), "expected_mismatch");
+        assert_eq!(ErrorCode::SourceChanged.as_str(), "source_changed");
+        assert_eq!(ErrorCode::WriteFailed.as_str(), "write_failed");
+    }
+
+    /// Exit semantics, которые обязан документировать `tools/anki-repo/README.md`.
+    ///
+    /// Один exit code описывает несколько кодов ошибок, поэтому документация
+    /// должна перечислять их вместе: `4` — `find`/`not_found` и
+    /// `edit`/`note_not_found`, `7` — `edit`/`expected_mismatch` и
+    /// `edit`/`source_changed`.
+    #[test]
+    fn shared_exit_codes_cover_all_documented_reasons() {
+        // Exit 4: нет совпадений у `find` и нет заметки у `edit`.
+        assert_eq!(ErrorCode::NotFound.exit_code(), 4);
+        assert_eq!(ErrorCode::NoteNotFound.exit_code(), 4);
+
+        // Exit 7: конфликт предусловия по значению поля и устаревший исходник.
+        assert_eq!(ErrorCode::ExpectedMismatch.exit_code(), 7);
+        assert_eq!(ErrorCode::SourceChanged.exit_code(), 7);
+
+        // Коды различаются, несмотря на общий exit code: wrapper'у нужна причина,
+        // а не только код процесса.
+        assert_ne!(ErrorCode::NotFound, ErrorCode::NoteNotFound);
+        assert_ne!(ErrorCode::ExpectedMismatch, ErrorCode::SourceChanged);
+        assert_ne!(
+            ErrorCode::NotFound.as_str(),
+            ErrorCode::NoteNotFound.as_str()
+        );
+        assert_ne!(
+            ErrorCode::ExpectedMismatch.as_str(),
+            ErrorCode::SourceChanged.as_str()
+        );
+    }
+
+    #[test]
     fn codes_are_stable_snake_case() {
         let codes = [
             ErrorCode::Usage,
@@ -161,6 +252,15 @@ mod tests {
             ErrorCode::UnknownDeck,
             ErrorCode::NotFound,
             ErrorCode::Ambiguous,
+            ErrorCode::SourceNotCanonical,
+            ErrorCode::InvalidRequest,
+            ErrorCode::DuplicateEditTarget,
+            ErrorCode::NoteNotFound,
+            ErrorCode::ExportInvalid,
+            ErrorCode::ExportNotMutable,
+            ErrorCode::ExpectedMismatch,
+            ErrorCode::SourceChanged,
+            ErrorCode::WriteFailed,
             ErrorCode::Internal,
         ];
         for code in codes {

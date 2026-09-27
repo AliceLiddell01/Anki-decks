@@ -3,7 +3,7 @@ name = "anki-repo"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Read-only CLI для детерминированного анализа CrowdAnki-экспортов репозитория Anki-decks"
+description = "CLI для детерминированного анализа CrowdAnki-экспортов репозитория Anki-decks и точечной правки значений их полей"
 publish = false
 
 [dependencies]
@@ -11,6 +11,14 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+# Межпроцессная сериализация публикации `deck.json`. Публичный API этого crate
+# под `unsafe_code = "forbid"`, поэтому блокировка берётся не через ручной FFI,
+# а через небольшую обёртку над `flock(2)`. На Linux зависимость сводится к
+# `libc`; `File::lock`/`try_lock` из std появились только в Rust 1.89, а MSRV
+# crate — 1.88.
+[target.'cfg(unix)'.dependencies]
+fs2 = "0.4"
 
 [lib]
 name = "anki_repo"
