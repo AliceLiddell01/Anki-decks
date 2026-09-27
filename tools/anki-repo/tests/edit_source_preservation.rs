@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use common::{
@@ -710,19 +711,36 @@ fn real_deck_copy(level: u8) -> TempDir {
     dir
 }
 
-/// Первые `count` заметок колоды как тройки «guid, значение Значение».
+/// Первые `count` заметок колоды как пары «guid, значение поля `Значение`».
+///
+/// Позиция поля разрешается так же, как в самой команде: через
+/// `note_model_uuid` заметки и `note_models[].flds`, а не фиксированным индексом
+/// `fields[2]`. Иначе тест читал бы и проверял не то поле, которое правит `edit`,
+/// и оставался бы зелёным при переупорядочивании полей модели.
 fn sample_notes(text: &[u8], count: usize) -> Vec<(String, String)> {
     let document: Value = serde_json::from_slice(text).expect("deck.json — JSON");
-    document["notes"]
-        .as_array()
-        .expect("notes — массив")
+    let root = anki_repo::loader::typed_root(document, Path::new("deck.json"))
+        .expect("типизированное ядро экспорта");
+    let index = anki_repo::index::ExportIndex::build(&root);
+
+    index
+        .notes
         .iter()
         .take(count)
-        .map(|note| {
-            (
-                note["guid"].as_str().expect("guid").to_string(),
-                note["fields"][2].as_str().expect("Значение").to_string(),
-            )
+        .map(|entry| {
+            let guid = entry.note.guid.clone().expect("guid заметки");
+            let model = entry
+                .note
+                .note_model_uuid
+                .as_deref()
+                .and_then(|uuid| index.model_by_uuid(uuid))
+                .unwrap_or_else(|| panic!("модель заметки {guid:?} не найдена"));
+            let value = anki_repo::index::field_value_by_name(entry.note, model, "Значение")
+                .unwrap_or_else(|| panic!("заметка {guid:?} не содержит поле Значение"))
+                .as_text()
+                .unwrap_or_else(|| panic!("поле Значение заметки {guid:?} не строка"));
+
+            (guid, value.to_string())
         })
         .collect()
 }

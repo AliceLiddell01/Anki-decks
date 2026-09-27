@@ -5,6 +5,7 @@
 //! process stdio, поэтому контракт проверяем без обязательного subprocess.
 //! Единственное чтение из process stdio — `edit --request -`.
 
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
@@ -177,16 +178,9 @@ fn build_edit_request(
         let raw = if label == STDIN_REQUEST_SOURCE {
             read_stdin_request()?
         } else {
-            std::fs::read(path).map_err(|error| {
-                DomainError::with_details(
-                    ErrorCode::InputUnreadable,
-                    format!("не удалось прочитать запрос {label}: {error}"),
-                    crate::details! {
-                        "path" => label.as_str(),
-                        "io_error" => error.to_string(),
-                    },
-                )
-            })?
+            let file =
+                File::open(path).map_err(|error| request_read_error(label.as_str(), &error))?;
+            read_bounded(file).map_err(|error| request_read_error(label.as_str(), &error))?
         };
 
         return edit_op::parse_request_bytes(&raw, &label);
@@ -212,23 +206,47 @@ fn build_edit_request(
     Ok(request)
 }
 
-/// Читает JSON-запрос целиком со stdin.
-fn read_stdin_request() -> Result<Vec<u8>, DomainError> {
+/// Предел чтения запроса: максимум размера плюс один байт.
+///
+/// Лишний байт нужен, чтобы [`edit_op::parse_request_bytes`] отличил «ровно
+/// предел» от «больше предела» по длине буфера.
+const REQUEST_READ_LIMIT: u64 = edit_op::MAX_REQUEST_BYTES as u64 + 1;
+
+/// Читает не более [`REQUEST_READ_LIMIT`] байтов.
+///
+/// Предел размера запроса проверяется по длине буфера, поэтому неограниченное
+/// чтение успело бы занять память под весь входной поток прежде, чем команда
+/// сообщила бы о превышении.
+fn read_bounded<R: Read>(reader: R) -> std::io::Result<Vec<u8>> {
     let mut raw = Vec::new();
-    std::io::stdin()
-        .lock()
-        .read_to_end(&mut raw)
-        .map_err(|error| {
-            DomainError::with_details(
-                ErrorCode::InputUnreadable,
-                format!("не удалось прочитать запрос со stdin: {error}"),
-                crate::details! {
-                    "path" => STDIN_REQUEST_SOURCE,
-                    "io_error" => error.to_string(),
-                },
-            )
-        })?;
+    reader.take(REQUEST_READ_LIMIT).read_to_end(&mut raw)?;
     Ok(raw)
+}
+
+/// Готовит ошибку нечитаемого файла запроса.
+fn request_read_error(label: &str, error: &std::io::Error) -> DomainError {
+    DomainError::with_details(
+        ErrorCode::InputUnreadable,
+        format!("не удалось прочитать запрос {label}: {error}"),
+        crate::details! {
+            "path" => label,
+            "io_error" => error.to_string(),
+        },
+    )
+}
+
+/// Читает JSON-запрос со stdin, не более [`REQUEST_READ_LIMIT`] байтов.
+fn read_stdin_request() -> Result<Vec<u8>, DomainError> {
+    read_bounded(std::io::stdin().lock()).map_err(|error| {
+        DomainError::with_details(
+            ErrorCode::InputUnreadable,
+            format!("не удалось прочитать запрос со stdin: {error}"),
+            crate::details! {
+                "path" => STDIN_REQUEST_SOURCE,
+                "io_error" => error.to_string(),
+            },
+        )
+    })
 }
 
 fn build_criteria(
@@ -290,5 +308,42 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
                 message = error.message
             ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Бесконечный reader: если бы чтение не было ограничено, тест не завершился
+    /// бы, поэтому это прямая проверка предела, а не косвенная.
+    #[test]
+    fn request_read_stops_at_the_limit() {
+        let raw = read_bounded(std::io::repeat(b'a')).expect("чтение повторов");
+
+        assert_eq!(raw.len() as u64, REQUEST_READ_LIMIT);
+        assert!(
+            raw.len() > edit_op::MAX_REQUEST_BYTES,
+            "лишний байт нужен, чтобы отличить ровно предел от превышения"
+        );
+    }
+
+    #[test]
+    fn request_read_keeps_short_input_intact() {
+        let raw = read_bounded(&b"{\"schema_version\": 1}"[..]).expect("чтение");
+
+        assert_eq!(raw, b"{\"schema_version\": 1}".to_vec());
+    }
+
+    #[test]
+    fn request_read_keeps_the_boundary_exactly_at_the_limit() {
+        let source = vec![b' '; edit_op::MAX_REQUEST_BYTES];
+        let raw = read_bounded(&source[..]).expect("чтение");
+
+        assert_eq!(raw.len(), edit_op::MAX_REQUEST_BYTES);
+        assert!(
+            raw.len() <= edit_op::MAX_REQUEST_BYTES,
+            "ровно предел не считается превышением"
+        );
     }
 }

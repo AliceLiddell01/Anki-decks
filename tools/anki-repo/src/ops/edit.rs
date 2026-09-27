@@ -518,10 +518,10 @@ pub fn edit(
     let candidate = loader::render_canonical_bytes(&value)?;
     let candidate_value = loader::parse_deck_json_bytes(&candidate, &deck_json)?;
 
-    let reparse_ok = candidate_value == value;
+    ensure_reparsed(&candidate_value, &value)?;
     verify_targets(&candidate_value, &value_notes, &resolved)?;
     let shape = check_diff_shape(&source, &candidate, &effective)?;
-    let delta_ok = byte_delta(&source, &candidate) == token_delta(&effective);
+    ensure_byte_delta(&source, &candidate, &effective)?;
 
     let candidate_root = loader::typed_root(candidate_value, &deck_json)?;
     let after = validate::validate_document(&candidate_root, export_dir);
@@ -576,10 +576,10 @@ pub fn edit(
         validation,
         checks: EditChecks {
             source_canonical: true,
-            candidate_reparsed: reparse_ok,
+            candidate_reparsed: true,
             semantic_targets_verified: true,
             diff_shape_is_exactly_requested: true,
-            byte_delta_matches_token_delta: delta_ok,
+            byte_delta_matches_token_delta: true,
         },
     })
 }
@@ -1337,6 +1337,57 @@ fn diff_violation(message: String) -> DomainError {
     )
 }
 
+/// Проверяет, что повторный разбор кандидата даёт ровно задуманное значение.
+///
+/// Проверка обязательна, а её результат не просто сообщается в отчёте: если
+/// канонический рендер и разбор перестали быть взаимно обратными, кандидат
+/// описывает не то, что запланировано, и публиковать его нельзя. Молчаливая
+/// запись с `candidate_reparsed: false` в отчёте означала бы, что файл заменён
+/// байтами с неизвестным содержимым.
+///
+/// # Errors
+///
+/// [`ErrorCode::Internal`], если значения разошлись: это признак ошибки в tool,
+/// а не в данных, поэтому запись не выполняется.
+fn ensure_reparsed(reparsed: &Value, intended: &Value) -> Result<(), DomainError> {
+    if reparsed == intended {
+        return Ok(());
+    }
+
+    Err(DomainError::with_details(
+        ErrorCode::Internal,
+        "нарушен инвариант правки: кандидат повторно разбирается не в задуманное значение",
+        details! {
+            "reason" => "candidate_reparse_violation",
+        },
+    ))
+}
+
+/// Проверяет, что прирост байтов объясняется длиной изменённых токенов.
+///
+/// Проверка обязательна по той же причине, что и [`ensure_reparsed`]: расхождение
+/// означает, что байтовый diff изменил больше запрошенного набора изменений.
+///
+/// # Errors
+///
+/// [`ErrorCode::Internal`], если прирост байтов не сходится с суммой разниц
+/// запрошенных токенов; запись не выполняется.
+fn ensure_byte_delta(
+    source: &[u8],
+    candidate: &[u8],
+    effective: &[(String, String)],
+) -> Result<(), DomainError> {
+    let actual = byte_delta(source, candidate);
+    let expected = token_delta(effective);
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(diff_violation(format!(
+        "прирост байтов {actual} не объясняется длиной изменённых токенов {expected}"
+    )))
+}
+
 /// Готовит отчёт по одной правке.
 fn outcome_of(entry: &ResolvedEdit) -> EditOutcome {
     EditOutcome {
@@ -1785,6 +1836,51 @@ mod tests {
         assert_eq!(byte_delta(b"abc", b"abcde"), 2);
         assert_eq!(byte_delta(b"abcde", b"abc"), -2);
         assert_eq!(byte_delta(b"", b""), 0);
+    }
+
+    #[test]
+    fn reparse_guard_accepts_equal_values() {
+        let intended = json!({ "notes": [{ "fields": ["a"] }] });
+        assert!(ensure_reparsed(&intended.clone(), &intended).is_ok());
+    }
+
+    #[test]
+    fn reparse_guard_refuses_divergent_value() {
+        let intended = json!({ "notes": [{ "fields": ["a"] }] });
+        let reparsed = json!({ "notes": [{ "fields": ["b"] }] });
+
+        let error = ensure_reparsed(&reparsed, &intended).expect_err("расхождение обязательно");
+
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.exit_code(), 70);
+        assert_eq!(error.details["reason"], "candidate_reparse_violation");
+    }
+
+    #[test]
+    fn byte_delta_guard_accepts_explained_growth() {
+        let effective = vec![("a".to_string(), "abcd".to_string())];
+        let source = br#"{"v": "a"}"#;
+        let candidate = br#"{"v": "abcd"}"#;
+
+        assert!(ensure_byte_delta(source, candidate, &effective).is_ok());
+    }
+
+    #[test]
+    fn byte_delta_guard_refuses_unexplained_growth() {
+        let effective = vec![("a".to_string(), "ab".to_string())];
+        // Кандидат длиннее ровно на байт, но запрошенный токен обещает прирост 1,
+        // а байты меняются вне изменённого значения.
+        let source = br#"{"v": "a", "w": ""}"#;
+        let candidate = br#"{"v": "ab", "w": ""}"#;
+        assert_eq!(byte_delta(source, candidate), token_delta(&effective));
+
+        // Ломаем соответствие: рост есть, а эффективных правок нет.
+        let error = ensure_byte_delta(source, candidate, &[])
+            .expect_err("необъяснённый прирост обязателен к отказу");
+
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.exit_code(), 70);
+        assert_eq!(error.details["reason"], "diff_shape_violation");
     }
 
     #[test]
