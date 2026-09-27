@@ -336,7 +336,7 @@ mod tests {
             .iter()
             .map(|field| field.name.as_str())
             .collect();
-        assert_eq!(names, vec!["Слово", "Значение"]);
+        assert_eq!(names, vec!["Заголовок", "Толкование"]);
         let word = &result.fields[0];
         assert_eq!((word.total, word.nonempty, word.empty), (2, 2, 0));
         let meaning = &result.fields[1];
@@ -347,12 +347,12 @@ mod tests {
     fn group_by_uses_raw_values_without_normalization() {
         let node = deck_node(MINIMAL_EXPORT);
         let index = ExportIndex::build(&node);
-        let result = stats(Path::new("."), &index, &query(Some("Значение"), 20))
+        let result = stats(Path::new("."), &index, &query(Some("Толкование"), 20))
             .expect("stats")
             .group_by
             .expect("распределение должно быть посчитано");
 
-        assert_eq!(result.field, "Значение");
+        assert_eq!(result.field, "Толкование");
         assert_eq!(result.notes_with_field, 2);
         assert_eq!(result.notes_without_field, 0);
         assert_eq!(result.distinct_values, 2);
@@ -370,7 +370,7 @@ mod tests {
         let node = deck_node(&serde_json::to_string(&value).expect("json"));
         let index = ExportIndex::build(&node);
 
-        let buckets = stats(Path::new("."), &index, &query(Some("Значение"), 20))
+        let buckets = stats(Path::new("."), &index, &query(Some("Толкование"), 20))
             .expect("stats")
             .group_by
             .expect("распределение")
@@ -386,7 +386,7 @@ mod tests {
     fn top_truncates_distribution() {
         let node = deck_node(MINIMAL_EXPORT);
         let index = ExportIndex::build(&node);
-        let group = stats(Path::new("."), &index, &query(Some("Значение"), 1))
+        let group = stats(Path::new("."), &index, &query(Some("Толкование"), 1))
             .expect("stats")
             .group_by
             .expect("распределение");

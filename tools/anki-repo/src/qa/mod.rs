@@ -253,13 +253,6 @@ pub const RULES: &[Rule] = &[
         applicable: |_| true,
         run: duplicate_rules::duplicate_note_content,
     },
-    Rule {
-        code: "duplicate_primary_field",
-        severity: QaSeverity::Info,
-        description: "несколько заметок имеют одинаковое сырое значение головного поля",
-        applicable: duplicate_rules::primary_field_applicable,
-        run: duplicate_rules::duplicate_primary_field,
-    },
 ];
 
 /// Индекс правила в реестре; он же приоритет в каноническом порядке findings.
@@ -357,6 +350,7 @@ pub fn collect(context: &RuleContext<'_>) -> Vec<Finding> {
 mod tests {
     use super::*;
     use crate::test_support::{MINIMAL_EXPORT, deck_node};
+    use serde_json::json;
 
     fn findings(json: &str) -> Vec<Finding> {
         let node = deck_node(json);
@@ -382,6 +376,65 @@ mod tests {
     }
 
     #[test]
+    fn registry_matches_the_documented_rule_set() {
+        let actual: Vec<(&str, QaSeverity)> = RULES
+            .iter()
+            .map(|rule| (rule.code, rule.severity))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("empty_field_value", QaSeverity::Warning),
+                ("leading_whitespace", QaSeverity::Warning),
+                ("trailing_whitespace", QaSeverity::Warning),
+                ("forbidden_white_span", QaSeverity::Error),
+                ("duplicate_note_content", QaSeverity::Warning),
+            ],
+            "реестр QA-правил — публичный контракт: его изменение должно быть осознанным"
+        );
+    }
+
+    /// QA-правила судят о значениях, а не об именах полей конкретной модели.
+    ///
+    /// Один и тот же набор значений под разными именами полей и моделей обязан
+    /// дать один и тот же набор findings.
+    #[test]
+    fn rules_are_independent_of_field_and_model_names() {
+        let renamed = crate::test_support::export_with(MINIMAL_EXPORT, |value| {
+            value["note_models"][0]["name"] = json!("Другая модель");
+            value["note_models"][0]["flds"] = json!([
+                {"name": "Альфа", "ord": 0},
+                {"name": "Бета", "ord": 1}
+            ]);
+        });
+        let baseline = crate::test_support::export_with(MINIMAL_EXPORT, |value| {
+            value["notes"][0]["fields"] = json!(["[sound:a.mp3]偶然", " значение "]);
+        });
+        let renamed = crate::test_support::export_with(&renamed, |value| {
+            value["notes"][0]["fields"] = json!(["[sound:a.mp3]偶然", " значение "]);
+        });
+
+        let shape = |found: &[Finding]| -> Vec<(String, usize, Option<i64>)> {
+            found
+                .iter()
+                .map(|finding| {
+                    (
+                        finding.code.to_string(),
+                        finding.note_position,
+                        finding.field_ord,
+                    )
+                })
+                .collect()
+        };
+        let baseline_findings = shape(&findings(&baseline));
+        assert!(
+            !baseline_findings.is_empty(),
+            "фикстура должна давать findings, иначе равенство ниже тривиально"
+        );
+        assert_eq!(baseline_findings, shape(&findings(&renamed)));
+    }
+
+    #[test]
     fn findings_are_ordered_by_rule_position_and_field() {
         let json = crate::test_support::export_with(MINIMAL_EXPORT, |value| {
             value["notes"][0]["fields"][1] = serde_json::json!(" значение ");
@@ -403,7 +456,7 @@ mod tests {
                 .filter(|finding| finding.code == "empty_field_value")
                 .count(),
             0,
-            "оба значения «Значение» заданы явно и не пусты"
+            "оба значения «Толкование» заданы явно и не пусты"
         );
         assert!(
             found

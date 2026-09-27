@@ -820,7 +820,7 @@ pub fn review_check(result: &ReviewCheckResult) -> String {
         result.effective_proposals
     ));
     out.line(format!(
-        "Готовый запрос для Stage 2: {}",
+        "Готовый запрос для edit: {}",
         match &result.edit_request {
             Some(request) => format!("да, правок {}", request.edits.len()),
             None if !result.source_blockers.is_empty() => {

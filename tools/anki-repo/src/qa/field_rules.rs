@@ -162,9 +162,13 @@ mod tests {
             value["notes"][0]["fields"][1] = json!("");
         });
         let found = findings_for(&json, "empty_field_value");
-        assert_eq!(found.len(), 2, "пустые «Значение» первой и второй заметок");
+        assert_eq!(
+            found.len(),
+            2,
+            "пустые «Толкование» первой и второй заметок"
+        );
         assert_eq!(found[0].note_position, 0);
-        assert_eq!(found[0].field.as_deref(), Some("Значение"));
+        assert_eq!(found[0].field.as_deref(), Some("Толкование"));
         assert_eq!(found[0].field_ord, Some(1));
         assert_eq!(found[0].evidence["value_chars"], 0);
     }
@@ -264,17 +268,17 @@ mod tests {
         assert!(rs_is_empty(&context, "leading_whitespace"));
         assert!(rs_is_empty(&context, "forbidden_white_span"));
         assert_eq!(
-            context.views[0].text("Слово"),
+            context.views[0].text("Заголовок"),
             Some("[sound:a.mp3]偶然"),
             "строковое поле остаётся доступным"
         );
         assert_eq!(
-            context.views[0].text("Значение"),
+            context.views[0].text("Толкование"),
             None,
             "нестроковое значение не даёт текста"
         );
         assert_eq!(
-            context.views[1].text("Значение"),
+            context.views[1].text("Толкование"),
             None,
             "отсутствующая позиция не даёт текста"
         );
@@ -324,7 +328,7 @@ mod tests {
         assert!(found[1].addressable);
         assert!(
             found.iter().any(|finding| finding.note_position == 0
-                && finding.field.as_deref() == Some("Значение")),
+                && finding.field.as_deref() == Some("Толкование")),
             "заметка без guid всё равно описывается позицией в экспорте"
         );
     }

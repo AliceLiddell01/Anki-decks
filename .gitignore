@@ -1,2 +1,6 @@
 # Windows Mark-of-the-Web metadata that may appear as literal files in WSL/Linux
 *:Zone.Identifier
+
+# Артефакты сборки корневого Cargo workspace: Rust-проверки запускаются из корня
+# репозитория, поэтому build output принадлежит корневому `target/`.
+/target

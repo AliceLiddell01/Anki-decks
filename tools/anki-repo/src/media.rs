@@ -98,7 +98,7 @@ pub fn normalize_media_name(name: &str) -> String {
 
 /// Извлекает ссылки на media из HTML-значения поля заметки.
 ///
-/// Поддерживаются только очевидные Stage 1 конструкции: `[sound:NAME]` и
+/// Поддерживаются только очевидные конструкции: `[sound:NAME]` и
 /// `src="NAME"` / `src='NAME'`. Полноценный Anki/HTML parser не используется.
 pub fn extract_media_references(text: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();

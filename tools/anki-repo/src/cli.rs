@@ -81,7 +81,7 @@ pub enum Command {
     /// Компактное описание структуры экспорта.
     #[command(visible_alias = "describe")]
     Inspect {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
         /// Добавить UUID, deck paths, шаблоны и bounded sample диагностики.
         #[arg(long)]
@@ -93,26 +93,22 @@ pub enum Command {
         clap::ArgGroup::new("criteria")
             .required(true)
             .multiple(false)
-            .args(["guid", "word", "field"])
+            .args(["guid", "field"])
     ))]
     Find {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
 
         /// Точный поиск заметки по guid.
         #[arg(long)]
         guid: Option<String>,
 
-        /// Сокращение для contains по сырому значению поля «Слово».
-        #[arg(long)]
-        word: Option<String>,
-
         /// Имя поля модели для поиска.
         #[arg(long, requires = "value")]
         field: Option<String>,
 
         /// Искомое значение поля.
-        #[arg(long, requires = "field", conflicts_with = "word")]
+        #[arg(long, requires = "field")]
         value: Option<String>,
 
         /// Режим сопоставления для --field (только вместе с --field).
@@ -134,7 +130,7 @@ pub enum Command {
 
     /// Структурная агрегированная статистика.
     Stats {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
 
         /// Агрегация по сырым значениям указанного поля.
@@ -152,13 +148,13 @@ pub enum Command {
 
     /// Детерминированная проверка структурной целостности.
     Validate {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
     },
 
     /// Детерминированные QA-findings по содержимому карточек.
     Qa {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
 
         /// Ограничить вывод одним кодом правила; флаг можно повторять.
@@ -179,10 +175,10 @@ pub enum Command {
         clap::ArgGroup::new("criteria")
             .required(true)
             .multiple(false)
-            .args(["all", "guid", "word", "field", "qa_code"])
+            .args(["all", "guid", "field", "qa_code"])
     ))]
     Review {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
 
         /// Выбрать все заметки области.
@@ -193,16 +189,12 @@ pub enum Command {
         #[arg(long)]
         guid: Option<String>,
 
-        /// Сокращение для contains по сырому значению поля «Слово».
-        #[arg(long)]
-        word: Option<String>,
-
         /// Имя поля модели для отбора.
         #[arg(long, requires = "value")]
         field: Option<String>,
 
         /// Искомое значение поля.
-        #[arg(long, requires = "field", conflicts_with = "word")]
+        #[arg(long, requires = "field")]
         value: Option<String>,
 
         /// Режим сопоставления для --field (только вместе с --field).
@@ -233,7 +225,7 @@ pub enum Command {
     /// Проверка предложений агента против текущего экспорта.
     #[command(name = "review-check")]
     ReviewCheck {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
 
         /// JSON-документ предложений (schema_version 1, `proposals`); `-` читает stdin.
@@ -249,7 +241,7 @@ pub enum Command {
             .args(["request_file", "guid"])
     ))]
     Edit {
-        /// Каталог экспорта, например decks/japanese/words/Words__N3.
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
 
         /// JSON-файл с запросом на правки; `-` читает запрос со stdin.

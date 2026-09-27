@@ -212,7 +212,7 @@ pub struct DeckNode {
     /// Тег типа сериализованной сущности.
     #[serde(rename = "__type__", default)]
     pub type_name: Option<String>,
-    /// Полное имя колоды в Anki-нотации (`Words::N1`).
+    /// Полное имя колоды в Anki-нотации (`Родитель::Дочерняя`).
     #[serde(default)]
     pub name: String,
     /// Идентичность CrowdAnki этого узла.

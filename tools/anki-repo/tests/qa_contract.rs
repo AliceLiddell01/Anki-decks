@@ -1,21 +1,31 @@
 //! Контракт CLI команды `qa`: коды правил, границы вывода, exit codes.
 //!
-//! Свойства findings проверяются на синтетических экспортах, а на канонических
-//! колодах — только то, что не зависит от текущего содержимого репозитория:
-//! форма ответа, детерминизм и согласованность counts с самим выводом.
+//! Ни один тест здесь не знает ни layout репозитория, ни содержимого `decks/`:
+//! каждая фикстура — синтетический экспорт в собственном временном каталоге, а
+//! пути в аргументах CLI абсолютные, потому что `run_cli` не задаёт рабочий
+//! каталог. Default test suite и CI обязаны оставаться корректными, когда
+//! состав колод, уровни JLPT, note models и media изменятся или временно
+//! отсутствуют.
 //!
 //! Ни одно ожидаемое число не зашито в тест: counts по каждому коду
 //! пересчитываются из сырого `deck.json` независимым oracle'ом
-//! ([`common::raw_qa_counts`]), а адреса каждого показанного finding'а
-//! проверяются по сырым заметкам, а не по выводу tool'а.
+//! ([`common::raw_qa_counts`]), число показанных findings и признак усечения
+//! выводятся из этих counts, а адрес каждого показанного finding'а проверяется
+//! по сырым заметкам, а не по выводу tool'а.
 
 mod common;
 
 use common::{
-    QA_CODES, TempDir, collect_notes, export_with, parse_json, raw_field_position, raw_json,
-    raw_models, raw_note_model_fields, raw_qa_counts, run_cli, words_deck,
+    QA_CODES, TempDir, collect_notes, export_with, mixed_export, parse_json, raw_field_position,
+    raw_models, raw_note_model_fields, raw_qa_counts, run_cli,
 };
 use serde_json::{Value, json};
+
+/// Предел печати, который тесты передают явно.
+///
+/// Это аргумент теста, а не факт об экспорте: сколько findings вернётся и была
+/// ли выборка обрезана, всегда считается из oracle'а.
+const PRINT_LIMIT: usize = 200;
 
 fn qa_json(export: &str, extra: &[&str]) -> (i32, Value) {
     let mut args = vec!["--json", "qa", export];
@@ -24,44 +34,94 @@ fn qa_json(export: &str, extra: &[&str]) -> (i32, Value) {
     (code, parse_json(&stdout))
 }
 
-/// Экспорт, в котором есть по одному finding каждого правила.
-fn rules_export() -> Value {
+/// Набор значений, на которых срабатывают разные правила реестра.
+///
+/// Отдельная функция, а не замыкание: один и тот же набор нужно подставить и в
+/// исходные имена полей, и в переименованную модель. Значения намеренно не
+/// зависят ни от имён полей, ни от имён моделей — это свойство и проверяется.
+fn rich_values(value: &mut Value) {
+    value["notes"][0]["fields"] =
+        json!([" <span style=\"color: #fff\">偶然</span> ", " значение "]);
+    value["notes"][1]["fields"] = json!(["", "значение", ""]);
+}
+
+/// Экспорт, в котором срабатывает каждое правило реестра.
+///
+/// Набор значений подобран так, чтобы насыщенно покрыть все пять кодов: пустое
+/// значение, оба краевых пробела, устаревшая белая `<span>`-обёртка и группа
+/// заметок с полностью одинаковым содержимым. Ни одно число здесь не
+/// утверждается — counts теста берутся из [`raw_qa_counts`].
+fn rich_export() -> Value {
     export_with(|value| {
-        value["notes"][0]["fields"] = json!([" <span style=\"color: #fff\">x</span> ", "значение"]);
-        value["notes"][1]["fields"] = json!(["", "значение"]);
-        let mut duplicate = value["notes"][1].clone();
-        duplicate["guid"] = json!("guid-3");
-        value["notes"]
-            .as_array_mut()
-            .expect("notes")
-            .push(duplicate);
+        value["notes"][0]["fields"] = json!([
+            " <span style=\"color: #fff\">偶然</span> ",
+            " значение ",
+            "хвост "
+        ]);
+        value["notes"][1]["fields"] = json!(["", "значение", ""]);
+        let notes = value["notes"].as_array_mut().expect("notes");
+        for index in 0..2 {
+            let mut copy = notes[1].clone();
+            copy["guid"] = json!(format!("guid-dup-{index}"));
+            notes.push(copy);
+        }
     })
+}
+
+/// Насыщенный findings экспорт другой формы.
+///
+/// Второй независимый пример: другое дерево колод, другие имена моделей и
+/// полей, `flds` объявлены не в порядке `ord`, у одной модели одно поле. Набор
+/// значений снова покрывает все коды, но в других позициях и с другими counts —
+/// поэтому oracle проверяется не на одной форме экспорта.
+fn mixed_rich_export() -> Value {
+    let mut value = mixed_export();
+    {
+        let notes = value["children"][0]["notes"].as_array_mut().expect("notes");
+        notes[0]["fields"] = json!(["<span style=\"color: #fff\">альфа</span>", " бета ", ""]);
+        notes[1]["fields"] = json!(["одно поле "]);
+    }
+    value["children"][1]["notes"][0]["fields"] =
+        json!(["<span style=\"color: #fff\">альфа</span>", " бета ", ""]);
+    value
+}
+
+/// Форма findings, не зависящая от имён: код, позиция заметки и `ord` поля.
+fn finding_shape(parsed: &Value) -> Vec<(String, u64, Option<i64>)> {
+    parsed["result"]["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .map(|finding| {
+            (
+                finding["code"].as_str().expect("code").to_string(),
+                finding["note_index"].as_u64().expect("note_index"),
+                finding["field_ord"].as_i64(),
+            )
+        })
+        .collect()
 }
 
 #[test]
 fn rules_registry_is_listed_with_stable_codes() {
     let temp = TempDir::new("qa-rules");
-    temp.write_export(&rules_export());
+    temp.write_export(&rich_export());
     let (code, parsed) = qa_json(&temp.path().to_string_lossy(), &[]);
     assert_eq!(code, 0);
     assert_eq!(parsed["schema_version"], 1);
     assert_eq!(parsed["command"], "qa");
 
+    // Реестр виден в JSON-выводе `qa` и совпадает с кодами, по которым тест
+    // пересчитывает ожидания: это публичный контракт команды.
     let rules = parsed["result"]["rules"].as_array().expect("rules");
     let codes: Vec<&str> = rules
         .iter()
         .map(|rule| rule["code"].as_str().expect("code"))
         .collect();
-    assert_eq!(
-        codes,
-        vec![
-            "empty_field_value",
-            "leading_whitespace",
-            "trailing_whitespace",
-            "forbidden_white_span",
-            "duplicate_note_content",
-            "duplicate_primary_field"
-        ]
+    assert_eq!(codes, QA_CODES.to_vec());
+    assert!(
+        !codes.contains(&"duplicate_primary_field"),
+        "удалённое правило не должно возвращаться в реестр"
     );
     for rule in rules {
         assert!(
@@ -79,27 +139,44 @@ fn rules_registry_is_listed_with_stable_codes() {
         .collect();
     assert_eq!(
         severities,
-        vec!["warning", "warning", "warning", "error", "warning", "info"]
+        vec!["warning", "warning", "warning", "error", "warning"]
+    );
+
+    let by_code: Vec<&str> = parsed["result"]["by_code"]
+        .as_array()
+        .expect("by_code")
+        .iter()
+        .map(|entry| entry["code"].as_str().expect("code"))
+        .collect();
+    assert_eq!(
+        by_code,
+        QA_CODES.to_vec(),
+        "распределение по кодам перечисляет тот же реестр"
     );
 }
 
 #[test]
 fn qa_reports_error_severity_findings_without_failing() {
+    let raw = rich_export();
     let temp = TempDir::new("qa-error-severity");
-    temp.write_export(&rules_export());
+    temp.write_export(&raw);
     let (code, parsed) = qa_json(
         &temp.path().to_string_lossy(),
         &["--code", "forbidden_white_span"],
     );
 
     assert_eq!(code, 0, "QA ERROR не делает команду неуспешной");
-    assert_eq!(parsed["result"]["findings_total"], 1);
+    assert_eq!(
+        parsed["result"]["findings_total"],
+        raw_qa_counts(&raw)["forbidden_white_span"],
+        "число findings правила берётся из независимого пересчёта"
+    );
     let finding = &parsed["result"]["findings"][0];
     assert_eq!(finding["severity"], "error");
     assert_eq!(finding["code"], "forbidden_white_span");
     assert_eq!(finding["note_index"], 0);
     assert_eq!(finding["guid"], "guid-1");
-    assert_eq!(finding["field"], "Слово");
+    assert_eq!(finding["field"], "Заголовок");
     assert_eq!(finding["field_ord"], 0);
     assert_eq!(finding["evidence"]["occurrences"], 1);
     assert!(
@@ -129,14 +206,13 @@ fn evidence_stays_bounded_and_never_contains_full_field_value() {
         sample.chars().count()
     );
     assert!(sample.ends_with('…'));
-    assert_eq!(finding["evidence"]["value_chars"], 2001);
+    assert_eq!(finding["evidence"]["value_chars"], long.chars().count() + 1);
     assert_eq!(finding["evidence"]["boundary"]["chars"], 1);
 }
 
 #[test]
 fn max_per_code_bounds_output_but_not_counts() {
-    let temp = TempDir::new("qa-max-per-code");
-    temp.write_export(&export_with(|value| {
+    let raw = export_with(|value| {
         let template = value["notes"][0].clone();
         for index in 0..30 {
             let mut copy = template.clone();
@@ -144,37 +220,57 @@ fn max_per_code_bounds_output_but_not_counts() {
             copy["fields"] = json!(["слово", ""]);
             value["notes"].as_array_mut().expect("notes").push(copy);
         }
-    }));
+    });
+    let temp = TempDir::new("qa-max-per-code");
+    temp.write_export(&raw);
+    let export = temp.path().to_string_lossy().to_string();
 
-    let (_, parsed) = qa_json(
-        &temp.path().to_string_lossy(),
-        &["--code", "empty_field_value", "--max-per-code", "5"],
-    );
-    assert_eq!(parsed["result"]["findings_total"], 31);
-    assert_eq!(parsed["result"]["findings_returned"], 5);
-    assert_eq!(parsed["result"]["truncated"], true);
-    assert_eq!(parsed["result"]["max_per_code"], 5);
-    assert_eq!(parsed["result"]["by_code"][0]["count"], 31);
-    assert_eq!(
-        parsed["result"]["findings"]
-            .as_array()
-            .expect("findings")
-            .len(),
-        5
+    let expected = raw_qa_counts(&raw)["empty_field_value"];
+    const SMALL: usize = 5;
+    assert!(
+        expected > SMALL,
+        "фикстура обязана превышать предел печати, иначе тест ничего не проверяет"
     );
 
+    let small = SMALL.to_string();
+    let (code, parsed) = qa_json(
+        &export,
+        &["--code", "empty_field_value", "--max-per-code", &small],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(parsed["result"]["findings_total"], expected);
+    assert_eq!(parsed["result"]["findings_returned"], SMALL);
+    assert_eq!(parsed["result"]["truncated"], expected > SMALL);
+    assert_eq!(parsed["result"]["max_per_code"], SMALL);
+    assert_eq!(parsed["result"]["by_code"][0]["count"], expected);
+    let shown = parsed["result"]["findings"].as_array().expect("findings");
+    assert_eq!(shown.len(), SMALL);
+    for finding in shown {
+        assert_finding_matches_raw_labelled(&raw, finding, "предел печати");
+    }
+
+    let complete_limit = PRINT_LIMIT.to_string();
     let (_, complete) = qa_json(
-        &temp.path().to_string_lossy(),
-        &["--code", "empty_field_value", "--max-per-code", "200"],
+        &export,
+        &[
+            "--code",
+            "empty_field_value",
+            "--max-per-code",
+            &complete_limit,
+        ],
     );
-    assert_eq!(complete["result"]["findings_returned"], 31);
+    assert!(
+        expected <= PRINT_LIMIT,
+        "фикстура помещается в предел печати"
+    );
+    assert_eq!(complete["result"]["findings_returned"], expected);
     assert_eq!(complete["result"]["truncated"], false);
 }
 
 #[test]
 fn output_is_deterministic_across_runs() {
     let temp = TempDir::new("qa-determinism");
-    temp.write_export(&rules_export());
+    temp.write_export(&rich_export());
     let (_, first) = qa_json(&temp.path().to_string_lossy(), &[]);
     let (_, second) = qa_json(&temp.path().to_string_lossy(), &[]);
     assert_eq!(first["result"], second["result"]);
@@ -183,7 +279,7 @@ fn output_is_deterministic_across_runs() {
 #[test]
 fn unknown_code_is_a_usage_class_error_with_available_codes() {
     let temp = TempDir::new("qa-unknown-code");
-    temp.write_export(&rules_export());
+    temp.write_export(&rich_export());
     let (code, parsed) = qa_json(&temp.path().to_string_lossy(), &["--code", "нет_такого"]);
 
     assert_eq!(code, 3);
@@ -191,57 +287,115 @@ fn unknown_code_is_a_usage_class_error_with_available_codes() {
     let available = parsed["error"]["details"]["available_codes"]
         .as_array()
         .expect("available_codes");
-    assert!(available.iter().any(|code| code == "empty_field_value"));
+    let available: Vec<&str> = available
+        .iter()
+        .map(|code| code.as_str().expect("code"))
+        .collect();
+    assert_eq!(
+        available,
+        QA_CODES.to_vec(),
+        "в ошибке перечислен ровно действующий реестр"
+    );
     assert_eq!(parsed["error"]["details"]["unknown_codes"][0], "нет_такого");
+}
+
+/// Удалённое правило больше не существует для CLI: `qa --code
+/// duplicate_primary_field` — usage-класс ошибка с ненулевым exit code, а не
+/// молчаливый пустой вывод.
+#[test]
+fn removed_duplicate_primary_field_code_is_rejected() {
+    let temp = TempDir::new("qa-removed-code");
+    temp.write_export(&rich_export());
+    let (code, parsed) = qa_json(
+        &temp.path().to_string_lossy(),
+        &["--code", "duplicate_primary_field"],
+    );
+
+    assert_eq!(code, 3, "неизвестный код — ошибка, а не пустой результат");
+    assert_eq!(parsed["error"]["code"], "unknown_qa_code");
+    assert_eq!(
+        parsed["error"]["details"]["unknown_codes"][0],
+        "duplicate_primary_field"
+    );
+    let available = parsed["error"]["details"]["available_codes"]
+        .as_array()
+        .expect("available_codes");
+    assert_eq!(
+        available.len(),
+        QA_CODES.len(),
+        "реестр остался из пяти кодов"
+    );
+    assert!(
+        !available
+            .iter()
+            .any(|code| code == "duplicate_primary_field"),
+        "удалённый код не может предлагаться как доступный"
+    );
 }
 
 #[test]
 fn human_mode_lists_every_rule_and_keeps_stdout_only() {
     let temp = TempDir::new("qa-human");
-    temp.write_export(&rules_export());
+    temp.write_export(&rich_export());
     let (code, stdout, stderr) = run_cli(&["qa", &temp.path().to_string_lossy()]);
 
     assert_eq!(code, 0);
     assert!(stderr.is_empty());
-    for needle in [
-        "По кодам:",
-        "Findings:",
-        "Правила (6):",
-        "empty_field_value",
-        "duplicate_primary_field",
-        "усечено",
-    ] {
+    let mut needles = vec![
+        "По кодам:".to_string(),
+        "Findings:".to_string(),
+        format!("Правила ({}):", QA_CODES.len()),
+        "усечено".to_string(),
+    ];
+    needles.extend(QA_CODES.iter().map(|code| (*code).to_string()));
+    for needle in &needles {
         assert!(
-            stdout.contains(needle),
+            stdout.contains(needle.as_str()),
             "нет фрагмента {needle:?}\n{stdout}"
         );
     }
+    assert!(
+        !stdout.contains("duplicate_primary_field"),
+        "удалённое правило не должно печататься\n{stdout}"
+    );
 }
 
+/// Counts и адреса findings на synthetic-экспортах пересчитываются независимо.
+///
+/// Тест не утверждает ни одного зашитого числа: ожидаемые counts берутся из
+/// [`raw_qa_counts`], признак усечения и число показанных findings выводятся из
+/// них, а каждый показанный finding проверяется по сырым заметкам. Насыщенность
+/// (findings есть у каждого кода реестра) тоже проверяется через oracle.
 #[test]
-fn canonical_decks_report_independently_recomputed_counts() {
-    for level in [1u8, 2, 3, 4, 5] {
-        let export = words_deck(level);
-        let raw = raw_json(level);
+fn synthetic_exports_report_independently_recomputed_counts() {
+    let exports = [("rich", rich_export()), ("mixed", mixed_rich_export())];
+
+    for (label, raw) in exports {
+        let temp = TempDir::new(&format!("qa-oracle-{label}"));
+        temp.write_export(&raw);
+        let export = temp.path().to_string_lossy().to_string();
         let expected = raw_qa_counts(&raw);
 
         let mut notes = Vec::new();
         collect_notes(&raw, &mut notes);
+        for code in QA_CODES {
+            assert!(
+                expected[code] > 0,
+                "{label}: фикстура обязана давать findings кода {code}"
+            );
+        }
 
-        // Предел печати — аргумент теста, а не факт о колоде: сколько findings
-        // вернётся и была ли выборка обрезана, считается из oracle'а.
-        const LIMIT: usize = 200;
-        let limit = LIMIT.to_string();
-        let (code, parsed) = qa_json(&export.to_string_lossy(), &["--max-per-code", &limit]);
-        assert_eq!(code, 0, "N{level}");
+        let limit = PRINT_LIMIT.to_string();
+        let (exit, parsed) = qa_json(&export, &["--max-per-code", &limit]);
+        assert_eq!(exit, 0, "{label}");
         assert_eq!(
             parsed["result"]["notes_total"],
             notes.len(),
-            "N{level}: число заметок"
+            "{label}: число заметок"
         );
 
         let by_code = parsed["result"]["by_code"].as_array().expect("by_code");
-        assert_eq!(by_code.len(), QA_CODES.len(), "N{level}: все коды в выводе");
+        assert_eq!(by_code.len(), QA_CODES.len(), "{label}: все коды в выводе");
         for code in QA_CODES {
             let count = by_code
                 .iter()
@@ -249,7 +403,7 @@ fn canonical_decks_report_independently_recomputed_counts() {
                 .map_or(0, |entry| entry["count"].as_u64().expect("count"));
             assert_eq!(
                 count as usize, expected[code],
-                "N{level}: {code} должен совпадать с независимым пересчётом"
+                "{label}: {code} должен совпадать с независимым пересчётом"
             );
         }
 
@@ -259,14 +413,14 @@ fn canonical_decks_report_independently_recomputed_counts() {
             .sum();
         assert_eq!(
             total as usize, parsed["result"]["findings_total"],
-            "N{level}: сумма по кодам"
+            "{label}: сумма по кодам"
         );
 
-        // Реестр правил не зависит от содержимого колоды.
+        // Реестр правил не зависит от содержимого экспорта.
         assert_eq!(
             parsed["result"]["rules"].as_array().expect("rules").len(),
             QA_CODES.len(),
-            "N{level}"
+            "{label}"
         );
 
         // Печать ограничена кодом, у которого findings больше предела; адрес
@@ -278,8 +432,8 @@ fn canonical_decks_report_independently_recomputed_counts() {
             .expect("реестр не пуст");
         assert_eq!(
             parsed["result"]["truncated"],
-            widest > LIMIT,
-            "N{level}: признак усечения следует из oracle'а"
+            widest > PRINT_LIMIT,
+            "{label}: признак усечения следует из oracle'а"
         );
         // Предел применяется к каждому коду отдельно, поэтому ожидание — сумма
         // урезанных по коду счётчиков, а не урезанная сумма всех findings.
@@ -287,12 +441,12 @@ fn canonical_decks_report_independently_recomputed_counts() {
             parsed["result"]["findings_returned"],
             QA_CODES
                 .iter()
-                .map(|code| expected[code].min(LIMIT))
+                .map(|code| expected[code].min(PRINT_LIMIT))
                 .sum::<usize>(),
-            "N{level}: показано по пределу на каждый код"
+            "{label}: показано по пределу на каждый код"
         );
         for finding in parsed["result"]["findings"].as_array().expect("findings") {
-            assert_finding_matches_raw(&raw, finding, level);
+            assert_finding_matches_raw_labelled(&raw, finding, label);
         }
     }
 }
@@ -319,19 +473,44 @@ fn oversized_group_is_reported_as_truncated() {
     );
     assert_eq!(code, 0);
 
+    // Ожидаемая группа собирается из сырых заметок: участники — заметки той же
+    // модели с теми же значениями `fields`, в порядке экспорта.
+    let mut notes = Vec::new();
+    collect_notes(&raw, &mut notes);
+    let group_fingerprint = serde_json::to_string(&notes[0]["fields"]).expect("fields");
+    let group_model = notes[0]["note_model_uuid"].clone();
+    let members: Vec<usize> = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, note)| {
+            note["note_model_uuid"] == group_model
+                && serde_json::to_string(&note["fields"]).expect("fields") == group_fingerprint
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        members.len() > limit,
+        "фикстура обязана превышать предел числа участников"
+    );
+
     let findings = parsed["result"]["findings"].as_array().expect("findings");
     assert_eq!(findings.len(), 1, "группа описывается одним finding'ом");
     let finding = &findings[0];
     assert_eq!(finding["related_truncated"], true);
     assert_eq!(
-        finding["related_note_indices"]
+        finding["related_note_indices"],
+        json!(members[..limit].to_vec()),
+        "усечённый список участников — первые участники группы"
+    );
+    assert_eq!(
+        finding["related_guids"]
             .as_array()
-            .expect("related_note_indices")
+            .expect("related_guids")
             .len(),
         limit,
-        "усечённый список участников полон до предела"
+        "guid на каждого показанного участника"
     );
-    assert_eq!(finding["group_size"], json!(limit + 2));
+    assert_eq!(finding["group_size"], members.len());
     assert_finding_matches_raw_labelled(&raw, finding, "группа сверх предела");
 }
 
@@ -339,13 +518,8 @@ fn oversized_group_is_reported_as_truncated() {
 ///
 /// Проверка идёт от адреса (`note_index` → заметка в сыром порядке обхода) и от
 /// свойства правила, а не от сообщения tool'а: тест не повторяет формулировки,
-/// а пересчитывает факт.
-fn assert_finding_matches_raw(raw: &Value, finding: &Value, level: u8) {
-    assert_finding_matches_raw_labelled(raw, finding, &format!("N{level}"));
-}
-
-/// То же самое, но с произвольной меткой: oracle'ом пользуются и синтетические
-/// экспорты, у которых нет номера колоды.
+/// а пересчитывает факт. `prefix` называет экспорт в диагностике, поэтому
+/// oracle'ом пользуются и синтетические фикстуры без номера колоды.
 fn assert_finding_matches_raw_labelled(raw: &Value, finding: &Value, prefix: &str) {
     let code = finding["code"].as_str().expect("code");
     let label = format!("{prefix}: {code} #{}", finding["note_index"]);
@@ -358,7 +532,10 @@ fn assert_finding_matches_raw_labelled(raw: &Value, finding: &Value, prefix: &st
         .unwrap_or_else(|| panic!("{label}: нет заметки"));
     let models = raw_models(raw);
 
-    if code.starts_with("duplicate_") {
+    // Групповые утверждения относятся только к `duplicate_note_content`:
+    // контракт `related`/`group_size`/`related_truncated` принадлежит правилу
+    // дубликатов содержимого, а не какому-либо «главному полю» заметки.
+    if code == "duplicate_note_content" {
         assert!(
             finding["addressable"].as_bool().expect("addressable"),
             "{label}: владелец группы обязан быть адресуемым"
@@ -409,27 +586,13 @@ fn assert_finding_matches_raw_labelled(raw: &Value, finding: &Value, prefix: &st
                     .unwrap_or_else(|| panic!("{label}: нет участника группы"))
             })
             .collect();
-        match code {
-            "duplicate_note_content" => {
-                let first = serde_json::to_string(&members[0]["fields"]).expect("fields");
-                for member in &members {
-                    assert_eq!(
-                        serde_json::to_string(&member["fields"]).expect("fields"),
-                        first,
-                        "{label}: участники обязаны иметь одинаковые fields"
-                    );
-                }
-            }
-            _ => {
-                for member in &members {
-                    let ord = raw_field_position(&models, member, "Слово");
-                    assert_eq!(
-                        member["fields"][ord],
-                        members[0]["fields"][raw_field_position(&models, members[0], "Слово")],
-                        "{label}: участники обязаны иметь одинаковое головное поле"
-                    );
-                }
-            }
+        let first = serde_json::to_string(&members[0]["fields"]).expect("fields");
+        for member in &members {
+            assert_eq!(
+                serde_json::to_string(&member["fields"]).expect("fields"),
+                first,
+                "{label}: участники обязаны иметь одинаковые fields"
+            );
         }
         return;
     }
@@ -472,16 +635,18 @@ fn assert_finding_matches_raw_labelled(raw: &Value, finding: &Value, prefix: &st
 
 #[test]
 fn empty_field_findings_point_at_a_real_empty_value() {
-    let export = words_deck(1);
-    let raw = raw_json(1);
+    let raw = rich_export();
+    let temp = TempDir::new("qa-empty-field");
+    temp.write_export(&raw);
+    let export = temp.path().to_string_lossy().to_string();
+
     let mut notes = Vec::new();
     collect_notes(&raw, &mut notes);
     let expected = raw_qa_counts(&raw)["empty_field_value"];
 
-    const LIMIT: usize = 200;
-    let limit = LIMIT.to_string();
+    let limit = PRINT_LIMIT.to_string();
     let (code, parsed) = qa_json(
-        &export.to_string_lossy(),
+        &export,
         &["--code", "empty_field_value", "--max-per-code", &limit],
     );
     assert_eq!(code, 0);
@@ -489,12 +654,12 @@ fn empty_field_findings_point_at_a_real_empty_value() {
     let findings = parsed["result"]["findings"].as_array().expect("findings");
     assert_eq!(
         findings.len(),
-        expected.min(LIMIT),
+        expected.min(PRINT_LIMIT),
         "показаны ровно те findings правила, что помещаются в предел печати"
     );
     assert_eq!(
         parsed["result"]["truncated"],
-        expected > LIMIT,
+        expected > PRINT_LIMIT,
         "признак усечения следует из oracle'а"
     );
 
@@ -525,8 +690,7 @@ fn empty_field_findings_point_at_a_real_empty_value() {
 
 #[test]
 fn findings_on_unaddressable_notes_are_marked_and_counted() {
-    let temp = TempDir::new("qa-unaddressable");
-    let export = export_with(|value| {
+    let raw = export_with(|value| {
         let notes = value["notes"].as_array_mut().expect("notes");
         let mut no_guid = notes[0].clone();
         no_guid["guid"] = json!(null);
@@ -536,26 +700,15 @@ fn findings_on_unaddressable_notes_are_marked_and_counted() {
         duplicate_guid["fields"] = json!(["", "значение", ""]);
         notes.push(duplicate_guid);
     });
-    temp.write_export(&export);
-
-    let (code, parsed) = qa_json(
-        &temp.path().to_string_lossy(),
-        &["--code", "empty_field_value", "--max-per-code", "200"],
-    );
-    assert_eq!(code, 0, "неадресуемость — не отказ команды");
-
-    let findings = parsed["result"]["findings"].as_array().expect("findings");
-    assert_eq!(
-        findings.len(),
-        5,
-        "findings остаются диагностикой содержимого, даже если их нельзя исполнить"
-    );
-    assert_eq!(parsed["result"]["unaddressable_findings"], 4);
+    let temp = TempDir::new("qa-unaddressable");
+    temp.write_export(&raw);
+    let export = temp.path().to_string_lossy().to_string();
 
     // Ожидание считается по самому fixture: заметка неадресуема, если её guid
     // отсутствует или встречается больше одного раза.
-    let notes = export["notes"].as_array().expect("notes");
-    let guids: Vec<Option<&str>> = notes.iter().map(|note| note["guid"].as_str()).collect();
+    let mut raw_notes = Vec::new();
+    collect_notes(&raw, &mut raw_notes);
+    let guids: Vec<Option<&str>> = raw_notes.iter().map(|note| note["guid"].as_str()).collect();
     let duplicated: Vec<&str> = guids
         .iter()
         .flatten()
@@ -563,7 +716,21 @@ fn findings_on_unaddressable_notes_are_marked_and_counted() {
         .copied()
         .collect();
 
-    let mut marked = 0;
+    let limit = PRINT_LIMIT.to_string();
+    let (code, parsed) = qa_json(
+        &export,
+        &["--code", "empty_field_value", "--max-per-code", &limit],
+    );
+    assert_eq!(code, 0, "неадресуемость — не отказ команды");
+
+    let findings = parsed["result"]["findings"].as_array().expect("findings");
+    assert_eq!(
+        findings.len(),
+        raw_qa_counts(&raw)["empty_field_value"],
+        "counts findings пересчитываются из сырого JSON"
+    );
+
+    let mut unaddressable = 0;
     let mut addressable = 0;
     for finding in findings {
         let index = finding["note_index"].as_u64().expect("note_index") as usize;
@@ -574,47 +741,79 @@ fn findings_on_unaddressable_notes_are_marked_and_counted() {
             "адресуемость обязана совпасть с сырым guid: {finding}"
         );
         assert_eq!(
-            finding["guid"], notes[index]["guid"],
+            finding["guid"], raw_notes[index]["guid"],
             "guid заметки не подменяется"
         );
-        marked += usize::from(expected);
+        unaddressable += usize::from(expected);
         addressable += usize::from(!expected);
     }
-    assert_eq!(marked, 4);
     assert_eq!(
-        addressable, 1,
-        "правило не помечает неадресуемым всё подряд: заметка с уникальным guid остаётся целью"
+        parsed["result"]["unaddressable_findings"], unaddressable,
+        "счётчик неадресуемых findings выводится из сырых guid, а не из вывода"
+    );
+    assert!(
+        unaddressable > 0 && addressable > 0,
+        "фикстура обязана покрывать обе стороны, и правило не помечает \
+         неадресуемым всё подряд: {unaddressable} неадресуемых, {addressable} адресуемых"
     );
 }
 
 #[test]
 fn qa_summarizes_the_full_group_for_grouped_findings() {
-    let temp = TempDir::new("qa-group-context");
-    temp.write_export(&export_with(|value| {
+    let raw = export_with(|value| {
         let template = value["notes"][0].clone();
         for index in 3..6 {
             let mut copy = template.clone();
             copy["guid"] = json!(format!("guid-{index}"));
             value["notes"].as_array_mut().expect("notes").push(copy);
         }
-    }));
+    });
+    let temp = TempDir::new("qa-group-context");
+    temp.write_export(&raw);
 
     let (code, parsed) = qa_json(
         &temp.path().to_string_lossy(),
         &["--code", "duplicate_note_content"],
     );
     assert_eq!(code, 0);
-    let finding = &parsed["result"]["findings"][0];
-    assert_eq!(finding["group_size"], 4);
-    assert_eq!(finding["related_note_indices"], json!([0, 2, 3, 4]));
+
+    // Группа и её участники выводятся из сырых заметок, а не из вывода tool'а.
+    let mut notes = Vec::new();
+    collect_notes(&raw, &mut notes);
+    let group_fingerprint = serde_json::to_string(&notes[0]["fields"]).expect("fields");
+    let group_model = notes[0]["note_model_uuid"].clone();
+    let members: Vec<usize> = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, note)| {
+            note["note_model_uuid"] == group_model
+                && serde_json::to_string(&note["fields"]).expect("fields") == group_fingerprint
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let member_guids: Vec<&str> = members
+        .iter()
+        .map(|index| notes[*index]["guid"].as_str().expect("guid"))
+        .collect();
+
+    let findings = parsed["result"]["findings"].as_array().expect("findings");
+    assert_eq!(
+        findings.len(),
+        raw_qa_counts(&raw)["duplicate_note_content"],
+        "группа описывается одним finding'ом"
+    );
+    let finding = &findings[0];
+    assert_eq!(finding["group_size"], members.len());
+    assert_eq!(finding["related_note_indices"], json!(members));
     assert_eq!(
         finding["related_guids"],
-        json!(["guid-1", "guid-3", "guid-4", "guid-5"]),
+        json!(member_guids),
         "участники названы так, чтобы предложение можно было исполнить"
     );
     assert_eq!(finding["related_truncated"], false);
     assert_eq!(
-        finding["evidence"]["fields_total"], 3,
+        finding["evidence"]["fields_total"],
+        notes[0]["fields"].as_array().expect("fields").len(),
         "evidence хранит только то, что относится к правилу"
     );
 }
@@ -652,6 +851,79 @@ fn human_truncation_message_names_the_real_way_to_see_the_rest() {
     assert!(stdout.contains("остальные не выводятся"), "{stdout}");
 }
 
+/// QA судит о значениях, а не об именах полей, моделей и колод.
+///
+/// Один и тот же набор значений под полностью другими именами обязан дать тот
+/// же набор findings — те же коды в тех же позициях. `ord` при этом не меняется,
+/// а объявление `flds` намеренно идёт не по порядку: адрес поля задаётся `ord`
+/// модели, поэтому ни имя, ни позиция объявления на результат не влияют.
+#[test]
+fn rules_are_independent_of_field_and_model_names() {
+    let baseline = export_with(rich_values);
+    let renamed = export_with(|value| {
+        rich_values(value);
+        value["name"] = json!("Совсем другая колода");
+        let model = &mut value["note_models"][0];
+        model["crowdanki_uuid"] = json!("model-alpha");
+        model["name"] = json!("Модель \"Альфа\"");
+        model["flds"] = json!([
+            {"name": "Поле третье", "ord": 2},
+            {"name": "Поле первое", "ord": 0},
+            {"name": "Поле второе", "ord": 1}
+        ]);
+        for note in value["notes"].as_array_mut().expect("notes") {
+            note["note_model_uuid"] = json!("model-alpha");
+        }
+    });
+
+    let baseline_dir = TempDir::new("qa-renamed-baseline");
+    baseline_dir.write_export(&baseline);
+    let renamed_dir = TempDir::new("qa-renamed-model");
+    renamed_dir.write_export(&renamed);
+
+    let limit = PRINT_LIMIT.to_string();
+    let (code, base_parsed) = qa_json(
+        &baseline_dir.path().to_string_lossy(),
+        &["--max-per-code", &limit],
+    );
+    assert_eq!(code, 0);
+    let (code, renamed_parsed) = qa_json(
+        &renamed_dir.path().to_string_lossy(),
+        &["--max-per-code", &limit],
+    );
+    assert_eq!(code, 0);
+
+    let shape = finding_shape(&base_parsed);
+    assert!(
+        !shape.is_empty(),
+        "фикстура обязана давать findings, иначе равенство пусто"
+    );
+    assert_eq!(
+        shape,
+        finding_shape(&renamed_parsed),
+        "переименование полей, моделей и колоды не меняет набор findings"
+    );
+    assert_eq!(
+        base_parsed["result"]["by_code"], renamed_parsed["result"]["by_code"],
+        "counts по кодам тоже не зависят от имён"
+    );
+
+    // Проверка, что переименование действительно применилось: иначе равенство
+    // выше выполнялось бы по тривиальной причине.
+    let renamed_findings = renamed_parsed["result"]["findings"]
+        .as_array()
+        .expect("findings");
+    for finding in renamed_findings {
+        assert_eq!(finding["note_model_uuid"], "model-alpha");
+        if let Some(name) = finding["field"].as_str() {
+            assert!(
+                name.starts_with("Поле "),
+                "имя поля обязано быть переименованным: {name}"
+            );
+        }
+    }
+}
+
 /// Шкала QA не связана со шкалой `validate`: `error` у правила — это серьёзный
 /// дефект содержимого, а не структурная ошибка экспорта.
 #[test]
@@ -676,7 +948,7 @@ fn qa_error_severity_neither_invalidates_the_export_nor_blocks_edit() {
     // И не мешает правке значения поля.
     let request = common::edit_request(&[(
         "guid-1",
-        "Слово",
+        "Заголовок",
         "<span style=\"color: #fff\">偶然</span>",
         "偶然",
     )]);

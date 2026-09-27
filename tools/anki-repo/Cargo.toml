@@ -1,8 +1,11 @@
 [package]
 name = "anki-repo"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.88"
+# `edition` и `rust-version` принадлежат корневому workspace (`/Cargo.toml`,
+# `[workspace.package]`): toolchain/MSRV объявлены там один раз для всех
+# Rust-участников репозитория, а CI читает их оттуда же.
+edition.workspace = true
+rust-version.workspace = true
 description = "CLI для детерминированного анализа CrowdAnki-экспортов репозитория Anki-decks и точечной правки значений их полей"
 publish = false
 
@@ -15,8 +18,8 @@ thiserror = "2"
 # Межпроцессная сериализация публикации `deck.json`. Публичный API этого crate
 # под `unsafe_code = "forbid"`, поэтому блокировка берётся не через ручной FFI,
 # а через небольшую обёртку над `flock(2)`. На Linux зависимость сводится к
-# `libc`; `File::lock`/`try_lock` из std появились только в Rust 1.89, а MSRV
-# crate — 1.88.
+# `libc`; `File::lock`/`try_lock` из std появились только в Rust 1.89, а
+# заявленная в корневом workspace MSRV ниже этой версии.
 [target.'cfg(unix)'.dependencies]
 fs2 = "0.4"
 

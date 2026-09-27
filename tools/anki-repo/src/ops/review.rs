@@ -25,7 +25,7 @@
 //! [`crate::ops::validate`], `review` их не диагностирует.
 //!
 //! Третий контракт — контекст группы. Для групповых QA-finding'ов
-//! (`duplicate_note_content`, `duplicate_primary_field`) в batch попадают все
+//! (например, `duplicate_note_content`) в batch попадают все
 //! участники группы, а не только та заметка, к которой приписан finding: иначе
 //! агент не может судить о дубликате, не прочитав `deck.json`. Участники берутся
 //! из domain-результата ([`qa::Finding::related`]), а не собираются здесь
@@ -527,14 +527,17 @@ mod tests {
     fn items_carry_named_fields() {
         let result = run(MINIMAL_EXPORT, &query(ReviewCriteria::All));
         let second = &result.items[1];
-        assert_eq!(second.note.note_model_name.as_deref(), Some("Слова"));
+        assert_eq!(
+            second.note.note_model_name.as_deref(),
+            Some("Тестовая модель")
+        );
         let names: Vec<&str> = second
             .note
             .fields
             .iter()
             .map(|field| field.name.as_str())
             .collect();
-        assert_eq!(names, vec!["Слово", "Значение"]);
+        assert_eq!(names, vec!["Заголовок", "Толкование"]);
         assert_eq!(
             second.note.fields[1].value.as_deref(),
             Some(""),
@@ -638,7 +641,7 @@ mod tests {
             MINIMAL_EXPORT,
             &ReviewQuery {
                 criteria: ReviewCriteria::Field {
-                    field: "Слово".to_string(),
+                    field: "Заголовок".to_string(),
                     value: "偶然".to_string(),
                     mode: MatchMode::Exact,
                 },
@@ -656,7 +659,7 @@ mod tests {
             MINIMAL_EXPORT,
             &ReviewQuery {
                 criteria: ReviewCriteria::Field {
-                    field: "Слово".to_string(),
+                    field: "Заголовок".to_string(),
                     value: "偶然".to_string(),
                     mode: MatchMode::Contains,
                 },

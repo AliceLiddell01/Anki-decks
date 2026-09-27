@@ -16,7 +16,7 @@ use crate::loader::load_export;
 use crate::ops::edit as edit_op;
 use crate::ops::edit::{EditRequest, EditSpec, STDIN_REQUEST_SOURCE};
 use crate::ops::find as find_op;
-use crate::ops::find::{FindCriteria, FindQuery, MatchMode, WORD_SHORTCUT_FIELD};
+use crate::ops::find::{FindCriteria, FindQuery, MatchMode};
 use crate::ops::inspect as inspect_op;
 use crate::ops::qa as qa_op;
 use crate::ops::qa::QaQuery;
@@ -71,7 +71,6 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
         Command::Find {
             export_dir,
             guid,
-            word,
             field,
             value,
             match_mode,
@@ -83,7 +82,6 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             let query = FindQuery {
                 criteria: build_criteria(
                     guid.as_deref(),
-                    word.as_deref(),
                     field.as_deref(),
                     value.as_deref(),
                     *match_mode,
@@ -166,7 +164,6 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             export_dir,
             all,
             guid,
-            word,
             field,
             value,
             match_mode,
@@ -181,7 +178,6 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 criteria: build_review_criteria(
                     *all,
                     guid.as_deref(),
-                    word.as_deref(),
                     field.as_deref(),
                     value.as_deref(),
                     *match_mode,
@@ -303,7 +299,7 @@ fn build_edit_request(
 /// Читает документ запроса из файла или stdin.
 ///
 /// `max_bytes` — предел размера документа, объявленный его владельцем
-/// (`edit` и `review-check` используют один и тот же предел Stage 2).
+/// (`edit` и `review-check` используют один и тот же предел запроса правки).
 fn read_document(path: &Path, max_bytes: usize, what: &str) -> Result<Vec<u8>, DomainError> {
     let label = path.display().to_string();
     let limit = document_read_limit(max_bytes);
@@ -350,7 +346,6 @@ fn document_read_error(what: &str, label: &str, error: &std::io::Error) -> Domai
 
 fn build_criteria(
     guid: Option<&str>,
-    word: Option<&str>,
     field: Option<&str>,
     value: Option<&str>,
     match_mode: Option<MatchArg>,
@@ -368,13 +363,6 @@ fn build_criteria(
             guid: guid.to_string(),
         });
     }
-    if let Some(word) = word {
-        return Ok(FindCriteria::Field {
-            field: WORD_SHORTCUT_FIELD.to_string(),
-            value: word.to_string(),
-            mode: MatchMode::Contains,
-        });
-    }
     if let Some(field) = field {
         return Ok(FindCriteria::Field {
             field: field.to_string(),
@@ -387,7 +375,7 @@ fn build_criteria(
     }
     Err(DomainError::new(
         ErrorCode::Usage,
-        "не задан критерий поиска: нужен один из --guid, --word или --field",
+        "не задан критерий поиска: нужен --guid или --field",
     ))
 }
 
@@ -405,13 +393,13 @@ const fn to_usize(value: u64) -> usize {
 
 /// Собирает критерий выбора для `review`.
 ///
-/// `--word` повторяет сокращение `find`: `contains` по сырому значению поля
-/// «Слово». Взаимная исключительность аргументов проверяется clap, а
-/// зависимость `--match` от `--field` — здесь, как и в `find`.
+/// `review` и `find` принимают одинаковые критерии по полю: `--field` со
+/// значением и, необязательно, `--match`. Взаимная исключительность аргументов
+/// проверяется clap, а зависимость `--match` от `--field` — здесь, как и в
+/// `find`.
 fn build_review_criteria(
     all: bool,
     guid: Option<&str>,
-    word: Option<&str>,
     field: Option<&str>,
     value: Option<&str>,
     match_mode: Option<MatchArg>,
@@ -431,13 +419,6 @@ fn build_review_criteria(
             guid: guid.to_string(),
         });
     }
-    if let Some(word) = word {
-        return Ok(ReviewCriteria::Field {
-            field: WORD_SHORTCUT_FIELD.to_string(),
-            value: word.to_string(),
-            mode: MatchMode::Contains,
-        });
-    }
     if let Some(code) = qa_code {
         return Ok(ReviewCriteria::QaCode {
             code: code.to_string(),
@@ -455,7 +436,7 @@ fn build_review_criteria(
     }
     Err(DomainError::new(
         ErrorCode::Usage,
-        "не задан критерий отбора: нужен один из --all, --guid, --word, --field или --qa-code",
+        "не задан критерий отбора: нужен один из --all, --guid, --field или --qa-code",
     ))
 }
 

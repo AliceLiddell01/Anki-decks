@@ -2,7 +2,7 @@
 //! `qa/review → предложения → review-check → edit`.
 //!
 //! Ключевые свойства: `review-check` ничего не пишет, отдаёт готовый запрос
-//! Stage 2 только для полностью валидного документа и различает stale,
+//! запрос для `edit` только для полностью валидного документа и различает stale,
 //! invalid и conflict.
 //!
 //! Вход команды — собственный versioned документ предложений (`proposals`), а не
@@ -43,7 +43,7 @@ fn check_json(export: &str, request: &Value, name: &str) -> (i32, Value) {
 }
 
 #[test]
-fn valid_proposals_produce_a_stage_two_request() {
+fn valid_proposals_produce_an_edit_request() {
     let temp = TempDir::new("review-check-valid");
     temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[
@@ -131,9 +131,9 @@ fn no_request_is_emitted_when_nothing_is_effective() {
     let temp = TempDir::new("review-check-noop");
     temp.write_canonical_deck_json(&proposals_export());
     let request = proposals_document(&[
-        ("guid-1", "Пример", "", ""),                   // значение не меняется
-        ("guid-2", "Значение", "значение", "значение"), // тоже без изменения
-        ("guid-2", "Пример", "не то", "новое"),         // конфликт
+        ("guid-1", "Пример", "", ""),                     // значение не меняется
+        ("guid-2", "Толкование", "значение", "значение"), // тоже без изменения
+        ("guid-2", "Пример", "не то", "новое"),           // конфликт
     ]);
     let (code, parsed) = check_json(&temp.path().to_string_lossy(), &request, "p.json");
 
@@ -518,7 +518,7 @@ fn human_mode_explains_statuses_and_the_missing_request() {
         "Итог: stale",
         "valid 1",
         "conflict 1",
-        "Готовый запрос для Stage 2: нет: отчёт не ok",
+        "Готовый запрос для edit: нет: отчёт не ok",
         "#0 valid",
         "#1 conflict",
         "ожидалось: не то",
@@ -597,7 +597,7 @@ fn proposal_metadata_is_reported_but_never_enters_the_request() {
     assert_eq!(
         emitted.get("reason"),
         None,
-        "review metadata не переносится в запрос Stage 2"
+        "review metadata не переносится в запрос edit"
     );
     assert_eq!(emitted["expected"], "");
     assert_eq!(emitted["replacement"], "пример-1");
@@ -628,7 +628,7 @@ fn full_pipeline_applies_exactly_one_reviewed_change() {
     assert_eq!(item["guid"], "guid-1");
     assert_eq!(item["fields"]["Пример"], "");
 
-    // 2. Внешний агент возвращает предложение в форме Stage 2.
+    // 2. Внешний агент возвращает предложение в форме запроса `edit`.
     let proposals = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     let proposals_path = write_proposals(&export_dir, "proposals.json", &proposals);
 

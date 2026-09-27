@@ -107,8 +107,7 @@ fn deck_json_path(export_dir: &Path) -> Result<PathBuf, DomainError> {
         return Err(DomainError::with_details(
             ErrorCode::InputUnreadable,
             format!(
-                "{} не является каталогом; укажите каталог экспорта, например \
-                 decks/japanese/words/Words__N3",
+                "{} не является каталогом; укажите каталог, в котором лежит deck.json",
                 export_dir.display()
             ),
             details! {

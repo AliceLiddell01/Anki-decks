@@ -9,17 +9,14 @@
 //!
 //! Здесь нет ни файлового ввода-вывода, ни доменных результатов: только чистые
 //! функции над [`ExportIndex`] и доменные ошибки для неразрешимых критериев.
+//!
+//! Ни одно правило выбора не знает имён полей конкретной модели: поле всегда
+//! называет вызывающая сторона, а [`ensure_known_field`] сверяет имя с
+//! фактическими `note_models[].flds[].name` экспорта.
 
 use crate::details;
 use crate::error::{DomainError, ErrorCode};
 use crate::index::{ExportIndex, NoteRef, field_value_by_name};
-
-/// Имя головного поля словарной модели.
-///
-/// Используется сокращением `--word` в `find`/`review` и QA-правилом
-/// `duplicate_primary_field`. Это имя поля конкретной модели, а не позиция в
-/// `fields`: любое использование обязано разрешаться через саму модель.
-pub const PRIMARY_FIELD: &str = "Слово";
 
 /// Режим сопоставления значения поля.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,13 +204,14 @@ mod tests {
         let node = deck_node(MINIMAL_EXPORT);
         let index = ExportIndex::build(&node);
 
-        let positions = positions_matching_field(&index, "Слово", "", MatchMode::Contains, None);
+        let positions =
+            positions_matching_field(&index, "Заголовок", "", MatchMode::Contains, None);
         assert_eq!(positions, vec![0, 1]);
 
-        let exact = positions_matching_field(&index, "Слово", "必然", MatchMode::Exact, None);
+        let exact = positions_matching_field(&index, "Заголовок", "必然", MatchMode::Exact, None);
         assert_eq!(exact, vec![1]);
         assert!(
-            positions_matching_field(&index, "Слово", "必", MatchMode::Exact, None).is_empty(),
+            positions_matching_field(&index, "Заголовок", "必", MatchMode::Exact, None).is_empty(),
             "exact не должен совпадать по подстроке"
         );
     }
@@ -228,7 +226,7 @@ mod tests {
             error.details["available_fields"].as_array().map(Vec::len),
             Some(2)
         );
-        ensure_known_field(&index, "Слово").expect("поле модели известно");
+        ensure_known_field(&index, "Заголовок").expect("поле модели известно");
     }
 
     #[test]
@@ -239,21 +237,21 @@ mod tests {
         let node = deck_node(&json);
         let index = ExportIndex::build(&node);
 
-        assert_eq!(note_field_text(&index, &index.notes[0], "Слово"), None);
+        assert_eq!(note_field_text(&index, &index.notes[0], "Заголовок"), None);
         assert!(!note_field_matches(
             &index,
             &index.notes[0],
-            "Слово",
+            "Заголовок",
             "42",
             MatchMode::Contains
         ));
         assert_eq!(
-            positions_matching_field(&index, "Слово", "42", MatchMode::Contains, None),
+            positions_matching_field(&index, "Заголовок", "42", MatchMode::Contains, None),
             Vec::<usize>::new(),
             "нестроковое значение не участвует в критерии"
         );
         assert_eq!(
-            positions_matching_field(&index, "Слово", "必然", MatchMode::Exact, None),
+            positions_matching_field(&index, "Заголовок", "必然", MatchMode::Exact, None),
             vec![1],
             "строковое значение другой заметки по-прежнему находится"
         );

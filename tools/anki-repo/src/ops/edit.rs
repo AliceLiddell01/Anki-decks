@@ -1603,9 +1603,9 @@ mod tests {
             edit_index: 0,
             edit_id: None,
             guid: "guid-1".to_string(),
-            deck_path: "Words::N1".to_string(),
+            deck_path: "Тестовая колода::Вложенная".to_string(),
             note_position: 0,
-            field: "Значение".to_string(),
+            field: "Толкование".to_string(),
             field_ord: 2,
             current: current.to_string(),
             expected: expected.to_string(),
@@ -1685,7 +1685,7 @@ mod tests {
             .map(|position| EditSpec {
                 edit_id: None,
                 guid: format!("guid-{position}"),
-                field: "Значение".to_string(),
+                field: "Толкование".to_string(),
                 expected: "a".to_string(),
                 replacement: "b".to_string(),
             })

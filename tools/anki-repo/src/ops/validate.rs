@@ -898,7 +898,7 @@ fn check_templates(index: &ExportIndex<'_>, issues: &mut Vec<Issue>) {
                             None,
                             format!("{base}.tmpls[{position}].{side}"),
                             format!(
-                                "template construct {:?} нельзя проверить ограниченным Stage 1 parser'ом",
+                                "template construct {:?} нельзя проверить ограниченным parser'ом",
                                 construct.raw
                             ),
                             details! {
@@ -1272,24 +1272,24 @@ mod tests {
 
     #[test]
     fn scans_simple_and_braced_constructs() {
-        let found = scan_template("{{Слово}}{{#Значение}}А{{/Значение}}");
+        let found = scan_template("{{Заголовок}}{{#Толкование}}А{{/Толкование}}");
         let tokens: Vec<&str> = found.iter().map(|item| item.token.as_str()).collect();
-        assert_eq!(tokens, vec!["Слово", "Значение", "Значение"]);
-        assert_eq!(found[0].raw, "{{Слово}}");
+        assert_eq!(tokens, vec!["Заголовок", "Толкование", "Толкование"]);
+        assert_eq!(found[0].raw, "{{Заголовок}}");
     }
 
     #[test]
     fn reports_unterminated_construct_once() {
-        let found = scan_template("{{Слово");
+        let found = scan_template("{{Заголовок");
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].token, "Слово");
+        assert_eq!(found[0].token, "Заголовок");
     }
 
     #[test]
     fn classifies_known_names_and_special_tokens() {
-        let known = fields(&["Слово", "Значение"]);
+        let known = fields(&["Заголовок", "Толкование"]);
         assert_eq!(
-            classify_template_token("Слово", &known),
+            classify_template_token("Заголовок", &known),
             TemplateToken::Known
         );
         assert_eq!(
@@ -1305,9 +1305,9 @@ mod tests {
 
     #[test]
     fn classifies_filters_conservatively() {
-        let known = fields(&["Слово"]);
+        let known = fields(&["Заголовок"]);
         assert_eq!(
-            classify_template_token("tts ja_JP:Слово", &known),
+            classify_template_token("tts ja_JP:Заголовок", &known),
             TemplateToken::Known
         );
         assert_eq!(
@@ -1318,7 +1318,7 @@ mod tests {
 
     #[test]
     fn classifies_unknown_simple_reference_as_unresolved() {
-        let known = fields(&["Слово"]);
+        let known = fields(&["Заголовок"]);
         assert_eq!(
             classify_template_token("Пропавшее", &known),
             TemplateToken::Unresolved
