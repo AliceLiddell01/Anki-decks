@@ -284,8 +284,8 @@ fn guids_are_reported_accurately() {
         );
     }
 
-    let value = loaded.root.name.clone();
-    assert_eq!(value, "Группа", "корневой узел читается из экспорта");
+    let root_name = loaded.root.name.clone();
+    assert_eq!(root_name, "Группа", "корневой узел читается из экспорта");
 }
 
 #[test]
