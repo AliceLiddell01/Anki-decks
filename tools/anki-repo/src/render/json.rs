@@ -19,7 +19,7 @@ use crate::ops::review::ReviewResult;
 use crate::ops::review_check::ReviewCheckResult;
 use crate::ops::stats::StatsResult;
 use crate::ops::validate::{SeverityCounts, ValidateResult};
-use crate::ops::visual_report::{ReportSide, VisualReportResult};
+use crate::ops::visual_report::{PreviewFileFact, ReportSide, VisualReportResult};
 use crate::template::ModelKind;
 
 /// Версия machine-readable контракта.
@@ -1442,6 +1442,8 @@ struct VisualReportDto<'a> {
     index_html: String,
     card_files: &'a [String],
     card_files_total: usize,
+    preview_files: Vec<PreviewFileDto<'a>>,
+    preview_files_truncated: bool,
     retire_tag: Option<&'a str>,
     counts: ReportCountsDto,
     outcomes: Vec<NoteOutcomeDto<'a>>,
@@ -1512,6 +1514,46 @@ struct DiagnosticDto<'a> {
     subject: Option<&'a str>,
 }
 
+/// Файл превью и то, что он доказывает.
+#[derive(Serialize)]
+struct PreviewFileDto<'a> {
+    file: &'a str,
+    state: &'static str,
+    guid: &'a str,
+    model_name: &'a str,
+    template_name: &'a str,
+    hint: &'a str,
+    media: &'a [String],
+    missing_sounds: &'a [String],
+}
+
+impl<'a> From<&'a PreviewFileFact> for PreviewFileDto<'a> {
+    fn from(fact: &'a PreviewFileFact) -> Self {
+        Self {
+            file: &fact.file,
+            state: fact.state.as_str(),
+            guid: &fact.guid,
+            model_name: &fact.model_name,
+            template_name: &fact.template_name,
+            hint: &fact.hint,
+            media: &fact.media,
+            missing_sounds: &fact.missing_sounds,
+        }
+    }
+}
+
+/// Сводка по media одного состояния.
+#[derive(Serialize)]
+struct StateMediaDto<'a> {
+    state: &'static str,
+    copied: &'a [String],
+    missing: &'a [String],
+    traversal: &'a [String],
+    remote: &'a [String],
+    symlinks: &'a [String],
+    oversized: &'a [String],
+}
+
 #[derive(Serialize)]
 struct MediaSummaryDto<'a> {
     copied: usize,
@@ -1521,6 +1563,7 @@ struct MediaSummaryDto<'a> {
     symlinks: &'a [String],
     oversized: &'a [String],
     budget_skipped: usize,
+    states: Vec<StateMediaDto<'a>>,
 }
 
 #[derive(Serialize)]
@@ -1543,6 +1586,12 @@ impl<'a> From<&'a VisualReportResult> for VisualReportDto<'a> {
             index_html: result.index_html.display().to_string(),
             card_files: &result.card_files,
             card_files_total: result.card_files_total,
+            preview_files: result
+                .preview_files
+                .iter()
+                .map(PreviewFileDto::from)
+                .collect(),
+            preview_files_truncated: result.preview_files_truncated,
             retire_tag: result.retire_tag.as_deref(),
             counts: ReportCountsDto {
                 created: result.counts.created,
@@ -1597,6 +1646,20 @@ impl<'a> From<&'a VisualReportResult> for VisualReportDto<'a> {
                 symlinks: &result.media.symlinks,
                 oversized: &result.media.oversized,
                 budget_skipped: result.media.budget_skipped,
+                states: result
+                    .media
+                    .states
+                    .iter()
+                    .map(|(state, summary)| StateMediaDto {
+                        state: state.as_str(),
+                        copied: &summary.copied,
+                        missing: &summary.missing,
+                        traversal: &summary.traversal,
+                        remote: &summary.remote,
+                        symlinks: &summary.symlinks,
+                        oversized: &summary.oversized,
+                    })
+                    .collect(),
             },
             limitations: &result.limitations,
             checks: ReportChecksDto {

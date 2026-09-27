@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -34,6 +35,7 @@ use crate::index::{ExportIndex, NoteRef, model_fields_in_ord_order, resolve_name
 use crate::media as media_index;
 use crate::model::{DeckNode, FieldValue, NoteModel, TemplateDef};
 use crate::ops::retire::validate_tag;
+use crate::report::SideState;
 use crate::report::diff::{TokenKind, diff_tokens_lossy};
 use crate::report::html::{
     CardFile, CardSide, DiffMark, FieldDiff, ReportCard, ReportCounts, ReportDiagnosticView,
@@ -229,6 +231,10 @@ pub struct UnsupportedConstruct {
 }
 
 /// Сводка работы с media.
+///
+/// Общие списки (`copied`, `missing`, …) описывают отчёт целиком, а `states`
+/// называет то же самое по состояниям: одинаковое имя файла в «до» и «после» —
+/// это два разных факта, и по общей сводке их не различить.
 #[derive(Debug, Clone, Default)]
 pub struct MediaSummary {
     /// Сколько файлов скопировано в отчёт.
@@ -245,6 +251,29 @@ pub struct MediaSummary {
     pub oversized: Vec<String>,
     /// Сколько ссылок не обработано из-за предела.
     pub budget_skipped: usize,
+    /// Работа с media по состояниям.
+    pub states: Vec<(SideState, media::StateMedia)>,
+}
+
+/// Файл превью вместе с тем, что он доказывает: состояние, заметку и модель.
+#[derive(Debug, Clone)]
+pub struct PreviewFileFact {
+    /// Относительный путь файла внутри каталога отчёта.
+    pub file: String,
+    /// Состояние, из которого построено превью.
+    pub state: SideState,
+    /// `guid` заметки.
+    pub guid: String,
+    /// Имя модели.
+    pub model_name: String,
+    /// Имя шаблона.
+    pub template_name: String,
+    /// Подпись шаблона в превью: `до`/`после` и ord.
+    pub hint: String,
+    /// Относительные пути media, которые превью использует.
+    pub media: Vec<String>,
+    /// Звуки без файла: показаны как отсутствующие.
+    pub missing_sounds: Vec<String>,
 }
 
 /// Выполненные проверки отчёта.
@@ -285,6 +314,10 @@ pub struct VisualReportResult {
     pub card_files: Vec<String>,
     /// Сколько файлов превью записано всего.
     pub card_files_total: usize,
+    /// Что доказывает каждый файл превью (обрезано до [`MAX_LISTED_NOTES`]).
+    pub preview_files: Vec<PreviewFileFact>,
+    /// Был ли список превью обрезан.
+    pub preview_files_truncated: bool,
     /// Тег вывода из обращения.
     pub retire_tag: Option<String>,
     /// Счётчики отчёта.
@@ -345,7 +378,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     let classification = classify(&before, &after, request.retire_tag.as_deref());
     let mut counts = classification.counts;
     let mut diagnostics = classification.diagnostics;
-    let mut build = Build::new(&after);
+    let mut build = Build::new(&before, &after);
 
     let mut sections: Vec<ReportSection> = Vec::new();
     for plan in &classification.plans {
@@ -406,42 +439,80 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
         });
     }
 
-    // Источники — каталоги экспорта, а не их `media`: подкаталог выбирает сам
-    // план, и второй раз присоединять его здесь означало бы искать файлы в
-    // `media/media/`.
+    // Источники — каталоги экспорта вместе с их состоянием, а не их `media`:
+    // подкаталог выбирает сам план, и второй раз присоединять его здесь означало
+    // бы искать файлы в `media/media/`. Состояние обязательно: файл ищется только
+    // в своём экспорте, иначе превью «до» показало бы файл из «после».
     let source_exports = [
-        after.summary.export_dir.clone(),
-        before.summary.export_dir.clone(),
+        (SideState::Before, before.summary.export_dir.clone()),
+        (SideState::After, after.summary.export_dir.clone()),
     ];
     let mut media_plan = media::plan(&source_exports, &build.media_references, &out_dir)?;
     media::note_symlinks(&mut media_plan, &source_exports, &build.media_references);
     push_media_diagnostics(&media_plan, &mut diagnostics);
     diagnostics.append(&mut build.preview_issues);
 
-    let mut touched: Vec<String> = build.touched_models.iter().cloned().collect();
+    let mut touched: Vec<(SideState, String)> = build
+        .touched_models
+        .iter()
+        .flat_map(|(state, uuids)| uuids.iter().map(|uuid| (*state, uuid.clone())))
+        .collect();
     touched.sort();
-    for uuid in &touched {
-        if let Some(scan) = build.model_scans.get(uuid) {
+    for (state, uuid) in &touched {
+        if let Some(scan) = build
+            .model_scans
+            .get(state)
+            .and_then(|scans| scans.get(uuid))
+        {
             emit_model_diagnostics(scan, uuid, &mut diagnostics);
         }
     }
 
     // Подстановка ссылок выполняется после планирования media: до него неизвестно,
-    // какие файлы окажутся рядом с отчётом.
+    // какие файлы окажутся рядом с отчётом. Ссылка состояния подставляется только
+    // на файл своего состояния, а звук без файла честно помечается отсутствующим.
     let mut written: Vec<PathBuf> = Vec::new();
-    for (file, document) in &build.card_documents {
-        let mut document = document.clone();
-        for side in &mut document.sides {
-            side.html = rewrite_media_refs(&side.html, &media_plan, "../");
+    let mut preview_files: Vec<PreviewFileFact> = Vec::new();
+    let documents = std::mem::take(&mut build.card_documents);
+    for document in &documents {
+        let mut card = document.document.clone();
+        let mut resolved_media: BTreeSet<String> = BTreeSet::new();
+        let mut missing_sounds: BTreeSet<String> = BTreeSet::new();
+        for side in &mut card.sides {
+            side.html = rewrite_preview_references(
+                &side.html,
+                document.state,
+                &media_plan,
+                &mut resolved_media,
+                &mut missing_sounds,
+            );
         }
-        let path = out_dir.join(file);
-        write_report_file(&path, card_html(&document).as_bytes())?;
+        let path = out_dir.join(&document.file);
+        write_report_file(&path, card_html(&card).as_bytes())?;
         written.push(path);
+        preview_files.push(PreviewFileFact {
+            file: document.file.clone(),
+            state: document.state,
+            guid: document.guid.clone(),
+            model_name: document.model_name.clone(),
+            template_name: document.template_name.clone(),
+            hint: document.hint.clone(),
+            media: resolved_media.into_iter().collect(),
+            missing_sounds: missing_sounds.into_iter().collect(),
+        });
     }
 
-    let unsupported: Vec<UnsupportedConstruct> = touched
+    // Одна и та же модель может быть затронута в обоих состояниях: в списке
+    // неподдержанных конструкций она обязана появиться один раз.
+    let mut unsupported: Vec<UnsupportedConstruct> = Vec::new();
+    for item in touched
         .iter()
-        .filter_map(|uuid| build.model_scans.get(uuid))
+        .filter_map(|(state, uuid)| {
+            build
+                .model_scans
+                .get(state)
+                .and_then(|scans| scans.get(uuid))
+        })
         .flat_map(|scan| {
             scan.unsupported
                 .iter()
@@ -450,7 +521,14 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
                     reason: reason.clone(),
                 })
         })
-        .collect();
+    {
+        if !unsupported
+            .iter()
+            .any(|known| known.construct == item.construct && known.reason == item.reason)
+        {
+            unsupported.push(item);
+        }
+    }
 
     let card_files_total = build.card_files.len();
     counts.previews = card_files_total;
@@ -485,12 +563,17 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     written.push(index_path.clone());
 
     let all_inside = written.iter().all(|path| path.starts_with(&out_dir));
-    let media_dir = out_dir.join(media::MEDIA_SUBDIR);
-    let media_confined = media_plan.copied.iter().all(|name| {
-        !name.contains('/')
-            && !name.contains('\\')
-            && media_dir.join(name).starts_with(&out_dir)
-            && media_dir.join(name).is_file()
+    // Скопированный файл обязан лежать в подкаталоге media своего состояния:
+    // проверка повторяет границу каталога независимо от того, как планировщик
+    // сложил пути.
+    let media_confined = SideState::ALL.iter().all(|state| {
+        let dir = out_dir.join(state.media_dir());
+        media_plan.state(*state).copied.iter().all(|name| {
+            !name.contains('/')
+                && !name.contains('\\')
+                && dir.join(name).starts_with(&out_dir)
+                && dir.join(name).is_file()
+        })
     });
     let out_dir_outside_decks = !canonical_ish(&out_dir)
         .components()
@@ -508,6 +591,8 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
             .cloned()
             .collect(),
         card_files_total,
+        preview_files_truncated: preview_files.len() > MAX_LISTED_NOTES,
+        preview_files: preview_files.into_iter().take(MAX_LISTED_NOTES).collect(),
         retire_tag: request.retire_tag.clone(),
         counts,
         outcomes_truncated: classification.outcomes.len() > MAX_LISTED_NOTES,
@@ -519,13 +604,17 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
         diagnostics,
         unsupported_constructs: unsupported,
         media: MediaSummary {
-            copied: media_plan.copied.len(),
-            missing: media_plan.missing.clone(),
-            traversal: media_plan.traversal.clone(),
-            remote: media_plan.remote.clone(),
-            symlinks: media_plan.symlinks.clone(),
-            oversized: media_plan.oversized.clone(),
+            copied: media_plan.copied_total(),
+            missing: media_plan.missing_union(),
+            traversal: media_plan.traversal_union(),
+            remote: media_plan.remote_union(),
+            symlinks: media_plan.symlinks_union(),
+            oversized: media_plan.oversized_union(),
             budget_skipped: media_plan.budget_skipped,
+            states: SideState::ALL
+                .iter()
+                .map(|state| (*state, media_plan.state(*state)))
+                .collect(),
         },
         limitations,
         checks: ReportChecks {
@@ -563,20 +652,32 @@ fn index_references_external(index: &str) -> bool {
 /// Ограничения отчёта — то, что он заведомо не показывает.
 fn limitations() -> Vec<String> {
     vec![
-        "Превью статическое: JavaScript шаблона не выполняется, cloze-разметка и фильтры \
-         (cloze, type, tts, furigana, hint) не вычисляются. Неподдержанные конструкции видны \
-         в самом превью сырым текстом и перечислены отдельным разделом."
+        "Превью разметки статическое: cloze-разметка и фильтры (cloze, type, tts, furigana, \
+         hint) не вычисляются. Неподдержанные конструкции видны в самом превью сырым текстом и \
+         перечислены отдельным разделом."
             .to_string(),
-        "Обёртка карточки собрана как `card card{N}`, где N — ord шаблона плюс один. Ночной \
-         режим, масштаб шрифта и темы устройства не воспроизводятся: показывается только \
-         дневное оформление."
+        "Свой код отчёта выполняется: он переключает светлую и ночную тему, подгоняет высоту \
+         кадра по содержимому и показывает звук проигрывателем. Он детерминированно записан в \
+         сами файлы отчёта и не ходит в сеть. Код шаблона Anki при этом не выполняется: \
+         `<script>` из шаблона или значения поля остаётся неподдержанной конструкцией и показан \
+         в превью текстом, а не тегом."
+            .to_string(),
+        "Обёртка карточки собрана как `card card{N}`, где N — ord шаблона плюс один. Ночная тема \
+         переключается классом `nightMode` на корне документа и на самой карточке, как в Anki, \
+         поэтому селекторы модели `.card.nightMode` и `.nightMode .…` применяются; тёмные \
+         значения по умолчанию — разумное приближение, а не копия темы Anki. Масштаб шрифта \
+         интерфейса и темы устройства не воспроизводятся."
             .to_string(),
         "Базовые стили страницы превью — приближение базовых стилей Anki, а не их копия. \
          Оформление карточки задаёт CSS модели, и он подключён после базовых правил."
             .to_string(),
-        "Рядом с отчётом лежат только те media-файлы, которые нашлись в `media/` одного из \
-         состояний. `media_files` — список ссылок, а не доказательство наличия файла, поэтому \
-         отсутствующие файлы перечислены в диагностике, а не выдуманы."
+        "Media копируются по состояниям, в `media/before` и `media/after`: одинаковое имя файла \
+         в двух экспортах — два разных файла. Рядом с отчётом лежат только те файлы, которые \
+         нашлись в `media/` своего состояния. `media_files` — список ссылок, а не доказательство \
+         наличия файла, поэтому отсутствующие файлы перечислены в диагностике, а не выдуманы."
+            .to_string(),
+        "Звук `[sound:имя]` показывается локальным проигрывателем. Если файла нет, ссылка \
+         остаётся видимой и помеченной отсутствующей: подставлять чужой звук отчёт не будет."
             .to_string(),
         "Внешние ссылки (`http://`, `https://`, `//`, `data:`) не скачиваются: отчёт открывается \
          офлайн и не заменяет их ничем."
@@ -588,7 +689,8 @@ fn limitations() -> Vec<String> {
          а не по отрендеренному тексту: правка одной разметки должна быть видна."
             .to_string(),
         "Приложение открывает отчёт как обычный файл: ссылки на превью и media относительные, \
-         поэтому каталог отчёта нужно переносить целиком."
+         поэтому каталог отчёта нужно переносить целиком. Без JavaScript отчёт остаётся \
+         читаемым: превью видны полностью, но высота кадра не подстраивается под содержимое."
             .to_string(),
     ]
 }
@@ -1222,30 +1324,63 @@ fn ambiguous_card(outcome: &NoteOutcome) -> ReportCard {
 /// Накопитель отчёта: файлы превью, media-ссылки и наблюдения по моделям.
 struct Build {
     card_files: Vec<String>,
-    card_documents: Vec<(String, CardFile)>,
-    media_references: BTreeSet<String>,
-    model_scans: BTreeMap<String, ModelScan>,
-    touched_models: BTreeSet<String>,
+    card_documents: Vec<CardDocument>,
+    /// Media-ссылки по состояниям: файл состояния ищется только в своём экспорте.
+    media_references: BTreeMap<SideState, BTreeSet<String>>,
+    /// Наблюдения по моделям, отдельно для каждого состояния.
+    model_scans: BTreeMap<SideState, BTreeMap<String, ModelScan>>,
+    /// Модели, для которых строилось превью, отдельно для каждого состояния.
+    touched_models: BTreeMap<SideState, BTreeSet<String>>,
     /// Наблюдения о неполных превью: собираются при сборке карточек.
     preview_issues: Vec<Diagnostic>,
 }
 
 impl Build {
-    /// Готовит наблюдения по всем моделям состояния «после».
-    fn new(after: &Side) -> Self {
-        let mut model_scans: BTreeMap<String, ModelScan> = BTreeMap::new();
-        for (uuid, model) in &after.index.models {
-            model_scans.insert(uuid.clone(), scan_model(uuid, model));
+    /// Готовит наблюдения по моделям обоих состояний.
+    ///
+    /// Модели сканируются в обоих состояниях, потому что превью «до» строится по
+    /// модели «до»: правка могла быть именно в шаблоне, и тогда шаблон «после» к
+    /// превью «до» отношения не имеет.
+    fn new(before: &Side, after: &Side) -> Self {
+        let mut model_scans: BTreeMap<SideState, BTreeMap<String, ModelScan>> = BTreeMap::new();
+        for (state, side) in [(SideState::Before, before), (SideState::After, after)] {
+            let mut scans: BTreeMap<String, ModelScan> = BTreeMap::new();
+            for (uuid, model) in &side.index.models {
+                scans.insert(uuid.clone(), scan_model(uuid, model));
+            }
+            model_scans.insert(state, scans);
         }
         Self {
             card_files: Vec::new(),
             card_documents: Vec::new(),
-            media_references: BTreeSet::new(),
+            media_references: BTreeMap::new(),
             model_scans,
-            touched_models: BTreeSet::new(),
+            touched_models: BTreeMap::new(),
             preview_issues: Vec::new(),
         }
     }
+
+    /// Запоминает, что модель участвовала в превью этого состояния.
+    fn touch_model(&mut self, state: SideState, uuid: &str) {
+        self.touched_models
+            .entry(state)
+            .or_default()
+            .insert(uuid.to_string());
+    }
+}
+
+/// Документ превью вместе с тем, из чего он построен.
+///
+/// Состояние — не подпись, а источник: по нему выбираются media-файлы, поэтому
+/// документ обязан помнить его до самого момента записи.
+struct CardDocument {
+    file: String,
+    state: SideState,
+    guid: String,
+    model_name: String,
+    template_name: String,
+    hint: String,
+    document: CardFile,
 }
 
 /// Наблюдения по одной модели: что в её шаблонах не поддержано превью.
@@ -1335,24 +1470,44 @@ fn build_card(
     let before_facts = single_fact(before, &outcome.guid);
 
     let Some(after_facts) = after_facts else {
-        // Заметка исчезла или её `guid` неоднозначен: превью строится по
-        // состоянию «до», а не выдумывается.
+        // Заметка исчезла или её `guid` неоднозначен: состояние «до» остаётся
+        // единственным источником правды, и превью строится по нему. Состояние
+        // «после» не выдумывается: пустой кадр выглядел бы как «стало пусто».
+        let mut notes =
+            vec!["заметка отсутствует в состоянии «после»: показано состояние «до»".to_string()];
+        let before_model = before_facts
+            .and_then(|facts| facts.model_uuid.as_deref())
+            .and_then(|uuid| before.index.models.get(uuid));
+        let previews = match (before_facts, before_model) {
+            (Some(facts), Some(model)) => {
+                if let Some(uuid) = &facts.model_uuid {
+                    build.touch_model(SideState::Before, uuid);
+                }
+                build_state_previews(outcome, SideState::Before, facts, model, &mut notes, build)
+            }
+            _ => {
+                notes.push(
+                    "модель заметки не разрешилась в состоянии «до»: превью не строится"
+                        .to_string(),
+                );
+                Vec::new()
+            }
+        };
         return ReportCard {
             heading: heading(outcome),
             deck_path: outcome.deck_path.clone(),
             guid: outcome.guid.clone(),
-            model_name: outcome.model_name.clone().unwrap_or_default(),
+            model_name: before_model
+                .map(|model| model.name.clone())
+                .unwrap_or_else(|| outcome.model_name.clone().unwrap_or_default()),
             tags_before: outcome.tags_before.clone(),
             tags_after: outcome.tags_after.clone(),
             fields: before_facts
                 .map(|facts| bounded_fields(&facts.field_order))
                 .unwrap_or_default(),
             diffs: Vec::new(),
-            previews: Vec::new(),
-            notes: vec![
-                "заметка отсутствует в состоянии «после»: превью показывает только значения «до»"
-                    .to_string(),
-            ],
+            previews,
+            notes,
         };
     };
 
@@ -1379,7 +1534,7 @@ fn build_card(
     };
 
     if let Some(uuid) = &after_facts.model_uuid {
-        build.touched_models.insert(uuid.clone());
+        build.touch_model(SideState::After, uuid);
     }
 
     let diffs = field_diffs(outcome, before_facts, after_facts);
@@ -1401,65 +1556,39 @@ fn build_card(
                 ));
             }
 
-            for template in model.templates.iter().take(MAX_TEMPLATES_PER_MODEL) {
-                if build.card_files.len() >= MAX_CARD_FILES {
-                    notes.push(format!(
-                        "достигнут предел {MAX_CARD_FILES} файлов превью: остальные не записаны"
-                    ));
-                    break;
+            // Изменённая заметка показывается обеими сторонами: ревьюер должен
+            // видеть, что было, а не только что осталось. Кадр «до» строится по
+            // заметке и модели состояния «до», а не украшается diff'ом поверх
+            // «после». Порядок сборки задаёт нумерацию файлов, поэтому «до» идёт
+            // первым — так номер файла совпадает с порядком колонок.
+            if outcome.kind == NoteChangeKind::Changed
+                && let Some(before_facts) = before_facts
+                && let Some(before_model) = before_facts
+                    .model_uuid
+                    .as_deref()
+                    .and_then(|uuid| before.index.models.get(uuid))
+            {
+                if let Some(uuid) = &before_facts.model_uuid {
+                    build.touch_model(SideState::Before, uuid);
                 }
-
-                let document = match render_template(
-                    template,
-                    after_facts,
-                    model,
-                    &mut build.media_references,
-                ) {
-                    Ok(document) => document,
-                    Err(reason) => {
-                        notes.push(reason);
-                        continue;
-                    }
-                };
-
-                if document.sides.iter().any(|side| !side.issues.is_empty()) {
-                    notes.push(format!(
-                        "превью шаблона «{}» неполное: часть конструкций не вычисляется статически",
-                        template.name
-                    ));
-                }
-
-                // То же наблюдение обязано попасть и в диагностику, а не только в
-                // HTML карточки: иначе машинный потребитель `--json` не узнает,
-                // что превью неполное.
-                let issues: Vec<String> = document
-                    .sides
-                    .iter()
-                    .flat_map(|side| side.issues.iter().cloned())
-                    .collect();
-                if !issues.is_empty() {
-                    build.preview_issues.push(Diagnostic::warning(
-                        "preview_incomplete",
-                        format!(
-                            "превью шаблона «{}» заметки {} неполное: {}",
-                            template.name,
-                            outcome.guid,
-                            issues.join("; ")
-                        ),
-                        Some(outcome.guid.clone()),
-                    ));
-                }
-
-                let relative =
-                    format!("{CARDS_SUBDIR}/card-{:04}.html", build.card_files.len() + 1);
-                previews.push(ReportPreview {
-                    label: template.name.clone(),
-                    file: relative.clone(),
-                    hint: format!("шаблон ord {}", template.ord),
-                });
-                build.card_files.push(relative.clone());
-                build.card_documents.push((relative, document));
+                previews = build_state_previews(
+                    outcome,
+                    SideState::Before,
+                    before_facts,
+                    before_model,
+                    &mut notes,
+                    build,
+                );
             }
+
+            previews.extend(build_state_previews(
+                outcome,
+                SideState::After,
+                after_facts,
+                model,
+                &mut notes,
+                build,
+            ));
         }
         NoteChangeKind::Retired => {
             notes.push(format!(
@@ -1483,6 +1612,94 @@ fn build_card(
         previews,
         notes,
     }
+}
+
+/// Строит превью одной заметки для одного состояния экспорта.
+///
+/// Состояние передаётся явно и не выводится из модели: этим определяется и
+/// набор media-файлов, и то, какой документ куда попал.
+fn build_state_previews(
+    outcome: &NoteOutcome,
+    state: SideState,
+    facts: &NoteFacts,
+    model: &ModelFacts,
+    notes: &mut Vec<String>,
+    build: &mut Build,
+) -> Vec<ReportPreview> {
+    let mut previews: Vec<ReportPreview> = Vec::new();
+
+    for template in model.templates.iter().take(MAX_TEMPLATES_PER_MODEL) {
+        if build.card_files.len() >= MAX_CARD_FILES {
+            notes.push(format!(
+                "достигнут предел {MAX_CARD_FILES} файлов превью: остальные не записаны"
+            ));
+            break;
+        }
+
+        let references = build.media_references.entry(state).or_default();
+        let document = match render_template(template, facts, model, references) {
+            Ok(document) => document,
+            Err(reason) => {
+                notes.push(reason);
+                continue;
+            }
+        };
+
+        if document.sides.iter().any(|side| !side.issues.is_empty()) {
+            notes.push(format!(
+                "превью шаблона «{}» ({}) неполное: часть конструкций не вычисляется статически",
+                template.name,
+                state.label()
+            ));
+        }
+
+        // То же наблюдение обязано попасть и в диагностику, а не только в HTML
+        // карточки: иначе машинный потребитель `--json` не узнает, что превью
+        // неполное.
+        let issues: Vec<String> = document
+            .sides
+            .iter()
+            .flat_map(|side| side.issues.iter().cloned())
+            .collect();
+        if !issues.is_empty() {
+            build.preview_issues.push(Diagnostic::warning(
+                "preview_incomplete",
+                format!(
+                    "превью шаблона «{}» ({}) заметки {} неполное: {}",
+                    template.name,
+                    state.label(),
+                    outcome.guid,
+                    issues.join("; ")
+                ),
+                Some(outcome.guid.clone()),
+            ));
+        }
+
+        let relative = format!("{CARDS_SUBDIR}/card-{:04}.html", build.card_files.len() + 1);
+        // Состояние уже названо подписью кадра и полем `state` в JSON: повторять
+        // его в подсказке — шум для читателя отчёта.
+        let hint = format!("шаблон ord {}", template.ord);
+        previews.push(ReportPreview {
+            label: template.name.clone(),
+            state,
+            file: relative.clone(),
+            hint: hint.clone(),
+            resolved_media: Vec::new(),
+            missing_sounds: Vec::new(),
+        });
+        build.card_files.push(relative.clone());
+        build.card_documents.push(CardDocument {
+            file: relative,
+            state,
+            guid: outcome.guid.clone(),
+            model_name: model.name.clone(),
+            template_name: template.name.clone(),
+            hint,
+            document,
+        });
+    }
+
+    previews
 }
 
 /// Обрезает значения полей для показа в отчёте.
@@ -1603,15 +1820,71 @@ fn render_template(
     })
 }
 
-/// Заменяет ссылки на media относительными путями внутри отчёта.
-fn rewrite_media_refs(html: &str, plan: &MediaPlan, prefix: &str) -> String {
+/// Подставляет в готовый HTML превью ссылки своего состояния и звук.
+///
+/// Ссылка состояния разрешается только на файл этого состояния: план хранит
+/// разрешение с ключом `(состояние, ссылка)`, поэтому превью «до» не может
+/// показать файл из «после».
+///
+/// Звук (`[sound:имя]`) превращается в локальный проигрыватель с классом
+/// `replay-button` — тем же хуком, которым его оформляет модель в Anki.
+/// Отсутствующий файл не выдумывается и не заменяется: ссылка остаётся видимой и
+/// помеченной, а её имя попадает в диагностику и в JSON-результат.
+fn rewrite_preview_references(
+    html: &str,
+    state: SideState,
+    plan: &MediaPlan,
+    resolved_media: &mut BTreeSet<String>,
+    missing_sounds: &mut BTreeSet<String>,
+) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
 
-    while let Some(position) = rest.find("src=") {
+    loop {
+        let src_position = rest.find("src=");
+        let sound_position = rest.find("[sound:");
+        let position = match (src_position, sound_position) {
+            (Some(src), Some(sound)) => src.min(sound),
+            (Some(src), None) => src,
+            (None, Some(sound)) => sound,
+            (None, None) => break,
+        };
+
+        if sound_position == Some(position) {
+            let after = &rest[position + "[sound:".len()..];
+            let Some(end) = after.find(']') else {
+                // Незакрытая ссылка: остаток копируется как есть, гадать не о чем.
+                break;
+            };
+            let reference = &after[..end];
+            out.push_str(&rest[..position]);
+            match plan.resolved_path(state, reference) {
+                Some(path) => {
+                    resolved_media.insert(path.to_string());
+                    let _ = write!(
+                        out,
+                        "<span class=\"replay-button\"><audio class=\"report-audio\" controls \
+                         preload=\"none\" src=\"../{path}\"></audio></span>"
+                    );
+                }
+                None => {
+                    if !media::is_remote(reference) {
+                        missing_sounds.insert(media_index::normalize_media_name(reference));
+                    }
+                    let _ = write!(
+                        out,
+                        "<span class=\"replay-button report-audio-missing\" title=\"файл не \
+                         найден в экспорте\">[sound:{}]</span>",
+                        escape_attr(reference)
+                    );
+                }
+            }
+            rest = &after[end + 1..];
+            continue;
+        }
+
         let (head, tail) = rest.split_at(position + "src=".len());
         out.push_str(head);
-
         let Some(quote) = tail.chars().next() else {
             break;
         };
@@ -1627,12 +1900,10 @@ fn rewrite_media_refs(html: &str, plan: &MediaPlan, prefix: &str) -> String {
         };
 
         let reference = &tail[1..1 + end];
-        match plan.resolved_name(reference) {
-            Some(name) => {
-                out.push_str(&format!(
-                    "{quote}{prefix}{}/{name}{quote}",
-                    media::MEDIA_SUBDIR
-                ));
+        match plan.resolved_path(state, reference) {
+            Some(path) => {
+                resolved_media.insert(path.to_string());
+                let _ = write!(out, "{quote}../{path}{quote}");
             }
             None => out.push_str(&format!("{quote}{reference}{quote}")),
         }
@@ -1643,44 +1914,64 @@ fn rewrite_media_refs(html: &str, plan: &MediaPlan, prefix: &str) -> String {
     out
 }
 
+/// Экранирует значение атрибута.
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 /// Добавляет диагностику по работе с media.
+///
+/// Диагностика называется вместе с состоянием: «файла нет» — это утверждение о
+/// конкретном экспорте, и для изменённой заметки оно должно быть отнесено к «до»
+/// или к «после», иначе читатель сделает неверный вывод о причине правки.
 fn push_media_diagnostics(plan: &MediaPlan, diagnostics: &mut Vec<Diagnostic>) {
-    for name in &plan.missing {
-        diagnostics.push(Diagnostic::warning(
-            "missing_media",
-            format!("файл media {name:?} не найден в экспорте: превью останется без него"),
-            Some(name.clone()),
-        ));
-    }
-    for reference in &plan.traversal {
-        diagnostics.push(Diagnostic::warning(
-            "media_path_traversal",
-            format!(
-                "ссылка {reference:?} содержит путь: в отчёт попадает только базовое имя файла"
-            ),
-            Some(reference.clone()),
-        ));
-    }
-    for reference in &plan.remote {
-        diagnostics.push(Diagnostic::info(
-            "remote_media_reference",
-            format!("ссылка {reference:?} ведёт вне экспорта и не копируется в отчёт"),
-            Some(reference.clone()),
-        ));
-    }
-    for name in &plan.symlinks {
-        diagnostics.push(Diagnostic::warning(
-            "media_symlink_skipped",
-            format!("файл media {name:?} — символическая ссылка: он не читается и не копируется"),
-            Some(name.clone()),
-        ));
-    }
-    for name in &plan.oversized {
-        diagnostics.push(Diagnostic::warning(
-            "media_too_large",
-            format!("файл media {name:?} превысил предел размера и не скопирован"),
-            Some(name.clone()),
-        ));
+    for (state, state_media) in &plan.states {
+        for name in &state_media.missing {
+            diagnostics.push(Diagnostic::warning(
+                "missing_media",
+                format!(
+                    "файл media {name:?} не найден в состоянии «{}»: превью останется без него",
+                    state.as_str()
+                ),
+                Some(format!("{}:{name}", state.as_str())),
+            ));
+        }
+        for reference in &state_media.traversal {
+            diagnostics.push(Diagnostic::warning(
+                "media_path_traversal",
+                format!(
+                    "ссылка {reference:?} содержит путь: в отчёт попадает только базовое имя файла"
+                ),
+                Some(reference.clone()),
+            ));
+        }
+        for reference in &state_media.remote {
+            diagnostics.push(Diagnostic::info(
+                "remote_media_reference",
+                format!("ссылка {reference:?} ведёт вне экспорта и не копируется в отчёт"),
+                Some(reference.clone()),
+            ));
+        }
+        for name in &state_media.symlinks {
+            diagnostics.push(Diagnostic::warning(
+                "media_symlink_skipped",
+                format!(
+                    "файл media {name:?} — символическая ссылка: он не читается и не копируется"
+                ),
+                Some(format!("{}:{name}", state.as_str())),
+            ));
+        }
+        for name in &state_media.oversized {
+            diagnostics.push(Diagnostic::warning(
+                "media_too_large",
+                format!("файл media {name:?} превысил предел размера и не скопирован"),
+                Some(format!("{}:{name}", state.as_str())),
+            ));
+        }
     }
     if plan.budget_skipped > 0 {
         diagnostics.push(Diagnostic::warning(
@@ -1890,7 +2181,30 @@ mod tests {
         assert!(result.checks.all_files_inside_out_dir);
         assert!(result.checks.index_without_external_assets);
         assert!(result.checks.out_dir_outside_decks);
-        assert_eq!(result.card_files_total, 2, "превью для created и changed");
+        // Созданная заметка показывается одним состоянием, изменённая — двумя:
+        // «до» и «после» строятся из разных экспортов независимо друг от друга.
+        assert_eq!(
+            result.card_files_total, 3,
+            "превью для created и changed: одно состояние у created, два у changed"
+        );
+        let states_of = |guid: &str| -> Vec<&str> {
+            result
+                .preview_files
+                .iter()
+                .filter(|fact| fact.guid == guid)
+                .map(|fact| fact.state.as_str())
+                .collect()
+        };
+        assert_eq!(
+            states_of("guid-3"),
+            vec!["after"],
+            "созданная: только «после»"
+        );
+        assert_eq!(
+            states_of("guid-1"),
+            vec!["before", "after"],
+            "изменённая: обе стороны, «до» первым"
+        );
 
         let index = fs::read_to_string(&result.index_html).expect("index.html");
         assert!(index.contains("Изменённые заметки"));
@@ -2152,6 +2466,15 @@ mod tests {
         assert!(ensure_out_dir(&out, &[]).is_ok());
     }
 
+    fn state_references(state: SideState, names: &[&str]) -> BTreeMap<SideState, BTreeSet<String>> {
+        let mut map: BTreeMap<SideState, BTreeSet<String>> = BTreeMap::new();
+        map.insert(
+            state,
+            names.iter().map(|name| (*name).to_string()).collect(),
+        );
+        map
+    }
+
     #[test]
     fn media_refs_are_rewritten_only_for_copied_files() {
         let dir = TempDir::new("visual-report-rewrite");
@@ -2159,16 +2482,64 @@ mod tests {
         fs::create_dir_all(source.join("media")).expect("media");
         fs::write(source.join("media/есть.png"), b"x").expect("файл");
 
-        let references: BTreeSet<String> = ["есть.png".to_string()].into_iter().collect();
-        let plan =
-            media::plan(&[source], &references, &dir.path().join("out")).expect("план media");
+        let references = state_references(SideState::After, &["есть.png"]);
+        let plan = media::plan(
+            &[(SideState::After, source)],
+            &references,
+            &dir.path().join("out"),
+        )
+        .expect("план media");
 
         let html = "<img src=\"есть.png\"><img src=\"нет.png\"><img src=\"https://x/у.png\">";
-        let rewritten = rewrite_media_refs(html, &plan, "../");
+        let mut resolved: BTreeSet<String> = BTreeSet::new();
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        let rewritten =
+            rewrite_preview_references(html, SideState::After, &plan, &mut resolved, &mut missing);
 
-        assert!(rewritten.contains("src=\"../media/есть.png\""));
+        assert!(rewritten.contains("src=\"../media/after/есть.png\""));
         assert!(rewritten.contains("src=\"нет.png\""));
         assert!(rewritten.contains("src=\"https://x/у.png\""));
+        assert_eq!(resolved, ["media/after/есть.png".to_string()].into());
+        assert!(
+            missing.is_empty(),
+            "картинка — не звук: в missing_sounds не попадает"
+        );
+    }
+
+    #[test]
+    fn sound_becomes_an_offline_player_and_a_missing_sound_stays_marked() {
+        let dir = TempDir::new("visual-report-sound");
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("media")).expect("media");
+        fs::write(source.join("media/есть.mp3"), b"x").expect("файл");
+
+        let references = state_references(SideState::Before, &["есть.mp3", "нет.mp3"]);
+        let plan = media::plan(
+            &[(SideState::Before, source)],
+            &references,
+            &dir.path().join("out"),
+        )
+        .expect("план media");
+
+        let html = "слово [sound:есть.mp3] и [sound:нет.mp3]";
+        let mut resolved: BTreeSet<String> = BTreeSet::new();
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        let rewritten =
+            rewrite_preview_references(html, SideState::Before, &plan, &mut resolved, &mut missing);
+
+        assert!(rewritten.contains("class=\"replay-button\""));
+        assert!(rewritten.contains("class=\"report-audio\""));
+        assert!(rewritten.contains("src=\"../media/before/есть.mp3\""));
+        // Отсутствующий звук остаётся видимым и помеченным: подставлять чужой
+        // файл отчёт не имеет права.
+        assert!(rewritten.contains("report-audio-missing"));
+        assert!(rewritten.contains("[sound:нет.mp3]"));
+        assert!(!rewritten.contains("media/before/нет.mp3"));
+        assert_eq!(
+            resolved,
+            ["media/before/есть.mp3".to_string()].into_iter().collect()
+        );
+        assert_eq!(missing, ["нет.mp3".to_string()].into_iter().collect());
     }
 
     #[test]

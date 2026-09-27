@@ -13,17 +13,22 @@
 //! Отдельный документ даёт ровно то, что нужно ревью: карточка выглядит так, как
 //! её оформит модель, и ничего вокруг не портит.
 //!
-//! Никакого JavaScript в отчёте нет: раскрытие — это `<details>`, а ссылки на
-//! карточки работают как обычные ссылки на файл. Никаких внешних ресурсов —
-//! ни CDN, ни шрифтов, ни картинок по сети: отчёт обязан открываться офлайн, из
-//! каталога на диске.
+//! Изменённая заметка показывается двумя отдельными кадрами — «до» и «после», —
+//! и каждый строится из своего состояния экспорта. Косметический diff поверх
+//! «после» дал бы неверную картинку: ревьюер должен видеть то, что было, а не
+//! то, что осталось после удаления.
+//!
+//! Интерактивность (высота кадра по содержимому и переключение светлой и ночной
+//! темы) обеспечивает собственный runtime отчёта — он лежит прямо в записанных
+//! файлах, детерминирован и не ходит в сеть. Внешних ресурсов нет: ни CDN, ни
+//! шрифтов, ни картинок по сети. Граница доверия описана в
+//! [`crate::report::runtime`]: код отчёта разрешён, код шаблона Anki — нет.
 
 use std::fmt::Write as _;
 
+use crate::report::SideState;
+use crate::report::runtime::{self, CARD_RUNTIME_JS, INDEX_RUNTIME_JS};
 use crate::report::style::{CARD_BASE_CSS, REPORT_CSS};
-
-/// Высота превью карточки в отчёте.
-pub const PREVIEW_HEIGHT_PX: u32 = 420;
 
 /// Экранирует текст для вставки в HTML-текст.
 #[must_use]
@@ -90,10 +95,16 @@ pub struct FieldDiff {
 pub struct ReportPreview {
     /// Подпись превью: имя шаблона.
     pub label: String,
+    /// Состояние экспорта, из которого построено превью.
+    pub state: SideState,
     /// Относительный путь к документу превью.
     pub file: String,
     /// Подсказка о том, что именно показывает превью.
     pub hint: String,
+    /// Относительные пути media, которые превью действительно использует.
+    pub resolved_media: Vec<String>,
+    /// Звуки, файла которых не нашлось: показаны как отсутствующие, не выдуманы.
+    pub missing_sounds: Vec<String>,
 }
 
 /// Карточка отчёта.
@@ -219,7 +230,7 @@ pub fn card_html(card: &CardFile) -> String {
             out,
             "<div class=\"{}\">{}</div>",
             escape_html(&side.classes),
-            side.html
+            neutralize_scripts(&side.html)
         );
         if !side.issues.is_empty() {
             out.push_str("<ul class=\"report-side-issues\">\n");
@@ -237,6 +248,13 @@ pub fn card_html(card: &CardFile) -> String {
          .report-side-issues { font: 12px/1.4 sans-serif; color: #a32323; margin: .3em .6em; }\n\
          .report-side:last-of-type { border-bottom: 0; }</style>\n",
     );
+    // Runtime превью: сообщает родителю фактическую высоту документа и принимает
+    // выбранную тему. Он идёт последним, чтобы к моменту выполнения документ был
+    // уже разобран, и подключается строкой, а не внешним файлом: отчёт обязан
+    // остаться самодостаточным.
+    out.push_str("<script data-report-runtime=\"card\">");
+    out.push_str(CARD_RUNTIME_JS);
+    out.push_str("</script>\n");
     out.push_str("</body>\n</html>\n");
     out
 }
@@ -263,6 +281,30 @@ pub fn index_html(document: &ReportDocument) -> String {
         "<p class=\"report-subtitle\">до: <code>{}</code> → после: <code>{}</code></p>",
         escape_html(&document.before_label),
         escape_html(&document.after_label)
+    );
+    out.push_str(
+        "<div class=\"report-theme\" role=\"group\" aria-label=\"Тема отчёта и превью карточек\">\n",
+    );
+    for (value, label) in [
+        (runtime::THEME_LIGHT, "Светлая"),
+        (runtime::THEME_NIGHT, "Тёмная"),
+    ] {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"report-theme-option\" \
+             data-report-theme-value=\"{value}\" aria-pressed=\"{}\">{label}</button>",
+            if value == runtime::THEME_LIGHT {
+                "true"
+            } else {
+                "false"
+            }
+        );
+    }
+    out.push_str("</div>\n");
+    out.push_str(
+        "<p class=\"report-hint\">Тема переключает и оболочку отчёта, и ночное состояние \
+         карточек: превью получает класс <code>nightMode</code>, как в Anki, поэтому селекторы \
+         модели <code>.card.nightMode</code> и <code>.nightMode .…</code> применяются.</p>\n",
     );
     if let Some(tag) = &document.retire_tag {
         let _ = writeln!(
@@ -373,7 +415,14 @@ pub fn index_html(document: &ReportDocument) -> String {
         out.push_str("</section>\n");
     }
 
-    out.push_str("</main>\n</body>\n</html>\n");
+    out.push_str("</main>\n");
+    // Runtime отчёта: переключает тему оболочки, отвечает кадрам текущей темой и
+    // подставляет измеренную ими высоту. Идёт последним, чтобы все кадры уже
+    // были в документе.
+    out.push_str("<script data-report-runtime=\"index\">");
+    out.push_str(INDEX_RUNTIME_JS);
+    out.push_str("</script>\n");
+    out.push_str("</body>\n</html>\n");
     out
 }
 
@@ -442,25 +491,7 @@ fn render_card(out: &mut String, card: &ReportCard) {
         out.push_str("</table>\n");
     }
 
-    for preview in &card.previews {
-        out.push_str("<div class=\"report-preview-host\">");
-        let _ = writeln!(
-            out,
-            "<p class=\"report-preview-label\">превью: {} — {} \
-             <a class=\"report-preview-link\" href=\"{}\">открыть отдельно</a></p>",
-            escape_html(&preview.label),
-            escape_html(&preview.hint),
-            escape_html(&preview.file)
-        );
-        let _ = writeln!(
-            out,
-            "<iframe class=\"report-preview\" src=\"{}\" loading=\"lazy\" \
-             title=\"{}\" height=\"{PREVIEW_HEIGHT_PX}\"></iframe>",
-            escape_html(&preview.file),
-            escape_html(&preview.label)
-        );
-        out.push_str("</div>\n");
-    }
+    render_previews(out, &card.previews);
 
     if !card.notes.is_empty() {
         out.push_str("<ul class=\"report-issues\">\n");
@@ -471,6 +502,93 @@ fn render_card(out: &mut String, card: &ReportCard) {
     }
 
     out.push_str("</article>\n");
+}
+
+/// Рендерит превью карточки, разделяя их по состоянию.
+///
+/// Два состояния одной заметки сравниваются глазами, поэтому они кладутся в
+/// отдельные колонки одной раскладки: на широком экране — бок о бок, на узком —
+/// столбиком. Когда состояние одно (`created` и `removed`), второй колонки не
+/// создаётся: выдуманная сторона выглядела бы как факт.
+fn render_previews(out: &mut String, previews: &[ReportPreview]) {
+    let mut before: Vec<&ReportPreview> = Vec::new();
+    let mut after: Vec<&ReportPreview> = Vec::new();
+    for preview in previews {
+        match preview.state {
+            SideState::Before => before.push(preview),
+            SideState::After => after.push(preview),
+        }
+    }
+
+    if before.is_empty() && after.is_empty() {
+        return;
+    }
+
+    let both = !before.is_empty() && !after.is_empty();
+    if both {
+        out.push_str("<div class=\"report-compare\">\n");
+    }
+    for (state, list) in [(SideState::Before, &before), (SideState::After, &after)] {
+        if list.is_empty() {
+            continue;
+        }
+        if both {
+            let _ = writeln!(
+                out,
+                "<div class=\"report-compare-side\" data-state=\"{}\">",
+                state.as_str()
+            );
+            let _ = writeln!(
+                out,
+                "<p class=\"report-compare-label\">{}</p>",
+                state.label()
+            );
+        }
+        for preview in list.iter() {
+            out.push_str("<div class=\"report-preview-host\">");
+            let _ = writeln!(
+                out,
+                "<p class=\"report-preview-label\">{}: {} — {} \
+                 <a class=\"report-preview-link\" href=\"{}\">открыть отдельно</a></p>",
+                escape_html(state.label()),
+                escape_html(&preview.label),
+                escape_html(&preview.hint),
+                escape_html(&preview.file)
+            );
+            // Высота — запасная: runtime заменит её измеренной высотой содержимого,
+            // потому что карточка почти всегда выше любого фиксированного размера,
+            // а прокручиваться должна страница отчёта, а не окно внутри окна.
+            let _ = writeln!(
+                out,
+                "<iframe class=\"report-preview\" data-report-state=\"{}\" src=\"{}\" \
+                 loading=\"lazy\" title=\"{} {} — {}\" height=\"{}\"></iframe>",
+                state.as_str(),
+                escape_html(&preview.file),
+                state.label(),
+                escape_html(&preview.label),
+                escape_html(&preview.hint),
+                runtime::FALLBACK_PREVIEW_HEIGHT_PX
+            );
+            out.push_str("</div>\n");
+        }
+        if both {
+            out.push_str("</div>\n");
+        }
+    }
+    if both {
+        out.push_str("</div>\n");
+    }
+}
+
+/// Обезвреживает `<script>` из данных модели или значения поля.
+///
+/// Отказ от отрисовки стороны оставляет неподдержанную конструкцию видимой — и
+/// это правильно, ревьюер должен видеть, что именно не отрисовано. Но видимый
+/// текст и исполняемый тег — разные вещи: без этой замены браузер, открыв файл
+/// отчёта, выполнил бы код шаблона Anki. Тег показан текстом, а не исполнен.
+fn neutralize_scripts(html: &str) -> String {
+    html.replace("<script", "&lt;script")
+        .replace("</script", "&lt;/script")
 }
 
 /// Рендерит фрагменты diff для одной колонки: «было» показывает общие и
@@ -531,8 +649,11 @@ mod tests {
                     diffs: Vec::new(),
                     previews: vec![ReportPreview {
                         label: "Карточка 1".to_string(),
+                        state: SideState::After,
                         file: "cards/card-0001.html".to_string(),
                         hint: "шаблон модели".to_string(),
+                        resolved_media: Vec::new(),
+                        missing_sounds: Vec::new(),
                     }],
                     notes: Vec::new(),
                 }],
@@ -545,12 +666,98 @@ mod tests {
 
         let html = index_html(&document);
         assert!(html.starts_with("<!doctype html>"));
-        assert!(!html.contains("<script"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
         assert!(!html.contains("202"));
         assert!(html.contains("cards/card-0001.html"));
         assert!(html.contains("retired::auto"));
+        // Интерактивность отчёта — собственный код, записанный в сам файл.
+        // Внешних ссылок в нём быть не может: отчёт открывается офлайн.
+        assert!(html.contains("data-report-runtime=\"index\""));
+        assert!(html.contains("report:hello"));
+        assert!(!html.contains("<script src="));
+    }
+
+    #[test]
+    fn card_html_carries_the_card_runtime_and_night_hook() {
+        let card = CardFile {
+            title: "Карточка".to_string(),
+            model_css: String::new(),
+            sides: vec![CardSide {
+                label: "Лицевая сторона".to_string(),
+                classes: "card card1".to_string(),
+                html: "<div>слово</div>".to_string(),
+                issues: Vec::new(),
+            }],
+        };
+
+        let html = card_html(&card);
+        assert!(html.contains("data-report-runtime=\"card\""));
+        assert!(html.contains("nightMode"));
+        assert!(html.contains("report:height"));
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+    }
+
+    #[test]
+    fn two_states_are_rendered_as_separate_columns() {
+        let mut document = ReportDocument {
+            title: "Отчёт".to_string(),
+            before_label: "before".to_string(),
+            after_label: "after".to_string(),
+            retire_tag: None,
+            counts: ReportCounts::default(),
+            sections: vec![ReportSection {
+                title: "Изменённые заметки".to_string(),
+                hint: String::new(),
+                cards: vec![ReportCard {
+                    heading: "Слово — тест".to_string(),
+                    deck_path: "Words::N1".to_string(),
+                    guid: "abcdefghij".to_string(),
+                    model_name: "Слова".to_string(),
+                    tags_before: Vec::new(),
+                    tags_after: Vec::new(),
+                    fields: Vec::new(),
+                    diffs: Vec::new(),
+                    previews: vec![
+                        ReportPreview {
+                            label: "Карточка 1".to_string(),
+                            state: SideState::Before,
+                            file: "cards/card-0001.html".to_string(),
+                            hint: "шаблон ord 0".to_string(),
+                            resolved_media: Vec::new(),
+                            missing_sounds: Vec::new(),
+                        },
+                        ReportPreview {
+                            label: "Карточка 1".to_string(),
+                            state: SideState::After,
+                            file: "cards/card-0002.html".to_string(),
+                            hint: "шаблон ord 0".to_string(),
+                            resolved_media: Vec::new(),
+                            missing_sounds: Vec::new(),
+                        },
+                    ],
+                    notes: Vec::new(),
+                }],
+                truncated: None,
+            }],
+            diagnostics: Vec::new(),
+            limitations: Vec::new(),
+            unsupported_constructs: Vec::new(),
+        };
+
+        let html = index_html(&document);
+        assert!(html.contains("class=\"report-compare\""));
+        assert!(html.contains("data-state=\"before\""));
+        assert!(html.contains("data-state=\"after\""));
+        assert!(html.contains("data-report-state=\"before\""));
+
+        // Одно состояние — одна колонка: выдуманной стороны быть не должно.
+        document.sections[0].cards[0].previews.truncate(1);
+        let single = index_html(&document);
+        assert!(!single.contains("class=\"report-compare\""));
+        assert!(!single.contains("data-report-state=\"after\""));
+        assert!(!single.contains("class=\"report-compare-side\" data-state=\"after\""));
     }
 
     #[test]
