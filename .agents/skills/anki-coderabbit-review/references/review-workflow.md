@@ -26,6 +26,24 @@ repository. Если пользователь передал PR URL или но�
 head с текущим checkout надёжным доступным способом (например `gh pr view` или
 GitHub API/MCP). Несовпадение — precondition problem: не переключай ветки молча.
 
+### Опубликованность candidate
+
+Iteration начинается с committed + pushed HEAD, поэтому одной чистоты worktree
+недостаточно: нужно убедиться, что текущий HEAD уже опубликован. Remote-tracking
+ссылка может быть устаревшей, поэтому сначала обнови её, а потом сравни:
+
+```bash
+git fetch <remote>
+git rev-parse HEAD
+git rev-parse '@{u}'
+```
+
+Если HEAD и upstream расходятся — есть неопубликованные коммиты либо upstream
+ушёл вперёд, — это precondition problem, а не материал для review. Не запускай
+review неопубликованного candidate и не публикуй неизвестные локальные коммиты
+молча: либо явно опубликуй candidate в рамках задачи, либо остановись и сообщи
+состояние.
+
 ### Base для review
 
 Base нужен как точка сравнения текущего committed diff.
@@ -280,11 +298,18 @@ pass. Не превращай marker commit в маскировку blocker'а.
 ### 4.7 Push и подтверждение HEAD
 
 ```bash
-git push
+git push <remote> HEAD
+git fetch <remote>
 git rev-parse HEAD
 git rev-parse '@{u}'
 git status --porcelain
 ```
+
+Указывай remote и refspec явно. Голый `git push` подчиняется `push.default` и
+другим настройкам Git: в конфигурациях вида `matching` он может опубликовать
+несколько refs, а cycle обязан публиковать только текущую branch. `<remote>` —
+фактический remote этой branch (обычно `origin`), берётся из её upstream, а не
+назначается произвольно.
 
 Локальный и remote HEAD должны совпасть, worktree — остаться clean. Только после
 этого начинается следующая iteration, и только она проверяет новый
