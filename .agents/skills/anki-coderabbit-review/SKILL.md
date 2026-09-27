@@ -34,11 +34,15 @@ Skill не владеет:
 - подготовкой PR и обычным commit/push;
 - содержанием `.coderabbit.yaml` (это отдельная конфигурация репозитория);
 - репозиторной verification matrix — её владельцы перечислены в
-  `AGENTS.md` и `.codex/context/`.
+  `AGENTS.md` и `.codex/context/`;
+- review чужого репозитория или server-side review без локального checkout;
+- облачными возможностями CodeRabbit Coding Agent.
 
 Это лёгкий repository skill: дисциплина задаётся этим workflow и существующим
 Git/verification контекстом, а не отдельным adapter'ом, state machine или
-persistent review state. Не создавай их.
+persistent review state. Не создавай их. Он также не является универсальным
+frontend'ом над CodeRabbit: новые возможности CLI не расширяют его scope
+автоматически.
 
 ## Trigger contract
 
@@ -51,7 +55,15 @@ Skill активируется **только при явном CodeRabbit inten
 - «сделай 3 итерации CodeRabbit»;
 - «сделай 6 итераций кодрэббит»;
 - «повтори CodeRabbit ещё 2 раза»;
+- «сделай deep CodeRabbit review» — с явным deep intent;
+- «прогони CodeRabbit с фокусом на ...» — если пользователь явно задал focus;
 - просьба продолжить явно уже начатый CodeRabbit review cycle.
+
+Deep — **opt-in**, а не режим по умолчанию: обычный запрос CodeRabbit cycle
+выполняется обычным review, и full pull request review policy включается только
+явным запросом пользователя. Если явный deep-запрос выполнить нельзя (нет
+early access, capability недоступна, CLI/server incompatible), это состояние
+сообщается, а не подменяется обычным review.
 
 Само слово «ревью» без указания CodeRabbit **не** включает внешний reviewer.
 Не активируй skill автоматически для обычной разработки, generic self-review,
@@ -95,7 +107,12 @@ target_iterations = explicit_user_count ?? 3
 Не считается iteration: rate limit до завершения review; auth failure;
 network/provider failure; invalid или malformed provider result; запуск в
 неправильном repository; любой failure до фактического получения review
-результата; пропущенный review, когда review scope не содержит изменений.
+результата; failed или incomplete review, то есть прогон, который не дошёл до
+authoritative завершения; review scope, отвергнутый как слишком большой;
+запрошенный deep, который оказался недоступен или несовместим; пропущенный
+review, когда review scope не содержит изменений.
+
+Пришедшие findings сами по себе не доказывают, что review завершён полностью.
 
 Marker commit требует реально выполненного review. Пропуск review без изменений —
 не clean pass: он не расходует iteration и означает, что candidate или base
@@ -133,6 +150,14 @@ Clean iteration **не является early stop**: workflow заканчив�
   commit автоматически и не уничтожаются.
 - Rate limit provider'а не расходует iteration и не маскируется marker commit'ом.
 - Настоящий blocker не маскируется marker commit'ом.
+- Явно запрошенная пользователем review-возможность (например deep с focus) не
+  подменяется молча другой: если её нельзя выполнить, это сообщается как
+  состояние, требующее решения.
+- Scope review не сужается и не делится молча: урезанный scope — это другой
+  review, а не завершённая iteration.
+- Отсутствие данных о завершении не принимается за доказательство успеха.
+- Версионно-зависимая CLI-механика не хардкодится как вечный контракт:
+  фактический interface установленной версии определяется в начале cycle.
 - `.coderabbit.yaml` не мутируется как побочный эффект review и не дублируется в
   документации.
 - Skill не становится второй копией repository verification matrix и не
@@ -141,9 +166,11 @@ Clean iteration **не является early stop**: workflow заканчив�
 ## Подробный workflow
 
 Пошаговая механика — setup и candidate, discovery фактического provider interface,
-invocation, triage, verification, commit/push, rate-limit handling, blockers и
-финальный отчёт — находится в
+invocation (включая deep), oversized scope, triage, verification, commit/push,
+rate-limit handling, blockers, границы skill и финальный отчёт — находится в
 [`references/review-workflow.md`](references/review-workflow.md).
 
 Читай его перед началом cycle: `SKILL.md` задаёт контракт и границы, reference
-владеет порядком действий.
+владеет порядком действий. Версионно-зависимые детали CLI живут в reference;
+наблюдения там привязаны к конкретной проверенной версии и перепроверяются в
+начале каждого cycle, а не считаются вечным контрактом.
