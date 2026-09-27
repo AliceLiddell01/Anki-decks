@@ -507,3 +507,110 @@ fn report_keeps_full_card_file_list_separate_from_the_written_files() {
         vec!["cards/card-0001.html", "cards/card-0002.html", "index.html"]
     );
 }
+
+#[test]
+fn report_leaves_both_exports_untouched_and_keeps_cards_diff_free() {
+    let before = canonical_base("report-immutable-before");
+    let after = canonical_base("report-immutable-after");
+    // Маркер в CSS модели: он обязан попасть в изолированное превью и не
+    // попасть в страницу отчёта, иначе CSS колоды смог бы переоформить UI.
+    for dir in [&before, &after] {
+        let mut export = dir.deck_json();
+        export["note_models"][0]["css"] = json!("#модель { color: red }");
+        dir.write_canonical_deck_json(&export);
+    }
+    set_field(&after, "guid-1", 1, "изменённое толкование");
+    let before_bytes = before.deck_json_bytes();
+    let after_bytes = after.deck_json_bytes();
+    let before_files = walk(before.path());
+    let after_files = walk(after.path());
+
+    let out = TempDir::new("report-immutable-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_eq!(result["counts"]["changed"], 1);
+
+    // Генератор отчёта ничего не пишет в сравниваемые состояния: ни в deck.json,
+    // ни в новые файлы рядом.
+    assert_eq!(
+        before.deck_json_bytes(),
+        before_bytes,
+        "состояние «до» не тронуто"
+    );
+    assert_eq!(
+        after.deck_json_bytes(),
+        after_bytes,
+        "состояние «после» не тронуто"
+    );
+    assert_eq!(walk(before.path()), before_files);
+    assert_eq!(walk(after.path()), after_files);
+
+    // Превью обязано показывать карточку, а не diff: подсветка правки живёт
+    // отдельно, в описании изменения на странице отчёта.
+    let card = std::fs::read_to_string(out.path().join("cards/card-0001.html")).expect("карточка");
+    assert!(
+        !card.contains("report-token-del") && !card.contains("report-token-ins"),
+        "в превью нет подсветки diff"
+    );
+    assert!(
+        !card.contains("report-counts") && !card.contains("report-diagnostics"),
+        "в превью нет элементов страницы отчёта"
+    );
+
+    // И наоборот: страница отчёта не встраивает CSS модели, а только ссылается
+    // на изолированные карточки.
+    assert!(
+        card.contains("#модель { color: red }"),
+        "превью несёт фактический CSS модели"
+    );
+    let index = std::fs::read_to_string(out.path().join("index.html")).expect("index.html");
+    assert!(
+        index.contains("cards/card-0001.html"),
+        "отчёт ссылается на превью: {index:.200}"
+    );
+    assert!(
+        !index.contains("#модель { color: red }"),
+        "страница отчёта не встраивает CSS модели и не может им переоформляться"
+    );
+}
+
+#[test]
+fn report_renders_every_template_of_a_touched_model() {
+    let before = canonical_base("report-templates-before");
+    let after = canonical_base("report-templates-after");
+    // Вторая карточка той же модели: Anki показывает по карточке на каждый
+    // шаблон, и отчёт обязан показать их все, а не только первую.
+    let mut export = after.deck_json();
+    export["note_models"][0]["css"] = json!(".report-title { color: red }");
+    export["note_models"][0]["tmpls"]
+        .as_array_mut()
+        .expect("шаблоны")
+        .push(json!({
+            "__type__": "CardTemplate",
+            "name": "Карточка 2",
+            "ord": 1,
+            "qfmt": "{{Толкование}}",
+            "afmt": "{{FrontSide}}",
+        }));
+    after.write_canonical_deck_json(&export);
+    set_field(&after, "guid-1", 1, "изменённое толкование");
+
+    let out = TempDir::new("report-templates-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+
+    assert_eq!(
+        result["card_files_total"], 2,
+        "обе карточки модели показаны"
+    );
+    let first = std::fs::read_to_string(out.path().join("cards/card-0001.html")).expect("первая");
+    let second = std::fs::read_to_string(out.path().join("cards/card-0002.html")).expect("вторая");
+    assert!(first.contains("card card1"), "ord 0 → card1");
+    assert!(second.contains("card card2"), "ord 1 → card2");
+    for (name, card) in [("card-0001", &first), ("card-0002", &second)] {
+        assert!(
+            card.contains(".report-title { color: red }"),
+            "{name} обязан нести фактический CSS модели"
+        );
+    }
+}

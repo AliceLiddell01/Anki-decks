@@ -1038,3 +1038,366 @@ fn human_output_names_the_mode_and_the_statuses() {
     assert!(stdout.contains("тэг"));
     assert!(!stdout.contains("deck.json заменён"));
 }
+
+#[test]
+fn create_apply_changes_nothing_but_the_appended_note() {
+    let dir = canonical_base_export("create-only-appended");
+    let before = dir.deck_json();
+    let before_bytes = dir.deck_json_bytes();
+    let request = create_request(&[note_spec(fields("新語", "новое слово", "例"))]);
+    let path = write_request(&dir, "create.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+    let result = result_of(exit, &stdout);
+    let guid = result["outcomes"][0]["guid"].as_str().expect("guid");
+    let after = dir.deck_json();
+
+    // Точное доказательство «изменилось только это»: канонический рендер
+    // исходника с дописанной заметкой обязан совпасть с записанным файлом байт
+    // в байт. Любая посторонняя правка — переупорядочивание, нормализация,
+    // переписанный ключ — сломала бы это равенство.
+    let mut expected = before.clone();
+    expected["notes"]
+        .as_array_mut()
+        .expect("заметки")
+        .push(json!({
+            "__type__": "Note",
+            "guid": guid,
+            "note_model_uuid": MODEL_UUID,
+            "tags": [],
+            "fields": ["新語", "новое слово", "例"],
+        }));
+    assert_eq!(
+        dir.deck_json_bytes(),
+        anki_repo::loader::render_canonical_bytes(&expected).expect("канонизация"),
+        "изменилась ровно дописанная заметка"
+    );
+
+    // То же наблюдение по частям: идентичности и модели не тронуты.
+    assert_eq!(after["crowdanki_uuid"], before["crowdanki_uuid"]);
+    assert_eq!(after["deck_config_uuid"], before["deck_config_uuid"]);
+    assert_eq!(
+        after["note_models"], before["note_models"],
+        "модель не изменилась"
+    );
+    assert_eq!(
+        after["deck_configurations"], before["deck_configurations"],
+        "конфигурации не изменились"
+    );
+    assert_eq!(
+        after["media_files"], before["media_files"],
+        "media_files не изменился"
+    );
+    assert_eq!(
+        after["children"], before["children"],
+        "дерево колод не изменилось"
+    );
+    let before_notes = before["notes"].as_array().expect("заметки").clone();
+    let after_notes = after["notes"].as_array().expect("заметки");
+    assert_eq!(
+        &after_notes[..before_notes.len()],
+        before_notes.as_slice(),
+        "существующие заметки не переупорядочены и не переписаны"
+    );
+    assert_eq!(after_notes.len(), before_notes.len() + 1);
+    assert!(
+        dir.deck_json_bytes().len() > before_bytes.len(),
+        "файл вырос только на новую заметку"
+    );
+    // Каталог media в этой фикстуре отсутствует, и создание заметки его не создаёт.
+    assert!(
+        !dir.path().join("media").exists(),
+        "создание заметки не создаёт media/"
+    );
+}
+
+#[test]
+fn create_batch_failure_writes_nothing() {
+    let dir = canonical_base_export("create-batch-failure");
+    let before = dir.deck_json_bytes();
+    // Первая заметка корректна, вторая ссылается на media: запрос отвергается
+    // целиком, а не частично — иначе батч был бы не атомарным.
+    let request = create_request(&[
+        note_spec(fields("新語", "новое слово", "例")),
+        note_spec(fields("第二", "[sound:x.mp3]", "例")),
+    ]);
+    let path = write_request(&dir, "create.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+    let error = error_of(exit, &stdout);
+    assert_eq!(error["code"], "media_forbidden");
+    assert_eq!(dir.deck_json_bytes(), before, "ни одна заметка не записана");
+    assert_eq!(
+        dir.deck_json()["notes"].as_array().expect("заметки").len(),
+        2
+    );
+}
+
+#[test]
+fn retire_batch_failure_writes_nothing() {
+    let dir = canonical_base_export("retire-batch-failure");
+    let before = dir.deck_json_bytes();
+    let request = retire_request("smoke::retired", &["guid-1", "guid-нет"]);
+    let path = write_request(&dir, "retire.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "retire",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+    let error = error_of(exit, &stdout);
+    assert_eq!(error["code"], "unresolved_guid");
+    assert_eq!(
+        dir.deck_json_bytes(),
+        before,
+        "первая заметка не помечена, потому что вторая не разрешилась"
+    );
+    assert_eq!(
+        dir.deck_json()["notes"][0]["tags"],
+        json!(["тэг"]),
+        "теги первой заметки не тронуты"
+    );
+}
+
+#[test]
+fn create_auto_rejects_two_equally_compatible_models() {
+    // Две модели с одинаковым набором имён полей, и обе реально используются
+    // заметками целевой колоды: `auto` обязан отказать, а не выбрать первую.
+    let export = export_with(|value| {
+        let models = value["note_models"].as_array_mut().expect("модели");
+        let mut clone = models[0].clone();
+        clone["crowdanki_uuid"] = json!("model-clone");
+        clone["name"] = json!("Тестовая модель (клон)");
+        models.push(clone);
+        // Вторая заметка колоды переходит на клон, поэтому кандидатов два.
+        value["notes"][1]["note_model_uuid"] = json!("model-clone");
+    });
+    let dir = canonical_export("create-auto-ambiguous", &export);
+    let request = create_request(&[note_spec(fields("x", "y", "z"))]);
+    let path = write_request(&dir, "create.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+    assert_eq!(exit, 5, "неоднозначность auto — exit 5");
+    assert_eq!(error_of(exit, &stdout)["code"], "ambiguous_model");
+    assert_eq!(
+        dir.deck_json()["notes"].as_array().expect("заметки").len(),
+        2,
+        "при неоднозначности ничего не записано"
+    );
+}
+
+#[test]
+fn create_auto_picks_the_only_compatible_model_of_the_deck() {
+    // В целевой колоде две модели с несовместимыми наборами полей; набор
+    // запроса совпадает ровно с одной — выигрывает она, без догадок.
+    let dir = canonical_export("create-auto-unique", &mixed_export());
+    let request = create_request(&[json!({
+        "deck": {"crowdanki_uuid": "deck-first"},
+        "model": {"mode": "auto"},
+        "fields": {"Альфа": "а", "Бета": "б", "Гамма": "в"},
+        "tags": [],
+    })]);
+    let path = write_request(&dir, "create.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+        ],
+    );
+    let result = result_of(exit, &stdout);
+    let outcome = &result["outcomes"][0];
+    assert_eq!(outcome["status"], "dry_run");
+    assert_eq!(outcome["model_mode"], "auto");
+    assert_eq!(outcome["model_uuid"], "model-out-of-order");
+    assert_eq!(
+        outcome["field_names"],
+        json!(["Альфа", "Бета", "Гамма"]),
+        "имена полей перечислены в порядке ord модели"
+    );
+}
+
+#[test]
+fn create_auto_falls_back_to_the_only_compatible_model_of_the_export() {
+    // Пустая колода: заметок, которые «использовали» бы модель, в ней нет.
+    // Явное правило — взять единственную совместимую модель экспорта и назвать
+    // это в evidence; догадка по соседней колоде без правила была бы здесь
+    // недопустима, поэтому свидетельство обязано быть видимым.
+    let export = export_with(|value| {
+        value["children"] = json!([
+            {
+                "__type__": "Deck",
+                "name": "Test::Deck::Пустая",
+                "crowdanki_uuid": "deck-empty",
+                "deck_config_uuid": "cfg-1",
+                "children": [],
+                "media_files": [],
+                "note_models": [],
+                "deck_configurations": [],
+                "notes": [],
+            }
+        ]);
+    });
+    let dir = canonical_export("create-auto-empty-deck", &export);
+    let request = create_request(&[json!({
+        "deck": {"crowdanki_uuid": "deck-empty"},
+        "model": {"mode": "auto"},
+        "fields": fields("x", "y", "z"),
+        "tags": [],
+    })]);
+    let path = write_request(&dir, "create.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+        ],
+    );
+    let result = result_of(exit, &stdout);
+    let outcome = &result["outcomes"][0];
+    assert_eq!(outcome["model_mode"], "auto");
+    assert_eq!(outcome["model_uuid"], MODEL_UUID);
+    let evidence = outcome["model_evidence"].as_str().expect("свидетельство");
+    assert!(
+        evidence.contains("нет заметок"),
+        "свидетельство обязано назвать, что заметок модели в колоде нет: {evidence}"
+    );
+
+    // Заметка попадёт именно в целевую колоду, а не в ту, чьи заметки дали
+    // свидетельство.
+    let request = create_request(&[json!({
+        "deck": {"crowdanki_uuid": "deck-empty"},
+        "model": {"mode": "auto"},
+        "fields": fields("x", "y", "z"),
+        "tags": [],
+    })]);
+    let path = write_request(&dir, "apply.json", &request);
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+    let result = result_of(exit, &stdout);
+    assert_eq!(result["outcomes"][0]["status"], "created");
+    assert_eq!(result["outcomes"][0]["deck_uuid"], "deck-empty");
+    let export = dir.deck_json();
+    assert_eq!(
+        export["children"][0]["notes"]
+            .as_array()
+            .expect("заметки")
+            .len(),
+        1,
+        "заметка попала именно в целевую колоду"
+    );
+    assert_eq!(
+        export["notes"].as_array().expect("заметки").len(),
+        2,
+        "заметки корневой колоды не тронуты"
+    );
+}
+
+#[test]
+fn create_auto_refuses_an_empty_deck_with_several_compatible_models() {
+    // Та же пустая колода, но совместимых моделей в экспорте две: правило
+    // «единственная совместимая» не выполняется, и auto обязан отказать.
+    let export = export_with(|value| {
+        let models = value["note_models"].as_array_mut().expect("модели");
+        let mut clone = models[0].clone();
+        clone["crowdanki_uuid"] = json!("model-clone");
+        clone["name"] = json!("Тестовая модель (клон)");
+        models.push(clone);
+        value["children"] = json!([
+            {
+                "__type__": "Deck",
+                "name": "Test::Deck::Пустая",
+                "crowdanki_uuid": "deck-empty",
+                "deck_config_uuid": "cfg-1",
+                "children": [],
+                "media_files": [],
+                "note_models": [],
+                "deck_configurations": [],
+                "notes": [],
+            }
+        ]);
+    });
+    let dir = canonical_export("create-auto-empty-ambiguous", &export);
+    let request = create_request(&[json!({
+        "deck": {"crowdanki_uuid": "deck-empty"},
+        "model": {"mode": "auto"},
+        "fields": fields("x", "y", "z"),
+        "tags": [],
+    })]);
+    let path = write_request(&dir, "create.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+        ],
+    );
+    assert_eq!(exit, 5, "две совместимые модели — exit 5");
+    let error = error_of(exit, &stdout);
+    assert_eq!(error["code"], "ambiguous_model");
+    assert_eq!(
+        error["details"]["candidates"]
+            .as_array()
+            .expect("кандидаты")
+            .len(),
+        2,
+        "отказ обязан перечислить кандидатов"
+    );
+}
