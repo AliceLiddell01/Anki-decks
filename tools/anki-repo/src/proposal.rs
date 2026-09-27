@@ -269,7 +269,7 @@ mod tests {
     fn minimal_document_is_accepted() {
         let document = parse(
             r#"{"schema_version": 1, "proposals": [
-                 {"guid": "guid-1", "field": "Значение", "expected": "", "replacement": "x"}
+                 {"guid": "guid-1", "field": "Толкование", "expected": "", "replacement": "x"}
                ]}"#,
         )
         .expect("валидный документ");
@@ -284,7 +284,7 @@ mod tests {
     fn proposal_metadata_is_kept_and_compiled_into_the_request() {
         let document = parse(
             r#"{"schema_version": 1, "proposals": [
-                 {"proposal_id": "p1", "guid": "guid-1", "field": "Значение",
+                 {"proposal_id": "p1", "guid": "guid-1", "field": "Толкование",
                   "expected": "было", "replacement": "стало", "reason": "опечатка"}
                ]}"#,
         )
@@ -308,7 +308,7 @@ mod tests {
         let document = document(vec![Proposal {
             proposal_id: None,
             guid: "guid-1".to_string(),
-            field: "Значение".to_string(),
+            field: "Толкование".to_string(),
             expected: String::new(),
             replacement: "x".to_string(),
             reason: Some(long),
@@ -326,7 +326,7 @@ mod tests {
     fn unknown_fields_are_rejected() {
         let error = parse(
             r#"{"schema_version": 1, "proposals": [
-                 {"guid": "guid-1", "field": "Значение", "expected": "", "replacement": "x",
+                 {"guid": "guid-1", "field": "Толкование", "expected": "", "replacement": "x",
                   "confidence": 0.9}
                ]}"#,
         )
@@ -344,7 +344,7 @@ mod tests {
     fn unsupported_schema_version_is_rejected() {
         let error = parse(
             r#"{"schema_version": 2, "proposals": [
-                 {"guid": "guid-1", "field": "Значение", "expected": "", "replacement": "x"}
+                 {"guid": "guid-1", "field": "Толкование", "expected": "", "replacement": "x"}
                ]}"#,
         )
         .expect_err("версия схемы");

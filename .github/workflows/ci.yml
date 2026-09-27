@@ -1,0 +1,106 @@
+name: Проверки репозитория
+
+# Семантические triggers, без привязки к литералу имени ветки:
+# - `pull_request` — проверка любого PR;
+# - `push` — событие покрывает интеграцию в поддерживаемую ветку, а какой именно
+#   branch является default, job определяет сам через `github.event.repository`
+#   (см. `if` у job'ов), поэтому имя ветки в workflow не зашито;
+# - `workflow_dispatch` — ручной запуск.
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+# CI только читает репозиторий: ни один job не пишет в него, не публикует
+# артефакты и не выполняет mutating repository операции.
+permissions:
+  contents: read
+
+concurrency:
+  # Новый прогон отменяет предыдущий только для PR: проверку default branch
+  # нельзя отменять на середине.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  code:
+    name: Код и тесты
+    # Push в feature-ветку не дублирует прогон PR: на push job выполняется
+    # только для default branch текущего репозитория.
+    if: >-
+      github.event_name != 'push'
+      || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Установить стабильный Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Проверить форматирование
+        run: cargo fmt --all --check
+
+      - name: Проверить статику Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Собрать и выполнить тесты
+        run: cargo test --workspace --locked
+
+      - name: Проверить найденные CrowdAnki-экспорты
+        # Шаг сам находит экспорты внутри `decks/` и ничего не знает о конкретных
+        # колодах, уровнях, моделях заметок и именах полей. Отсутствие экспортов —
+        # не ошибка, поэтому состав данных может меняться без правки CI.
+        run: |
+          set -euo pipefail
+          status=0
+          found=0
+          while IFS= read -r -d '' deck_json; do
+            found=$((found + 1))
+            export_dir=$(dirname "$deck_json")
+            echo "Проверяю экспорт: $export_dir"
+            cargo run --quiet --locked --bin anki-repo -- validate "$export_dir" || status=1
+          done < <(find decks -name deck.json -print0 2>/dev/null || true)
+          echo "Найдено экспортов: $found"
+          exit "$status"
+
+  msrv:
+    name: Заявленная MSRV
+    if: >-
+      github.event_name != 'push'
+      || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Прочитать заявленную MSRV
+        id: msrv
+        # Единственный владелец значения — `[workspace.package] rust-version`
+        # в корневом Cargo.toml. Workflow не хранит собственную копию версии:
+        # он спрашивает Cargo и заодно проверяет, что участники workspace не
+        # расходятся в `rust-version`.
+        run: |
+          set -euo pipefail
+          versions=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '[.packages[].rust_version] | unique | .[]')
+          declared=$(printf '%s\n' "$versions" | grep -c . || true)
+          if [ "$declared" -ne 1 ]; then
+            echo "::error::участники workspace расходятся в rust-version: $(printf '%s' "$versions" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "toolchain=$versions" >> "$GITHUB_OUTPUT"
+          echo "Заявленная MSRV: $versions"
+
+      - name: Установить Rust заявленной MSRV
+        run: rustup toolchain install "${{ steps.msrv.outputs.toolchain }}" --profile minimal
+
+      - name: Проверить сборку на заявленной MSRV
+        run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --locked

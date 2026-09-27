@@ -9,6 +9,11 @@
 ```text
 AGENTS.md
 README.md
+Cargo.toml                   # корневой Cargo workspace: owner edition и MSRV
+Cargo.lock
+.github/
+└── workflows/
+    └── ci.yml               # независимый CI: код/тесты и заявленная MSRV
 .agents/
 └── skills/
 .codex/
@@ -31,10 +36,21 @@ tools/
 - `.codex/context/` — долговременные карты формата и рабочего процесса.
 - `.agents/skills/` — repository skills, по каталогу на skill; процедуру владеет
   сам skill, а не этот файл.
-- `tools/anki-repo/` — самостоятельный Rust package `anki-repo` для анализа
-  экспорта и одной строго ограниченной правки его значений (`edit`); его контракт
-  описан в `tools/anki-repo/README.md`.
+- `tools/anki-repo/` — Rust package `anki-repo` для анализа экспорта и одной
+  строго ограниченной правки его значений (`edit`); его контракт описан в
+  `tools/anki-repo/README.md`. Это участник корневого workspace, а не отдельный
+  workspace: `cargo` запускается из корня репозитория.
+- `Cargo.toml` в корне — единственный владелец `[workspace.package]`: заявленной
+  MSRV (`rust-version`) и `edition` для всех Rust-участников. `Cargo.lock` тоже
+  лежит в корне.
+- `.github/workflows/ci.yml` — независимый CI репозитория: читает код, не
+  публикует артефакты и не использует секреты. Подробности — в `03-VERIFICATION.md`.
 - `AGENTS.md` — короткий обязательный контракт для любого агента.
+
+`decks/` — данные, а не контракт репозитория: toolkit работает с произвольным
+CrowdAnki-экспортом и не знает имён полей конкретной модели, а CI и default-набор
+тестов не зависят от того, какие колоды сейчас лежат в `decks/`. Текущий состав
+и имена моделей ниже — состояние на сегодня, а не требование к репозиторию.
 
 ## Как находить место изменения
 

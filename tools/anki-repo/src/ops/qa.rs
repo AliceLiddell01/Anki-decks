@@ -312,9 +312,9 @@ mod tests {
         assert_eq!(finding.note_index, 1);
         assert_eq!(finding.guid.as_deref(), Some("guid-2"));
         assert_eq!(finding.deck_path, "Test::Deck");
-        assert_eq!(finding.note_model.as_deref(), Some("Слова"));
+        assert_eq!(finding.note_model.as_deref(), Some("Тестовая модель"));
         assert_eq!(finding.note_model_uuid.as_deref(), Some("model-1"));
-        assert_eq!(finding.field.as_deref(), Some("Значение"));
+        assert_eq!(finding.field.as_deref(), Some("Толкование"));
         assert_eq!(finding.field_ord, Some(1));
         assert_eq!(finding.severity, QaSeverity::Warning);
         assert_eq!(result.notes_total, 2);

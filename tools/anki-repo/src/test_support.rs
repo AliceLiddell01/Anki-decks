@@ -67,14 +67,14 @@ pub const MINIMAL_EXPORT: &str = r#"{
     {
       "__type__": "NoteModel",
       "crowdanki_uuid": "model-1",
-      "name": "Слова",
+      "name": "Тестовая модель",
       "css": "",
       "flds": [
-        {"name": "Слово", "ord": 0},
-        {"name": "Значение", "ord": 1}
+        {"name": "Заголовок", "ord": 0},
+        {"name": "Толкование", "ord": 1}
       ],
       "tmpls": [
-        {"name": "Карточка 1", "ord": 0, "qfmt": "{{Слово}}", "afmt": "{{FrontSide}}{{Значение}}"}
+        {"name": "Карточка 1", "ord": 0, "qfmt": "{{Заголовок}}", "afmt": "{{FrontSide}}{{Толкование}}"}
       ],
       "x_unknown_model_key": {"keep": true}
     }
@@ -145,14 +145,14 @@ pub const NESTED_EXPORT: &str = r#"{
     {
       "__type__": "NoteModel",
       "crowdanki_uuid": "model-1",
-      "name": "Слова",
+      "name": "Тестовая модель",
       "css": "",
       "flds": [
-        {"name": "Слово", "ord": 0},
-        {"name": "Значение", "ord": 1}
+        {"name": "Заголовок", "ord": 0},
+        {"name": "Толкование", "ord": 1}
       ],
       "tmpls": [
-        {"name": "Карточка 1", "ord": 0, "qfmt": "{{Слово}}", "afmt": "{{Значение}}"}
+        {"name": "Карточка 1", "ord": 0, "qfmt": "{{Заголовок}}", "afmt": "{{Толкование}}"}
       ]
     }
   ],

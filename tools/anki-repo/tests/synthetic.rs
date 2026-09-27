@@ -344,8 +344,8 @@ fn duplicate_field_name_is_an_error() {
     let dir = TempDir::new("field-name");
     dir.write_export(&export_with(|value| {
         value["note_models"][0]["flds"] = json!([
-            {"name": "Слово", "ord": 0},
-            {"name": "Слово", "ord": 1},
+            {"name": "Заголовок", "ord": 0},
+            {"name": "Заголовок", "ord": 1},
             {"name": "Пример", "ord": 2}
         ]);
     }));
@@ -412,8 +412,8 @@ fn template_field_of_another_model_is_not_a_known_field() {
         second["crowdanki_uuid"] = json!("model-2");
         second["name"] = json!("Другая модель");
         second["flds"] = json!([{"name": "Другое поле", "ord": 0}]);
-        second["tmpls"][0]["qfmt"] = json!("{{Слово}}");
-        second["tmpls"][0]["afmt"] = json!("{{Слово}}");
+        second["tmpls"][0]["qfmt"] = json!("{{Заголовок}}");
+        second["tmpls"][0]["afmt"] = json!("{{Заголовок}}");
         value["note_models"]
             .as_array_mut()
             .expect("note_models")
@@ -425,7 +425,7 @@ fn template_field_of_another_model_is_not_a_known_field() {
     assert_eq!(
         severity_of(&result, "template_field_unresolved"),
         Some(Severity::Error),
-        "поле «Слово» принадлежит другой модели и не должно считаться известным"
+        "поле «Заголовок» принадлежит другой модели и не должно считаться известным"
     );
 }
 

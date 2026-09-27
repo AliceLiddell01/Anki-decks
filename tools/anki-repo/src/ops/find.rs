@@ -1,7 +1,8 @@
 //! Операция `find`: поиск небольшого набора заметок по предсказуемым критериям.
 //!
-//! Stage 1 сознательно не делает HTML-to-headword extraction, fuzzy matching,
-//! regex и японскую морфологию. Поиск идёт по сырым значениям полей.
+//! Toolkit сознательно не делает HTML-to-headword extraction, fuzzy matching,
+//! regex и японскую морфологию. Поиск идёт по сырым значениям полей, а имя поля
+//! всегда задаёт вызывающая сторона.
 
 use std::path::Path;
 
@@ -10,9 +11,6 @@ use crate::error::{DomainError, ErrorCode};
 use crate::index::{ExportIndex, NoteRef};
 use crate::ops::NoteSummary;
 use crate::selection;
-
-/// Поле-сокращение для `--word`.
-pub use crate::selection::PRIMARY_FIELD as WORD_SHORTCUT_FIELD;
 
 /// Режим сопоставления значения поля.
 ///
@@ -230,7 +228,7 @@ mod tests {
         let result = find(
             Path::new("."),
             &index,
-            &query_field("Слово", "偶然", MatchMode::Contains),
+            &query_field("Заголовок", "偶然", MatchMode::Contains),
         )
         .expect("поиск должен найти заметку");
 
@@ -240,14 +238,14 @@ mod tests {
         let note = &result.notes[0];
         assert_eq!(note.guid.as_deref(), Some("guid-1"));
         assert_eq!(note.deck_path, "Test::Deck");
-        assert_eq!(note.note_model_name.as_deref(), Some("Слова"));
+        assert_eq!(note.note_model_name.as_deref(), Some("Тестовая модель"));
         assert_eq!(note.tags, vec!["тэг".to_string()]);
         let names: Vec<&str> = note
             .fields
             .iter()
             .map(|field| field.name.as_str())
             .collect();
-        assert_eq!(names, vec!["Слово", "Значение"]);
+        assert_eq!(names, vec!["Заголовок", "Толкование"]);
         assert_eq!(note.fields[1].value.as_deref(), Some("случайность"));
     }
 
@@ -259,14 +257,14 @@ mod tests {
             find(
                 Path::new("."),
                 &index,
-                &query_field("Слово", "必然", MatchMode::Exact),
+                &query_field("Заголовок", "必然", MatchMode::Exact),
             )
             .is_ok()
         );
         let error = find(
             Path::new("."),
             &index,
-            &query_field("Слово", "必", MatchMode::Exact),
+            &query_field("Заголовок", "必", MatchMode::Exact),
         )
         .expect_err("точное совпадение не должно находиться по подстроке");
         assert_eq!(error.code, ErrorCode::NotFound);
@@ -279,7 +277,7 @@ mod tests {
         let error = find(
             Path::new("."),
             &index,
-            &query_field("Слово", "нет-такого", MatchMode::Contains),
+            &query_field("Заголовок", "нет-такого", MatchMode::Contains),
         )
         .expect_err("пустой результат — not_found");
         assert_eq!(error.code, ErrorCode::NotFound);
@@ -290,7 +288,7 @@ mod tests {
     fn limit_truncates_but_keeps_matched_total() {
         let node = deck_node(MINIMAL_EXPORT);
         let index = ExportIndex::build(&node);
-        let mut query = query_field("Слово", "", MatchMode::Contains);
+        let mut query = query_field("Заголовок", "", MatchMode::Contains);
         query.limit = 1;
         let result = find(Path::new("."), &index, &query).expect("поиск");
         assert_eq!(result.matched_total, 2);
@@ -349,7 +347,7 @@ mod tests {
         let node = deck_node(NESTED_EXPORT);
         let index = ExportIndex::build(&node);
 
-        let mut query = query_field("Слово", "", MatchMode::Contains);
+        let mut query = query_field("Заголовок", "", MatchMode::Contains);
         query.deck = Some("Root::Child".to_string());
         let result = find(Path::new("."), &index, &query).expect("поиск по поддереву");
         assert_eq!(result.matched_total, 2);
@@ -380,7 +378,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::UnknownField);
         assert!(error.details["available_fields"].is_array());
 
-        let mut query = query_field("Слово", "偶然", MatchMode::Contains);
+        let mut query = query_field("Заголовок", "偶然", MatchMode::Contains);
         query.deck = Some("Нет::Такой".to_string());
         let error = find(Path::new("."), &index, &query).expect_err("неизвестная колода");
         assert_eq!(error.code, ErrorCode::UnknownDeck);
@@ -393,7 +391,7 @@ mod tests {
         let result = find(
             Path::new("."),
             &index,
-            &query_field("Слово", "", MatchMode::Contains),
+            &query_field("Заголовок", "", MatchMode::Contains),
         )
         .expect("поиск");
         let guids: Vec<&str> = result

@@ -270,7 +270,7 @@ mod tests {
         let model = index
             .model_by_uuid("model-1")
             .expect("модель должна разрешаться");
-        assert_eq!(model.name.as_deref(), Some("Слова"));
+        assert_eq!(model.name.as_deref(), Some("Тестовая модель"));
         assert!(index.model_by_uuid("нет-такой").is_none());
     }
 
@@ -281,9 +281,9 @@ mod tests {
         let model = index.model_by_uuid("model-1").expect("модель");
         let note = &index.notes[0].note;
 
-        let word = field_value_by_name(note, model, "Слово").expect("поле Слово");
+        let word = field_value_by_name(note, model, "Заголовок").expect("поле Заголовок");
         assert_eq!(word.as_text(), Some("[sound:a.mp3]偶然"));
-        let meaning = field_value_by_name(note, model, "Значение").expect("поле Значение");
+        let meaning = field_value_by_name(note, model, "Толкование").expect("поле Толкование");
         assert_eq!(meaning.as_text(), Some("случайность"));
         assert!(field_value_by_name(note, model, "НетТакого").is_none());
     }
@@ -295,7 +295,7 @@ mod tests {
         let model = index.model_by_uuid("model-1").expect("модель");
         let fields = resolve_named_fields(index.notes[0].note, model);
         let names: Vec<&str> = fields.iter().map(|field| field.name).collect();
-        assert_eq!(names, vec!["Слово", "Значение"]);
+        assert_eq!(names, vec!["Заголовок", "Толкование"]);
         assert_eq!(fields[0].ord, Ord::Int(0));
         assert_eq!(fields[1].ord, Ord::Int(1));
 

@@ -1,0 +1,17 @@
+# Корневой Cargo workspace — каноническая точка запуска Rust-проверок
+# репозитория. Из него `cargo` видит toolkit `tools/anki-repo`, поэтому CI и
+# локальные проверки не обязаны знать фактический layout crate'а, а версия
+# toolchain и edition объявлены здесь один раз для всех участников workspace.
+#
+# Это не отдельный crate: корень остаётся репозиторием колод, а Cargo — его
+# repository-level границей для Rust-кода.
+[workspace]
+members = ["tools/anki-repo"]
+resolver = "3"
+
+[workspace.package]
+# Минимальная поддерживаемая версия Rust (MSRV) для всех участников workspace.
+# Единственный владелец этого значения: CI читает его отсюда через
+# `cargo metadata`, а не хранит собственную копию.
+rust-version = "1.88"
+edition = "2024"

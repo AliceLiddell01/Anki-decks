@@ -2,6 +2,12 @@
 //!
 //! Каждый fixture живёт в собственном временном каталоге и удаляется через
 //! `Drop`, поэтому тесты можно запускать параллельно.
+//!
+//! Ни один helper не знает layout репозитория и содержимого `decks/`: default
+//! test suite обязан оставаться корректным, когда состав колод, уровни JLPT,
+//! note models и media изменятся или временно отсутствуют. Всё, что тесту
+//! нужно, тест строит сам — в своём временном каталоге и с собственными именами
+//! полей и моделей.
 
 #![allow(dead_code)]
 
@@ -10,23 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anki_repo::selection::PRIMARY_FIELD;
 use serde_json::{Value, json};
-
-/// Корень репозитория Anki-decks (на два уровня выше `tools/anki-repo`).
-pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("каталог tools")
-        .parent()
-        .expect("корень репозитория")
-        .to_path_buf()
-}
-
-/// Путь к канонической словарной колоде N1–N5.
-pub fn words_deck(level: u8) -> PathBuf {
-    repo_root().join(format!("decks/japanese/words/Words__N{level}"))
-}
 
 /// Путь к собранному test-binary `anki-repo`.
 pub fn cli_binary() -> PathBuf {
@@ -126,11 +116,11 @@ pub fn base_export() -> Value {
             {
                 "__type__": "NoteModel",
                 "crowdanki_uuid": "model-1",
-                "name": "Слова",
+                "name": "Тестовая модель",
                 "css": "",
                 "flds": [
-                    {"name": "Слово", "ord": 0},
-                    {"name": "Значение", "ord": 1},
+                    {"name": "Заголовок", "ord": 0},
+                    {"name": "Толкование", "ord": 1},
                     {"name": "Пример", "ord": 2}
                 ],
                 "tmpls": [
@@ -138,7 +128,7 @@ pub fn base_export() -> Value {
                         "__type__": "CardTemplate",
                         "name": "Карточка 1",
                         "ord": 0,
-                        "qfmt": "{{Слово}}",
+                        "qfmt": "{{Заголовок}}",
                         "afmt": "{{FrontSide}}{{#Пример}}{{Пример}}{{/Пример}}"
                     }
                 ]
@@ -173,10 +163,131 @@ pub fn export_with(mutate: impl FnOnce(&mut Value)) -> Value {
     value
 }
 
-/// Запускает `anki-repo` из корня репозитория, чтобы относительные пути в
-/// аргументах совпадали с реальными путями репозитория.
+/// Синтетический экспорт другой формы: две колоды, две модели, две конфигурации.
+///
+/// Нужен как второй, независимый от [`base_export`] пример корректного
+/// CrowdAnki-экспорта: у моделей разные имена, разное число полей, а `flds`
+/// объявлены не в порядке `ord`. Поэтому поведение, которое случайно опиралось
+/// на форму конкретного экспорта, здесь обязано разойтись.
+pub fn mixed_export() -> Value {
+    json!({
+        "__type__": "Deck",
+        "name": "Группа",
+        "crowdanki_uuid": "deck-group",
+        "deck_config_uuid": "cfg-группа",
+        "children": [
+            {
+                "__type__": "Deck",
+                "name": "Группа::Первая",
+                "crowdanki_uuid": "deck-first",
+                "deck_config_uuid": "cfg-группа",
+                "children": [],
+                "media_files": [],
+                "note_models": [],
+                "deck_configurations": [],
+                "notes": [
+                    {
+                        "__type__": "Note",
+                        "guid": "первая-1",
+                        "note_model_uuid": "model-out-of-order",
+                        "tags": ["первая"],
+                        "fields": ["значение гамма", "значение альфа", "значение бета"]
+                    },
+                    {
+                        "__type__": "Note",
+                        "guid": "первая-2",
+                        "note_model_uuid": "model-single-field",
+                        "tags": [],
+                        "fields": ["одно поле"]
+                    }
+                ]
+            },
+            {
+                "__type__": "Deck",
+                "name": "Группа::Вторая",
+                "crowdanki_uuid": "deck-second",
+                "deck_config_uuid": "cfg-вторая",
+                "children": [],
+                "media_files": [],
+                "note_models": [],
+                "deck_configurations": [],
+                "notes": [
+                    {
+                        "__type__": "Note",
+                        "guid": "вторая-1",
+                        "note_model_uuid": "model-out-of-order",
+                        "tags": [],
+                        "fields": ["значение гамма", "другое альфа", "другое бета"]
+                    }
+                ]
+            }
+        ],
+        "media_files": [],
+        "note_models": [
+            {
+                "__type__": "NoteModel",
+                "crowdanki_uuid": "model-out-of-order",
+                "name": "Модель с непорядковыми ord",
+                "css": "",
+                "flds": [
+                    {"name": "Гамма", "ord": 2},
+                    {"name": "Альфа", "ord": 0},
+                    {"name": "Бета", "ord": 1}
+                ],
+                "tmpls": [
+                    {
+                        "__type__": "CardTemplate",
+                        "name": "Карточка 1",
+                        "ord": 0,
+                        "qfmt": "{{Альфа}}",
+                        "afmt": "{{FrontSide}}{{Бета}}{{Гамма}}"
+                    }
+                ]
+            },
+            {
+                "__type__": "NoteModel",
+                "crowdanki_uuid": "model-single-field",
+                "name": "Модель с одним полем",
+                "css": "",
+                "flds": [
+                    {"name": "Единственное поле", "ord": 0}
+                ],
+                "tmpls": [
+                    {
+                        "__type__": "CardTemplate",
+                        "name": "Карточка 1",
+                        "ord": 0,
+                        "qfmt": "{{Единственное поле}}",
+                        "afmt": "{{FrontSide}}"
+                    }
+                ]
+            }
+        ],
+        "deck_configurations": [
+            {"__type__": "DeckConfig", "crowdanki_uuid": "cfg-группа", "name": "Основная"},
+            {"__type__": "DeckConfig", "crowdanki_uuid": "cfg-вторая", "name": "Вторая"}
+        ]
+    })
+}
+
+/// Готовит временный каталог с каноническим `deck.json` из готового значения.
+pub fn canonical_export(label: &str, export: &Value) -> TempDir {
+    let dir = TempDir::new(label);
+    dir.write_canonical_deck_json(export);
+    dir
+}
+
+/// Готовит временный каталог с каноническим `deck.json` из [`base_export`].
+pub fn canonical_base_export(label: &str) -> TempDir {
+    canonical_export(label, &base_export())
+}
+
+/// Запускает `anki-repo` без привязки к рабочему каталогу репозитория.
+///
+/// Пути в аргументах обязаны быть абсолютными: тест не должен зависеть от того,
+/// где лежит crate и что лежит в `decks/`.
 pub fn run_cli(args: &[&str]) -> (i32, String, String) {
-    run_cli_in(Some(&repo_root()), args)
+    run_cli_in(None, args)
 }
 
 /// Запускает `anki-repo` в заданном рабочем каталоге.
@@ -294,14 +405,6 @@ pub fn write_proposals(dir: &TempDir, name: &str, document: &Value) -> PathBuf {
     path
 }
 
-/// Сырой JSON канонической колоды `Words__N{level}`.
-pub fn raw_json(level: u8) -> Value {
-    let path = words_deck(level).join("deck.json");
-    let text =
-        fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
-}
-
 /// Все заметки сырого экспорта в порядке обхода дерева.
 ///
 /// Порядок совпадает с порядком `note_index` tool'а и не зависит от него: это
@@ -406,13 +509,12 @@ pub fn raw_field_position(
 }
 
 /// Коды QA-правил: ключи [`raw_qa_counts`].
-pub const QA_CODES: [&str; 6] = [
+pub const QA_CODES: [&str; 5] = [
     "empty_field_value",
     "leading_whitespace",
     "trailing_whitespace",
     "forbidden_white_span",
     "duplicate_note_content",
-    "duplicate_primary_field",
 ];
 
 /// Независимый пересчёт ожидаемых counts QA прямо из сырого JSON.
@@ -420,9 +522,10 @@ pub const QA_CODES: [&str; 6] = [
 /// Это oracle теста, а не второй экземпляр правил: он сознательно написан
 /// иначе (прямой обход `serde_json` без индексов экспорта), чтобы расхождение
 /// с `anki-repo` было видно. Ни одно ожидаемое значение не зашито в тест —
-/// они пересчитываются из текущего содержимого колоды.
+/// они пересчитываются из фактического содержимого проверяемого экспорта.
 ///
-/// Допущения, верные для канонических колод (`validate` даёт 0 ERROR):
+/// Допущения, верные для проверяемых synthetic-экспортов (`validate` даёт
+/// 0 ERROR):
 /// значения полей — строки, `guid` непусты и уникальны, `note_model_uuid`
 /// разрешается. Проверки адресуемости ниже повторяют это независимо, поэтому
 /// колода с нарушением допущения не сломает oracle молча: она изменит counts,
@@ -506,10 +609,6 @@ pub fn raw_qa_counts(value: &Value) -> BTreeMap<&'static str, usize> {
         "duplicate_note_content",
         raw_content_duplicate_groups(&addressable),
     );
-    counts.insert(
-        "duplicate_primary_field",
-        raw_primary_duplicate_groups(&addressable, &models),
-    );
     counts
 }
 
@@ -524,33 +623,6 @@ fn raw_content_duplicate_groups(notes: &[&&Value]) -> usize {
         let fields = serde_json::to_string(note.get("fields").unwrap_or(&Value::Null))
             .expect("fields сериализуются");
         *groups.entry((uuid.to_string(), fields)).or_default() += 1;
-    }
-    groups.values().filter(|size| **size >= 2).count()
-}
-
-/// Группы заметок с одинаковым сырым головным полем.
-fn raw_primary_duplicate_groups(
-    notes: &[&&Value],
-    models: &BTreeMap<String, BTreeMap<String, i64>>,
-) -> usize {
-    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-    for note in notes {
-        let Some(uuid) = note.get("note_model_uuid").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(ord) = models.get(uuid).and_then(|model| model.get(PRIMARY_FIELD)) else {
-            continue;
-        };
-        let Some(text) = note
-            .get("fields")
-            .and_then(Value::as_array)
-            .and_then(|fields| fields.get(usize::try_from(*ord).expect("ord неотрицателен")))
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        else {
-            continue;
-        };
-        *groups.entry(text.to_string()).or_default() += 1;
     }
     groups.values().filter(|size| **size >= 2).count()
 }

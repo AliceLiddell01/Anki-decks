@@ -190,7 +190,7 @@ pub struct ReviewCheckResult {
     pub source_editable: bool,
     /// Почему исходник нельзя править (пусто, если можно).
     pub source_blockers: Vec<SourceBlocker>,
-    /// Готовый запрос для Stage 2: чистый отчёт, эффективные правки и
+    /// Готовый запрос для `edit`: чистый отчёт, эффективные правки и
     /// правимый исходник.
     pub edit_request: Option<EditRequest>,
     /// Process exit code: причина блокировки исходника важнее итога по
@@ -313,7 +313,7 @@ pub fn review_check(
     })
 }
 
-/// Собирает запрос Stage 2 из исполнимых предложений.
+/// Собирает запрос для `edit` из исполнимых предложений.
 ///
 /// В `expected` переносится значение из предложения, и это безопасно: статус
 /// `valid` получают только те предложения, у которых фактическое текущее значение
@@ -341,7 +341,7 @@ fn build_edit_request(
             .collect(),
     };
 
-    // Тот же инвариант, что у Stage 2: выпускаемый запрос обязан быть исполнимым.
+    // Тот же инвариант, что у запроса `edit`: выпускаемый запрос обязан быть исполнимым.
     edit::validate_request(&request)?;
     Ok(Some(request))
 }
@@ -466,7 +466,7 @@ mod tests {
     fn uneditable_source_blocks_the_request_but_keeps_the_report() {
         let node = deck_node(MINIMAL_EXPORT);
         let index = ExportIndex::build(&node);
-        let document = request(vec![("guid-1", "Значение", "случайность", "случайно")]);
+        let document = request(vec![("guid-1", "Толкование", "случайность", "случайно")]);
         let blockers = vec![
             source_blocker(ErrorCode::SourceNotCanonical),
             source_blocker(ErrorCode::ExportInvalid),
@@ -501,7 +501,7 @@ mod tests {
     fn valid_proposal_is_reported_and_compiled_into_a_request() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![("guid-1", "Значение", "случайность", "случайно")]),
+            &request(vec![("guid-1", "Толкование", "случайность", "случайно")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Ok);
         assert_eq!(result.exit_code, 0);
@@ -527,7 +527,7 @@ mod tests {
     fn mismatched_current_value_is_a_conflict_without_a_request() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![("guid-1", "Значение", "устаревшее", "новое")]),
+            &request(vec![("guid-1", "Толкование", "устаревшее", "новое")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Stale);
         assert_eq!(result.exit_code, 7);
@@ -540,7 +540,7 @@ mod tests {
     fn already_applied_proposal_is_reported_not_conflicting() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![("guid-1", "Значение", "старое", "случайность")]),
+            &request(vec![("guid-1", "Толкование", "старое", "случайность")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Ok);
         assert_eq!(result.exit_code, 0);
@@ -554,7 +554,7 @@ mod tests {
     fn identical_expected_and_replacement_is_already_correct() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![("guid-1", "Значение", "случайность", "случайность")]),
+            &request(vec![("guid-1", "Толкование", "случайность", "случайность")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Ok);
         assert_eq!(result.counts.already_correct, 1);
@@ -565,7 +565,7 @@ mod tests {
     fn unknown_guid_is_reported_as_invalid_not_as_error() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![("нет-такого", "Значение", "a", "b")]),
+            &request(vec![("нет-такого", "Толкование", "a", "b")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Invalid);
         assert_eq!(result.exit_code, 4, "seniority: note_not_found → 4");
@@ -594,8 +594,8 @@ mod tests {
         let result = check(
             &json,
             &request(vec![
-                ("нет-такого", "Значение", "a", "b"),
-                ("guid-1", "Значение", "a", "b"),
+                ("нет-такого", "Толкование", "a", "b"),
+                ("guid-1", "Толкование", "a", "b"),
             ]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Invalid);
@@ -608,8 +608,8 @@ mod tests {
         let result = check(
             MINIMAL_EXPORT,
             &request(vec![
-                ("guid-1", "Значение", "случайность", "случайно"),
-                ("guid-2", "Значение", "устаревшее", "новое"),
+                ("guid-1", "Толкование", "случайность", "случайно"),
+                ("guid-2", "Толкование", "устаревшее", "новое"),
             ]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Stale);
@@ -625,7 +625,7 @@ mod tests {
         let json = export_with(MINIMAL_EXPORT, |value| {
             value["notes"][0]["fields"][1] = serde_json::json!(42);
         });
-        let result = check(&json, &request(vec![("guid-1", "Значение", "42", "43")]));
+        let result = check(&json, &request(vec![("guid-1", "Толкование", "42", "43")]));
         assert_eq!(result.outcome, ReviewOutcome::Invalid);
         assert_eq!(result.exit_code, 3);
         assert_eq!(result.proposals[0].problem, Some("field_not_resolvable"));
@@ -645,7 +645,7 @@ mod tests {
             .map(|index| {
                 (
                     Box::leak(format!("bulk-{index}").into_boxed_str()) as &str,
-                    "Значение",
+                    "Толкование",
                     "случайность",
                     "новое",
                 )
@@ -683,8 +683,8 @@ mod tests {
         let error = check_error(
             MINIMAL_EXPORT,
             &request(vec![
-                ("guid-1", "Значение", "случайность", "a"),
-                ("guid-1", "Значение", "случайность", "b"),
+                ("guid-1", "Толкование", "случайность", "a"),
+                ("guid-1", "Толкование", "случайность", "b"),
             ]),
         );
         assert_eq!(error.code, ErrorCode::DuplicateEditTarget);
@@ -706,7 +706,7 @@ mod tests {
         let raw = r#"{
             "schema_version": 1,
             "proposals": [
-                {"proposal_id": "e1", "guid": "guid-1", "field": "Значение",
+                {"proposal_id": "e1", "guid": "guid-1", "field": "Толкование",
                  "expected": "случайность", "replacement": "случайно"}
             ]
         }"#
@@ -720,7 +720,7 @@ mod tests {
         let result = review_check(&export, &index, &parsed, &blockers).expect("проверка");
         let emitted = result.edit_request.expect("запрос");
 
-        let dry_run = edit::edit(&export, &emitted, false).expect("dry-run Stage 2");
+        let dry_run = edit::edit(&export, &emitted, false).expect("dry-run запроса edit");
         assert!(!dry_run.applied);
         assert_eq!(dry_run.summaries.dry_run, 1);
         assert_eq!(dry_run.effective_edits, 1);

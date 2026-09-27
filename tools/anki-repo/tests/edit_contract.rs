@@ -55,7 +55,7 @@ fn dry_run_plans_the_change_and_keeps_the_file() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "случайность",
             "--set",
@@ -142,7 +142,7 @@ fn apply_is_idempotent_and_reports_already_applied() {
             "--guid".to_string(),
             "guid-1".to_string(),
             "--field".to_string(),
-            "Значение".to_string(),
+            "Толкование".to_string(),
             "--expect".to_string(),
             "случайность".to_string(),
             "--set".to_string(),
@@ -185,7 +185,7 @@ fn identical_expected_and_replacement_change_nothing() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "случайность",
             "--set",
@@ -215,7 +215,7 @@ fn conflict_reports_the_actual_value_and_exits_with_seven() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "другое",
             "--set",
@@ -230,7 +230,7 @@ fn conflict_reports_the_actual_value_and_exits_with_seven() {
     assert_eq!(error["details"]["edits_total"], 1);
     assert_eq!(error["details"]["conflicts_total"], 1);
     assert_eq!(error["details"]["conflicts"][0]["guid"], "guid-1");
-    assert_eq!(error["details"]["conflicts"][0]["field"], "Значение");
+    assert_eq!(error["details"]["conflicts"][0]["field"], "Толкование");
     assert_eq!(
         error["details"]["conflicts"][0]["expected_sample"],
         "другое"
@@ -250,7 +250,7 @@ fn conflict_reports_the_actual_value_and_exits_with_seven() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "другое",
             "--set",
@@ -284,7 +284,7 @@ fn export_with_field_count_error_is_rejected_before_conflict_check() {
             "--guid",
             "guid-2",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "неизбежность",
             "--set",
@@ -310,7 +310,7 @@ fn unknown_guid_exits_with_four() {
             "--guid",
             "нет-такого",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "x",
             "--set",
@@ -350,7 +350,10 @@ fn unknown_field_exits_with_three_and_lists_available_names() {
     assert_eq!(error["code"], "unknown_field");
     assert_eq!(exit, 3);
     assert!(
-        error["message"].as_str().expect("текст").contains("Слово"),
+        error["message"]
+            .as_str()
+            .expect("текст")
+            .contains("Заголовок"),
         "диагностика должна перечислять доступные поля: {}",
         error["message"]
     );
@@ -364,11 +367,11 @@ fn a_field_of_another_model_is_rejected_with_the_models_own_names() {
     let mut second = first_model.clone();
     second["crowdanki_uuid"] = Value::String("model-2".to_string());
     second["flds"] = serde_json::json!([
-        {"name": "Слово", "ord": 0},
+        {"name": "Заголовок", "ord": 0},
         {"name": "Значение-2", "ord": 1},
         {"name": "Пример", "ord": 2}
     ]);
-    second["tmpls"][0]["afmt"] = Value::String("{{Слово}}{{Пример}}".to_string());
+    second["tmpls"][0]["afmt"] = Value::String("{{Заголовок}}{{Пример}}".to_string());
     export["note_models"] = serde_json::json!([first_model, second]);
     export["notes"][0]["note_model_uuid"] = Value::String("model-2".to_string());
     export["notes"][0]["fields"] = serde_json::json!(["[sound:a.mp3]偶然", "случайность-2", ""]);
@@ -383,7 +386,7 @@ fn a_field_of_another_model_is_rejected_with_the_models_own_names() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "x",
             "--set",
@@ -403,8 +406,8 @@ fn a_field_of_another_model_is_rejected_with_the_models_own_names() {
 fn batch_reports_every_resolution_problem_at_once() {
     let dir = canonical_fixture("edit-batch-problems");
     let request = edit_request(&[
-        ("guid-1", "Значение", "случайность", "случайность!"),
-        ("нет-такого", "Значение", "x", "y"),
+        ("guid-1", "Толкование", "случайность", "случайность!"),
+        ("нет-такого", "Толкование", "x", "y"),
         ("guid-2", "НетТакогоПоля", "x", "y"),
     ]);
     let path = write_request(&dir, "request.json", &request);
@@ -436,8 +439,8 @@ fn duplicate_target_is_rejected_without_touching_the_export() {
     let dir = canonical_fixture("edit-duplicate");
     let before = dir.deck_json_bytes();
     let request = edit_request(&[
-        ("guid-1", "Значение", "случайность", "а"),
-        ("guid-1", "Значение", "а", "б"),
+        ("guid-1", "Толкование", "случайность", "а"),
+        ("guid-1", "Толкование", "а", "б"),
     ]);
     let path = write_request(&dir, "request.json", &request);
 
@@ -493,7 +496,7 @@ fn unsupported_schema_version_is_rejected() {
         &dir,
         "request.json",
         &serde_json::json!({"schema_version": 99, "edits": [
-            {"guid": "guid-1", "field": "Значение", "expected": "a", "replacement": "b"}
+            {"guid": "guid-1", "field": "Толкование", "expected": "a", "replacement": "b"}
         ]}),
     );
 
@@ -528,7 +531,7 @@ fn non_canonical_source_is_rejected_before_any_write() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "случайность",
             "--set",
@@ -562,7 +565,7 @@ fn export_with_errors_is_not_mutable() {
             "--guid",
             "guid-2",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "неизбежность",
             "--set",
@@ -584,7 +587,7 @@ fn conflicting_model_definitions_make_the_export_not_mutable() {
     let mut variant = export["note_models"][0].clone();
     variant["flds"] = serde_json::json!([
         {"name": "Другое", "ord": 0},
-        {"name": "Значение", "ord": 1},
+        {"name": "Толкование", "ord": 1},
         {"name": "Пример", "ord": 2}
     ]);
     export["children"] = serde_json::json!([{
@@ -609,7 +612,7 @@ fn conflicting_model_definitions_make_the_export_not_mutable() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "случайность",
             "--set",
@@ -639,7 +642,7 @@ fn missing_export_directory_exits_with_three() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "x",
             "--set",
@@ -656,8 +659,8 @@ fn missing_export_directory_exits_with_three() {
 fn request_file_and_stdin_are_equivalent() {
     let dir = canonical_fixture("edit-stdin");
     let request = edit_request(&[
-        ("guid-1", "Значение", "случайность", "случайность!"),
-        ("guid-2", "Слово", "必然", "必然!"),
+        ("guid-1", "Толкование", "случайность", "случайность!"),
+        ("guid-2", "Заголовок", "必然", "必然!"),
     ]);
     let path = write_request(&dir, "request.json", &request);
     let raw = serde_json::to_vec(&request).expect("запрос");
@@ -696,7 +699,7 @@ fn request_file_and_stdin_are_equivalent() {
 fn batch_mixes_statuses_in_one_invocation() {
     let dir = canonical_fixture("edit-mixed");
     // Сначала применяем одну правку, чтобы вторая стала `already_applied`.
-    let first = edit_request(&[("guid-1", "Значение", "случайность", "случайность!")]);
+    let first = edit_request(&[("guid-1", "Толкование", "случайность", "случайность!")]);
     let path = write_request(&dir, "first.json", &first);
     let (exit, _, _) = run_cli_in(
         None,
@@ -711,8 +714,8 @@ fn batch_mixes_statuses_in_one_invocation() {
     assert_eq!(exit, 0);
 
     let mixed = edit_request(&[
-        ("guid-1", "Значение", "случайность", "случайность!"),
-        ("guid-2", "Значение", "неизбежность", "неизбежность"),
+        ("guid-1", "Толкование", "случайность", "случайность!"),
+        ("guid-2", "Толкование", "неизбежность", "неизбежность"),
         ("guid-2", "Пример", "", "必然の一致"),
     ]);
     let path = write_request(&dir, "mixed.json", &mixed);
@@ -755,7 +758,7 @@ fn json_result_contract_has_stable_keys() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "случайность",
             "--set",
@@ -837,7 +840,7 @@ fn human_output_names_modes_checks_and_values() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "случайность",
             "--set",
@@ -920,7 +923,7 @@ fn media_directory_is_never_touched() {
             "--guid",
             "guid-1",
             "--field",
-            "Значение",
+            "Толкование",
             "--expect",
             "случайность",
             "--set",
@@ -951,7 +954,7 @@ fn validation_results_are_reported_before_and_after() {
             "--guid",
             "guid-1",
             "--field",
-            "Слово",
+            "Заголовок",
             "--expect",
             "[sound:a.mp3]偶然",
             "--set",

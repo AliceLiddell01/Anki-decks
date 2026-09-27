@@ -6,17 +6,20 @@ Toolkit `tools/anki-repo` покрывает большую часть мини�
 читать JSON вручную:
 
 ```bash
-cd tools/anki-repo
-cargo run --quiet -- inspect  ../../decks/japanese/words/Words__N3
-cargo run --quiet -- stats    ../../decks/japanese/words/Words__N3
-cargo run --quiet -- validate ../../decks/japanese/words/Words__N3
+# из корня репозитория — там же, где корневой Cargo workspace
+cargo run --quiet --bin anki-repo -- inspect  decks/japanese/words/Words__N3
+cargo run --quiet --bin anki-repo -- stats    decks/japanese/words/Words__N3
+cargo run --quiet --bin anki-repo -- validate decks/japanese/words/Words__N3
 
 # точечная правка значения поля: сначала dry-run, потом запись
-cargo run --quiet -- edit ../../decks/japanese/words/Words__N3 \
+cargo run --quiet --bin anki-repo -- edit decks/japanese/words/Words__N3 \
   --guid '<guid>' --field 'Значение' --expect '<было>' --set '<стало>'
-cargo run --quiet -- edit ../../decks/japanese/words/Words__N3 \
+cargo run --quiet --bin anki-repo -- edit decks/japanese/words/Words__N3 \
   --guid '<guid>' --field 'Значение' --expect '<было>' --set '<стало>' --apply
 ```
+
+`Words__N3` здесь — пример текущего экспорта, а не обязательный путь: команды
+работают с любым каталогом CrowdAnki-экспорта, в котором лежит `deck.json`.
 
 Соответствие минимуму ниже:
 
@@ -45,7 +48,7 @@ cargo run --quiet -- edit ../../decks/japanese/words/Words__N3 \
 Перед правкой зафиксируй `inspect`/`stats` (число заметок, узлов, моделей,
 распределение по полям), после правки повтори и сравни. Для точечной работы с
 одной заметкой используй `find --guid`, для поиска по значению поля —
-`find --field` или сокращение `find --word`.
+`find --field <имя поля> --value <значение> [--match exact|contains]`.
 
 ### Через `qa`, `review` и `review-check`
 
@@ -53,16 +56,21 @@ cargo run --quiet -- edit ../../decks/japanese/words/Words__N3 \
 JSON руками:
 
 ```bash
-cd tools/anki-repo
-cargo run --quiet -- qa     ../../decks/japanese/words/Words__N3
-cargo run --quiet -- review ../../decks/japanese/words/Words__N3 --qa-code empty_field_value
+# из корня репозитория
+cargo run --quiet --bin anki-repo -- qa     decks/japanese/words/Words__N3
+cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-code empty_field_value
 ```
 
 - `qa` детерминированно находит findings по фиксированному реестру правил
-  (пустые значения, пробелы по краям, белый `<span>`, дубликаты содержимого и
-  поля `Слово`). У `qa` своя шкала severity — `error | warning | info`, — и она
-  не связана со шкалой `validate`: QA `error` (например, `forbidden_white_span`)
-  означает серьёзный продуктовый дефект содержимого, а не структурную ошибку
+  (пустые значения, пробелы по краям, белый `<span>`, дубликаты содержимого
+  заметки). Реестр: `empty_field_value`, `leading_whitespace`,
+  `trailing_whitespace` (warning), `forbidden_white_span` (error),
+  `duplicate_note_content` (warning). Имена полей конкретной модели в реестр не
+  входят: «главное поле» — понятие модели заметок, а не CrowdAnki, поэтому у
+  toolkit'а нет универсальной семантики такого правила. У `qa` своя шкала
+  severity — `error | warning | info`, — и она не связана со шкалой `validate`:
+  QA `error` (например, `forbidden_white_span`) означает серьёзный продуктовый
+  дефект содержимого, а не структурную ошибку
   экспорта. Такой finding не делает экспорт невалидным, не меняет exit code `qa`
   (он остаётся `0`) и не блокирует `edit`. Структурные причины (неразрешимая
   модель, отсутствующий или неуникальный `guid`) остаются зоной `validate`, а
@@ -146,6 +154,48 @@ cargo run --quiet -- review ../../decks/japanese/words/Words__N3 --qa-code empty
 одновременных `edit --apply` одного экспорта не могут молча потерять результат
 одного из них: проигравший получает `source_changed` и должен быть повторён по
 актуальному состоянию.
+
+## Проверки CI
+
+`.github/workflows/ci.yml` (workflow «Проверки репозитория») прогоняет те же
+проверки, что и локально, но независимо от машины разработчика. Он запускается
+на `pull_request`, на `push` и вручную (`workflow_dispatch`); push-job выполняется
+только для default branch, имя ветки в workflow не зашито. CI имеет
+`permissions: contents: read`: он не публикует артефакты, не использует секреты и
+ничего не пишет в репозиторий.
+
+Два job'а:
+
+- «Код и тесты» — на стабильном тулчейне, из корня репозитория:
+  - `cargo fmt --all --check`;
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+  - `cargo test --workspace --locked`;
+  - проверка найденных CrowdAnki-экспортов: шаг сам ищет `deck.json` внутри
+    `decks/` и вызывает для каждого `validate`. Конкретные колоды, уровни, модели
+    заметок и имена полей в workflow не зашиты; если экспортов нет, шаг
+    завершается успешно.
+- «Заявленная MSRV» — отдельный job: читает версию из корневого `Cargo.toml`
+  через `cargo metadata --no-deps --format-version 1` (поле `rust_version`
+  участников workspace), проверяет, что участники не расходятся в этой версии,
+  ставит её и выполняет
+  `cargo +<msrv> check --workspace --all-targets --locked`. Версия MSRV не
+  дублируется в workflow: единственный владелец — `[workspace.package]` корневого
+  манифеста.
+
+Локально тот же набор воспроизводится из корня репозитория:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+CI и default-набор тестов проверяют инварианты формата CrowdAnki и поведение
+toolkit'а, а не сегодняшний состав `decks/`. Изменение состава колод, уровней,
+конкретных note models, имён полей и media не требует правки CI или default-тестов
+и не должно начать требовать её: ни один шаг не называет колоду по имени, а
+проверка экспортов сама находит то, что лежит в `decks/`. Исключение — изменение
+самого формата или контракта toolkit'а.
 
 ## Минимум после любой правки JSON
 
