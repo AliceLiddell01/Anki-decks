@@ -266,7 +266,7 @@ fn conflict_reports_the_actual_value_and_exits_with_seven() {
 }
 
 #[test]
-fn in_memory_error_also_uses_the_conflict_exit_code() {
+fn export_with_field_count_error_is_rejected_before_conflict_check() {
     let dir = canonical_fixture("edit-in-memory-conflict");
 
     // Заметка с некорректным числом полей: типизированное дерево сообщает
@@ -461,7 +461,7 @@ fn duplicate_target_is_rejected_without_touching_the_export() {
 }
 
 #[test]
-fn empty_request_is_a_usage_level_error() {
+fn empty_request_is_an_invalid_request_with_exit_three() {
     let dir = canonical_fixture("edit-empty-request");
     let path = write_request(
         &dir,
@@ -964,12 +964,23 @@ fn validation_results_are_reported_before_and_after() {
     assert_eq!(result["validation"]["before"]["errors"], 0);
     assert_eq!(result["validation"]["after"]["errors"], 0);
 
+    // Правка подменила ссылку на объявленный media-файл ссылкой на
+    // необъявленный, поэтому в дельте обязан появиться новый WARNING.
+    let warnings = result["validation"]["new_warning_codes"]
+        .as_array()
+        .expect("new_warning_codes — массив");
+    assert!(
+        warnings
+            .iter()
+            .any(|code| code == "media_reference_undeclared"),
+        "ожидалось предупреждение media_reference_undeclared, получено {warnings:?}"
+    );
+
     let after = dir.deck_json_bytes();
-    let before = {
-        let mut export = base_export();
-        export["notes"][0]["fields"][0] = Value::String("[sound:a.mp3]偶然".to_string());
-        anki_repo::loader::render_canonical_bytes(&export).expect("каноническая форма")
-    };
+    // `base_export()` уже содержит это значение, поэтому `before` берётся прямо из
+    // него: промежуточная мутация ничего не меняла и только вводила в заблуждение.
+    let before =
+        anki_repo::loader::render_canonical_bytes(&base_export()).expect("каноническая форма");
     let (old_line, new_line) = single_line_change(&before, &after);
     assert!(old_line.contains("sound:a.mp3"));
     assert!(new_line.contains("sound:missing.mp3"));
