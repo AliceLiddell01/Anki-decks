@@ -60,15 +60,32 @@ cargo run --quiet -- review ../../decks/japanese/words/Words__N3 --qa-code empty
 
 - `qa` детерминированно находит findings по фиксированному реестру правил
   (пустые значения, пробелы по краям, белый `<span>`, дубликаты содержимого и
-  поля `Слово`). Findings — не ошибки экспорта: уровня `ERROR` среди них нет,
-  `validate` от них не меняется, `edit` они не блокируют.
+  поля `Слово`). У `qa` своя шкала severity — `error | warning | info`, — и она
+  не связана со шкалой `validate`: QA `error` (например, `forbidden_white_span`)
+  означает серьёзный продуктовый дефект содержимого, а не структурную ошибку
+  экспорта. Такой finding не делает экспорт невалидным, не меняет exit code `qa`
+  (он остаётся `0`) и не блокирует `edit`. Структурные причины (неразрешимая
+  модель, отсутствующий или неуникальный `guid`) остаются зоной `validate`, а
+  `qa` только помечает затронутые findings полем `addressable: false` и считает
+  их в `unaddressable_findings`.
+- Findings правил-дубликатов описывают группу целиком: `group_size` и
+  `related_note_indices`/`related_guids` называют всех участников (владельца
+  finding входит в группу, список `related` — нет), а при превышении предела
+  видно `related_truncated: true`. Группа никогда не обрезается молча.
 - `review` отдаёт компактный batch заметок по найденной проблеме. Читай batch, а
   не `deck.json`: страница ограничена по умолчанию 25 заметками, и по
-  `next_offset` видно, есть ли продолжение.
-- Предложения по содержимому проверяй через `review-check` до любой записи: он
-  ничего не пишет и различает `valid`, `already_correct`, `already_applied`,
-  `conflict` и `invalid`. Запрос для `edit` берётся из `result.edit_request` и
-  существует только при `outcome: ok`.
+  `next_offset` видно, есть ли продолжение. Отбор по `--qa-code` для правил
+  групп приводит всех участников группы, а не только владельца finding; заметки
+  без однозначного `guid` в batch не попадают и посчитаны в
+  `excluded_unaddressable`.
+- Предложения по содержимому проверяй через `review-check` до любой записи:
+  у команды собственный документ предложений (`schema_version: 1`,
+  `proposals[]` с `proposal_id`/`guid`/`field`/`expected`/`replacement` и
+  необязательным `reason`), а не запрос `edit`. Он ничего не пишет и различает
+  `valid`, `already_correct`, `already_applied`, `conflict` и `invalid`. Запрос
+  для `edit` берётся из `result.edit_request` и существует только при
+  `outcome: ok`; `proposal_id` становится `edit_id`, а `reason` в запрос не
+  переносится.
 - Содержательное суждение о карточке делает внешний агент: `qa` и `review` не
   оценивают смысл, а toolkit не вызывает LLM API.
 

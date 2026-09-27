@@ -32,6 +32,9 @@ pub fn empty_field_value(context: &RuleContext<'_>) -> Vec<RawFinding> {
                     "sample": "",
                     "value_chars": 0,
                 }),
+                related: Vec::new(),
+                related_truncated: false,
+                group_size: None,
             });
         }
     }
@@ -95,6 +98,9 @@ fn whitespace_rule(
                         "chars": whitespace.chars().count(),
                     },
                 }),
+                related: Vec::new(),
+                related_truncated: false,
+                group_size: None,
             });
         }
     }
@@ -124,6 +130,9 @@ pub fn forbidden_white_span(context: &RuleContext<'_>) -> Vec<RawFinding> {
                     "occurrences": scan.occurrences,
                     "first_tag": scan.first_tag,
                 }),
+                related: Vec::new(),
+                related_truncated: false,
+                group_size: None,
             });
         }
     }
@@ -306,11 +315,13 @@ mod tests {
             value["notes"][0]["guid"] = json!(null);
             value["notes"][0]["fields"][1] = json!("");
         });
+        // Правило описывает содержимое, а не адресуемость: заметка без guid
+        // по-прежнему даёт finding, но он честно помечен как неисполнимый.
         let found = findings_for(&json, "empty_field_value");
-        // У второй заметки модели «Значение» пустое изначально, у первой — по
-        // условию теста; обе заметки попадают в findings.
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].note_position, 0);
+        assert!(!found[0].addressable);
+        assert!(found[1].addressable);
         assert!(
             found.iter().any(|finding| finding.note_position == 0
                 && finding.field.as_deref() == Some("Значение")),

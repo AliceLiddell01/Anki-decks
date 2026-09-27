@@ -71,6 +71,13 @@ pub struct NoteView<'a> {
     pub model: Option<&'a NoteModel>,
     /// Поля заметки в порядке `ord` модели.
     pub fields: Vec<ResolvedField<'a>>,
+    /// Можно ли однозначно адресовать заметку в этом экспорте.
+    ///
+    /// Адресуемость — это свойство *экспорта*, а не заметки: `guid` может
+    /// отсутствовать, быть пустым или повторяться, а модель — не разрешаться.
+    /// Вычисляет его тот слой, у которого есть индексы ([`RuleContext::build`]),
+    /// чтобы правила и команды не повторяли одну и ту же проверку по-разному.
+    pub addressable: bool,
 }
 
 impl NoteView<'_> {
@@ -124,18 +131,36 @@ impl<'a> RuleContext<'a> {
                     deck_path: index.note_deck_path(entry),
                     model,
                     fields,
+                    addressable: is_addressable(index, entry),
                 }
             })
             .collect();
         Self { views }
     }
 
-    /// Все заметки с непустым `guid` и разрешимой моделью.
+    /// Заметки, которые можно адресовать однозначно.
+    ///
+    /// Правила о группах заметок работают только через этот итератор: находить
+    /// группу по `guid`, который нельзя процитировать внешнему агенту, значило бы
+    /// выдавать неисполнимую рекомендацию.
     pub fn addressable(&self) -> impl Iterator<Item = &NoteView<'a>> {
-        self.views.iter().filter(|view| {
-            view.model.is_some() && !view.note.guid.as_deref().unwrap_or("").is_empty()
-        })
+        self.views.iter().filter(|view| view.addressable)
     }
+}
+
+/// Разрешается ли заметка в этом экспорте однозначно.
+///
+/// Уникальность `guid` не проверяется здесь заново: индекс экспорта уже знает
+/// все позиции каждого `guid`, и повторный `guid` для адресации неоднозначен
+/// ровно так же, как для `find` и `review`.
+fn is_addressable(index: &ExportIndex<'_>, entry: &crate::index::NoteRef<'_>) -> bool {
+    let model_resolves = entry
+        .note
+        .note_model_uuid
+        .as_deref()
+        .is_some_and(|uuid| index.model_by_uuid(uuid).is_some());
+    let guid = entry.note.guid.as_deref().unwrap_or("");
+    model_resolves && !guid.is_empty() && index.note_positions_by_guid(guid).len() == 1
 }
 
 /// Ненормализованный факт, найденный правилом.
@@ -152,6 +177,15 @@ pub struct RawFinding {
     /// Machine-readable детали; объём значения здесь не ограничен, размер
     /// выборок ограничивает само правило.
     pub evidence: Value,
+    /// Позиции остальных заметок группы, если finding — про группу.
+    ///
+    /// Ограничено [`duplicate_rules::MAX_RELATED_NOTES`]: это структурированный
+    /// ответ на вопрос «кто ещё в группе», и его читают и `qa`, и `review`.
+    pub related: Vec<usize>,
+    /// Была ли группа обрезана до [`duplicate_rules::MAX_RELATED_NOTES`].
+    pub related_truncated: bool,
+    /// Размер группы целиком, если finding — про группу.
+    pub group_size: Option<usize>,
 }
 
 /// Одно зарегистрированное QA-правило.
@@ -264,6 +298,14 @@ pub struct Finding {
     pub message: String,
     /// Machine-readable детали.
     pub evidence: Value,
+    /// Можно ли адресовать заметку finding'а однозначно.
+    pub addressable: bool,
+    /// Позиции остальных заметок группы.
+    pub related: Vec<usize>,
+    /// Была ли группа обрезана.
+    pub related_truncated: bool,
+    /// Размер группы целиком.
+    pub group_size: Option<usize>,
 }
 
 /// Выполняет все применимые правила и возвращает findings в каноническом
@@ -286,6 +328,10 @@ pub fn collect(context: &RuleContext<'_>) -> Vec<Finding> {
                 field_ord: raw.field_ord,
                 message: raw.message,
                 evidence: raw.evidence,
+                addressable: context.views[raw.note_position].addressable,
+                related: raw.related,
+                related_truncated: raw.related_truncated,
+                group_size: raw.group_size,
             });
         }
     }

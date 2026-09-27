@@ -11,6 +11,14 @@
 //! видеть все найденные *классы* проблем сразу, даже когда один класс массовый.
 //! `findings_total` всегда считает полное число, `truncated` показывает,
 //! попало ли в вывод всё.
+//!
+//! Второе ограничение вывода задано не размером, а downstream-контрактом:
+//! finding на заметку, которую нельзя адресовать (`guid` отсутствует, пуст или
+//! повторяется), помечается `addressable: false`. Такой finding остаётся
+//! диагностикой содержимого, но не выдаётся за editable target: предложение по
+//! нему нечем исполнить. Структурные причины неадресуемости остаются
+//! собственностью [`crate::ops::validate`]; `qa` их не дублирует и не превращает
+//! в отказ.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -54,6 +62,8 @@ pub struct QaResult {
     pub by_code: Vec<CodeCount>,
     /// Findings в каноническом порядке.
     pub findings: Vec<FindingView>,
+    /// Сколько выбранных findings нельзя адресовать однозначно.
+    pub unaddressable_findings: usize,
 }
 
 /// Реестр одного правила в результате.
@@ -107,6 +117,16 @@ pub struct FindingView {
     pub message: String,
     /// Machine-readable детали в границах, установленных правилом.
     pub evidence: Value,
+    /// Можно ли адресовать заметку finding'а однозначно.
+    pub addressable: bool,
+    /// `guid` остальных участников группы в порядке экспорта.
+    pub related_guids: Vec<String>,
+    /// Позиции всех участников группы, включая саму заметку finding'а.
+    pub related_note_indices: Vec<usize>,
+    /// Был ли список участников обрезан.
+    pub related_truncated: bool,
+    /// Размер группы целиком, если finding — про группу.
+    pub group_size: Option<usize>,
 }
 
 /// Выполняет `qa`.
@@ -178,6 +198,11 @@ pub fn qa(
         })
         .collect();
 
+    let unaddressable_findings = selected
+        .iter()
+        .filter(|finding| !finding.addressable)
+        .count();
+
     Ok(QaResult {
         export_dir: export_dir.display().to_string(),
         notes_total: index.notes.len(),
@@ -189,6 +214,7 @@ pub fn qa(
         rules,
         by_code,
         findings,
+        unaddressable_findings,
     })
 }
 
@@ -238,7 +264,22 @@ fn finding_view(
         field_ord: finding.field_ord,
         message: finding.message.clone(),
         evidence: finding.evidence.clone(),
+        addressable: finding.addressable,
+        related_guids: related_guids(index, &finding.related),
+        related_note_indices: finding.related.clone(),
+        related_truncated: finding.related_truncated,
+        group_size: finding.group_size,
     }
+}
+
+/// Разрешает `guid` участников группы; неразрешимый участник не выдумывается.
+fn related_guids(index: &ExportIndex<'_>, related: &[usize]) -> Vec<String> {
+    related
+        .iter()
+        .filter_map(|position| index.notes.get(*position))
+        .filter_map(|entry| entry.note.guid.clone())
+        .filter(|guid| !guid.is_empty())
+        .collect()
 }
 
 #[cfg(test)]

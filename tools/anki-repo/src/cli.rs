@@ -236,8 +236,8 @@ pub enum Command {
         /// Каталог экспорта, например decks/japanese/words/Words__N3.
         export_dir: PathBuf,
 
-        /// JSON-файл с предложениями; `-` читает документ со stdin.
-        #[arg(long = "proposals", alias = "request", value_name = "PATH")]
+        /// JSON-документ предложений (schema_version 1, `proposals`); `-` читает stdin.
+        #[arg(long = "proposals", value_name = "PATH")]
         proposals_file: PathBuf,
     },
 

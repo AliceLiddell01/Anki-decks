@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use common::{repo_root, words_deck};
+use common::{
+    collect_notes, raw_field_ord, raw_field_position, raw_json, raw_models, repo_root, words_deck,
+};
 use serde_json::Value;
 
 use anki_repo::index::ExportIndex;
@@ -31,30 +33,12 @@ const EXPECTED_FIELDS: [&str; 6] = [
     "Похожие слова",
 ];
 
-fn raw_json(level: u8) -> Value {
-    let path = words_deck(level).join("deck.json");
-    let text =
-        fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
-}
-
 fn count_nodes(value: &Value) -> usize {
     let children = value
         .get("children")
         .and_then(Value::as_array)
         .map_or(0, |children| children.iter().map(count_nodes).sum());
     1 + children
-}
-
-fn collect_notes<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
-    if let Some(notes) = value.get("notes").and_then(Value::as_array) {
-        out.extend(notes);
-    }
-    if let Some(children) = value.get("children").and_then(Value::as_array) {
-        for child in children {
-            collect_notes(child, out);
-        }
-    }
 }
 
 fn declared_media(value: &Value, out: &mut Vec<String>) {
@@ -92,69 +76,6 @@ fn basename(name: &str) -> String {
 }
 
 /// Состав моделей из сырого JSON: `crowdanki_uuid` → (имя поля → `ord`).
-fn raw_models(value: &Value) -> BTreeMap<String, BTreeMap<String, i64>> {
-    fn walk(value: &Value, out: &mut BTreeMap<String, BTreeMap<String, i64>>) {
-        if let Some(models) = value.get("note_models").and_then(Value::as_array) {
-            for model in models {
-                let Some(uuid) = model.get("crowdanki_uuid").and_then(Value::as_str) else {
-                    continue;
-                };
-                let mut fields = BTreeMap::new();
-                if let Some(flds) = model.get("flds").and_then(Value::as_array) {
-                    for field in flds {
-                        let name = field
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let ord = field.get("ord").and_then(Value::as_i64).unwrap_or_default();
-                        fields.insert(name.to_string(), ord);
-                    }
-                }
-                out.insert(uuid.to_string(), fields);
-            }
-        }
-        if let Some(children) = value.get("children").and_then(Value::as_array) {
-            for child in children {
-                walk(child, out);
-            }
-        }
-    }
-
-    let mut models = BTreeMap::new();
-    walk(value, &mut models);
-    models
-}
-
-/// Возвращает `ord` поля заметки так, как он задан её моделью в сыром JSON.
-///
-/// Позиция в `fields` не предполагается равной `ord`: она всегда разрешается
-/// через `note_model_uuid`.
-fn raw_field_ord(
-    models: &BTreeMap<String, BTreeMap<String, i64>>,
-    note: &Value,
-    name: &str,
-) -> i64 {
-    let uuid = note
-        .get("note_model_uuid")
-        .and_then(Value::as_str)
-        .expect("у заметки должен быть note_model_uuid");
-    models
-        .get(uuid)
-        .unwrap_or_else(|| panic!("модель {uuid} не найдена в note_models"))
-        .get(name)
-        .unwrap_or_else(|| panic!("поле {name} не найдено в модели {uuid}"))
-        .to_owned()
-}
-
-/// Позиция поля заметки в массиве `fields`, вычисленная по `ord` модели.
-fn raw_field_position(
-    models: &BTreeMap<String, BTreeMap<String, i64>>,
-    note: &Value,
-    name: &str,
-) -> usize {
-    usize::try_from(raw_field_ord(models, note, name)).expect("ord должен быть неотрицательным")
-}
-
 /// Все уровни N1–N5 должны существовать и содержать `deck.json`.
 #[test]
 fn canonical_decks_exist() {

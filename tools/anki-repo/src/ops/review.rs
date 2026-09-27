@@ -15,6 +15,22 @@
 //!   в экспорте — exit 5, как в `find`;
 //! - критерий-фильтр (`all`, поле, QA-код) и `--offset` за концом выборки дают
 //!   валидную пустую страницу с exit 0: без этого невозможна пагинация.
+//!
+//! Второй контракт — адресуемость batch'а. Batch существует, чтобы внешний агент
+//! предложил правки, а предложение исполнимо только для заметки, которую можно
+//! однозначно назвать (`guid` есть, он уникален, модель разрешается). Поэтому
+//! заметка, которую нельзя адресовать, в batch не попадает, а её число
+//! сообщается отдельно ([`ReviewResult::excluded_unaddressable`]) — молча
+//! выбросить её нельзя. Структурные причины такой заметки остаются предметом
+//! [`crate::ops::validate`], `review` их не диагностирует.
+//!
+//! Третий контракт — контекст группы. Для групповых QA-finding'ов
+//! (`duplicate_note_content`, `duplicate_primary_field`) в batch попадают все
+//! участники группы, а не только та заметка, к которой приписан finding: иначе
+//! агент не может судить о дубликате, не прочитав `deck.json`. Участники берутся
+//! из domain-результата ([`qa::Finding::related`]), а не собираются здесь
+//! повторно; границы списка сообщаются полями `group_size` и
+//! `related_truncated`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -87,6 +103,15 @@ pub struct SelectionSummary {
     pub deck: Option<String>,
 }
 
+/// Другой участник группы в контексте finding'а.
+#[derive(Debug, Clone)]
+pub struct RelatedNote {
+    /// Позиция заметки в порядке экспорта.
+    pub note_index: usize,
+    /// `guid` участника; `None`, если участник неадресуем и его нельзя назвать.
+    pub guid: Option<String>,
+}
+
 /// QA-finding в компактной форме для batch'а.
 #[derive(Debug, Clone)]
 pub struct FindingSummary {
@@ -98,6 +123,25 @@ pub struct FindingSummary {
     pub field: Option<String>,
     /// Человекочитаемое описание.
     pub message: String,
+    /// Размер группы целиком, если finding — про группу.
+    pub group_size: Option<usize>,
+    /// Остальные участники группы, включая неадресуемых.
+    pub related: Vec<RelatedNote>,
+    /// Был ли список участников обрезан до предела правила.
+    pub related_truncated: bool,
+}
+
+/// Роль заметки в групповом finding'е, найденном в этом batch'е.
+#[derive(Debug, Clone)]
+pub struct GroupMembership {
+    /// Код правила группы.
+    pub code: &'static str,
+    /// Позиция заметки, к которой приписан finding группы.
+    pub owner_note_index: usize,
+    /// `guid` этой заметки.
+    pub owner_guid: Option<String>,
+    /// Размер группы целиком.
+    pub group_size: usize,
 }
 
 /// Одна карточка batch'а.
@@ -111,6 +155,8 @@ pub struct ReviewItem {
     pub qa_findings: Vec<FindingSummary>,
     /// Есть ли findings, не попавшие в карточку.
     pub qa_findings_truncated: bool,
+    /// Группы из этого batch'а, в которых заметка — участник, а не владелец.
+    pub group_membership: Vec<GroupMembership>,
 }
 
 /// Результат `review`.
@@ -136,6 +182,8 @@ pub struct ReviewResult {
     pub next_offset: Option<usize>,
     /// Карточки этой страницы в порядке экспорта.
     pub items: Vec<ReviewItem>,
+    /// Сколько заметок критерий отобрал, но batch не взял из-за неадресуемости.
+    pub excluded_unaddressable: usize,
 }
 
 /// Выполняет `review`.
@@ -153,7 +201,20 @@ pub fn review(
     let scope = selection::resolve_deck_scope(index, query.deck.as_deref())?;
     let context = RuleContext::build(index);
     let findings = qa::collect(&context);
-    let selected = select(index, &findings, query, scope)?;
+    let matched = select(index, &findings, query, scope)?;
+
+    // Адресуемость — свойство экспорта, и оно уже вычислено QA-слоем один раз
+    // для всех команд. Здесь заметка только отсеивается, но не диагностируется:
+    // структурные причины принадлежат `validate`.
+    let mut excluded_unaddressable = 0;
+    let mut selected = Vec::with_capacity(matched.len());
+    for position in matched {
+        if context.views[position].addressable {
+            selected.push(position);
+        } else {
+            excluded_unaddressable += 1;
+        }
+    }
 
     let total_selected = selected.len();
     let start = query.offset.min(total_selected);
@@ -161,6 +222,7 @@ pub fn review(
     let page = &selected[start..end];
 
     let mut by_position: BTreeMap<usize, Vec<FindingSummary>> = BTreeMap::new();
+    let mut memberships: BTreeMap<usize, Vec<GroupMembership>> = BTreeMap::new();
     for finding in &findings {
         by_position
             .entry(finding.note_position)
@@ -170,7 +232,29 @@ pub fn review(
                 severity: finding.severity,
                 field: finding.field.clone(),
                 message: finding.message.clone(),
+                group_size: finding.group_size,
+                related: related_notes(index, &finding.related, finding.note_position),
+                related_truncated: finding.related_truncated,
             });
+        // Участник группы тоже должен понимать, почему он в batch'е: сам
+        // finding приписан владельцу, и без этой ссылки batch выглядел бы
+        // набором несвязанных заметок.
+        if finding.group_size.is_some() {
+            for position in &finding.related {
+                if *position == finding.note_position {
+                    continue;
+                }
+                memberships
+                    .entry(*position)
+                    .or_default()
+                    .push(GroupMembership {
+                        code: finding.code,
+                        owner_note_index: finding.note_position,
+                        owner_guid: guid_at(index, finding.note_position),
+                        group_size: finding.group_size.unwrap_or(1),
+                    });
+            }
+        }
     }
 
     let items: Vec<ReviewItem> = page
@@ -178,7 +262,13 @@ pub fn review(
         .map(|position| {
             let empty: &[FindingSummary] = &[];
             let note_findings = by_position.get(position).map_or(empty, Vec::as_slice);
-            build_item(index, *position, note_findings, MAX_FINDINGS_PER_ITEM)
+            build_item(
+                index,
+                *position,
+                note_findings,
+                &memberships,
+                MAX_FINDINGS_PER_ITEM,
+            )
         })
         .collect();
 
@@ -194,7 +284,34 @@ pub fn review(
         truncated,
         next_offset: truncated.then_some(end),
         items,
+        excluded_unaddressable,
     })
+}
+
+/// `guid` заметки по позиции в порядке экспорта.
+fn guid_at(index: &ExportIndex<'_>, position: usize) -> Option<String> {
+    index
+        .notes
+        .get(position)
+        .and_then(|entry| entry.note.guid.clone())
+        .filter(|guid| !guid.is_empty())
+}
+
+/// Участники группы как адресуемые ссылки.
+///
+/// Список включает саму заметку finding'а: это позиции всей группы, как их
+/// вычислило правило, и потребитель не должен досчитывать владельца сам.
+/// Неадресуемый участник остаётся в списке с `guid: None`: это контекст группы,
+/// а не editable target.
+fn related_notes(index: &ExportIndex<'_>, related: &[usize], owner: usize) -> Vec<RelatedNote> {
+    related
+        .iter()
+        .filter(|position| **position != owner)
+        .map(|position| RelatedNote {
+            note_index: *position,
+            guid: guid_at(index, *position),
+        })
+        .collect()
 }
 
 /// Собирает одну карточку batch'а с ограничением числа findings.
@@ -202,6 +319,7 @@ fn build_item(
     index: &ExportIndex<'_>,
     position: usize,
     findings: &[FindingSummary],
+    memberships: &BTreeMap<usize, Vec<GroupMembership>>,
     limit: usize,
 ) -> ReviewItem {
     ReviewItem {
@@ -209,6 +327,7 @@ fn build_item(
         note: NoteSummary::build(index, &index.notes[position]),
         qa_findings: findings.iter().take(limit).cloned().collect(),
         qa_findings_truncated: findings.len() > limit,
+        group_membership: memberships.get(&position).cloned().unwrap_or_default(),
     }
 }
 
@@ -268,10 +387,19 @@ fn select(
                     },
                 ));
             }
+            // Групповое finding отбирает всю группу: иначе агент не может
+            // судить о дубликате, не читая экспорт целиком. Список участников
+            // приходит из domain-результата и уже ограничен правилом.
             let matching: BTreeSet<usize> = findings
                 .iter()
                 .filter(|finding| finding.code == code)
-                .map(|finding| finding.note_position)
+                .flat_map(|finding| finding.related.iter().copied())
+                .chain(
+                    findings
+                        .iter()
+                        .filter(|finding| finding.code == code)
+                        .map(|finding| finding.note_position),
+                )
                 .collect();
             Ok(matching
                 .into_iter()
@@ -426,20 +554,25 @@ mod tests {
                 severity: QaSeverity::Warning,
                 field: None,
                 message: format!("finding {index}"),
+                group_size: None,
+                related: Vec::new(),
+                related_truncated: false,
             })
             .collect();
 
-        let bounded = build_item(&index, 0, &findings, 2);
+        let memberships = BTreeMap::new();
+        let bounded = build_item(&index, 0, &findings, &memberships, 2);
         assert_eq!(bounded.qa_findings.len(), 2);
         assert!(bounded.qa_findings_truncated);
 
-        let complete = build_item(&index, 0, &findings, 3);
+        let complete = build_item(&index, 0, &findings, &memberships, 3);
         assert_eq!(complete.qa_findings.len(), 3);
         assert!(!complete.qa_findings_truncated);
 
-        let none = build_item(&index, 0, &[], MAX_FINDINGS_PER_ITEM);
+        let none = build_item(&index, 0, &[], &memberships, MAX_FINDINGS_PER_ITEM);
         assert!(none.qa_findings.is_empty());
         assert!(!none.qa_findings_truncated);
+        assert!(bounded.group_membership.is_empty());
     }
 
     #[test]

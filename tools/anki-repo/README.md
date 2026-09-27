@@ -214,11 +214,25 @@ anki-repo --json qa decks/japanese/words/Words__N5 > findings.json
 - `duplicate_primary_field` работает только если в модели есть поле `Слово`;
   иначе правило помечается `applicable: false` и findings не выдаёт.
 - Findings никогда не делают экспорт структурно невалидным и не блокируют `edit`.
+  Шкала `error | warning | info` — это тяжесть дефекта для читателя, независимая от
+  шкалы `validate`: QA `error` не является ошибкой структуры экспорта.
+- Finding может попасть в заметку, которую нельзя исполнить: у неё не разрешается
+  модель, нет `guid` или `guid` не уникален. Такие findings **помечаются**
+  `addressable: false` и считаются в `unaddressable_findings`, а не исчезают:
+  структурную причину называет `validate`, а `qa` не выдаёт неисполнимый адрес за
+  обычную цель `edit`.
+- Правила-дубликаты описывают группу целиком: `group_size` — число участников,
+  `related_note_indices` и `related_guids` — все участники, включая владельца
+  finding (порядок — канонический порядок findings). Список ограничен 20
+  участниками (`MAX_RELATED_NOTES`), и тогда `related_truncated: true`: группа
+  никогда не обрезается молча.
 
 Каждый finding адресуется позицией заметки в экспорте (`note_index`), `guid`,
 путём колоды, моделью и парой «имя поля + `ord`», а `evidence` несёт ограниченные
 выборки: длину значения, усечённый образец и детали конкретного правила
 (например, `boundary` для пробельных правил и `first_tag` для `forbidden_white_span`).
+Данные группы в `evidence` не дублируются: они лежат в полях `group_size`,
+`related_note_indices` и `related_guids`.
 
 ### `review`
 
@@ -262,6 +276,22 @@ anki-repo review decks/japanese/words/Words__N3 --guid 'D!TAYVuHi,'
 остаётся ошибкой `not_found` (exit code 4), а неоднозначный `guid` — `ambiguous`
 (exit code 5).
 
+Что попадает в batch:
+
+- Заметки без исполнимо адресуемого `guid` в batch не выводятся: без `guid`, с
+  пустым `guid` или с `guid`, встречающимся больше одного раза (адрес неоднозначен,
+  поэтому исключаются **все** такие вхождения). Их число видно в
+  `excluded_unaddressable`; `notes_total` при этом описывает экспорт целиком, а не
+  страницу. Пустая страница из-за этого исключения не молчит: счётчик объясняет
+  причину.
+- `--qa-code` для правил-дубликатов приводит **всех** участников группы, а не
+  только владельца finding: иначе группа потеряла бы остальных заметок на пути
+  `qa → review`. Владелец несёт сам finding (с `group_size` и `related` — всеми
+  участниками, кроме себя), а каждый участник — `group_membership` со ссылкой на
+  владельца (`code`, `owner_note_index`, `owner_guid`, `group_size`).
+- `--all`, `--guid`, `--word` и `--field` группы не расширяют: они отбирают ровно
+  то, что означает их критерий.
+
 ### `review-check`
 
 Проверка предложений внешнего агента против **текущего** состояния экспорта.
@@ -281,13 +311,31 @@ anki-repo edit decks/japanese/words/Words__N1 --request request.json --apply
 anki-repo validate decks/japanese/words/Words__N1
 ```
 
-Документ предложений — это буквально документ запроса `edit` (`schema_version: 1`
-и `edits` из `edit_id`, `guid`, `field`, `expected`, `replacement`). Отдельного
-формата нет намеренно: предложение агента и запрос на правку описывают одно и то
-же действие, поэтому `review-check` переиспользует разбор, валидацию и разрешение
-целей `edit`, а выпущенный `edit_request` принимается `edit` без переупаковки.
-Сообщения об ошибках документа используют словарь запроса `edit` (`edits`,
-`schema_version`); это внутренняя форма, а не отдельный контракт.
+У команды собственный versioned документ предложений, а не запрос `edit`:
+
+```json
+{
+  "schema_version": 1,
+  "proposals": [
+    {
+      "proposal_id": "p0",
+      "guid": "guid-1",
+      "field": "Пример",
+      "expected": "",
+      "replacement": "пример-1",
+      "reason": "в колоде пустой пример"
+    }
+  ]
+}
+```
+
+`proposal_id` и `reason` — часть контракта предложения: первый становится
+`edit_id` в выпущенном запросе, второй остаётся review-метаданными (в отчёте он
+усечён до безопасной длины, а в `edit_request` не переносится вовсе). Неизвестные
+ключи запрещены: документ предложений — отдельный публичный вход, поэтому он не
+принимает поля чужой формы, а ошибки называют именно его словарь. `review-check`
+переиспользует внутренний разбор и разрешение целей `edit`, поэтому выпущенный
+`edit_request` принимается `edit` без переупаковки.
 
 Исход предложения:
 
@@ -327,10 +375,15 @@ anki-repo validate decks/japanese/words/Words__N1
 Так же ведёт себя `validate` с exit code 6.
 
 Отчёт ограничен (`proposals` — до 50 записей, `proposals_truncated`), но счётчики
-`counts` и сам `edit_request` не усекаются. Проблемы уровня всего документа
-(пустой, слишком большой, структурно некорректный, повторяющийся `edit_id`, чужая
-`schema_version`, повтор пары «`guid`, поле») остаются доменными ошибками с exit
-code 3: пока документ не разобран, проверять нечего.
+`counts` и сам `edit_request` не усекаются: усечение затрагивает только печать, и
+человеческий вывод говорит об этом прямо, не обещая «полного списка в `--json`».
+
+Проблемы уровня всего документа остаются доменными ошибками `invalid_request` с
+exit code 3 (пока документ не разобран, проверять нечего) и различаются по
+`details.reason`: `malformed_proposals` (структурно некорректный или чужая форма),
+`unsupported_schema_version`, `empty_proposals`, `too_many_proposals` (больше
+20 000), `proposals_too_large` (больше 8 МиБ), `duplicate_proposal_id` и
+`duplicate_edit_target` (повтор пары «`guid`, поле»).
 
 ### Типовой конвейер
 
@@ -343,8 +396,8 @@ anki-repo qa "$EXPORT"
 # 2. компактный batch по найденной проблеме
 anki-repo --json review "$EXPORT" --qa-code empty_field_value --limit 25 > batch.json
 
-# 3. внешний агент читает batch.json и возвращает предложения в форме запроса edit
-#    (schema_version, edits: edit_id, guid, field, expected, replacement)
+# 3. внешний агент читает batch.json и возвращает документ предложений
+#    (schema_version, proposals: proposal_id, guid, field, expected, replacement)
 
 # 4. проверка предложений против текущего состояния экспорта
 anki-repo --json review-check "$EXPORT" --proposals proposals.json \
@@ -365,13 +418,17 @@ anki-repo validate "$EXPORT"
 
 | Команда | Ключи `result` |
 |---|---|
-| `qa` | `export_dir`, `notes_total`, `findings_total`, `findings_returned`, `truncated`, `max_per_code`, `codes`, `by_code`, `rules`, `findings` |
-| `review` | `export_dir`, `selection`, `notes_total`, `total_selected`, `offset`, `limit`, `returned`, `truncated`, `next_offset`, `items` |
+| `qa` | `export_dir`, `notes_total`, `findings_total`, `findings_returned`, `unaddressable_findings`, `truncated`, `max_per_code`, `codes`, `by_code`, `rules`, `findings` |
+| `review` | `export_dir`, `selection`, `notes_total`, `total_selected`, `excluded_unaddressable`, `offset`, `limit`, `returned`, `truncated`, `next_offset`, `items` |
 | `review-check` | `export_dir`, `deck_json`, `outcome`, `proposals_total`, `counts`, `effective_proposals`, `proposals_truncated`, `proposals`, `edit_request` |
 
 В `items` команды `review` поля заметки лежат в `fields` — объекте в порядке `ord`
 модели, как и в `find`. В `findings` команды `qa` поле `field_ord` равно `null`
-для правил, которые не привязаны к конкретной позиции поля.
+для правил, которые не привязаны к конкретной позиции поля. Поля адресуемости
+(`addressable` в `qa`, `excluded_unaddressable` в `review`) и контекста группы
+(`group_size`, `related_note_indices`/`related_guids` в `qa`; `group_membership`,
+`related`, `group_size`, `related_truncated` в `review`) присутствуют всегда, в том
+числе когда группа не найдена и счётчики равны нулю.
 
 ### `edit`
 
@@ -636,8 +693,9 @@ exit code.
 | `unknown_field` | 3 | Указанного поля нет ни в одной модели экспорта; для `edit` — также если поля нет в модели целевой заметки |
 | `unknown_deck` | 3 | Указанная колода не найдена |
 | `unknown_qa_code` | 3 | Указанного кода QA нет в реестре правил (`qa --code`, `review --qa-code`) |
-| `invalid_request` | 3 | `edit` и `review-check`: пустой, слишком большой или структурно некорректный документ, повторяющийся `edit_id` или чужая `schema_version` |
+| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id` или чужая `schema_version`; `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large` или `duplicate_proposal_id` |
 | `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды |
+| `proposal_not_executable` (`details.reason`) | — | Не отдельный код: `review-check` сообщает о неисполнимом предложении статусом `invalid` внутри отчёта, а не ошибкой команды |
 | `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме |
 | `export_invalid` | 6 | `edit`: в исходном экспорте есть `ERROR` (в том числе `duplicate_note_guid` — повтор `guid` делает адресацию правки неоднозначной); либо кандидат правки получил новый `ERROR` (проверка до записи) |
 | `export_not_mutable` | 6 | `edit`: в экспорте есть `conflicting_note_model_definition` |
@@ -692,6 +750,9 @@ exit code.
 - Предложения принимаются только в форме, которую понимает `edit`: правка значения
   существующего поля существующей заметки. `qa` и `review` не предлагают
   добавление, удаление и переименование сущностей, а `review-check` их не примет.
+- Усечение отчёта (лимит findings на код, страница `review`, предел правок и
+  предложений) никогда не скрывает факт усечения: счётчики считают всё, а текст
+  сообщает, что остаток не выводится ни в human-, ни в JSON-режиме.
 - `review-check` проверяет предложение против текущего состояния экспорта, но не
   резервирует его: между проверкой и `edit --apply` содержимое может измениться, и
   тогда конфликт предусловия поймает уже `edit`.
@@ -723,16 +784,26 @@ cargo nextest run
 - `tests/cli_contract.rs` — аргументы CLI, exit codes и разделение
   `stdout`/`stderr` через реальный binary;
 - `tests/qa_contract.rs` — контракт `qa`: состав реестра, уровень `error` без
-  отказа, границы выборок в `evidence`, `--max-per-code` против полных счётчиков,
-  детерминизм и адресность findings на канонических колодах;
+  отказа (и без влияния на `validate`/`edit`), границы выборок в `evidence`,
+  `--max-per-code` против полных счётчиков, детерминизм, пометка неадресуемых
+  findings, полный контекст группы и пересчёт counts на канонических колодах
+  независимым oracle'ом по сырому `deck.json` (ни одно ожидаемое число не зашито
+  в тест);
 - `tests/review_contract.rs` — контракт `review`: размер страницы, полный обход
   пагинации без потерь и повторов, пустая страница за концом выборки, компактность
-  batch, ограничение findings внутри заметки и совпадение ошибок `--guid` с `find`;
+  batch, ограничение findings внутри заметки, совпадение ошибок `--guid` с `find`,
+  приведение всех участников группы правил-дубликатов и исключение неадресуемых
+  заметок с видимым `excluded_unaddressable`;
 - `tests/review_check_contract.rs` — контракт `review-check`: все пять статусов
-  предложения, приоритет `stale`/`invalid` (5 → 4 → 3) в exit codes, отсутствие
-  записи и временных файлов, усечение отчёта при полных счётчиках, чтение
-  документа со stdin и сквозной конвейер `review → предложения → review-check →
-  edit (dry-run и `--apply`) → validate` на временной копии экспорта;
+  предложения, приоритет `stale`/`invalid` (5 → 4 → 3) в exit codes, отказ на
+  документе чужой формы (`edits`) и на устаревшем флаге `--request`, все причины
+  `invalid_request` документа предложений (`malformed_proposals`,
+  `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`,
+  `proposals_too_large`, `duplicate_proposal_id`), перенос метаданных
+  (`proposal_id` → `edit_id`, `reason` только в отчёт), отсутствие записи и
+  временных файлов, усечение отчёта при полных счётчиках, чтение документа со
+  stdin и сквозной конвейер `review → предложения → review-check → edit (dry-run и
+  `--apply`) → validate` на временной копии экспорта;
 - `tests/edit_contract.rs` — контракт `edit`: режимы dry-run и `--apply`, все
   четыре исхода правки, конфликт предусловия, пакетные ошибки разрешения,
   отказы по неканоничному и невалидному экспорту, схема JSON-ответа, exit codes

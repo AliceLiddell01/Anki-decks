@@ -1,8 +1,14 @@
 //! Human renderer: компактный текст на русском языке.
 //!
 //! Renderer не выполняет доменную работу: он только печатает уже готовый
-//! domain result. Значения полей в human-режиме приводятся к одной строке и
-//! ограничиваются по длине; полные значения доступны в `--json`.
+//! domain result — включая адресуемость заметок и состав групп, которые команды
+//! уже вычислили. Значения полей в human-режиме приводятся к одной строке и
+//! ограничиваются по длине.
+//!
+//! Сообщение об усечении обязано называть реальную причину и реальный способ
+//! получить остаток. `--json` сериализует ровно тот же vector, поэтому
+//! «полный список доступен в --json» запрещено: это обещание, которого команда
+//! не выполняет.
 
 use crate::ops::NamedField;
 use crate::ops::edit::{EditResult, EditStatus};
@@ -511,7 +517,11 @@ pub fn edit(result: &EditResult) -> String {
         }
     }
     if result.outcomes_truncated {
-        out.line("  … отчёт обрезан, полный список доступен в --json");
+        out.line(format!(
+            "  … в отчёт попало только {} правок из {}; остальные не показаны ни здесь, ни в --json",
+            result.outcomes.len(),
+            result.edits_total
+        ));
     }
 
     out.blank();
@@ -582,6 +592,13 @@ pub fn qa(result: &QaResult) -> String {
         yes_no(result.truncated),
         result.max_per_code
     ));
+    if result.unaddressable_findings > 0 {
+        out.line(format!(
+            "Неадресуемых findings: {} (нет guid, guid не уникален или модель не разрешается; \
+             это диагностика содержимого, структурные причины — в validate)",
+            result.unaddressable_findings
+        ));
+    }
     out.line(format!(
         "Коды: {}",
         if result.codes.is_empty() {
@@ -633,9 +650,31 @@ pub fn qa(result: &QaResult) -> String {
             ));
         }
         out.line(format!("      {}", finding.message));
+        if !finding.addressable {
+            out.line(
+                "        адресуемость: нет (guid отсутствует, пуст или повторяется) — \
+                 предложение по этой заметке неисполнимо, структурные причины смотрите в validate",
+            );
+        }
+        if finding.group_size.is_some() {
+            out.line(format!(
+                "        участники группы ({}): {}",
+                finding
+                    .group_size
+                    .map_or_else(|| "?".to_string(), |size| size.to_string()),
+                describe_related(&finding.related_note_indices, &finding.related_guids)
+            ));
+            if finding.related_truncated {
+                out.line("        … показаны не все участники группы");
+            }
+        }
     }
     if result.truncated {
-        out.line("  … вывод обрезан, полный список доступен в --json");
+        out.line(format!(
+            "  … показано не более {} findings на код: остальные не выводятся ни здесь, ни в --json; \
+             увеличьте --max-per-code (или сузьте выборку через --code)",
+            result.max_per_code
+        ));
     }
 
     out.blank();
@@ -673,6 +712,13 @@ pub fn review(result: &ReviewResult) -> String {
         Some(next) => out.line(format!("Следующая страница: --offset {next}")),
         None => out.line("Следующая страница: нет"),
     };
+    if result.excluded_unaddressable > 0 {
+        out.line(format!(
+            "Исключено неадресуемых заметок: {} (нет guid, guid не уникален или модель не \
+             разрешается; предложение по ним неисполнимо, структурные причины — в validate)",
+            result.excluded_unaddressable
+        ));
+    }
 
     for item in &result.items {
         out.blank();
@@ -697,6 +743,15 @@ pub fn review(result: &ReviewResult) -> String {
         for field in &item.note.fields {
             out.line(format!("    {}: {}", field.name, render_field(field)));
         }
+        for membership in &item.group_membership {
+            out.line(format!(
+                "    группа {}: участник группы заметки #{} ({}), всего участников {}",
+                membership.code,
+                membership.owner_note_index,
+                optional(membership.owner_guid.as_deref()),
+                membership.group_size
+            ));
+        }
         if item.qa_findings.is_empty() {
             out.line("    QA: —");
         } else {
@@ -713,6 +768,18 @@ pub fn review(result: &ReviewResult) -> String {
                     field,
                     finding.message
                 ));
+                if finding.group_size.is_some() {
+                    out.line(format!(
+                        "        группа: участников {}, кроме этой заметки: {}",
+                        finding
+                            .group_size
+                            .map_or_else(|| "?".to_string(), |size| size.to_string()),
+                        describe_related_notes(&finding.related)
+                    ));
+                    if finding.related_truncated {
+                        out.line("        … показаны не все участники группы");
+                    }
+                }
             }
             if item.qa_findings_truncated {
                 out.line("      … список findings обрезан");
@@ -779,6 +846,9 @@ pub fn review_check(result: &ReviewCheckResult) -> String {
             "      замена: {}",
             compact_value(&proposal.replacement_sample)
         ));
+        if let Some(reason) = &proposal.reason {
+            out.line(format!("      пояснение агента: {}", compact_value(reason)));
+        }
         if let Some(message) = &proposal.message {
             out.line(format!(
                 "      проблема [{}]: {message}",
@@ -787,10 +857,46 @@ pub fn review_check(result: &ReviewCheckResult) -> String {
         }
     }
     if result.proposals_truncated {
-        out.line("  … отчёт обрезан, полный список доступен в --json");
+        out.line(format!(
+            "  … в отчёт попало только {} предложений из {}; счётчики выше считают все, \
+             а остальные предложения не показаны ни здесь, ни в --json",
+            result.proposals.len(),
+            result.proposals_total
+        ));
     }
 
     out.finish()
+}
+
+/// Печатает участников группы в форме `note_index (guid)`.
+fn describe_related(positions: &[usize], guids: &[String]) -> String {
+    if positions.is_empty() {
+        return "—".to_string();
+    }
+    positions
+        .iter()
+        .enumerate()
+        .map(|(offset, position)| match guids.get(offset) {
+            Some(guid) => format!("#{position} ({guid})"),
+            None => format!("#{position} (без guid)"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Печатает участников группы batch'а в форме `note_index (guid)`.
+fn describe_related_notes(related: &[crate::ops::review::RelatedNote]) -> String {
+    if related.is_empty() {
+        return "—".to_string();
+    }
+    related
+        .iter()
+        .map(|note| match &note.guid {
+            Some(guid) => format!("#{} ({guid})", note.note_index),
+            None => format!("#{} (без guid)", note.note_index),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Описывает критерий выбора `review`.

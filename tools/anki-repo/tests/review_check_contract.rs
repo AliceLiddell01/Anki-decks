@@ -4,6 +4,11 @@
 //! Ключевые свойства: `review-check` ничего не пишет, отдаёт готовый запрос
 //! Stage 2 только для полностью валидного документа и различает stale,
 //! invalid и conflict.
+//!
+//! Вход команды — собственный versioned документ предложений (`proposals`), а не
+//! запрос `edit`: это разные публичные контракты, и смешивать их запрещено.
+//! Поэтому здесь же проверяется, что документ чужой формы отвергается, а
+//! `edit_request` в ответе принимается границей записи без переупаковки.
 
 mod common;
 
@@ -11,8 +16,8 @@ use std::fs;
 use std::process::Stdio;
 
 use common::{
-    TempDir, edit_request, parse_json, run_cli, run_cli_with_stdin_in, single_line_change,
-    write_request,
+    TempDir, parse_json, proposals_document, run_cli, run_cli_with_stdin_in, single_line_change,
+    write_proposals,
 };
 use serde_json::{Value, json};
 
@@ -26,7 +31,7 @@ fn proposals_export() -> Value {
 
 fn check_json(export: &str, request: &Value, name: &str) -> (i32, Value) {
     let temp = TempDir::new("review-check-request");
-    let path = write_request(&temp, name, request);
+    let path = write_proposals(&temp, name, request);
     let (code, stdout, _) = run_cli(&[
         "--json",
         "review-check",
@@ -41,7 +46,7 @@ fn check_json(export: &str, request: &Value, name: &str) -> (i32, Value) {
 fn valid_proposals_produce_a_stage_two_request() {
     let temp = TempDir::new("review-check-valid");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[
+    let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("guid-2", "Пример", "", "пример-2"),
     ]);
@@ -58,7 +63,7 @@ fn valid_proposals_produce_a_stage_two_request() {
 
     let proposal = &result["proposals"][0];
     assert_eq!(proposal["proposal_index"], 0);
-    assert_eq!(proposal["proposal_id"], "e0");
+    assert_eq!(proposal["proposal_id"], "p0");
     assert_eq!(proposal["status"], "valid");
     assert_eq!(proposal["guid"], "guid-1");
     assert_eq!(proposal["field"], "Пример");
@@ -86,7 +91,7 @@ fn review_check_never_touches_the_export() {
     let deck = temp.path().join("deck.json");
     let before = fs::read(&deck).expect("deck.json");
 
-    let request = edit_request(&[("guid-1", "Пример", "", "пример-1")]);
+    let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     let (code, _) = check_json(&temp.path().to_string_lossy(), &request, "p.json");
 
     assert_eq!(code, 0);
@@ -109,7 +114,7 @@ fn review_check_never_touches_the_export() {
 fn mismatched_expected_value_is_a_conflict_and_blocks_the_request() {
     let temp = TempDir::new("review-check-conflict");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[("guid-1", "Пример", "устаревшее", "новое")]);
+    let request = proposals_document(&[("guid-1", "Пример", "устаревшее", "новое")]);
     let (code, parsed) = check_json(&temp.path().to_string_lossy(), &request, "p.json");
 
     assert_eq!(code, 7, "stale — это source_changed/conflict класс");
@@ -125,7 +130,7 @@ fn mismatched_expected_value_is_a_conflict_and_blocks_the_request() {
 fn no_request_is_emitted_when_nothing_is_effective() {
     let temp = TempDir::new("review-check-noop");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[
+    let request = proposals_document(&[
         ("guid-1", "Пример", "", ""),                   // значение не меняется
         ("guid-2", "Значение", "значение", "значение"), // тоже без изменения
         ("guid-2", "Пример", "не то", "новое"),         // конфликт
@@ -143,7 +148,7 @@ fn no_request_is_emitted_when_nothing_is_effective() {
 fn duplicate_targets_are_rejected_by_the_shared_request_validator() {
     let temp = TempDir::new("review-check-duplicate");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[
+    let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("guid-1", "Пример", "", "пример-2"),
     ]);
@@ -160,7 +165,7 @@ fn duplicate_targets_are_rejected_by_the_shared_request_validator() {
 fn unknown_guid_is_reported_per_proposal_while_valid_ones_survive() {
     let temp = TempDir::new("review-check-invalid");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[
+    let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("нет-такого", "Пример", "", "пример-2"),
         ("guid-2", "НетТакогоПоля", "", "значение"),
@@ -200,7 +205,7 @@ fn ambiguous_guid_outranks_the_other_invalid_kinds() {
             .expect("notes")
             .push(duplicate);
     }));
-    let request = edit_request(&[
+    let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("нет-такого", "Пример", "", "пример-2"),
     ]);
@@ -216,8 +221,9 @@ fn already_applied_proposals_are_reported_without_a_request() {
     temp.write_canonical_deck_json(&proposals_export());
     let export = temp.path().to_string_lossy().to_string();
 
-    let apply = edit_request(&[("guid-1", "Пример", "", "пример-1")]);
-    let path = write_request(&temp, "apply.json", &apply);
+    // Правку выполняет `edit` — у него по-прежнему свой документ `edit`.
+    let apply = common::edit_request(&[("guid-1", "Пример", "", "пример-1")]);
+    let path = common::write_request(&temp, "apply.json", &apply);
     let (code, _, _) = run_cli(&[
         "edit",
         &export,
@@ -227,7 +233,9 @@ fn already_applied_proposals_are_reported_without_a_request() {
     ]);
     assert_eq!(code, 0);
 
-    let (code, parsed) = check_json(&export, &apply, "again.json");
+    // Проверка повторяется уже документом предложений.
+    let again = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
+    let (code, parsed) = check_json(&export, &again, "again.json");
     assert_eq!(code, 0, "уже применённое — не ошибка");
     assert_eq!(parsed["result"]["outcome"], "ok");
     assert_eq!(parsed["result"]["counts"]["already_applied"], 1);
@@ -250,9 +258,9 @@ fn report_is_bounded_while_counts_stay_complete() {
 
     let request = json!({
         "schema_version": 1,
-        "edits": (0..60)
+        "proposals": (0..60)
             .map(|index| json!({
-                "edit_id": format!("e{index}"),
+                "proposal_id": format!("p{index}"),
                 "guid": format!("bulk-{index}"),
                 "field": "Пример",
                 "expected": "",
@@ -286,7 +294,7 @@ fn report_is_bounded_while_counts_stay_complete() {
 fn proposals_can_be_read_from_stdin() {
     let temp = TempDir::new("review-check-stdin");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[("guid-1", "Пример", "", "пример-1")]);
+    let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     let raw = serde_json::to_vec(&request).expect("сериализация");
 
     let (code, stdout, _) = run_cli_with_stdin_in(
@@ -312,7 +320,7 @@ fn non_string_field_value_is_invalid_not_an_error() {
     temp.write_export(&common::export_with(|value| {
         value["notes"][0]["fields"][2] = json!(7);
     }));
-    let request = edit_request(&[("guid-1", "Пример", "", "пример-1")]);
+    let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
     let (code, parsed) = check_json(&temp.path().to_string_lossy(), &request, "p.json");
 
     // Значение поля, которое нельзя править как строку, — неисполнимое
@@ -336,21 +344,53 @@ fn broken_document_is_a_usage_class_error_before_any_report() {
     temp.write_export(&proposals_export());
     let export = temp.path().to_string_lossy().to_string();
 
+    let valid = json!({"proposal_id": "p0", "guid": "guid-1", "field": "Пример",
+        "expected": "", "replacement": "x"});
+    let too_many = json!({
+        "schema_version": 1,
+        "proposals": (0..20_001)
+            .map(|index| json!({
+                "proposal_id": format!("p{index}"),
+                "guid": format!("guid-{index}"),
+                "field": "Пример",
+                "expected": "",
+                "replacement": "x",
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let oversized = json!({
+        "schema_version": 1,
+        "proposals": [{"proposal_id": "p0", "guid": "guid-1", "field": "Пример",
+            "expected": "", "replacement": "x".repeat(9 * 1024 * 1024)}],
+    });
+
     // Все проблемы уровня всего документа — это `invalid_request`/exit 3:
     // ни одно предложение не проверяется, пока документ не разобран.
-    let cases: [(Value, &str); 4] = [
+    let cases: [(Value, &str); 7] = [
         (
-            json!({"schema_version": 9, "edits": [{"guid": "guid-1", "field": "Пример",
-                "expected": "", "replacement": "x"}]}),
+            json!({"schema_version": 9, "proposals": [valid.clone()]}),
             "unsupported_schema_version",
         ),
-        (json!({"schema_version": 1, "edits": []}), "empty_request"),
-        (json!({"schema_version": 1}), "malformed_request"),
         (
-            json!({"schema_version": 1, "edits": [{"guid": "guid-1", "field": "Пример",
-                "expected": "", "replacement": "x"}], "extra": true}),
-            "malformed_request",
+            json!({"schema_version": 1, "proposals": []}),
+            "empty_proposals",
         ),
+        (json!({"schema_version": 1}), "malformed_proposals"),
+        (
+            json!({"schema_version": 1, "proposals": [valid.clone()], "extra": true}),
+            "malformed_proposals",
+        ),
+        // Документ чужой формы (запрос `edit`) не является документом предложений.
+        (
+            json!({"schema_version": 1, "edits": [{"edit_id": "e0", "guid": "guid-1",
+                "field": "Пример", "expected": "", "replacement": "x"}]}),
+            "malformed_proposals",
+        ),
+        (
+            json!({"schema_version": 1, "proposals": [valid.clone(), valid.clone()]}),
+            "duplicate_proposal_id",
+        ),
+        (too_many, "too_many_proposals"),
     ];
 
     for (index, (document, reason)) in cases.iter().enumerate() {
@@ -360,6 +400,13 @@ fn broken_document_is_a_usage_class_error_before_any_report() {
         assert_eq!(parsed["error"]["details"]["reason"], *reason);
         assert!(parsed["result"].is_null(), "отчёта быть не должно");
     }
+
+    // Отдельно: документ больше предела читается как ошибка ввода, а не парсится.
+    let (code, parsed) = check_json(&export, &oversized, "too-large.json");
+    assert_eq!(code, 3);
+    assert_eq!(parsed["error"]["code"], "invalid_request");
+    assert_eq!(parsed["error"]["details"]["reason"], "proposals_too_large");
+    assert!(parsed["result"].is_null());
 }
 
 #[test]
@@ -388,11 +435,11 @@ fn missing_proposals_file_is_an_input_error() {
 fn human_mode_explains_statuses_and_the_missing_request() {
     let temp = TempDir::new("review-check-human");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[
+    let request = proposals_document(&[
         ("guid-1", "Пример", "", "пример-1"),
         ("guid-2", "Пример", "не то", "пример-2"),
     ]);
-    let path = write_request(&temp, "p.json", &request);
+    let path = write_proposals(&temp, "p.json", &request);
     let (code, stdout, stderr) = run_cli(&[
         "review-check",
         &temp.path().to_string_lossy(),
@@ -419,25 +466,76 @@ fn human_mode_explains_statuses_and_the_missing_request() {
 }
 
 #[test]
-fn review_check_accepts_the_request_alias_and_reports_unknown_arguments() {
+fn review_check_rejects_the_edit_style_flag_and_names_its_own() {
     let temp = TempDir::new("review-check-alias");
     temp.write_export(&proposals_export());
-    let request = edit_request(&[("guid-1", "Пример", "", "пример-1")]);
-    let path = write_request(&temp, "p.json", &request);
+    let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
+    let path = write_proposals(&temp, "p.json", &request);
 
-    let (code, stdout, _) = run_cli(&[
+    // `--request` был именем входа, когда команда принимала запрос `edit`.
+    // Теперь у неё свой документ, и старый флаг обязан быть просто неизвестен.
+    let (code, _, stderr) = run_cli(&[
         "--json",
         "review-check",
         &temp.path().to_string_lossy(),
         "--request",
         &path.to_string_lossy(),
     ]);
-    assert_eq!(code, 0);
-    assert_eq!(parse_json(&stdout)["result"]["counts"]["valid"], 1);
+    assert_eq!(code, 2, "устаревший флаг — ошибка использования");
+    assert!(stderr.contains("--request"), "{stderr}");
+    assert!(
+        stderr.contains("--proposals"),
+        "подсказка обязана называть настоящий флаг: {stderr}"
+    );
 
     let (code, _, stderr) = run_cli(&["review-check", &temp.path().to_string_lossy()]);
     assert_eq!(code, 2, "без документа команда бесполезна");
     assert!(stderr.contains("--proposals"));
+
+    let (code, stdout, _) = run_cli(&[
+        "--json",
+        "review-check",
+        &temp.path().to_string_lossy(),
+        "--proposals",
+        &path.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0);
+    assert_eq!(parse_json(&stdout)["result"]["counts"]["valid"], 1);
+}
+
+#[test]
+fn proposal_metadata_is_reported_but_never_enters_the_request() {
+    let temp = TempDir::new("review-check-metadata");
+    temp.write_export(&proposals_export());
+    let mut document = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
+    document["proposals"][0]["reason"] = json!("в колоде пустой пример");
+    let path = write_proposals(&temp, "p.json", &document);
+
+    let (code, stdout, _) = run_cli(&[
+        "--json",
+        "review-check",
+        &temp.path().to_string_lossy(),
+        "--proposals",
+        &path.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0);
+    let parsed = parse_json(&stdout);
+    let proposal = &parsed["result"]["proposals"][0];
+    assert_eq!(proposal["proposal_id"], "p0");
+    assert_eq!(proposal["reason"], "в колоде пустой пример");
+
+    let emitted = &parsed["result"]["edit_request"]["edits"][0];
+    assert_eq!(
+        emitted["edit_id"], "p0",
+        "идентификатор предложения становится идентификатором правки"
+    );
+    assert_eq!(
+        emitted.get("reason"),
+        None,
+        "review metadata не переносится в запрос Stage 2"
+    );
+    assert_eq!(emitted["expected"], "");
+    assert_eq!(emitted["replacement"], "пример-1");
 }
 
 /// Сквозной путь: `review` → предложения → `review-check` → `edit` → `validate`.
@@ -466,8 +564,8 @@ fn full_pipeline_applies_exactly_one_reviewed_change() {
     assert_eq!(item["fields"]["Пример"], "");
 
     // 2. Внешний агент возвращает предложение в форме Stage 2.
-    let proposals = edit_request(&[("guid-1", "Пример", "", "пример-1")]);
-    let proposals_path = write_request(&export_dir, "proposals.json", &proposals);
+    let proposals = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
+    let proposals_path = write_proposals(&export_dir, "proposals.json", &proposals);
 
     // 3. Toolkit проверяет предложения против текущего состояния экспорта.
     let (code, stdout, _) = run_cli(&[
@@ -483,7 +581,7 @@ fn full_pipeline_applies_exactly_one_reviewed_change() {
     let emitted = check["result"]["edit_request"].clone();
 
     // 4. Готовый запрос идёт в `edit` без переупаковки: сначала dry-run.
-    let request_path = write_request(&export_dir, "request.json", &emitted);
+    let request_path = common::write_request(&export_dir, "request.json", &emitted);
     let before = fs::read(export_dir.path().join("deck.json")).expect("deck.json");
     let (code, stdout, _) = run_cli(&[
         "edit",
@@ -556,8 +654,8 @@ fn pipeline_stdout_can_be_piped_through_shell_redirection() {
     let temp = TempDir::new("pipeline-pipe");
     temp.write_export(&proposals_export());
     let export = temp.path().to_string_lossy().to_string();
-    let request = edit_request(&[("guid-1", "Пример", "", "пример-1")]);
-    let path = write_request(&temp, "p.json", &request);
+    let request = proposals_document(&[("guid-1", "Пример", "", "пример-1")]);
+    let path = write_proposals(&temp, "p.json", &request);
 
     // Проверяем, что JSON-ответ — один документ, который парсится целиком.
     let output = std::process::Command::new(common::cli_binary())
@@ -575,4 +673,49 @@ fn pipeline_stdout_can_be_piped_through_shell_redirection() {
     assert!(output.status.success());
     let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout — один JSON");
     assert_eq!(parsed["result"]["outcome"], "ok");
+}
+
+/// Человеческий вывод не обещает полного списка там, где его нет.
+#[test]
+fn human_report_does_not_promise_a_full_list_in_json() {
+    let temp = TempDir::new("review-check-human-truncated");
+    temp.write_export(&common::export_with(|value| {
+        let template = value["notes"][0].clone();
+        for index in 0..60 {
+            let mut copy = template.clone();
+            copy["guid"] = json!(format!("bulk-{index}"));
+            copy["fields"] = json!(["слово", "значение", ""]);
+            value["notes"].as_array_mut().expect("notes").push(copy);
+        }
+    }));
+
+    let request = json!({
+        "schema_version": 1,
+        "proposals": (0..60)
+            .map(|index| json!({
+                "proposal_id": format!("p{index}"),
+                "guid": format!("bulk-{index}"),
+                "field": "Пример",
+                "expected": "",
+                "replacement": format!("пример-{index}"),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let path = write_proposals(&temp, "p.json", &request);
+
+    let (code, stdout, stderr) = run_cli(&[
+        "review-check",
+        &temp.path().to_string_lossy(),
+        "--proposals",
+        &path.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("предложений из"),
+        "сообщение об усечении обязано называть оба числа: {stdout}"
+    );
+    assert!(
+        !stdout.contains("полный список доступен"),
+        "обещание полного списка в --json неверно: JSON сериализует тот же vector"
+    );
 }

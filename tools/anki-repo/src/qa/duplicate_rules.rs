@@ -1,8 +1,11 @@
 //! Правила дубликатов: одинаковое содержимое заметок и одинаковое головное поле.
 //!
 //! Оба правила групповые: finding адресуется группе, а не каждой её заметке, и
-//! несёт `related_*`-поля, чтобы ревьюер видел всех участников сразу и не
-//! собирал тот же факт из нескольких записей.
+//! несёт структурированный список участников ([`RawFinding::related`]), чтобы
+//! ревьюер видел всех участников сразу и не собирал тот же факт из нескольких
+//! записей. Участники — часть domain-результата, а не украшение evidence:
+//! по ним `review --qa-code` расширяет batch, поэтому renderers не имеют права
+//! вычислять группу заново.
 //!
 //! Группировка идёт по разрешённой модели (`note_model_uuid`) и по сырым
 //! значениям полей. Никакого «похоже» здесь нет: сравнение точное, поэтому
@@ -16,7 +19,7 @@ use crate::qa::{NoteView, RawFinding, RuleContext};
 use crate::selection::PRIMARY_FIELD;
 use crate::text::bounded_sample;
 
-/// Предел числа участников группы в evidence.
+/// Предел числа участников группы в finding'е.
 pub const MAX_RELATED_NOTES: usize = 20;
 
 /// Заметки двух разных участников группы.
@@ -56,12 +59,11 @@ pub fn duplicate_note_content(context: &RuleContext<'_>) -> Vec<RawFinding> {
                 model_label(first)
             ),
             evidence: json!({
-                "group_size": members.len(),
                 "fields_total": first.note.fields.len(),
-                "related_guids": related.guids,
-                "related_note_indices": related.positions,
-                "related_truncated": related.truncated,
             }),
+            related: related.positions,
+            related_truncated: related.truncated,
+            group_size: Some(members.len()),
         });
     }
 
@@ -118,11 +120,10 @@ pub fn duplicate_primary_field(context: &RuleContext<'_>) -> Vec<RawFinding> {
             evidence: json!({
                 "raw_value": bounded_sample(&raw),
                 "raw_value_chars": raw.chars().count(),
-                "group_size": members.len(),
-                "related_guids": related.guids,
-                "related_note_indices": related.positions,
-                "related_truncated": related.truncated,
             }),
+            related: related.positions,
+            related_truncated: related.truncated,
+            group_size: Some(members.len()),
         });
     }
 
@@ -131,28 +132,22 @@ pub fn duplicate_primary_field(context: &RuleContext<'_>) -> Vec<RawFinding> {
 }
 
 /// Ограниченный список участников группы.
+///
+/// Позиции хранятся в порядке экспорта и включают саму заметку finding'а:
+/// потребитель (batch `review`) не должен досчитывать её сам.
 struct Related {
-    guids: Vec<String>,
     positions: Vec<usize>,
     truncated: bool,
 }
 
 impl Related {
     fn new(members: &[&NoteView<'_>]) -> Self {
-        let guids = members
-            .iter()
-            .filter_map(|view| view.note.guid.clone())
-            .filter(|guid| !guid.is_empty())
-            .take(MAX_RELATED_NOTES)
-            .collect();
-        let positions = members
-            .iter()
-            .map(|view| view.position)
-            .take(MAX_RELATED_NOTES)
-            .collect();
         Self {
-            guids,
-            positions,
+            positions: members
+                .iter()
+                .map(|view| view.position)
+                .take(MAX_RELATED_NOTES)
+                .collect(),
             truncated: members.len() > MAX_RELATED_NOTES,
         }
     }
@@ -219,13 +214,9 @@ mod tests {
         assert_eq!(found.len(), 1, "одна группа, а не три finding'а");
         assert_eq!(found[0].note_position, 0);
         assert_eq!(found[0].field, None);
-        assert_eq!(found[0].evidence["group_size"], 2);
-        assert_eq!(
-            found[0].evidence["related_guids"],
-            json!(["guid-1", "guid-3"])
-        );
-        assert_eq!(found[0].evidence["related_note_indices"], json!([0, 2]));
-        assert_eq!(found[0].evidence["related_truncated"], false);
+        assert_eq!(found[0].group_size, Some(2));
+        assert_eq!(found[0].related, vec![0, 2]);
+        assert!(!found[0].related_truncated);
     }
 
     #[test]
@@ -299,12 +290,9 @@ mod tests {
         assert_eq!(found[0].note_position, 0);
         assert_eq!(found[0].field.as_deref(), Some(PRIMARY_FIELD));
         assert_eq!(found[0].field_ord, Some(0));
-        assert_eq!(found[0].evidence["group_size"], 2);
+        assert_eq!(found[0].group_size, Some(2));
         assert_eq!(found[0].evidence["raw_value"], "[sound:a.mp3]偶然");
-        assert_eq!(
-            found[0].evidence["related_guids"],
-            json!(["guid-1", "guid-3"])
-        );
+        assert_eq!(found[0].related, vec![0, 2]);
     }
 
     #[test]
@@ -362,17 +350,15 @@ mod tests {
         let found = findings_for(&json, "duplicate_note_content");
         assert_eq!(found.len(), 1);
         assert_eq!(
-            found[0].evidence["group_size"],
-            MAX_RELATED_NOTES + 6,
+            found[0].group_size,
+            Some(MAX_RELATED_NOTES + 6),
             "размер группы считается целиком"
         );
         assert_eq!(
-            found[0].evidence["related_guids"]
-                .as_array()
-                .expect("guids")
-                .len(),
-            MAX_RELATED_NOTES
+            found[0].related.len(),
+            MAX_RELATED_NOTES,
+            "список участников обрезан до предела"
         );
-        assert_eq!(found[0].evidence["related_truncated"], true);
+        assert!(found[0].related_truncated);
     }
 }

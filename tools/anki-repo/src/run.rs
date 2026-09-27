@@ -25,6 +25,7 @@ use crate::ops::review::{ReviewCriteria, ReviewQuery};
 use crate::ops::review_check as review_check_op;
 use crate::ops::stats::{StatsQuery, stats as stats_op};
 use crate::ops::validate::validate as validate_op;
+use crate::proposal;
 use crate::render::{human, json};
 
 /// Полностью подготовленный к печати результат команды.
@@ -209,14 +210,14 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             let label = proposals_file.display().to_string();
             let raw = read_document(
                 proposals_file,
-                review_check_op::MAX_PROPOSAL_BYTES,
+                proposal::MAX_PROPOSAL_BYTES,
                 "документ предложений",
             )?;
-            let request = edit_op::parse_request_bytes(&raw, &label)?;
+            let document = proposal::parse_proposal_bytes(&raw, &label)?;
 
             let loaded = load_export(export_dir)?;
             let index = ExportIndex::build(&loaded.root);
-            let result = review_check_op::review_check(&loaded.export_dir, &index, &request)?;
+            let result = review_check_op::review_check(&loaded.export_dir, &index, &document)?;
             Ok(Rendered {
                 command: "review-check",
                 stdout: if cli.json {

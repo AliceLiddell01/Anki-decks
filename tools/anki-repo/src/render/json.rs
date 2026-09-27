@@ -714,6 +714,7 @@ struct QaDto<'a> {
     codes: Vec<String>,
     by_code: Vec<CodeCountDto>,
     rules: Vec<RuleDto>,
+    unaddressable_findings: usize,
     findings: Vec<QaFindingDto<'a>>,
 }
 
@@ -746,6 +747,11 @@ struct QaFindingDto<'a> {
     field_ord: Option<i64>,
     message: String,
     evidence: &'a serde_json::Value,
+    addressable: bool,
+    related_guids: Vec<String>,
+    related_note_indices: Vec<usize>,
+    related_truncated: bool,
+    group_size: Option<usize>,
 }
 
 impl<'a> From<&'a QaResult> for QaDto<'a> {
@@ -778,6 +784,7 @@ impl<'a> From<&'a QaResult> for QaDto<'a> {
                     findings: rule.findings,
                 })
                 .collect(),
+            unaddressable_findings: result.unaddressable_findings,
             findings: result
                 .findings
                 .iter()
@@ -793,6 +800,11 @@ impl<'a> From<&'a QaResult> for QaDto<'a> {
                     field_ord: finding.field_ord,
                     message: finding.message.clone(),
                     evidence: &finding.evidence,
+                    addressable: finding.addressable,
+                    related_guids: finding.related_guids.clone(),
+                    related_note_indices: finding.related_note_indices.clone(),
+                    related_truncated: finding.related_truncated,
+                    group_size: finding.group_size,
                 })
                 .collect(),
         }
@@ -810,6 +822,7 @@ struct ReviewDto<'a> {
     returned: usize,
     truncated: bool,
     next_offset: Option<usize>,
+    excluded_unaddressable: usize,
     items: Vec<ReviewItemDto<'a>>,
 }
 
@@ -835,6 +848,7 @@ struct ReviewItemDto<'a> {
     fields: OrderedFields<'a>,
     qa_findings: Vec<FindingSummaryDto>,
     qa_findings_truncated: bool,
+    group_membership: Vec<GroupMembershipDto>,
 }
 
 #[derive(Serialize)]
@@ -843,6 +857,23 @@ struct FindingSummaryDto {
     severity: &'static str,
     field: Option<String>,
     message: String,
+    group_size: Option<usize>,
+    related: Vec<RelatedNoteDto>,
+    related_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct RelatedNoteDto {
+    note_index: usize,
+    guid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GroupMembershipDto {
+    code: &'static str,
+    owner_note_index: usize,
+    owner_guid: Option<String>,
+    group_size: usize,
 }
 
 impl<'a> From<&'a ReviewResult> for ReviewDto<'a> {
@@ -865,6 +896,7 @@ impl<'a> From<&'a ReviewResult> for ReviewDto<'a> {
             returned: result.returned,
             truncated: result.truncated,
             next_offset: result.next_offset,
+            excluded_unaddressable: result.excluded_unaddressable,
             items: result
                 .items
                 .iter()
@@ -884,9 +916,29 @@ impl<'a> From<&'a ReviewResult> for ReviewDto<'a> {
                             severity: finding.severity.as_str(),
                             field: finding.field.clone(),
                             message: finding.message.clone(),
+                            group_size: finding.group_size,
+                            related: finding
+                                .related
+                                .iter()
+                                .map(|related| RelatedNoteDto {
+                                    note_index: related.note_index,
+                                    guid: related.guid.clone(),
+                                })
+                                .collect(),
+                            related_truncated: finding.related_truncated,
                         })
                         .collect(),
                     qa_findings_truncated: item.qa_findings_truncated,
+                    group_membership: item
+                        .group_membership
+                        .iter()
+                        .map(|membership| GroupMembershipDto {
+                            code: membership.code,
+                            owner_note_index: membership.owner_note_index,
+                            owner_guid: membership.owner_guid.clone(),
+                            group_size: membership.group_size,
+                        })
+                        .collect(),
                 })
                 .collect(),
         }
@@ -931,6 +983,7 @@ struct CheckedProposalDto<'a> {
     current_sample: Option<String>,
     expected_sample: &'a str,
     replacement_sample: &'a str,
+    reason: Option<String>,
     problem: Option<&'static str>,
     message: Option<String>,
 }
@@ -984,6 +1037,7 @@ impl<'a> From<&'a ReviewCheckResult> for ReviewCheckDto<'a> {
                     current_sample: proposal.current_sample.clone(),
                     expected_sample: proposal.expected_sample.as_str(),
                     replacement_sample: proposal.replacement_sample.as_str(),
+                    reason: proposal.reason.clone(),
                     problem: proposal.problem,
                     message: proposal.message.clone(),
                 })

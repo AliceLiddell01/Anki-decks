@@ -21,6 +21,7 @@ pub mod media;
 pub mod model;
 pub mod ops;
 pub mod output;
+pub mod proposal;
 pub mod qa;
 pub mod render;
 pub mod run;

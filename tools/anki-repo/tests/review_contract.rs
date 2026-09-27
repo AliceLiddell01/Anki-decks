@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::{TempDir, export_with, parse_json, run_cli, words_deck};
+use common::{
+    TempDir, collect_notes, export_with, parse_json, raw_json, raw_qa_counts, run_cli, words_deck,
+};
 use serde_json::{Value, json};
 
 fn review_json(export: &str, extra: &[&str]) -> (i32, Value) {
@@ -307,6 +309,13 @@ fn human_mode_prints_selected_and_next_page() {
 #[test]
 fn canonical_deck_review_is_bounded_per_note() {
     let export = words_deck(3);
+    // Ожидаемое число заметок с пустым полем пересчитывается из сырого
+    // deck.json, а не берётся из текущего содержимого репозитория.
+    let raw = raw_json(3);
+    let mut notes = Vec::new();
+    collect_notes(&raw, &mut notes);
+    let expected_selected = raw_qa_counts(&raw)["empty_field_value"];
+
     let (code, parsed) = review_json(
         &export.to_string_lossy(),
         &["--qa-code", "empty_field_value", "--limit", "1"],
@@ -314,9 +323,11 @@ fn canonical_deck_review_is_bounded_per_note() {
     assert_eq!(code, 0);
 
     let result = &parsed["result"];
-    assert_eq!(result["notes_total"], 1507);
-    assert_eq!(result["total_selected"], 72);
+    assert_eq!(result["notes_total"], notes.len());
+    assert_eq!(result["total_selected"], expected_selected);
+    assert_eq!(result["excluded_unaddressable"], 0);
     assert_eq!(result["returned"], 1);
+    assert_eq!(result["truncated"], true, "страница ограничена одним item");
 
     let item = &result["items"][0];
     let fields = item["fields"].as_object().expect("fields");
@@ -325,5 +336,210 @@ fn canonical_deck_review_is_bounded_per_note() {
         6,
         "batch несёт только именованные поля заметки"
     );
-    assert_eq!(fields["Ударение"], "");
+    assert!(
+        item["qa_findings"]
+            .as_array()
+            .expect("qa_findings")
+            .iter()
+            .any(|finding| finding["code"] == "empty_field_value"),
+        "item обязан нести finding, по которому выбран"
+    );
+    assert_eq!(
+        fields["Ударение"], "",
+        "выбранная заметка действительно содержит пустое поле"
+    );
+}
+
+/// Экспорт с одной группой из трёх одинаковых заметок и одной уникальной.
+fn content_group_export() -> Value {
+    export_with(|value| {
+        let template = value["notes"][0].clone();
+        for index in 3..6 {
+            let mut copy = template.clone();
+            copy["guid"] = json!(format!("guid-{index}"));
+            value["notes"].as_array_mut().expect("notes").push(copy);
+        }
+    })
+}
+
+/// Экспорт с одной группой из трёх заметок с одинаковым головным полем.
+fn primary_group_export() -> Value {
+    export_with(|value| {
+        for index in 3..6 {
+            value["notes"].as_array_mut().expect("notes").push(json!({
+                "__type__": "Note",
+                "guid": format!("guid-{index}"),
+                "note_model_uuid": "model-1",
+                "tags": [],
+                "fields": ["[sound:a.mp3]偶然", format!("значение-{index}"), ""],
+            }));
+        }
+    })
+}
+
+#[test]
+fn grouped_qa_code_selection_brings_every_participant() {
+    let temp = TempDir::new("review-group-content");
+    temp.write_export(&content_group_export());
+    let (code, parsed) = review_json(
+        &temp.path().to_string_lossy(),
+        &["--qa-code", "duplicate_note_content", "--limit", "10"],
+    );
+    assert_eq!(code, 0);
+
+    let result = &parsed["result"];
+    assert_eq!(
+        result["total_selected"], 4,
+        "в batch попадают все участники группы, а не только владелец finding'а"
+    );
+
+    let owner = &result["items"][0];
+    let finding = owner["qa_findings"]
+        .as_array()
+        .expect("qa_findings")
+        .iter()
+        .find(|finding| finding["code"] == "duplicate_note_content")
+        .expect("finding группы у владельца");
+    assert_eq!(finding["group_size"], 4);
+    assert_eq!(finding["related_truncated"], false);
+
+    // Владелец называет остальных участников с их guid.
+    let related: Vec<&Value> = finding["related"]
+        .as_array()
+        .expect("related")
+        .iter()
+        .map(|related| &related["guid"])
+        .collect();
+    assert_eq!(
+        related,
+        vec![&json!("guid-3"), &json!("guid-4"), &json!("guid-5")],
+        "все участники группы, кроме самого владельца"
+    );
+
+    // Остальные участники понимают, почему они в batch'е: каждая группа, в
+    // которой заметка — участник, названа вместе со своим владельцем.
+    for item in &result["items"].as_array().expect("items")[1..] {
+        let membership = item["group_membership"]
+            .as_array()
+            .expect("group_membership");
+        assert!(!membership.is_empty(), "участник обязан знать свою группу");
+        assert!(
+            membership
+                .iter()
+                .any(|entry| entry["code"] == "duplicate_note_content"),
+            "участник выбран по этому коду"
+        );
+        for entry in membership {
+            assert_eq!(entry["owner_note_index"], 0);
+            assert_eq!(entry["owner_guid"], "guid-1");
+            assert_eq!(entry["group_size"], 4);
+        }
+    }
+}
+
+#[test]
+fn grouped_primary_field_selection_brings_every_participant() {
+    let temp = TempDir::new("review-group-primary");
+    temp.write_export(&primary_group_export());
+    let (code, parsed) = review_json(
+        &temp.path().to_string_lossy(),
+        &["--qa-code", "duplicate_primary_field", "--limit", "10"],
+    );
+    assert_eq!(code, 0);
+
+    let result = &parsed["result"];
+    assert_eq!(result["total_selected"], 4);
+    assert_eq!(
+        result["items"].as_array().expect("items").len(),
+        4,
+        "каждая заметка группы — отдельный item с полями"
+    );
+    let owner = &result["items"][0];
+    let finding = owner["qa_findings"]
+        .as_array()
+        .expect("qa_findings")
+        .iter()
+        .find(|finding| finding["code"] == "duplicate_primary_field")
+        .expect("finding группы");
+    assert_eq!(finding["group_size"], 4);
+    assert_eq!(finding["related"].as_array().expect("related").len(), 3);
+}
+
+#[test]
+fn unaddressable_notes_never_reach_the_batch() {
+    let temp = TempDir::new("review-unaddressable");
+    temp.write_export(&export_with(|value| {
+        let notes = value["notes"].as_array_mut().expect("notes");
+        // Заметка без guid: её нельзя назвать предложением.
+        let mut no_guid = notes[0].clone();
+        no_guid["guid"] = json!(null);
+        no_guid["fields"] = json!(["дубль", "значение", ""]);
+        notes.push(no_guid);
+        // Заметка с повторяющимся guid: адресация неоднозначна.
+        let mut duplicate_guid = notes[0].clone();
+        duplicate_guid["fields"] = json!(["ещё один", "значение", ""]);
+        notes.push(duplicate_guid);
+    }));
+
+    let (code, parsed) = review_json(&temp.path().to_string_lossy(), &["--all", "--limit", "10"]);
+    assert_eq!(code, 0);
+    let result = &parsed["result"];
+    assert_eq!(
+        result["notes_total"], 4,
+        "неадресуемые заметки остаются частью экспорта"
+    );
+    assert_eq!(
+        result["excluded_unaddressable"], 3,
+        "исключены заметка без guid и оба вхождения повторённого guid: \
+         адрес неоднозначен у каждого из них"
+    );
+    assert_eq!(result["total_selected"], 1);
+    assert_eq!(
+        result["items"][0]["guid"], "guid-2",
+        "в batch остаётся единственная однозначно адресуемая заметка"
+    );
+
+    // То же для критерия по полю: исключение не зависит от вида критерия.
+    let (code, parsed) = review_json(
+        &temp.path().to_string_lossy(),
+        &[
+            "--field",
+            "Значение",
+            "--value",
+            "значение",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(code, 0);
+    let result = &parsed["result"];
+    assert_eq!(result["excluded_unaddressable"], 2);
+    assert_eq!(
+        result["total_selected"], 0,
+        "обе подходящие заметки неадресуемы, и это видно снаружи"
+    );
+}
+
+#[test]
+fn guid_lookup_of_an_unresolvable_note_reports_the_exclusion() {
+    let temp = TempDir::new("review-guid-unresolvable");
+    temp.write_export(&export_with(|value| {
+        value["notes"][0]["note_model_uuid"] = json!("нет-такой-модели");
+    }));
+
+    let (code, parsed) = review_json(
+        &temp.path().to_string_lossy(),
+        &["--guid", "guid-1", "--limit", "10"],
+    );
+    assert_eq!(
+        code, 0,
+        "identity lookup нашёл заметку, отказом это не является"
+    );
+    let result = &parsed["result"];
+    assert_eq!(result["total_selected"], 0);
+    assert_eq!(result["returned"], 0);
+    assert_eq!(
+        result["excluded_unaddressable"], 1,
+        "пустая страница объяснена, а не молчалива"
+    );
 }

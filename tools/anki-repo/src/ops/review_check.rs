@@ -1,12 +1,17 @@
 //! Операция `review-check`: проверка предложений агента против текущего экспорта.
 //!
-//! Вход — документ предложений (proposals). Его форма совпадает с формой запроса
-//! Stage 2 ([`crate::ops::edit::EditRequest`]): `schema_version: 1` и список
-//! `edits` с полями `guid`, `field`, `expected`, `replacement` и необязательным
-//! `edit_id`. Такой выбор сделан сознательно: разбор документа, проверка схемы,
-//! запрет повторных целей и разрешение полей переиспользуются из `edit` целиком,
-//! а выпускаемый `edit_request` принимается существующей границей записи без
-//! переупаковки.
+//! Вход — документ предложений ([`crate::proposal::ProposalDocument`]), отдельный
+//! versioned контракт внешнего агента. Выход — отчёт по каждому предложению и,
+//! если отчёт чистый, готовый *исполнимый* запрос для `edit`. Это два разных
+//! публичных документа: proposal metadata (`proposal_id`, `reason`) принадлежит
+//! входу, а `edit_request` — границей записи. Смешивать их нельзя: расширение
+//! metadata не должно менять write contract.
+//!
+//! Resolution целей (`guid` → модель → `flds[].ord` → `fields`) и классификация
+//! правок не дублируются: документ компилируется в
+//! [`crate::ops::edit::EditRequest`], и дальше работает общий с `edit` код
+//! разрешения и валидации. Поэтому статусы `review-check` и `edit` описывают одно
+//! и то же действие одинаково.
 //!
 //! Команда никогда не пишет и не вызывает LLM: она только сравнивает `expected`
 //! с текущим значением поля и классифицирует предложение.
@@ -29,19 +34,15 @@ use std::path::Path;
 use crate::error::DomainError;
 use crate::index::ExportIndex;
 use crate::ops::edit::{self, EditRequest, EditSpec, EditStatus, ProblemKind};
+use crate::proposal::{Proposal, ProposalDocument};
 use crate::text::bounded_sample;
 
-/// Предел числа предложений в одном документе.
-pub use crate::ops::edit::MAX_EDITS as MAX_PROPOSALS;
-/// Предел размера документа предложений в байтах.
-pub use crate::ops::edit::MAX_REQUEST_BYTES as MAX_PROPOSAL_BYTES;
-/// Имя канала, читаемого вместо файла предложений.
-pub use crate::ops::edit::STDIN_REQUEST_SOURCE;
-/// Поддерживаемая версия схемы документа предложений.
-pub use crate::ops::edit::SUPPORTED_REQUEST_SCHEMA_VERSION as SUPPORTED_PROPOSAL_SCHEMA_VERSION;
-
 /// Предел числа предложений в отчёте.
-pub const MAX_REPORTED_PROPOSALS: usize = edit::MAX_REPORTED_EDITS;
+///
+/// Отчёт — представление проверки, а не её вход: предел объявлен здесь, а не
+/// заимствован у отчёта `edit`, чтобы два контракта можно было менять по
+/// отдельности.
+pub const MAX_REPORTED_PROPOSALS: usize = 50;
 
 /// Итог проверки документа предложений.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +142,8 @@ pub struct CheckedProposal {
     pub expected_sample: String,
     /// Выборка нового значения.
     pub replacement_sample: String,
+    /// Ограниченная выборка пояснения агента, если оно было в предложении.
+    pub reason: Option<String>,
     /// Код проблемы для `invalid`-предложений.
     pub problem: Option<&'static str>,
     /// Пояснение проблемы для `invalid`-предложений.
@@ -182,9 +185,12 @@ pub struct ReviewCheckResult {
 pub fn review_check(
     export_dir: &Path,
     index: &ExportIndex<'_>,
-    request: &EditRequest,
+    document: &ProposalDocument,
 ) -> Result<ReviewCheckResult, DomainError> {
-    edit::validate_request(request)?;
+    // Документ проверяется ещё раз, а не только при разборе: функция публична, и
+    // её контракт не должен зависеть от того, что документ пришёл из
+    // [`crate::proposal::parse_proposal_bytes`].
+    edit::validate_request(&document.to_edit_request())?;
 
     let mut counts = CheckCounts::default();
     let mut proposals = Vec::new();
@@ -192,8 +198,10 @@ pub fn review_check(
     let mut saw_ambiguous = false;
     let mut saw_not_found = false;
 
-    for (proposal_index, spec) in request.edits.iter().enumerate() {
-        let checked = match edit::resolve_edit(index, proposal_index, spec, false) {
+    for (proposal_index, proposal) in document.proposals.iter().enumerate() {
+        let spec = proposal.to_edit_spec();
+        let reason = proposal.bounded_reason();
+        let checked = match edit::resolve_edit(index, proposal_index, &spec, false) {
             Ok(resolved) => {
                 let status = match resolved.status {
                     EditStatus::DryRun | EditStatus::Applied => CheckStatus::Valid,
@@ -204,7 +212,7 @@ pub fn review_check(
                 if status == CheckStatus::Valid {
                     effective.push(spec.clone());
                 }
-                CheckedProposal::from_resolved(proposal_index, &resolved, status)
+                CheckedProposal::from_resolved(proposal_index, &resolved, status, reason)
             }
             Err(problem) => {
                 match problem.kind {
@@ -212,7 +220,7 @@ pub fn review_check(
                     ProblemKind::NoteNotFound => saw_not_found = true,
                     ProblemKind::UnknownField | ProblemKind::FieldNotInModel => {}
                 }
-                CheckedProposal::from_problem(proposal_index, spec, &problem)
+                CheckedProposal::from_problem(proposal_index, proposal, &problem, reason)
             }
         };
 
@@ -251,10 +259,10 @@ pub fn review_check(
         export_dir: export_dir.display().to_string(),
         deck_json: export_dir.join("deck.json").display().to_string(),
         outcome,
-        proposals_total: request.edits.len(),
+        proposals_total: document.proposals.len(),
         counts,
         effective_proposals: effective.len(),
-        proposals_truncated: request.edits.len() > proposals.len(),
+        proposals_truncated: document.proposals.len() > proposals.len(),
         proposals,
         edit_request,
         exit_code,
@@ -299,6 +307,7 @@ impl CheckedProposal {
         proposal_index: usize,
         resolved: &edit::ResolvedEdit,
         status: CheckStatus,
+        reason: Option<String>,
     ) -> Self {
         Self {
             proposal_index,
@@ -315,16 +324,23 @@ impl CheckedProposal {
             current_sample: Some(bounded_sample(&resolved.current)),
             expected_sample: bounded_sample(&resolved.expected),
             replacement_sample: bounded_sample(&resolved.replacement),
+            reason,
             problem: None,
             message: None,
         }
     }
 
     /// Строит запись отчёта по неразрешённому предложению.
-    fn from_problem(proposal_index: usize, spec: &EditSpec, problem: &edit::Problem) -> Self {
+    fn from_problem(
+        proposal_index: usize,
+        proposal: &Proposal,
+        problem: &edit::Problem,
+        reason: Option<String>,
+    ) -> Self {
+        let spec = proposal.to_edit_spec();
         Self {
             proposal_index,
-            proposal_id: spec.edit_id.clone(),
+            proposal_id: proposal.proposal_id.clone(),
             guid: problem.guid.clone(),
             field: problem.field.clone(),
             status: CheckStatus::Invalid,
@@ -337,6 +353,7 @@ impl CheckedProposal {
             current_sample: None,
             expected_sample: bounded_sample(&spec.expected),
             replacement_sample: bounded_sample(&spec.replacement),
+            reason,
             problem: Some(problem_code(problem.kind)),
             message: Some(problem.message.clone()),
         }
@@ -366,27 +383,30 @@ mod tests {
     use crate::loader;
     use crate::test_support::{MINIMAL_EXPORT, TempDir, deck_node, export_with};
 
-    fn request(specs: Vec<EditSpec>) -> EditRequest {
-        EditRequest { edits: specs }
-    }
-
-    fn spec(guid: &str, field: &str, expected: &str, replacement: &str) -> EditSpec {
-        EditSpec {
-            edit_id: None,
-            guid: guid.to_string(),
-            field: field.to_string(),
-            expected: expected.to_string(),
-            replacement: replacement.to_string(),
+    /// Документ предложений из троек «guid, поле, expected, replacement».
+    fn request(specs: Vec<(&str, &str, &str, &str)>) -> ProposalDocument {
+        ProposalDocument {
+            proposals: specs
+                .into_iter()
+                .map(|(guid, field, expected, replacement)| Proposal {
+                    proposal_id: None,
+                    guid: guid.to_string(),
+                    field: field.to_string(),
+                    expected: expected.to_string(),
+                    replacement: replacement.to_string(),
+                    reason: None,
+                })
+                .collect(),
         }
     }
 
-    fn check(json: &str, request: &EditRequest) -> ReviewCheckResult {
+    fn check(json: &str, request: &ProposalDocument) -> ReviewCheckResult {
         let node = deck_node(json);
         let index = ExportIndex::build(&node);
         review_check(Path::new("."), &index, request).expect("review-check")
     }
 
-    fn check_error(json: &str, request: &EditRequest) -> DomainError {
+    fn check_error(json: &str, request: &ProposalDocument) -> DomainError {
         let node = deck_node(json);
         let index = ExportIndex::build(&node);
         review_check(Path::new("."), &index, request).expect_err("ожидалась ошибка")
@@ -396,7 +416,7 @@ mod tests {
     fn valid_proposal_is_reported_and_compiled_into_a_request() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![spec("guid-1", "Значение", "случайность", "случайно")]),
+            &request(vec![("guid-1", "Значение", "случайность", "случайно")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Ok);
         assert_eq!(result.exit_code, 0);
@@ -422,7 +442,7 @@ mod tests {
     fn mismatched_current_value_is_a_conflict_without_a_request() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![spec("guid-1", "Значение", "устаревшее", "новое")]),
+            &request(vec![("guid-1", "Значение", "устаревшее", "новое")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Stale);
         assert_eq!(result.exit_code, 7);
@@ -435,7 +455,7 @@ mod tests {
     fn already_applied_proposal_is_reported_not_conflicting() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![spec("guid-1", "Значение", "старое", "случайность")]),
+            &request(vec![("guid-1", "Значение", "старое", "случайность")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Ok);
         assert_eq!(result.exit_code, 0);
@@ -449,12 +469,7 @@ mod tests {
     fn identical_expected_and_replacement_is_already_correct() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![spec(
-                "guid-1",
-                "Значение",
-                "случайность",
-                "случайность",
-            )]),
+            &request(vec![("guid-1", "Значение", "случайность", "случайность")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Ok);
         assert_eq!(result.counts.already_correct, 1);
@@ -465,7 +480,7 @@ mod tests {
     fn unknown_guid_is_reported_as_invalid_not_as_error() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![spec("нет-такого", "Значение", "a", "b")]),
+            &request(vec![("нет-такого", "Значение", "a", "b")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Invalid);
         assert_eq!(result.exit_code, 4, "seniority: note_not_found → 4");
@@ -479,7 +494,7 @@ mod tests {
     fn unknown_field_is_reported_as_invalid() {
         let result = check(
             MINIMAL_EXPORT,
-            &request(vec![spec("guid-1", "НетТакого", "a", "b")]),
+            &request(vec![("guid-1", "НетТакого", "a", "b")]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Invalid);
         assert_eq!(result.exit_code, 3);
@@ -494,8 +509,8 @@ mod tests {
         let result = check(
             &json,
             &request(vec![
-                spec("нет-такого", "Значение", "a", "b"),
-                spec("guid-1", "Значение", "a", "b"),
+                ("нет-такого", "Значение", "a", "b"),
+                ("guid-1", "Значение", "a", "b"),
             ]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Invalid);
@@ -508,8 +523,8 @@ mod tests {
         let result = check(
             MINIMAL_EXPORT,
             &request(vec![
-                spec("guid-1", "Значение", "случайность", "случайно"),
-                spec("guid-2", "Значение", "устаревшее", "новое"),
+                ("guid-1", "Значение", "случайность", "случайно"),
+                ("guid-2", "Значение", "устаревшее", "новое"),
             ]),
         );
         assert_eq!(result.outcome, ReviewOutcome::Stale);
@@ -525,10 +540,7 @@ mod tests {
         let json = export_with(MINIMAL_EXPORT, |value| {
             value["notes"][0]["fields"][1] = serde_json::json!(42);
         });
-        let result = check(
-            &json,
-            &request(vec![spec("guid-1", "Значение", "42", "43")]),
-        );
+        let result = check(&json, &request(vec![("guid-1", "Значение", "42", "43")]));
         assert_eq!(result.outcome, ReviewOutcome::Invalid);
         assert_eq!(result.exit_code, 3);
         assert_eq!(result.proposals[0].problem, Some("field_not_resolvable"));
@@ -545,7 +557,14 @@ mod tests {
             }
         });
         let specs = (0..(MAX_REPORTED_PROPOSALS + 3))
-            .map(|index| spec(&format!("bulk-{index}"), "Значение", "случайность", "новое"))
+            .map(|index| {
+                (
+                    Box::leak(format!("bulk-{index}").into_boxed_str()) as &str,
+                    "Значение",
+                    "случайность",
+                    "новое",
+                )
+            })
             .collect();
         let result = check(&json, &request(specs));
 
@@ -565,7 +584,12 @@ mod tests {
 
     #[test]
     fn empty_document_is_rejected_before_any_report() {
-        let error = check_error(MINIMAL_EXPORT, &EditRequest { edits: Vec::new() });
+        let error = check_error(
+            MINIMAL_EXPORT,
+            &ProposalDocument {
+                proposals: Vec::new(),
+            },
+        );
         assert_eq!(error.code, ErrorCode::InvalidRequest);
     }
 
@@ -574,8 +598,8 @@ mod tests {
         let error = check_error(
             MINIMAL_EXPORT,
             &request(vec![
-                spec("guid-1", "Значение", "случайность", "a"),
-                spec("guid-1", "Значение", "случайность", "b"),
+                ("guid-1", "Значение", "случайность", "a"),
+                ("guid-1", "Значение", "случайность", "b"),
             ]),
         );
         assert_eq!(error.code, ErrorCode::DuplicateEditTarget);
@@ -596,13 +620,13 @@ mod tests {
 
         let raw = r#"{
             "schema_version": 1,
-            "edits": [
-                {"edit_id": "e1", "guid": "guid-1", "field": "Значение",
+            "proposals": [
+                {"proposal_id": "e1", "guid": "guid-1", "field": "Значение",
                  "expected": "случайность", "replacement": "случайно"}
             ]
         }"#
         .as_bytes();
-        let parsed = edit::parse_request_bytes(raw, "тест").expect("разбор документа");
+        let parsed = crate::proposal::parse_proposal_bytes(raw, "тест").expect("разбор документа");
 
         let loaded = loader::load_export(&export).expect("загрузка экспорта");
         let index = ExportIndex::build(&loaded.root);
