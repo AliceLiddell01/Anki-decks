@@ -1603,7 +1603,7 @@ mod tests {
             edit_index: 0,
             edit_id: None,
             guid: "guid-1".to_string(),
-            deck_path: "Words::N1".to_string(),
+            deck_path: "Тестовая колода::Вложенная".to_string(),
             note_position: 0,
             field: "Толкование".to_string(),
             field_ord: 2,
