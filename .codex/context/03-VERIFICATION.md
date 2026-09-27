@@ -36,6 +36,10 @@ cargo run --quiet --bin anki-repo -- edit decks/japanese/words/Words__N3 \
   изменилось ровно запрошенное число строк и что прирост размера объясняется
   длиной заменённых значений. Изменённое число строк видно в отчёте
   (`changed_lines`), а `git diff --numstat` подтверждает его независимо.
+- `create` и `retire` закрывают пункт 7 так же: обе пишут только канонический
+  `deck.json`, переразбирают кандидата до записи, подтверждают, что изменилась
+  ровно ожидаемая поверхность (`only_notes_appended` / `only_tags_appended`), и
+  сравнивают коды `validation` до и после.
 
 `validate` возвращает exit code `0`, если в экспорте нет ни одного issue уровня
 `ERROR`, и `6`, если хотя бы один есть: проблемы содержимого — включая
@@ -112,8 +116,7 @@ cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-
   оценивают смысл, а toolkit не вызывает LLM API.
 
 Порядок работы с содержимым: `qa` → `review` → предложения внешнего агента →
-`review-check` → `edit` (dry-run, затем `--apply`) → `validate`. Записи в
-`deck.json` по-прежнему делает только `edit`.
+`review-check` → `edit` (dry-run, затем `--apply`) → `validate`.
 
 ### Через `edit`
 
@@ -154,6 +157,77 @@ cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-
 одновременных `edit --apply` одного экспорта не могут молча потерять результат
 одного из них: проигравший получает `source_changed` и должен быть повторён по
 актуальному состоянию.
+
+### Через `create`, `retire` и `visual-report`
+
+Появление новой заметки и вывод старой из обращения проверяются тем же порядком,
+что и правка: сначала схема, потом dry-run, потом запись, потом валидация.
+
+```bash
+EXPORT=decks/japanese/words/Words__N1
+
+# 1. фактическая схема полей: имена, порядок ord, примеры значений, шаблоны
+cargo run --quiet --bin anki-repo -- models "$EXPORT"
+
+# 2. новая заметка: dry-run, запись, переносимый результат
+cargo run --quiet --bin anki-repo -- create "$EXPORT" --request create.json
+cargo run --quiet --bin anki-repo -- create "$EXPORT" --request create.json --apply \
+  --emit-resolved create.resolved.json
+
+# 3. повторный запуск с тем же запросом обязан дать already_applied и не тронуть файл
+cargo run --quiet --bin anki-repo -- create "$EXPORT" --request create.resolved.json --apply
+
+# 4. вывод из обращения: тег, а не удаление
+cargo run --quiet --bin anki-repo -- retire "$EXPORT" --guid '<guid>' --tag 'archived::auto' --apply
+
+# 5. заметка обязана остаться адресуемой после вывода из обращения
+cargo run --quiet --bin anki-repo -- find "$EXPORT" --guid '<guid>'
+
+# 6. валидация и проверка формы
+cargo run --quiet --bin anki-repo -- validate "$EXPORT"
+cargo run --quiet --bin anki-repo -- qa "$EXPORT"
+```
+
+Что именно проверять по отчётам:
+
+- `create`: `notes_created`, `byte_delta`, `checks` (все семь обязаны быть `true`),
+  `validation.before`/`after` — новых `ERROR` быть не должно; затем
+  `git diff --numstat` по `deck.json` и `git status` по `media/` (media не менялся).
+- `retire`: `notes_retired`, `checks` (все пять), `outcomes[].previous_tags` и
+  `outcomes[].tags` — в тегах должен появиться ровно один новый тег, а `fields`
+  заметки в diff'е меняться не должны.
+- Повторный запуск любой из трёх мутирующих команд обязан быть идемпотентным:
+  `already_applied` / `already_retired`, `applied: false`, файл не перезаписан.
+
+Статический отчёт о различиях двух состояний собирается командой `visual-report`:
+
+```bash
+cargo run --quiet --bin anki-repo -- visual-report \
+  --before /path/to/эталон --after "$EXPORT" \
+  --out /tmp/отчёт --retire-tag 'archived::auto'
+```
+
+Отчёт — вспомогательное свидетельство, а не замена проверкам выше: он показывает
+превью по фактическим шаблонам модели и перечисляет то, что статически не
+вычисляется (`unsupported_constructs`, диагностика `preview_incomplete`). Каталог
+отчёта обязан лежать вне `decks/**` и не коммитится: это артефакт прогона. Если
+отчёт показывает `removed`, это наблюдение о составе JSON, а не команда удалять
+заметку.
+
+Отказы, которые не являются поводом обходить команду:
+
+- `unknown_model` (3) — набор имён полей не совпал с моделью колоды (`mode: auto`).
+  Перечитай схему через `models`; опечатка в имени поля выглядит именно так.
+- `ambiguous_model` (5) / `deck_identity_mismatch` (3) — догадка запрещена:
+  назови модель или колоду идентичностью явно.
+- `media_forbidden` (3) — значение нового поля ссылается на файл. Toolkit не
+  создаёт media: сначала подготовь файл в `media/`, потом ссылайся на него.
+- `guid_conflict` (6) — заметка с таким `guid` уже есть и отличается от запроса.
+  Это задача `edit`, а не `create`.
+- `unresolved_deck_identity` (3) — целевая колода не объявляет `crowdanki_uuid`.
+- `invalid_request` (3) с `reason: out_dir_inside_decks` / `out_dir_overlaps_export`
+  / `out_dir_not_empty` — каталог отчёта выбран неверно; выбери чистый каталог вне
+  репозитория.
 
 ## Проверки CI
 
@@ -256,3 +330,8 @@ media не требует правки CI или default-тестов и не д
 - убедиться, что в него не попали временные файлы и пользовательские локальные данные;
 - для больших JSON отдельно проверить, что diff соответствует масштабу задачи;
 - перечислить в PR только реально выполненные проверки.
+
+Каталог статического отчёта `visual-report` — временный артефакт прогона: он
+лежит вне репозитория (или как минимум вне `decks/**`), не добавляется в коммит и
+не заменяет собой проверки выше. Если отчёт всё же понадобился рядом с
+репозиторием, он либо игнорируется Git'ом, либо удаляется до `git status`.

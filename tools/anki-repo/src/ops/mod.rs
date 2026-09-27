@@ -1,17 +1,25 @@
 //! Domain-операции: `inspect`, `find`, `stats`, `validate`, `edit`, `qa`,
-//! `review`, `review-check`.
+//! `review`, `review-check`, `models`, `create`, `retire`, `visual-report`.
 //!
 //! Каждая операция возвращает собственный domain result. Human и JSON
 //! renderers — только два представления одного и того же результата.
 
+pub mod create;
+pub mod deck_select;
 pub mod edit;
 pub mod find;
 pub mod inspect;
+pub mod models;
+pub mod publish;
 pub mod qa;
+pub mod retire;
 pub mod review;
 pub mod review_check;
+pub mod source;
 pub mod stats;
+pub mod structural;
 pub mod validate;
+pub mod visual_report;
 
 use crate::index::{ExportIndex, NoteRef, resolve_named_fields};
 use crate::media::MediaReport;

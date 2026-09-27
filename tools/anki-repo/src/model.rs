@@ -118,6 +118,22 @@ where
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Десериализует строку, не превращая неожиданный тип в ошибку загрузки.
+///
+/// Модель намеренно не описывает весь формат Anki, поэтому поле, значение
+/// которого пришло не строкой, должно доехать до диагностики, а не сломать
+/// разбор всего `deck.json`.
+fn de_lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text),
+        Some(other) => Some(other.to_string()),
+    })
+}
+
 /// Определение поля модели заметки (`note_models[].flds[]`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct FieldDef {
@@ -127,6 +143,10 @@ pub struct FieldDef {
     /// Позиция поля, соответствующая индексу в `Note.fields`.
     #[serde(default)]
     pub ord: Ord,
+    /// Описание поля из Anki (ключ `description`). В реальных экспортах часто
+    /// пустое: подпись поля, а не источник семантики его содержимого.
+    #[serde(default, deserialize_with = "de_lenient_string")]
+    pub description: Option<String>,
     /// Неизвестные свойства определения поля.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -161,6 +181,23 @@ pub struct NoteModel {
     /// Имя модели.
     #[serde(default)]
     pub name: Option<String>,
+    /// Значение ключа `type`: `0` — обычная модель, `1` — cloze.
+    ///
+    /// Неожиданное значение не ломает загрузку: оно доезжает как
+    /// [`Ord::Invalid`] и становится диагностикой, а не ошибкой разбора.
+    #[serde(rename = "type", default)]
+    pub model_type: Ord,
+    /// CSS модели. Anki подключает его как отдельный `<style>` на карточку.
+    #[serde(default, deserialize_with = "de_lenient_string")]
+    pub css: Option<String>,
+    /// Значение ключа `req` как есть.
+    ///
+    /// `req` — legacy-кэш требований генерации карт: Anki пересчитывает его сам,
+    /// а решение о генерации карточки принимается по фронт-шаблону, а не по
+    /// этому ключу. Toolkit поэтому его не интерпретирует, но показывает как
+    /// факт формата.
+    #[serde(default)]
+    pub req: Option<Value>,
     /// Определения полей.
     #[serde(default, deserialize_with = "de_vec")]
     pub flds: Vec<FieldDef>,

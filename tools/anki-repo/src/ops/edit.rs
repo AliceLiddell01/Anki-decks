@@ -47,7 +47,14 @@ use crate::details;
 use crate::error::{DomainError, ErrorCode};
 use crate::index::{self, ExportIndex};
 use crate::loader;
-use crate::ops::validate::{self, Severity, SeverityCounts, ValidateResult, warning_codes};
+#[cfg(test)]
+use crate::ops::source::first_difference;
+use crate::ops::source::{
+    EditableSource, ValidationDelta, ValueNote, ValueNotePath, collect_value_notes,
+    ensure_note_correspondence, internal, load_editable_source, note_mut, note_ref,
+    validation_delta,
+};
+use crate::ops::validate;
 use crate::text::bounded_sample as sample;
 use crate::write;
 
@@ -189,27 +196,6 @@ pub struct EditSummaries {
     pub noop_identical: usize,
     /// Сколько правок уже было применено ранее.
     pub already_applied: usize,
-}
-
-/// Сравнение валидации до и после правки.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationDelta {
-    /// Счётчики исходного экспорта.
-    pub before: SeverityCounts,
-    /// Счётчики кандидата.
-    pub after: SeverityCounts,
-    /// Коды ERROR, появившиеся только у кандидата.
-    pub new_error_codes: Vec<String>,
-    /// Коды WARNING, появившиеся только у кандидата.
-    pub new_warning_codes: Vec<String>,
-}
-
-impl ValidationDelta {
-    /// Появились ли у кандидата новые ERROR.
-    #[must_use]
-    pub fn has_new_errors(&self) -> bool {
-        !self.new_error_codes.is_empty()
-    }
 }
 
 /// Результаты обязательных проверок консистентности.
@@ -629,124 +615,6 @@ pub(crate) enum ProblemKind {
     Ambiguous,
 }
 
-/// Соответствие заметки в JSON-дереве и в типизированном дереве.
-#[derive(Debug)]
-struct ValueNote {
-    /// Позиция в JSON-дереве.
-    path: ValueNotePath,
-    /// `guid` из JSON.
-    guid: Option<String>,
-    /// `note_model_uuid` из JSON.
-    model_uuid: Option<String>,
-}
-
-/// Позиция заметки в JSON-дереве.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ValueNotePath {
-    /// Индексы `children` от корня экспорта.
-    children: Vec<usize>,
-    /// Индекс заметки в `notes` узла.
-    note: usize,
-}
-
-/// Обходит JSON-дерево в том же порядке, что и [`ExportIndex`].
-fn collect_value_notes(root: &Value) -> Result<Vec<ValueNote>, DomainError> {
-    let mut notes = Vec::new();
-    collect_notes_in(root, &mut Vec::new(), &mut notes)?;
-    Ok(notes)
-}
-
-fn collect_notes_in(
-    node: &Value,
-    children: &mut Vec<usize>,
-    notes: &mut Vec<ValueNote>,
-) -> Result<(), DomainError> {
-    let Some(object) = node.as_object() else {
-        return Err(internal(format!(
-            "узел колоды в JSON не является объектом, а его тип: {}",
-            type_name(node)
-        )));
-    };
-
-    match object.get("notes") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(entries)) => {
-            for (position, entry) in entries.iter().enumerate() {
-                let Some(note) = entry.as_object() else {
-                    return Err(internal(format!(
-                        "заметка #{position} не является объектом, а её тип: {}",
-                        type_name(entry)
-                    )));
-                };
-                notes.push(ValueNote {
-                    path: ValueNotePath {
-                        children: children.clone(),
-                        note: position,
-                    },
-                    guid: string_property(note.get("guid")),
-                    model_uuid: string_property(note.get("note_model_uuid")),
-                });
-            }
-        }
-        Some(other) => {
-            return Err(internal(format!(
-                "notes не является массивом, а его тип: {}",
-                type_name(other)
-            )));
-        }
-    }
-
-    match object.get("children") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(entries)) => {
-            for (position, entry) in entries.iter().enumerate() {
-                children.push(position);
-                collect_notes_in(entry, children, notes)?;
-                children.pop();
-            }
-        }
-        Some(other) => {
-            return Err(internal(format!(
-                "children не является массивом, а его тип: {}",
-                type_name(other)
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// Проверяет, что обе проекции экспорта видят одни и те же заметки.
-///
-/// Значения полей берутся из типизированного дерева, а мутируется JSON-дерево.
-/// Совпадение позиций и идентификаторов — то, что делает эту связь законной.
-fn ensure_note_correspondence(
-    index: &ExportIndex<'_>,
-    value_notes: &[ValueNote],
-) -> Result<(), DomainError> {
-    if index.notes.len() != value_notes.len() {
-        return Err(internal(format!(
-            "число заметок в типизированном дереве ({}) и в JSON ({}) различается",
-            index.notes.len(),
-            value_notes.len()
-        )));
-    }
-
-    for (position, (typed, value)) in index.notes.iter().zip(value_notes.iter()).enumerate() {
-        if typed.note.guid.as_deref() != value.guid.as_deref()
-            || typed.note.note_model_uuid.as_deref() != value.model_uuid.as_deref()
-        {
-            return Err(internal(format!(
-                "заметка #{position} различается между проекциями: \
-                 типизированная guid {:?}/модель {:?}, JSON guid {:?}/модель {:?}",
-                typed.note.guid, typed.note.note_model_uuid, value.guid, value.model_uuid
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 /// Разрешает одну правку до конкретного значения поля.
 pub(crate) fn resolve_edit(
     index: &ExportIndex<'_>,
@@ -1003,191 +871,6 @@ fn conflicts_error(conflicts: &[EditConflict], total: usize, deck_json: &Path) -
     )
 }
 
-/// Разобранный исходник без предварительных проверок границы записи.
-///
-/// Один и тот же набор проверок нужен двум командам: `edit` пишет по этому
-/// исходнику, а `review-check` обещает агенту запрос, который граница записи
-/// обязана принять. Держать эти проверки в одном месте — единственный способ
-/// не разойтись в том, какой экспорт вообще можно править.
-pub(crate) struct EditableSource {
-    /// Полный путь к `deck.json`.
-    pub deck_json: PathBuf,
-    /// Сырые байты `deck.json`: каноничность проверяется побайтово.
-    pub source: Vec<u8>,
-    /// Разобранное значение: `edit` меняет именно его.
-    pub value: Value,
-    /// Типизированный корень того же файла.
-    pub root: crate::model::DeckNode,
-    /// Проверки экспорта до правки: `edit` сравнивает с ними результат.
-    pub before: ValidateResult,
-}
-
-/// Читает и разбирает `deck.json` без оценки права на запись.
-///
-/// # Errors
-///
-/// Возвращает ошибки чтения и разбора [`loader::read_deck_json_bytes`] и
-/// [`loader::parse_deck_json_bytes`].
-pub(crate) fn read_source(export_dir: &Path) -> Result<EditableSource, DomainError> {
-    let (deck_json, source) = loader::read_deck_json_bytes(export_dir)?;
-    let value = loader::parse_deck_json_bytes(&source, &deck_json)?;
-    let root = loader::typed_root(
-        loader::parse_deck_json_bytes(&source, &deck_json)?,
-        &deck_json,
-    )?;
-    let before = validate::validate_document(&root, export_dir);
-
-    Ok(EditableSource {
-        deck_json,
-        source,
-        value,
-        root,
-        before,
-    })
-}
-
-/// Собирает причины, по которым этот исходник нельзя править.
-///
-/// Проверки ровно те же, на которых `edit` останавливается до классификации
-/// правок. `edit` берёт первую причину и отказывается работать;
-/// `review-check` называет их все, потому что его отчёт обязан объяснить, из-за
-/// чего запрос не выпущен. Порядок причин фиксирован: каноническая форма,
-/// `ERROR` экспорта, неоднозначный порядок полей модели.
-#[must_use]
-pub(crate) fn source_blockers(source: &EditableSource) -> Vec<DomainError> {
-    let mut blockers = Vec::new();
-
-    if let Err(error) = ensure_source_is_canonical(&source.value, &source.source, &source.deck_json)
-    {
-        blockers.push(error);
-    }
-    blockers.extend(mutable_blockers(&source.before, &source.deck_json));
-
-    blockers
-}
-
-/// Читает `deck.json` и требует, чтобы исходник можно было править.
-///
-/// # Errors
-///
-/// Возвращает ошибки чтения и разбора [`read_source`], а также первую из
-/// [`source_blockers`].
-pub(crate) fn load_editable_source(export_dir: &Path) -> Result<EditableSource, DomainError> {
-    let source = read_source(export_dir)?;
-
-    match source_blockers(&source).into_iter().next() {
-        Some(blocker) => Err(blocker),
-        None => Ok(source),
-    }
-}
-
-/// Отклоняет исходник, который не в канонической форме.
-fn ensure_source_is_canonical(
-    value: &Value,
-    source: &[u8],
-    deck_json: &Path,
-) -> Result<(), DomainError> {
-    let canonical = loader::render_canonical_bytes(value)?;
-    if canonical == source {
-        return Ok(());
-    }
-
-    Err(DomainError::with_details(
-        ErrorCode::SourceNotCanonical,
-        format!(
-            "{} не в канонической форме; правка отклонена, чтобы не переписать файл целиком",
-            deck_json.display()
-        ),
-        details! {
-            "path" => deck_json.display().to_string(),
-            "reason" => "canonical_round_trip_mismatch",
-            "source_bytes" => source.len(),
-            "canonical_bytes" => canonical.len(),
-            "first_difference_offset" => first_difference(source, &canonical),
-        },
-    ))
-}
-
-/// Причины, по которым экспорт нельзя безопасно править.
-///
-/// Возвращает `ERROR`-экспорт и неоднозначный порядок полей модели в
-/// фиксированном порядке: сначала непригодный экспорт, затем небезопасный.
-fn mutable_blockers(before: &ValidateResult, deck_json: &Path) -> Vec<DomainError> {
-    let mut blockers = Vec::new();
-    let errors: Vec<&str> = distinct_codes(before, Severity::Error);
-    if !errors.is_empty() {
-        blockers.push(DomainError::with_details(
-            ErrorCode::ExportInvalid,
-            format!(
-                "экспорт содержит ERROR ({}); правка значений полей возможна только в валидном экспорте",
-                errors.join(", ")
-            ),
-            details! {
-                "phase" => "source",
-                "path" => deck_json.display().to_string(),
-                "errors" => before.summary.errors,
-                "error_codes" => errors,
-            },
-        ));
-    }
-
-    let blocked = warning_codes::CONFLICTING_NOTE_MODEL_DEFINITION;
-    if before
-        .issues
-        .iter()
-        .any(|issue| issue.severity == Severity::Warning && issue.code == blocked)
-    {
-        blockers.push(DomainError::with_details(
-            ErrorCode::ExportNotMutable,
-            format!(
-                "экспорт содержит WARNING {blocked}: порядок полей неоднозначен, правка по имени поля небезопасна"
-            ),
-            details! {
-                "phase" => "source",
-                "path" => deck_json.display().to_string(),
-                "code" => blocked,
-            },
-        ));
-    }
-
-    blockers
-}
-
-/// Уникальные коды issues указанной серьёзности.
-fn distinct_codes(result: &ValidateResult, severity: Severity) -> Vec<&'static str> {
-    let mut codes: Vec<&'static str> = result
-        .issues
-        .iter()
-        .filter(|issue| issue.severity == severity)
-        .map(|issue| issue.code)
-        .collect();
-    codes.sort_unstable();
-    codes.dedup();
-    codes.truncate(MAX_REPORTED_CODES);
-    codes
-}
-
-/// Сравнивает валидацию до и после правки.
-fn validation_delta(before: &ValidateResult, after: &ValidateResult) -> ValidationDelta {
-    let before_errors = distinct_codes(before, Severity::Error);
-    let before_warnings = distinct_codes(before, Severity::Warning);
-
-    ValidationDelta {
-        before: before.summary,
-        after: after.summary,
-        new_error_codes: distinct_codes(after, Severity::Error)
-            .into_iter()
-            .filter(|code| !before_errors.contains(code))
-            .map(ToString::to_string)
-            .collect(),
-        new_warning_codes: distinct_codes(after, Severity::Warning)
-            .into_iter()
-            .filter(|code| !before_warnings.contains(code))
-            .map(ToString::to_string)
-            .collect(),
-    }
-}
-
 /// Заменяет значение поля в JSON-дереве.
 fn set_field_value(
     root: &mut Value,
@@ -1251,14 +934,6 @@ fn verify_targets(
     }
 
     Ok(())
-}
-
-/// Номер первого различающегося байта двух срезов.
-fn first_difference(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .position(|(left, right)| left != right)
-        .unwrap_or_else(|| left.len().min(right.len()))
 }
 
 /// Разница размеров в байтах.
@@ -1504,60 +1179,6 @@ fn conflict_of(entry: &ResolvedEdit) -> EditConflict {
         expected_sample: sample(&entry.expected),
         current_sample: sample(&entry.current),
     }
-}
-
-/// Имя типа JSON-значения для диагностики.
-fn type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
-/// Строковое свойство JSON-объекта.
-fn string_property(value: Option<&Value>) -> Option<String> {
-    value.and_then(Value::as_str).map(ToString::to_string)
-}
-
-/// Ссылка на заметку по её позиции в JSON-дереве.
-fn note_ref<'a>(root: &'a Value, path: &ValueNotePath) -> Option<&'a Value> {
-    let mut current = root;
-    for step in &path.children {
-        current = current.get("children")?.as_array()?.get(*step)?;
-    }
-    current.get("notes")?.as_array()?.get(path.note)
-}
-
-/// Изменяемая ссылка на заметку по её позиции в JSON-дереве.
-fn note_mut<'a>(root: &'a mut Value, path: &ValueNotePath) -> Option<&'a mut Value> {
-    let mut current = root;
-    for step in &path.children {
-        current = current
-            .as_object_mut()?
-            .get_mut("children")?
-            .as_array_mut()?
-            .get_mut(*step)?;
-    }
-    current
-        .as_object_mut()?
-        .get_mut("notes")?
-        .as_array_mut()?
-        .get_mut(path.note)
-}
-
-/// Готовит внутреннюю ошибку домена.
-fn internal(message: impl Into<String>) -> DomainError {
-    DomainError::with_details(
-        ErrorCode::Internal,
-        message,
-        details! {
-            "reason" => "edit_internal_invariant",
-        },
-    )
 }
 
 /// Структура JSON-запроса.
@@ -1968,59 +1589,6 @@ mod tests {
         let truncated = sample(&long);
         assert_eq!(truncated.chars().count(), VALUE_SAMPLE_CHARS + 1);
         assert!(truncated.ends_with('…'));
-    }
-
-    #[test]
-    fn note_paths_address_nested_children() {
-        let mut document: Value = serde_json::from_str(
-            r#"{
-                "notes": [{"guid": "root"}],
-                "children": [
-                    {"notes": [], "children": []},
-                    {"notes": [{"guid": "leaf"}], "children": []}
-                ]
-            }"#,
-        )
-        .expect("JSON");
-
-        let notes = collect_value_notes(&document).expect("обход");
-        assert_eq!(notes.len(), 2);
-        assert_eq!(notes[0].guid.as_deref(), Some("root"));
-        assert_eq!(notes[1].guid.as_deref(), Some("leaf"));
-        assert_eq!(
-            notes[1].path,
-            ValueNotePath {
-                children: vec![1],
-                note: 0
-            }
-        );
-
-        let leaf = note_ref(&document, &notes[1].path).expect("ссылка");
-        assert_eq!(leaf["guid"], "leaf");
-
-        let leaf_mut = note_mut(&mut document, &notes[1].path).expect("ссылка");
-        assert_eq!(leaf_mut["guid"], "leaf");
-    }
-
-    #[test]
-    fn missing_notes_and_children_behave_like_empty_arrays() {
-        let document: Value = serde_json::from_str("{}").expect("JSON");
-        assert!(collect_value_notes(&document).expect("обход").is_empty());
-
-        let nulls: Value =
-            serde_json::from_str(r#"{"notes": null, "children": null}"#).expect("JSON");
-        assert!(collect_value_notes(&nulls).expect("обход").is_empty());
-    }
-
-    #[test]
-    fn malformed_note_containers_are_internal_errors() {
-        let wrong_notes: Value = serde_json::from_str(r#"{"notes": 7}"#).expect("JSON");
-        let error = collect_value_notes(&wrong_notes).expect_err("notes не массив");
-        assert_eq!(error.code, ErrorCode::Internal);
-
-        let wrong_child: Value = serde_json::from_str(r#"{"children": [1]}"#).expect("JSON");
-        let error = collect_value_notes(&wrong_child).expect_err("узел не объект");
-        assert_eq!(error.code, ErrorCode::Internal);
     }
 
     #[test]

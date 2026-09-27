@@ -35,7 +35,7 @@
 //! неоднозначный порядок полей модели), отчёт по предложениям всё равно
 //! печатается: он остаётся полезным агенту, а `source_blockers` называет
 //! причины, по которым запрос не выпущен. Проверки берутся у `edit`
-//! ([`crate::ops::edit::source_blockers`]), а не повторяются здесь.
+//! ([`crate::ops::source::source_blockers`]), а не повторяются здесь.
 
 use std::path::Path;
 
@@ -201,7 +201,7 @@ pub struct ReviewCheckResult {
 /// Проверяет документ предложений против текущего состояния экспорта.
 ///
 /// `source_blockers` — причины, по которым исходник нельзя править; их считает
-/// общая с `edit` проверка ([`crate::ops::edit::source_blockers`]). Они не
+/// общая с `edit` проверка ([`crate::ops::source::source_blockers`]). Они не
 /// отменяют отчёт: агент видит и статусы предложений, и то, что запрос пока
 /// неисполним.
 ///
@@ -713,8 +713,8 @@ mod tests {
         .as_bytes();
         let parsed = crate::proposal::parse_proposal_bytes(raw, "тест").expect("разбор документа");
 
-        let source = edit::read_source(&export).expect("загрузка экспорта");
-        let blockers = edit::source_blockers(&source);
+        let source = crate::ops::source::read_source(&export).expect("загрузка экспорта");
+        let blockers = crate::ops::source::source_blockers(&source);
         assert!(blockers.is_empty(), "фикстура должна быть правимой");
         let index = ExportIndex::build(&source.root);
         let result = review_check(&export, &index, &parsed, &blockers).expect("проверка");

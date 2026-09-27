@@ -36,9 +36,9 @@ tools/
 - `.codex/context/` — долговременные карты формата и рабочего процесса.
 - `.agents/skills/` — repository skills, по каталогу на skill; процедуру владеет
   сам skill, а не этот файл.
-- `tools/anki-repo/` — Rust package `anki-repo` для анализа экспорта и одной
-  строго ограниченной правки его значений (`edit`); его контракт описан в
-  `tools/anki-repo/README.md`. Это участник корневого workspace, а не отдельный
+- `tools/anki-repo/` — Rust package `anki-repo` для анализа экспорта и строго
+  ограниченной записи в него (`edit`, `create`, `retire`) вместе со статическим
+  отчётом `visual-report`; его контракт описан в `tools/anki-repo/README.md`. Это участник корневого workspace, а не отдельный
   workspace: `cargo` запускается из корня репозитория.
 - `Cargo.toml` в корне — единственный владелец `[workspace.package]`: заявленной
   MSRV (`rust-version`) и `edition` для всех Rust-участников. `Cargo.lock` тоже
@@ -85,5 +85,7 @@ repository gate: CI рекурсивно находит `deck.json` под `deck
 Для правки значения поля существующей заметки используй `edit` того же toolkit'а,
 а не ручной скрипт: он разрешает то же соответствие `note_model_uuid` →
 `flds[].ord` → `fields`, по умолчанию работает как dry-run, требует `--expect` и
-проверяет байтовый diff до записи. Команды и контракт вывода описаны в
-`tools/anki-repo/README.md`.
+проверяет байтовый diff до записи. Новая заметка добавляется командой `create` (перед
+ней смотри фактическую схему полей через `models`), а вывод заметки из обращения —
+командой `retire` одним тегом: физического удаления в toolkit'е нет. Команды и
+контракт вывода описаны в `tools/anki-repo/README.md`.

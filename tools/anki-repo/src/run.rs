@@ -12,19 +12,29 @@ use std::path::Path;
 use crate::cli::{Cli, Command, MatchArg};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
+use crate::loader;
 use crate::loader::load_export;
+use crate::ops::create as create_op;
+use crate::ops::deck_select::DeckSelector;
 use crate::ops::edit as edit_op;
 use crate::ops::edit::{EditRequest, EditSpec, STDIN_REQUEST_SOURCE};
 use crate::ops::find as find_op;
 use crate::ops::find::{FindCriteria, FindQuery, MatchMode};
 use crate::ops::inspect as inspect_op;
+use crate::ops::models as models_op;
+use crate::ops::models::ModelsQuery;
 use crate::ops::qa as qa_op;
 use crate::ops::qa::QaQuery;
+use crate::ops::retire as retire_op;
+use crate::ops::retire::{RetireRequest, RetireSpec};
 use crate::ops::review as review_op;
 use crate::ops::review::{ReviewCriteria, ReviewQuery};
 use crate::ops::review_check as review_check_op;
+use crate::ops::source as source_op;
 use crate::ops::stats::{StatsQuery, stats as stats_op};
 use crate::ops::validate::validate as validate_op;
+use crate::ops::visual_report as visual_report_op;
+use crate::ops::visual_report::ReportRequest;
 use crate::proposal;
 use crate::render::{human, json};
 
@@ -215,8 +225,8 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             // запрос выпускается только там, где граница записи приняла бы этот
             // экспорт. Иначе `review-check` обещал бы запрос, который `edit`
             // отклонит из-за неканонического или невалидного источника.
-            let source = edit_op::read_source(export_dir)?;
-            let blockers = edit_op::source_blockers(&source);
+            let source = source_op::read_source(export_dir)?;
+            let blockers = source_op::source_blockers(&source);
             let index = ExportIndex::build(&source.root);
             let result = review_check_op::review_check(export_dir, &index, &document, &blockers)?;
             Ok(Rendered {
@@ -227,6 +237,99 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     human::review_check(&result)
                 },
                 exit: result.exit_code,
+            })
+        }
+
+        Command::Models {
+            export_dir,
+            deck,
+            deck_uuid,
+            deck_preorder,
+            sample_limit,
+        } => {
+            let query = ModelsQuery {
+                deck: deck_selector(deck.clone(), deck_uuid.clone(), *deck_preorder),
+                sample_limit: to_usize(*sample_limit),
+            };
+            let result = models_op::inspect(export_dir, &query)?;
+            Ok(Rendered {
+                command: "models",
+                stdout: if cli.json {
+                    json::models_json(&result)
+                } else {
+                    human::models(&result)
+                },
+                exit: 0,
+            })
+        }
+
+        Command::Create {
+            export_dir,
+            request_file,
+            apply,
+            emit_resolved,
+        } => {
+            let raw = read_document(request_file, create_op::MAX_REQUEST_BYTES, "запрос")?;
+            let label = request_file.display().to_string();
+            let request = create_op::parse_request_bytes(&raw, &label)?;
+            let result = create_op::create(export_dir, &request, *apply)?;
+            if let Some(path) = emit_resolved {
+                write_json_document(path, &result.resolved_request)?;
+            }
+            Ok(Rendered {
+                command: "create",
+                stdout: if cli.json {
+                    json::create_json(&result)
+                } else {
+                    human::create(&result)
+                },
+                exit: 0,
+            })
+        }
+
+        Command::Retire {
+            export_dir,
+            request_file,
+            guid,
+            tag,
+            apply,
+        } => {
+            let request = build_retire_request(request_file.as_deref(), guid, tag.as_deref())?;
+            let result = retire_op::retire(export_dir, &request, *apply)?;
+            Ok(Rendered {
+                command: "retire",
+                stdout: if cli.json {
+                    json::retire_json(&result)
+                } else {
+                    human::retire(&result)
+                },
+                exit: 0,
+            })
+        }
+
+        Command::VisualReport {
+            before,
+            after,
+            out,
+            retire_tag,
+            preview_limit,
+        } => {
+            let request = ReportRequest {
+                before: before.clone(),
+                after: after.clone(),
+                out: out.clone(),
+                retire_tag: retire_tag.clone(),
+                preview_limit: to_usize(*preview_limit),
+            };
+            let result = visual_report_op::report(&request)?;
+            Ok(Rendered {
+                command: "visual-report",
+                stdout: if cli.json {
+                    json::visual_report_json(&result)
+                } else {
+                    human::visual_report(&result)
+                },
+                exit: 0,
             })
         }
 
@@ -258,6 +361,86 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             })
         }
     }
+}
+
+/// Собирает селектор колоды из аргументов CLI.
+///
+/// Отсутствие всех трёх аргументов означает корневую колоду экспорта
+/// (`preorder = 0`): у CrowdAnki-экспорта один корневой узел, и читать «модели
+/// экспорта» без адреса колоды означает именно его. Запись такого умолчания не
+/// имеет: `create` берёт колоду каждой заметки из самого запроса.
+fn deck_selector(
+    path: Option<String>,
+    crowdanki_uuid: Option<String>,
+    preorder: Option<usize>,
+) -> DeckSelector {
+    let selector = DeckSelector {
+        path,
+        crowdanki_uuid,
+        preorder,
+    };
+    if selector.is_empty() {
+        return DeckSelector {
+            preorder: Some(0),
+            ..DeckSelector::default()
+        };
+    }
+    selector
+}
+
+/// Собирает запрос на вывод заметок из обращения из аргументов CLI.
+///
+/// `--request` читается целиком и разбирается; `-` означает stdin. Одиночные
+/// `--guid` вместе с `--tag` дают тот же запрос, что и файл, поэтому обе формы
+/// проходят одни и те же проверки владельца операции.
+fn build_retire_request(
+    request_file: Option<&Path>,
+    guid: &[String],
+    tag: Option<&str>,
+) -> Result<RetireRequest, DomainError> {
+    if let Some(path) = request_file {
+        let label = path.display().to_string();
+        let raw = read_document(path, retire_op::MAX_REQUEST_BYTES, "запрос")?;
+        return retire_op::parse_request_bytes(&raw, &label);
+    }
+
+    let (Some(tag), false) = (tag, guid.is_empty()) else {
+        return Err(DomainError::new(
+            ErrorCode::Usage,
+            "для вывода из обращения нужен либо --request, либо --tag с хотя бы одним --guid",
+        ));
+    };
+
+    let request = RetireRequest {
+        tag: tag.to_string(),
+        notes: guid
+            .iter()
+            .map(|guid| RetireSpec {
+                note_id: None,
+                guid: guid.clone(),
+            })
+            .collect(),
+    };
+    retire_op::validate_request(&request)?;
+    Ok(request)
+}
+
+/// Записывает JSON-документ в канонической форме.
+///
+/// Канонические байты дают побайтовую воспроизводимость: повторный прогон
+/// создаёт тот же файл, а не «почти тот же».
+fn write_json_document(path: &Path, value: &serde_json::Value) -> Result<(), DomainError> {
+    let bytes = loader::render_canonical_bytes(value)?;
+    std::fs::write(path, bytes).map_err(|error| {
+        DomainError::with_details(
+            ErrorCode::WriteFailed,
+            format!("не удалось записать {}: {error}", path.display()),
+            crate::details! {
+                "reason" => "document_write_failed",
+                "path" => path.display().to_string(),
+            },
+        )
+    })
 }
 
 /// Собирает запрос на правку из аргументов CLI.

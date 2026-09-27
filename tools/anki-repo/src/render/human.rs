@@ -11,14 +11,18 @@
 //! не выполняет.
 
 use crate::ops::NamedField;
+use crate::ops::create::CreateResult;
 use crate::ops::edit::{EditResult, EditStatus};
 use crate::ops::find::FindResult;
 use crate::ops::inspect::InspectResult;
+use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
+use crate::ops::retire::RetireResult;
 use crate::ops::review::ReviewResult;
 use crate::ops::review_check::{ReviewCheckResult, ReviewOutcome};
 use crate::ops::stats::StatsResult;
 use crate::ops::validate::{Severity, ValidateResult};
+use crate::ops::visual_report::{NoteChangeKind, VisualReportResult};
 
 /// Предел длины значения поля в human-режиме.
 pub const VALUE_LIMIT: usize = 300;
@@ -938,4 +942,491 @@ fn describe_selection(result: &ReviewResult) -> String {
         parts.push(format!("колода {deck:?}"));
     }
     parts.join("; ")
+}
+
+/// Human-readable представление `models`.
+pub fn models(result: &ModelsResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir.display()));
+    out.line(format!(
+        "Колода: {} (preorder {}, uuid {})",
+        result.deck.path,
+        result.deck.preorder,
+        optional(result.deck.crowdanki_uuid.as_deref())
+    ));
+    out.line(format!("Заметок в узле: {}", result.deck.notes_in_deck));
+    out.line(format!("Предел примеров на поле: {}", result.sample_limit));
+
+    if result.models.is_empty() {
+        out.blank();
+        out.line("Модели заметок в этой колоде не найдены.");
+        return out.finish();
+    }
+
+    for model in &result.models {
+        out.blank();
+        out.line(format!(
+            "Модель: {} ({}, {}, {})",
+            model.name,
+            model.crowdanki_uuid,
+            model_kind_name(model.model_kind),
+            if model.declared_in_deck {
+                "объявлена в колоде"
+            } else {
+                "объявлена вне колоды"
+            }
+        ));
+        out.line(format!(
+            "  type: {}; заметок в узле {}, в поддереве {}",
+            model
+                .model_type
+                .map_or_else(|| "—".to_string(), |value| value.to_string()),
+            model.notes_in_deck,
+            model.notes_in_subtree
+        ));
+
+        out.line(format!("  Поля ({}):", model.fields.len()));
+        for field in &model.fields {
+            out.line(format!(
+                "    ord {} {} — пусто у {} заметок колоды",
+                field.ord, field.name, field.empty_in_deck
+            ));
+            if let Some(description) = field.description.as_deref()
+                && !description.trim().is_empty()
+            {
+                out.line(format!("        описание: {}", compact_value(description)));
+            }
+            for sample in &field.samples {
+                out.line(format!(
+                    "        пример [{}]: {}",
+                    optional(sample.guid.as_deref()),
+                    compact_value(&sample.value)
+                ));
+            }
+        }
+
+        out.line(format!("  Шаблоны ({}):", model.templates.len()));
+        for template in &model.templates {
+            out.line(format!(
+                "    ord {} {} — поля: {}; special: {}",
+                template.ord,
+                optional(template.name.as_deref()),
+                if template.fields.is_empty() {
+                    "—".to_string()
+                } else {
+                    template.fields.join(", ")
+                },
+                if template.specials.is_empty() {
+                    "—".to_string()
+                } else {
+                    template.specials.join(", ")
+                }
+            ));
+            for unsupported in &template.unsupported {
+                out.line(format!(
+                    "        не поддержано превью: {} — {}",
+                    unsupported.construct, unsupported.reason
+                ));
+            }
+        }
+
+        if !model.schema_problems.is_empty() {
+            out.line("  Схема полей непригодна для сборки значений:");
+            for problem in &model.schema_problems {
+                out.line(format!("    {problem}"));
+            }
+        }
+    }
+
+    out.finish()
+}
+
+/// Human-readable представление `create`.
+pub fn create(result: &CreateResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir.display()));
+    out.line(format!("deck.json: {}", result.deck_json.display()));
+    out.line(mode_line(result.applied, result.dry_run));
+    out.line(format!("Заметок в запросе: {}", result.notes_total));
+    out.line(format!("Создано: {}", result.notes_created));
+    out.line(format!("Уже было: {}", result.notes_already_applied));
+    out.line(format!(
+        "Байт: {} → {} ({:+})",
+        result.source_bytes, result.candidate_bytes, result.byte_delta
+    ));
+
+    out.blank();
+    out.line(format!(
+        "Затронутые колоды ({}):",
+        result.decks_touched.len()
+    ));
+    if result.decks_touched.is_empty() {
+        out.line("  —");
+    }
+    for touch in &result.decks_touched {
+        out.line(format!(
+            "  {} ({}) — было заметок {}, добавлено {}",
+            touch.deck_path, touch.deck_uuid, touch.notes_before, touch.notes_added
+        ));
+    }
+
+    out.blank();
+    out.line(format!("Заметки ({}):", result.outcomes.len()));
+    if result.outcomes.is_empty() {
+        out.line("  —");
+    }
+    for outcome in &result.outcomes {
+        let note_id = outcome
+            .note_id
+            .as_deref()
+            .map_or(String::new(), |id| format!(" [{id}]"));
+        let guid = if outcome.guid_generated {
+            format!("{:?} (сгенерирован)", outcome.guid)
+        } else {
+            format!("{:?}", outcome.guid)
+        };
+        out.line(format!(
+            "  #{} {}{} — guid {}, колода {}, модель {} ({})",
+            outcome.note_index,
+            outcome.status.as_str(),
+            note_id,
+            guid,
+            outcome.deck_path,
+            outcome.model_name,
+            outcome.model_uuid
+        ));
+        out.line(format!(
+            "      свидетельство модели: {}",
+            outcome.model_evidence
+        ));
+        out.line(format!(
+            "      поля ({}): {}",
+            outcome.fields_total,
+            outcome.field_names.join(", ")
+        ));
+        out.line(format!(
+            "      теги: {}; media-ссылок в новых значениях: {}",
+            if outcome.tags.is_empty() {
+                "—".to_string()
+            } else {
+                outcome.tags.join(", ")
+            },
+            outcome.media_references
+        ));
+    }
+    if result.outcomes_truncated {
+        out.line(format!(
+            "  … в отчёт попало только {} заметок из {}",
+            result.outcomes.len(),
+            result.notes_total
+        ));
+    }
+
+    out.blank();
+    out.line("Проверки:");
+    for (name, value) in [
+        ("source_canonical", result.checks.source_canonical),
+        ("candidate_reparsed", result.checks.candidate_reparsed),
+        (
+            "model_resolution_evidenced",
+            result.checks.model_resolution_evidenced,
+        ),
+        (
+            "media_references_absent",
+            result.checks.media_references_absent,
+        ),
+        (
+            "guids_resolved_without_conflict",
+            result.checks.guids_resolved_without_conflict,
+        ),
+        ("only_notes_appended", result.checks.only_notes_appended),
+        (
+            "appended_notes_verified",
+            result.checks.appended_notes_verified,
+        ),
+    ] {
+        out.line(format!("  {name}: {}", yes_no(value)));
+    }
+
+    push_validation(&mut out, &result.validation);
+    out.finish()
+}
+
+/// Human-readable представление `retire`.
+pub fn retire(result: &RetireResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir.display()));
+    out.line(format!("deck.json: {}", result.deck_json.display()));
+    out.line(mode_line(result.applied, result.dry_run));
+    out.line(format!("Тег вывода из обращения: {:?}", result.tag));
+    out.line(format!("Заметок в запросе: {}", result.notes_total));
+    out.line(format!("Помечено: {}", result.notes_retired));
+    out.line(format!(
+        "Уже было помечено: {}",
+        result.notes_already_retired
+    ));
+    out.line(format!(
+        "Байт: {} → {} ({:+})",
+        result.source_bytes, result.candidate_bytes, result.byte_delta
+    ));
+
+    out.blank();
+    out.line(format!("Заметки ({}):", result.outcomes.len()));
+    if result.outcomes.is_empty() {
+        out.line("  —");
+    }
+    for outcome in &result.outcomes {
+        let note_id = outcome
+            .note_id
+            .as_deref()
+            .map_or(String::new(), |id| format!(" [{id}]"));
+        out.line(format!(
+            "  #{} {}{} — guid {:?}, колода {}, заметка {}",
+            outcome.note_index,
+            outcome.status.as_str(),
+            note_id,
+            outcome.guid,
+            outcome.deck_path,
+            outcome.note_position
+        ));
+        out.line(format!(
+            "      теги: {} → {}",
+            if outcome.previous_tags.is_empty() {
+                "—".to_string()
+            } else {
+                outcome.previous_tags.join(", ")
+            },
+            if outcome.tags.is_empty() {
+                "—".to_string()
+            } else {
+                outcome.tags.join(", ")
+            }
+        ));
+    }
+    if result.outcomes_truncated {
+        out.line(format!(
+            "  … в отчёт попало только {} заметок из {}",
+            result.outcomes.len(),
+            result.notes_total
+        ));
+    }
+
+    out.blank();
+    out.line("Проверки:");
+    for (name, value) in [
+        ("source_canonical", result.checks.source_canonical),
+        ("candidate_reparsed", result.checks.candidate_reparsed),
+        ("only_tags_appended", result.checks.only_tags_appended),
+        (
+            "tags_appended_verified",
+            result.checks.tags_appended_verified,
+        ),
+        (
+            "retired_notes_still_resolvable",
+            result.checks.retired_notes_still_resolvable,
+        ),
+    ] {
+        out.line(format!("  {name}: {}", yes_no(value)));
+    }
+
+    push_validation(&mut out, &result.validation);
+    out.finish()
+}
+
+/// Human-readable представление `visual-report`.
+pub fn visual_report(result: &VisualReportResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("До: {}", result.before.export_dir.display()));
+    out.line(format!("После: {}", result.after.export_dir.display()));
+    out.line(format!("Отчёт: {}", result.index_html.display()));
+    out.line(format!(
+        "Заметок: {} → {}",
+        result.before.notes, result.after.notes
+    ));
+    out.line(format!(
+        "Файлов превью: {} (в списке {})",
+        result.card_files_total,
+        result.card_files.len()
+    ));
+    if let Some(tag) = &result.retire_tag {
+        out.line(format!("Тег вывода из обращения: {tag:?}"));
+    }
+
+    out.blank();
+    out.line("Изменения:");
+    for (name, value) in [
+        ("created", result.counts.created),
+        ("changed", result.counts.changed),
+        ("retired", result.counts.retired),
+        ("removed", result.counts.removed),
+        ("unchanged", result.counts.unchanged),
+        ("ambiguous", result.counts.ambiguous),
+    ] {
+        out.line(format!("  {name}: {value}"));
+    }
+
+    // Заметки без изменений в список не попадают: их число уже названо выше, а
+    // список из сотен одинаковых строк не читается человеком. В `--json` они
+    // остаются, чтобы машинный потребитель видел полный состав.
+    let listed: Vec<_> = result
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.kind != NoteChangeKind::Unchanged)
+        .collect();
+
+    out.blank();
+    out.line(format!(
+        "Заметки в отчёте (показано {}, без изменений пропущено {}):",
+        listed.len(),
+        result.counts.unchanged
+    ));
+    if listed.is_empty() {
+        out.line("  —");
+    }
+    {
+        for outcome in &listed {
+            let fields = if outcome.changed_fields.is_empty() {
+                String::new()
+            } else {
+                format!("; поля: {}", outcome.changed_fields.join(", "))
+            };
+            out.line(format!(
+                "  {} guid {:?} — колода {}{fields}",
+                outcome.kind.as_str(),
+                outcome.guid,
+                if outcome.deck_path.is_empty() {
+                    "—"
+                } else {
+                    &outcome.deck_path
+                }
+            ));
+        }
+    }
+    if result.outcomes_truncated {
+        // Знаменатель — число классифицированных заметок, а не сумма размеров
+        // двух состояний: заметка, присутствующая в обоих, считалась бы дважды.
+        let classified = result.counts.created
+            + result.counts.changed
+            + result.counts.retired
+            + result.counts.removed
+            + result.counts.unchanged
+            + result.counts.ambiguous;
+        out.line(format!(
+            "  … в JSON-результат попало только {} заметок из {classified}",
+            result.outcomes.len()
+        ));
+    }
+
+    out.blank();
+    out.line(format!("Диагностика ({}):", result.diagnostics.len()));
+    if result.diagnostics.is_empty() {
+        out.line("  —");
+    }
+    for diagnostic in &result.diagnostics {
+        out.line(format!(
+            "  [{}] {} — {}",
+            diagnostic.severity, diagnostic.code, diagnostic.message
+        ));
+    }
+
+    out.blank();
+    out.line(format!(
+        "Media: скопировано {}, отсутствует {}, вне экспорта {}, символических ссылок {}, слишком больших {}",
+        result.media.copied,
+        result.media.missing.len(),
+        result.media.remote.len(),
+        result.media.symlinks.len(),
+        result.media.oversized.len()
+    ));
+
+    if !result.unsupported_constructs.is_empty() {
+        out.blank();
+        out.line(format!(
+            "Неподдержанные конструкции затронутых моделей ({}):",
+            result.unsupported_constructs.len()
+        ));
+        for item in &result.unsupported_constructs {
+            out.line(format!("  {} — {}", item.construct, item.reason));
+        }
+    }
+
+    out.blank();
+    out.line("Ограничения отчёта:");
+    for limitation in &result.limitations {
+        out.line(format!("  — {limitation}"));
+    }
+
+    out.blank();
+    out.line("Проверки:");
+    for (name, value) in [
+        ("before_parsed", result.checks.before_parsed),
+        ("after_parsed", result.checks.after_parsed),
+        ("every_note_classified", result.checks.every_note_classified),
+        ("out_dir_outside_decks", result.checks.out_dir_outside_decks),
+        (
+            "all_files_inside_out_dir",
+            result.checks.all_files_inside_out_dir,
+        ),
+        (
+            "index_without_external_assets",
+            result.checks.index_without_external_assets,
+        ),
+        (
+            "media_confined_to_out_dir",
+            result.checks.media_confined_to_out_dir,
+        ),
+    ] {
+        out.line(format!("  {name}: {}", yes_no(value)));
+    }
+
+    out.finish()
+}
+
+/// Печатает строку режима записи для мутирующих команд.
+fn mode_line(applied: bool, dry_run: bool) -> &'static str {
+    if applied {
+        "Режим: --apply, deck.json заменён атомарно"
+    } else if dry_run {
+        "Режим: dry-run, deck.json не изменён"
+    } else {
+        "Режим: --apply, запись не требовалась"
+    }
+}
+
+/// Печатает сравнение валидации до и после.
+fn push_validation(out: &mut Out, validation: &crate::ops::source::ValidationDelta) {
+    out.blank();
+    out.line(format!(
+        "Валидация: ошибок {} → {}, предупреждений {} → {}, info {} → {}",
+        validation.before.errors,
+        validation.after.errors,
+        validation.before.warnings,
+        validation.after.warnings,
+        validation.before.info,
+        validation.after.info
+    ));
+    if !validation.new_error_codes.is_empty() {
+        out.line(format!(
+            "  новые коды ошибок: {}",
+            validation.new_error_codes.join(", ")
+        ));
+    }
+    if !validation.new_warning_codes.is_empty() {
+        out.line(format!(
+            "  новые коды предупреждений: {}",
+            validation.new_warning_codes.join(", ")
+        ));
+    }
+}
+
+/// Имя вида модели для human-readable вывода.
+fn model_kind_name(kind: crate::template::ModelKind) -> &'static str {
+    match kind {
+        crate::template::ModelKind::Standard => "standard",
+        crate::template::ModelKind::Cloze => "cloze",
+    }
 }

@@ -26,8 +26,34 @@ pub enum ErrorCode {
     UnknownField,
     /// Запрошенный deck path отсутствует в экспорте.
     UnknownDeck,
+    /// Селектор колоды совпал более чем с одним узлом дерева.
+    AmbiguousDeck,
+    /// Селектор модели заметок не совпал ни с одной моделью экспорта.
+    UnknownModel,
+    /// Селектор модели заметок совпал более чем с одной моделью.
+    AmbiguousModel,
+    /// Модель заметок существует, но её field/template schema непригодна
+    /// для безопасной сборки значений полей.
+    ModelSchemaUnusable,
+    /// Модель требует значение поля, которого нет в запросе создания.
+    MissingFieldValue,
+    /// Новое значение поля создаваемой заметки содержит media-ссылку.
+    MediaForbidden,
+    /// `guid` новой заметки уже занят заметкой с другой identity/содержимым.
+    GuidCollision,
+    /// Тот же `guid` уже описан в запросе дважды с разным содержимым.
+    GuidConflict,
+    /// `create --apply`/`retire --apply`: запрос не содержит разрешённой
+    /// стабильной identity.
+    UnresolvedGuid,
+    /// `create --apply`: запрос не содержит разрешённой identity target deck.
+    UnresolvedDeckIdentity,
+    /// Селектор и ожидаемая identity колоды указывают на разные узлы.
+    DeckIdentityMismatch,
     /// `qa`/`review`: запрошен неизвестный код QA-правила.
     UnknownQaCode,
+    /// `visual-report`: before/after нельзя сравнить как один логический export.
+    InvalidComparison,
     /// `find` по идентичности не нашёл ни одного совпадения.
     NotFound,
     /// `find` по идентичности нашёл больше одного совпадения.
@@ -66,7 +92,19 @@ impl ErrorCode {
             Self::SchemaInvalid => "schema_invalid",
             Self::UnknownField => "unknown_field",
             Self::UnknownDeck => "unknown_deck",
+            Self::AmbiguousDeck => "ambiguous_deck",
+            Self::UnknownModel => "unknown_model",
+            Self::AmbiguousModel => "ambiguous_model",
+            Self::ModelSchemaUnusable => "model_schema_unusable",
+            Self::MissingFieldValue => "missing_field_value",
+            Self::MediaForbidden => "media_forbidden",
+            Self::GuidCollision => "guid_collision",
+            Self::GuidConflict => "guid_conflict",
+            Self::UnresolvedGuid => "unresolved_guid",
+            Self::UnresolvedDeckIdentity => "unresolved_deck_identity",
+            Self::DeckIdentityMismatch => "deck_identity_mismatch",
             Self::UnknownQaCode => "unknown_qa_code",
+            Self::InvalidComparison => "invalid_comparison",
             Self::NotFound => "not_found",
             Self::Ambiguous => "ambiguous",
             Self::SourceNotCanonical => "source_not_canonical",
@@ -93,13 +131,24 @@ impl ErrorCode {
             | Self::SchemaInvalid
             | Self::UnknownField
             | Self::UnknownDeck
+            | Self::UnknownModel
+            | Self::MissingFieldValue
+            | Self::MediaForbidden
+            | Self::UnresolvedGuid
+            | Self::UnresolvedDeckIdentity
+            | Self::DeckIdentityMismatch
+            | Self::InvalidComparison
             | Self::UnknownQaCode
             | Self::SourceNotCanonical
             | Self::InvalidRequest
             | Self::DuplicateEditTarget => 3,
             Self::NotFound | Self::NoteNotFound => 4,
-            Self::Ambiguous => 5,
-            Self::ExportInvalid | Self::ExportNotMutable => 6,
+            Self::Ambiguous | Self::AmbiguousDeck | Self::AmbiguousModel => 5,
+            Self::ExportInvalid
+            | Self::ExportNotMutable
+            | Self::ModelSchemaUnusable
+            | Self::GuidCollision
+            | Self::GuidConflict => 6,
             Self::ExpectedMismatch | Self::SourceChanged => 7,
             Self::WriteFailed => 8,
             Self::Internal => 70,
@@ -254,7 +303,19 @@ mod tests {
             ErrorCode::SchemaInvalid,
             ErrorCode::UnknownField,
             ErrorCode::UnknownDeck,
+            ErrorCode::AmbiguousDeck,
+            ErrorCode::UnknownModel,
+            ErrorCode::AmbiguousModel,
+            ErrorCode::ModelSchemaUnusable,
+            ErrorCode::MissingFieldValue,
+            ErrorCode::MediaForbidden,
+            ErrorCode::GuidCollision,
+            ErrorCode::GuidConflict,
+            ErrorCode::UnresolvedGuid,
+            ErrorCode::UnresolvedDeckIdentity,
+            ErrorCode::DeckIdentityMismatch,
             ErrorCode::UnknownQaCode,
+            ErrorCode::InvalidComparison,
             ErrorCode::NotFound,
             ErrorCode::Ambiguous,
             ErrorCode::SourceNotCanonical,
