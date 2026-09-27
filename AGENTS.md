@@ -86,6 +86,23 @@
 
 ## 7. Skills
 
-`.agents/skills/` зарезервирован под будущие специализированные skills.
+`.agents/skills/` содержит repository skills — по одному каталогу
+`.agents/skills/<name>/SKILL.md` на skill, с собственными reference-файлами.
+Применяй их, когда текущий запрос явно подпадает под назначение skill.
 
-Пока пользователь явно не попросил создать или изменить skill, не добавляй туда реализацию и не придумывай преждевременную автоматизацию.
+- `anki-coderabbit-review` — явный CodeRabbit review cycle текущего checkout.
+  Маршрутизируй сюда только явный CodeRabbit intent: «сделай ревью CodeRabbit»,
+  «запусти CodeRabbit», «прогони кодрэббит», «сделай 5 итераций CodeRabbit»,
+  «повтори CodeRabbit ещё 2 раза», продолжение уже начатого CodeRabbit-цикла.
+  Default — 3 completed iterations, если пользователь не назвал своё
+  положительное число; каждая completed iteration заканчивается отдельным
+  commit + push текущей ветки. Merge не входит в этот cycle.
+- Обычное «ревью», generic code review без CodeRabbit intent, обычная разработка,
+  подготовка PR, обычный commit/push и задачи по изменению самого skill в этот
+  skill не маршрутизируются.
+
+Процедуру CodeRabbit workflow владеет сам skill; не дублируй её здесь и не
+переноси в `.codex/context/`.
+
+Новые skills и изменения существующих добавляй только по явной просьбе
+пользователя, не придумывая преждевременную автоматизацию.
