@@ -7,9 +7,11 @@
 
 mod common;
 
+use std::process::{Command, Stdio};
+
 use common::{
-    TempDir, base_export, edit_request, lines, run_cli_in, single_line_change, words_deck,
-    write_request,
+    TempDir, base_export, cli_binary, edit_request, lines, run_cli_in, single_line_change,
+    words_deck, write_request,
 };
 use serde_json::{Value, json};
 
@@ -430,6 +432,155 @@ fn broken_utf8_is_rejected_as_invalid_json() {
     let document: Value = serde_json::from_str(&stdout).expect("stdout — JSON");
     assert_eq!(document["error"]["code"], "invalid_json");
     assert_ne!(exit, 0);
+}
+
+/// Параллельные `edit --apply` из одного snapshot не теряют результат и не
+/// повреждают экспорт.
+///
+/// Каждый процесс читает `deck.json` целиком, вычисляет кандидат и публикует его
+/// целиком — под эксклюзивной блокировкой целевого файла. Независимо от того, кто
+/// именно выиграл гонку, инвариант один:
+///
+/// * процесс с exit code `0` применил свою правку;
+/// * процесс с exit code `7` получил контролируемый `source_changed` и не оставил
+///   следов;
+/// * в любом случае итог — валидный канонический экспорт, а не «смесь» кандидатов
+///   и не потеря обеих правок.
+///
+/// Тест намеренно не фиксирует победителя: он зависит от порядка захвата
+/// блокировки, который задаёт ядро, а не тест. Проверяется инвариант, который
+/// обязан держаться при любом порядке.
+///
+/// Детерминированная регрессия на само окно между проверкой и публикацией живёт
+/// на уровне write-layer:
+/// `write::tests::concurrent_publication_publishes_one_candidate_and_reports_conflict`.
+#[test]
+fn parallel_applies_never_corrupt_or_lose_the_export() {
+    let dir = canonical_fixture("preserve-parallel-apply");
+    let snapshot = dir.deck_json_bytes();
+
+    // Каждая правка — в своём поле, поэтому «оба применились» тоже допустимо.
+    let plans: [(&str, &str, &str, &str, usize, &str); 2] = [
+        (
+            "a.json",
+            "guid-1",
+            "случайность",
+            "случайность A",
+            0,
+            "случайность",
+        ),
+        (
+            "b.json",
+            "guid-2",
+            "неизбежность",
+            "неизбежность B",
+            1,
+            "неизбежность",
+        ),
+    ];
+
+    let jobs: Vec<(std::path::PathBuf, usize, &str)> = plans
+        .iter()
+        .map(
+            |(name, guid, expected, replacement, note_index, original)| {
+                let request = edit_request(&[(*guid, "Значение", expected, replacement)]);
+                (write_request(&dir, name, &request), *note_index, *original)
+            },
+        )
+        .collect();
+
+    let children: Vec<std::process::Child> = jobs
+        .iter()
+        .map(|(request, _, _)| {
+            let mut command = Command::new(cli_binary());
+            command.args([
+                "edit",
+                dir.path().to_str().expect("путь"),
+                "--json",
+                "--request",
+                request.to_str().expect("путь"),
+                "--apply",
+            ]);
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            command.spawn().expect("anki-repo должен запускаться")
+        })
+        .collect();
+
+    // Итог каждого процесса: применился он или получил контролируемый конфликт.
+    let mut applied = Vec::new();
+    for (index, child) in children.into_iter().enumerate() {
+        let output = child
+            .wait_with_output()
+            .expect("процесс должен завершиться");
+        let stdout = String::from_utf8(output.stdout).expect("stdout — utf-8");
+        let stderr = String::from_utf8(output.stderr).expect("stderr — utf-8");
+        let code = output.status.code();
+        let document: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("правка #{index}: stdout не JSON ({error}): {stdout}"));
+
+        match code {
+            Some(0) => {
+                assert_eq!(document["result"]["applied"], true, "правка #{index}");
+                applied.push(index);
+            }
+            Some(7) => {
+                assert_eq!(
+                    document["error"]["code"], "source_changed",
+                    "правка #{index}: устаревший исходник — контролируемый конфликт"
+                );
+            }
+            other => panic!(
+                "правка #{index} завершилась непредвиденным кодом {other:?}, \
+                 stdout: {stdout}, stderr: {stderr}"
+            ),
+        }
+    }
+
+    assert!(
+        !applied.is_empty(),
+        "хотя бы одна правка должна примениться"
+    );
+
+    // Файл остаётся валидным каноническим экспортом.
+    let after = dir.deck_json_bytes();
+    assert_ne!(after, snapshot, "файл должен измениться");
+    let document: Value = serde_json::from_slice(&after).expect("итог — валидный JSON");
+    assert_eq!(
+        anki_repo::loader::render_canonical_bytes(&document).expect("канонизация"),
+        after,
+        "итог обязан оставаться в канонической форме"
+    );
+
+    // Состояние каждого поля объясняется исходом его процесса: успех — новое
+    // значение, конфликт — исходное, без следов отвергнутого кандидата.
+    for (index, (_, _, _, replacement, note_index, original)) in plans.iter().enumerate() {
+        let value = document["notes"][*note_index]["fields"][1]
+            .as_str()
+            .expect("значение поля");
+        if applied.contains(&index) {
+            assert_eq!(value, *replacement, "правка #{index} применилась");
+        } else {
+            assert_eq!(value, *original, "правка #{index} не оставила следов");
+            assert_ne!(
+                value, *replacement,
+                "отвергнутый кандидат не должен попасть в файл"
+            );
+        }
+    }
+
+    let entries: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("каталог")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+    assert!(entries.is_empty(), "остались временные файлы: {entries:?}");
 }
 
 #[test]

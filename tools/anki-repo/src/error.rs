@@ -209,6 +209,36 @@ mod tests {
         assert_eq!(ErrorCode::WriteFailed.as_str(), "write_failed");
     }
 
+    /// Exit semantics, которые обязан документировать `tools/anki-repo/README.md`.
+    ///
+    /// Один exit code описывает несколько кодов ошибок, поэтому документация
+    /// должна перечислять их вместе: `4` — `find`/`not_found` и
+    /// `edit`/`note_not_found`, `7` — `edit`/`expected_mismatch` и
+    /// `edit`/`source_changed`.
+    #[test]
+    fn shared_exit_codes_cover_all_documented_reasons() {
+        // Exit 4: нет совпадений у `find` и нет заметки у `edit`.
+        assert_eq!(ErrorCode::NotFound.exit_code(), 4);
+        assert_eq!(ErrorCode::NoteNotFound.exit_code(), 4);
+
+        // Exit 7: конфликт предусловия по значению поля и устаревший исходник.
+        assert_eq!(ErrorCode::ExpectedMismatch.exit_code(), 7);
+        assert_eq!(ErrorCode::SourceChanged.exit_code(), 7);
+
+        // Коды различаются, несмотря на общий exit code: wrapper'у нужна причина,
+        // а не только код процесса.
+        assert_ne!(ErrorCode::NotFound, ErrorCode::NoteNotFound);
+        assert_ne!(ErrorCode::ExpectedMismatch, ErrorCode::SourceChanged);
+        assert_ne!(
+            ErrorCode::NotFound.as_str(),
+            ErrorCode::NoteNotFound.as_str()
+        );
+        assert_ne!(
+            ErrorCode::ExpectedMismatch.as_str(),
+            ErrorCode::SourceChanged.as_str()
+        );
+    }
+
     #[test]
     fn codes_are_stable_snake_case() {
         let codes = [
