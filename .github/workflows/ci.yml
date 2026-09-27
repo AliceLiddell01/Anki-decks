@@ -63,12 +63,22 @@ jobs:
           set -euo pipefail
           status=0
           found=0
-          while IFS= read -r -d '' deck_json; do
-            found=$((found + 1))
-            export_dir=$(dirname "$deck_json")
-            echo "Проверяю экспорт: $export_dir"
-            cargo run --quiet --locked --bin anki-repo -- validate "$export_dir" || status=1
-          done < <(find decks -name deck.json -print0 2>/dev/null || true)
+          # Отсутствие `decks/` — допустимое состояние, а не ошибка шага.
+          if [ -d decks ]; then
+            # Список собирается в файл: ошибка обхода не должна теряться внутри
+            # process substitution, иначе часть экспортов молча выпадет из
+            # проверки, а шаг останется зелёным. Поэтому обход идёт отдельной
+            # командой под `set -e`, а его диагностика не подавляется.
+            deck_list=$(mktemp)
+            trap 'rm -f "$deck_list"' EXIT
+            find decks -name deck.json -print0 > "$deck_list"
+            while IFS= read -r -d '' deck_json; do
+              found=$((found + 1))
+              export_dir=$(dirname "$deck_json")
+              echo "Проверяю экспорт: $export_dir"
+              cargo run --quiet --locked --bin anki-repo -- validate "$export_dir" || status=1
+            done < "$deck_list"
+          fi
           echo "Найдено экспортов: $found"
           exit "$status"
 
