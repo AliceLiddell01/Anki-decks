@@ -1,8 +1,9 @@
-//! Domain-операции: `inspect`, `find`, `stats`, `validate`.
+//! Domain-операции: `inspect`, `find`, `stats`, `validate`, `edit`.
 //!
 //! Каждая операция возвращает собственный domain result. Human и JSON
 //! renderers — только два представления одного и того же результата.
 
+pub mod edit;
 pub mod find;
 pub mod inspect;
 pub mod stats;

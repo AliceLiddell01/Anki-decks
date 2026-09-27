@@ -3,11 +3,17 @@
 //!
 //! [`execute`] полностью готовит stdout и exit code команды и не пишет в
 //! process stdio, поэтому контракт проверяем без обязательного subprocess.
+//! Единственное чтение из process stdio — `edit --request -`.
+
+use std::io::Read;
+use std::path::Path;
 
 use crate::cli::{Cli, Command, MatchArg};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
 use crate::loader::load_export;
+use crate::ops::edit as edit_op;
+use crate::ops::edit::{EditRequest, EditSpec, STDIN_REQUEST_SOURCE};
 use crate::ops::find as find_op;
 use crate::ops::find::{FindCriteria, FindQuery, MatchMode, WORD_SHORTCUT_FIELD};
 use crate::ops::inspect as inspect_op;
@@ -125,7 +131,104 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 exit: if result.valid { 0 } else { 6 },
             })
         }
+
+        Command::Edit {
+            export_dir,
+            request_file,
+            guid,
+            field,
+            set,
+            expect,
+            apply,
+        } => {
+            let request = build_edit_request(
+                request_file.as_deref(),
+                guid.as_deref(),
+                field.as_deref(),
+                set.as_deref(),
+                expect.as_deref(),
+            )?;
+            let result = edit_op::edit(export_dir, &request, *apply)?;
+            Ok(Rendered {
+                command: "edit",
+                stdout: if cli.json {
+                    json::edit_json(&result)
+                } else {
+                    human::edit(&result)
+                },
+                exit: 0,
+            })
+        }
     }
+}
+
+/// Собирает запрос на правку из аргументов CLI.
+///
+/// `--request` читается целиком и разбирается; `-` означает stdin.
+fn build_edit_request(
+    request_file: Option<&Path>,
+    guid: Option<&str>,
+    field: Option<&str>,
+    set: Option<&str>,
+    expect: Option<&str>,
+) -> Result<EditRequest, DomainError> {
+    if let Some(path) = request_file {
+        let label = path.display().to_string();
+        let raw = if label == STDIN_REQUEST_SOURCE {
+            read_stdin_request()?
+        } else {
+            std::fs::read(path).map_err(|error| {
+                DomainError::with_details(
+                    ErrorCode::InputUnreadable,
+                    format!("не удалось прочитать запрос {label}: {error}"),
+                    crate::details! {
+                        "path" => label.as_str(),
+                        "io_error" => error.to_string(),
+                    },
+                )
+            })?
+        };
+
+        return edit_op::parse_request_bytes(&raw, &label);
+    }
+
+    let (Some(guid), Some(field), Some(set), Some(expect)) = (guid, field, set, expect) else {
+        return Err(DomainError::new(
+            ErrorCode::Usage,
+            "для правки нужен либо --request, либо --guid с --field, --set и --expect",
+        ));
+    };
+
+    let request = EditRequest {
+        edits: vec![EditSpec {
+            edit_id: None,
+            guid: guid.to_string(),
+            field: field.to_string(),
+            expected: expect.to_string(),
+            replacement: set.to_string(),
+        }],
+    };
+    edit_op::validate_request(&request)?;
+    Ok(request)
+}
+
+/// Читает JSON-запрос целиком со stdin.
+fn read_stdin_request() -> Result<Vec<u8>, DomainError> {
+    let mut raw = Vec::new();
+    std::io::stdin()
+        .lock()
+        .read_to_end(&mut raw)
+        .map_err(|error| {
+            DomainError::with_details(
+                ErrorCode::InputUnreadable,
+                format!("не удалось прочитать запрос со stdin: {error}"),
+                crate::details! {
+                    "path" => STDIN_REQUEST_SOURCE,
+                    "io_error" => error.to_string(),
+                },
+            )
+        })?;
+    Ok(raw)
 }
 
 fn build_criteria(

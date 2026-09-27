@@ -5,6 +5,7 @@
 //! ограничиваются по длине; полные значения доступны в `--json`.
 
 use crate::ops::NamedField;
+use crate::ops::edit::{EditResult, EditStatus};
 use crate::ops::find::FindResult;
 use crate::ops::inspect::InspectResult;
 use crate::ops::stats::StatsResult;
@@ -438,5 +439,129 @@ fn describe_scope(deck_path: Option<&str>, location: &str) -> String {
         (Some(path), true) => path.to_string(),
         (None, false) => location.to_string(),
         (None, true) => String::new(),
+    }
+}
+
+/// Печатает результат `edit`.
+pub fn edit(result: &EditResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir.display()));
+    out.line(format!("deck.json: {}", result.deck_json.display()));
+    out.line(if result.applied {
+        "Режим: --apply, deck.json заменён атомарно".to_string()
+    } else if result.dry_run {
+        "Режим: dry-run, deck.json не изменён".to_string()
+    } else {
+        "Режим: --apply, запись не требовалась".to_string()
+    });
+    out.line(format!("Правок в запросе: {}", result.edits_total));
+    out.line(format!("Эффективных правок: {}", result.effective_edits));
+    out.line(format!(
+        "Статусы: применено {}, dry-run {}, без изменений {}, уже применено {}",
+        result.summaries.applied,
+        result.summaries.dry_run,
+        result.summaries.noop_identical,
+        result.summaries.already_applied
+    ));
+    match result.first_changed_line {
+        Some(line) => out.line(format!(
+            "Изменённых строк: {} (первая — {line})",
+            result.changed_lines
+        )),
+        None => out.line("Изменённых строк: 0"),
+    };
+    out.line(format!(
+        "Байт: {} → {} ({:+})",
+        result.source_bytes, result.candidate_bytes, result.byte_delta
+    ));
+
+    out.blank();
+    out.line(format!("Правки ({}):", result.outcomes.len()));
+    if result.outcomes.is_empty() {
+        out.line("  —");
+    }
+    for outcome in &result.outcomes {
+        let edit_id = outcome
+            .edit_id
+            .as_deref()
+            .map_or(String::new(), |id| format!(" [{id}]"));
+        out.line(format!(
+            "  #{} {}{} — {} (ord {}, заметка {}, колода {})",
+            outcome.edit_index,
+            outcome.status.as_str(),
+            edit_id,
+            format_args!("{:?}/{:?}", outcome.guid, outcome.field),
+            outcome.field_ord,
+            outcome.note_index,
+            outcome.deck_path
+        ));
+        if outcome.status != EditStatus::NoopIdentical {
+            out.line(format!(
+                "      было: {}",
+                compact_value(&outcome.old_sample)
+            ));
+            out.line(format!(
+                "      стало: {}",
+                compact_value(&outcome.new_sample)
+            ));
+        }
+    }
+    if result.outcomes_truncated {
+        out.line("  … отчёт обрезан, полный список доступен в --json");
+    }
+
+    out.blank();
+    out.line("Проверки:");
+    for (name, value) in [
+        ("source_canonical", result.checks.source_canonical),
+        ("candidate_reparsed", result.checks.candidate_reparsed),
+        (
+            "semantic_targets_verified",
+            result.checks.semantic_targets_verified,
+        ),
+        (
+            "diff_shape_is_exactly_requested",
+            result.checks.diff_shape_is_exactly_requested,
+        ),
+        (
+            "byte_delta_matches_token_delta",
+            result.checks.byte_delta_matches_token_delta,
+        ),
+    ] {
+        out.line(format!("  {name}: {}", yes_no(value)));
+    }
+
+    out.blank();
+    out.line(format!(
+        "Валидация до: ERROR {}, WARNING {}, INFO {}",
+        result.validation.before.errors,
+        result.validation.before.warnings,
+        result.validation.before.info
+    ));
+    out.line(format!(
+        "Валидация после: ERROR {}, WARNING {}, INFO {}",
+        result.validation.after.errors,
+        result.validation.after.warnings,
+        result.validation.after.info
+    ));
+    out.line(format!(
+        "Новые ERROR: {}",
+        list_or_none(&result.validation.new_error_codes)
+    ));
+    out.line(format!(
+        "Новые WARNING: {}",
+        list_or_none(&result.validation.new_warning_codes)
+    ));
+
+    out.finish()
+}
+
+/// Печатает список кодов или «нет».
+fn list_or_none(codes: &[String]) -> String {
+    if codes.is_empty() {
+        "нет".to_string()
+    } else {
+        codes.join(", ")
     }
 }
