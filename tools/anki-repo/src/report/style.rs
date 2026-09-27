@@ -200,6 +200,9 @@ body.report.report-night {
 .report-preview {
   display: block;
   width: 100%;
+  /* Кадр растёт по измеренной высоте содержимого, поэтому собственные полосы
+     прокрутки ему не нужны: прокручивается сама страница отчёта. */
+  overflow: hidden;
   border: 1px solid var(--report-line);
   border-radius: 6px;
   background: #fff;

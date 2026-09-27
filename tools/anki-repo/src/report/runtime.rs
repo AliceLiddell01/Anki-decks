@@ -184,6 +184,7 @@ pub const CARD_RUNTIME_JS: &str = r#"
   var HEIGHT_MESSAGE = 'report:height';
   var THEME_MESSAGE = 'report:theme';
   var MIN_HEIGHT = 80;
+  var HEIGHT_EPSILON = 1;
   var MAX_HEIGHT = 40000;
 
   function post(message) {
@@ -227,6 +228,10 @@ pub const CARD_RUNTIME_JS: &str = r#"
     if (body) {
       height = Math.max(height, body.scrollHeight || 0, body.offsetHeight || 0);
     }
+    // Запас в один пиксель гасит дробное округление: без него кадр почти того
+    // же размера, что содержимое, получает собственный scrollbar и отчёт
+    // прокручивается двумя вложенными областями.
+    height += HEIGHT_EPSILON;
     return Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, height));
   }
 

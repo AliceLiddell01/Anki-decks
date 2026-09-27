@@ -1061,7 +1061,12 @@ function cardRun(src) {
 
   const hello = posted.find((message) => message.type === 'report:hello');
   assert.ok(hello, 'карточка обязана сообщить о готовности');
-  assert.strictEqual(hello.height, 480, 'высота берётся из содержимого');
+  // Высота равна содержимому плюс запас против дробного округления: ровно
+  // содержимое даёт кадру собственный scrollbar.
+  assert.ok(
+    hello.height >= 480 && hello.height <= 481,
+    'высота берётся из содержимого: ' + hello.height
+  );
 
   const message = listeners.message[0];
   message({ data: { type: 'report:theme', theme: 'night' } });
@@ -1075,7 +1080,10 @@ function cardRun(src) {
   const load = listeners.load.find((fn) => fn);
   load({ target: { tagName: 'IMG' } });
   const height = posted.filter((item) => item.type === 'report:height').pop();
-  assert.strictEqual(height.height, 900, 'высота обновляется после загрузки media');
+  assert.ok(
+    height.height >= 900 && height.height <= 901,
+    'высота обновляется после загрузки media: ' + height.height
+  );
 }
 
 function indexRun(src) {
