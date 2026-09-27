@@ -62,16 +62,23 @@ reviews:
 
     - path: "tools/anki-repo/src/**/*.rs"
       instructions: >-
-        Сохраняй основной контракт anki-repo: CLI только читает один CrowdAnki
-        export за вызов и не мутирует deck.json, media или настройки Anki.
+        Сохраняй основной контракт anki-repo: семь команд читают один CrowdAnki
+        export за вызов и не мутируют deck.json, media или настройки Anki, а
+        единственная мутирующая команда — edit, и только по явному --apply.
         Проверяй детерминированность, стабильность JSON output contract,
         schema_version, command/error codes, exit codes, порядок вывода,
-        semantics inspect/find/stats/validate и разделение stdout/stderr.
-        Учитывай Rust edition 2024 и запрет unsafe_code. Новые panic paths,
-        недетерминированные HashMap/FS iteration effects, неограниченный вывод,
-        чтение media по небезопасным путям и скрытые filesystem mutations
-        считай существенными дефектами. Изменение наблюдаемого CLI-контракта
-        должно сопровождаться соответствующими тестами и обновлением README.
+        semantics inspect/find/stats/validate/qa/review/review-check/edit и
+        разделение stdout/stderr. Отдельно следи за границей QA-review: toolkit
+        не вызывает LLM API и не ходит в сеть, реестр правил QA детерминирован,
+        findings не делают экспорт невалидным и не блокируют edit, а
+        review-check ничего не пишет и выпускает edit_request только для
+        полностью валидного документа. Новое правило QA обязано попадать в общий
+        реестр, а не в отдельную ветку диспетчера. Учитывай Rust edition 2024 и
+        запрет unsafe_code. Новые panic paths, недетерминированные HashMap/FS
+        iteration effects, неограниченный вывод, чтение media по небезопасным
+        путям и скрытые filesystem mutations считай существенными дефектами.
+        Изменение наблюдаемого CLI-контракта должно сопровождаться
+        соответствующими тестами и обновлением README.
 
     - path: "tools/anki-repo/tests/**/*.rs"
       instructions: >-

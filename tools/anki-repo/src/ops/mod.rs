@@ -1,4 +1,5 @@
-//! Domain-операции: `inspect`, `find`, `stats`, `validate`, `edit`.
+//! Domain-операции: `inspect`, `find`, `stats`, `validate`, `edit`, `qa`,
+//! `review`, `review-check`.
 //!
 //! Каждая операция возвращает собственный domain result. Human и JSON
 //! renderers — только два представления одного и того же результата.
@@ -6,10 +7,15 @@
 pub mod edit;
 pub mod find;
 pub mod inspect;
+pub mod qa;
+pub mod review;
+pub mod review_check;
 pub mod stats;
 pub mod validate;
 
+use crate::index::{ExportIndex, NoteRef, resolve_named_fields};
 use crate::media::MediaReport;
+use crate::model::FieldValue;
 
 /// Именованное значение поля заметки в порядке `ord` модели.
 #[derive(Debug, Clone)]
@@ -20,6 +26,58 @@ pub struct NamedField {
     pub ord: Option<i64>,
     /// Значение поля; `None`, если значения по этой позиции нет.
     pub value: Option<String>,
+}
+
+/// Компактная сводка заметки, одинаковая для всех читающих команд.
+///
+/// Разрешение модели и полей выполняется здесь ровно один раз: `find` и
+/// `review` не должны строить эту сводку каждая по-своему.
+#[derive(Debug)]
+pub struct NoteSummary {
+    /// Идентификатор заметки.
+    pub guid: Option<String>,
+    /// Путь колоды заметки.
+    pub deck_path: String,
+    /// Имя модели заметки.
+    pub note_model_name: Option<String>,
+    /// Идентичность модели заметки.
+    pub note_model_uuid: Option<String>,
+    /// Теги заметки.
+    pub tags: Vec<String>,
+    /// Поля заметки в порядке `ord` модели.
+    pub fields: Vec<NamedField>,
+}
+
+impl NoteSummary {
+    /// Строит сводку по заметке в индексах экспорта.
+    #[must_use]
+    pub fn build(index: &ExportIndex<'_>, entry: &NoteRef<'_>) -> Self {
+        let model = entry
+            .note
+            .note_model_uuid
+            .as_deref()
+            .and_then(|uuid| index.model_by_uuid(uuid));
+
+        let fields = model.map_or_else(Vec::new, |model| {
+            resolve_named_fields(entry.note, model)
+                .into_iter()
+                .map(|field| NamedField {
+                    name: field.name.to_string(),
+                    ord: field.ord.value(),
+                    value: field.value.map(FieldValue::rendered),
+                })
+                .collect()
+        });
+
+        Self {
+            guid: entry.note.guid.clone(),
+            deck_path: index.note_deck_path(entry).to_string(),
+            note_model_name: model.and_then(|model| model.name.clone()),
+            note_model_uuid: entry.note.note_model_uuid.clone(),
+            tags: entry.note.tags.clone(),
+            fields,
+        }
+    }
 }
 
 /// Пара «ключ — количество» для детерминированных распределений.

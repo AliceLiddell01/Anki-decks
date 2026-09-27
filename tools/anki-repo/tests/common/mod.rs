@@ -5,10 +5,12 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use anki_repo::selection::PRIMARY_FIELD;
 use serde_json::{Value, json};
 
 /// Корень репозитория Anki-decks (на два уровня выше `tools/anki-repo`).
@@ -261,6 +263,386 @@ pub fn write_request(dir: &TempDir, name: &str, request: &Value) -> PathBuf {
     )
     .expect("запрос должен записаться");
     path
+}
+
+/// Собирает документ предложений — публичный вход `review-check`.
+pub fn proposals_document(proposals: &[(&str, &str, &str, &str)]) -> Value {
+    json!({
+        "schema_version": 1,
+        "proposals": proposals
+            .iter()
+            .enumerate()
+            .map(|(position, (guid, field, expected, replacement))| json!({
+                "proposal_id": format!("p{position}"),
+                "guid": guid,
+                "field": field,
+                "expected": expected,
+                "replacement": replacement,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Записывает документ предложений рядом с экспортом.
+pub fn write_proposals(dir: &TempDir, name: &str, document: &Value) -> PathBuf {
+    let path = dir.path().join(name);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(document).expect("документ должен сериализоваться"),
+    )
+    .expect("документ должен записаться");
+    path
+}
+
+/// Сырой JSON канонической колоды `Words__N{level}`.
+pub fn raw_json(level: u8) -> Value {
+    let path = words_deck(level).join("deck.json");
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// Все заметки сырого экспорта в порядке обхода дерева.
+///
+/// Порядок совпадает с порядком `note_index` tool'а и не зависит от него: это
+/// независимый источник для проверки адресов findings.
+pub fn collect_notes<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
+    if let Some(notes) = value.get("notes").and_then(Value::as_array) {
+        out.extend(notes);
+    }
+    if let Some(children) = value.get("children").and_then(Value::as_array) {
+        for child in children {
+            collect_notes(child, out);
+        }
+    }
+}
+
+/// Все модели экспорта в порядке `flds`: `(crowdanki_uuid, [(имя, ord)])`.
+///
+/// Порядок `flds` сохраняется: именно он задаёт порядок полей заметки, а не
+/// алфавит имён и не позиция значения в `fields`.
+pub fn raw_all_models(value: &Value) -> Vec<(String, Vec<(String, i64)>)> {
+    fn walk(value: &Value, out: &mut Vec<(String, Vec<(String, i64)>)>) {
+        if let Some(models) = value.get("note_models").and_then(Value::as_array) {
+            for model in models {
+                let Some(uuid) = model.get("crowdanki_uuid").and_then(Value::as_str) else {
+                    continue;
+                };
+                let mut fields = Vec::new();
+                if let Some(flds) = model.get("flds").and_then(Value::as_array) {
+                    for field in flds {
+                        let name = field
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let ord = field.get("ord").and_then(Value::as_i64).unwrap_or_default();
+                        fields.push((name.to_string(), ord));
+                    }
+                }
+                out.push((uuid.to_string(), fields));
+            }
+        }
+        if let Some(children) = value.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk(child, out);
+            }
+        }
+    }
+
+    let mut models = Vec::new();
+    walk(value, &mut models);
+    models
+}
+
+/// Состав моделей из сырого JSON: `crowdanki_uuid` → (имя поля → `ord`).
+pub fn raw_models(value: &Value) -> BTreeMap<String, BTreeMap<String, i64>> {
+    raw_all_models(value)
+        .into_iter()
+        .map(|(uuid, fields)| (uuid, fields.into_iter().collect()))
+        .collect()
+}
+
+/// Поля модели конкретной заметки в порядке `flds`: `(имя, ord)`.
+pub fn raw_note_model_fields(raw: &Value, note: &Value) -> Vec<(String, i64)> {
+    let uuid = note
+        .get("note_model_uuid")
+        .and_then(Value::as_str)
+        .expect("у заметки должен быть note_model_uuid");
+    raw_all_models(raw)
+        .into_iter()
+        .find(|(model_uuid, _)| model_uuid == uuid)
+        .unwrap_or_else(|| panic!("модель {uuid} не найдена в note_models"))
+        .1
+}
+
+/// Возвращает `ord` поля заметки так, как он задан её моделью в сыром JSON.
+///
+/// Позиция в `fields` не предполагается равной `ord`: она всегда разрешается
+/// через `note_model_uuid`.
+pub fn raw_field_ord(
+    models: &BTreeMap<String, BTreeMap<String, i64>>,
+    note: &Value,
+    name: &str,
+) -> i64 {
+    let uuid = note
+        .get("note_model_uuid")
+        .and_then(Value::as_str)
+        .expect("у заметки должен быть note_model_uuid");
+    models
+        .get(uuid)
+        .unwrap_or_else(|| panic!("модель {uuid} не найдена в note_models"))
+        .get(name)
+        .unwrap_or_else(|| panic!("поле {name} не найдено в модели {uuid}"))
+        .to_owned()
+}
+
+/// Позиция поля заметки в массиве `fields`, вычисленная по `ord` модели.
+pub fn raw_field_position(
+    models: &BTreeMap<String, BTreeMap<String, i64>>,
+    note: &Value,
+    name: &str,
+) -> usize {
+    usize::try_from(raw_field_ord(models, note, name)).expect("ord должен быть неотрицательным")
+}
+
+/// Коды QA-правил: ключи [`raw_qa_counts`].
+pub const QA_CODES: [&str; 6] = [
+    "empty_field_value",
+    "leading_whitespace",
+    "trailing_whitespace",
+    "forbidden_white_span",
+    "duplicate_note_content",
+    "duplicate_primary_field",
+];
+
+/// Независимый пересчёт ожидаемых counts QA прямо из сырого JSON.
+///
+/// Это oracle теста, а не второй экземпляр правил: он сознательно написан
+/// иначе (прямой обход `serde_json` без индексов экспорта), чтобы расхождение
+/// с `anki-repo` было видно. Ни одно ожидаемое значение не зашито в тест —
+/// они пересчитываются из текущего содержимого колоды.
+///
+/// Допущения, верные для канонических колод (`validate` даёт 0 ERROR):
+/// значения полей — строки, `guid` непусты и уникальны, `note_model_uuid`
+/// разрешается. Проверки адресуемости ниже повторяют это независимо, поэтому
+/// колода с нарушением допущения не сломает oracle молча: она изменит counts,
+/// и тест это увидит.
+pub fn raw_qa_counts(value: &Value) -> BTreeMap<&'static str, usize> {
+    let models = raw_models(value);
+    let mut notes = Vec::new();
+    collect_notes(value, &mut notes);
+
+    let mut guid_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for note in &notes {
+        if let Some(guid) = note
+            .get("guid")
+            .and_then(Value::as_str)
+            .filter(|guid| !guid.is_empty())
+        {
+            *guid_counts.entry(guid).or_default() += 1;
+        }
+    }
+
+    let addressable: Vec<&&Value> = notes
+        .iter()
+        .filter(|note| {
+            let ok_guid = note
+                .get("guid")
+                .and_then(Value::as_str)
+                .is_some_and(|guid| !guid.is_empty() && guid_counts[guid] == 1);
+            let ok_model = note
+                .get("note_model_uuid")
+                .and_then(Value::as_str)
+                .is_some_and(|uuid| models.contains_key(uuid));
+            ok_guid && ok_model
+        })
+        .collect();
+
+    let mut counts = BTreeMap::new();
+    let mut empty = 0;
+    let mut leading = 0;
+    let mut trailing = 0;
+    let mut spans = 0;
+
+    for note in &notes {
+        let Some(uuid) = note.get("note_model_uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(model) = models.get(uuid) else {
+            continue;
+        };
+        let Some(fields) = note.get("fields").and_then(Value::as_array) else {
+            continue;
+        };
+        for ord in model.values() {
+            let Some(text) = fields
+                .get(usize::try_from(*ord).expect("ord неотрицателен"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if text.is_empty() {
+                empty += 1;
+            }
+            if text.starts_with(char::is_whitespace) {
+                leading += 1;
+            }
+            if text.ends_with(char::is_whitespace) {
+                trailing += 1;
+            }
+            // Правило срабатывает на значение поля, а не на каждое
+            // совпадение внутри него: один finding на пару (заметка, поле).
+            if has_white_span(text) {
+                spans += 1;
+            }
+        }
+    }
+
+    counts.insert("empty_field_value", empty);
+    counts.insert("leading_whitespace", leading);
+    counts.insert("trailing_whitespace", trailing);
+    counts.insert("forbidden_white_span", spans);
+    counts.insert(
+        "duplicate_note_content",
+        raw_content_duplicate_groups(&addressable),
+    );
+    counts.insert(
+        "duplicate_primary_field",
+        raw_primary_duplicate_groups(&addressable, &models),
+    );
+    counts
+}
+
+/// Группы заметок с полностью одинаковыми значениями `fields`.
+fn raw_content_duplicate_groups(notes: &[&&Value]) -> usize {
+    let mut groups: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for note in notes {
+        let uuid = note
+            .get("note_model_uuid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let fields = serde_json::to_string(note.get("fields").unwrap_or(&Value::Null))
+            .expect("fields сериализуются");
+        *groups.entry((uuid.to_string(), fields)).or_default() += 1;
+    }
+    groups.values().filter(|size| **size >= 2).count()
+}
+
+/// Группы заметок с одинаковым сырым головным полем.
+fn raw_primary_duplicate_groups(
+    notes: &[&&Value],
+    models: &BTreeMap<String, BTreeMap<String, i64>>,
+) -> usize {
+    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+    for note in notes {
+        let Some(uuid) = note.get("note_model_uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(ord) = models.get(uuid).and_then(|model| model.get(PRIMARY_FIELD)) else {
+            continue;
+        };
+        let Some(text) = note
+            .get("fields")
+            .and_then(Value::as_array)
+            .and_then(|fields| fields.get(usize::try_from(*ord).expect("ord неотрицателен")))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        *groups.entry(text.to_string()).or_default() += 1;
+    }
+    groups.values().filter(|size| **size >= 2).count()
+}
+
+/// Сколько раз в значении встречается `<span>` с белым цветом текста.
+///
+/// Упрощённый независимый скан: теги обходятся как текст, а `style`
+/// разбирается по `;` и `:`. Этого достаточно, чтобы пересчитать ожидаемое
+/// число findings правила `forbidden_white_span`, не вызывая сам toolkit.
+///
+/// Отвечает именно на вопрос правила — «есть ли в значении белый `<span>`», —
+/// потому что findings у этого правила по одному на пару (заметка, поле).
+fn has_white_span(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+
+    while let Some(start) = rest.find("<span") {
+        let after = &rest[start..];
+        let following = after[5..].chars().next();
+        let is_tag = following.is_none_or(|character| {
+            character.is_ascii_whitespace() || character == '>' || character == '/'
+        });
+        let Some(end) = after.find('>') else { break };
+        let tag = &after[..=end];
+        if is_tag && tag_declares_white_color(tag) {
+            return true;
+        }
+        rest = &after[end + 1..];
+    }
+
+    false
+}
+
+/// Объявлен ли в теге `<span>` белый `color`.
+fn tag_declares_white_color(tag: &str) -> bool {
+    let mut rest = tag;
+    while let Some(position) = rest.find("style") {
+        rest = &rest[position + "style".len()..];
+        let rest_trimmed = rest.trim_start();
+        if !rest_trimmed.starts_with('=') {
+            continue;
+        }
+        let value = rest_trimmed[1..].trim_start();
+        let style = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let inner = &value[quote.len_utf8()..];
+                match inner.find(quote) {
+                    Some(end) => &inner[..end],
+                    None => inner,
+                }
+            }
+            _ => {
+                let end = value
+                    .find(|character: char| character == '>' || character.is_ascii_whitespace())
+                    .unwrap_or(value.len());
+                &value[..end]
+            }
+        };
+
+        if style.split(';').any(|declaration| {
+            let Some((property, raw)) = declaration.split_once(':') else {
+                return false;
+            };
+            property.trim() == "color" && white_color_value(raw)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Эквивалентно ли значение CSS-свойства `color` белому.
+fn white_color_value(raw: &str) -> bool {
+    let value = raw.trim().to_ascii_lowercase();
+    let value = value.strip_suffix("!important").unwrap_or(&value).trim();
+    let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+
+    if matches!(compact.as_str(), "white" | "#fff" | "#ffffff") {
+        return true;
+    }
+    let Some(arguments) = compact
+        .strip_prefix("rgb(")
+        .or_else(|| compact.strip_prefix("rgba("))
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let components: Vec<&str> = arguments.split(',').collect();
+    components.len() >= 3
+        && components[..3]
+            .iter()
+            .all(|component| *component == "255" || *component == "100%")
 }
 
 /// Разбивает байты на строки без завершающего перевода строки.

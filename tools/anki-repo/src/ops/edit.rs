@@ -48,6 +48,7 @@ use crate::error::{DomainError, ErrorCode};
 use crate::index::{self, ExportIndex};
 use crate::loader;
 use crate::ops::validate::{self, Severity, SeverityCounts, ValidateResult, warning_codes};
+use crate::text::bounded_sample as sample;
 use crate::write;
 
 /// Жёсткий максимум числа правок в одном запросе.
@@ -59,7 +60,10 @@ pub const MAX_REPORTED_EDITS: usize = 50;
 /// Предел числа конфликтов в отчёте.
 pub const MAX_REPORTED_CONFLICTS: usize = 50;
 /// Предел длины выборки значения в отчёте.
-pub const VALUE_SAMPLE_CHARS: usize = 120;
+///
+/// Реализация общей bounded-выборки живёт в [`crate::text`]; путь
+/// `VALUE_SAMPLE_CHARS` сохранён для совместимости с существующими тестами.
+pub use crate::text::VALUE_SAMPLE_CHARS;
 /// Предел числа кодов и имён в диагностике.
 pub const MAX_REPORTED_CODES: usize = 20;
 /// Предел числа проблем разрешения в деталях ошибки.
@@ -448,18 +452,14 @@ pub fn edit(
 ) -> Result<EditResult, DomainError> {
     validate_request(request)?;
 
-    let (deck_json, source) = loader::read_deck_json_bytes(export_dir)?;
-    let mut value = loader::parse_deck_json_bytes(&source, &deck_json)?;
-    let source_root = loader::typed_root(
-        loader::parse_deck_json_bytes(&source, &deck_json)?,
-        &deck_json,
-    )?;
+    let EditableSource {
+        deck_json,
+        source,
+        mut value,
+        root: source_root,
+        before,
+    } = load_editable_source(export_dir)?;
     let index = ExportIndex::build(&source_root);
-
-    ensure_source_is_canonical(&value, &source, &deck_json)?;
-
-    let before = validate::validate_document(&source_root, export_dir);
-    ensure_mutable(&before, &deck_json)?;
 
     let value_notes = collect_value_notes(&value)?;
     ensure_note_correspondence(&index, &value_notes)?;
@@ -585,35 +585,39 @@ pub fn edit(
 }
 
 /// Одна разрешённая правка: всё нужное для отчёта и мутации.
+///
+/// Структура и [`resolve_edit`] переиспользуются `review-check`: проверка
+/// предложений агента обязана разрешать `guid` и поле ровно теми же правилами,
+/// что и сама запись, иначе её вердикт разошёлся бы с вердиктом `edit`.
 #[derive(Debug, Clone)]
-struct ResolvedEdit {
-    edit_index: usize,
-    edit_id: Option<String>,
-    guid: String,
-    deck_path: String,
-    note_position: usize,
-    field: String,
-    field_ord: usize,
-    current: String,
-    expected: String,
-    replacement: String,
-    status: EditStatus,
+pub(crate) struct ResolvedEdit {
+    pub(crate) edit_index: usize,
+    pub(crate) edit_id: Option<String>,
+    pub(crate) guid: String,
+    pub(crate) deck_path: String,
+    pub(crate) note_position: usize,
+    pub(crate) field: String,
+    pub(crate) field_ord: usize,
+    pub(crate) current: String,
+    pub(crate) expected: String,
+    pub(crate) replacement: String,
+    pub(crate) status: EditStatus,
 }
 
 /// Проблема разрешения одной правки.
 #[derive(Debug, Clone)]
-struct Problem {
-    edit_index: usize,
-    guid: String,
-    field: String,
-    code: &'static str,
-    kind: ProblemKind,
-    message: String,
+pub(crate) struct Problem {
+    pub(crate) edit_index: usize,
+    pub(crate) guid: String,
+    pub(crate) field: String,
+    pub(crate) code: &'static str,
+    pub(crate) kind: ProblemKind,
+    pub(crate) message: String,
 }
 
 /// Вид проблемы разрешения.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProblemKind {
+pub(crate) enum ProblemKind {
     /// Заметки с таким `guid` нет.
     NoteNotFound,
     /// Имени поля нет ни в одной модели экспорта.
@@ -744,7 +748,7 @@ fn ensure_note_correspondence(
 }
 
 /// Разрешает одну правку до конкретного значения поля.
-fn resolve_edit(
+pub(crate) fn resolve_edit(
     index: &ExportIndex<'_>,
     edit_index: usize,
     spec: &EditSpec,
@@ -857,7 +861,7 @@ fn resolve_edit(
 }
 
 /// Классифицирует правку по четвёрке «текущее, expected, replacement».
-fn classify(entry: &ResolvedEdit, apply: bool) -> EditStatus {
+pub(crate) fn classify(entry: &ResolvedEdit, apply: bool) -> EditStatus {
     if entry.current == entry.expected {
         if entry.expected == entry.replacement {
             EditStatus::NoopIdentical
@@ -999,6 +1003,84 @@ fn conflicts_error(conflicts: &[EditConflict], total: usize, deck_json: &Path) -
     )
 }
 
+/// Разобранный исходник без предварительных проверок границы записи.
+///
+/// Один и тот же набор проверок нужен двум командам: `edit` пишет по этому
+/// исходнику, а `review-check` обещает агенту запрос, который граница записи
+/// обязана принять. Держать эти проверки в одном месте — единственный способ
+/// не разойтись в том, какой экспорт вообще можно править.
+pub(crate) struct EditableSource {
+    /// Полный путь к `deck.json`.
+    pub deck_json: PathBuf,
+    /// Сырые байты `deck.json`: каноничность проверяется побайтово.
+    pub source: Vec<u8>,
+    /// Разобранное значение: `edit` меняет именно его.
+    pub value: Value,
+    /// Типизированный корень того же файла.
+    pub root: crate::model::DeckNode,
+    /// Проверки экспорта до правки: `edit` сравнивает с ними результат.
+    pub before: ValidateResult,
+}
+
+/// Читает и разбирает `deck.json` без оценки права на запись.
+///
+/// # Errors
+///
+/// Возвращает ошибки чтения и разбора [`loader::read_deck_json_bytes`] и
+/// [`loader::parse_deck_json_bytes`].
+pub(crate) fn read_source(export_dir: &Path) -> Result<EditableSource, DomainError> {
+    let (deck_json, source) = loader::read_deck_json_bytes(export_dir)?;
+    let value = loader::parse_deck_json_bytes(&source, &deck_json)?;
+    let root = loader::typed_root(
+        loader::parse_deck_json_bytes(&source, &deck_json)?,
+        &deck_json,
+    )?;
+    let before = validate::validate_document(&root, export_dir);
+
+    Ok(EditableSource {
+        deck_json,
+        source,
+        value,
+        root,
+        before,
+    })
+}
+
+/// Собирает причины, по которым этот исходник нельзя править.
+///
+/// Проверки ровно те же, на которых `edit` останавливается до классификации
+/// правок. `edit` берёт первую причину и отказывается работать;
+/// `review-check` называет их все, потому что его отчёт обязан объяснить, из-за
+/// чего запрос не выпущен. Порядок причин фиксирован: каноническая форма,
+/// `ERROR` экспорта, неоднозначный порядок полей модели.
+#[must_use]
+pub(crate) fn source_blockers(source: &EditableSource) -> Vec<DomainError> {
+    let mut blockers = Vec::new();
+
+    if let Err(error) = ensure_source_is_canonical(&source.value, &source.source, &source.deck_json)
+    {
+        blockers.push(error);
+    }
+    blockers.extend(mutable_blockers(&source.before, &source.deck_json));
+
+    blockers
+}
+
+/// Читает `deck.json` и требует, чтобы исходник можно было править.
+///
+/// # Errors
+///
+/// Возвращает ошибки чтения и разбора [`read_source`], а также первую из
+/// [`source_blockers`].
+pub(crate) fn load_editable_source(export_dir: &Path) -> Result<EditableSource, DomainError> {
+    let source = read_source(export_dir)?;
+
+    match source_blockers(&source).into_iter().next() {
+        Some(blocker) => Err(blocker),
+        None => Ok(source),
+    }
+}
+
 /// Отклоняет исходник, который не в канонической форме.
 fn ensure_source_is_canonical(
     value: &Value,
@@ -1026,11 +1108,15 @@ fn ensure_source_is_canonical(
     ))
 }
 
-/// Отклоняет экспорт, который нельзя безопасно править.
-fn ensure_mutable(before: &ValidateResult, deck_json: &Path) -> Result<(), DomainError> {
+/// Причины, по которым экспорт нельзя безопасно править.
+///
+/// Возвращает `ERROR`-экспорт и неоднозначный порядок полей модели в
+/// фиксированном порядке: сначала непригодный экспорт, затем небезопасный.
+fn mutable_blockers(before: &ValidateResult, deck_json: &Path) -> Vec<DomainError> {
+    let mut blockers = Vec::new();
     let errors: Vec<&str> = distinct_codes(before, Severity::Error);
     if !errors.is_empty() {
-        return Err(DomainError::with_details(
+        blockers.push(DomainError::with_details(
             ErrorCode::ExportInvalid,
             format!(
                 "экспорт содержит ERROR ({}); правка значений полей возможна только в валидном экспорте",
@@ -1051,7 +1137,7 @@ fn ensure_mutable(before: &ValidateResult, deck_json: &Path) -> Result<(), Domai
         .iter()
         .any(|issue| issue.severity == Severity::Warning && issue.code == blocked)
     {
-        return Err(DomainError::with_details(
+        blockers.push(DomainError::with_details(
             ErrorCode::ExportNotMutable,
             format!(
                 "экспорт содержит WARNING {blocked}: порядок полей неоднозначен, правка по имени поля небезопасна"
@@ -1064,7 +1150,7 @@ fn ensure_mutable(before: &ValidateResult, deck_json: &Path) -> Result<(), Domai
         ));
     }
 
-    Ok(())
+    blockers
 }
 
 /// Уникальные коды issues указанной серьёзности.
@@ -1418,25 +1504,6 @@ fn conflict_of(entry: &ResolvedEdit) -> EditConflict {
         expected_sample: sample(&entry.expected),
         current_sample: sample(&entry.current),
     }
-}
-
-/// Ограничивает выборку значения и убирает переводы строк.
-fn sample(text: &str) -> String {
-    let mut result = String::new();
-    for (position, character) in text.chars().enumerate() {
-        if position == VALUE_SAMPLE_CHARS {
-            result.push('…');
-            break;
-        }
-        match character {
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            character if (character as u32) < 0x20 => result.push('·'),
-            character => result.push(character),
-        }
-    }
-    result
 }
 
 /// Имя типа JSON-значения для диагностики.

@@ -11,6 +11,9 @@ use crate::ops::NamedField;
 use crate::ops::edit::EditResult;
 use crate::ops::find::FindResult;
 use crate::ops::inspect::{InspectResult, InspectVerbose, ModelSummary};
+use crate::ops::qa::QaResult;
+use crate::ops::review::ReviewResult;
+use crate::ops::review_check::ReviewCheckResult;
 use crate::ops::stats::StatsResult;
 use crate::ops::validate::{SeverityCounts, ValidateResult};
 
@@ -681,6 +684,396 @@ impl From<&ValidateResult> for ValidateDto {
                     details: issue.details.clone(),
                 })
                 .collect(),
+        }
+    }
+}
+
+/// JSON-представление результата `qa`.
+pub fn qa_json(result: &QaResult) -> String {
+    to_json("qa", QaDto::from(result))
+}
+
+/// JSON-представление результата `review`.
+pub fn review_json(result: &ReviewResult) -> String {
+    to_json("review", ReviewDto::from(result))
+}
+
+/// JSON-представление результата `review-check`.
+pub fn review_check_json(result: &ReviewCheckResult) -> String {
+    to_json("review-check", ReviewCheckDto::from(result))
+}
+
+#[derive(Serialize)]
+struct QaDto<'a> {
+    export_dir: String,
+    notes_total: usize,
+    findings_total: usize,
+    findings_returned: usize,
+    truncated: bool,
+    max_per_code: usize,
+    codes: Vec<String>,
+    by_code: Vec<CodeCountDto>,
+    rules: Vec<RuleDto>,
+    unaddressable_findings: usize,
+    findings: Vec<QaFindingDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct CodeCountDto {
+    code: &'static str,
+    severity: &'static str,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct RuleDto {
+    code: &'static str,
+    severity: &'static str,
+    description: &'static str,
+    applicable: bool,
+    findings: usize,
+}
+
+#[derive(Serialize)]
+struct QaFindingDto<'a> {
+    code: &'static str,
+    severity: &'static str,
+    note_index: usize,
+    guid: Option<String>,
+    deck_path: String,
+    note_model_name: Option<String>,
+    note_model_uuid: Option<String>,
+    field: Option<String>,
+    field_ord: Option<i64>,
+    message: String,
+    evidence: &'a serde_json::Value,
+    addressable: bool,
+    related_guids: Vec<String>,
+    related_note_indices: Vec<usize>,
+    related_truncated: bool,
+    group_size: Option<usize>,
+}
+
+impl<'a> From<&'a QaResult> for QaDto<'a> {
+    fn from(result: &'a QaResult) -> Self {
+        Self {
+            export_dir: result.export_dir.clone(),
+            notes_total: result.notes_total,
+            findings_total: result.findings_total,
+            findings_returned: result.findings_returned,
+            truncated: result.truncated,
+            max_per_code: result.max_per_code,
+            codes: result.codes.clone(),
+            by_code: result
+                .by_code
+                .iter()
+                .map(|entry| CodeCountDto {
+                    code: entry.code,
+                    severity: entry.severity.as_str(),
+                    count: entry.count,
+                })
+                .collect(),
+            rules: result
+                .rules
+                .iter()
+                .map(|rule| RuleDto {
+                    code: rule.code,
+                    severity: rule.severity.as_str(),
+                    description: rule.description,
+                    applicable: rule.applicable,
+                    findings: rule.findings,
+                })
+                .collect(),
+            unaddressable_findings: result.unaddressable_findings,
+            findings: result
+                .findings
+                .iter()
+                .map(|finding| QaFindingDto {
+                    code: finding.code,
+                    severity: finding.severity.as_str(),
+                    note_index: finding.note_index,
+                    guid: finding.guid.clone(),
+                    deck_path: finding.deck_path.clone(),
+                    note_model_name: finding.note_model.clone(),
+                    note_model_uuid: finding.note_model_uuid.clone(),
+                    field: finding.field.clone(),
+                    field_ord: finding.field_ord,
+                    message: finding.message.clone(),
+                    evidence: &finding.evidence,
+                    addressable: finding.addressable,
+                    related_guids: finding.related_guids.clone(),
+                    related_note_indices: finding.related_note_indices.clone(),
+                    related_truncated: finding.related_truncated,
+                    group_size: finding.group_size,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ReviewDto<'a> {
+    export_dir: String,
+    selection: ReviewSelectionDto,
+    notes_total: usize,
+    total_selected: usize,
+    offset: usize,
+    limit: usize,
+    returned: usize,
+    truncated: bool,
+    next_offset: Option<usize>,
+    excluded_unaddressable: usize,
+    items: Vec<ReviewItemDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct ReviewSelectionDto {
+    kind: &'static str,
+    guid: Option<String>,
+    field: Option<String>,
+    value: Option<String>,
+    match_mode: Option<&'static str>,
+    qa_code: Option<String>,
+    deck: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReviewItemDto<'a> {
+    note_index: usize,
+    guid: Option<String>,
+    deck_path: String,
+    note_model_name: Option<String>,
+    note_model_uuid: Option<String>,
+    tags: Vec<String>,
+    fields: OrderedFields<'a>,
+    qa_findings: Vec<FindingSummaryDto>,
+    qa_findings_truncated: bool,
+    group_membership: Vec<GroupMembershipDto>,
+}
+
+#[derive(Serialize)]
+struct FindingSummaryDto {
+    code: &'static str,
+    severity: &'static str,
+    field: Option<String>,
+    message: String,
+    group_size: Option<usize>,
+    related: Vec<RelatedNoteDto>,
+    related_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct RelatedNoteDto {
+    note_index: usize,
+    guid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GroupMembershipDto {
+    code: &'static str,
+    owner_note_index: usize,
+    owner_guid: Option<String>,
+    group_size: usize,
+}
+
+impl<'a> From<&'a ReviewResult> for ReviewDto<'a> {
+    fn from(result: &'a ReviewResult) -> Self {
+        Self {
+            export_dir: result.export_dir.clone(),
+            selection: ReviewSelectionDto {
+                kind: result.selection.kind,
+                guid: result.selection.guid.clone(),
+                field: result.selection.field.clone(),
+                value: result.selection.value.clone(),
+                match_mode: result.selection.match_mode,
+                qa_code: result.selection.qa_code.clone(),
+                deck: result.selection.deck.clone(),
+            },
+            notes_total: result.notes_total,
+            total_selected: result.total_selected,
+            offset: result.offset,
+            limit: result.limit,
+            returned: result.returned,
+            truncated: result.truncated,
+            next_offset: result.next_offset,
+            excluded_unaddressable: result.excluded_unaddressable,
+            items: result
+                .items
+                .iter()
+                .map(|item| ReviewItemDto {
+                    note_index: item.note_index,
+                    guid: item.note.guid.clone(),
+                    deck_path: item.note.deck_path.clone(),
+                    note_model_name: item.note.note_model_name.clone(),
+                    note_model_uuid: item.note.note_model_uuid.clone(),
+                    tags: item.note.tags.clone(),
+                    fields: OrderedFields(&item.note.fields),
+                    qa_findings: item
+                        .qa_findings
+                        .iter()
+                        .map(|finding| FindingSummaryDto {
+                            code: finding.code,
+                            severity: finding.severity.as_str(),
+                            field: finding.field.clone(),
+                            message: finding.message.clone(),
+                            group_size: finding.group_size,
+                            related: finding
+                                .related
+                                .iter()
+                                .map(|related| RelatedNoteDto {
+                                    note_index: related.note_index,
+                                    guid: related.guid.clone(),
+                                })
+                                .collect(),
+                            related_truncated: finding.related_truncated,
+                        })
+                        .collect(),
+                    qa_findings_truncated: item.qa_findings_truncated,
+                    group_membership: item
+                        .group_membership
+                        .iter()
+                        .map(|membership| GroupMembershipDto {
+                            code: membership.code,
+                            owner_note_index: membership.owner_note_index,
+                            owner_guid: membership.owner_guid.clone(),
+                            group_size: membership.group_size,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ReviewCheckDto<'a> {
+    export_dir: String,
+    deck_json: String,
+    outcome: &'static str,
+    proposals_total: usize,
+    counts: CheckCountsDto,
+    effective_proposals: usize,
+    proposals_truncated: bool,
+    source_editable: bool,
+    source_blockers: Vec<SourceBlockerDto>,
+    proposals: Vec<CheckedProposalDto<'a>>,
+    edit_request: Option<EditRequestDto>,
+}
+
+/// Причина, по которой текущий исходник нельзя править.
+#[derive(Serialize)]
+struct SourceBlockerDto {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct CheckCountsDto {
+    valid: usize,
+    already_correct: usize,
+    already_applied: usize,
+    conflict: usize,
+    invalid: usize,
+}
+
+#[derive(Serialize)]
+struct CheckedProposalDto<'a> {
+    proposal_index: usize,
+    proposal_id: Option<String>,
+    guid: String,
+    field: String,
+    status: &'static str,
+    note_index: Option<usize>,
+    deck_path: Option<String>,
+    field_ord: Option<usize>,
+    current_len: Option<usize>,
+    expected_len: usize,
+    replacement_len: usize,
+    current_sample: Option<String>,
+    expected_sample: &'a str,
+    replacement_sample: &'a str,
+    reason: Option<String>,
+    problem: Option<&'static str>,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EditRequestDto {
+    schema_version: u32,
+    edits: Vec<EditSpecDto>,
+}
+
+#[derive(Serialize)]
+struct EditSpecDto {
+    edit_id: Option<String>,
+    guid: String,
+    field: String,
+    expected: String,
+    replacement: String,
+}
+
+impl<'a> From<&'a ReviewCheckResult> for ReviewCheckDto<'a> {
+    fn from(result: &'a ReviewCheckResult) -> Self {
+        Self {
+            export_dir: result.export_dir.clone(),
+            deck_json: result.deck_json.clone(),
+            outcome: result.outcome.as_str(),
+            proposals_total: result.proposals_total,
+            counts: CheckCountsDto {
+                valid: result.counts.valid,
+                already_correct: result.counts.already_correct,
+                already_applied: result.counts.already_applied,
+                conflict: result.counts.conflict,
+                invalid: result.counts.invalid,
+            },
+            effective_proposals: result.effective_proposals,
+            proposals_truncated: result.proposals_truncated,
+            source_editable: result.source_editable,
+            source_blockers: result
+                .source_blockers
+                .iter()
+                .map(|blocker| SourceBlockerDto {
+                    code: blocker.code,
+                    message: blocker.message.clone(),
+                })
+                .collect(),
+            proposals: result
+                .proposals
+                .iter()
+                .map(|proposal| CheckedProposalDto {
+                    proposal_index: proposal.proposal_index,
+                    proposal_id: proposal.proposal_id.clone(),
+                    guid: proposal.guid.clone(),
+                    field: proposal.field.clone(),
+                    status: proposal.status.as_str(),
+                    note_index: proposal.note_index,
+                    deck_path: proposal.deck_path.clone(),
+                    field_ord: proposal.field_ord,
+                    current_len: proposal.current_len,
+                    expected_len: proposal.expected_len,
+                    replacement_len: proposal.replacement_len,
+                    current_sample: proposal.current_sample.clone(),
+                    expected_sample: proposal.expected_sample.as_str(),
+                    replacement_sample: proposal.replacement_sample.as_str(),
+                    reason: proposal.reason.clone(),
+                    problem: proposal.problem,
+                    message: proposal.message.clone(),
+                })
+                .collect(),
+            edit_request: result.edit_request.as_ref().map(|request| EditRequestDto {
+                schema_version: crate::ops::edit::SUPPORTED_REQUEST_SCHEMA_VERSION,
+                edits: request
+                    .edits
+                    .iter()
+                    .map(|edit| EditSpecDto {
+                        edit_id: edit.edit_id.clone(),
+                        guid: edit.guid.clone(),
+                        field: edit.field.clone(),
+                        expected: edit.expected.clone(),
+                        replacement: edit.replacement.clone(),
+                    })
+                    .collect(),
+            }),
         }
     }
 }

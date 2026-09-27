@@ -26,6 +26,8 @@ pub enum ErrorCode {
     UnknownField,
     /// Запрошенный deck path отсутствует в экспорте.
     UnknownDeck,
+    /// `qa`/`review`: запрошен неизвестный код QA-правила.
+    UnknownQaCode,
     /// `find` по идентичности не нашёл ни одного совпадения.
     NotFound,
     /// `find` по идентичности нашёл больше одного совпадения.
@@ -64,6 +66,7 @@ impl ErrorCode {
             Self::SchemaInvalid => "schema_invalid",
             Self::UnknownField => "unknown_field",
             Self::UnknownDeck => "unknown_deck",
+            Self::UnknownQaCode => "unknown_qa_code",
             Self::NotFound => "not_found",
             Self::Ambiguous => "ambiguous",
             Self::SourceNotCanonical => "source_not_canonical",
@@ -90,6 +93,7 @@ impl ErrorCode {
             | Self::SchemaInvalid
             | Self::UnknownField
             | Self::UnknownDeck
+            | Self::UnknownQaCode
             | Self::SourceNotCanonical
             | Self::InvalidRequest
             | Self::DuplicateEditTarget => 3,
@@ -250,6 +254,7 @@ mod tests {
             ErrorCode::SchemaInvalid,
             ErrorCode::UnknownField,
             ErrorCode::UnknownDeck,
+            ErrorCode::UnknownQaCode,
             ErrorCode::NotFound,
             ErrorCode::Ambiguous,
             ErrorCode::SourceNotCanonical,

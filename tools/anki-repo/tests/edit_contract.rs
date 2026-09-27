@@ -7,10 +7,10 @@
 mod common;
 
 use common::{
-    TempDir, base_export, edit_request, run_cli_in, run_cli_with_stdin_in, single_line_change,
-    write_request,
+    TempDir, base_export, edit_request, run_cli, run_cli_in, run_cli_with_stdin_in,
+    single_line_change, write_request,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Канонический синтетический экспорт из `base_export`.
 fn canonical_fixture(label: &str) -> TempDir {
@@ -984,4 +984,60 @@ fn validation_results_are_reported_before_and_after() {
     let (old_line, new_line) = single_line_change(&before, &after);
     assert!(old_line.contains("sound:a.mp3"));
     assert!(new_line.contains("sound:missing.mp3"));
+}
+
+/// Усечение отчёта `edit` объясняется честно: остаток недоступен и в `--json`.
+#[test]
+fn human_report_does_not_promise_a_full_list_in_json() {
+    let temp = TempDir::new("edit-human-truncated");
+    temp.write_canonical_deck_json(&common::export_with(|value| {
+        let template = value["notes"][0].clone();
+        for index in 0..60 {
+            let mut copy = template.clone();
+            copy["guid"] = json!(format!("bulk-{index}"));
+            copy["fields"] = json!(["слово", "значение", "пример"]);
+            value["notes"].as_array_mut().expect("notes").push(copy);
+        }
+    }));
+
+    let edits: Vec<(String, String, String, String)> = (0..60)
+        .map(|index| {
+            (
+                format!("bulk-{index}"),
+                "Пример".to_string(),
+                "пример".to_string(),
+                format!("пример-{index}"),
+            )
+        })
+        .collect();
+    let request = common::edit_request(
+        &edits
+            .iter()
+            .map(|(guid, field, expected, replacement)| {
+                (
+                    guid.as_str(),
+                    field.as_str(),
+                    expected.as_str(),
+                    replacement.as_str(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let path = common::write_request(&temp, "edit.json", &request);
+
+    let (code, stdout, stderr) = run_cli(&[
+        "edit",
+        &temp.path().to_string_lossy(),
+        "--request",
+        &path.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("правок из"),
+        "сообщение об усечении обязано называть оба числа: {stdout}"
+    );
+    assert!(
+        !stdout.contains("полный список доступен"),
+        "обещание полного списка в --json неверно: JSON сериализует тот же vector"
+    );
 }
