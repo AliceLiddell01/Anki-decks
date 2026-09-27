@@ -48,6 +48,7 @@ use crate::error::{DomainError, ErrorCode};
 use crate::index::{self, ExportIndex};
 use crate::loader;
 use crate::ops::validate::{self, Severity, SeverityCounts, ValidateResult, warning_codes};
+use crate::text::bounded_sample as sample;
 use crate::write;
 
 /// Жёсткий максимум числа правок в одном запросе.
@@ -59,7 +60,10 @@ pub const MAX_REPORTED_EDITS: usize = 50;
 /// Предел числа конфликтов в отчёте.
 pub const MAX_REPORTED_CONFLICTS: usize = 50;
 /// Предел длины выборки значения в отчёте.
-pub const VALUE_SAMPLE_CHARS: usize = 120;
+///
+/// Реализация общей bounded-выборки живёт в [`crate::text`]; путь
+/// `VALUE_SAMPLE_CHARS` сохранён для совместимости с существующими тестами.
+pub use crate::text::VALUE_SAMPLE_CHARS;
 /// Предел числа кодов и имён в диагностике.
 pub const MAX_REPORTED_CODES: usize = 20;
 /// Предел числа проблем разрешения в деталях ошибки.
@@ -585,35 +589,39 @@ pub fn edit(
 }
 
 /// Одна разрешённая правка: всё нужное для отчёта и мутации.
+///
+/// Структура и [`resolve_edit`] переиспользуются `review-check`: проверка
+/// предложений агента обязана разрешать `guid` и поле ровно теми же правилами,
+/// что и сама запись, иначе её вердикт разошёлся бы с вердиктом `edit`.
 #[derive(Debug, Clone)]
-struct ResolvedEdit {
-    edit_index: usize,
-    edit_id: Option<String>,
-    guid: String,
-    deck_path: String,
-    note_position: usize,
-    field: String,
-    field_ord: usize,
-    current: String,
-    expected: String,
-    replacement: String,
-    status: EditStatus,
+pub(crate) struct ResolvedEdit {
+    pub(crate) edit_index: usize,
+    pub(crate) edit_id: Option<String>,
+    pub(crate) guid: String,
+    pub(crate) deck_path: String,
+    pub(crate) note_position: usize,
+    pub(crate) field: String,
+    pub(crate) field_ord: usize,
+    pub(crate) current: String,
+    pub(crate) expected: String,
+    pub(crate) replacement: String,
+    pub(crate) status: EditStatus,
 }
 
 /// Проблема разрешения одной правки.
 #[derive(Debug, Clone)]
-struct Problem {
-    edit_index: usize,
-    guid: String,
-    field: String,
-    code: &'static str,
-    kind: ProblemKind,
-    message: String,
+pub(crate) struct Problem {
+    pub(crate) edit_index: usize,
+    pub(crate) guid: String,
+    pub(crate) field: String,
+    pub(crate) code: &'static str,
+    pub(crate) kind: ProblemKind,
+    pub(crate) message: String,
 }
 
 /// Вид проблемы разрешения.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProblemKind {
+pub(crate) enum ProblemKind {
     /// Заметки с таким `guid` нет.
     NoteNotFound,
     /// Имени поля нет ни в одной модели экспорта.
@@ -744,7 +752,7 @@ fn ensure_note_correspondence(
 }
 
 /// Разрешает одну правку до конкретного значения поля.
-fn resolve_edit(
+pub(crate) fn resolve_edit(
     index: &ExportIndex<'_>,
     edit_index: usize,
     spec: &EditSpec,
@@ -857,7 +865,7 @@ fn resolve_edit(
 }
 
 /// Классифицирует правку по четвёрке «текущее, expected, replacement».
-fn classify(entry: &ResolvedEdit, apply: bool) -> EditStatus {
+pub(crate) fn classify(entry: &ResolvedEdit, apply: bool) -> EditStatus {
     if entry.current == entry.expected {
         if entry.expected == entry.replacement {
             EditStatus::NoopIdentical
@@ -1418,25 +1426,6 @@ fn conflict_of(entry: &ResolvedEdit) -> EditConflict {
         expected_sample: sample(&entry.expected),
         current_sample: sample(&entry.current),
     }
-}
-
-/// Ограничивает выборку значения и убирает переводы строк.
-fn sample(text: &str) -> String {
-    let mut result = String::new();
-    for (position, character) in text.chars().enumerate() {
-        if position == VALUE_SAMPLE_CHARS {
-            result.push('…');
-            break;
-        }
-        match character {
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            character if (character as u32) < 0x20 => result.push('·'),
-            character => result.push(character),
-        }
-    }
-    result
 }
 
 /// Имя типа JSON-значения для диагностики.

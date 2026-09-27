@@ -8,6 +8,9 @@ use crate::ops::NamedField;
 use crate::ops::edit::{EditResult, EditStatus};
 use crate::ops::find::FindResult;
 use crate::ops::inspect::InspectResult;
+use crate::ops::qa::QaResult;
+use crate::ops::review::ReviewResult;
+use crate::ops::review_check::{ReviewCheckResult, ReviewOutcome};
 use crate::ops::stats::StatsResult;
 use crate::ops::validate::{Severity, ValidateResult};
 
@@ -564,4 +567,251 @@ fn list_or_none(codes: &[String]) -> String {
     } else {
         codes.join(", ")
     }
+}
+
+/// Печатает результат `qa`.
+pub fn qa(result: &QaResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir));
+    out.line(format!("Заметок всего: {}", result.notes_total));
+    out.line(format!(
+        "Findings: всего {}, показано {}, усечено: {} (предел {} на код)",
+        result.findings_total,
+        result.findings_returned,
+        yes_no(result.truncated),
+        result.max_per_code
+    ));
+    out.line(format!(
+        "Коды: {}",
+        if result.codes.is_empty() {
+            "все правила".to_string()
+        } else {
+            result.codes.join(", ")
+        }
+    ));
+
+    out.blank();
+    out.line("По кодам:");
+    if result.by_code.is_empty() {
+        out.line("  —");
+    }
+    for entry in &result.by_code {
+        out.line(format!(
+            "  {} [{}]: {}",
+            entry.code,
+            entry.severity.as_str(),
+            entry.count
+        ));
+    }
+
+    out.blank();
+    out.line("Findings:");
+    if result.findings.is_empty() {
+        out.line("  —");
+    }
+    for finding in &result.findings {
+        out.line(format!(
+            "  [{}] {} — заметка #{} ({})",
+            finding.severity.as_str(),
+            finding.code,
+            finding.note_index,
+            optional(finding.guid.as_deref())
+        ));
+        out.line(format!(
+            "      колода: {}, модель: {}",
+            finding.deck_path,
+            optional(finding.note_model.as_deref())
+        ));
+        if let Some(field) = &finding.field {
+            out.line(format!(
+                "      поле: {} (ord {})",
+                field,
+                finding
+                    .field_ord
+                    .map_or_else(|| "?".to_string(), |ord| ord.to_string())
+            ));
+        }
+        out.line(format!("      {}", finding.message));
+    }
+    if result.truncated {
+        out.line("  … вывод обрезан, полный список доступен в --json");
+    }
+
+    out.blank();
+    out.line(format!("Правила ({}):", result.rules.len()));
+    for rule in &result.rules {
+        out.line(format!(
+            "  {} [{}] применимо: {}, findings: {}",
+            rule.code,
+            rule.severity.as_str(),
+            yes_no(rule.applicable),
+            rule.findings
+        ));
+        out.line(format!("      {}", rule.description));
+    }
+
+    out.finish()
+}
+
+/// Печатает результат `review`.
+pub fn review(result: &ReviewResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir));
+    out.line(format!("Критерий: {}", describe_selection(result)));
+    out.line(format!(
+        "Выбрано заметок: {} из {}, страница: offset {}, limit {}, возвращено {}, усечено: {}",
+        result.total_selected,
+        result.notes_total,
+        result.offset,
+        result.limit,
+        result.returned,
+        yes_no(result.truncated)
+    ));
+    match result.next_offset {
+        Some(next) => out.line(format!("Следующая страница: --offset {next}")),
+        None => out.line("Следующая страница: нет"),
+    };
+
+    for item in &result.items {
+        out.blank();
+        out.line(format!(
+            "[#{}] guid: {}",
+            item.note_index,
+            optional(item.note.guid.as_deref())
+        ));
+        out.line(format!("    колода: {}", item.note.deck_path));
+        out.line(format!(
+            "    модель: {}",
+            optional(item.note.note_model_name.as_deref())
+        ));
+        out.line(format!(
+            "    теги: {}",
+            if item.note.tags.is_empty() {
+                "—".to_string()
+            } else {
+                item.note.tags.join(", ")
+            }
+        ));
+        for field in &item.note.fields {
+            out.line(format!("    {}: {}", field.name, render_field(field)));
+        }
+        if item.qa_findings.is_empty() {
+            out.line("    QA: —");
+        } else {
+            out.line(format!("    QA ({}):", item.qa_findings.len()));
+            for finding in &item.qa_findings {
+                let field = finding
+                    .field
+                    .as_deref()
+                    .map_or(String::new(), |field| format!(", поле {field}"));
+                out.line(format!(
+                    "      [{}] {}{} — {}",
+                    finding.severity.as_str(),
+                    finding.code,
+                    field,
+                    finding.message
+                ));
+            }
+            if item.qa_findings_truncated {
+                out.line("      … список findings обрезан");
+            }
+        }
+    }
+
+    out.finish()
+}
+
+/// Печатает результат `review-check`.
+pub fn review_check(result: &ReviewCheckResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir));
+    out.line(format!("deck.json: {}", result.deck_json));
+    out.line(format!("Итог: {}", result.outcome.as_str()));
+    out.line(format!(
+        "Предложений в документе: {}",
+        result.proposals_total
+    ));
+    out.line(format!(
+        "Статусы: valid {}, already_correct {}, already_applied {}, conflict {}, invalid {}",
+        result.counts.valid,
+        result.counts.already_correct,
+        result.counts.already_applied,
+        result.counts.conflict,
+        result.counts.invalid
+    ));
+    out.line(format!(
+        "Эффективных предложений: {}",
+        result.effective_proposals
+    ));
+    out.line(format!(
+        "Готовый запрос для Stage 2: {}",
+        match &result.edit_request {
+            Some(request) => format!("да, правок {}", request.edits.len()),
+            None if result.outcome == ReviewOutcome::Ok => "нет: нечего применять".to_string(),
+            None => "нет: отчёт не ok".to_string(),
+        }
+    ));
+
+    out.blank();
+    out.line(format!("Предложения ({}):", result.proposals.len()));
+    if result.proposals.is_empty() {
+        out.line("  —");
+    }
+    for proposal in &result.proposals {
+        out.line(format!(
+            "  #{} {} — {}",
+            proposal.proposal_index,
+            proposal.status.as_str(),
+            format_args!("{:?}/{:?}", proposal.guid, proposal.field)
+        ));
+        if let (Some(current), Some(_)) = (proposal.current_sample.as_deref(), proposal.note_index)
+        {
+            out.line(format!("      сейчас: {}", compact_value(current)));
+        }
+        out.line(format!(
+            "      ожидалось: {}",
+            compact_value(&proposal.expected_sample)
+        ));
+        out.line(format!(
+            "      замена: {}",
+            compact_value(&proposal.replacement_sample)
+        ));
+        if let Some(message) = &proposal.message {
+            out.line(format!(
+                "      проблема [{}]: {message}",
+                proposal.problem.unwrap_or("problem")
+            ));
+        }
+    }
+    if result.proposals_truncated {
+        out.line("  … отчёт обрезан, полный список доступен в --json");
+    }
+
+    out.finish()
+}
+
+/// Описывает критерий выбора `review`.
+fn describe_selection(result: &ReviewResult) -> String {
+    let selection = &result.selection;
+    let mut parts = vec![selection.kind.to_string()];
+    if let Some(guid) = &selection.guid {
+        parts.push(format!("guid {guid:?}"));
+    }
+    if let Some(field) = &selection.field {
+        parts.push(format!(
+            "поле {field:?}, значение {:?}, режим {}",
+            selection.value.as_deref().unwrap_or_default(),
+            selection.match_mode.unwrap_or("contains")
+        ));
+    }
+    if let Some(code) = &selection.qa_code {
+        parts.push(format!("QA-код {code}"));
+    }
+    if let Some(deck) = &selection.deck {
+        parts.push(format!("колода {deck:?}"));
+    }
+    parts.join("; ")
 }

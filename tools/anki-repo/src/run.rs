@@ -18,6 +18,11 @@ use crate::ops::edit::{EditRequest, EditSpec, STDIN_REQUEST_SOURCE};
 use crate::ops::find as find_op;
 use crate::ops::find::{FindCriteria, FindQuery, MatchMode, WORD_SHORTCUT_FIELD};
 use crate::ops::inspect as inspect_op;
+use crate::ops::qa as qa_op;
+use crate::ops::qa::QaQuery;
+use crate::ops::review as review_op;
+use crate::ops::review::{ReviewCriteria, ReviewQuery};
+use crate::ops::review_check as review_check_op;
 use crate::ops::stats::{StatsQuery, stats as stats_op};
 use crate::ops::validate::validate as validate_op;
 use crate::render::{human, json};
@@ -133,6 +138,96 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             })
         }
 
+        Command::Qa {
+            export_dir,
+            codes,
+            max_per_code,
+        } => {
+            let loaded = load_export(export_dir)?;
+            let index = ExportIndex::build(&loaded.root);
+            let query = QaQuery {
+                codes: codes.clone(),
+                max_per_code: to_usize(*max_per_code),
+            };
+            let result = qa_op::qa(&loaded.export_dir, &index, &query)?;
+            Ok(Rendered {
+                command: "qa",
+                stdout: if cli.json {
+                    json::qa_json(&result)
+                } else {
+                    human::qa(&result)
+                },
+                exit: 0,
+            })
+        }
+
+        Command::Review {
+            export_dir,
+            all,
+            guid,
+            word,
+            field,
+            value,
+            match_mode,
+            qa_code,
+            deck,
+            offset,
+            limit,
+        } => {
+            let loaded = load_export(export_dir)?;
+            let index = ExportIndex::build(&loaded.root);
+            let query = ReviewQuery {
+                criteria: build_review_criteria(
+                    *all,
+                    guid.as_deref(),
+                    word.as_deref(),
+                    field.as_deref(),
+                    value.as_deref(),
+                    *match_mode,
+                    qa_code.as_deref(),
+                )?,
+                deck: deck.clone(),
+                offset: to_usize(*offset),
+                limit: to_usize(*limit),
+            };
+            let result = review_op::review(&loaded.export_dir, &index, &query)?;
+            Ok(Rendered {
+                command: "review",
+                stdout: if cli.json {
+                    json::review_json(&result)
+                } else {
+                    human::review(&result)
+                },
+                exit: 0,
+            })
+        }
+
+        Command::ReviewCheck {
+            export_dir,
+            proposals_file,
+        } => {
+            let label = proposals_file.display().to_string();
+            let raw = read_document(
+                proposals_file,
+                review_check_op::MAX_PROPOSAL_BYTES,
+                "документ предложений",
+            )?;
+            let request = edit_op::parse_request_bytes(&raw, &label)?;
+
+            let loaded = load_export(export_dir)?;
+            let index = ExportIndex::build(&loaded.root);
+            let result = review_check_op::review_check(&loaded.export_dir, &index, &request)?;
+            Ok(Rendered {
+                command: "review-check",
+                stdout: if cli.json {
+                    json::review_check_json(&result)
+                } else {
+                    human::review_check(&result)
+                },
+                exit: result.exit_code,
+            })
+        }
+
         Command::Edit {
             export_dir,
             request_file,
@@ -175,14 +270,7 @@ fn build_edit_request(
 ) -> Result<EditRequest, DomainError> {
     if let Some(path) = request_file {
         let label = path.display().to_string();
-        let raw = if label == STDIN_REQUEST_SOURCE {
-            read_stdin_request()?
-        } else {
-            let file =
-                File::open(path).map_err(|error| request_read_error(label.as_str(), &error))?;
-            read_bounded(file).map_err(|error| request_read_error(label.as_str(), &error))?
-        };
-
+        let raw = read_document(path, edit_op::MAX_REQUEST_BYTES, "запрос")?;
         return edit_op::parse_request_bytes(&raw, &label);
     }
 
@@ -206,47 +294,52 @@ fn build_edit_request(
     Ok(request)
 }
 
-/// Предел чтения запроса: максимум размера плюс один байт.
+/// Читает документ запроса из файла или stdin.
 ///
-/// Лишний байт нужен, чтобы [`edit_op::parse_request_bytes`] отличил «ровно
-/// предел» от «больше предела» по длине буфера.
-const REQUEST_READ_LIMIT: u64 = edit_op::MAX_REQUEST_BYTES as u64 + 1;
+/// `max_bytes` — предел размера документа, объявленный его владельцем
+/// (`edit` и `review-check` используют один и тот же предел Stage 2).
+fn read_document(path: &Path, max_bytes: usize, what: &str) -> Result<Vec<u8>, DomainError> {
+    let label = path.display().to_string();
+    let limit = document_read_limit(max_bytes);
+    if label == STDIN_REQUEST_SOURCE {
+        return read_bounded(std::io::stdin().lock(), limit)
+            .map_err(|error| document_read_error(what, STDIN_REQUEST_SOURCE, &error));
+    }
 
-/// Читает не более [`REQUEST_READ_LIMIT`] байтов.
+    let file =
+        File::open(path).map_err(|error| document_read_error(what, label.as_str(), &error))?;
+    read_bounded(file, limit).map_err(|error| document_read_error(what, label.as_str(), &error))
+}
+
+/// Предел чтения документа: максимум размера плюс один байт.
 ///
-/// Предел размера запроса проверяется по длине буфера, поэтому неограниченное
+/// Лишний байт нужен, чтобы владелец документа отличил «ровно предел» от
+/// «больше предела» по длине буфера.
+const fn document_read_limit(max_bytes: usize) -> u64 {
+    max_bytes as u64 + 1
+}
+
+/// Читает не более `limit` байтов.
+///
+/// Предел размера документа проверяется по длине буфера, поэтому неограниченное
 /// чтение успело бы занять память под весь входной поток прежде, чем команда
 /// сообщила бы о превышении.
-fn read_bounded<R: Read>(reader: R) -> std::io::Result<Vec<u8>> {
+fn read_bounded<R: Read>(reader: R, limit: u64) -> std::io::Result<Vec<u8>> {
     let mut raw = Vec::new();
-    reader.take(REQUEST_READ_LIMIT).read_to_end(&mut raw)?;
+    reader.take(limit).read_to_end(&mut raw)?;
     Ok(raw)
 }
 
-/// Готовит ошибку нечитаемого файла запроса.
-fn request_read_error(label: &str, error: &std::io::Error) -> DomainError {
+/// Готовит ошибку нечитаемого документа запроса.
+fn document_read_error(what: &str, label: &str, error: &std::io::Error) -> DomainError {
     DomainError::with_details(
         ErrorCode::InputUnreadable,
-        format!("не удалось прочитать запрос {label}: {error}"),
+        format!("не удалось прочитать {what} {label}: {error}"),
         crate::details! {
             "path" => label,
             "io_error" => error.to_string(),
         },
     )
-}
-
-/// Читает JSON-запрос со stdin, не более [`REQUEST_READ_LIMIT`] байтов.
-fn read_stdin_request() -> Result<Vec<u8>, DomainError> {
-    read_bounded(std::io::stdin().lock()).map_err(|error| {
-        DomainError::with_details(
-            ErrorCode::InputUnreadable,
-            format!("не удалось прочитать запрос со stdin: {error}"),
-            crate::details! {
-                "path" => STDIN_REQUEST_SOURCE,
-                "io_error" => error.to_string(),
-            },
-        )
-    })
 }
 
 fn build_criteria(
@@ -292,6 +385,74 @@ fn build_criteria(
     ))
 }
 
+/// Приводит счётчик CLI к `usize` без паники.
+///
+/// Значения уже ограничены clap, а насыщение здесь защищает от 32-битной
+/// платформы, где `u64` может не поместиться в `usize`.
+const fn to_usize(value: u64) -> usize {
+    if value > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        value as usize
+    }
+}
+
+/// Собирает критерий выбора для `review`.
+///
+/// `--word` повторяет сокращение `find`: `contains` по сырому значению поля
+/// «Слово». Взаимная исключительность аргументов проверяется clap, а
+/// зависимость `--match` от `--field` — здесь, как и в `find`.
+fn build_review_criteria(
+    all: bool,
+    guid: Option<&str>,
+    word: Option<&str>,
+    field: Option<&str>,
+    value: Option<&str>,
+    match_mode: Option<MatchArg>,
+    qa_code: Option<&str>,
+) -> Result<ReviewCriteria, DomainError> {
+    if match_mode.is_some() && field.is_none() {
+        return Err(DomainError::new(
+            ErrorCode::Usage,
+            "аргумент --match применяется только вместе с --field",
+        ));
+    }
+    if all {
+        return Ok(ReviewCriteria::All);
+    }
+    if let Some(guid) = guid {
+        return Ok(ReviewCriteria::Guid {
+            guid: guid.to_string(),
+        });
+    }
+    if let Some(word) = word {
+        return Ok(ReviewCriteria::Field {
+            field: WORD_SHORTCUT_FIELD.to_string(),
+            value: word.to_string(),
+            mode: MatchMode::Contains,
+        });
+    }
+    if let Some(code) = qa_code {
+        return Ok(ReviewCriteria::QaCode {
+            code: code.to_string(),
+        });
+    }
+    if let Some(field) = field {
+        return Ok(ReviewCriteria::Field {
+            field: field.to_string(),
+            value: value.unwrap_or_default().to_string(),
+            mode: match match_mode {
+                Some(MatchArg::Exact) => MatchMode::Exact,
+                _ => MatchMode::Contains,
+            },
+        });
+    }
+    Err(DomainError::new(
+        ErrorCode::Usage,
+        "не задан критерий отбора: нужен один из --all, --guid, --word, --field или --qa-code",
+    ))
+}
+
 /// Готовит stdout/stderr для доменной ошибки.
 ///
 /// В JSON mode stdout содержит только один валидный JSON document, а stderr
@@ -319,9 +480,10 @@ mod tests {
     /// бы, поэтому это прямая проверка предела, а не косвенная.
     #[test]
     fn request_read_stops_at_the_limit() {
-        let raw = read_bounded(std::io::repeat(b'a')).expect("чтение повторов");
+        let limit = document_read_limit(edit_op::MAX_REQUEST_BYTES);
+        let raw = read_bounded(std::io::repeat(b'a'), limit).expect("чтение повторов");
 
-        assert_eq!(raw.len() as u64, REQUEST_READ_LIMIT);
+        assert_eq!(raw.len() as u64, limit);
         assert!(
             raw.len() > edit_op::MAX_REQUEST_BYTES,
             "лишний байт нужен, чтобы отличить ровно предел от превышения"
@@ -330,7 +492,11 @@ mod tests {
 
     #[test]
     fn request_read_keeps_short_input_intact() {
-        let raw = read_bounded(&b"{\"schema_version\": 1}"[..]).expect("чтение");
+        let raw = read_bounded(
+            &b"{\"schema_version\": 1}"[..],
+            document_read_limit(edit_op::MAX_REQUEST_BYTES),
+        )
+        .expect("чтение");
 
         assert_eq!(raw, b"{\"schema_version\": 1}".to_vec());
     }
@@ -338,7 +504,8 @@ mod tests {
     #[test]
     fn request_read_keeps_the_boundary_exactly_at_the_limit() {
         let source = vec![b' '; edit_op::MAX_REQUEST_BYTES];
-        let raw = read_bounded(&source[..]).expect("чтение");
+        let raw = read_bounded(&source[..], document_read_limit(edit_op::MAX_REQUEST_BYTES))
+            .expect("чтение");
 
         assert_eq!(raw.len(), edit_op::MAX_REQUEST_BYTES);
         assert!(

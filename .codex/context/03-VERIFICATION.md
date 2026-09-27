@@ -47,6 +47,35 @@ cargo run --quiet -- edit ../../decks/japanese/words/Words__N3 \
 одной заметкой используй `find --guid`, для поиска по значению поля —
 `find --field` или сокращение `find --word`.
 
+### Через `qa`, `review` и `review-check`
+
+Для поиска проблем в содержимом карточек используй `qa`, а не выборочное чтение
+JSON руками:
+
+```bash
+cd tools/anki-repo
+cargo run --quiet -- qa     ../../decks/japanese/words/Words__N3
+cargo run --quiet -- review ../../decks/japanese/words/Words__N3 --qa-code empty_field_value
+```
+
+- `qa` детерминированно находит findings по фиксированному реестру правил
+  (пустые значения, пробелы по краям, белый `<span>`, дубликаты содержимого и
+  поля `Слово`). Findings — не ошибки экспорта: уровня `ERROR` среди них нет,
+  `validate` от них не меняется, `edit` они не блокируют.
+- `review` отдаёт компактный batch заметок по найденной проблеме. Читай batch, а
+  не `deck.json`: страница ограничена по умолчанию 25 заметками, и по
+  `next_offset` видно, есть ли продолжение.
+- Предложения по содержимому проверяй через `review-check` до любой записи: он
+  ничего не пишет и различает `valid`, `already_correct`, `already_applied`,
+  `conflict` и `invalid`. Запрос для `edit` берётся из `result.edit_request` и
+  существует только при `outcome: ok`.
+- Содержательное суждение о карточке делает внешний агент: `qa` и `review` не
+  оценивают смысл, а toolkit не вызывает LLM API.
+
+Порядок работы с содержимым: `qa` → `review` → предложения внешнего агента →
+`review-check` → `edit` (dry-run, затем `--apply`) → `validate`. Записи в
+`deck.json` по-прежнему делает только `edit`.
+
 ### Через `edit`
 
 Для правки значения поля существующей заметки предпочитай `edit` ручному

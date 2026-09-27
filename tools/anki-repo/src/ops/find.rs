@@ -7,30 +7,18 @@ use std::path::Path;
 
 use crate::details;
 use crate::error::{DomainError, ErrorCode};
-use crate::index::{ExportIndex, NoteRef, field_value_by_name, resolve_named_fields};
-use crate::ops::NamedField;
+use crate::index::{ExportIndex, NoteRef};
+use crate::ops::NoteSummary;
+use crate::selection;
 
 /// Поле-сокращение для `--word`.
-pub const WORD_SHORTCUT_FIELD: &str = "Слово";
+pub use crate::selection::PRIMARY_FIELD as WORD_SHORTCUT_FIELD;
 
 /// Режим сопоставления значения поля.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// Подстрока в сыром значении поля.
-    Contains,
-    /// Полное совпадение с сырым значением поля.
-    Exact,
-}
-
-impl MatchMode {
-    /// Стабильное machine-readable имя режима.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Contains => "contains",
-            Self::Exact => "exact",
-        }
-    }
-}
+///
+/// Определён в общем слое выбора ([`crate::selection`]) и переэкспортируется
+/// здесь, потому что исторически принадлежит контракту `find`.
+pub use crate::selection::MatchMode;
 
 /// Критерий поиска.
 #[derive(Debug, Clone)]
@@ -99,21 +87,10 @@ pub struct CriteriaSummary {
 }
 
 /// Найденная заметка с именованными полями.
-#[derive(Debug)]
-pub struct FoundNote {
-    /// Идентификатор заметки.
-    pub guid: Option<String>,
-    /// Путь колоды.
-    pub deck_path: String,
-    /// Имя модели заметки.
-    pub note_model_name: Option<String>,
-    /// Идентичность модели заметки.
-    pub note_model_uuid: Option<String>,
-    /// Теги заметки.
-    pub tags: Vec<String>,
-    /// Поля заметки в порядке `ord` модели.
-    pub fields: Vec<NamedField>,
-}
+///
+/// Сводка заметки общая для читающих команд ([`crate::ops::NoteSummary`]);
+/// `FoundNote` сохраняет историческое имя контракта `find`.
+pub type FoundNote = NoteSummary;
 
 /// Выполняет `find`.
 ///
@@ -126,27 +103,15 @@ pub fn find(
     index: &ExportIndex<'_>,
     query: &FindQuery,
 ) -> Result<FindResult, DomainError> {
-    let deck_scope = resolve_deck_scope(index, query.deck.as_deref())?;
+    let deck_scope = selection::resolve_deck_scope(index, query.deck.as_deref())?;
     let criteria = summarize_criteria(query);
     let export_dir = export_dir.display().to_string();
 
     let matched: Vec<usize> = match &query.criteria {
-        FindCriteria::Guid { guid } => index
-            .note_positions_by_guid(guid)
-            .iter()
-            .copied()
-            .filter(|position| in_scope(index, &index.notes[*position], deck_scope))
-            .collect(),
+        FindCriteria::Guid { guid } => selection::positions_by_guid(index, guid, deck_scope),
         FindCriteria::Field { field, value, mode } => {
-            ensure_known_field(index, field)?;
-            index
-                .notes
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| in_scope(index, entry, deck_scope))
-                .filter(|(_, entry)| note_field_matches(index, entry, field, value, *mode))
-                .map(|(position, _)| position)
-                .collect()
+            selection::ensure_known_field(index, field)?;
+            selection::positions_matching_field(index, field, value, *mode, deck_scope)
         }
     };
 
@@ -212,31 +177,7 @@ pub fn find(
 }
 
 fn build_found_note(index: &ExportIndex<'_>, entry: &NoteRef<'_>) -> FoundNote {
-    let model = entry
-        .note
-        .note_model_uuid
-        .as_deref()
-        .and_then(|uuid| index.model_by_uuid(uuid));
-
-    let fields = model.map_or_else(Vec::new, |model| {
-        resolve_named_fields(entry.note, model)
-            .into_iter()
-            .map(|field| NamedField {
-                name: field.name.to_string(),
-                ord: field.ord.value(),
-                value: field.value.map(crate::model::FieldValue::rendered),
-            })
-            .collect()
-    });
-
-    FoundNote {
-        guid: entry.note.guid.clone(),
-        deck_path: index.note_deck_path(entry).to_string(),
-        note_model_name: model.and_then(|model| model.name.clone()),
-        note_model_uuid: entry.note.note_model_uuid.clone(),
-        tags: entry.note.tags.clone(),
-        fields,
-    }
+    NoteSummary::build(index, entry)
 }
 
 fn summarize_criteria(query: &FindQuery) -> CriteriaSummary {
@@ -259,80 +200,6 @@ fn summarize_criteria(query: &FindQuery) -> CriteriaSummary {
             deck: query.deck.clone(),
             limit: query.limit,
         },
-    }
-}
-
-fn resolve_deck_scope(
-    index: &ExportIndex<'_>,
-    deck: Option<&str>,
-) -> Result<Option<usize>, DomainError> {
-    let Some(deck) = deck else {
-        return Ok(None);
-    };
-    index.node_index_by_path(deck).map(Some).ok_or_else(|| {
-        let available: Vec<String> = index
-            .nodes
-            .iter()
-            .map(|entry| entry.path.to_string())
-            .collect();
-        DomainError::with_details(
-            ErrorCode::UnknownDeck,
-            format!("колода {deck:?} не найдена в экспорте"),
-            details! {
-                "deck" => deck,
-                "available_decks" => available,
-            },
-        )
-    })
-}
-
-fn ensure_known_field(index: &ExportIndex<'_>, field: &str) -> Result<(), DomainError> {
-    if index.known_field_names().contains(field) {
-        return Ok(());
-    }
-    let available: Vec<String> = index
-        .known_field_names()
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
-    Err(DomainError::with_details(
-        ErrorCode::UnknownField,
-        format!("поле {field:?} отсутствует во всех note models экспорта"),
-        details! {
-            "field" => field,
-            "available_fields" => available,
-        },
-    ))
-}
-
-fn in_scope(index: &ExportIndex<'_>, entry: &NoteRef<'_>, scope: Option<usize>) -> bool {
-    scope.is_none_or(|node| index.subtree_range(node).contains(&entry.node))
-}
-
-fn note_field_matches(
-    index: &ExportIndex<'_>,
-    entry: &NoteRef<'_>,
-    field: &str,
-    value: &str,
-    mode: MatchMode,
-) -> bool {
-    let Some(model) = entry
-        .note
-        .note_model_uuid
-        .as_deref()
-        .and_then(|uuid| index.model_by_uuid(uuid))
-    else {
-        return false;
-    };
-    let Some(raw) = field_value_by_name(entry.note, model, field) else {
-        return false;
-    };
-    let Some(text) = raw.as_text() else {
-        return false;
-    };
-    match mode {
-        MatchMode::Contains => text.contains(value),
-        MatchMode::Exact => text == value,
     }
 }
 

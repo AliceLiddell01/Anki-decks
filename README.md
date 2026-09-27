@@ -15,7 +15,7 @@
 │   └── japanese/
 │       └── words/           # японская словарная колода CrowdAnki
 └── tools/
-    └── anki-repo/           # read-only toolkit для анализа CrowdAnki-экспорта
+    └── anki-repo/           # toolkit анализа, QA-review и точечной правки CrowdAnki-экспорта
 ```
 
 Сами JSON-экспорты добавляются в соответствующие каталоги колод отдельными изменениями. В базовом каркасе репозитория содержимое колод намеренно отсутствует.
@@ -36,14 +36,14 @@
 
 ## Инструменты
 
-`tools/anki-repo` — самостоятельный read-only Rust CLI для анализа одного CrowdAnki-экспорта. Он разрешает связи `note_model_uuid` → `note_models[].flds[].ord` → `Note.fields` и выполняет четыре операции: `inspect`, `find`, `stats`, `validate`. У каждой операции есть человекочитаемый вывод и отдельный стабильный JSON-вывод.
+`tools/anki-repo` — самостоятельный Rust CLI для анализа одного CrowdAnki-экспорта, QA-review его содержимого и одной строго ограниченной правки. Он разрешает связи `note_model_uuid` → `note_models[].flds[].ord` → `Note.fields` и выполняет восемь операций: `inspect`, `find`, `stats`, `validate`, `qa`, `review`, `review-check` и `edit`. У каждой операции есть человекочитаемый вывод и отдельный стабильный JSON-вывод.
 
 ```bash
 cd tools/anki-repo
 cargo run --quiet -- validate ../../decks/japanese/words/Words__N3
 ```
 
-Tool ничего не изменяет: он не пишет `deck.json`, не копирует media и не трогает настройки планировщика. Команды, контракт вывода и exit codes — `tools/anki-repo/README.md`.
+Семь команд только читают: они не пишут `deck.json`, не копируют media и не трогают настройки планировщика. Единственная мутирующая команда — `edit`: она меняет значения существующих полей существующих заметок, по умолчанию работает как dry-run и пишет только по явному `--apply`. Конвейер `qa` → `review` → `review-check` готовит проверенный запрос для `edit`, но сам ничего не пишет и не вызывает LLM API. Команды, контракт вывода и exit codes — `tools/anki-repo/README.md`.
 
 ## Медиа
 
