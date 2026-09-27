@@ -711,13 +711,14 @@ fn real_deck_copy(level: u8) -> TempDir {
     dir
 }
 
-/// Первые `count` заметок колоды как пары «guid, значение поля `Значение`».
+/// Все заметки колоды как пары «guid, значение поля `Значение`».
 ///
 /// Позиция поля разрешается так же, как в самой команде: через
 /// `note_model_uuid` заметки и `note_models[].flds`, а не фиксированным индексом
 /// `fields[2]`. Иначе тест читал бы и проверял не то поле, которое правит `edit`,
-/// и оставался бы зелёным при переупорядочивании полей модели.
-fn sample_notes(text: &[u8], count: usize) -> Vec<(String, String)> {
+/// и оставался бы зелёным при переупорядочивании полей модели. Обход идёт по
+/// индексу экспорта, поэтому заметки вложенных колод тоже попадают в выборку.
+fn resolved_notes(text: &[u8]) -> Vec<(String, String)> {
     let document: Value = serde_json::from_slice(text).expect("deck.json — JSON");
     let root = anki_repo::loader::typed_root(document, Path::new("deck.json"))
         .expect("типизированное ядро экспорта");
@@ -726,7 +727,6 @@ fn sample_notes(text: &[u8], count: usize) -> Vec<(String, String)> {
     index
         .notes
         .iter()
-        .take(count)
         .map(|entry| {
             let guid = entry.note.guid.clone().expect("guid заметки");
             let model = entry
@@ -743,6 +743,11 @@ fn sample_notes(text: &[u8], count: usize) -> Vec<(String, String)> {
             (guid, value.to_string())
         })
         .collect()
+}
+
+/// Первые `count` заметок колоды в том же разрешении поля.
+fn sample_notes(text: &[u8], count: usize) -> Vec<(String, String)> {
+    resolved_notes(text).into_iter().take(count).collect()
 }
 
 #[test]
@@ -889,16 +894,9 @@ fn real_word_deck_batch_stays_surgical() {
         );
 
         // Ни одна другая заметка не получила маркер.
-        let document: Value = serde_json::from_slice(&after).expect("JSON");
-        let marked = document["notes"]
-            .as_array()
-            .expect("notes")
-            .iter()
-            .filter(|note| {
-                note["fields"][2]
-                    .as_str()
-                    .is_some_and(|value| value.ends_with(" [batch]"))
-            })
+        let marked = resolved_notes(&after)
+            .into_iter()
+            .filter(|(_, value)| value.ends_with(" [batch]"))
             .count();
         assert_eq!(marked, count, "N{level}: маркер только у целевых заметок");
     }
