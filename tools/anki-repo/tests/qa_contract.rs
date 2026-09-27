@@ -281,15 +281,58 @@ fn canonical_decks_report_independently_recomputed_counts() {
             widest > LIMIT,
             "N{level}: признак усечения следует из oracle'а"
         );
+        // Предел применяется к каждому коду отдельно, поэтому ожидание — сумма
+        // урезанных по коду счётчиков, а не урезанная сумма всех findings.
         assert_eq!(
             parsed["result"]["findings_returned"],
-            expected.values().sum::<usize>().min(LIMIT * QA_CODES.len()),
-            "N{level}: показано не больше предела на код"
+            QA_CODES
+                .iter()
+                .map(|code| expected[code].min(LIMIT))
+                .sum::<usize>(),
+            "N{level}: показано по пределу на каждый код"
         );
         for finding in parsed["result"]["findings"].as_array().expect("findings") {
             assert_finding_matches_raw(&raw, finding, level);
         }
     }
+}
+
+/// Группа больше предела участников обрезается явно, и ветка `related_truncated`
+/// проверяется тем же oracle'ом, а не отдельным набором утверждений.
+#[test]
+fn oversized_group_is_reported_as_truncated() {
+    let limit = anki_repo::qa::duplicate_rules::MAX_RELATED_NOTES;
+    let raw = export_with(|value| {
+        let template = value["notes"][0].clone();
+        for index in 0..=limit {
+            let mut copy = template.clone();
+            copy["guid"] = json!(format!("guid-bulk-{index}"));
+            value["notes"].as_array_mut().expect("notes").push(copy);
+        }
+    });
+    let temp = TempDir::new("qa-group-truncated");
+    temp.write_export(&raw);
+
+    let (code, parsed) = qa_json(
+        &temp.path().to_string_lossy(),
+        &["--code", "duplicate_note_content"],
+    );
+    assert_eq!(code, 0);
+
+    let findings = parsed["result"]["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 1, "группа описывается одним finding'ом");
+    let finding = &findings[0];
+    assert_eq!(finding["related_truncated"], true);
+    assert_eq!(
+        finding["related_note_indices"]
+            .as_array()
+            .expect("related_note_indices")
+            .len(),
+        limit,
+        "усечённый список участников полон до предела"
+    );
+    assert_eq!(finding["group_size"], json!(limit + 2));
+    assert_finding_matches_raw_labelled(&raw, finding, "группа сверх предела");
 }
 
 /// Проверяет один finding по сырому `deck.json`.
@@ -298,8 +341,14 @@ fn canonical_decks_report_independently_recomputed_counts() {
 /// свойства правила, а не от сообщения tool'а: тест не повторяет формулировки,
 /// а пересчитывает факт.
 fn assert_finding_matches_raw(raw: &Value, finding: &Value, level: u8) {
+    assert_finding_matches_raw_labelled(raw, finding, &format!("N{level}"));
+}
+
+/// То же самое, но с произвольной меткой: oracle'ом пользуются и синтетические
+/// экспорты, у которых нет номера колоды.
+fn assert_finding_matches_raw_labelled(raw: &Value, finding: &Value, prefix: &str) {
     let code = finding["code"].as_str().expect("code");
-    let label = format!("N{level}: {code} #{}", finding["note_index"]);
+    let label = format!("{prefix}: {code} #{}", finding["note_index"]);
 
     let mut notes = Vec::new();
     collect_notes(raw, &mut notes);
@@ -317,18 +366,34 @@ fn assert_finding_matches_raw(raw: &Value, finding: &Value, level: u8) {
         let related = finding["related_note_indices"]
             .as_array()
             .expect("related_note_indices");
+        let group_size = finding["group_size"].as_u64().expect("group_size");
+        let truncated = finding["related_truncated"]
+            .as_bool()
+            .expect("related_truncated");
         assert!(
             related.len() >= 2,
             "{label}: группа не может состоять из одной заметки"
         );
-        assert_eq!(
-            finding["group_size"],
-            finding["related_note_indices"]
-                .as_array()
-                .expect("related_note_indices")
-                .len(),
-            "{label}: группа не обрезана, размер совпадает со списком"
-        );
+        // Список участников ограничен доменом, поэтому «размер группы равен
+        // длине списка» верно только без усечения; усечённый список обязан быть
+        // полным до предела, а группа — больше него.
+        if truncated {
+            assert_eq!(
+                related.len(),
+                anki_repo::qa::duplicate_rules::MAX_RELATED_NOTES,
+                "{label}: усечённый список участников полон до предела"
+            );
+            assert!(
+                group_size > related.len() as u64,
+                "{label}: усечённая группа больше показанного списка"
+            );
+        } else {
+            assert_eq!(
+                group_size,
+                related.len() as u64,
+                "{label}: без усечения размер группы совпадает со списком"
+            );
+        }
         let guids = finding["related_guids"].as_array().expect("related_guids");
         assert_eq!(
             guids.len(),
