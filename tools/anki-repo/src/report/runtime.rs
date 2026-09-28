@@ -225,11 +225,13 @@ pub const CARD_RUNTIME_JS: &str = r#"
 
   function contentHeight() {
     var height = 0;
-    var root = document.documentElement;
     var body = document.body;
-    if (root) {
-      height = Math.max(height, root.scrollHeight || 0, root.offsetHeight || 0);
-    }
+    // Высоту содержимого несёт `body`. Корневой элемент в измерении не участвует
+    // намеренно: пока содержимое ниже кадра, его `scrollHeight` равен высоте
+    // кадра, а кадру нужна высота именно содержимого. Участие корня порождало
+    // петлю — измерение зависело от текущей высоты кадра, каждая пересылка
+    // поднимала её на пиксель, рост снова будил измерение, — и короткая карточка
+    // занимала кадр целиком.
     if (body) {
       height = Math.max(height, body.scrollHeight || 0, body.offsetHeight || 0);
     }

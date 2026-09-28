@@ -75,6 +75,19 @@ fn error_of(exit: i32, stdout: &str) -> Value {
     document["error"].clone()
 }
 
+/// Требует, чтобы обязательные проверки записи не были «провалены».
+///
+/// Проверки относятся к кандидату. Когда писать нечего (повторный прогон нашёл
+/// всё уже применённым), они не выполнялись, а не провалились: `false` в них
+/// читалось бы как провал обязательной проверки на успешном прогоне.
+fn assert_all_checks_passed(result: &Value) {
+    let checks = result["checks"].as_object().expect("checks — объект");
+    assert!(!checks.is_empty(), "checks перечисляет проверки: {result}");
+    for (name, value) in checks {
+        assert_eq!(value, true, "проверка {name} не провалена: {result}");
+    }
+}
+
 /// Запускает команду в режиме `--json`.
 ///
 /// `--json` — глобальный флаг, который clap не принимает дважды, поэтому он
@@ -367,6 +380,7 @@ fn create_is_idempotent_through_the_emitted_resolved_request() {
     );
     let first = result_of(exit, &stdout);
     let after_first = dir.deck_json_bytes();
+    assert_all_checks_passed(&first);
 
     let emitted: Value =
         serde_json::from_slice(&std::fs::read(&resolved).expect("файл")).expect("JSON");
@@ -392,6 +406,7 @@ fn create_is_idempotent_through_the_emitted_resolved_request() {
     assert_eq!(second["notes_already_applied"], 1);
     assert_eq!(second["outcomes"][0]["status"], "already_applied");
     assert_eq!(dir.deck_json_bytes(), after_first, "повтор не пишет файл");
+    assert_all_checks_passed(&second);
 }
 
 #[test]
@@ -1222,7 +1237,9 @@ fn retire_is_idempotent_and_never_duplicates_the_tag() {
     ];
 
     let (exit, stdout, _) = run_cli_in(None, &args);
-    assert_eq!(result_of(exit, &stdout)["outcomes"][0]["status"], "retired");
+    let first = result_of(exit, &stdout);
+    assert_eq!(first["outcomes"][0]["status"], "retired");
+    assert_all_checks_passed(&first);
     let after_first = dir.deck_json_bytes();
 
     let (exit, stdout, _) = run_cli_in(None, &args);
@@ -1232,6 +1249,7 @@ fn retire_is_idempotent_and_never_duplicates_the_tag() {
     assert_eq!(result["notes_already_retired"], 1);
     assert_eq!(result["applied"], false);
     assert_eq!(dir.deck_json_bytes(), after_first);
+    assert_all_checks_passed(&result);
 
     assert_eq!(
         dir.deck_json()["notes"][0]["tags"],

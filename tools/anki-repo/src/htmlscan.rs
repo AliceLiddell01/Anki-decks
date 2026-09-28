@@ -402,8 +402,12 @@ fn raw_text_range(html: &str, name: &str, body_start: usize) -> (usize, Option<u
         if bytes.get(after) == Some(&b'/') {
             let name_start = after + 1;
             let name_end = name_start + name.len();
+            // Сравниваются байты, а не срез строки: `name_end` мог оказаться
+            // внутри многобайтного символа, и срез строки по такому индексу
+            // паникует — на значении поля вроде `</ыыы` разбор обрывался бы не
+            // отказом, а паникой всего процесса.
             if name_end <= bytes.len()
-                && html[name_start..name_end].eq_ignore_ascii_case(name)
+                && bytes[name_start..name_end].eq_ignore_ascii_case(name.as_bytes())
                 && bytes
                     .get(name_end)
                     .is_none_or(|byte| is_whitespace(*byte) || *byte == b'>' || *byte == b'/')
@@ -548,6 +552,23 @@ mod tests {
         for html in [
             "<", "<a", "<a ", "<a =", "<a = ", "<a ===", "<a/", "<a/ ", "<a href", "<!--", "<!",
             "<?", "</", "<a b='",
+        ] {
+            let _ = scan_tags(html);
+        }
+    }
+
+    /// Многобайтный символ сразу после `</` не роняет разбор.
+    ///
+    /// Граница имени закрывающего тега попадает внутрь символа: срез строки по
+    /// такому индексу паникует, а сравнение байтов — нет. Значение поля приходит
+    /// из экспорта, поэтому паника здесь — отказ всего процесса на чужих данных.
+    #[test]
+    fn a_multibyte_character_after_a_close_marker_is_not_a_panic() {
+        for html in [
+            "<style></ыыы",
+            "<style>a</ыыыыы",
+            "<script></日本語日本語",
+            "<style>a</ы>",
         ] {
             let _ = scan_tags(html);
         }

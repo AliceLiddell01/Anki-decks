@@ -175,8 +175,9 @@ fn lock_exclusive(path: &Path, _file: &File) -> Result<(), DomainError> {
 /// записанный `deck.json`: читатель не должен видеть половину файла.
 ///
 /// Поэтому публикация идёт тем же способом, что и у `deck.json` (временный файл
-/// рядом с целью, `sync_all`, затем `rename`), и остаётся единственной в
-/// toolkit'е: второй реализации атомарной записи здесь не появляется.
+/// рядом с целью, `sync_all`, затем `rename` и best-effort синхронизация
+/// каталога), и остаётся единственной в toolkit'е: второй реализации атомарной
+/// записи здесь не появляется.
 ///
 /// # Errors
 ///
@@ -196,7 +197,9 @@ pub fn replace_document_atomically(
 
     let outcome = write_new_document(&temp_path, file, saved_permissions.as_ref(), document)
         .and_then(|()| {
-            fs::rename(&temp_path, path).map_err(|error| write_error(path, "rename", &error))
+            fs::rename(&temp_path, path).map_err(|error| write_error(path, "rename", &error))?;
+            sync_directory(path);
+            Ok(())
         });
 
     if outcome.is_err() {
@@ -352,18 +355,27 @@ fn write_and_publish(
 
     fs::rename(temp_path, path).map_err(|error| write_error(path, "rename", &error))?;
 
-    // Синхронизация каталога делает появление новой записи долговечным. На
-    // Windows открыть каталог средствами `std` нельзя, поэтому шаг
-    // best-effort и не влияет на результат.
+    sync_directory(path);
+
+    drop(lock);
+    Ok(())
+}
+
+/// Делает появление новой записи долговечным.
+///
+/// Вызывается только после успешного `rename`. На Windows открыть каталог
+/// средствами `std` нельзя, поэтому шаг best-effort и не влияет на результат.
+fn sync_directory(path: &Path) {
     #[cfg(unix)]
     {
         if let Ok(directory) = File::open(path.parent().unwrap_or_else(|| Path::new("."))) {
             let _ = directory.sync_all();
         }
     }
-
-    drop(lock);
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// Готовит ошибку отказа записи.
@@ -465,13 +477,25 @@ mod tests {
         fs::write(&path, "прежнее".as_bytes()).expect("файл");
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("chmod");
 
-        // Каталог только для чтения: временный файл создать нельзя, и прежнее
-        // содержимое обязано остаться нетронутым.
-        let error = replace_document_atomically(&path, "новое".as_bytes()).expect_err("отказ");
+        // Каталог только для чтения означает отказ, только если права вообще
+        // ограничивают запись: под root каталог 0o555 остаётся записываемым, и
+        // проверять на нём нечего.
+        let probe = dir.path().join("проверка-прав");
+        let rejecting = fs::write(&probe, b"x").is_err();
+        let _ = fs::remove_file(&probe);
+        if !rejecting {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod");
+            eprintln!("каталог 0o555 принимает запись: проверка пропущена");
+            return;
+        }
+
+        let outcome = replace_document_atomically(&path, "новое".as_bytes());
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod");
 
+        let error = outcome.expect_err("отказ");
         assert_eq!(error.code, ErrorCode::WriteFailed);
         assert_eq!(fs::read(&path).expect("файл"), "прежнее".as_bytes());
+        assert_temp_files_absent(dir.path());
     }
 
     #[test]

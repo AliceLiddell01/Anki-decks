@@ -1103,6 +1103,7 @@ fn classify(before: &Side, after: &Side, retire_tag: Option<&str>) -> Classifica
                     0,
                     after_positions.len(),
                 ));
+                note_ambiguous_guid(guid, 0, after_positions.len(), &mut diagnostics);
                 continue;
             }
             for position in after_positions {
@@ -1131,6 +1132,7 @@ fn classify(before: &Side, after: &Side, retire_tag: Option<&str>) -> Classifica
                     before_positions.len(),
                     0,
                 ));
+                note_ambiguous_guid(guid, before_positions.len(), 0, &mut diagnostics);
                 continue;
             }
             for position in before_positions {
@@ -1167,16 +1169,12 @@ fn classify(before: &Side, after: &Side, retire_tag: Option<&str>) -> Classifica
                 before_positions.len(),
                 after_positions.len(),
             ));
-            diagnostics.push(Diagnostic::warning(
-                "ambiguous_guid",
-                format!(
-                    "guid {guid:?} встречается {} раз в «до» и {} раз в «после»: отчёт не \
-                     выбирает заметку",
-                    before_positions.len(),
-                    after_positions.len()
-                ),
-                Some(guid.to_string()),
-            ));
+            note_ambiguous_guid(
+                guid,
+                before_positions.len(),
+                after_positions.len(),
+                &mut diagnostics,
+            );
             continue;
         }
 
@@ -1216,6 +1214,10 @@ fn classify(before: &Side, after: &Side, retire_tag: Option<&str>) -> Classifica
     outcomes.extend(retired.iter().cloned());
     outcomes.extend(removed.iter().cloned());
     outcomes.extend(unchanged.iter().cloned());
+    // Неоднозначный `guid` — такой же исход заметки, как остальные: он есть в
+    // `counts`, у него есть карточка в отчёте, и читатель, разбирающий
+    // `outcomes`, обязан увидеть его там же, а не искать отдельно.
+    outcomes.extend(ambiguous.iter().cloned());
 
     let plans = vec![
         SectionPlan {
@@ -1463,6 +1465,28 @@ fn ambiguous_outcome(
         before_occurrences,
         after_occurrences,
     }
+}
+
+/// Называет неоднозначный `guid` в диагностике.
+///
+/// Диагностика обязана появляться при любом повторе `guid`, а не только тогда,
+/// когда заметка нашлась в обоих состояниях: счётчик `ambiguous` без названного
+/// `guid` говорит, что проблема есть, но не говорит, где именно, и читатель
+/// отчёта ищет её сам.
+fn note_ambiguous_guid(
+    guid: &str,
+    before_occurrences: usize,
+    after_occurrences: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(Diagnostic::warning(
+        "ambiguous_guid",
+        format!(
+            "guid {guid:?} встречается {before_occurrences} раз в «до» и {after_occurrences} раз \
+             в «после»: отчёт не выбирает заметку"
+        ),
+        Some(guid.to_string()),
+    ));
 }
 
 /// Карточка отчёта для неоднозначного `guid` — без превью и без догадок.

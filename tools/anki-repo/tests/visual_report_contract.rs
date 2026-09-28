@@ -763,6 +763,7 @@ fn foreign_files_inside_the_report_directory_are_reported_and_kept() {
 /// Отказ генерации не уничтожает прежний отчёт: сборка идёт рядом с каталогом
 /// отчёта, и до переноса каталог не меняется вообще.
 #[test]
+#[cfg(unix)]
 fn a_failed_generation_keeps_the_previous_report() {
     let before = canonical_base("report-keep-before");
     let after = canonical_base("report-keep-after");
@@ -830,6 +831,7 @@ fn read_manifest(root: &Path) -> serde_json::Value {
 }
 
 /// Делает файл нечитаемым для текущего пользователя.
+#[cfg(unix)]
 fn make_unreadable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mut permissions = std::fs::metadata(path).expect("файл").permissions();
@@ -894,6 +896,83 @@ fn report_reports_ambiguous_guid_separately() {
         })
         .collect();
     assert_eq!(files, vec![("guid-2", "before")]);
+}
+
+#[test]
+fn every_ambiguous_guid_is_named_and_listed_as_an_outcome() {
+    // Три ветви неоднозначности: повтор только в «после», повтор только в «до» и
+    // повтор в обоих состояниях. Диагностика обязана появиться во всех трёх, а
+    // `outcomes` — перечислить все три `guid`.
+    let before = canonical_export(
+        "report-ambiguous-all-before",
+        &duplicate_guids(&["guid-1", "guid-1", "guid-2", "guid-2"]),
+    );
+    let after = canonical_export(
+        "report-ambiguous-all-after",
+        &duplicate_guids(&["guid-1", "guid-1", "guid-3", "guid-3"]),
+    );
+
+    let out = TempDir::new("report-ambiguous-all-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+
+    assert_eq!(result["counts"]["ambiguous"], 3, "{result}");
+    assert_eq!(result["checks"]["every_note_classified"], true, "{result}");
+
+    let named: Vec<&str> = result["diagnostics"]
+        .as_array()
+        .expect("диагностики")
+        .iter()
+        .filter(|item| item["code"] == "ambiguous_guid")
+        .filter_map(|item| item["subject"].as_str())
+        .collect();
+    assert_eq!(
+        named,
+        vec!["guid-1", "guid-2", "guid-3"],
+        "неоднозначность поимённо названа в каждой ветви: {result}"
+    );
+
+    let outcomes: Vec<(&str, &str, u64, u64)> = result["outcomes"]
+        .as_array()
+        .expect("исходы")
+        .iter()
+        .filter(|item| item["kind"] == "ambiguous")
+        .map(|item| {
+            (
+                item["guid"].as_str().expect("guid"),
+                item["kind"].as_str().expect("вид"),
+                item["before_occurrences"].as_u64().expect("вхождения до"),
+                item["after_occurrences"].as_u64().expect("вхождения после"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            ("guid-1", "ambiguous", 2, 2),
+            ("guid-2", "ambiguous", 2, 0),
+            ("guid-3", "ambiguous", 0, 2),
+        ],
+        "исход `ambiguous` перечислен вместе с числом вхождений: {result}"
+    );
+}
+
+/// Экспорт, в котором заметки повторяются: сборка `guid` задаётся списком.
+fn duplicate_guids(guids: &[&str]) -> Value {
+    let mut export = base_export();
+    let templates: Vec<Value> = export["notes"].as_array().expect("заметки").to_vec();
+    let notes: Vec<Value> = guids
+        .iter()
+        .enumerate()
+        .map(|(index, guid)| {
+            let mut note = templates[index % templates.len()].clone();
+            note["guid"] = json!(guid);
+            note["fields"] = json!([format!("значение {index}"), format!("поле {index}"), ""]);
+            note
+        })
+        .collect();
+    export["notes"] = Value::Array(notes);
+    export
 }
 
 #[test]
@@ -1432,7 +1511,10 @@ function element(tag, height) {
 function cardRun(src) {
   const posted = [];
   const listeners = {};
-  const root = element('html', 0);
+  // Корень показывает кадр, а не содержимое: пока содержимое ниже, его
+  // `scrollHeight` равен высоте кадра. Высота обязана считаться по содержимому,
+  // иначе измерение зависело бы от текущей высоты кадра и росло бы само.
+  const root = element('html', 1200);
   const body = element('body', 480);
   const card = element('div', 480);
   const document = {
@@ -1474,6 +1556,16 @@ function cardRun(src) {
   assert.ok(
     height.height >= 900 && height.height <= 901,
     'высота обновляется после загрузки media: ' + height.height
+  );
+
+  // Измерение по resize повторяется, но высота кадра в нём не участвует: рост
+  // кадра не поднимает измеренную высоту и не запускает рост заново.
+  const resize = listeners.resize.find((fn) => fn);
+  resize({});
+  const resized = posted.filter((item) => item.type === 'report:height').pop();
+  assert.ok(
+    resized.height >= 900 && resized.height <= 901,
+    'resize не поднимает высоту кадра: ' + resized.height
   );
 }
 
@@ -2376,5 +2468,76 @@ fn a_symlinked_out_dir_is_refused_and_its_target_is_untouched() {
             .next()
             .is_none(),
         "по ссылке ничего не записано"
+    );
+}
+
+/// Ссылка на media, из которой не выходит базового имени, — свойство конкретного
+/// экспорта, а не повод прервать отчёт: она называется диагностикой
+/// `media_path_traversal` и не копируется.
+#[test]
+fn a_media_reference_without_a_basename_is_named_and_does_not_stop_the_report() {
+    let before = canonical_base("report-traversal-before");
+    let after = canonical_base("report-traversal-after");
+    for dir in [&before, &after] {
+        set_field(
+            dir,
+            "guid-2",
+            0,
+            "[sound:..][sound:x/..][sound:../../наружу.mp3]必然",
+        );
+    }
+    before.write_media(&["наружу.mp3"]);
+    after.write_media(&["наружу.mp3"]);
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let out = TempDir::new("report-traversal-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    assert_eq!(
+        result["media"]["traversal"],
+        json!(["..", "../../наружу.mp3", "x/.."]),
+        "ссылка с путём названа целиком: {result}"
+    );
+    let without_basename: Vec<&str> = result["preview_files"]
+        .as_array()
+        .expect("превью")
+        .iter()
+        .flat_map(|preview| preview["missing_sounds"].as_array().expect("звуки"))
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        without_basename,
+        vec!["..", "x/..", "..", "x/.."],
+        "ссылка без базового имени не подставлена: {result}"
+    );
+
+    // Копируется только базовое имя: `наружу.mp3` попадает в отчёт, а `..` и
+    // `x/..` не создают ни файла, ни каталога.
+    assert_eq!(result["media"]["copied"], 2, "{result}");
+    let written = walk(out.path());
+    assert_eq!(
+        written
+            .iter()
+            .filter(|path| path.starts_with("media/"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "media/after/наружу.mp3".to_string(),
+            "media/before/наружу.mp3".to_string()
+        ],
+        "состав media отчёта: {written:?}"
+    );
+    let card = card_text(&out, "cards/card-0002.html");
+    for reference in ["[sound:..]", "[sound:x/..]"] {
+        assert!(
+            card.contains(reference),
+            "{reference} остаётся сырым текстом, а не подстановкой: {card}"
+        );
+    }
+    assert!(
+        card.contains("src=\"../media/after/наружу.mp3\""),
+        "ссылка с путём разрешается только в базовое имя внутри отчёта: {card}"
     );
 }

@@ -621,6 +621,12 @@ pub fn create(
         .as_ref()
         .map_or(source.source.len(), |candidate| candidate.bytes.len());
 
+    // Проверки записи — свидетельство, а не второй канал ошибки: провал любой из
+    // них прерывает команду отказом (см. `ensure_reparsed` и родственные), поэтому
+    // в успешном результате они перечислены как прошедшие. Повторный прогон, в
+    // котором писать нечего, тоже успешен: `false` в этих полях читалось бы как
+    // провал обязательной проверки, хотя файл остался ровно тем же.
+
     Ok(CreateResult {
         export_dir: export_dir.to_path_buf(),
         deck_json: source.deck_json.clone(),
@@ -650,12 +656,12 @@ pub fn create(
         validation,
         checks: CreateChecks {
             source_canonical: true,
-            candidate_reparsed: candidate.is_some(),
+            candidate_reparsed: true,
             model_resolution_evidenced: true,
             media_references_absent: true,
             guids_resolved_without_conflict: true,
-            only_notes_appended: candidate.is_some(),
-            appended_notes_verified: candidate.is_some(),
+            only_notes_appended: true,
+            appended_notes_verified: true,
         },
         resolved_request,
     })

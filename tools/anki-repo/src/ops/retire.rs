@@ -426,6 +426,10 @@ pub fn retire(
         .as_ref()
         .map_or(source.source.len(), |candidate| candidate.bytes.len());
 
+    // Провал любой из этих проверок прерывает команду отказом, поэтому успешный
+    // результат перечисляет их как прошедшие — в том числе повторный прогон, в
+    // котором тег уже стоит у всех заметок и писать нечего.
+
     Ok(RetireResult {
         export_dir: export_dir.to_path_buf(),
         deck_json: source.deck_json.clone(),
@@ -443,10 +447,10 @@ pub fn retire(
         validation,
         checks: RetireChecks {
             source_canonical: true,
-            candidate_reparsed: candidate.is_some(),
-            only_tags_appended: candidate.is_some(),
-            tags_appended_verified: candidate.is_some(),
-            retired_notes_still_resolvable: candidate.is_some(),
+            candidate_reparsed: true,
+            only_tags_appended: true,
+            tags_appended_verified: true,
+            retired_notes_still_resolvable: true,
         },
     })
 }

@@ -744,8 +744,9 @@ cat retire.json | anki-repo retire "$EXPORT" --request - --apply
 | `already_retired` | тег уже стоит: файл не перезаписывается, тег не дублируется |
 
 Тег проверяется тем же правилом, что и теги Anki: он непустой, без пробелов и
-служебных символов. Нечисловой `guid` в экспорте — `unresolved_guid` (exit 3),
-повтор `guid` — уже `ERROR` уровня `validate`, то есть отказ до любой записи.
+служебных символов. Повтор `guid` в экспорте — уже `ERROR` уровня `validate`, то
+есть отказ до любой записи; `guid`, которого нет в экспорте, — `unresolved_guid`
+(exit 3).
 
 #### Что гарантируется
 
@@ -1093,9 +1094,9 @@ anki-repo visual-report --before "$ЭТАЛОН" --after "$EXPORT" --out /tmp/о
 | `qa` | `export_dir`, `notes_total`, `findings_total`, `findings_returned`, `unaddressable_findings`, `truncated`, `max_per_code`, `codes`, `by_code`, `rules`, `findings` |
 | `review` | `export_dir`, `selection`, `notes_total`, `total_selected`, `excluded_unaddressable`, `offset`, `limit`, `returned`, `truncated`, `next_offset`, `items` |
 | `review-check` | `export_dir`, `deck_json`, `outcome`, `proposals_total`, `counts`, `effective_proposals`, `proposals_truncated`, `source_editable`, `source_blockers`, `proposals`, `edit_request` |
-| `models` | `export_dir`, `deck`, `models`, `sample_limit`, `notes_in_deck` |
-| `create` | `export_dir`, `deck_json`, `dry_run`, `applied`, `source_bytes`, `candidate_bytes`, `byte_delta`, `notes_total`, `notes_created`, `notes_already_applied`, `outcomes`, `outcomes_truncated`, `decks_touched`, `validation`, `checks`, `resolved_request` |
-| `retire` | `export_dir`, `deck_json`, `dry_run`, `applied`, `tag`, `source_bytes`, `candidate_bytes`, `byte_delta`, `notes_total`, `notes_retired`, `notes_already_retired`, `outcomes`, `outcomes_truncated`, `checks` |
+| `models` | `export_dir`, `deck` (`path`, `crowdanki_uuid`, `preorder`, `notes_in_deck`), `sample_limit`, `models` |
+| `create` | `export_dir`, `deck_json`, `dry_run`, `applied`, `source_bytes`, `candidate_bytes`, `byte_delta`, `notes_total`, `notes_created`, `notes_already_applied`, `outcomes`, `outcomes_truncated`, `decks_touched`, `validation`, `checks` |
+| `retire` | `export_dir`, `deck_json`, `dry_run`, `applied`, `tag`, `source_bytes`, `candidate_bytes`, `byte_delta`, `notes_total`, `notes_retired`, `notes_already_retired`, `outcomes`, `outcomes_truncated`, `validation`, `checks` |
 | `visual-report` | `before`, `after`, `out_dir`, `index_html`, `card_files`, `card_files_total`, `preview_files`, `preview_files_truncated`, `retire_tag`, `counts`, `outcomes`, `outcomes_truncated`, `diagnostics`, `unsupported_constructs`, `media`, `limitations`, `checks` |
 
 В `items` команды `review` поля заметки лежат в `fields` — объекте в порядке `ord`
@@ -1456,13 +1457,15 @@ exit code.
 | `ambiguous` | 5 | `find --guid` и `review --guid`: `guid` не разрешается однозначно. Для `edit` и `review-check` эта ветка недостижима как *код возврата*: повтор `guid` отсекается раньше как `export_invalid` (6), а в отчёте `review-check` он остаётся статусом предложения `invalid`/`ambiguous_guid` |
 | `unknown_model` | 3 | `create`: подходящей модели нет — ни явно указанной, ни совместимой с набором полей запроса в режиме `auto` (сообщение перечисляет фактически запрошенные имена полей) |
 | `media_forbidden` | 3 | `create`: значение нового поля ссылается на media (`[sound:…]` или media-атрибут у элемента, который его несёт, — по таблице `ADDRESS_ATTRIBUTES`); запись тега и атрибута значения не имеет, а незакрытая конструкция отвергается. Создание заметок не создаёт и не копирует файлы |
-| `unresolved_guid` | 3 | `retire` (и пакетный запрос `create` с явным `guid`): в экспорте нет заметки с таким `guid` |
+| `unresolved_guid` | 3 | `retire`: в экспорте нет заметки с указанным `guid`. Пакетный запрос `create` с явным `guid` этой ошибки не даёт: совпавший по содержимому `guid` — это `already_applied`, а разошедшийся по содержимому — `guid_conflict` (6) |
 | `unresolved_deck_identity` | 3 | `create --apply`: целевая колода не объявляет `crowdanki_uuid`, поэтому адресовать цель после записи нечем |
 | `deck_identity_mismatch` | 3 | `models` и `create`: указанные селекторы колоды указывают на разные узлы; выбор одного из них был бы догадкой |
 | `model_schema_unusable` | 6 | `create`: схема полей модели непригодна для сборки значений (пропуск, повтор или нечисловой `ord`). В `models` та же модель остаётся видимой со свидетельством и списком `schema_problems` |
 | `guid_collision` | 6 | `create`: сгенерированный `guid` совпал с уже существующим (источник случайности исчерпан или усечён) — заметка не добавлена |
 | `guid_conflict` | 6 | `create`: заметка с таким `guid` уже есть, но её содержимое отличается от запроса. Обновление существующей заметки — задача `edit`, а не `create` |
 | `ambiguous_model` | 5 | `create`: подходящих моделей несколько (`mode: auto`) или имя в `mode: explicit` неоднозначно |
+| `ambiguous_deck` | 5 | `models` и `create`: селектор колоды совпал более чем с одним узлом, поэтому цель не выбрана |
+| `missing_field_value` | 3 | `models` и `create`: модель требует поле, которого нет в запросе |
 | `internal_error` | 70 | Внутренняя ошибка, включая нарушение байтового инварианта правки |
 
 Проверки каталога отчёта у `visual-report` — это `invalid_request` с

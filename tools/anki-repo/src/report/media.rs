@@ -221,11 +221,18 @@ pub fn plan(
             }
 
             let name = normalize_media_name(reference);
-            if name != *reference {
+            let plain = is_plain_name(&name);
+            // Ссылка с путём — отдельный класс, и он не является ни «файла нет в
+            // экспорте», ни поводом прервать отчёт: читателю важно увидеть, что
+            // ссылка ведёт не туда, куда выглядит. Поэтому такая ссылка
+            // называется диагностикой `media_path_traversal`, не копируется и не
+            // разрешается — а отчёт продолжает собираться.
+            if name != *reference || !plain {
                 entry.traversal.push(reference.clone());
             }
-
-            ensure_plain_name(&name)?;
+            if !plain {
+                continue;
+            }
 
             if !entry.copied.contains(&name) {
                 if copied_total >= MAX_MEDIA_COPIES {
@@ -302,27 +309,19 @@ fn find_file(source: &Path, name: &str) -> Option<PathBuf> {
     Some(candidate)
 }
 
-/// Проверяет, что имя пригодно для записи внутрь каталога отчёта.
-fn ensure_plain_name(name: &str) -> Result<(), DomainError> {
-    let ok = !name.is_empty()
+/// Пригодно ли нормализованное имя для записи внутрь каталога отчёта.
+///
+/// Отдельная функция, а не отказ внутри цикла: непригодное имя — свойство данных
+/// конкретного экспорта, и отчёт обязан назвать его, а не прекратить работу.
+/// Копирование при этом не выполняется вовсе, поэтому за пределы каталога отчёта
+/// по-прежнему не попадает ничего.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
         && name != "."
         && name != ".."
         && !name.contains('/')
         && !name.contains('\\')
-        && !name.contains('\0');
-
-    if ok {
-        return Ok(());
-    }
-
-    Err(DomainError::with_details(
-        ErrorCode::Internal,
-        format!("нормализованное имя media {name:?} не является базовым именем файла"),
-        details! {
-            "reason" => "media_name_not_plain",
-            "name" => name,
-        },
-    ))
+        && !name.contains('\0')
 }
 
 /// Диагностическая запись о найденной символической ссылке.
