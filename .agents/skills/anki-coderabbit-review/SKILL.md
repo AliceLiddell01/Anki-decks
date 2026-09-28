@@ -38,6 +38,18 @@ Skill не владеет:
 - review чужого репозитория или server-side review без локального checkout;
 - облачными возможностями CodeRabbit Coding Agent.
 
+## Ownership публикации
+
+Общую Git/GitHub процедуру этот skill не владеет и не дублирует: branch, index,
+commit, push, exact remote verification, PR create/edit, Draft/Ready, merge и
+cleanup принадлежат repository skill `anki-git-workflow`.
+
+CodeRabbit cycle **требует** тот terminal state, который нужен конкретной
+iteration, и делегирует публикацию этому владельцу, сохраняя собственные
+CodeRabbit-specific semantics: provider invocation и завершение review, разбор и
+triage findings, iteration semantics, rate limit и clean-pass semantics остаются
+здесь.
+
 Это лёгкий repository skill: дисциплина задаётся этим workflow и существующим
 Git/verification контекстом, а не отдельным adapter'ом, state machine или
 persistent review state. Не создавай их. Он также не является универсальным
@@ -94,11 +106,14 @@ target_iterations = explicit_user_count ?? 3
 → исправление confirmed / partially confirmed
 → применимая repository verification
 → отдельный commit
-→ push текущей ветки
-→ подтверждение нового clean/synchronized HEAD
+→ публикация текущей ветки через `anki-git-workflow` (push + exact remote
+  verification)
+→ подтверждённый новый clean/synchronized HEAD
 ```
 
-Следующая iteration начинается только после успешного commit + push предыдущей.
+Следующая iteration начинается только после подтверждённой публикации предыдущей.
+Механику commit/push/remote verification владеет `anki-git-workflow`; здесь
+остаётся только требование к её результату.
 
 Счётчик completed iterations увеличивается только тогда, когда provider review
 фактически завершён **и** вся последовательность iteration дошла до
@@ -142,7 +157,8 @@ Clean iteration **не является early stop**: workflow заканчив�
   проверяется по актуальному reviewed HEAD и только потом исправляется.
 - Commit + push каждой completed iteration входит в явно запрошенный cycle и не
   требует отдельного подтверждения. Это разрешение ограничено текущим cycle и
-  текущей веткой.
+  текущей веткой; сама публикация выполняется по процедуре `anki-git-workflow` и
+  подтверждается фактическим удалённым SHA, а не exit code push.
 - Skill **не** разрешает merge, force-push, rebase опубликованной истории без
   отдельной причины, создание другой ветки, переключение на другой PR, смену base
   PR, закрытие PR и публикацию несвязанных локальных изменений.
@@ -166,8 +182,9 @@ Clean iteration **не является early stop**: workflow заканчив�
 ## Подробный workflow
 
 Пошаговая механика — setup и candidate, discovery фактического provider interface,
-invocation (включая deep), oversized scope, triage, verification, commit/push,
-rate-limit handling, blockers, границы skill и финальный отчёт — находится в
+invocation (включая deep), oversized scope, triage, verification, требование к
+публикации completed iteration, rate-limit handling, blockers, границы skill и
+финальный отчёт — находится в
 [`references/review-workflow.md`](references/review-workflow.md).
 
 Читай его перед началом cycle: `SKILL.md` задаёт контракт и границы, reference

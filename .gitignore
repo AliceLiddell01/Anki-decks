@@ -12,3 +12,8 @@
 # `git status`.
 /visual-report/
 /report/
+
+# Repository-local рабочие артефакты агента — например Markdown-источник body
+# текущего PR (`/.codex/local/pr/<task>/body.md`). Это не публикуемый контракт
+# репозитория и не tracked: процедуру владеет `.agents/skills/anki-git-workflow/`.
+/.codex/local/

@@ -35,7 +35,9 @@ tools/
 - `decks/japanese/words/` — японская словарная колода.
 - `.codex/context/` — долговременные карты формата и рабочего процесса.
 - `.agents/skills/` — repository skills, по каталогу на skill; процедуру владеет
-  сам skill, а не этот файл.
+  сам skill, а не этот файл. Обычную процедуру Git/GitHub владеет
+  `.agents/skills/anki-git-workflow/`, явно запрошенный CodeRabbit review cycle —
+  `.agents/skills/anki-coderabbit-review/`.
 - `tools/anki-repo/` — Rust package `anki-repo` для анализа экспорта и строго
   ограниченной записи в него (`edit`, `create`, `retire`) вместе со статическим
   отчётом `visual-report`; его контракт описан в `tools/anki-repo/README.md`. Это участник корневого workspace, а не отдельный
