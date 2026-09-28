@@ -26,6 +26,19 @@ pub const MAX_REVIEW_LIMIT: u64 = 200;
 /// Смещение страницы `review` по умолчанию.
 pub const DEFAULT_REVIEW_OFFSET: u64 = 0;
 
+/// Предел выборки свидетельств `models` по умолчанию.
+///
+/// Значение берётся у владельца операции, чтобы CLI-умолчание не разошлось с
+/// фактическим поведением команды.
+pub const DEFAULT_MODELS_SAMPLE_LIMIT: u64 = crate::ops::models::DEFAULT_SAMPLE_LIMIT as u64;
+/// Жёсткий максимум выборки свидетельств `models`.
+pub const MAX_MODELS_SAMPLE_LIMIT: u64 = crate::ops::models::MAX_SAMPLE_LIMIT as u64;
+/// Предел подробных заметок `visual-report` по умолчанию.
+pub const DEFAULT_VISUAL_PREVIEW_LIMIT: u64 =
+    crate::ops::visual_report::DEFAULT_PREVIEW_LIMIT as u64;
+/// Жёсткий максимум подробных заметок `visual-report`.
+pub const MAX_VISUAL_PREVIEW_LIMIT: u64 = crate::ops::visual_report::MAX_PREVIEW_LIMIT as u64;
+
 /// Режим сопоставления значения поля на уровне CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum MatchArg {
@@ -40,13 +53,18 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ, QA-review и точечная правка CrowdAnki-экспортов: inspect, find, stats, validate, qa, review, review-check, edit",
-    long_about = "Анализ, QA-review и точечная правка одного CrowdAnki-экспорта.\n\
-                  inspect, find, stats, validate, qa, review и review-check только читают.\n\
-                  edit меняет значения существующих полей существующих заметок и\n\
-                  пишет только по явному --apply, только для канонического deck.json\n\
-                  и только после проверок предусловий.\n\
-                  Toolkit не вызывает LLM API: разбор содержимого делает внешний агент.",
+    about = "Анализ, QA-review, создание и вывод из обращения заметок CrowdAnki: inspect, find, stats, validate, qa, review, review-check, models, create, retire, visual-report",
+    long_about = "Анализ, QA-review и правка одного CrowdAnki-экспорта.\n\
+                  inspect, find, stats, validate, qa, review, review-check, models и\n\
+                  visual-report только читают.\n\
+                  edit меняет значения существующих полей существующих заметок.\n\
+                  create добавляет заметки в существующие колоды существующих моделей.\n\
+                  retire помечает заметки тегом вместо физического удаления.\n\
+                  Все три мутирующие команды пишут только по явному --apply, только\n\
+                  для канонического deck.json и только после проверок предусловий.\n\
+                  Имена полей берутся из фактической модели экспорта: models показывает\n\
+                  схему полей и свидетельства по значениям.\n\
+                  Toolkit не вызывает LLM API и не ходит в сеть.",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -71,6 +89,10 @@ impl Cli {
             Command::Review { .. } => "review",
             Command::ReviewCheck { .. } => "review-check",
             Command::Edit { .. } => "edit",
+            Command::Models { .. } => "models",
+            Command::Create { .. } => "create",
+            Command::Retire { .. } => "retire",
+            Command::VisualReport { .. } => "visual-report",
         }
     }
 }
@@ -231,6 +253,120 @@ pub enum Command {
         /// JSON-документ предложений (schema_version 1, `proposals`); `-` читает stdin.
         #[arg(long = "proposals", value_name = "PATH")]
         proposals_file: PathBuf,
+    },
+
+    /// Схема полей моделей области и свидетельства по фактическим значениям.
+    ///
+    /// Селекторы колоды можно комбинировать: их согласованность проверяет домен
+    /// (`deck_identity_mismatch`), а не clap, — та же проверка работает и для
+    /// селекторов внутри JSON-запроса `create`.
+    #[command(group(
+        clap::ArgGroup::new("deck_selector")
+            .required(false)
+            .multiple(true)
+            .args(["deck", "deck_uuid", "deck_preorder"])
+    ))]
+    Models {
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
+        export_dir: PathBuf,
+
+        /// Колода по полному имени (`::`-путь из deck.json).
+        #[arg(long)]
+        deck: Option<String>,
+
+        /// Колода по её crowdanki_uuid.
+        #[arg(long = "deck-uuid", value_name = "UUID")]
+        deck_uuid: Option<String>,
+
+        /// Колода по позиции в порядке обхода; `0` — корневая колода экспорта.
+        #[arg(long = "deck-preorder", value_name = "N")]
+        deck_preorder: Option<usize>,
+
+        /// Сколько примеров значений показывать на поле.
+        #[arg(
+            long = "sample-limit",
+            default_value_t = DEFAULT_MODELS_SAMPLE_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_MODELS_SAMPLE_LIMIT),
+        )]
+        sample_limit: u64,
+    },
+
+    /// Создание заметок в существующих колодах существующих моделей.
+    Create {
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
+        export_dir: PathBuf,
+
+        /// JSON-документ запроса (schema_version 1, `notes`); `-` читает stdin.
+        #[arg(long = "request", value_name = "PATH")]
+        request_file: PathBuf,
+
+        /// Записать заметки в deck.json. Без флага выполняется только dry-run.
+        #[arg(long)]
+        apply: bool,
+
+        /// Записать разрешённый запрос в файл: его повторный прогон идемпотентен.
+        #[arg(long = "emit-resolved", value_name = "PATH")]
+        emit_resolved: Option<PathBuf>,
+    },
+
+    /// Вывод заметок из обращения: тег вместо физического удаления.
+    #[command(group(
+        clap::ArgGroup::new("targets")
+            .required(true)
+            .multiple(false)
+            .args(["request_file", "guid"])
+    ))]
+    Retire {
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
+        export_dir: PathBuf,
+
+        /// JSON-документ запроса (schema_version 1, `tag`, `notes`); `-` читает stdin.
+        #[arg(long = "request", value_name = "PATH")]
+        request_file: Option<PathBuf>,
+
+        /// `guid` выводимой из обращения заметки; флаг можно повторить.
+        #[arg(long = "guid", value_name = "GUID", requires = "tag")]
+        guid: Vec<String>,
+
+        /// Тег вывода из обращения: чем именно помечать, решает колода.
+        #[arg(long = "tag", value_name = "TAG", requires = "guid")]
+        tag: Option<String>,
+
+        /// Записать теги в deck.json. Без флага выполняется только dry-run.
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// Статический визуальный отчёт об изменениях двух состояний экспорта.
+    #[command(name = "visual-report")]
+    VisualReport {
+        /// Каталог экспорта в состоянии «до».
+        #[arg(long = "before", value_name = "DIR")]
+        before: PathBuf,
+
+        /// Каталог экспорта в состоянии «после».
+        #[arg(long = "after", value_name = "DIR")]
+        after: PathBuf,
+
+        /// Каталог, в который пишется отчёт; создаётся, если его нет.
+        #[arg(long = "out", value_name = "DIR")]
+        out: PathBuf,
+
+        /// Тег вывода из обращения: по нему заметка попадает в раздел выведенных.
+        #[arg(long = "retire-tag", value_name = "TAG")]
+        retire_tag: Option<String>,
+
+        /// Сколько заметок показать подробно в каждом разделе отчёта.
+        ///
+        /// Предел применяется к каждому разделу отдельно (`created`, `changed`,
+        /// `retired`, `removed`, неоднозначные `guid`), а общее число файлов
+        /// превью дополнительно ограничено `MAX_CARD_FILES`.
+        #[arg(
+            long = "preview-limit",
+            default_value_t = DEFAULT_VISUAL_PREVIEW_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_VISUAL_PREVIEW_LIMIT),
+        )]
+        preview_limit: u64,
     },
 
     /// Точечная правка значений существующих полей существующих заметок.

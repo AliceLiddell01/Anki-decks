@@ -166,6 +166,73 @@ fn lock_exclusive(path: &Path, _file: &File) -> Result<(), DomainError> {
     ))
 }
 
+/// Публикует документ, у которого нет предусловия на прежнее содержимое.
+///
+/// Этим путём пишутся артефакты, которые не являются чьим-то изменяемым
+/// исходником: resolved-запрос `create --emit-resolved` и файл-манифест отчёта.
+/// Проверять у них «источник не изменился» нечем и незачем — они и есть результат
+/// команды, — но частично записанный документ недопустим так же, как частично
+/// записанный `deck.json`: читатель не должен видеть половину файла.
+///
+/// Поэтому публикация идёт тем же способом, что и у `deck.json` (временный файл
+/// рядом с целью, `sync_all`, затем `rename` и best-effort синхронизация
+/// каталога), и остаётся единственной в toolkit'е: второй реализации атомарной
+/// записи здесь не появляется.
+///
+/// # Errors
+///
+/// [`ErrorCode::WriteFailed`] для любого отказа файловой системы. Временный файл
+/// не переживает неуспешную публикацию.
+pub fn replace_document_atomically(
+    path: &Path,
+    document: &[u8],
+) -> Result<PublishedFile, DomainError> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let saved_permissions = fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.permissions());
+
+    let (temp_path, file, temp_attempt) = create_temp(path, directory)?;
+
+    let outcome = write_new_document(&temp_path, file, saved_permissions.as_ref(), document)
+        .and_then(|()| {
+            fs::rename(&temp_path, path).map_err(|error| write_error(path, "rename", &error))?;
+            sync_directory(path);
+            Ok(())
+        });
+
+    if outcome.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    outcome.map(|()| PublishedFile {
+        path: path.to_path_buf(),
+        bytes: document.len(),
+        temp_attempt,
+    })
+}
+
+/// Записывает документ во временный файл и сбрасывает его на диск.
+fn write_new_document(
+    temp_path: &Path,
+    mut file: File,
+    saved_permissions: Option<&fs::Permissions>,
+    document: &[u8],
+) -> Result<(), DomainError> {
+    file.write_all(document)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| write_error(temp_path, "write_candidate", &error))?;
+
+    if let Some(permissions) = saved_permissions {
+        file.set_permissions(permissions.clone())
+            .map_err(|error| write_error(temp_path, "set_permissions", &error))?;
+    }
+
+    drop(file);
+    Ok(())
+}
+
 /// Публикует `candidate` вместо `path`, ожидая там байты `expected_source`.
 ///
 /// # Errors
@@ -288,18 +355,27 @@ fn write_and_publish(
 
     fs::rename(temp_path, path).map_err(|error| write_error(path, "rename", &error))?;
 
-    // Синхронизация каталога делает появление новой записи долговечным. На
-    // Windows открыть каталог средствами `std` нельзя, поэтому шаг
-    // best-effort и не влияет на результат.
+    sync_directory(path);
+
+    drop(lock);
+    Ok(())
+}
+
+/// Делает появление новой записи долговечным.
+///
+/// Вызывается только после успешного `rename`. На Windows открыть каталог
+/// средствами `std` нельзя, поэтому шаг best-effort и не влияет на результат.
+fn sync_directory(path: &Path) {
     #[cfg(unix)]
     {
         if let Ok(directory) = File::open(path.parent().unwrap_or_else(|| Path::new("."))) {
             let _ = directory.sync_all();
         }
     }
-
-    drop(lock);
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// Готовит ошибку отказа записи.
@@ -349,6 +425,76 @@ mod tests {
 
         assert_eq!(published.bytes, 3);
         assert_eq!(fs::read(&path).expect("файл"), b"new");
+        assert_temp_files_absent(dir.path());
+    }
+
+    #[test]
+    fn creates_a_document_that_did_not_exist() {
+        let dir = TempDir::new("write-document-new");
+        let artifacts = dir.path().join("artifacts");
+        fs::create_dir_all(&artifacts).expect("каталог");
+        let path = artifacts.join("resolved.json");
+
+        let published =
+            replace_document_atomically(&path, b"{\"note\":1}").expect("документ записан");
+
+        assert_eq!(published.bytes, 10);
+        assert_eq!(fs::read(&path).expect("файл"), b"{\"note\":1}");
+        assert_temp_files_absent(&dir.path().join("artifacts"));
+    }
+
+    #[test]
+    fn replaces_a_document_whole() {
+        let dir = TempDir::new("write-document-replace");
+        let path = dir.path().join("resolved.json");
+        fs::write(&path, "прежнее содержимое".as_bytes()).expect("файл");
+
+        replace_document_atomically(&path, "новое".as_bytes()).expect("замена");
+
+        assert_eq!(fs::read(&path).expect("файл"), "новое".as_bytes());
+        assert_temp_files_absent(dir.path());
+    }
+
+    #[test]
+    fn a_missing_parent_directory_is_a_write_failure() {
+        let dir = TempDir::new("write-document-missing");
+        let path = dir.path().join("нет-такого").join("resolved.json");
+
+        let error = replace_document_atomically(&path, b"x").expect_err("нет каталога");
+
+        assert_eq!(error.code, ErrorCode::WriteFailed);
+        assert_eq!(error.details["operation"], "create_temp");
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_document_is_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("write-document-readonly");
+        let path = dir.path().join("resolved.json");
+        fs::write(&path, "прежнее".as_bytes()).expect("файл");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        // Каталог только для чтения означает отказ, только если права вообще
+        // ограничивают запись: под root каталог 0o555 остаётся записываемым, и
+        // проверять на нём нечего.
+        let probe = dir.path().join("проверка-прав");
+        let rejecting = fs::write(&probe, b"x").is_err();
+        let _ = fs::remove_file(&probe);
+        if !rejecting {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod");
+            eprintln!("каталог 0o555 принимает запись: проверка пропущена");
+            return;
+        }
+
+        let outcome = replace_document_atomically(&path, "новое".as_bytes());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let error = outcome.expect_err("отказ");
+        assert_eq!(error.code, ErrorCode::WriteFailed);
+        assert_eq!(fs::read(&path).expect("файл"), "прежнее".as_bytes());
         assert_temp_files_absent(dir.path());
     }
 

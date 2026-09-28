@@ -82,6 +82,17 @@ impl TempDir {
         serde_json::from_slice(&bytes).expect("deck.json должен быть валидным JSON")
     }
 
+    /// Записывает файл media с указанным содержимым.
+    ///
+    /// Содержимое задаётся явно, потому что два состояния могут содержать
+    /// одноимённый файл с разными байтами — именно это и проверяет отчёт.
+    pub fn write_media_bytes(&self, name: &str, bytes: &[u8]) {
+        let media = self.path.join("media");
+        fs::create_dir_all(&media).expect("media должен создаваться");
+        fs::write(media.join(name), bytes)
+            .unwrap_or_else(|error| panic!("файл media {name}: {error}"));
+    }
+
     /// Создаёт каталог `media/` с указанными именами файлов.
     pub fn write_media(&self, names: &[&str]) {
         let media = self.path.join("media");

@@ -62,13 +62,21 @@ reviews:
 
     - path: "tools/anki-repo/src/**/*.rs"
       instructions: >-
-        Сохраняй основной контракт anki-repo: семь команд читают один CrowdAnki
-        export за вызов и не мутируют deck.json, media или настройки Anki, а
-        единственная мутирующая команда — edit, и только по явному --apply.
-        Проверяй детерминированность, стабильность JSON output contract,
-        schema_version, command/error codes, exit codes, порядок вывода,
-        semantics inspect/find/stats/validate/qa/review/review-check/edit и
-        разделение stdout/stderr. Отдельно следи за границей QA-review: toolkit
+        Сохраняй основной контракт anki-repo: каждая команда работает с одним
+        CrowdAnki export за вызов и не мутирует media, deck_configurations и
+        настройки Anki. Читающих команд девять (inspect/find/stats/validate/qa/
+        review/review-check/models/visual-report), мутирующих три, и каждая
+        пишет только по явному --apply: edit меняет значения существующих
+        полей, create добавляет заметку в существующую колоду существующей
+        модели, retire дописывает тег вывода из обращения. Физического удаления
+        заметок, создания колод и моделей и изменения идентификаторов в toolkit
+        нет — появление такой ветки считай регрессией контракта, а не
+        расширением. visual-report пишет только новый каталог отчёта, никогда не
+        внутрь export или decks/**, и остаётся офлайновым: ни сети, ни
+        <script>, ни подмены внешних ссылок. Проверяй детерминированность,
+        стабильность JSON output contract, schema_version, command/error codes,
+        exit codes, порядок вывода, semantics всех команд и разделение
+        stdout/stderr. Отдельно следи за границей QA-review: toolkit
         не вызывает LLM API и не ходит в сеть, реестр правил QA детерминирован,
         findings не делают экспорт невалидным и не блокируют edit, а
         review-check ничего не пишет и выпускает edit_request только для
@@ -98,11 +106,13 @@ reviews:
         сохранение publish=false и unsafe_code=forbid. Новая зависимость должна
         решать конкретную задачу и не дублировать уже имеющуюся возможность.
 
-    - path: "tools/anki-repo/Cargo.lock"
+    - path: "Cargo.lock"
       instructions: >-
-        Cargo.lock должен меняться только как следствие осознанного изменения
-        зависимостей или воспроизводимого обновления lockfile. Флагай
-        необъяснимый lockfile churn и рассинхронизацию с Cargo.toml.
+        Cargo.lock лежит в корне: workspace собирается и тестируется из корня
+        репозитория, участник — tools/anki-repo. Меняться он должен только как
+        следствие осознанного изменения зависимостей или воспроизводимого
+        обновления lockfile. Флагай необъяснимый lockfile churn, рассинхронизацию
+        с Cargo.toml и копию lockfile внутри каталога crate'а.
 
     - path: ".codex/context/**"
       instructions: >-

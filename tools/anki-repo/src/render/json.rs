@@ -8,14 +8,19 @@ use serde::ser::{SerializeMap, Serializer};
 
 use crate::error::DomainError;
 use crate::ops::NamedField;
+use crate::ops::create::CreateResult;
 use crate::ops::edit::EditResult;
 use crate::ops::find::FindResult;
 use crate::ops::inspect::{InspectResult, InspectVerbose, ModelSummary};
+use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
+use crate::ops::retire::RetireResult;
 use crate::ops::review::ReviewResult;
 use crate::ops::review_check::ReviewCheckResult;
 use crate::ops::stats::StatsResult;
 use crate::ops::validate::{SeverityCounts, ValidateResult};
+use crate::ops::visual_report::{PreviewFileFact, ReportSide, VisualReportResult};
+use crate::template::ModelKind;
 
 /// Версия machine-readable контракта.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -1074,6 +1079,619 @@ impl<'a> From<&'a ReviewCheckResult> for ReviewCheckDto<'a> {
                     })
                     .collect(),
             }),
+        }
+    }
+}
+
+/// JSON-представление `models`.
+pub fn models_json(result: &ModelsResult) -> String {
+    to_json("models", ModelsDto::from(result))
+}
+
+#[derive(Serialize)]
+struct ModelsDto<'a> {
+    export_dir: String,
+    deck: DeckIdentityDto<'a>,
+    sample_limit: usize,
+    models: Vec<ModelEvidenceDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct DeckIdentityDto<'a> {
+    path: &'a str,
+    crowdanki_uuid: Option<&'a str>,
+    preorder: usize,
+    notes_in_deck: usize,
+}
+
+#[derive(Serialize)]
+struct ModelEvidenceDto<'a> {
+    crowdanki_uuid: &'a str,
+    name: &'a str,
+    model_type: Option<i64>,
+    model_kind: &'static str,
+    declared_in_deck: bool,
+    notes_in_deck: usize,
+    notes_in_subtree: usize,
+    fields: Vec<FieldEvidenceDto<'a>>,
+    templates: Vec<TemplateEvidenceDto<'a>>,
+    schema_problems: &'a [String],
+    req: Option<&'a serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct FieldEvidenceDto<'a> {
+    ord: usize,
+    name: &'a str,
+    description: Option<&'a str>,
+    samples: Vec<FieldSampleDto<'a>>,
+    empty_in_deck: usize,
+}
+
+#[derive(Serialize)]
+struct FieldSampleDto<'a> {
+    guid: Option<&'a str>,
+    value: &'a str,
+}
+
+#[derive(Serialize)]
+struct TemplateEvidenceDto<'a> {
+    ord: usize,
+    name: Option<&'a str>,
+    fields: &'a [String],
+    specials: &'a [String],
+    unsupported: Vec<UnsupportedConstructDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct UnsupportedConstructDto<'a> {
+    construct: &'a str,
+    reason: &'a str,
+}
+
+impl<'a> From<&'a ModelsResult> for ModelsDto<'a> {
+    fn from(result: &'a ModelsResult) -> Self {
+        Self {
+            export_dir: result.export_dir.display().to_string(),
+            deck: DeckIdentityDto {
+                path: &result.deck.path,
+                crowdanki_uuid: result.deck.crowdanki_uuid.as_deref(),
+                preorder: result.deck.preorder,
+                notes_in_deck: result.deck.notes_in_deck,
+            },
+            sample_limit: result.sample_limit,
+            models: result
+                .models
+                .iter()
+                .map(|model| ModelEvidenceDto {
+                    crowdanki_uuid: &model.crowdanki_uuid,
+                    name: &model.name,
+                    model_type: model.model_type,
+                    model_kind: model_kind_name(model.model_kind),
+                    declared_in_deck: model.declared_in_deck,
+                    notes_in_deck: model.notes_in_deck,
+                    notes_in_subtree: model.notes_in_subtree,
+                    fields: model
+                        .fields
+                        .iter()
+                        .map(|field| FieldEvidenceDto {
+                            ord: field.ord,
+                            name: &field.name,
+                            description: field.description.as_deref(),
+                            samples: field
+                                .samples
+                                .iter()
+                                .map(|sample| FieldSampleDto {
+                                    guid: sample.guid.as_deref(),
+                                    value: &sample.value,
+                                })
+                                .collect(),
+                            empty_in_deck: field.empty_in_deck,
+                        })
+                        .collect(),
+                    templates: model
+                        .templates
+                        .iter()
+                        .map(|template| TemplateEvidenceDto {
+                            ord: template.ord,
+                            name: template.name.as_deref(),
+                            fields: &template.fields,
+                            specials: &template.specials,
+                            unsupported: template
+                                .unsupported
+                                .iter()
+                                .map(|item| UnsupportedConstructDto {
+                                    construct: &item.construct,
+                                    reason: &item.reason,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    schema_problems: &model.schema_problems,
+                    req: model.req.as_ref(),
+                })
+                .collect(),
+        }
+    }
+}
+
+const fn model_kind_name(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::Standard => "standard",
+        ModelKind::Cloze => "cloze",
+    }
+}
+
+/// JSON-представление `create`.
+pub fn create_json(result: &CreateResult) -> String {
+    to_json("create", CreateDto::from(result))
+}
+
+#[derive(Serialize)]
+struct CreateDto<'a> {
+    export_dir: String,
+    deck_json: String,
+    dry_run: bool,
+    applied: bool,
+    source_bytes: usize,
+    candidate_bytes: usize,
+    byte_delta: i64,
+    notes_total: usize,
+    notes_created: usize,
+    notes_already_applied: usize,
+    decks_touched: Vec<DeckTouchDto<'a>>,
+    outcomes: Vec<CreateOutcomeDto<'a>>,
+    outcomes_truncated: bool,
+    validation: ValidationDeltaDto,
+    checks: CreateChecksDto,
+}
+
+#[derive(Serialize)]
+struct DeckTouchDto<'a> {
+    deck_path: &'a str,
+    deck_uuid: &'a str,
+    notes_before: usize,
+    notes_added: usize,
+}
+
+#[derive(Serialize)]
+struct CreateOutcomeDto<'a> {
+    note_index: usize,
+    note_id: Option<&'a str>,
+    guid: &'a str,
+    guid_generated: bool,
+    status: &'static str,
+    deck_path: &'a str,
+    deck_uuid: &'a str,
+    model_mode: &'static str,
+    model_uuid: &'a str,
+    model_name: &'a str,
+    model_evidence: &'a str,
+    fields_total: usize,
+    field_names: &'a [String],
+    tags: &'a [String],
+    media_references: usize,
+}
+
+#[derive(Serialize)]
+struct CreateChecksDto {
+    source_canonical: bool,
+    candidate_reparsed: bool,
+    model_resolution_evidenced: bool,
+    media_references_absent: bool,
+    guids_resolved_without_conflict: bool,
+    only_notes_appended: bool,
+    appended_notes_verified: bool,
+}
+
+impl<'a> From<&'a CreateResult> for CreateDto<'a> {
+    fn from(result: &'a CreateResult) -> Self {
+        Self {
+            export_dir: result.export_dir.display().to_string(),
+            deck_json: result.deck_json.display().to_string(),
+            dry_run: result.dry_run,
+            applied: result.applied,
+            source_bytes: result.source_bytes,
+            candidate_bytes: result.candidate_bytes,
+            byte_delta: result.byte_delta,
+            notes_total: result.notes_total,
+            notes_created: result.notes_created,
+            notes_already_applied: result.notes_already_applied,
+            decks_touched: result
+                .decks_touched
+                .iter()
+                .map(|touch| DeckTouchDto {
+                    deck_path: &touch.deck_path,
+                    deck_uuid: &touch.deck_uuid,
+                    notes_before: touch.notes_before,
+                    notes_added: touch.notes_added,
+                })
+                .collect(),
+            outcomes: result
+                .outcomes
+                .iter()
+                .map(|outcome| CreateOutcomeDto {
+                    note_index: outcome.note_index,
+                    note_id: outcome.note_id.as_deref(),
+                    guid: &outcome.guid,
+                    guid_generated: outcome.guid_generated,
+                    status: outcome.status.as_str(),
+                    deck_path: &outcome.deck_path,
+                    deck_uuid: &outcome.deck_uuid,
+                    model_mode: outcome.model_mode.as_str(),
+                    model_uuid: &outcome.model_uuid,
+                    model_name: &outcome.model_name,
+                    model_evidence: &outcome.model_evidence,
+                    fields_total: outcome.fields_total,
+                    field_names: &outcome.field_names,
+                    tags: &outcome.tags,
+                    media_references: outcome.media_references,
+                })
+                .collect(),
+            outcomes_truncated: result.outcomes_truncated,
+            validation: ValidationDeltaDto::from(&result.validation),
+            checks: CreateChecksDto {
+                source_canonical: result.checks.source_canonical,
+                candidate_reparsed: result.checks.candidate_reparsed,
+                model_resolution_evidenced: result.checks.model_resolution_evidenced,
+                media_references_absent: result.checks.media_references_absent,
+                guids_resolved_without_conflict: result.checks.guids_resolved_without_conflict,
+                only_notes_appended: result.checks.only_notes_appended,
+                appended_notes_verified: result.checks.appended_notes_verified,
+            },
+        }
+    }
+}
+
+/// JSON-представление `retire`.
+pub fn retire_json(result: &RetireResult) -> String {
+    to_json("retire", RetireDto::from(result))
+}
+
+#[derive(Serialize)]
+struct RetireDto<'a> {
+    export_dir: String,
+    deck_json: String,
+    dry_run: bool,
+    applied: bool,
+    source_bytes: usize,
+    candidate_bytes: usize,
+    byte_delta: i64,
+    tag: &'a str,
+    notes_total: usize,
+    notes_retired: usize,
+    notes_already_retired: usize,
+    outcomes: Vec<RetireOutcomeDto<'a>>,
+    outcomes_truncated: bool,
+    validation: ValidationDeltaDto,
+    checks: RetireChecksDto,
+}
+
+#[derive(Serialize)]
+struct RetireOutcomeDto<'a> {
+    note_index: usize,
+    note_id: Option<&'a str>,
+    guid: &'a str,
+    status: &'static str,
+    deck_path: &'a str,
+    note_position: usize,
+    previous_tags: &'a [String],
+    tags: &'a [String],
+}
+
+#[derive(Serialize)]
+struct RetireChecksDto {
+    source_canonical: bool,
+    candidate_reparsed: bool,
+    only_tags_appended: bool,
+    tags_appended_verified: bool,
+    retired_notes_still_resolvable: bool,
+}
+
+impl<'a> From<&'a RetireResult> for RetireDto<'a> {
+    fn from(result: &'a RetireResult) -> Self {
+        Self {
+            export_dir: result.export_dir.display().to_string(),
+            deck_json: result.deck_json.display().to_string(),
+            dry_run: result.dry_run,
+            applied: result.applied,
+            source_bytes: result.source_bytes,
+            candidate_bytes: result.candidate_bytes,
+            byte_delta: result.byte_delta,
+            tag: &result.tag,
+            notes_total: result.notes_total,
+            notes_retired: result.notes_retired,
+            notes_already_retired: result.notes_already_retired,
+            outcomes: result
+                .outcomes
+                .iter()
+                .map(|outcome| RetireOutcomeDto {
+                    note_index: outcome.note_index,
+                    note_id: outcome.note_id.as_deref(),
+                    guid: &outcome.guid,
+                    status: outcome.status.as_str(),
+                    deck_path: &outcome.deck_path,
+                    note_position: outcome.note_position,
+                    previous_tags: &outcome.previous_tags,
+                    tags: &outcome.tags,
+                })
+                .collect(),
+            outcomes_truncated: result.outcomes_truncated,
+            validation: ValidationDeltaDto::from(&result.validation),
+            checks: RetireChecksDto {
+                source_canonical: result.checks.source_canonical,
+                candidate_reparsed: result.checks.candidate_reparsed,
+                only_tags_appended: result.checks.only_tags_appended,
+                tags_appended_verified: result.checks.tags_appended_verified,
+                retired_notes_still_resolvable: result.checks.retired_notes_still_resolvable,
+            },
+        }
+    }
+}
+
+/// JSON-представление `visual-report`.
+pub fn visual_report_json(result: &VisualReportResult) -> String {
+    to_json("visual-report", VisualReportDto::from(result))
+}
+
+#[derive(Serialize)]
+struct VisualReportDto<'a> {
+    before: ReportSideDto,
+    after: ReportSideDto,
+    out_dir: String,
+    index_html: String,
+    card_files: &'a [String],
+    card_files_total: usize,
+    preview_files: Vec<PreviewFileDto<'a>>,
+    preview_files_truncated: bool,
+    retire_tag: Option<&'a str>,
+    counts: ReportCountsDto,
+    outcomes: Vec<NoteOutcomeDto<'a>>,
+    outcomes_truncated: bool,
+    diagnostics: Vec<DiagnosticDto<'a>>,
+    unsupported_constructs: Vec<UnsupportedConstructDto<'a>>,
+    media: MediaSummaryDto<'a>,
+    limitations: &'a [String],
+    checks: ReportChecksDto,
+}
+
+#[derive(Serialize)]
+struct ReportSideDto {
+    export_dir: String,
+    deck_json: String,
+    deck_name: String,
+    crowdanki_uuid: Option<String>,
+    notes: usize,
+    decks: usize,
+    models: usize,
+}
+
+impl From<&ReportSide> for ReportSideDto {
+    fn from(side: &ReportSide) -> Self {
+        Self {
+            export_dir: side.export_dir.display().to_string(),
+            deck_json: side.deck_json.display().to_string(),
+            deck_name: side.deck_name.clone(),
+            crowdanki_uuid: side.deck_uuid.clone(),
+            notes: side.notes,
+            decks: side.decks,
+            models: side.models,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ReportCountsDto {
+    created: usize,
+    changed: usize,
+    retired: usize,
+    removed: usize,
+    unchanged: usize,
+    ambiguous: usize,
+    previews: usize,
+    notes_before: usize,
+    notes_after: usize,
+}
+
+#[derive(Serialize)]
+struct NoteOutcomeDto<'a> {
+    guid: &'a str,
+    kind: &'static str,
+    deck_path: &'a str,
+    model_name: Option<&'a str>,
+    tags_before: &'a [String],
+    tags_after: &'a [String],
+    changed_fields: &'a [String],
+    before_occurrences: usize,
+    after_occurrences: usize,
+}
+
+#[derive(Serialize)]
+struct DiagnosticDto<'a> {
+    code: &'a str,
+    severity: &'a str,
+    message: &'a str,
+    subject: Option<&'a str>,
+}
+
+/// Файл превью и то, что он доказывает.
+#[derive(Serialize)]
+struct PreviewFileDto<'a> {
+    file: &'a str,
+    state: &'static str,
+    guid: &'a str,
+    model_name: &'a str,
+    template_name: &'a str,
+    hint: &'a str,
+    media: &'a [String],
+    missing_sounds: &'a [String],
+}
+
+impl<'a> From<&'a PreviewFileFact> for PreviewFileDto<'a> {
+    fn from(fact: &'a PreviewFileFact) -> Self {
+        Self {
+            file: &fact.file,
+            state: fact.state.as_str(),
+            guid: &fact.guid,
+            model_name: &fact.model_name,
+            template_name: &fact.template_name,
+            hint: &fact.hint,
+            media: &fact.media,
+            missing_sounds: &fact.missing_sounds,
+        }
+    }
+}
+
+/// Сводка по media одного состояния.
+#[derive(Serialize)]
+struct StateMediaDto<'a> {
+    state: &'static str,
+    copied: &'a [String],
+    missing: &'a [String],
+    traversal: &'a [String],
+    remote: &'a [String],
+    symlinks: &'a [String],
+    oversized: &'a [String],
+}
+
+#[derive(Serialize)]
+struct MediaSummaryDto<'a> {
+    copied: usize,
+    missing: &'a [String],
+    traversal: &'a [String],
+    remote: &'a [String],
+    symlinks: &'a [String],
+    oversized: &'a [String],
+    budget_skipped: usize,
+    states: Vec<StateMediaDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct ReportChecksDto {
+    before_parsed: bool,
+    after_parsed: bool,
+    every_note_classified: bool,
+    out_dir_outside_decks: bool,
+    all_files_inside_out_dir: bool,
+    index_without_external_assets: bool,
+    every_generated_page_offline: bool,
+    media_confined_to_out_dir: bool,
+}
+
+impl<'a> From<&'a VisualReportResult> for VisualReportDto<'a> {
+    fn from(result: &'a VisualReportResult) -> Self {
+        Self {
+            before: ReportSideDto::from(&result.before),
+            after: ReportSideDto::from(&result.after),
+            out_dir: result.out_dir.display().to_string(),
+            index_html: result.index_html.display().to_string(),
+            card_files: &result.card_files,
+            card_files_total: result.card_files_total,
+            preview_files: result
+                .preview_files
+                .iter()
+                .map(PreviewFileDto::from)
+                .collect(),
+            preview_files_truncated: result.preview_files_truncated,
+            retire_tag: result.retire_tag.as_deref(),
+            counts: ReportCountsDto {
+                created: result.counts.created,
+                changed: result.counts.changed,
+                retired: result.counts.retired,
+                removed: result.counts.removed,
+                unchanged: result.counts.unchanged,
+                ambiguous: result.counts.ambiguous,
+                previews: result.counts.previews,
+                notes_before: result.counts.notes_before,
+                notes_after: result.counts.notes_after,
+            },
+            outcomes: result
+                .outcomes
+                .iter()
+                .map(|outcome| NoteOutcomeDto {
+                    guid: &outcome.guid,
+                    kind: outcome.kind.as_str(),
+                    deck_path: &outcome.deck_path,
+                    model_name: outcome.model_name.as_deref(),
+                    tags_before: &outcome.tags_before,
+                    tags_after: &outcome.tags_after,
+                    changed_fields: &outcome.changed_fields,
+                    before_occurrences: outcome.before_occurrences,
+                    after_occurrences: outcome.after_occurrences,
+                })
+                .collect(),
+            outcomes_truncated: result.outcomes_truncated,
+            diagnostics: result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| DiagnosticDto {
+                    code: diagnostic.code,
+                    severity: diagnostic.severity,
+                    message: &diagnostic.message,
+                    subject: diagnostic.subject.as_deref(),
+                })
+                .collect(),
+            unsupported_constructs: result
+                .unsupported_constructs
+                .iter()
+                .map(|item| UnsupportedConstructDto {
+                    construct: &item.construct,
+                    reason: &item.reason,
+                })
+                .collect(),
+            media: MediaSummaryDto {
+                copied: result.media.copied,
+                missing: &result.media.missing,
+                traversal: &result.media.traversal,
+                remote: &result.media.remote,
+                symlinks: &result.media.symlinks,
+                oversized: &result.media.oversized,
+                budget_skipped: result.media.budget_skipped,
+                states: result
+                    .media
+                    .states
+                    .iter()
+                    .map(|(state, summary)| StateMediaDto {
+                        state: state.as_str(),
+                        copied: &summary.copied,
+                        missing: &summary.missing,
+                        traversal: &summary.traversal,
+                        remote: &summary.remote,
+                        symlinks: &summary.symlinks,
+                        oversized: &summary.oversized,
+                    })
+                    .collect(),
+            },
+            limitations: &result.limitations,
+            checks: ReportChecksDto {
+                before_parsed: result.checks.before_parsed,
+                after_parsed: result.checks.after_parsed,
+                every_note_classified: result.checks.every_note_classified,
+                out_dir_outside_decks: result.checks.out_dir_outside_decks,
+                all_files_inside_out_dir: result.checks.all_files_inside_out_dir,
+                index_without_external_assets: result.checks.index_without_external_assets,
+                every_generated_page_offline: result.checks.every_generated_page_offline,
+                media_confined_to_out_dir: result.checks.media_confined_to_out_dir,
+            },
+        }
+    }
+}
+
+impl From<&crate::ops::source::ValidationDelta> for ValidationDeltaDto {
+    fn from(delta: &crate::ops::source::ValidationDelta) -> Self {
+        Self {
+            before: SeverityCountsDto {
+                errors: delta.before.errors,
+                warnings: delta.before.warnings,
+                info: delta.before.info,
+            },
+            after: SeverityCountsDto {
+                errors: delta.after.errors,
+                warnings: delta.after.warnings,
+                info: delta.after.info,
+            },
+            new_error_codes: delta.new_error_codes.clone(),
+            new_warning_codes: delta.new_warning_codes.clone(),
         }
     }
 }
