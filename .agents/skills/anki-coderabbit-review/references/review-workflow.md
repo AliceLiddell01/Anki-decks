@@ -8,6 +8,12 @@ verification, commit/push, rate-limit handling и отчёт.
 iteration, clean iteration, инварианты) задаёт `SKILL.md`. Здесь — только порядок
 действий.
 
+Общую процедуру публикации — staging, commit, push, exact remote verification —
+владеет repository skill `anki-git-workflow`
+(`references/publication.md`). Этот файл не дублирует её: он только требует от
+каждой completed iteration того состояния, которое ей нужно, и передаёт саму
+механику этому владельцу.
+
 ## 1. Установить candidate текущего checkout
 
 Cycle всегда работает с текущим checkout. Перед первой iteration зафиксируй:
@@ -29,15 +35,11 @@ GitHub API/MCP). Несовпадение — precondition problem: не пер�
 ### Опубликованность candidate
 
 Iteration начинается с committed + pushed HEAD, поэтому одной чистоты worktree
-недостаточно: нужно убедиться, что текущий HEAD уже опубликован. Remote-tracking
-ссылка может быть устаревшей, поэтому сначала обнови её, а потом сравни:
-
-```bash
-git fetch <remote>
-git rev-parse HEAD
-git rev-parse '@{u}'
-```
-
+недостаточно: нужно убедиться, что текущий HEAD уже опубликован. Устаревший
+remote-tracking ref для этого не годится — опубликованность подтверждается тем
+точным сравнением удалённой ссылки, которым владеет `anki-git-workflow`
+(`references/publication.md`, «Remote postcondition»); не заводи здесь второй
+копии этой процедуры.
 Если HEAD и upstream расходятся — есть неопубликованные коммиты либо upstream
 ушёл вперёд, — это precondition problem, а не материал для review. Не запускай
 review неопубликованного candidate и не публикуй неизвестные локальные коммиты
@@ -51,13 +53,9 @@ Base нужен как точка сравнения текущего committed 
 1. Если для текущей branch существует PR и это удаётся установить надёжно —
    используй его фактический base.
 2. Если PR нет — используй канонический base repository, однозначно следующий из
-   Git state, например remote default branch:
-
-   ```bash
-   git symbolic-ref refs/remotes/origin/HEAD
-   # или, если локальная ссылка отсутствует:
-   git ls-remote --symref origin HEAD
-   ```
+   Git state: remote default branch. Как именно он разрешается, владеет
+   `anki-git-workflow` (`references/publication.md`, «Ветка»); не заводи здесь
+   второй копии этой процедуры.
 
 Официальная документация CodeRabbit CLI **не описывает** автоматическое
 определение base открытого PR для локального review: `--base` остаётся
@@ -470,9 +468,10 @@ fixes требуется:
    `AGENTS.md`, `.codex/context/INDEX.md` и владелец затронутой области, в том
    числе `.codex/context/03-VERIFICATION.md` для CrowdAnki JSON и контракт
    `tools/anki-repo/README.md` для toolkit;
-3. проверка итогового diff/status перед commit (`git diff`, `git status
-   --porcelain`): в commit не должны попасть временные файлы, несвязанные
-   изменения и пользовательские локальные данные.
+3. проверка перед commit, что в него не попадут временные файлы, несвязанные
+   изменения и пользовательские локальные данные: staging и перечитывание
+   staged diff выполняются по процедуре `anki-git-workflow`
+   (`references/publication.md`), а не второй копией здесь.
 
 Какие именно проверки нужны, определяется актуальным repository context и
 затронутой областью, а не этим файлом. Если review не потребовал изменения кода,
@@ -481,6 +480,11 @@ fixes требуется:
 ### 4.6 Commit
 
 Commit создаётся на текущей branch и в текущем repository.
+
+CodeRabbit-specific часть здесь — только **что** должно попасть в commit. Сама
+механика staging и commit принадлежит `anki-git-workflow`
+(`references/publication.md`): стейджатся только пути текущей задачи, staged diff
+перечитывается, сообщение описывает фактическое изменение.
 
 - Если iteration содержит реальные fixes — commit содержит их и имеет смысловое
   сообщение по фактической root cause; marker commit не создаётся.
@@ -495,25 +499,21 @@ Commit создаётся на текущей branch и в текущем reposi
 Сообщение пиши по-русски, в стиле репозитория, ясно показывая clean CodeRabbit
 pass. Не превращай marker commit в маскировку blocker'а.
 
-### 4.7 Push и подтверждение HEAD
+Пустой marker commit — осознанная часть именно этого контракта: он маркирует
+реально выполненный clean review. Это тот случай, когда пустой commit допустим;
+на обычные задачи вне CodeRabbit cycle он не распространяется.
 
-```bash
-git push <remote> HEAD
-git fetch <remote>
-git rev-parse HEAD
-git rev-parse '@{u}'
-git status --porcelain
-```
+### 4.7 Публикация и подтверждение HEAD
 
-Указывай remote и refspec явно. Голый `git push` подчиняется `push.default` и
-другим настройкам Git: в конфигурациях вида `matching` он может опубликовать
-несколько refs, а cycle обязан публиковать только текущую branch. `<remote>` —
-фактический remote этой branch (обычно `origin`), берётся из её upstream, а не
-назначается произвольно.
+Публикация выполняется по процедуре `anki-git-workflow`
+(`references/publication.md`): явный remote и refspec, push текущей branch,
+корректный upstream при первой публикации и exact сравнение удалённого SHA с
+ожидаемым локальным HEAD.
 
-Локальный и remote HEAD должны совпасть, worktree — остаться clean. Только после
-этого начинается следующая iteration, и только она проверяет новый
-опубликованный HEAD.
+CodeRabbit-specific требование к результату: к началу следующей iteration
+опубликованный HEAD должен совпадать с локальным, а worktree — остаться clean.
+Только после этого начинается следующая iteration, и только она проверяет новый
+опубликованный HEAD. Exit code push сам по себе доказательством не является.
 
 Разрешение на commit и push является частью уже явно запрошенного cycle и
 ограничено текущим cycle и текущей branch. Оно **не** разрешает merge,

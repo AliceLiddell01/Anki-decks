@@ -4,3 +4,8 @@
 # Артефакты сборки корневого Cargo workspace: Rust-проверки запускаются из корня
 # репозитория, поэтому build output принадлежит корневому `target/`.
 /target
+
+# Repository-local рабочие артефакты агента — например Markdown-источник body
+# текущего PR (`/.codex/local/pr/<task>/body.md`). Это не публикуемый контракт
+# репозитория и не tracked: процедуру владеет `.agents/skills/anki-git-workflow/`.
+/.codex/local/
