@@ -45,7 +45,12 @@
 
 `.agents/skills/` содержит repository skills: по каталогу
 `.agents/skills/<name>/SKILL.md` на skill. Процедуру каждого workflow владеет сам
-skill, а не README.
+skill, а не README:
+
+- `anki-git-workflow` — обычная процедура Git/GitHub: рабочая ветка, commit, push
+  с проверкой удалённого состояния, PR и отдельно разрешённый merge;
+- `anki-coderabbit-review` — явно запрошенный CodeRabbit review cycle текущего
+  checkout.
 
 ## Инструменты
 

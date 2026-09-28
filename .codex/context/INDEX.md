@@ -18,6 +18,12 @@
 | `02-CROWDANKI-JSON.md` | устройство CrowdAnki JSON, связи сущностей и безопасная навигация |
 | `03-VERIFICATION.md` | минимальные проверки JSON и структурных инвариантов после изменения, проверки CI и локальное воспроизведение набора |
 | `tools/anki-repo/README.md` | контракт toolkit `anki-repo`: команды, вывод, exit codes, правила QA, границы правки `edit` |
+| `.agents/skills/anki-git-workflow/` | обычная процедура Git/GitHub: branch, staging, commit, push, проверка удалённого состояния, PR, merge |
+| `.agents/skills/anki-coderabbit-review/` | явно запрошенный CodeRabbit review cycle текущего checkout |
+
+Вопросы вне этого каталога — Git/GitHub lifecycle и CodeRabbit review — принадлежат
+repository skills из `.agents/skills/`: маршрутизируй к ним, а не заводи здесь
+второго владельца их процедуры.
 
 ## Инструменты
 
