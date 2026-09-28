@@ -12,7 +12,7 @@
 //! кавычки — то есть валидная разметка проходила бы мимо гейта
 //! `media_forbidden`. Разбор разметки выполняет [`crate::htmlscan`], а политика
 //! «какой атрибут какого элемента несёт media» объявлена здесь одной таблицей
-//! [`MEDIA_ATTRIBUTES`], чтобы README, гейт `create` и подстановка ссылок в
+//! [`ADDRESS_ATTRIBUTES`], чтобы README, гейт `create` и подстановка ссылок в
 //! отчёте не разъезжались.
 //!
 //! Две функции намеренно различаются, и различие документировано:
@@ -27,7 +27,9 @@
 //!
 //! Разбор самой разметки выполняет [`crate::htmlscan`], разбор CSS — владелец
 //! политики адресов [`crate::report::css`]: гейт не заводит второй парсер, иначе
-//! «что здесь адрес» решалось бы в двух местах и разъезжалось.
+//! «что здесь адрес» решалось бы в двух местах и разъезжалось. Значение `style`
+//! перед разбором раскодируется: браузер раскодирует символьные ссылки в
+//! атрибуте, поэтому `url&#40;a.png&#41;` — это для него адрес, а не текст.
 //!
 //! Гейт используется только для отказа; ссылок он не читает и файлов не
 //! открывает.
@@ -80,10 +82,11 @@ pub enum ReferenceKind {
 ///   `input`, `embed`, `iframe`, `frame`, `script`. `<div src="…">` не запрашивает
 ///   ничего — такого атрибута у `div` нет, — поэтому считать его ссылкой значило
 ///   бы запрещать валидную разметку на основании имени атрибута, а не семантики
-///   элемента. Так же поэлементны legacy `background`, `srcset` и `poster`;
+///   элемента. Так же поэлементны legacy `background`, `srcset`, `poster` и
+///   ссылка на файл у SVG (`image`, `feImage`);
 /// - **навигационные атрибуты, наоборот, перечислены через `*`.** Переход не
 ///   запрашивает файл, но уводит документ за его пределы, а состав элементов,
-///   которые его выполняют, шире и включает SVG (`xlink:href` у `use` и `image`).
+///   которые его выполняют, шире и включает SVG (`xlink:href` у `use`).
 ///   Здесь неполный список означал бы живой внешний адрес в офлайн-отчёте, поэтому
 ///   область выбрана намеренно широкой: лишняя нейтрализация видна и безопасна.
 pub const ADDRESS_ATTRIBUTES: &[(&str, &str, ReferenceKind)] = &[
@@ -109,6 +112,15 @@ pub const ADDRESS_ATTRIBUTES: &[(&str, &str, ReferenceKind)] = &[
     ("source", "srcset", ReferenceKind::Media),
     ("video", "poster", ReferenceKind::Media),
     ("object", "data", ReferenceKind::Media),
+    // SVG: `href` у `image` и `feImage` запрашивает файл, а не уводит по переходу,
+    // поэтому эти строки стоят до навигационных `*`-строк — решает первое
+    // совпадение в таблице. `use href` сюда не попадает намеренно: тем же
+    // атрибутом адресуется и фрагмент внутри документа (`#иконка`), который файла
+    // не запрашивает, а таблица различает элементы и атрибуты, а не значения.
+    ("image", "href", ReferenceKind::Media),
+    ("image", "xlink:href", ReferenceKind::Media),
+    ("feimage", "href", ReferenceKind::Media),
+    ("feimage", "xlink:href", ReferenceKind::Media),
     ("*", "href", ReferenceKind::Navigation),
     ("*", "xlink:href", ReferenceKind::Navigation),
     ("*", "action", ReferenceKind::Navigation),
@@ -317,7 +329,7 @@ fn css_media_references(text: &str) -> Vec<String> {
                     if !attribute.name.eq_ignore_ascii_case("style") {
                         continue;
                     }
-                    found.extend(css_addresses(attribute.value));
+                    found.extend(style_attribute_addresses(attribute.value));
                 }
             }
             Tag::RawText { name, body, .. } => {
@@ -332,12 +344,25 @@ fn css_media_references(text: &str) -> Vec<String> {
                     if !attribute.name.eq_ignore_ascii_case("style") {
                         continue;
                     }
-                    found.extend(css_addresses(attribute.value));
+                    found.extend(style_attribute_addresses(attribute.value));
                 }
             }
         }
     }
     found
+}
+
+/// Адреса в значении `style` — так, как их увидит браузер.
+///
+/// Значение раскодируется: символьные ссылки в атрибуте браузер раскодирует, и
+/// `url&#40;a.png&#41;` — это для него адрес, а не текст. Ссылка, которой разбор
+/// не знает, тоже становится отказом: адрес в таком значении разбору не виден, а
+/// «не понял» здесь означает отказ, а не пропуск.
+fn style_attribute_addresses(value: &str) -> Vec<String> {
+    match htmlscan::decoded_attribute_value(value) {
+        Some(decoded) => css_addresses(&decoded),
+        None => vec![value.to_string()],
+    }
 }
 
 /// Адреса одного фрагмента CSS в записи владельца политики.
@@ -641,5 +666,77 @@ mod tests {
         };
         assert_eq!(report.missing_physical(), vec!["a.mp3".to_string()]);
         assert_eq!(report.undeclared_physical(), vec!["c.mp3".to_string()]);
+    }
+
+    /// SVG-ссылка на файл — это media, а не переход.
+    ///
+    /// `href` у `image` и `feImage` браузер запрашивает как ресурс, а не уводит по
+    /// нему документ. `use href` в таблице остаётся навигационным: тем же
+    /// атрибутом адресуется фрагмент внутри документа (`#иконка`), который файла
+    /// не запрашивает, а таблица различает элементы и атрибуты, а не значения.
+    #[test]
+    fn svg_file_references_are_media_and_fragments_are_not() {
+        for (element, attribute) in [
+            ("image", "href"),
+            ("image", "xlink:href"),
+            ("feImage", "href"),
+            ("feImage", "xlink:href"),
+        ] {
+            assert_eq!(
+                attribute_kind(element, attribute),
+                Some(ReferenceKind::Media),
+                "{element} {attribute}"
+            );
+        }
+        for (element, attribute) in [("use", "href"), ("use", "xlink:href"), ("a", "href")] {
+            assert_eq!(
+                attribute_kind(element, attribute),
+                Some(ReferenceKind::Navigation),
+                "{element} {attribute}"
+            );
+        }
+    }
+
+    /// Адрес в `style`, записанный символьной ссылкой, — та же ссылка.
+    ///
+    /// Браузер раскодирует ссылки в значении атрибута, и `url&#40;a.png&#41;` для
+    /// него — запрос файла. Гейт обязан видеть то же значение, что и браузер.
+    #[test]
+    fn a_style_address_written_as_a_character_reference_is_forbidden() {
+        for text in [
+            r#"<div style="background:url&#40;a.png&#41;">"#,
+            r#"<div style="background:url&#x28;a.png&#x29;">"#,
+            r#"<div style='background:url&#40;a.png&#41;'>"#,
+            // Незакрытый тег: значение поля склеится с шаблоном, и атрибут закроется
+            // уже там — гейт считает такую конструкцию ссылкой.
+            r#"<div style="background:url&#40;a.png&#41;"#,
+        ] {
+            assert!(
+                !forbidden_media_references(text).is_empty(),
+                "ссылка в {text:?} не найдена"
+            );
+        }
+    }
+
+    /// Ссылка, которой разбор не знает, — тоже отказ, а не пропуск.
+    ///
+    /// Значение может значить что угодно, а адрес в нём остался бы незамеченным.
+    #[test]
+    fn an_unknown_character_reference_is_refused_not_skipped() {
+        assert!(!forbidden_media_references(r#"<div style="x:&lpar;">"#).is_empty());
+    }
+
+    /// `&` в данных ссылкой не считается: гейт не запрещает то, чего в разметке нет.
+    #[test]
+    fn a_bare_ampersand_in_a_style_value_is_not_a_reference() {
+        for text in [
+            r#"<div style="content:'a & b'">"#,
+            r#"<div style="content:'&amp;'">"#,
+        ] {
+            assert!(
+                forbidden_media_references(text).is_empty(),
+                "лишний отказ на {text:?}"
+            );
+        }
     }
 }

@@ -2635,3 +2635,79 @@ fn a_media_reference_without_a_basename_is_named_and_does_not_stop_the_report() 
         "ссылка с путём разрешается только в базовое имя внутри отчёта: {card}"
     );
 }
+/// Разметка в значении поля разбирается так же, как её разберёт браузер.
+///
+/// Каждая конструкция ниже — это место, где разбор и браузер расходятся, если
+/// разбор читает текст по-своему: `/` у непустого элемента браузер игнорирует,
+/// `--!>` закрывает комментарий, а адрес в `style` браузер получает уже
+/// раскодированным. Расхождение направлено в одну сторону: разбор не видит
+/// разметки, которую браузер исполняет, и превью перестаёт быть превью
+/// неизменяемого JSON.
+#[test]
+fn a_field_value_is_parsed_the_way_the_browser_parses_it() {
+    let before = canonical_base("report-browser-before");
+    let after = canonical_base("report-browser-after");
+    set_field(
+        &after,
+        "guid-2",
+        0,
+        "<script/>alert('самозакрытый тег')</script>\
+         <!--a--!><img src=\"no.png\" onerror=\"alert('после комментария')\">\
+         <div style='content:\"кавычка\";background:url(&#40;a.png&#41;)'>разметка</div>\
+         <div data-report-runtime=\"card\" onmouseover=\"alert('пометка сборщика')\">разметка</div>",
+    );
+
+    let out = TempDir::new("report-browser-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+
+    assert_eq!(
+        result["checks"]["every_generated_page_offline"],
+        json!(true)
+    );
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    assert_eq!(
+        script_bodies(&card).len(),
+        1,
+        "в файле исполняется только runtime отчёта"
+    );
+    assert!(
+        event_handlers(&card).is_empty(),
+        "обработчиков событий в превью быть не должно: {:?}",
+        event_handlers(&card)
+    );
+    assert!(
+        !card.contains("<script/>"),
+        "тело self-closing script читается как код, а не как разметка"
+    );
+    assert!(
+        card.contains("самозакрытый тег"),
+        "отвергнутый код показан текстом: читатель видит, что именно не отрисовано"
+    );
+    // Комментарий — часть значения поля, и в превью он остаётся собой.
+    assert!(card.contains("<!--a--!>"), "комментарий не переписывается");
+    // Кавычка в `style` не имеет права закрыть атрибут и начать разметку.
+    assert!(
+        card.contains("content:&quot;кавычка&quot;"),
+        "кавычка в значении style экранирована"
+    );
+    // Адрес, записанный символьной ссылкой, для браузера — адрес: он не остаётся.
+    assert!(
+        !card.contains("url(a.png)") && !card.contains("src=\"no.png\""),
+        "адрес из CSS и из src не доходит до превью"
+    );
+    assert!(
+        card.contains("missing: no.png"),
+        "отсутствующий файл назван, а не спрятан: превью показывает, чего в нём нет"
+    );
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .expect("диагностика")
+            .iter()
+            .any(|item| item["code"] == "preview_construct_blocked"),
+        "диагностика называет отвергнутые конструкции: {result}"
+    );
+}

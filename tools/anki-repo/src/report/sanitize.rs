@@ -414,11 +414,14 @@ pub fn inspect(document: &str, page: Page, resources: &Resources) -> Vec<Violati
         match tag {
             Tag::Element(element) => {
                 let name = element.name.to_ascii_lowercase();
-                let runtime_owned = element.attribute("data-report-runtime").is_some();
 
-                if name == "script" && !runtime_owned {
+                // Исключения нет: runtime отчёта — это raw-text `script`, который
+                // разобран как [`Tag::RawText`] и сверен по телу. Элемент `script`
+                // в готовом документе — всегда чужая разметка, и пометка
+                // `data-report-runtime` в значении поля её не оправдывает.
+                if name == "script" {
                     violations.push(Violation {
-                        what: "исполняемый <script> без пометки runtime отчёта".to_string(),
+                        what: "исполняемый <script> без тела runtime отчёта".to_string(),
                     });
                 }
                 if DROPPED_ELEMENTS.contains(&name.as_str())
@@ -451,12 +454,13 @@ pub fn inspect(document: &str, page: Page, resources: &Resources) -> Vec<Violati
                         });
                     }
                     if attribute_name == "style" {
-                        violations.extend(css_violations(
-                            attribute.value,
-                            page,
-                            resources,
-                            "style",
-                        ));
+                        match htmlscan::decoded_attribute_value(attribute.value) {
+                            Some(decoded) => violations
+                                .extend(css_violations(&decoded, page, resources, "style")),
+                            None => violations.push(Violation {
+                                what: "значение style записано символьной ссылкой".to_string(),
+                            }),
+                        }
                     }
                 }
             }
@@ -581,17 +585,15 @@ impl Sanitizer<'_> {
             return;
         }
 
-        // Пометки сборщика страницы ставит сам отчёт: они нужны runtime и не
-        // являются данными.
-        let report_owned = element.attribute("data-report-runtime").is_some()
-            || element.attribute("data-report-state").is_some()
-            || element.attribute("data-report-theme-value").is_some();
-
+        // Пометки сборщика страницы ставит сам отчёт, но внутри значения поля их
+        // может написать кто угодно: данные не отличаются от разметки отчёта.
+        // Поэтому «свой» здесь не значит «доверенный» — исключений для обработчиков
+        // нет, и `report_owned` больше не ослабляет правило.
         let mut kept: Vec<usize> = Vec::new();
         let mut dropped: Vec<Blocked> = Vec::new();
         for (index, attribute) in element.attributes.iter().enumerate() {
             let attribute_name = attribute.name.to_ascii_lowercase();
-            if attribute_name.starts_with("on") && !report_owned {
+            if attribute_name.starts_with("on") {
                 dropped.push(Blocked::new(
                     attribute_name,
                     "обработчик события исполнил бы чужой код: атрибут удалён",
@@ -615,9 +617,24 @@ impl Sanitizer<'_> {
             kept.push(index);
         }
 
-        let sanitized_style = element
-            .attribute("style")
-            .map(|attribute| css(attribute.value, self.page, self.resources));
+        // Ссылки в значении атрибута раскодируются до разбора CSS: браузер увидит
+        // адрес там, где в исходном тексте его не видно, и очистка обязана решать
+        // по тому же тексту, что и браузер. Незнакомая ссылка значения не имеет:
+        // тогда весь `style` становится инертным, а причина называется.
+        let sanitized_style = element.attribute("style").map(|attribute| {
+            match htmlscan::decoded_attribute_value(attribute.value) {
+                Some(decoded) => css(&decoded, self.page, self.resources),
+                None => SanitizedCss {
+                    css: INERT_CSS_VALUE.to_string(),
+                    blocked: vec![Blocked::new(
+                        "style".to_string(),
+                        "значение style записано символьной ссылкой: адрес в нём разбору не виден, \
+                         поэтому значение не показано"
+                            .to_string(),
+                    )],
+                },
+            }
+        });
         if let Some(style) = &sanitized_style {
             self.blocked.extend(style.blocked.iter().cloned());
         }
@@ -632,7 +649,7 @@ impl Sanitizer<'_> {
                 continue;
             }
             let value = match sanitized_style.as_ref() {
-                Some(style) if attribute.name_is("style") => style.css.clone(),
+                Some(style) if attribute.name_is("style") => escape_attr(&style.css),
                 _ => escape_attr(attribute.value),
             };
             self.out.push(' ');
@@ -1111,6 +1128,99 @@ mod tests {
         ] {
             let sanitized = sanitize(fragment);
             assert!(clean(&sanitized.html), "{fragment:?} → {sanitized:?}");
+        }
+    }
+
+    /// Тег, записанный как самозакрытый, всё равно открывает raw-text элемент.
+    ///
+    /// HTML5 игнорирует `/` у непустого элемента, поэтому `<script/>` — это
+    /// открывающий тег, а тело после него читается браузером как код. Разбор
+    /// обязан увидеть то же: иначе чужой код в поле остался бы в документе тегом.
+    #[test]
+    fn a_self_closing_script_is_shown_as_text() {
+        let result = sanitize("<script/>alert(1)</script>");
+        assert!(!result.html.contains("<script"), "{result:?}");
+        assert!(result.html.contains("alert(1)"), "{result:?}");
+        assert_eq!(result.blocked.len(), 1, "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    /// Пометка сборщика отчёта не делает обработчик своим.
+    ///
+    /// `data-report-runtime` в значении поля может написать кто угодно, а
+    /// обработчик события — это исполнение чужого кода в отчёте.
+    #[test]
+    fn a_handler_behind_a_report_marker_is_dropped() {
+        let result = sanitize("<div data-report-runtime=\"card\" onmouseover=\"alert(3)\">т</div>");
+        assert_eq!(result.html, "<div data-report-runtime=\"card\">т</div>");
+        assert_eq!(result.blocked.len(), 1, "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    /// Кавычка внутри `style` не имеет права выйти за пределы атрибута.
+    ///
+    /// Значение `style` пишется в двойных кавычках, поэтому кавычка в очищенном
+    /// CSS — это конец атрибута и начало чужой разметки.
+    #[test]
+    fn a_quote_in_a_style_value_cannot_leave_the_attribute() {
+        let result =
+            sanitize("<div style='content:\"x\";background:url(https://evil/a.png)'>т</div>");
+        assert_eq!(
+            result.html,
+            "<div style=\"content:&quot;x&quot;;background:none\">т</div>"
+        );
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    /// Адрес, записанный символьной ссылкой, остаётся адресом.
+    ///
+    /// Браузер раскодирует ссылки в значении атрибута: `url&#40;a.png&#41;` — это
+    /// для него запрос файла, которого в отчёте нет.
+    #[test]
+    fn an_address_written_as_a_character_reference_is_still_an_address() {
+        let result = sanitize("<div style=\"background:url&#40;a.png&#41;\">т</div>");
+        assert_eq!(result.html, "<div style=\"background:none\">т</div>");
+        assert_eq!(result.blocked.len(), 1, "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    /// Незнакомая символьная ссылка делает значение инертным.
+    ///
+    /// Что именно она значит, разбор не знает, а адрес в таком значении мог бы
+    /// остаться незамеченным: поэтому значение не показывается, а причина
+    /// называется.
+    #[test]
+    fn an_unknown_character_reference_makes_the_style_inert() {
+        let result = sanitize("<div style=\"x:&lpar;\">т</div>");
+        assert_eq!(result.html, "<div style=\"none\">т</div>");
+        assert_eq!(result.blocked.len(), 1, "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    /// Комментарий кончается там, где его закрывает браузер.
+    ///
+    /// `--!>` закрывает комментарий для браузера: разметка после него действует.
+    /// Если разбор считает её комментарием, очистка не видит ни тега, ни
+    /// обработчика, и оба доходят до документа.
+    #[test]
+    fn a_comment_that_ends_early_does_not_hide_markup() {
+        let result = sanitize("<!--a--!><img src=no.png onerror=\"alert(2)\">");
+        assert_eq!(result.html, "<!--a--!><img>");
+        assert_eq!(result.blocked.len(), 2, "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    /// Документ с тегом `script` отвергается и с пометкой runtime.
+    ///
+    /// Runtime отчёта — это raw-text `script`, сверенный по телу, а элемент
+    /// `script` в готовом документе всегда чужая разметка.
+    #[test]
+    fn a_script_element_is_refused_even_with_a_report_marker() {
+        for document in [
+            "<body><script data-report-runtime=\"card\">alert(1)</script></body>",
+            "<body><script data-report-runtime=\"card\"/></body>",
+        ] {
+            assert!(!clean(document), "{document:?}");
         }
     }
 }

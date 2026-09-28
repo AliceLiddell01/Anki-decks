@@ -16,7 +16,7 @@
 //! - тег задаёт запрос, а не инструмент. Собственного «магического» тега у
 //!   toolkit'а нет: какой тег означает вывод из обращения — решение колоды.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -324,6 +324,20 @@ pub fn validate_request(request: &RetireRequest) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// Считаются ли два тега одним и тем же тегом.
+///
+/// Anki сопоставляет теги без учёта регистра: `Retired` и `retired` — один тег, и
+/// хранится в колоде одно написание. Сравнение поэтому тоже регистронезависимое, и
+/// не только для ASCII: теги здесь в том числе кириллические, а `to_lowercase`
+/// приводит регистр в Unicode, а не в латинице.
+///
+/// Правило одно на всех, кто отвечает на вопрос «этот тег уже стоит», иначе
+/// `retire` дописывал бы тег, который Anki считает уже стоящим.
+#[must_use]
+pub fn same_tag(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
+}
+
 /// Проверяет тег Anki: непустой, без пробельных символов и управляющих кодов.
 ///
 /// # Errors
@@ -554,12 +568,11 @@ fn resolve_target(
         )));
     }
 
-    let tags = entry
+    let already_tagged = entry
         .note
         .tags
         .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<&str>>();
+        .any(|existing| same_tag(existing, tag));
 
     Ok(Target {
         note_index,
@@ -570,7 +583,7 @@ fn resolve_target(
         children: value.path.children.clone(),
         note: value.path.note,
         previous_tags: entry.note.tags.clone(),
-        already_tagged: tags.contains(tag),
+        already_tagged,
     })
 }
 
@@ -757,7 +770,12 @@ fn ensure_still_resolvable(
             ));
         };
         let entry = &index.notes[*position];
-        if !entry.note.tags.iter().any(|existing| existing == tag) {
+        if !entry
+            .note
+            .tags
+            .iter()
+            .any(|existing| same_tag(existing, tag))
+        {
             return Err(DomainError::with_details(
                 ErrorCode::Internal,
                 format!(

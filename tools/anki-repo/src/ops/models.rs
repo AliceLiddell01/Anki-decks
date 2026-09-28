@@ -28,7 +28,7 @@ use crate::index::ExportIndex;
 use crate::loader;
 use crate::model::{NoteModel, Ord};
 use crate::ops::deck_select::{DeckSelector, ResolvedDeck};
-use crate::ops::source::{deck_child_paths, internal};
+use crate::ops::source::deck_child_paths;
 use crate::template::{ConstructKind, ModelKind, scan_constructs};
 use crate::text::bounded_sample;
 
@@ -358,7 +358,7 @@ fn evidence_of(
             ord: field.ord,
             name: field.name.clone(),
             description: field.description.clone(),
-            samples: sample_values(index, &notes, field.ord, sample_limit),
+            samples: sample_values(&notes, field.ord, sample_limit),
             empty_in_deck: notes
                 .iter()
                 .filter(|note| {
@@ -431,12 +431,7 @@ fn model_owner_declares(
 }
 
 /// Ограниченные representatives-примеры непустых значений поля.
-fn sample_values(
-    index: &ExportIndex<'_>,
-    notes: &[&crate::model::Note],
-    position: usize,
-    limit: usize,
-) -> Vec<FieldSample> {
+fn sample_values(notes: &[&crate::model::Note], position: usize, limit: usize) -> Vec<FieldSample> {
     let mut samples: Vec<FieldSample> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
@@ -460,7 +455,6 @@ fn sample_values(
         });
     }
 
-    let _ = index;
     samples
 }
 
@@ -637,7 +631,7 @@ pub fn resolve(
     match selector.mode {
         ModelMode::Explicit => {
             let model = explicit_model(index, selector)?;
-            let model = usable(model)?;
+            let model = usable_model(model)?;
 
             let known: BTreeSet<&str> = model.flds.iter().map(|f| f.name.as_str()).collect();
             let missing: Vec<String> = known
@@ -904,10 +898,6 @@ fn explicit_model<'a>(
 }
 
 /// Проверяет, что схема модели пригодна, и возвращает её же.
-fn usable(model: &NoteModel) -> Result<&NoteModel, DomainError> {
-    usable_model(model)
-}
-
 fn usable_model(model: &NoteModel) -> Result<&NoteModel, DomainError> {
     let problems = schema_problems(model);
     if problems.is_empty() {
@@ -941,10 +931,4 @@ fn notes_in_subtree(
         .filter(|note| subtree.contains(&note.node))
         .filter(|note| note.note.note_model_uuid == model.crowdanki_uuid)
         .count()
-}
-
-/// Внутренняя ошибка о неожиданном состоянии разрешения.
-#[allow(dead_code)]
-fn unexpected(message: impl Into<String>) -> DomainError {
-    internal(message)
 }

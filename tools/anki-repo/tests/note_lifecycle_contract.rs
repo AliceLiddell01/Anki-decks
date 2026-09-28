@@ -1870,3 +1870,82 @@ fn create_auto_refuses_an_empty_deck_with_several_compatible_models() {
         "отказ обязан перечислить кандидатов"
     );
 }
+/// Повтор тега ищется так же, как его ищет Anki: без учёта регистра.
+///
+/// `["Дом", "дом"]` — это один тег в двух написаниях, а не два тега. Принять такой
+/// запрос значит создать заметку, в которой тег стоит дважды: Anki хранит одно
+/// написание, и второе осталось бы мусором в поле.
+#[test]
+fn create_refuses_tags_that_differ_only_by_case() {
+    let dir = canonical_base_export("create-tag-case");
+    let before = dir.deck_json_bytes();
+
+    let mut spec = note_spec(fields("新語", "слово", ""));
+    spec["tags"] = json!(["Дом", "дом"]);
+    let path = write_request(&dir, "create-tag-case.json", &create_request(&[spec]));
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+    let error = error_of(exit, &stdout);
+    assert_eq!(error["code"], "invalid_request");
+    assert_eq!(error["details"]["reason"], "duplicate_tag");
+    assert_eq!(dir.deck_json_bytes(), before);
+
+    // Разные теги, отличающиеся не только регистром, по-прежнему принимаются.
+    let mut spec = note_spec(fields("新語", "слово", ""));
+    spec["tags"] = json!(["Дом", "дом::второй"]);
+    let path = write_request(&dir, "create-tag-distinct.json", &create_request(&[spec]));
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+        ],
+    );
+    let result = result_of(exit, &stdout);
+    assert_eq!(result["outcomes"][0]["status"], "dry_run");
+}
+
+/// Тег сравнивается как у Anki: без учёта регистра.
+///
+/// `тэг` и `ТЭГ` для Anki — один тег, поэтому дописывать второе написание значило
+/// бы дублировать тег, который уже стоит. Сравнение регистронезависимое и для
+/// кириллицы, а не только для латиницы.
+#[test]
+fn retire_treats_tags_that_differ_only_by_case_as_the_same() {
+    let dir = canonical_base_export("retire-tag-case");
+    let before = dir.deck_json_bytes();
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "retire",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--guid",
+            "guid-1",
+            "--tag",
+            "ТЭГ",
+            "--apply",
+        ],
+    );
+    let result = result_of(exit, &stdout);
+    assert_eq!(result["outcomes"][0]["status"], "already_retired");
+    assert_eq!(result["notes_retired"], 0);
+    assert_eq!(result["notes_already_retired"], 1);
+    assert_eq!(result["applied"], false);
+    assert_eq!(dir.deck_json_bytes(), before);
+    assert_eq!(dir.deck_json()["notes"][0]["tags"], json!(["тэг"]));
+}

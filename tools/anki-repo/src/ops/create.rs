@@ -37,6 +37,7 @@ use crate::model::FieldValue;
 use crate::ops::deck_select::DeckSelector;
 use crate::ops::models::{self, ModelMode, ModelSelector, ResolvedModel};
 use crate::ops::publish;
+use crate::ops::retire;
 use crate::ops::source::{
     EditableSource, ValidationDelta, deck_child_paths, internal, load_editable_source, node_mut,
     validation_delta,
@@ -406,10 +407,12 @@ pub fn validate_request(request: &CreateRequest) -> Result<(), DomainError> {
             ));
         }
 
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut seen: Vec<&str> = Vec::new();
         for tag in &note.tags {
             validate_tag(tag, position)?;
-            if !seen.insert(tag.as_str()) {
+            // Повтор ищется тем же правилом, что и у Anki: теги не различают
+            // регистр, поэтому `["Дом", "дом"]` — это повтор, а не два тега.
+            if seen.iter().any(|existing| retire::same_tag(existing, tag)) {
                 return Err(DomainError::with_details(
                     ErrorCode::InvalidRequest,
                     format!("заметка #{position}: тег {tag:?} повторяется"),
@@ -420,6 +423,7 @@ pub fn validate_request(request: &CreateRequest) -> Result<(), DomainError> {
                     },
                 ));
             }
+            seen.push(tag);
         }
     }
 

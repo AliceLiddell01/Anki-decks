@@ -215,20 +215,26 @@ fn next_token_len(rest: &str) -> usize {
 }
 
 /// Длина HTML-тега вместе с угловыми скобками, если он есть.
+///
+/// Поиск ограничен [`MAX_TAG_BYTES`] и не идёт по всему остатку: иначе в длинном
+/// тексте без `>` каждый `<` просматривал бы текст до конца, и разбор был бы
+/// квадратичным по длине значения.
 fn tag_len(text: &str) -> Option<usize> {
-    let end = text.find('>')?;
-    if end + 1 > MAX_TAG_BYTES {
-        return None;
-    }
+    let end = text
+        .as_bytes()
+        .iter()
+        .take(MAX_TAG_BYTES)
+        .position(|byte| *byte == b'>')?;
     Some(end + 1)
 }
 
 /// Длина HTML-сущности вместе с `&` и `;`, если она есть.
 fn entity_len(text: &str) -> Option<usize> {
-    let end = text.find(';')?;
-    if end + 1 > MAX_ENTITY_BYTES {
-        return None;
-    }
+    let end = text
+        .as_bytes()
+        .iter()
+        .take(MAX_ENTITY_BYTES)
+        .position(|byte| *byte == b';')?;
     let body = &text[1..end];
     if body.is_empty()
         || !body

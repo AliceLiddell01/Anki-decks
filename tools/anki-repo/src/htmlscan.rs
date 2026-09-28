@@ -13,8 +13,11 @@
 //!
 //! - поддержаны открывающие теги, комментарии, `<!doctype …>`, `<?…?>` и
 //!   raw-text содержимое `script`, `style`, `textarea`, `title`;
-//! - не строятся дерево, каскад, entities и исправление ошибок вложенности:
-//!   вопрос о ссылке в атрибуте от этого не зависит;
+//! - не строятся дерево, каскад и исправление ошибок вложенности: вопрос о ссылке
+//!   в атрибуте от этого не зависит. Символьные ссылки разбираются точечно —
+//!   [`decoded_attribute_value`] и только для значения атрибута, потому что
+//!   браузер раскодирует их именно там, а адрес обязан читаться так, как его
+//!   увидит браузер;
 //! - незакрытый тег честно возвращается как [`Tag::Unterminated`]. По HTML5
 //!   такой тег не порождает элемента (в браузерной семантике ссылки нет), но
 //!   сканируемый фрагмент — это ещё не документ: если следом идёт текст с `>`,
@@ -22,6 +25,7 @@
 //!   принимает потребитель: гейт `create` считает такую конструкцию ссылкой
 //!   (fail-closed), а санитайз отчёта делает её безвредным текстом.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// Пробельные символы, которые HTML считает разделителями атрибутов.
@@ -151,6 +155,130 @@ pub fn is_raw_text(name: &str) -> bool {
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
+/// Символьные ссылки HTML, которые этот разбор понимает.
+///
+/// Только те, что встречаются в данных: `&amp;` в CSS вполне возможен, а таблица
+/// из двух тысяч имён — уже не разбор адреса, а словарь. Остальные ссылки
+/// попадают в [`Reference::Unknown`], а «не понял» здесь означает отказ.
+const NAMED_REFERENCES: &[(&str, char)] = &[
+    ("amp", '&'),
+    ("lt", '<'),
+    ("gt", '>'),
+    ("quot", '"'),
+    ("apos", '\''),
+];
+
+/// Предел длины имени ссылки: `&#x10FFFF;` и самое длинное имя с запасом.
+const MAX_REFERENCE_BYTES: usize = 32;
+
+/// Значение атрибута так, как его увидит браузер.
+///
+/// Браузер раскодирует символьные ссылки в значении атрибута, поэтому адрес может
+/// быть записан как `url&#40;a.png&#41;`: в исходном тексте адреса не видно, а в
+/// браузере он есть. Тот, кто ищет адрес, обязан смотреть на это значение, а не на
+/// исходный текст.
+///
+/// `None` — ссылка, которой этот разбор не знает: она может значить что угодно, и
+/// «не понял» здесь означает отказ, а не пропуск. Одиночный `&` ссылкой не
+/// считается и остаётся собой: `content:'a & b'` — это данные, а не адрес. По той
+/// же причине не дочитывается и `&amp` без `;` — запись, которую браузер понимает
+/// только в устаревшей форме.
+#[must_use]
+pub fn decoded_attribute_value(value: &str) -> Option<Cow<'_, str>> {
+    if !value.contains('&') {
+        return Some(Cow::Borrowed(value));
+    }
+
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(offset) = rest.find('&') {
+        out.push_str(&rest[..offset]);
+        rest = &rest[offset..];
+        match decode_reference(rest) {
+            Reference::Decoded { symbol, len } => {
+                out.push(symbol);
+                rest = &rest[len..];
+            }
+            Reference::Literal => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+            Reference::Unknown => return None,
+        }
+    }
+    out.push_str(rest);
+
+    Some(Cow::Owned(out))
+}
+
+/// Что оказалось на месте `&`.
+enum Reference {
+    /// Ссылка, значение которой известно.
+    Decoded { symbol: char, len: usize },
+    /// `&` без ссылки: остаётся собой.
+    Literal,
+    /// Ссылка, значение которой разбор не знает.
+    Unknown,
+}
+
+/// Разбирает символьную ссылку в начале `text`.
+fn decode_reference(text: &str) -> Reference {
+    debug_assert!(text.starts_with('&'));
+    let bytes = text.as_bytes();
+
+    let mut end = 1;
+    while end < bytes.len()
+        && end - 1 < MAX_REFERENCE_BYTES
+        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'#')
+    {
+        end += 1;
+    }
+    if bytes.get(end) != Some(&b';') {
+        return if end == 1 {
+            Reference::Literal
+        } else {
+            Reference::Unknown
+        };
+    }
+
+    let len = end + 1;
+    let body = &text[1..end];
+    if body.is_empty() || matches!(body, "#" | "#x" | "#X") {
+        // `&;`: ссылки здесь нет, `&` остаётся собой.
+        return Reference::Literal;
+    }
+    let symbol = match body.strip_prefix('#') {
+        Some(digits) => decode_numeric(digits),
+        None => NAMED_REFERENCES
+            .iter()
+            .find(|(name, _)| *name == body)
+            .map(|(_, symbol)| *symbol),
+    };
+
+    match symbol {
+        Some(symbol) => Reference::Decoded { symbol, len },
+        None => Reference::Unknown,
+    }
+}
+
+/// Числовая ссылка `&#NNN;` или `&#xHHH;` как символ.
+fn decode_numeric(digits: &str) -> Option<char> {
+    let (radix, digits) = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => (16, hex),
+        None => (10, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    // Символ подстановки, которым HTML5 заменяет негодную ссылку, здесь не
+    // выдумывается: негодная ссылка — это не понятая ссылка, то есть отказ.
+    let code = u32::from_str_radix(digits, radix).ok()?;
+    if code == 0 {
+        return None;
+    }
+    char::from_u32(code)
+}
+
 /// Разбирает HTML на последовательность найденных конструкций.
 #[must_use]
 pub fn scan_tags(html: &str) -> Vec<Tag<'_>> {
@@ -179,7 +307,12 @@ pub fn scan_tags(html: &str) -> Vec<Tag<'_>> {
             }
             Some(byte) if byte.is_ascii_alphabetic() => match parse_start_tag(html, start) {
                 ParsedTag::Complete(element) => {
-                    let raw = is_raw_text(element.name) && !element.self_closing;
+                    // Raw text — свойство имени элемента, а не записи тега: HTML5
+                    // игнорирует `/` у непустых элементов, поэтому `<script/>`
+                    // открывает `script`, а не закрывает его. Признать такой тег
+                    // обычным элементом значило бы разбирать его тело как разметку:
+                    // браузер увидел бы в ней теги, а разбор — текст.
+                    let raw = is_raw_text(element.name);
                     let body_start = element.end + 1;
                     if raw {
                         let (body_end, close_end) = raw_text_range(html, element.name, body_start);
@@ -370,15 +503,51 @@ fn is_name_byte(byte: u8) -> bool {
 }
 
 /// Пропускает `<!-- … -->`, `<!doctype …>` и любую другую декларацию.
+///
+/// Границы комментария берутся из состояний комментария HTML5, а не из поиска
+/// `-->`: браузер закрывает комментарий и на `--!>`, и сразу на `<!-->`, и на
+/// `<!--->`. Расхождение здесь — это разметка, которую браузер видит, а разбор
+/// нет: текст после раннего закрытия он считал бы комментарием, а браузер
+/// исполнял бы как теги.
 fn skip_declaration(html: &str, start: usize) -> usize {
     let after = start + 2;
-    if html[after.min(html.len())..].starts_with("--") {
-        if let Some(end) = html[after..].find("-->") {
-            return after + end + 3;
-        }
-        return html.len();
+    if !html[after.min(html.len())..].starts_with("--") {
+        return skip_to_bracket(html, start + 1).map_or(html.len(), |end| end + 1);
     }
-    skip_to_bracket(html, start + 1).map_or(html.len(), |end| end + 1)
+
+    // Пустой комментарий закрывается сразу: `<!-->` — первым `>`, `<!--->` — им же
+    // после `-`.
+    let body = (start + 4).min(html.len());
+    if html[body..].starts_with('>') {
+        return body + 1;
+    }
+    if html[body..].starts_with("->") {
+        return body + 2;
+    }
+
+    match comment_end(html, body) {
+        Some(end) => end,
+        None => html.len(),
+    }
+}
+
+/// Позиция сразу после `-->` или `--!>`, если они есть в остатке.
+fn comment_end(html: &str, from: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut index = from;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'-' && bytes[index + 1] == b'-' {
+            match bytes.get(index + 2) {
+                Some(b'>') => return Some(index + 3),
+                Some(b'!') if bytes.get(index + 3) == Some(&b'>') => return Some(index + 4),
+                // `--!` без `>` комментарий не закрывает: HTML5 возвращается в
+                // состояние комментария, и разбор обязан искать дальше.
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Индекс ближайшей `>` начиная с `from`.
@@ -572,5 +741,81 @@ mod tests {
         ] {
             let _ = scan_tags(html);
         }
+    }
+
+    /// `/` у непустого элемента HTML5 игнорирует: `<script/>` открывает `script`.
+    ///
+    /// Если такой тег счесть обычным элементом, тело разберётся как разметка, а
+    /// браузер прочитает его как данные скрипта. Расхождение направлено ровно в
+    /// одну сторону: разбор видит теги там, где браузер видит код.
+    #[test]
+    fn a_self_closing_script_is_still_raw_text() {
+        let html = "<script/>alert(1)</script><p>x</p>";
+        let tags = scan_tags(html);
+        assert_eq!(tags.len(), 2, "тело script — не разметка: {tags:?}");
+
+        let Tag::RawText { name, body, .. } = &tags[0] else {
+            panic!("первый тег — raw-text script, а не {tags:?}");
+        };
+        assert!(name.eq_ignore_ascii_case("script"));
+        assert_eq!(&html[body.clone()], "alert(1)");
+        assert!(matches!(&tags[1], Tag::Element(element) if element.name_is("p")));
+    }
+
+    /// Комментарий кончается там, где его закрывает браузер, а не там, где рядом `-->`.
+    #[test]
+    fn a_comment_ends_where_the_browser_ends_it() {
+        for (html, expected) in [
+            // `--!>` закрывает комментарий.
+            ("<!--a--!><img src=\"a.png\">", "img"),
+            // Пустой комментарий закрывается сразу.
+            ("<!--><img src=\"a.png\">", "img"),
+            ("<!---><img src=\"a.png\">", "img"),
+            // `--!` без `>` комментария не закрывает: разметки здесь ещё нет.
+            ("<!--a--!b--><img src=\"a.png\">", "img"),
+            // Вложенная запись комментарием не становится.
+            ("<!-- <!-- --><img src=\"a.png\">", "img"),
+        ] {
+            let found = elements(html);
+            assert_eq!(found.len(), 1, "разметка в {html:?}: {found:?}");
+            assert!(found[0].name_is(expected), "тег в {html:?}: {found:?}");
+        }
+    }
+
+    /// Незакрытый комментарий не порождает разметки: браузер тоже её не увидит.
+    #[test]
+    fn an_unterminated_comment_swallows_the_rest() {
+        assert!(elements("<!-- <img src=\"a.png\">").is_empty());
+        assert!(elements("<!--a--! <img src=\"a.png\">").is_empty());
+    }
+
+    /// Символьные ссылки в значении атрибута читаются так, как их видит браузер.
+    #[test]
+    fn a_reference_in_an_attribute_value_is_decoded() {
+        let decoded = |value: &str| decoded_attribute_value(value).map(|value| value.into_owned());
+
+        assert_eq!(decoded("url(a.png)").as_deref(), Some("url(a.png)"));
+        assert_eq!(decoded("url&#40;a.png&#41;").as_deref(), Some("url(a.png)"));
+        assert_eq!(
+            decoded("url&#x28;a.png&#x29;").as_deref(),
+            Some("url(a.png)")
+        );
+        assert_eq!(decoded("a&amp;b").as_deref(), Some("a&b"));
+        assert_eq!(decoded("&lt;&gt;&quot;&apos;").as_deref(), Some("<>\"'"));
+        // `&` в данных ссылкой не считается.
+        assert_eq!(
+            decoded("content:'a & b'").as_deref(),
+            Some("content:'a & b'")
+        );
+        assert_eq!(decoded("&").as_deref(), Some("&"));
+        assert_eq!(decoded("a &; b").as_deref(), Some("a &; b"));
+
+        // Ссылка, которой разбор не знает, — отказ, а не пропуск: `&lpar;` вполне
+        // может быть `(`, а `&#x0;` браузер заменяет подстановкой.
+        assert_eq!(decoded("&lpar;"), None);
+        assert_eq!(decoded("&amp"), None);
+        assert_eq!(decoded("&#x0;"), None);
+        assert_eq!(decoded("&#xD800;"), None);
+        assert_eq!(decoded("&#1114112;"), None);
     }
 }
