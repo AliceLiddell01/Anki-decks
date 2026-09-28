@@ -482,6 +482,26 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
         }
     }
 
+    // Полный набор файлов отчёта известен до записи документов: он же —
+    // доказательство владения для следующего прогона и точный набор ресурсов, на
+    // который страница имеет право ссылаться. Набор строится по тому, что отчёт
+    // действительно положит рядом с собой, а не по форме адреса: ссылка на файл,
+    // которого в отчёте нет, разрешением не становится.
+    let mut report_files: Vec<String> = Vec::new();
+    for state in SideState::ALL {
+        for name in &media_plan.state(state).copied {
+            report_files.push(format!("{}/{name}", state.media_dir()));
+        }
+    }
+    report_files.extend(
+        build
+            .card_documents
+            .iter()
+            .map(|document| document.file.clone()),
+    );
+    report_files.push(INDEX_HTML.to_string());
+    let resources = sanitize::Resources::from_report_files(&report_files);
+
     // Подстановка ссылок выполняется после планирования media: до него неизвестно,
     // какие файлы окажутся рядом с отчётом. Ссылка состояния подставляется только
     // на файл своего состояния, а звук без файла честно помечается отсутствующим.
@@ -500,7 +520,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
                 &mut missing_sounds,
             );
         }
-        let mut page = card_html(&card);
+        let mut page = card_html(&card, &resources);
         // Отвергнутое границей доверия называется прямо в превью: молча
         // выброшенная конструкция выглядела бы как «её и не было». Пояснения
         // добавляются к обеим сторонам, потому что построены они из одного
@@ -531,11 +551,11 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
                 ),
                 Some(document.guid.clone()),
             ));
-            page = card_html(&card);
+            page = card_html(&card, &resources);
         }
         // Проверка одна на все сгенерированные файлы: тот документ, который
         // попадёт на диск, обязан её проходить — иначе отчёт не записывается.
-        let violations = sanitize::inspect(&page.html, sanitize::Page::Card);
+        let violations = sanitize::inspect(&page.html, sanitize::Page::Card, &resources);
         if !violations.is_empty() {
             return Err(DomainError::with_details(
                 ErrorCode::WriteFailed,
@@ -598,17 +618,6 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     let card_files_total = build.card_files.len();
     counts.previews = card_files_total;
 
-    // Полный набор файлов отчёта известен до записи точки входа: он же —
-    // доказательство владения для следующего прогона.
-    let mut report_files: Vec<String> = Vec::new();
-    for state in SideState::ALL {
-        for name in &media_plan.state(state).copied {
-            report_files.push(format!("{}/{name}", state.media_dir()));
-        }
-    }
-    report_files.extend(documents.iter().map(|document| document.file.clone()));
-    report_files.push(INDEX_HTML.to_string());
-
     // Устаревшее и чужое называются в самом отчёте: «файл исчез» и «файл не наш»
     // — разные события, и молчать о любом из них нельзя.
     let stale = stale_files(&ownership, &report_files);
@@ -663,10 +672,10 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     };
 
     let index_path = out_dir.join(INDEX_HTML);
-    let index = index_html(&document);
+    let index = index_html(&document, &resources);
     // Та же проверка, что и у документов превью: точка входа — такой же файл
     // отчёта, и правило для неё не может быть отдельным.
-    let index_violations = sanitize::inspect(&index, sanitize::Page::Index);
+    let index_violations = sanitize::inspect(&index, sanitize::Page::Index, &resources);
     if !index_violations.is_empty() {
         return Err(DomainError::with_details(
             ErrorCode::WriteFailed,
@@ -708,7 +717,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
         } else {
             sanitize::Page::Card
         };
-        if !sanitize::inspect(&text, page).is_empty() {
+        if !sanitize::inspect(&text, page, &resources).is_empty() {
             cards_offline = false;
         }
     }
@@ -2329,6 +2338,28 @@ fn push_media_diagnostics(plan: &MediaPlan, diagnostics: &mut Vec<Diagnostic>) {
 
 /// Проверяет и при необходимости создаёт каталог отчёта.
 fn ensure_out_dir(out: &Path, export_dirs: &[PathBuf]) -> Result<PathBuf, DomainError> {
+    // Ссылка вместо каталога — это подмена: путь, который назвал оператор, и путь,
+    // в который пишет отчёт, оказались бы разными. Доказательство владения,
+    // правила конфликтов и запрет на `decks/**` относились бы тогда к цели ссылки,
+    // выбранной тем, кто её создал, а не этой командой, и `canonical_ish` молча
+    // стёр бы разницу между ними. Поэтому `--out` — это именно каталог: имя в
+    // конце пути, а не ссылка на другое место. Ссылки в середине пути не
+    // запрещены: через них проходят и временные каталоги, и домашний каталог.
+    if fs::symlink_metadata(out).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(DomainError::with_details(
+            ErrorCode::InvalidRequest,
+            format!(
+                "каталог отчёта {} является символической ссылкой: отчёт пишется в каталог, а не по \
+                 ссылке, и названный путь обязан быть этим каталогом",
+                out.display()
+            ),
+            details! {
+                "reason" => "out_dir_is_symlink",
+                "out_dir" => out.display().to_string(),
+            },
+        ));
+    }
+
     let canonical = paths::canonical_ish(out);
 
     if canonical

@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 
 use crate::report::SideState;
 use crate::report::runtime::{self, CARD_RUNTIME_JS, INDEX_RUNTIME_JS};
-use crate::report::sanitize::{self, Blocked, Page};
+use crate::report::sanitize::{self, Blocked, Page, Resources};
 use crate::report::style::{CARD_BASE_CSS, REPORT_CSS};
 
 /// Единственный переключатель темы отчёта.
@@ -267,14 +267,18 @@ pub struct RenderedPage {
 
 /// Собирает `cards/*.html`.
 ///
+/// `resources` — то, что отчёт действительно записал: адрес разрешён только
+/// тогда, когда ведёт к файлу из этого набора. Сборщик не решает, что считать
+/// локальным, он спрашивает политику страницы.
+///
 /// CSS модели приходит из экспорта, то есть снаружи, поэтому он проходит ту же
 /// очистку, что и разметка: правило вида `background: url(https://…)` в модели —
 /// это запрос, которого офлайн-отчёт делать не имеет права. Безопасность здесь
 /// следует из устройства: непроверенной разметки в документе просто не остаётся,
 /// а не «случается так, что она не исполнилась».
 #[must_use]
-pub fn card_html(card: &CardFile) -> RenderedPage {
-    let model_css = sanitize::css(&card.model_css, Page::Card);
+pub fn card_html(card: &CardFile, resources: &Resources) -> RenderedPage {
+    let model_css = sanitize::css(&card.model_css, Page::Card, resources);
     let mut blocked: Vec<Blocked> = model_css.blocked;
     let mut out = String::with_capacity(card.model_css.len() + 1024);
     out.push_str("<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n");
@@ -294,7 +298,7 @@ pub fn card_html(card: &CardFile) -> RenderedPage {
             "<section class=\"report-side\"><h2 class=\"report-side-label\">{}</h2>",
             escape_html(&side.label)
         );
-        let body = sanitize::html(&side.html, Page::Card);
+        let body = sanitize::html(&side.html, Page::Card, resources);
         blocked.extend(body.blocked);
         let _ = writeln!(
             out,
@@ -331,9 +335,9 @@ pub fn card_html(card: &CardFile) -> RenderedPage {
     // от того, как собирался документ, и отвечает на вопрос «осталось ли здесь
     // исполняемое или сетевое».
     debug_assert!(
-        sanitize::inspect(&out, Page::Card).is_empty(),
+        sanitize::inspect(&out, Page::Card, resources).is_empty(),
         "документ превью обязан проходить общую проверку: {:?}",
-        sanitize::inspect(&out, Page::Card)
+        sanitize::inspect(&out, Page::Card, resources)
     );
 
     RenderedPage { html: out, blocked }
@@ -341,7 +345,7 @@ pub fn card_html(card: &CardFile) -> RenderedPage {
 
 /// Собирает `index.html`.
 #[must_use]
-pub fn index_html(document: &ReportDocument) -> String {
+pub fn index_html(document: &ReportDocument, resources: &Resources) -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
@@ -512,6 +516,15 @@ pub fn index_html(document: &ReportDocument) -> String {
     out.push_str(INDEX_RUNTIME_JS);
     out.push_str("</script>\n");
     out.push_str("</body>\n</html>\n");
+
+    // Та же независимая проверка, что и у документов превью: точка входа —
+    // такой же файл отчёта, и правило для неё не может быть отдельным.
+    debug_assert!(
+        sanitize::inspect(&out, Page::Index, resources).is_empty(),
+        "точка входа обязана проходить общую проверку: {:?}",
+        sanitize::inspect(&out, Page::Index, resources)
+    );
+
     out
 }
 
@@ -700,6 +713,14 @@ fn tokens_html(tokens: &[(DiffMark, String)], before_side: bool) -> String {
 mod tests {
     use super::*;
 
+    /// Ресурсы тестовых документов: ровно те файлы, которые они упоминают.
+    fn resources() -> Resources {
+        Resources::from_report_files(&[
+            "cards/card-0001.html".to_string(),
+            "cards/card-0002.html".to_string(),
+        ])
+    }
+
     #[test]
     fn escape_covers_html_metacharacters() {
         assert_eq!(
@@ -748,7 +769,7 @@ mod tests {
             unsupported_constructs: Vec::new(),
         };
 
-        let html = index_html(&document);
+        let html = index_html(&document, &resources());
         assert!(html.starts_with("<!doctype html>"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
@@ -775,7 +796,7 @@ mod tests {
             }],
         };
 
-        let html = card_html(&card).html;
+        let html = card_html(&card, &resources()).html;
         assert!(html.contains("data-report-runtime=\"card\""));
         assert!(html.contains("nightMode"));
         assert!(html.contains("report:height"));
@@ -830,7 +851,7 @@ mod tests {
             unsupported_constructs: Vec::new(),
         };
 
-        let html = index_html(&document);
+        let html = index_html(&document, &resources());
         assert!(html.contains("class=\"report-compare\""));
         assert!(html.contains("data-state=\"before\""));
         assert!(html.contains("data-state=\"after\""));
@@ -838,7 +859,7 @@ mod tests {
 
         // Одно состояние — одна колонка: выдуманной стороны быть не должно.
         document.sections[0].cards[0].previews.truncate(1);
-        let single = index_html(&document);
+        let single = index_html(&document, &resources());
         assert!(!single.contains("class=\"report-compare\""));
         assert!(!single.contains("data-report-state=\"after\""));
         assert!(!single.contains("class=\"report-compare-side\" data-state=\"after\""));
@@ -857,7 +878,7 @@ mod tests {
             }],
         };
 
-        let html = card_html(&card).html;
+        let html = card_html(&card, &resources()).html;
         let base = html.find("font-family: arial").expect("базовые стили");
         let model = html.find(".card { color: red; }").expect("CSS модели");
         assert!(base < model, "CSS модели обязан идти после базовых правил");

@@ -13,35 +13,45 @@
 //!   `embed`, `applet`, `frame`, `frameset`, `base`, `link`, `meta`, `form` — тег
 //!   удаляется, содержимое (если это осмысленный фрагмент) остаётся текстом;
 //! - **атрибут-обработчик** (`on*`) — удаляется целиком;
-//! - **адрес**: значение URL-атрибута обязано быть локальным
-//!   ([`Sanitizer::allows_reference`]), иначе атрибут удаляется;
-//! - **CSS**: `@import` вырезается, а `url()` с нелокальным адресом заменяется на
-//!   инертную заглушку. Это же применяется к атрибуту `style` и к содержимому
-//!   `<style>` — и к CSS модели, которую подставляет сборщик страницы карточки;
+//! - **адрес**: значение адресного атрибута обязано быть локальным
+//!   ([`Page::allows`]) — то есть вести к файлу, который в отчёте действительно
+//!   есть, иначе атрибут удаляется;
+//! - **CSS**: `@import` вырезается, а нелокальный адрес заменяется на инертную
+//!   заглушку. Что считать адресом в CSS, решает лексический разбор
+//!   ([`crate::report::css`]), а не поиск подстроки: `u\72l(…)` — это `url(…)`.
+//!   Это же применяется к атрибуту `style` и к содержимому `<style>` — и к CSS
+//!   модели, которую подставляет сборщик страницы карточки;
 //! - **незакрытый тег**: `<` в его начале экранируется, потому что иначе
 //!   недоверенный фрагмент склеивается с обёрткой отчёта, и границу между «данные
 //!   кончились» и «начался код отчёта» перестаёт существовать.
 //!
+//! Что считать адресом в разметке, решает таблица `media::ADDRESS_ATTRIBUTES`:
+//! `src` — адрес только у элементов, которые его несут, поэтому `<div src="…">`
+//! остаётся обычной разметкой, а не запрещённой ссылкой.
+//!
 //! Runtime отчёта проходит здесь же: он не «доверенный по имени», а **опознанный
 //! по содержимому**. Сборщик страницы помечает свои теги `data-report-runtime`, а
-//! [`GeneratedHtml::inspect`] принимает `<script>` только тогда, когда его тело
-//! совпадает с одной из констант отчёта ([`crate::report::runtime`]). Поэтому
-//! проверка «в документе нет исполняемого чужого кода» — это не поиск подстроки, а
-//! сравнение с единственным разрешённым телом, независимо от регистра, кавычек и
-//! прочей записи.
+//! [`inspect`] принимает `<script>` только тогда, когда его тело совпадает с одной
+//! из констант отчёта ([`crate::report::runtime`]). Поэтому проверка «в документе
+//! нет исполняемого чужого кода» — это не поиск подстроки, а сравнение с
+//! единственным разрешённым телом, независимо от регистра, кавычек и прочей записи.
 //!
-//! Проверка одна на все сгенерированные файлы ([`GeneratedHtml::inspect`]): и
-//! `index.html`, и `cards/*.html` проходят её перед записью, а тесты — после.
-//! Санитайз без независимой проверки — это обещание; проверка превращает его в
-//! контракт.
+//! Проверка одна на все сгенерированные файлы ([`inspect`]): и `index.html`, и
+//! `cards/*.html` проходят её перед записью, а тесты — после. Санитайз без
+//! независимой проверки — это обещание; проверка превращает его в контракт.
+//! Проверка при этом строже санитайза: адрес она сверяет с точным набором файлов
+//! отчёта ([`Resources`]), поэтому ссылка на такой же по форме, но отсутствующий
+//! файл становится отказом генерации, а не живым запросом у пользователя.
 //!
 //! Отвергнутое не выбрасывается молча: [`Sanitized::blocked`] перечисляет, что
 //! именно не показано, и это уходит в превью и в диагностику отчёта.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use crate::htmlscan::{self, Tag};
 use crate::media;
+use crate::report::css;
 use crate::report::runtime;
 
 /// Чем заменяется нелокальный адрес в CSS.
@@ -104,10 +114,7 @@ pub struct Violation {
     pub what: String,
 }
 
-/// Страница отчёта: у каждой свой набор локальных адресов.
-///
-/// Набор объявлен здесь, а не у вызывающего: это часть границы доверия, и
-/// страница не должна получать «свой» предикат в каждом месте вызова.
+/// Страница отчёта: у каждой свой документ и своя форма локального адреса.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     /// `cards/*.html`: рядом с ним скопированные media.
@@ -117,40 +124,197 @@ pub enum Page {
 }
 
 impl Page {
+    /// Каталог документа относительно корня отчёта.
+    fn document_dir(self) -> &'static str {
+        match self {
+            Self::Card => "cards",
+            Self::Index => "",
+        }
+    }
+
+    /// Приводит адрес к пути относительно корня отчёта.
+    ///
+    /// Это единственное место, где адрес становится путём, и оно fail-closed:
+    /// `None` означает «показать нельзя». Отказ получают схема (`data:`,
+    /// `https:`), абсолютный путь, обратный слэш, управляющие символы, пустой или
+    /// неоднозначный сегмент (`.`, пустой — то есть `//` и хвостовой `/`) и,
+    /// главное, любой адрес, который после нормализации выходит за корень отчёта.
+    ///
+    /// Нормализация идёт по сегментам относительно **пути документа**, а не по
+    /// префиксу строки: `../media/before/…` разрешено ровно столько раз, сколько
+    /// компонентов в каталоге документа (из `cards/` — один), `..` допустим только
+    /// в начале и только пока есть что выталкивать, а `cards/../…` — уже не
+    /// нормализация, а попытка выйти из своего каталога раньше времени.
+    ///
+    /// Отдельно отвергаются символы, которые меняют смысл адреса в URL, а не в
+    /// имени файла: `?`, `#` и `%`. Адрес в документе — это URL, и браузер читает
+    /// путь из него уже процент-декодированным, поэтому имя вида `..%2f..%2f…`
+    /// увело бы запрос туда, куда тот же текст как путь не ведёт. Имя файла отчёта
+    /// таких символов не содержит, и «не могу доказать, что это то же имя» здесь
+    /// означает отказ.
+    #[must_use]
+    pub fn resolve(self, value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.is_empty()
+            || value.contains('\\')
+            || value.contains(':')
+            || value.contains('?')
+            || value.contains('#')
+            || value.contains('%')
+        {
+            return None;
+        }
+        if value.starts_with('/') {
+            return None;
+        }
+        if value.chars().any(char::is_control) {
+            return None;
+        }
+
+        let mut segments: Vec<&str> = Vec::new();
+        if !self.document_dir().is_empty() {
+            segments.extend(self.document_dir().split('/'));
+        }
+        let mut descended = false;
+        for segment in value.split('/') {
+            match segment {
+                "" | "." => return None,
+                ".." => {
+                    if descended {
+                        return None;
+                    }
+                    segments.pop()?;
+                }
+                other => {
+                    descended = true;
+                    segments.push(other);
+                }
+            }
+        }
+
+        let resolved = segments.join("/");
+        if !self.has_resource_shape(&resolved) {
+            return None;
+        }
+        Some(resolved)
+    }
+
+    /// Форма ресурса, который эта страница имеет право запросить.
+    fn has_resource_shape(self, path: &str) -> bool {
+        let segments: Vec<&str> = path.split('/').collect();
+        match self {
+            Self::Card => {
+                matches!(segments.as_slice(), ["media", state, name]
+                    if matches!(*state, "before" | "after") && is_plain_name(name))
+            }
+            Self::Index => {
+                matches!(segments.as_slice(), ["cards", name]
+                    if is_plain_name(name) && name.ends_with(".html"))
+            }
+        }
+    }
+
     /// Что эта страница имеет право запрашивать.
     ///
-    /// Разрешены только относительные пути внутрь самого отчёта и переходы
-    /// внутри документа. Всё остальное — включая `data:` и абсолютные пути —
-    /// считается внешним: отчёт обязан оставаться офлайн и переносимым.
+    /// Разрешены переходы внутри документа и ровно те ресурсы, которые текущий
+    /// отчёт действительно содержит: `cards/*.html` для точки входа и
+    /// `media/<состояние>/*` для превью. Всё остальное — включая `data:`,
+    /// абсолютные пути, `..` за пределы отчёта и ссылку на файл, которого в
+    /// отчёте нет, — считается внешним: отчёт обязан оставаться офлайн и
+    /// переносимым.
     #[must_use]
-    pub fn allows(self, value: &str) -> bool {
-        let value = value.trim();
-        if value.starts_with('#') {
+    pub fn allows(self, resources: &Resources, value: &str) -> bool {
+        if value.trim_start().starts_with('#') {
             return true;
         }
-        if value.contains(':') {
+        let Some(path) = self.resolve(value) else {
             return false;
-        }
-        let prefix = match self {
-            Self::Card => CARD_MEDIA_PREFIX,
-            Self::Index => CARD_FILE_PREFIX,
         };
-        value.starts_with(prefix) && !value.starts_with("//")
+        match self {
+            Self::Card => resources.media_files.contains(&path),
+            Self::Index => resources.card_files.contains(&path),
+        }
     }
 }
 
-/// Префикс скопированной media относительно документа превью.
-pub const CARD_MEDIA_PREFIX: &str = "../media/";
+/// Имя файла без пути: оно и есть единица владения отчёта.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
 
-/// Префикс документа превью относительно точки входа отчёта.
-pub const CARD_FILE_PREFIX: &str = "cards/";
+/// Точный набор ресурсов, которые есть в каталоге отчёта.
+///
+/// Политика адресов не может быть только префиксом: `cards/` и `media/` — это
+/// каталоги, а не доказательство существования файла. Набор передаётся туда, где
+/// документ проверяется, и заполняется тем, что отчёт действительно записал:
+/// [`Page::allows`] отвечает не «похоже на свой каталог», а «этот файл здесь есть».
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resources {
+    card_files: BTreeSet<String>,
+    media_files: BTreeSet<String>,
+}
+
+impl Resources {
+    /// Набор из фактических относительных путей файлов отчёта.
+    ///
+    /// Пути, не относящиеся ни к `cards/`, ни к `media/`, отбрасываются: они не
+    /// могут быть целью адреса ни на одной странице.
+    #[must_use]
+    pub fn from_report_files<'a>(files: impl IntoIterator<Item = &'a String>) -> Self {
+        let mut resources = Self::default();
+        for file in files {
+            if file.starts_with("cards/") {
+                resources.card_files.insert(file.clone());
+            } else if file.starts_with("media/") {
+                resources.media_files.insert(file.clone());
+            }
+        }
+        resources
+    }
+
+    /// Документы превью, которые есть в отчёте.
+    #[must_use]
+    pub fn card_files(&self) -> &BTreeSet<String> {
+        &self.card_files
+    }
+
+    /// Скопированные media, которые есть в отчёте.
+    #[must_use]
+    pub fn media_files(&self) -> &BTreeSet<String> {
+        &self.media_files
+    }
+}
+
+/// Разрешено ли значение атрибута-адреса целиком.
+///
+/// У `srcset` в одном значении перечислено несколько адресов, и проверять их
+/// нужно по отдельности: список — это несколько запросов, а не один адрес, и
+/// префиксная проверка «начинается с `../media/`» пропустила бы всё, что стоит в
+/// списке после первого кандидата. Предикат один на санитайз и на проверку
+/// готового документа: две реализации одной политики разошлись бы.
+///
+/// Пустое значение разрешено: адреса в нём нет, а запрос текущего документа
+/// остаётся внутри отчёта.
+#[must_use]
+pub fn attribute_value_is_allowed(
+    page: Page,
+    resources: &Resources,
+    attribute: &str,
+    value: &str,
+) -> bool {
+    let candidates = media::split_attribute_values(attribute, value);
+    candidates
+        .iter()
+        .all(|candidate| page.allows(resources, &candidate.text))
+}
 
 /// Очищает недоверенный фрагмент HTML.
 #[must_use]
-pub fn html(fragment: &str, page: Page) -> Sanitized {
+pub fn html(fragment: &str, page: Page, resources: &Resources) -> Sanitized {
     let mut sanitizer = Sanitizer {
         source: fragment,
         page,
+        resources,
         out: String::with_capacity(fragment.len()),
         blocked: Vec::new(),
         pos: 0,
@@ -162,46 +326,49 @@ pub fn html(fragment: &str, page: Page) -> Sanitized {
     }
 }
 
-/// Очищает CSS: `@import` вырезается, нелокальные `url()` становятся инертными.
+/// Очищает CSS: `@import` вырезается, нелокальные адреса становятся инертными.
 ///
 /// Отдельная функция, потому что CSS приходит двумя путями: как содержимое
 /// `<style>` и как CSS модели, который подставляет сборщик страницы. Один
-/// владелец политики — одно поведение.
+/// владелец политики — одно поведение. Разбор, который решает, что здесь адрес,
+/// тоже один: [`crate::report::css`], а не поиск подстроки.
 #[must_use]
-pub fn css(style: &str, page: Page) -> SanitizedCss {
-    let stripped = strip_imports(style);
+pub fn css(style: &str, page: Page, resources: &Resources) -> SanitizedCss {
+    let mut out = String::with_capacity(style.len());
     let mut blocked: Vec<Blocked> = Vec::new();
-    if stripped.blocked {
-        blocked.push(Blocked::new(
-            "@import",
-            "внешняя таблица стилей не подключается: отчёт обязан оставаться офлайн",
-        ));
-    }
+    let mut cursor = 0usize;
 
-    let mut out = String::with_capacity(stripped.css.len());
-    let mut rest = stripped.css.as_str();
-    while let Some(position) = find_ci(rest, "url(") {
-        out.push_str(&rest[..position]);
-        let after = &rest[position + 4..];
-        let Some(end) = after.find(')') else {
-            // Не закрытая скобка: остаток не является ссылкой.
-            out.push_str(&rest[position..]);
-            rest = "";
-            break;
-        };
-        let target = after[..end].trim().trim_matches(|c| c == '"' || c == '\'');
-        if target.is_empty() || page.allows(target) {
-            out.push_str(&rest[position..position + 4 + end + 1]);
-        } else {
-            out.push_str(INERT_CSS_VALUE);
-            blocked.push(Blocked::new(
-                format!("url({target})"),
-                "адрес CSS не ведёт к скопированному рядом файлу: запрос не выполняется",
-            ));
+    for event in css::scan(style) {
+        let span = event.span();
+        // События не пересекаются, но защита нужна: перекрывающаяся замена
+        // испортила бы вторичную проверку независимо от того, как её собрали.
+        if span.start < cursor || span.end > style.len() {
+            continue;
         }
-        rest = &after[end + 1..];
+        out.push_str(&style[cursor..span.start]);
+        match event {
+            css::Event::Import(_) => {
+                blocked.push(Blocked::new(
+                    "@import",
+                    "внешняя таблица стилей не подключается: отчёт обязан оставаться офлайн",
+                ));
+            }
+            css::Event::Address(address) => {
+                if address.target.is_empty() || page.allows(resources, &address.target) {
+                    out.push_str(&style[span.clone()]);
+                } else {
+                    out.push_str(INERT_CSS_VALUE);
+                    blocked.push(Blocked::new(
+                        format!("url({})", address.target),
+                        "адрес CSS не ведёт к файлу, скопированному рядом с отчётом: запрос не \
+                         выполняется",
+                    ));
+                }
+            }
+        }
+        cursor = span.end;
     }
-    out.push_str(rest);
+    out.push_str(&style[cursor..]);
 
     SanitizedCss {
         css: escape_css_close(&out),
@@ -215,8 +382,13 @@ pub fn css(style: &str, page: Page) -> SanitizedCss {
 /// документ, и ищет только конструкции, которые исполнили бы чужой код или пошли
 /// бы по адресу. Разрешено ровно одно исключение — runtime отчёта, опознанный по
 /// телу, а не по имени тега.
+///
+/// Проверка намеренно строже санитайза: адреса она сверяет с точным набором
+/// ресурсов отчёта, а не только с формой пути. Если санитайз что-то пропустил,
+/// именно здесь это становится отказом генерации, а не живым запросом в браузере
+/// пользователя.
 #[must_use]
-pub fn inspect(document: &str, page: Page) -> Vec<Violation> {
+pub fn inspect(document: &str, page: Page, resources: &Resources) -> Vec<Violation> {
     let mut violations: Vec<Violation> = Vec::new();
 
     for tag in htmlscan::scan_tags(document) {
@@ -248,15 +420,24 @@ pub fn inspect(document: &str, page: Page) -> Vec<Violation> {
                         continue;
                     }
                     if media::attribute_is_address(&name, &attribute_name)
-                        && !attribute.value.is_empty()
-                        && !page.allows(attribute.value)
+                        && !attribute_value_is_allowed(
+                            page,
+                            resources,
+                            &attribute_name,
+                            attribute.value,
+                        )
                     {
                         violations.push(Violation {
                             what: format!("адрес {attribute_name}=\"{}\"", attribute.value),
                         });
                     }
                     if attribute_name == "style" {
-                        violations.extend(css_violations(attribute.value, page, "style"));
+                        violations.extend(css_violations(
+                            attribute.value,
+                            page,
+                            resources,
+                            "style",
+                        ));
                     }
                 }
             }
@@ -276,7 +457,12 @@ pub fn inspect(document: &str, page: Page) -> Vec<Violation> {
                     }
                 }
                 if lower == "style" {
-                    violations.extend(css_violations(&document[body.clone()], page, "style"));
+                    violations.extend(css_violations(
+                        &document[body.clone()],
+                        page,
+                        resources,
+                        "style",
+                    ));
                 }
                 if close_end.is_none() {
                     violations.push(Violation {
@@ -294,29 +480,25 @@ pub fn inspect(document: &str, page: Page) -> Vec<Violation> {
 }
 
 /// Проверяет CSS на нелокальные адреса и `@import`.
-fn css_violations(style: &str, page: Page, where_: &str) -> Vec<Violation> {
+///
+/// Разбор тот же, что у [`css`]: проверка не повторяет слабую эвристику, а
+/// спрашивает у того же владельца политики, только с точным набором ресурсов.
+fn css_violations(style: &str, page: Page, resources: &Resources, where_: &str) -> Vec<Violation> {
     let mut violations: Vec<Violation> = Vec::new();
-    if find_ci(style, "@import").is_some() {
-        violations.push(Violation {
-            what: format!("@import в {where_}"),
-        });
-    }
-
-    let mut rest = style;
-    while let Some(position) = find_ci(rest, "url(") {
-        let after = &rest[position + 4..];
-        let Some(end) = after.find(')') else {
-            break;
-        };
-        let target = after[..end].trim().trim_matches(|c| c == '"' || c == '\'');
-        if !target.is_empty() && !page.allows(target) {
-            violations.push(Violation {
-                what: format!("адрес url({target}) в {where_}"),
-            });
+    for event in css::scan(style) {
+        match event {
+            css::Event::Import(_) => violations.push(Violation {
+                what: format!("@import в {where_}"),
+            }),
+            css::Event::Address(address) => {
+                if !address.target.is_empty() && !page.allows(resources, &address.target) {
+                    violations.push(Violation {
+                        what: format!("адрес url({}) в {where_}", address.target),
+                    });
+                }
+            }
         }
-        rest = &after[end + 1..];
     }
-
     violations
 }
 
@@ -339,6 +521,7 @@ fn is_report_runtime(body: &str) -> bool {
 struct Sanitizer<'a> {
     source: &'a str,
     page: Page,
+    resources: &'a Resources,
     out: String,
     blocked: Vec<Blocked>,
     pos: usize,
@@ -395,8 +578,12 @@ impl Sanitizer<'_> {
                 continue;
             }
             if media::attribute_is_address(&name, &attribute_name)
-                && !attribute.value.is_empty()
-                && !self.page.allows(attribute.value)
+                && !attribute_value_is_allowed(
+                    self.page,
+                    self.resources,
+                    &attribute_name,
+                    attribute.value,
+                )
             {
                 dropped.push(Blocked::new(
                     format!("{attribute_name}=\"{}\"", attribute.value),
@@ -409,7 +596,7 @@ impl Sanitizer<'_> {
 
         let sanitized_style = element
             .attribute("style")
-            .map(|attribute| css(attribute.value, self.page));
+            .map(|attribute| css(attribute.value, self.page, self.resources));
         if let Some(style) = &sanitized_style {
             self.blocked.extend(style.blocked.iter().cloned());
         }
@@ -486,7 +673,7 @@ impl Sanitizer<'_> {
         // `<style>`: оформление сохраняется, потому что именно оно и делает
         // превью похожим на карточку, но CSS проходит ту же проверку адресов.
         self.flush(start);
-        let sanitized = css(&self.source[body.clone()], self.page);
+        let sanitized = css(&self.source[body.clone()], self.page, self.resources);
         self.blocked.extend(sanitized.blocked);
         self.out.push_str("<style>");
         self.out.push_str(&sanitized.css);
@@ -544,50 +731,30 @@ fn escape_css_close(style: &str) -> String {
     style.replace('<', "\\3c ")
 }
 
-/// Ищет подстроку без учёта ASCII-регистра.
-fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .to_ascii_lowercase()
-        .find(&needle.to_ascii_lowercase())
-}
-
-/// Вырезает `@import` вместе с его правилом.
-struct StrippedImports {
-    css: String,
-    blocked: bool,
-}
-
-fn strip_imports(style: &str) -> StrippedImports {
-    let mut out = String::with_capacity(style.len());
-    let mut rest = style;
-    let mut blocked = false;
-
-    while let Some(position) = find_ci(rest, "@import") {
-        blocked = true;
-        out.push_str(&rest[..position]);
-        let after = &rest[position + "@import".len()..];
-        let end = after.find(';').or_else(|| after.find('}'));
-        match end {
-            Some(end) => rest = &after[end + 1..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-
-    StrippedImports { css: out, blocked }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const PAGE: Page = Page::Card;
 
+    /// Набор отчёта для тестов: ровно те файлы, которые страница вправе запросить.
+    fn resources() -> Resources {
+        Resources::from_report_files(&[
+            "index.html".to_string(),
+            "cards/card-0001.html".to_string(),
+            "media/before/a.png".to_string(),
+            "media/before/b.png".to_string(),
+            "media/before/f.woff2".to_string(),
+            "media/after/a.png".to_string(),
+        ])
+    }
+
     fn sanitize(fragment: &str) -> Sanitized {
-        html(fragment, PAGE)
+        html(fragment, PAGE, &resources())
+    }
+
+    fn clean(document: &str) -> bool {
+        inspect(document, PAGE, &resources()).is_empty()
     }
 
     #[test]
@@ -601,7 +768,7 @@ mod tests {
             assert!(!result.html.contains("<script"), "{result:?}");
             assert!(!result.html.contains("<SCRIPT"), "{result:?}");
             assert!(result.html.contains("alert(1)") || result.html.contains("evil"));
-            assert!(inspect(&result.html, PAGE).is_empty(), "{result:?}");
+            assert!(clean(&result.html), "{result:?}");
         }
     }
 
@@ -619,7 +786,7 @@ mod tests {
                     && !result.html.to_ascii_lowercase().contains("onload"),
                 "{result:?}"
             );
-            assert!(inspect(&result.html, PAGE).is_empty(), "{result:?}");
+            assert!(clean(&result.html), "{result:?}");
         }
     }
 
@@ -633,6 +800,7 @@ mod tests {
             "<video poster=\"https://evil.example/a.png\"></video>",
             "<object data=\"https://evil.example\"></object>",
             "<img srcset=\"https://evil.example/a.png 1x\">",
+            "<iframe src=\"https://evil.example\"></iframe>",
         ] {
             let result = sanitize(fragment);
             assert!(
@@ -640,7 +808,7 @@ mod tests {
                 "{result:?}"
             );
             assert!(
-                inspect(&result.html, PAGE).is_empty(),
+                clean(&result.html),
                 "после очистки внешних адресов не остаётся: {result:?}"
             );
             assert!(!result.blocked.is_empty(), "отвергнутое обязано называться");
@@ -658,22 +826,142 @@ mod tests {
     }
 
     #[test]
+    fn a_src_outside_a_resource_bearing_element_is_not_an_address() {
+        // `src` у `div` такого атрибута не имеет, и браузер по нему ничего не
+        // запрашивает: запрещать эту разметку значило бы судить по имени
+        // атрибута, а не по семантике элемента.
+        let result = sanitize("<div src=\"не-адрес\">x</div>");
+        assert!(result.html.contains("не-адрес"), "{result:?}");
+        assert!(result.blocked.is_empty(), "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    #[test]
+    fn the_address_policy_is_structural_and_never_leaves_the_report_root() {
+        let resources = resources();
+        for bad in [
+            "../../outside.png",
+            "../media/before/../../../outside.png",
+            "cards/../../media/before/a.png",
+            "../media/../media/before/a.png",
+            "/media/before/a.png",
+            "//evil.example/a.png",
+            "media/before/a.png",
+            "cards/card-0001.html",
+            "..\\media\\before\\a.png",
+            "../media/before/./a.png",
+            "../media/before//a.png",
+            "../media/before/",
+            "../media/before/a.png?x=1",
+            "../media/before/a.png#фрагмент",
+            "../media/before/%2e%2e%2f%2e%2e%2foutside.png",
+            "../media/before/..%2f..%2foutside.png",
+            "data:image/png;base64,AAAA",
+            "https://evil.example/a.png",
+            "javascript:alert(1)",
+            "index.html",
+            "../media/период/../../../outside.png",
+        ] {
+            assert!(
+                !PAGE.allows(&resources, bad),
+                "{bad:?} не может быть разрешён"
+            );
+            assert_eq!(
+                PAGE.resolve(bad),
+                None,
+                "{bad:?} не имеет разрешённого пути"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_exact_set_of_report_files_is_reachable() {
+        let resources = resources();
+        assert!(PAGE.allows(&resources, "../media/before/a.png"));
+        assert!(PAGE.allows(&resources, "../media/after/a.png"));
+        assert!(PAGE.allows(&resources, " #локальный-фрагмент"));
+        // Форма та же, файла в отчёте нет: набор — это доказательство
+        // существования, а не форма пути.
+        assert!(!PAGE.allows(&resources, "../media/before/нет.png"));
+        assert!(!PAGE.allows(&resources, "../media/после/a.png"));
+        // Точка входа адресуется документами превью, а не ими же.
+        assert!(Page::Index.allows(&resources, "cards/card-0001.html"));
+        assert!(Page::Index.allows(&resources, "#якорь"));
+        assert!(!Page::Index.allows(&resources, "cards/card-0002.html"));
+        assert!(!Page::Index.allows(&resources, "../media/before/a.png"));
+    }
+
+    #[test]
+    fn an_address_of_the_right_shape_to_an_absent_file_is_dropped() {
+        let result = sanitize("<img src=\"../media/before/нет.png\">");
+        assert!(!result.html.contains("нет.png"), "{result:?}");
+        assert!(!result.blocked.is_empty(), "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    #[test]
     fn css_imports_and_remote_urls_are_neutralised() {
         let style = "a { background: url(https://evil.example/a.png); font: url(../media/before/f.woff2); }@import url(\"https://evil.example/c.css\");";
-        let result = css(style, PAGE);
+        let result = css(style, PAGE, &resources());
         assert!(!result.css.contains("evil.example/a.png"), "{result:?}");
         assert!(!result.css.contains("@import"), "{result:?}");
         assert!(result.css.contains("background: none"), "{result:?}");
         assert!(result.css.contains("../media/before/f.woff2"), "{result:?}");
-        assert!(inspect(&format!("<style>{}</style>", result.css), PAGE).is_empty());
+        assert!(clean(&format!("<style>{}</style>", result.css)));
+    }
+
+    #[test]
+    fn an_escaped_or_unterminated_css_address_never_survives() {
+        for style in [
+            "a{background:url(https://evil.example/a.png)}",
+            "a{background:URL(https://evil.example/a.png)}",
+            "a{background:u\\72l(https://evil.example/a.png)}",
+            "a{background:\\75 rl(https://evil.example/a.png)}",
+            "a{background:url(https\\3a //evil.example/a.png)}",
+            "a{background:url('https\\3a //evil.example/a.png')}",
+            "a{background:url( \"https://evil.example/a.png\" )}",
+            "a{background:image-set(\"https://evil.example/a.png\" 1x)}",
+            "a{background:-webkit-image-set('https://evil.example/a.png' 2x)}",
+            "@import url(https://evil.example/c.css);",
+            "@IMPORT \"https://evil.example/c.css\";",
+            "@im\\70 ort \"https://evil.example/c.css\";",
+            "a{background:url(https://evil.example/a.png",
+            "@font-face{src:\"https://evil.example/a.woff2\"}",
+            "a{background:url(https\\3a //evil.example/a.png)}",
+            "a{background:url(\"https\\3a //evil.example/a.png\")}",
+            "a{background:url(https\\3a //evil.example/a.png",
+        ] {
+            let result = css(style, PAGE, &resources());
+            assert!(!result.css.contains("evil"), "{style:?} → {:?}", result.css);
+            assert!(
+                clean(&format!("<style>{}</style>", result.css)),
+                "{style:?} → {:?}",
+                result.css
+            );
+        }
+    }
+
+    #[test]
+    fn safe_css_keeps_its_meaning() {
+        let style = "a { color: red; content: \"это не адрес\"; background: url(../media/before/a.png); filter: url(#локальный); }";
+        let result = css(style, PAGE, &resources());
+        assert!(result.css.contains("color: red"), "{result:?}");
+        assert!(result.css.contains("это не адрес"), "{result:?}");
+        assert!(result.css.contains("../media/before/a.png"), "{result:?}");
+        assert!(result.css.contains("url(#локальный)"), "{result:?}");
+        assert!(result.blocked.is_empty(), "{result:?}");
     }
 
     #[test]
     fn css_cannot_leave_the_style_element() {
-        let result = css("a { color: red; }</style><script>alert(1)</script>", PAGE);
+        let result = css(
+            "a { color: red; }</style><script>alert(1)</script>",
+            PAGE,
+            &resources(),
+        );
         assert!(!result.css.contains("</style>"), "{result:?}");
         assert!(!result.css.contains('<'), "{result:?}");
-        assert!(inspect(&format!("<style>{}</style>", result.css), PAGE).is_empty());
+        assert!(clean(&format!("<style>{}</style>", result.css)));
     }
 
     #[test]
@@ -686,7 +974,7 @@ mod tests {
         ] {
             let result = sanitize(fragment);
             assert!(
-                inspect(&result.html, PAGE).is_empty(),
+                clean(&result.html),
                 "незакрытая конструкция остаётся текстом: {result:?}"
             );
         }
@@ -694,54 +982,82 @@ mod tests {
 
     #[test]
     fn every_generated_document_passes_the_same_check() {
-        let index = crate::report::html::index_html(&crate::report::html::ReportDocument {
-            title: "Отчёт".to_string(),
-            before_label: "до".to_string(),
-            after_label: "после".to_string(),
-            retire_tag: None,
-            counts: crate::report::html::ReportCounts::default(),
-            sections: Vec::new(),
-            diagnostics: Vec::new(),
-            limitations: vec!["ограничение".to_string()],
-            unsupported_constructs: Vec::new(),
-        });
+        let resources = resources();
+        let index = crate::report::html::index_html(
+            &crate::report::html::ReportDocument {
+                title: "Отчёт".to_string(),
+                before_label: "до".to_string(),
+                after_label: "после".to_string(),
+                retire_tag: None,
+                counts: crate::report::html::ReportCounts::default(),
+                sections: Vec::new(),
+                diagnostics: Vec::new(),
+                limitations: vec!["ограничение".to_string()],
+                unsupported_constructs: Vec::new(),
+            },
+            &resources,
+        );
         assert!(
-            inspect(&index, PAGE).is_empty(),
+            inspect(&index, Page::Index, &resources).is_empty(),
             "{:?}",
-            inspect(&index, PAGE)
+            inspect(&index, Page::Index, &resources)
         );
 
-        let card = crate::report::html::card_html(&crate::report::html::CardFile {
-            title: "Карточка".to_string(),
-            model_css: "a { color: red }".to_string(),
-            sides: vec![crate::report::html::CardSide {
-                label: "Лицевая сторона".to_string(),
-                classes: "card card1".to_string(),
-                html: sanitize("<b>слово</b>").html,
-                issues: Vec::new(),
-            }],
-        })
+        let card = crate::report::html::card_html(
+            &crate::report::html::CardFile {
+                title: "Карточка".to_string(),
+                model_css: "a { color: red }".to_string(),
+                sides: vec![crate::report::html::CardSide {
+                    label: "Лицевая сторона".to_string(),
+                    classes: "card card1".to_string(),
+                    html: sanitize("<b>слово</b>").html,
+                    issues: Vec::new(),
+                }],
+            },
+            &resources,
+        )
         .html;
         assert!(
-            inspect(&card, PAGE).is_empty(),
+            inspect(&card, PAGE, &resources).is_empty(),
             "{:?}",
-            inspect(&card, PAGE)
+            inspect(&card, PAGE, &resources)
         );
     }
 
     #[test]
-    fn the_check_rejects_what_the_sanitizer_should_have_removed() {
+    fn a_document_that_carried_css_the_sanitizer_missed_is_refused() {
+        // Проверка не повторяет политику санитайза, а отвечает на тот же вопрос
+        // строже: документ, в котором адрес всё-таки остался, отвергается.
+        let resources = resources();
         for bad in [
             "<script>alert(1)</script>",
             "<iframe src=\"https://evil.example\"></iframe>",
             "<img src=\"https://evil.example/a.png\">",
             "<style>@import url(https://evil.example);</style>",
+            "<style>a{background:u\\72l(https://evil.example/a.png)}</style>",
             "<img src=../media/before/a.png onerror=x>",
+            "<img src=\"../media/before/нет.png\">",
+            "<style>a{background:url(https://evil.example/a.png)</style>",
+            "<style>@im\\70 ort \"https://evil.example/c.css\";</style>",
         ] {
             assert!(
-                !inspect(bad, PAGE).is_empty(),
+                !inspect(bad, PAGE, &resources).is_empty(),
                 "{bad:?} обязано отвергаться"
             );
+        }
+    }
+
+    #[test]
+    fn the_check_rejects_what_the_sanitizer_should_have_removed() {
+        // Тот же вопрос, что и выше, но от лица санитайза: после очистки документ
+        // обязан проходить проверку, а до неё — нет.
+        for fragment in [
+            "<script>alert(1)</script>",
+            "<img src=\"https://evil.example/a.png\">",
+            "<style>@import url(https://evil.example);</style>",
+        ] {
+            let sanitized = sanitize(fragment);
+            assert!(clean(&sanitized.html), "{fragment:?} → {sanitized:?}");
         }
     }
 }

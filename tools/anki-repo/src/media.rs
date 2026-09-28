@@ -66,9 +66,39 @@ pub enum ReferenceKind {
 /// где объявлено, что считать ссылкой, поэтому гейт `create` и граница доверия
 /// отчёта отвечают на этот вопрос одинаково, а README перечисляет ровно эти
 /// конструкции.
+///
+/// Область действия атрибута — часть семантики, а не удобство записи:
+///
+/// - **media-атрибуты перечислены поэлементно.** `src` запрашивает файл только у
+///   элементов, которые его несут: у `img`, `audio`, `video`, `source`, `track`,
+///   `input`, `embed`, `iframe`, `frame`, `script`. `<div src="…">` не запрашивает
+///   ничего — такого атрибута у `div` нет, — поэтому считать его ссылкой значило
+///   бы запрещать валидную разметку на основании имени атрибута, а не семантики
+///   элемента. Так же поэлементны legacy `background`, `srcset` и `poster`;
+/// - **навигационные атрибуты, наоборот, перечислены через `*`.** Переход не
+///   запрашивает файл, но уводит документ за его пределы, а состав элементов,
+///   которые его выполняют, шире и включает SVG (`xlink:href` у `use` и `image`).
+///   Здесь неполный список означал бы живой внешний адрес в офлайн-отчёте, поэтому
+///   область выбрана намеренно широкой: лишняя нейтрализация видна и безопасна.
 pub const ADDRESS_ATTRIBUTES: &[(&str, &str, ReferenceKind)] = &[
-    ("*", "src", ReferenceKind::Media),
-    ("*", "background", ReferenceKind::Media),
+    ("img", "src", ReferenceKind::Media),
+    ("audio", "src", ReferenceKind::Media),
+    ("video", "src", ReferenceKind::Media),
+    ("source", "src", ReferenceKind::Media),
+    ("track", "src", ReferenceKind::Media),
+    ("input", "src", ReferenceKind::Media),
+    ("embed", "src", ReferenceKind::Media),
+    ("iframe", "src", ReferenceKind::Media),
+    ("frame", "src", ReferenceKind::Media),
+    ("script", "src", ReferenceKind::Media),
+    ("body", "background", ReferenceKind::Media),
+    ("table", "background", ReferenceKind::Media),
+    ("thead", "background", ReferenceKind::Media),
+    ("tbody", "background", ReferenceKind::Media),
+    ("tfoot", "background", ReferenceKind::Media),
+    ("tr", "background", ReferenceKind::Media),
+    ("td", "background", ReferenceKind::Media),
+    ("th", "background", ReferenceKind::Media),
     ("img", "srcset", ReferenceKind::Media),
     ("source", "srcset", ReferenceKind::Media),
     ("video", "poster", ReferenceKind::Media),

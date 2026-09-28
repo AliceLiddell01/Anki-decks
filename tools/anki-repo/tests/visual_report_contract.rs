@@ -409,12 +409,16 @@ fn style_texts(text: &str) -> Vec<String> {
 /// отдельного списка запрещённых подстрок, который неизбежно отстал бы от
 /// контракта.
 fn assert_every_page_is_offline(out: &TempDir) {
-    for path in artifact_files(out.path()) {
+    // Набор ресурсов берётся из фактического артефакта: у теста нет отдельного
+    // списка разрешённых файлов, который неизбежно отстал бы от контракта.
+    let files = artifact_files(out.path());
+    let resources = anki_repo::report::sanitize::Resources::from_report_files(&files);
+    for path in files {
         let Some(page) = page_of(&path) else {
             continue;
         };
         let text = std::fs::read_to_string(out.path().join(&path)).expect("файл отчёта");
-        let violations = anki_repo::report::sanitize::inspect(&text, page);
+        let violations = anki_repo::report::sanitize::inspect(&text, page, &resources);
         assert!(
             violations.is_empty(),
             "{path} не проходит границу доверия: {violations:?}"
@@ -2121,5 +2125,256 @@ fn blocked_and_missing_content_is_named_in_the_preview() {
         missing,
         vec!["after:нет.png"],
         "состояние отсутствия названо"
+    );
+}
+
+/// Символическая ссылка внутри каталога отчёта — отказ до любых изменений.
+///
+/// Владение выдаёт право заменить имя внутри каталога отчёта. Ссылка — это
+/// другое имя для чего-то другого, поэтому замена по ней ушла бы туда, чего
+/// отчёт не выбирал, а прежний отчёт при отказе обязан остаться целым.
+#[test]
+#[cfg(unix)]
+fn a_symlink_inside_the_report_directory_is_refused_without_changes() {
+    let before = canonical_base("report-symlink-before");
+    let after = canonical_base("report-symlink-after");
+    let out = TempDir::new("report-symlink-out");
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let (exit, _) = report(before.path(), after.path(), out.path(), &[]);
+    assert_eq!(exit, 0);
+    let index_before = std::fs::read(out.path().join("index.html")).expect("index");
+    let manifest_before = read_manifest(out.path());
+
+    // Ссылка появляется в каталоге отчёта уже после прогона: цель лежит вне него.
+    let outside = TempDir::new("report-symlink-outside");
+    std::fs::write(outside.path().join("цель.html"), "снаружи").expect("файл");
+    std::os::unix::fs::symlink(outside.path().join("цель.html"), out.path().join("ссылка"))
+        .expect("ссылка");
+
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    assert_ne!(exit, 0, "ссылка в каталоге отчёта отвергается: {document}");
+    assert_eq!(
+        document["error"]["details"]["reason"], "out_dir_entry_conflict",
+        "ссылка названа отказом, а не «файлом отчёта»: {document}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("цель.html")).expect("файл"),
+        "снаружи",
+        "цель ссылки не тронута"
+    );
+    assert_eq!(
+        std::fs::read(out.path().join("index.html")).expect("index"),
+        index_before,
+        "прежний отчёт не изменён"
+    );
+    assert_eq!(
+        read_manifest(out.path()),
+        manifest_before,
+        "прежнее доказательство владения не переписано"
+    );
+}
+
+/// Имя, которого нет в доказательстве владения, не заменяется — даже если это
+/// точка входа отчёта.
+///
+/// Манифест — это и есть право изменить файл. Каталог, в котором `index.html`
+/// не значится в манифесте, доказывает владение всем остальным, но не им, и
+/// заменить файл по незнакомому имени отчёт не вправе.
+#[test]
+fn a_target_name_outside_the_proof_of_ownership_is_not_replaced() {
+    let before = canonical_base("report-outside-proof-before");
+    let after = canonical_base("report-outside-proof-after");
+    let out = TempDir::new("report-outside-proof-out");
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let (exit, _) = report(before.path(), after.path(), out.path(), &[]);
+    assert_eq!(exit, 0);
+    let index_before = std::fs::read(out.path().join("index.html")).expect("index");
+
+    // Доказательство владения перестаёт называть точку входа. Файл при этом
+    // остаётся на месте — и остаётся чужим для отчёта.
+    let mut manifest = read_manifest(out.path());
+    let files: Vec<Value> = manifest["files"]
+        .as_array()
+        .expect("файлы")
+        .iter()
+        .filter(|file| file.as_str() != Some("index.html"))
+        .cloned()
+        .collect();
+    assert!(!files.is_empty(), "в манифесте остаются другие файлы");
+    manifest["files"] = Value::Array(files);
+    std::fs::write(
+        out.path().join("report-manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("манифест"),
+    )
+    .expect("манифест");
+
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    assert_ne!(exit, 0, "чужое имя не заменяется: {document}");
+    assert_eq!(
+        document["error"]["details"]["reason"], "out_dir_entry_conflict",
+        "{document}"
+    );
+    assert_eq!(
+        std::fs::read(out.path().join("index.html")).expect("index"),
+        index_before,
+        "файл, которого нет в доказательстве владения, не перезаписан"
+    );
+}
+
+/// CSS модели не выносит адрес за границу доверия через экранирование.
+///
+/// Экранированный идентификатор функции (`u\72l(`) или экранированный символ в
+/// самом адресе — это тот же `url(`, и разбирать CSS по подстрокам здесь нельзя:
+/// именно так внешний адрес и попадал в готовую страницу.
+#[test]
+fn model_css_cannot_smuggle_an_address_through_an_escape() {
+    let before = canonical_base("report-css-escape-before");
+    let after = canonical_base("report-css-escape-after");
+    let mut export = after.deck_json();
+    // CSS собирается строкой Rust, а не литералом JSON: обратный слэш экранирования
+    // обязан дойти до значения одинарным, иначе проверялось бы не то написание.
+    let model_css = ".card { background: u\\72l(\"https://evil.example/a.png\"); }\
+         .card::before { background: url(https\\3a //evil.example/b.png); }\
+         .card::after { content: \"безобидный текст\"; }\
+         @im\\70 ort url(\"https://evil.example/c.css\");";
+    export["note_models"][0]["css"] = json!(model_css);
+    after.write_canonical_deck_json(&export);
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let out = TempDir::new("report-css-escape-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let _ = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    let css = style_texts(&card).join("\n");
+    assert!(!css.is_empty(), "CSS страницы превью обязан быть");
+    assert!(
+        !css.contains("evil.example"),
+        "внешний адрес не выносится ни одним написанием: {css}"
+    );
+    assert!(
+        !css.to_ascii_lowercase().contains("@import"),
+        "внешняя таблица стилей не подключается: {css}"
+    );
+    assert!(
+        css.contains("безобидный текст"),
+        "безобидное содержимое остаётся: {css}"
+    );
+}
+
+/// Адрес, который после нормализации покидает корень отчёта, не попадает в
+/// готовую страницу ни как media, ни как переход.
+///
+/// Проверка идёт по разобранным атрибутам, а не по подстроке: названное в
+/// объяснении «почему не показано» — это текст, а не адрес.
+#[test]
+fn an_address_that_leaves_the_report_root_never_reaches_the_page() {
+    let before = canonical_base("report-escape-before");
+    let after = canonical_base("report-escape-after");
+    set_field(
+        &after,
+        "guid-2",
+        0,
+        "<img src=\"../media/before/../../../outside.png\">\
+         <a href=\"../../outside.html\">переход</a>\
+         <img src=\"../media/before/%2e%2e%2f%2e%2e%2foutside.png\">\
+         <img src=\"/media/before/outside.png\">",
+    );
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let out = TempDir::new("report-escape-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    for (name, value) in address_values(&card) {
+        assert!(
+            !value.contains("outside"),
+            "{name}={value} ведёт за пределы каталога отчёта: {card}"
+        );
+    }
+    // Отвергнутое названо, а не выброшено молча.
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .expect("диагностика")
+            .iter()
+            .any(|item| {
+                item["code"] == "preview_construct_blocked"
+                    && item["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("../../outside.html"))
+            }),
+        "отвергнутый адрес назван в отчёте: {result}"
+    );
+}
+
+/// `src` у элемента, который его не имеет, — не адрес: разметка не переписывается
+/// и не считается ссылкой на media.
+#[test]
+fn a_src_outside_a_resource_bearing_element_is_not_an_address() {
+    let before = canonical_base("report-div-src-before");
+    let after = canonical_base("report-div-src-after");
+    set_field(&after, "guid-2", 0, "<div src=\"не-адрес.png\">слово</div>");
+    after.write_media(&["не-адрес.png"]);
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let out = TempDir::new("report-div-src-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    assert!(
+        card.contains("src=\"не-адрес.png\""),
+        "разметка сохраняется как есть: {card}"
+    );
+    assert!(
+        !card.contains("../media/after/не-адрес.png"),
+        "имя атрибута не подменяет семантику элемента: {card}"
+    );
+    assert_eq!(
+        result["media"]["copied"], 0,
+        "файл, на который никто не ссылается, не копируется: {result}"
+    );
+    assert_eq!(
+        result["media"]["missing"],
+        json!([]),
+        "и не считается отсутствующим: {result}"
+    );
+}
+
+/// `--out` — символическая ссылка: отказ, а не запись по её цели.
+///
+/// Ссылка делает названный путь и путь записи разными, а доказательство владения,
+/// правила конфликтов и запрет на `decks/**` относятся к настоящему каталогу.
+/// Кто создал ссылку, тот и выбрал цель, поэтому такой `--out` отвергается, а цель
+/// остаётся нетронутой.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_out_dir_is_refused_and_its_target_is_untouched() {
+    let before = canonical_base("report-link-before");
+    let after = canonical_base("report-link-after");
+    let target = TempDir::new("report-link-target");
+    let link_root = TempDir::new("report-link-root");
+    let link = link_root.path().join("отчёт");
+    std::os::unix::fs::symlink(target.path(), &link).expect("ссылка");
+
+    let (exit, document) = report(before.path(), after.path(), &link, &[]);
+    assert_ne!(exit, 0, "ссылка вместо каталога отвергается: {document}");
+    assert_eq!(
+        document["error"]["details"]["reason"], "out_dir_is_symlink",
+        "{document}"
+    );
+    assert!(
+        std::fs::read_dir(target.path())
+            .expect("цель ссылки")
+            .next()
+            .is_none(),
+        "по ссылке ничего не записано"
     );
 }
