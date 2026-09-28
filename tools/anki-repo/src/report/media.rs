@@ -67,6 +67,25 @@ pub struct MediaPlan {
     pub budget_skipped: usize,
 }
 
+/// Что означает ссылка превью в конкретном состоянии экспорта.
+///
+/// Отчёт уже знает про media больше, чем видно в HTML: файл либо скопирован,
+/// либо отсутствует, либо ссылка вообще не является локальным файлом отчёта.
+/// Превью обязано использовать это знание, а не оставлять браузеру догадываться
+/// по 404: иначе отсутствующая картинка выглядит как обычная страница, на
+/// которой что-то не загрузилось.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewReference<'a> {
+    /// Файл этого состояния скопирован: в HTML подставляется этот путь.
+    Copied(&'a str),
+    /// Локальная ссылка на базовое имя, файла которого в этом состоянии нет.
+    MissingLocal,
+    /// Ссылка не является локальным файлом отчёта: внешняя, с путём, слишком
+    /// большая, символическая ссылка или не обработанная из-за предела копий.
+    /// Такую ссылку отчёт не выдаёт за простое «файла нет».
+    NotAPreviewFile,
+}
+
 impl MediaPlan {
     /// Путь файла внутри каталога отчёта, если он скопирован для этого состояния.
     #[must_use]
@@ -74,6 +93,35 @@ impl MediaPlan {
         self.resolved
             .get(&(state, reference.to_string()))
             .map(String::as_str)
+    }
+
+    /// Как ссылка относится к состоянию: она проверяется по данным плана, а не
+    /// по имени файла, поэтому «отсутствует» — это утверждение об этом экспорте.
+    #[must_use]
+    pub fn preview_reference(&self, state: SideState, reference: &str) -> PreviewReference<'_> {
+        if is_remote(reference) {
+            return PreviewReference::NotAPreviewFile;
+        }
+        if let Some(path) = self.resolved_path(state, reference) {
+            return PreviewReference::Copied(path);
+        }
+
+        let name = normalize_media_name(reference);
+        // Ссылка с путём — отдельный класс: она уже названа диагностикой
+        // `media_path_traversal`, и отчёт не имеет права выдать её за обычное
+        // «файла нет в экспорте».
+        if name != reference {
+            return PreviewReference::NotAPreviewFile;
+        }
+
+        let state_media = self.state(state);
+        let skipped_elsewhere =
+            state_media.symlinks.contains(&name) || state_media.oversized.contains(&name);
+        if skipped_elsewhere || !state_media.missing.contains(&name) {
+            return PreviewReference::NotAPreviewFile;
+        }
+
+        PreviewReference::MissingLocal
     }
 
     /// Работа с media состояния.
@@ -496,5 +544,98 @@ mod tests {
         assert_eq!(plan.copied_total(), 0);
         assert_eq!(plan.symlinks_union(), vec!["a.png".to_string()]);
         assert!(plan.missing_union().contains(&"a.png".to_string()));
+    }
+
+    /// Классификация ссылки превью читается из данных плана, а не из имени файла:
+    /// «отсутствует» — это утверждение об экспорте, и его нельзя выдать за него
+    /// ссылке, у которой причина другая.
+    #[test]
+    fn a_preview_reference_is_classified_from_the_plan() {
+        let mut plan = MediaPlan::default();
+        let mut before = StateMedia::default();
+        before.copied.push("есть.png".to_string());
+        before.missing.push("нет.png".to_string());
+        // Символическая ссылка попадает и в missing, и в symlinks: план обязан
+        // назвать её ссылкой, а не пропажей.
+        before.missing.push("ссылка.png".to_string());
+        before.symlinks.push("ссылка.png".to_string());
+        before.oversized.push("большой.png".to_string());
+        before
+            .remote
+            .push("https://example.com/вне.png".to_string());
+        plan.states.insert(SideState::Before, before);
+        plan.resolved.insert(
+            (SideState::Before, "есть.png".to_string()),
+            "media/before/есть.png".to_string(),
+        );
+
+        assert_eq!(
+            plan.preview_reference(SideState::Before, "есть.png"),
+            PreviewReference::Copied("media/before/есть.png")
+        );
+        assert_eq!(
+            plan.preview_reference(SideState::Before, "нет.png"),
+            PreviewReference::MissingLocal
+        );
+        for reference in [
+            "ссылка.png",
+            "большой.png",
+            "https://example.com/вне.png",
+            "../нет.png",
+            "нет.png",
+        ] {
+            let expected = if reference == "нет.png" {
+                PreviewReference::MissingLocal
+            } else {
+                PreviewReference::NotAPreviewFile
+            };
+            assert_eq!(
+                plan.preview_reference(SideState::Before, reference),
+                expected,
+                "ссылка {reference:?}"
+            );
+        }
+    }
+
+    /// Копия в соседнем состоянии не делает файл существующим здесь: у каждого
+    /// состояния свой ответ на один и тот же вопрос.
+    #[test]
+    fn the_same_name_is_answered_per_state() {
+        let dir = crate::test_support::TempDir::new("report-media-per-state");
+        let before = dir.path().join("before");
+        let after = dir.path().join("after");
+        let out = dir.path().join("out");
+        write(&before.join("media/a.png"), b"before");
+        write(&after.join("media/a.png"), b"after");
+
+        let mut references: BTreeMap<SideState, BTreeSet<String>> = BTreeMap::new();
+        references.insert(
+            SideState::Before,
+            ["a.png".to_string()].into_iter().collect(),
+        );
+        references.insert(
+            SideState::After,
+            ["a.png".to_string()].into_iter().collect(),
+        );
+        let plan = plan(
+            &[(SideState::Before, before), (SideState::After, after)],
+            &references,
+            &out,
+        )
+        .expect("план");
+
+        assert_eq!(
+            plan.preview_reference(SideState::Before, "a.png"),
+            PreviewReference::Copied("media/before/a.png")
+        );
+        assert_eq!(
+            plan.preview_reference(SideState::After, "a.png"),
+            PreviewReference::Copied("media/after/a.png")
+        );
+        // Имя, которого нет в ссылках состояния, не доказано отсутствующим.
+        assert_eq!(
+            plan.preview_reference(SideState::Before, "чужое.png"),
+            PreviewReference::NotAPreviewFile
+        );
     }
 }

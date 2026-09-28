@@ -1826,6 +1826,14 @@ fn render_template(
 /// разрешение с ключом `(состояние, ссылка)`, поэтому превью «до» не может
 /// показать файл из «после».
 ///
+/// Локальная картинка, которой в этом состоянии нет, заменяется видимым
+/// плейсхолдером вместе со всем элементом `<img>`. Оставить исходный `src` нельзя:
+/// браузер запросил бы несуществующий файл и нарисовал свою иконку сломанного
+/// изображения, которая молчит о том, чего именно не хватает, и сама участвует в
+/// inline-раскладке. Отсутствие при этом устанавливается по данным плана этого
+/// состояния, а не по имени файла: внешние ссылки, ссылки с путём и прочие
+/// media-классы плейсхолдером не подменяются.
+///
 /// Звук (`[sound:имя]`) превращается в локальный проигрыватель с классом
 /// `replay-button` — тем же хуком, которым его оформляет модель в Anki.
 /// Отсутствующий файл не выдумывается и не заменяется: ссылка остаётся видимой и
@@ -1884,34 +1892,131 @@ fn rewrite_preview_references(
         }
 
         let (head, tail) = rest.split_at(position + "src=".len());
-        out.push_str(head);
         let Some(quote) = tail.chars().next() else {
+            out.push_str(head);
             break;
         };
         if quote != '"' && quote != '\'' {
+            out.push_str(head);
             out.push_str(tail.split_at(quote.len_utf8()).0);
             rest = &tail[quote.len_utf8()..];
             continue;
         }
 
         let Some(end) = tail[1..].find(quote) else {
+            out.push_str(head);
             out.push_str(tail);
             return out;
         };
 
         let reference = &tail[1..1 + end];
-        match plan.resolved_path(state, reference) {
-            Some(path) => {
+        let mut replaced_element = false;
+        match plan.preview_reference(state, reference) {
+            media::PreviewReference::Copied(path) => {
+                out.push_str(head);
                 resolved_media.insert(path.to_string());
                 let _ = write!(out, "{quote}../{path}{quote}");
             }
-            None => out.push_str(&format!("{quote}{reference}{quote}")),
+            media::PreviewReference::MissingLocal => {
+                match missing_image_element(rest, position, reference, state) {
+                    Some((start, tag_end, placeholder)) => {
+                        // Элемент отдаётся целиком: он целиком же и заменяется,
+                        // вместе с атрибутами, которые к отсутствующей картинке
+                        // уже не относятся.
+                        out.push_str(&rest[..start]);
+                        out.push_str(&placeholder);
+                        rest = &rest[tag_end + 1..];
+                        replaced_element = true;
+                    }
+                    None => {
+                        out.push_str(head);
+                        out.push_str(&format!("{quote}{reference}{quote}"));
+                    }
+                }
+            }
+            media::PreviewReference::NotAPreviewFile => {
+                out.push_str(head);
+                out.push_str(&format!("{quote}{reference}{quote}"));
+            }
+        }
+        if replaced_element {
+            continue;
         }
         rest = &tail[1 + end + 1..];
     }
 
     out.push_str(rest);
     out
+}
+
+/// Готовит замену элемента `<img>`, если ссылка подтверждённо отсутствует.
+///
+/// Возвращает начало тега, индекс его `>` и сам плейсхолдер. Плейсхолдер ставится
+/// только на месте картинки: у прочих элементов `src` означает не картинку, и
+/// отчёт не подменяет их текстом.
+fn missing_image_element(
+    html: &str,
+    position: usize,
+    reference: &str,
+    state: SideState,
+) -> Option<(usize, usize, String)> {
+    let (tag_start, tag_name) = enclosing_open_tag(html, position)?;
+    if tag_name != "img" {
+        return None;
+    }
+    let tag_end = closing_bracket(html, position)?;
+    Some((
+        tag_start,
+        tag_end,
+        missing_image_placeholder(reference, state),
+    ))
+}
+
+/// Плейсхолдер отсутствующей картинки: говорит basename и то, что файла нет.
+fn missing_image_placeholder(reference: &str, state: SideState) -> String {
+    let name = media_index::normalize_media_name(reference);
+    let title = format!(
+        "файл {} отсутствует в состоянии «{}»: превью осталось без него",
+        name,
+        state.as_str()
+    );
+    format!(
+        "<span class=\"report-media-missing\" title=\"{}\">missing: {}</span>",
+        escape_attr(&title),
+        escape_attr(&name)
+    )
+}
+
+/// Открывающий тег, внутри атрибутов которого находится позиция `position`.
+///
+/// Возвращает индекс `<` и имя тега в нижнем регистре. Если между `<` и позицией
+/// уже встретился `>`, то `src=` стоит не в атрибутах тега, и трогать нечего.
+fn enclosing_open_tag(html: &str, position: usize) -> Option<(usize, String)> {
+    let start = html[..position].rfind('<')?;
+    let head = &html[start + 1..position];
+    if head.contains('>') {
+        return None;
+    }
+    let name: String = head
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric())
+        .collect();
+    Some((start, name.to_ascii_lowercase()))
+}
+
+/// Индекс `>`, закрывающего тег, начиная с `from`, с учётом кавычек в атрибутах.
+fn closing_bracket(html: &str, from: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (offset, character) in html[from..].char_indices() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None if character == '"' || character == '\'' => quote = Some(character),
+            None if character == '>' => return Some(from + offset),
+            None => {}
+        }
+    }
+    None
 }
 
 /// Экранирует значение атрибута.
@@ -2482,7 +2587,7 @@ mod tests {
         fs::create_dir_all(source.join("media")).expect("media");
         fs::write(source.join("media/есть.png"), b"x").expect("файл");
 
-        let references = state_references(SideState::After, &["есть.png"]);
+        let references = state_references(SideState::After, &["есть.png", "нет.png"]);
         let plan = media::plan(
             &[(SideState::After, source)],
             &references,
@@ -2497,13 +2602,157 @@ mod tests {
             rewrite_preview_references(html, SideState::After, &plan, &mut resolved, &mut missing);
 
         assert!(rewritten.contains("src=\"../media/after/есть.png\""));
-        assert!(rewritten.contains("src=\"нет.png\""));
+        // Отсутствующий локальный файл не остаётся живой ссылкой: браузер показал бы
+        // на её месте значок битой картинки и 404 в консоли, то есть превью молча
+        // соврало бы о содержимом карточки.
+        assert!(
+            !rewritten.contains("src=\"нет.png\""),
+            "битая ссылка не остаётся в превью: {rewritten}"
+        );
+        assert!(rewritten.contains("class=\"report-media-missing\""));
+        assert!(rewritten.contains("missing: нет.png"));
+        // Внешняя ссылка локальным файлом отчёта не является: она не скачивается и
+        // не выдаётся за «файла нет в экспорте».
         assert!(rewritten.contains("src=\"https://x/у.png\""));
+        assert!(!rewritten.contains("missing: у.png"));
         assert_eq!(resolved, ["media/after/есть.png".to_string()].into());
         assert!(
             missing.is_empty(),
             "картинка — не звук: в missing_sounds не попадает"
         );
+    }
+
+    /// Ссылка, которая не является локальным файлом отчёта, не подменяется чипом
+    /// «файла нет»: у неё своя причина, и она названа диагностикой.
+    #[test]
+    fn a_reference_that_is_not_a_local_file_is_not_shown_as_missing() {
+        let dir = TempDir::new("visual-report-not-local");
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("media")).expect("media");
+        fs::write(source.join("media/есть.png"), b"x").expect("файл");
+        std::os::unix::fs::symlink(
+            source.join("media/есть.png"),
+            source.join("media/ссылка.png"),
+        )
+        .expect("символическая ссылка");
+
+        let names = [
+            "https://x/вне.png",
+            "../уход.png",
+            "ссылка.png",
+            "нет.png",
+            "есть.png",
+        ];
+        let references = state_references(SideState::Before, &names);
+        let mut plan = media::plan(
+            &[(SideState::Before, source.clone())],
+            &references,
+            &dir.path().join("out"),
+        )
+        .expect("план media");
+        // Порядок как в прогоне отчёта: символические ссылки известны плану до
+        // того, как по нему собирается HTML превью.
+        media::note_symlinks(&mut plan, &[(SideState::Before, source)], &references);
+
+        let html = names
+            .iter()
+            .map(|name| format!("<img src=\"{name}\">"))
+            .collect::<String>();
+        let mut resolved: BTreeSet<String> = BTreeSet::new();
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        let rewritten = rewrite_preview_references(
+            &html,
+            SideState::Before,
+            &plan,
+            &mut resolved,
+            &mut missing,
+        );
+
+        assert_eq!(
+            rewritten.matches("class=\"report-media-missing\"").count(),
+            1,
+            "чип получает только настоящий локальный пропуск: {rewritten}"
+        );
+        assert!(rewritten.contains("missing: нет.png"));
+        assert!(rewritten.contains("src=\"https://x/вне.png\""));
+        assert!(rewritten.contains("src=\"../уход.png\""));
+        assert!(rewritten.contains("src=\"ссылка.png\""));
+        assert!(rewritten.contains("src=\"../media/before/есть.png\""));
+        // Ссылка с путём осталась диагностикой, а не источником для чтения.
+        assert_eq!(plan.traversal_union(), vec!["../уход.png".to_string()]);
+        assert_eq!(plan.symlinks_union(), vec!["ссылка.png".to_string()]);
+    }
+
+    /// Чип — утверждение о конкретном состоянии, а не о заметке целиком.
+    #[test]
+    fn a_missing_local_image_is_marked_on_its_own_side_only() {
+        let dir = TempDir::new("visual-report-placeholder-state");
+        let before = dir.path().join("before");
+        let after = dir.path().join("after");
+        fs::create_dir_all(before.join("media")).expect("media before");
+        fs::create_dir_all(after.join("media")).expect("media after");
+        fs::write(after.join("media/竹.gif"), b"after").expect("файл after");
+
+        let mut references: BTreeMap<SideState, BTreeSet<String>> = BTreeMap::new();
+        for state in SideState::ALL {
+            references.insert(state, ["竹.gif".to_string()].into_iter().collect());
+        }
+        let plan = media::plan(
+            &[(SideState::Before, before), (SideState::After, after)],
+            &references,
+            &dir.path().join("out"),
+        )
+        .expect("план media");
+
+        let mut resolved: BTreeSet<String> = BTreeSet::new();
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        let before_html = rewrite_preview_references(
+            "<img src=\"竹.gif\">",
+            SideState::Before,
+            &plan,
+            &mut resolved,
+            &mut missing,
+        );
+        let after_html = rewrite_preview_references(
+            "<img src=\"竹.gif\">",
+            SideState::After,
+            &plan,
+            &mut resolved,
+            &mut missing,
+        );
+
+        assert!(before_html.contains("class=\"report-media-missing\""));
+        assert!(before_html.contains("missing: 竹.gif"));
+        assert!(!before_html.contains("src="), "ссылки в чипе нет");
+        assert!(before_html.contains("before"), "состояние названо в чипе");
+        assert!(after_html.contains("src=\"../media/after/竹.gif\""));
+        assert!(!after_html.contains("report-media-missing"));
+        assert_eq!(resolved, ["media/after/竹.gif".to_string()].into());
+    }
+
+    /// Чип встаёт только вместо картинки: ссылка на media у другого элемента
+    /// остаётся его собственной ссылкой.
+    #[test]
+    fn only_an_image_element_is_replaced_by_the_missing_placeholder() {
+        let dir = TempDir::new("visual-report-placeholder-tag");
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("media")).expect("media");
+
+        let plan = media::plan(
+            &[(SideState::After, source)],
+            &state_references(SideState::After, &["нет.png"]),
+            &dir.path().join("out"),
+        )
+        .expect("план media");
+
+        let html = "<audio src=\"нет.png\"></audio><img src=\"нет.png\">";
+        let mut resolved: BTreeSet<String> = BTreeSet::new();
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        let rewritten =
+            rewrite_preview_references(html, SideState::After, &plan, &mut resolved, &mut missing);
+
+        assert!(rewritten.contains("<audio src=\"нет.png\"></audio>"));
+        assert!(rewritten.contains("class=\"report-media-missing\""));
     }
 
     #[test]

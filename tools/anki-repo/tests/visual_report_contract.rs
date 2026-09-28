@@ -262,6 +262,18 @@ fn report_writes_a_self_contained_offline_document() {
         index.contains("data-report-theme-value=\"night\""),
         "у отчёта есть переключатель темы"
     );
+    // Тема — одно состояние, значит и переключатель один на весь документ: две
+    // группы кнопок разошлись бы в состоянии при первой же правке.
+    assert_eq!(
+        index.matches("class=\"report-theme\"").count(),
+        1,
+        "переключатель темы в документе ровно один"
+    );
+    assert_eq!(
+        index.matches("data-report-theme-value=").count(),
+        2,
+        "в переключателе две кнопки"
+    );
     assert!(
         index.contains("nightMode"),
         "отчёт объясняет, что ночная тема доходит до карточек"
@@ -900,12 +912,33 @@ fn media_missing_only_in_before_is_not_taken_from_after() {
         !out.path().join("media/after/only-before.png").exists(),
         "файл копируется только для того состояния, которое на него ссылается"
     );
+    let card_before = card_text(&out, "cards/card-0001.html");
+    let card_after = card_text(&out, "cards/card-0002.html");
     assert!(
-        card_text(&out, "cards/card-0001.html").contains("src=\"only-before.png\""),
-        "в кадре «до» ссылка остаётся сырой: файла там нет"
+        !card_before.contains("src=\"only-before.png\""),
+        "отсутствующая картинка не остаётся живой ссылкой: браузер показал бы битый значок вместо факта"
     );
     assert!(
-        card_text(&out, "cards/card-0002.html").contains("src=\"../media/after/only-after.png\"")
+        card_before.contains("class=\"report-media-missing\""),
+        "на месте файла видно состояние, а не пустота"
+    );
+    assert!(card_before.contains("missing: only-before.png"));
+    assert!(
+        card_before.contains("before"),
+        "чип называет состояние, в котором файла нет"
+    );
+    assert!(
+        !card_before.contains("only-after.png"),
+        "чужой файл состояния не подставляется"
+    );
+    assert!(
+        !card_after.contains("class=\"report-media-missing\""),
+        "в «после» файл на месте: чипа там быть не должно"
+    );
+    assert!(card_after.contains("src=\"../media/after/only-after.png\""));
+    assert!(
+        card_after.contains("<img"),
+        "настоящая картинка остаётся элементом img"
     );
 
     let missing: Vec<&str> = result["diagnostics"]
@@ -1270,5 +1303,182 @@ fn report_does_not_run_template_javascript() {
     assert_eq!(
         shown_as_text, 1,
         "шаблонный script показан текстом ровно в кадре «после»"
+    );
+}
+
+/// Иерархия отчёта: сначала сводка, потом служебные данные, потом содержимое.
+///
+/// Проза отчёта не имеет права растягиваться на всю ширину экрана, но и сжимать
+/// её вместе со сравнением нельзя: превью «до»/«после» меряется кадром карточки,
+/// а не длиной строки.
+#[test]
+fn report_keeps_prose_readable_without_narrowing_the_comparison() {
+    let before = canonical_base("report-layout-before");
+    let after = canonical_base("report-layout-after");
+    set_field(&after, "guid-2", 1, "переписанное толкование");
+
+    let out = TempDir::new("report-layout-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let _ = result_of(exit, &document);
+    let index = std::fs::read_to_string(out.path().join("index.html")).expect("index.html");
+
+    // Мера строки объявлена как отдельная величина, а не как ширина отчёта.
+    assert!(
+        index.contains("--report-reading-width"),
+        "мера строки прозы объявлена переменной"
+    );
+    assert!(
+        index.contains("max-width: var(--report-reading-width)"),
+        "проза ограничена мерой строки, а не пределом отчёта"
+    );
+    // Основной блок отчёта остаётся широким: сравнение обязано помещаться целиком.
+    assert!(
+        index.contains(".report-main") && index.contains("max-width: none"),
+        "ширина сравнения не режется мерой строки"
+    );
+    assert!(
+        index.contains(".report-compare"),
+        "сравнение состояний живёт в собственной раскладке"
+    );
+    // Рамку кадра несёт обёртка, а сам кадр её не имеет: при `border-box` рамка
+    // на кадре вычиталась бы из высоты, которую runtime ставит по содержимому, и
+    // внутри превью появлялся бы собственный scrollbar.
+    let rule = |selector: &str| -> String {
+        let start = index.find(selector).expect("селектор правила");
+        let open = index[start..].find('{').expect("начало правила") + start;
+        let close = index[open..].find('}').expect("конец правила") + open;
+        index[open + 1..close].to_string()
+    };
+    let frame = rule(".report-preview-frame {");
+    assert!(
+        frame.contains("border: 1px"),
+        "рамку кадра рисует обёртка: {frame}"
+    );
+    let preview = rule(".report-preview {");
+    assert!(
+        preview.contains("border: 0"),
+        "у самого кадра рамки нет: {preview}"
+    );
+    assert!(
+        !preview.contains("border: 1px"),
+        "рамка на кадре вернула бы расхождение высоты: {preview}"
+    );
+}
+
+/// Ограничения отчёта свёрнуты нативным `<details>` и называют свой объём.
+///
+/// Это не украшение: раздел ограничений описывает инструмент, а не изменение
+/// колоды, поэтому он не имеет права занимать первый экран, но обязан оставаться
+/// доступным без JavaScript и открываться по одному клику.
+#[test]
+fn report_keeps_its_limits_collapsed_and_counted() {
+    let before = canonical_base("report-limits-before");
+    let after = canonical_base("report-limits-after");
+    // Ссылка на файл, которого нет: у отчёта появляется настоящая диагностика,
+    // и она обязана остаться видимой рядом со свёрнутыми ограничениями.
+    set_field(&before, "guid-2", 2, "<img src=\"нет-файла.png\">");
+    set_field(&after, "guid-2", 1, "переписанное толкование");
+
+    let out = TempDir::new("report-limits-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let _ = result_of(exit, &document);
+    let index = std::fs::read_to_string(out.path().join("index.html")).expect("index.html");
+
+    let position = index
+        .find("<details")
+        .expect("ограничения — раскрывающийся блок");
+    let tag_end = index[position..].find('>').expect("тег") + position;
+    let summary_end = index[position..]
+        .find("</summary>")
+        .expect("у блока ограничений есть summary")
+        + position;
+    let opening = &index[position..tag_end];
+    assert!(
+        !opening.contains(" open"),
+        "блок ограничений свёрнут по умолчанию: {opening}"
+    );
+    assert!(
+        index[position..summary_end].contains("Ограничения этого отчёта"),
+        "свёрнутая строка называет раздел"
+    );
+    assert!(
+        index[position..summary_end].contains("пункт"),
+        "свёрнутая строка называет число пунктов"
+    );
+    assert!(
+        index.contains("<summary") && !index.contains("<summary open"),
+        "раскрытие не требует JavaScript"
+    );
+
+    // Служебные разделы и неполнота превью не прячутся в свёрнутый блок: иначе
+    // отчёт выглядел бы полным именно там, где он неполон.
+    let details_end = index[position..]
+        .find("</details>")
+        .expect("конец блока ограничений")
+        + position;
+    let after_limits = &index[details_end..];
+    assert!(
+        after_limits.contains("<h2>Диагностика</h2>"),
+        "диагностика видна вне свёрнутого блока ограничений"
+    );
+    for path in walk(out.path()) {
+        let text = std::fs::read_to_string(out.path().join(&path)).expect("файл отчёта");
+        let Some(found) = text.find("<h2>Неподдержанные конструкции шаблонов</h2>")
+        else {
+            continue;
+        };
+        let block_end = text.find("</details>").expect("конец блока ограничений");
+        assert!(
+            found > block_end,
+            "{path}: раздел неподдержанных конструкций обязан быть видимым"
+        );
+    }
+}
+
+/// Переключатель темы обязан быть доступен и в середине длинного отчёта.
+///
+/// Длинный отчёт не читают с одного экрана: если тема переключается только в
+/// шапке, до неё нужно возвращаться прокруткой. Панель закреплена и при этом
+/// остаётся единственным местом, где тема переключается.
+#[test]
+fn report_keeps_the_theme_control_reachable_while_scrolling() {
+    let before = canonical_base("report-toolbar-before");
+    let after = canonical_base("report-toolbar-after");
+    set_field(&after, "guid-2", 1, "переписанное толкование");
+
+    let out = TempDir::new("report-toolbar-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let _ = result_of(exit, &document);
+    let index = std::fs::read_to_string(out.path().join("index.html")).expect("index.html");
+
+    let toolbar = index
+        .find("class=\"report-toolbar\"")
+        .expect("панель управления темой");
+    let control = index
+        .find("class=\"report-theme\"")
+        .expect("переключатель темы");
+    assert!(
+        control > toolbar,
+        "переключатель живёт в закреплённой панели, а не в шапке"
+    );
+    assert_eq!(
+        index.matches("class=\"report-toolbar\"").count(),
+        1,
+        "панель одна на документ, а не повторяется у каждого раздела"
+    );
+    assert!(
+        index.contains("position: sticky"),
+        "панель закреплена при прокрутке"
+    );
+    assert!(
+        index.contains("top: 0"),
+        "панель держится у верхней кромки окна"
+    );
+
+    // Цвета темы объявлены один раз: панель не заводит второй источник истины.
+    assert_eq!(
+        index.matches("data-report-theme=").count(),
+        0,
+        "тема хранится в атрибуте, который ставит runtime, а не в разметке панели"
     );
 }

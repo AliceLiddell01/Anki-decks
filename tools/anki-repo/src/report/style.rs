@@ -35,6 +35,14 @@ pub const REPORT_CSS: &str = r#":root {
   --report-removed: #a32323;
   --report-ins: #d8f3dc;
   --report-del: #ffdcdc;
+  /* Читаемая длина строки для прозы отчёта. Это не предел ширины отчёта:
+     визуальное сравнение «до»/«после» живёт в собственной, более широкой
+     раскладке и меряется не символами, а кадром карточки. Значение подобрано по
+     самому мелкому тексту отчёта (`.85rem` у ограничений и диагностики): при нём
+     строка остаётся в пределах восьмидесяти символов, а основной текст — около
+     семидесяти. */
+  --report-reading-width: 68ch;
+  --report-gutter: clamp(1rem, 3vw, 3rem);
 }
 
 * { box-sizing: border-box; }
@@ -69,22 +77,88 @@ body.report.report-night {
 .report-header {
   background: var(--report-panel);
   border-bottom: 1px solid var(--report-line);
-  padding: 1.5rem clamp(1rem, 3vw, 3rem);
+  padding: 1.5rem var(--report-gutter) 1.25rem var(--report-gutter);
 }
 
 .report-title { margin: 0 0 .25rem 0; font-size: 1.4rem; }
 .report-subtitle { margin: 0; color: var(--report-muted); font-size: .9rem; }
 .report-subtitle code { background: var(--report-bg); padding: .1rem .3rem; border-radius: 3px; }
 
+/* Пояснение к отчёту — проза, поэтому оно ограничено читаемой длиной строки, а
+   не растянуто на всю ширину окна вместе с превью карточек. */
+.report-header .report-hint { max-width: var(--report-reading-width); }
+
+/* Панель управления живёт отдельно от шапки: на длинном отчёте переключатель
+   темы нужен у той карточки, которую сейчас смотрят, а не только наверху.
+   `sticky` оставляет его в потоке — он не отрывается от раскладки и занимает
+   собственную полосу высотой в одну строку, а не плавающий блок поверх текста. */
+.report-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem 1rem;
+  padding: .45rem var(--report-gutter);
+  background: var(--report-panel);
+  border-bottom: 1px solid var(--report-line);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 5%);
+}
+
+.report-toolbar-label { color: var(--report-muted); font-size: .85rem; }
+
+/* Проза отчёта: ограничения, диагностика, неподдержанные конструкции. Предел
+   ширины стоит только на текстовых секциях — карточки и их сравнение остаются
+   во всю доступную ширину. */
+.report-section-prose { max-width: var(--report-reading-width); }
+
+/* Справочный блок ограничений свёрнут по умолчанию и раскрывается нативным
+   `details`, то есть без участия runtime: читатель, у которого JavaScript
+   выключен, всё равно увидит, что отчёт чего-то не покрывает. */
+.report-details > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: .5rem;
+}
+
+.report-details > summary::-webkit-details-marker { display: none; }
+
+.report-details > summary::after {
+  content: "";
+  margin-left: auto;
+  width: .45rem;
+  height: .45rem;
+  border-right: 2px solid var(--report-muted);
+  border-bottom: 2px solid var(--report-muted);
+  transform: rotate(45deg) translate(-.1rem, -.1rem);
+  transition: transform .15s ease;
+}
+
+.report-details[open] > summary::after { transform: rotate(-135deg) translate(-.15rem, .1rem); }
+.report-details[open] > summary { margin-bottom: .6rem; }
+
+.report-details > summary h2 { margin: 0; font-size: 1.1rem; }
+.report-details > summary:focus-visible { outline: 2px solid var(--report-accent); outline-offset: 2px; }
+
+.report-summary-count {
+  color: var(--report-muted);
+  font-size: .85rem;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Отчёт использует доступную ширину: превью карточки — это и есть то, что
    сравнивает ревьюер, и искусственный предел ширины заставлял бы смотреть
-   карточку в узкой колонке рядом с пустым полем. */
-.report-main { padding: 1.5rem clamp(1rem, 3vw, 3rem); max-width: none; }
+   карточку в узкой колонке рядом с пустым полем. Прозу ограничивает не эта
+   ширина, а `.report-section-prose`. */
+.report-main { padding: 1.5rem var(--report-gutter); max-width: none; }
 
 .report-theme {
   display: inline-flex;
   gap: .25rem;
-  margin: .9rem 0 0 0;
+  margin: 0 0 0 auto;
   padding: .15rem;
   border: 1px solid var(--report-line);
   border-radius: 999px;
@@ -197,14 +271,26 @@ body.report.report-night {
 .report-compare-side[data-state="before"] .report-compare-label { color: var(--report-changed); }
 .report-compare-side[data-state="after"] .report-compare-label { color: var(--report-created); }
 
+.report-preview-frame {
+  border: 1px solid var(--report-line);
+  border-radius: 6px;
+  background: #fff;
+  overflow: hidden;
+}
+
+/* Рамку кадра несёт обёртка, а не сам `<iframe>`: высота кадра измеряется по
+   содержимому карточки и ставится на внешний box. Пока рамка была на кадре,
+   глобальный `box-sizing: border-box` вычитал её пиксели из измеренной высоты,
+   и содержимому не хватало ровно её — браузер показывал внутри превью
+   собственный scrollbar. Без рамки и отступов у кадра `style.height` совпадает
+   с высотой его содержимого, и запаса против дробного округления хватает. */
 .report-preview {
   display: block;
   width: 100%;
+  border: 0;
   /* Кадр растёт по измеренной высоте содержимого, поэтому собственные полосы
      прокрутки ему не нужны: прокручивается сама страница отчёта. */
   overflow: hidden;
-  border: 1px solid var(--report-line);
-  border-radius: 6px;
   background: #fff;
 }
 .report-preview-host { margin: .5rem 0 0 0; min-width: 0; }
@@ -268,4 +354,24 @@ img { max-width: 100%; }
   color: #a32323;
 }
 .nightMode .report-audio-missing { color: #f08a8a; border-bottom-color: #f08a8a; }
+
+/* Плейсхолдер отсутствующей картинки стоит ровно на месте media. Браузерная
+   иконка сломанного файла молчит о том, чего не хватает, и сама по себе
+   участвует в inline-раскладке; этот элемент говорит basename вслух и остаётся
+   предсказуемым по размеру. Размеры в `em`, чтобы плейсхолдер следовал
+   масштабу шрифта карточки, а не отчёта. */
+.report-media-missing {
+  display: inline-block;
+  max-width: 100%;
+  padding: .15em .5em;
+  border: 1px dashed currentColor;
+  border-radius: .25em;
+  font-size: .7em;
+  line-height: 1.4;
+  color: #a32323;
+  background-color: rgb(163 35 35 / 8%);
+  vertical-align: middle;
+  word-break: break-all;
+}
+.nightMode .report-media-missing { color: #f08a8a; background-color: rgb(240 138 138 / 12%); }
 "#;

@@ -138,6 +138,11 @@ pub const INDEX_RUNTIME_JS: &str = r#"
     if (!frame || typeof height !== 'number' || !isFinite(height)) {
       return;
     }
+    // Высота ставится на внешний box кадра, а измеряет карточка высоту своего
+    // содержимого. Совпадают они только потому, что у `.report-preview` нет ни
+    // рамки, ни отступов: при `box-sizing: border-box` и ненулевой рамке её
+    // пиксели вычитались бы из этой высоты, и внутри превью появлялся бы
+    // собственный scrollbar. Рамку кадра несёт обёртка `.report-preview-frame`.
     var bounded = Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, Math.round(height)));
     frame.style.height = bounded + 'px';
     frame.setAttribute('data-report-height', String(bounded));
@@ -228,9 +233,11 @@ pub const CARD_RUNTIME_JS: &str = r#"
     if (body) {
       height = Math.max(height, body.scrollHeight || 0, body.offsetHeight || 0);
     }
-    // Запас в один пиксель гасит дробное округление: без него кадр почти того
-    // же размера, что содержимое, получает собственный scrollbar и отчёт
-    // прокручивается двумя вложенными областями.
+    // Запас в один пиксель гасит дробное округление измерения: содержимое
+    // карточки почти никогда не кратно пикселю, а кадру нужна высота, которой
+    // хватило бы и на округлённое значение. Рамка и отступы кадра при этом ни при
+    // чём: их у `.report-preview` нет, иначе `box-sizing: border-box` вычитал бы
+    // их из этой высоты и содержимое получило бы собственный scrollbar.
     height += HEIGHT_EPSILON;
     return Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, height));
   }

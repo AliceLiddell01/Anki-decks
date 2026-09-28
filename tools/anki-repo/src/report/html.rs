@@ -30,6 +30,53 @@ use crate::report::SideState;
 use crate::report::runtime::{self, CARD_RUNTIME_JS, INDEX_RUNTIME_JS};
 use crate::report::style::{CARD_BASE_CSS, REPORT_CSS};
 
+/// Единственный переключатель темы отчёта.
+///
+/// Он ровно один на весь документ: тема — одно состояние, и две группы кнопок
+/// означали бы два места, где это состояние можно разойтись. Runtime обслуживает
+/// любую кнопку с `data-report-theme-value`, но источник темы обязан быть один.
+fn theme_control(out: &mut String) {
+    out.push_str(
+        "<div class=\"report-theme\" role=\"group\" aria-label=\"Тема отчёта и превью карточек\">\n",
+    );
+    for (value, label) in [
+        (runtime::THEME_LIGHT, "Светлая"),
+        (runtime::THEME_NIGHT, "Тёмная"),
+    ] {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"report-theme-option\" \
+             data-report-theme-value=\"{value}\" aria-pressed=\"{}\">{label}</button>",
+            if value == runtime::THEME_LIGHT {
+                "true"
+            } else {
+                "false"
+            }
+        );
+    }
+    out.push_str("</div>\n");
+}
+
+/// Счётчик пунктов ограничений в свёрнутом `summary`.
+///
+/// Число без слова читается как часть заголовка, поэтому форма слова называется
+/// прямо здесь: свёрнутый блок обязан сообщать, сколько пунктов за ним скрыто, и
+/// сообщать это по-русски, а не числом, которое можно принять за что угодно.
+fn limitation_count_label(count: usize) -> String {
+    let tail_two = count % 100;
+    let tail_one = count % 10;
+    let word = if (11..=14).contains(&tail_two) {
+        "пунктов"
+    } else if tail_one == 1 {
+        "пункт"
+    } else if (2..=4).contains(&tail_one) {
+        "пункта"
+    } else {
+        "пунктов"
+    };
+    format!("{count} {word}")
+}
+
 /// Экранирует текст для вставки в HTML-текст.
 #[must_use]
 pub fn escape_html(text: &str) -> String {
@@ -283,25 +330,6 @@ pub fn index_html(document: &ReportDocument) -> String {
         escape_html(&document.after_label)
     );
     out.push_str(
-        "<div class=\"report-theme\" role=\"group\" aria-label=\"Тема отчёта и превью карточек\">\n",
-    );
-    for (value, label) in [
-        (runtime::THEME_LIGHT, "Светлая"),
-        (runtime::THEME_NIGHT, "Тёмная"),
-    ] {
-        let _ = writeln!(
-            out,
-            "<button type=\"button\" class=\"report-theme-option\" \
-             data-report-theme-value=\"{value}\" aria-pressed=\"{}\">{label}</button>",
-            if value == runtime::THEME_LIGHT {
-                "true"
-            } else {
-                "false"
-            }
-        );
-    }
-    out.push_str("</div>\n");
-    out.push_str(
         "<p class=\"report-hint\">Тема переключает и оболочку отчёта, и ночное состояние \
          карточек: превью получает класс <code>nightMode</code>, как в Anki, поэтому селекторы \
          модели <code>.card.nightMode</code> и <code>.nightMode .…</code> применяются.</p>\n",
@@ -342,18 +370,44 @@ pub fn index_html(document: &ReportDocument) -> String {
         document.counts.notes_before, document.counts.notes_after
     );
     out.push_str("</ul>\n</header>\n");
+
+    // Переключатель темы живёт в отдельной липкой полосе после шапки, а не
+    // внутри неё: шапка уходит вверх на длинном отчёте, и возвращаться к ней
+    // ради смены темы у смотряемой карточки не нужно. Состояние темы при этом
+    // одно: кнопки по-прежнему адресуются атрибутом `data-report-theme-value`, и
+    // их обслуживает тот же runtime.
+    out.push_str("<div class=\"report-toolbar\">\n");
+    out.push_str("<span class=\"report-toolbar-label\">Тема отчёта и превью</span>\n");
+    theme_control(&mut out);
+    out.push_str("</div>\n");
+
     out.push_str("<main class=\"report-main\">\n");
 
-    out.push_str("<section class=\"report-section\">\n<h2>Ограничения этого отчёта</h2>\n");
+    // Ограничения — справочный блок, а не главное содержимое отчёта: свёрнутый
+    // `details` не отодвигает карточки вниз, но остаётся доступным без участия
+    // runtime. Диагностика и неподдержанные конструкции в него не прячутся: они
+    // относятся к доверию к конкретному превью и обязаны быть видны сразу.
+    out.push_str(
+        "<details class=\"report-section report-section-prose report-details\">\n\
+         <summary><h2>Ограничения этого отчёта</h2>\
+         <span class=\"report-summary-count\">",
+    );
+    let _ = write!(
+        out,
+        "{}",
+        limitation_count_label(document.limitations.len())
+    );
+    out.push_str("</span></summary>\n");
     out.push_str("<ul class=\"report-limits\">\n");
     for limitation in &document.limitations {
         let _ = writeln!(out, "<li>{}</li>", escape_html(limitation));
     }
-    out.push_str("</ul>\n</section>\n");
+    out.push_str("</ul>\n</details>\n");
 
     if !document.unsupported_constructs.is_empty() {
         out.push_str(
-            "<section class=\"report-section\">\n<h2>Неподдержанные конструкции шаблонов</h2>\n\
+            "<section class=\"report-section report-section-prose\">\n\
+             <h2>Неподдержанные конструкции шаблонов</h2>\n\
              <p class=\"report-hint\">Эти конструкции встретились в шаблонах затронутых моделей. \
              Превью помечено как неподдержанное там, где оно могло бы выглядеть иначе, чем в Anki.</p>\n",
         );
@@ -372,7 +426,9 @@ pub fn index_html(document: &ReportDocument) -> String {
     }
 
     if !document.diagnostics.is_empty() {
-        out.push_str("<section class=\"report-section\">\n<h2>Диагностика</h2>\n");
+        out.push_str(
+            "<section class=\"report-section report-section-prose\">\n<h2>Диагностика</h2>\n",
+        );
         out.push_str(
             "<p class=\"report-hint\">Диагностика не отменяет отчёт: она называет то, \
              что инструмент не стал угадывать.</p>\n<div class=\"report-diagnostics\">\n",
@@ -558,6 +614,11 @@ fn render_previews(out: &mut String, previews: &[ReportPreview]) {
             // Высота — запасная: runtime заменит её измеренной высотой содержимого,
             // потому что карточка почти всегда выше любого фиксированного размера,
             // а прокручиваться должна страница отчёта, а не окно внутри окна.
+            //
+            // Рамку несёт обёртка: у самого кадра нет ни рамки, ни отступов, иначе
+            // `box-sizing: border-box` вычитал бы их из поставленной высоты и
+            // содержимое получило бы собственный scrollbar.
+            out.push_str("<div class=\"report-preview-frame\">");
             let _ = writeln!(
                 out,
                 "<iframe class=\"report-preview\" data-report-state=\"{}\" src=\"{}\" \
@@ -569,6 +630,7 @@ fn render_previews(out: &mut String, previews: &[ReportPreview]) {
                 escape_html(&preview.hint),
                 runtime::FALLBACK_PREVIEW_HEIGHT_PX
             );
+            out.push_str("</div>\n");
             out.push_str("</div>\n");
         }
         if both {
