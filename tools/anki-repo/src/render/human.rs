@@ -1372,6 +1372,10 @@ pub fn visual_report(result: &VisualReportResult) -> String {
             result.checks.all_files_inside_out_dir,
         ),
         (
+            "every_generated_page_offline",
+            result.checks.every_generated_page_offline,
+        ),
+        (
             "index_without_external_assets",
             result.checks.index_without_external_assets,
         ),

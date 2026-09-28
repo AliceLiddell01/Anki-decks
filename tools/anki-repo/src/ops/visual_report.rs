@@ -24,17 +24,18 @@
 //! объявляются неподдержанными, а не «применяются» молча.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::fs;
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
 use crate::details;
 use crate::error::{DomainError, ErrorCode};
+use crate::htmlscan::{self, Tag};
 use crate::index::{ExportIndex, NoteRef, model_fields_in_ord_order, resolve_named_fields};
 use crate::media as media_index;
 use crate::model::{DeckNode, FieldValue, NoteModel, TemplateDef};
 use crate::ops::retire::validate_tag;
+use crate::paths;
 use crate::report::SideState;
 use crate::report::diff::{TokenKind, diff_tokens_lossy};
 use crate::report::html::{
@@ -42,6 +43,7 @@ use crate::report::html::{
     ReportDocument, ReportPreview, ReportSection, card_html, index_html,
 };
 use crate::report::media::{self, MediaPlan};
+use crate::report::sanitize;
 use crate::template::{
     ConstructKind, ModelKind, RenderedSide, TemplateContext, render_card, scan_constructs,
 };
@@ -290,11 +292,14 @@ pub struct ReportChecks {
     /// Все записанные файлы лежат внутри каталога отчёта.
     pub all_files_inside_out_dir: bool,
     /// Точка входа отчёта не ссылается на внешние ресурсы.
-    ///
-    /// Утверждение относится именно к `index.html`: он обязан открываться
-    /// офлайн. Файлы превью могут содержать внешние ссылки из значений полей,
-    /// и это отдельно объявлено ограничением отчёта.
     pub index_without_external_assets: bool,
+    /// Каждый сгенерированный документ прошёл общую проверку границы доверия.
+    ///
+    /// Проверка у точки входа и у документов превью одна и та же: она отвечает
+    /// на вопрос «осталось ли в этом файле исполняемое чужое или сетевой адрес»,
+    /// а не «похоже ли это на ссылку». Расхождение между `index.html` и
+    /// `cards/*.html` здесь невозможно по устройству: это один вызов.
+    pub every_generated_page_offline: bool,
     /// Media скопировано только внутрь каталога отчёта.
     pub media_confined_to_out_dir: bool,
 }
@@ -353,8 +358,8 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     let before = load_side(&request.before)?;
     let after = load_side(&request.after)?;
 
-    let canonical_before = canonical_ish(&before.summary.export_dir);
-    let canonical_after = canonical_ish(&after.summary.export_dir);
+    let canonical_before = paths::canonical_ish(&before.summary.export_dir);
+    let canonical_after = paths::canonical_ish(&after.summary.export_dir);
     if canonical_before == canonical_after {
         return Err(DomainError::with_details(
             ErrorCode::InvalidRequest,
@@ -472,6 +477,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     // какие файлы окажутся рядом с отчётом. Ссылка состояния подставляется только
     // на файл своего состояния, а звук без файла честно помечается отсутствующим.
     let mut written: Vec<PathBuf> = Vec::new();
+    let mut cards_offline = true;
     let mut preview_files: Vec<PreviewFileFact> = Vec::new();
     let documents = std::mem::take(&mut build.card_documents);
     for document in &documents {
@@ -487,8 +493,63 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
                 &mut missing_sounds,
             );
         }
+        let mut page = card_html(&card);
+        // Отвергнутое границей доверия называется прямо в превью: молча
+        // выброшенная конструкция выглядела бы как «её и не было». Пояснения
+        // добавляются к обеим сторонам, потому что построены они из одного
+        // документа модели.
+        if !page.blocked.is_empty() {
+            let notes: Vec<String> = page
+                .blocked
+                .iter()
+                .map(|blocked| format!("не показано {}: {}", blocked.what, blocked.reason))
+                .collect();
+            for side in &mut card.sides {
+                for note in &notes {
+                    if !side.issues.contains(note) {
+                        side.issues.push(note.clone());
+                    }
+                }
+            }
+            diagnostics.push(Diagnostic::warning(
+                "preview_construct_blocked",
+                format!(
+                    "в превью {} не показаны конструкции из данных модели или значения поля: {}",
+                    document.file,
+                    page.blocked
+                        .iter()
+                        .map(|blocked| blocked.what.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(document.guid.clone()),
+            ));
+            page = card_html(&card);
+        }
+        // Проверка одна на все сгенерированные файлы: тот документ, который
+        // попадёт на диск, обязан её проходить — иначе отчёт не записывается.
+        let violations = sanitize::inspect(&page.html, sanitize::Page::Card);
+        if !violations.is_empty() {
+            return Err(DomainError::with_details(
+                ErrorCode::WriteFailed,
+                format!(
+                    "документ превью {} не прошёл проверку границы доверия",
+                    document.file
+                ),
+                details! {
+                    "reason" => "preview_not_offline",
+                    "file" => document.file.clone(),
+                    "violations" => violations
+                        .iter()
+                        .map(|violation| violation.what.clone())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                },
+            ));
+        }
         let path = out_dir.join(&document.file);
-        write_report_file(&path, card_html(&card).as_bytes())?;
+        write_report_file(&path, page.html.as_bytes())?;
+        cards_offline = true;
         written.push(path);
         preview_files.push(PreviewFileFact {
             file: document.file.clone(),
@@ -559,6 +620,23 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
 
     let index_path = out_dir.join(INDEX_HTML);
     let index = index_html(&document);
+    // Та же проверка, что и у документов превью: точка входа — такой же файл
+    // отчёта, и правило для неё не может быть отдельным.
+    let index_violations = sanitize::inspect(&index, sanitize::Page::Index);
+    if !index_violations.is_empty() {
+        return Err(DomainError::with_details(
+            ErrorCode::WriteFailed,
+            format!("{INDEX_HTML} не прошёл проверку границы доверия"),
+            details! {
+                "reason" => "index_not_offline",
+                "violations" => index_violations
+                    .iter()
+                    .map(|violation| violation.what.clone())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            },
+        ));
+    }
     write_report_file(&index_path, index.as_bytes())?;
     written.push(index_path.clone());
 
@@ -575,7 +653,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
                 && dir.join(name).is_file()
         })
     });
-    let out_dir_outside_decks = !canonical_ish(&out_dir)
+    let out_dir_outside_decks = !paths::canonical_ish(&out_dir)
         .components()
         .any(|component| matches!(component, Component::Normal(name) if name == "decks"));
 
@@ -623,30 +701,11 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
             every_note_classified: classification.every_note_classified,
             out_dir_outside_decks,
             all_files_inside_out_dir: all_inside,
-            index_without_external_assets: !index_references_external(&index),
+            index_without_external_assets: index_violations.is_empty(),
+            every_generated_page_offline: index_violations.is_empty() && cards_offline,
             media_confined_to_out_dir: media_confined,
         },
     })
-}
-
-/// Ссылается ли точка входа отчёта на внешний ресурс.
-///
-/// Проверяются именно ссылки, а не любое упоминание схемы: ограничения отчёта
-/// перечисляют схемы словами, и запрет на подстроку `http://` запрещал бы
-/// объяснять пользователю, что отчёт не ходит в сеть.
-fn index_references_external(index: &str) -> bool {
-    const EXTERNAL_PREFIXES: [&str; 7] = [
-        "src=\"http",
-        "src='http",
-        "src=\"//",
-        "src='//",
-        "href=\"http",
-        "href='http",
-        "href=\"//",
-    ];
-    EXTERNAL_PREFIXES
-        .iter()
-        .any(|prefix| index.contains(prefix))
 }
 
 /// Ограничения отчёта — то, что он заведомо не показывает.
@@ -679,8 +738,11 @@ fn limitations() -> Vec<String> {
         "Звук `[sound:имя]` показывается локальным проигрывателем. Если файла нет, ссылка \
          остаётся видимой и помеченной отсутствующей: подставлять чужой звук отчёт не будет."
             .to_string(),
-        "Внешние ссылки (`http://`, `https://`, `//`, `data:`) не скачиваются: отчёт открывается \
-         офлайн и не заменяет их ничем."
+        "Внешние ссылки (`http://`, `https://`, `//`, `data:`) не показываются и не скачиваются: \
+         адрес в разметке или в CSS, который ведёт не к скопированному рядом файлу, удаляется, а \
+         не подставляется чем-то похожим на ссылку. Что именно не показано, сказано в превью и в \
+         диагностике. По той же причине не выполняется и код из шаблона или значения поля: \
+         `<script>`, обработчики событий и встроенные фреймы показываются текстом."
             .to_string(),
         "Отчёт сопоставляет два состояния по `guid` и не воспроизводит решения импорта \
          CrowdAnki: он не утверждает, что Anki создаст, обновит или не тронет что-либо."
@@ -1838,6 +1900,12 @@ fn render_template(
 /// `replay-button` — тем же хуком, которым его оформляет модель в Anki.
 /// Отсутствующий файл не выдумывается и не заменяется: ссылка остаётся видимой и
 /// помеченной, а её имя попадает в диагностику и в JSON-результат.
+///
+/// Разбор разметки здесь не свой: имена тегов и атрибутов, кавычки, пробелы вокруг
+/// `=` и незакрытые конструкции читает [`crate::htmlscan`], а «что здесь media» —
+/// таблица [`media_index::ADDRESS_ATTRIBUTES`]. Второй реализации того же разбора
+/// нет намеренно: она неизбежно разошлась бы с первой, и `create` запрещал бы не то,
+/// что показывает отчёт.
 fn rewrite_preview_references(
     html: &str,
     state: SideState,
@@ -1846,130 +1914,225 @@ fn rewrite_preview_references(
     missing_sounds: &mut BTreeSet<String>,
 ) -> String {
     let mut out = String::with_capacity(html.len());
-    let mut rest = html;
+    let mut position = 0usize;
 
-    loop {
-        let src_position = rest.find("src=");
-        let sound_position = rest.find("[sound:");
-        let position = match (src_position, sound_position) {
-            (Some(src), Some(sound)) => src.min(sound),
-            (Some(src), None) => src,
-            (None, Some(sound)) => sound,
-            (None, None) => break,
+    for tag in htmlscan::scan_tags(html) {
+        let (start, end) = match &tag {
+            Tag::Element(element) => (element.start, element.end + 1),
+            Tag::RawText {
+                start, close_end, ..
+            } => (*start, close_end.map_or(html.len(), |end| end + 1)),
+            // Незакрытый тег по HTML5 не порождает элемента, поэтому подставлять
+            // в него нечего: остаток остаётся текстом и в таком виде попадёт на
+            // страницу, где ту же политику применит граница доверия отчёта.
+            Tag::Unterminated { start, .. } => (*start, html.len()),
         };
 
-        if sound_position == Some(position) {
-            let after = &rest[position + "[sound:".len()..];
-            let Some(end) = after.find(']') else {
-                // Незакрытая ссылка: остаток копируется как есть, гадать не о чем.
-                break;
-            };
-            let reference = &after[..end];
-            out.push_str(&rest[..position]);
-            match plan.resolved_path(state, reference) {
-                Some(path) => {
-                    resolved_media.insert(path.to_string());
-                    let _ = write!(
-                        out,
-                        "<span class=\"replay-button\"><audio class=\"report-audio\" controls \
-                         preload=\"none\" src=\"../{path}\"></audio></span>"
-                    );
-                }
-                None => {
-                    if !media::is_remote(reference) {
-                        missing_sounds.insert(media_index::normalize_media_name(reference));
-                    }
-                    let _ = write!(
-                        out,
-                        "<span class=\"replay-button report-audio-missing\" title=\"файл не \
-                         найден в экспорте\">[sound:{}]</span>",
-                        escape_attr(reference)
-                    );
-                }
-            }
-            rest = &after[end + 1..];
-            continue;
-        }
+        out.push_str(&rewrite_sounds(
+            &html[position..start],
+            state,
+            plan,
+            resolved_media,
+            missing_sounds,
+        ));
 
-        let (head, tail) = rest.split_at(position + "src=".len());
-        let Some(quote) = tail.chars().next() else {
-            out.push_str(head);
-            break;
-        };
-        if quote != '"' && quote != '\'' {
-            out.push_str(head);
-            out.push_str(tail.split_at(quote.len_utf8()).0);
-            rest = &tail[quote.len_utf8()..];
-            continue;
-        }
-
-        let Some(end) = tail[1..].find(quote) else {
-            out.push_str(head);
-            out.push_str(tail);
-            return out;
-        };
-
-        let reference = &tail[1..1 + end];
-        let mut replaced_element = false;
-        match plan.preview_reference(state, reference) {
-            media::PreviewReference::Copied(path) => {
-                out.push_str(head);
-                resolved_media.insert(path.to_string());
-                let _ = write!(out, "{quote}../{path}{quote}");
+        match &tag {
+            Tag::Element(element) => {
+                out.push_str(&rewrite_element(html, element, state, plan, resolved_media));
             }
-            media::PreviewReference::MissingLocal => {
-                match missing_image_element(rest, position, reference, state) {
-                    Some((start, tag_end, placeholder)) => {
-                        // Элемент отдаётся целиком: он целиком же и заменяется,
-                        // вместе с атрибутами, которые к отсутствующей картинке
-                        // уже не относятся.
-                        out.push_str(&rest[..start]);
-                        out.push_str(&placeholder);
-                        rest = &rest[tag_end + 1..];
-                        replaced_element = true;
-                    }
-                    None => {
-                        out.push_str(head);
-                        out.push_str(&format!("{quote}{reference}{quote}"));
-                    }
-                }
-            }
-            media::PreviewReference::NotAPreviewFile => {
-                out.push_str(head);
-                out.push_str(&format!("{quote}{reference}{quote}"));
-            }
+            _ => out.push_str(&html[start..end]),
         }
-        if replaced_element {
-            continue;
-        }
-        rest = &tail[1 + end + 1..];
+        position = end;
     }
 
-    out.push_str(rest);
+    out.push_str(&rewrite_sounds(
+        &html[position..],
+        state,
+        plan,
+        resolved_media,
+        missing_sounds,
+    ));
     out
 }
 
-/// Готовит замену элемента `<img>`, если ссылка подтверждённо отсутствует.
-///
-/// Возвращает начало тега, индекс его `>` и сам плейсхолдер. Плейсхолдер ставится
-/// только на месте картинки: у прочих элементов `src` означает не картинку, и
-/// отчёт не подменяет их текстом.
-fn missing_image_element(
-    html: &str,
-    position: usize,
-    reference: &str,
+/// Подставляет `[sound:имя]` в текстовом фрагменте.
+fn rewrite_sounds(
+    text: &str,
     state: SideState,
-) -> Option<(usize, usize, String)> {
-    let (tag_start, tag_name) = enclosing_open_tag(html, position)?;
-    if tag_name != "img" {
-        return None;
+    plan: &MediaPlan,
+    resolved_media: &mut BTreeSet<String>,
+    missing_sounds: &mut BTreeSet<String>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut position = 0usize;
+
+    for reference in media_index::sound_references(text) {
+        out.push_str(&text[position..reference.span.start]);
+        out.push_str(&sound_player(
+            reference.name,
+            state,
+            plan,
+            resolved_media,
+            missing_sounds,
+        ));
+        position = reference.span.end;
     }
-    let tag_end = closing_bracket(html, position)?;
-    Some((
-        tag_start,
-        tag_end,
-        missing_image_placeholder(reference, state),
-    ))
+    out.push_str(&text[position..]);
+    out
+}
+
+/// Проигрыватель вместо `[sound:имя]`.
+///
+/// Файл берётся из состояния самой страницы: одинаковое имя в двух экспортах —
+/// это два разных файла, и превью «после» не имеет права играть звук «до».
+fn sound_player(
+    name: &str,
+    state: SideState,
+    plan: &MediaPlan,
+    resolved_media: &mut BTreeSet<String>,
+    missing_sounds: &mut BTreeSet<String>,
+) -> String {
+    match plan.resolved_path(state, name) {
+        Some(path) => {
+            resolved_media.insert(path.to_string());
+            format!(
+                "<span class=\"replay-button\"><audio class=\"report-audio\" controls \
+                 preload=\"none\" src=\"../{path}\"></audio></span>"
+            )
+        }
+        None => {
+            if !media::is_remote(name) {
+                missing_sounds.insert(media_index::normalize_media_name(name));
+            }
+            format!(
+                "<span class=\"replay-button report-audio-missing\" title=\"файл не \
+                 найден в экспорте\">[sound:{}]</span>",
+                escape_attr(name)
+            )
+        }
+    }
+}
+
+/// Подставляет адреса внутри одного элемента.
+///
+/// Заменяется только то место значения, где стоит ссылка: дескрипторы `srcset`
+/// остаются на своих местах, а незатронутые атрибуты — в своей записи.
+fn rewrite_element(
+    html: &str,
+    element: &htmlscan::Element<'_>,
+    state: SideState,
+    plan: &MediaPlan,
+    resolved_media: &mut BTreeSet<String>,
+) -> String {
+    let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
+    let mut missing_all = false;
+
+    for attribute in &element.attributes {
+        if !media_index::attribute_carries_media(element.name, attribute.name) {
+            continue;
+        }
+        let Some(value_range) = attribute.value_range.clone() else {
+            // Атрибут без `=`: адреса у него нет, но браузер прочтёт его как
+            // пустой адрес и запросит сам документ. Пустой адрес не остаётся.
+            if element.name_is("img") {
+                missing_all = true;
+            } else {
+                replacements.push((attribute_removal(html, element, attribute), String::new()));
+            }
+            continue;
+        };
+        let value = &html[value_range.clone()];
+        let candidates = media_index::split_attribute_values(attribute.name, value);
+        let mut kept: Vec<String> = Vec::new();
+        for candidate in &candidates {
+            match plan.preview_reference(state, &candidate.text) {
+                media::PreviewReference::Copied(path) => {
+                    resolved_media.insert(path.to_string());
+                    kept.push(format!("../{path}"));
+                }
+                media::PreviewReference::MissingLocal => kept.push(String::new()),
+                media::PreviewReference::NotAPreviewFile => kept.push(candidate.text.clone()),
+            }
+        }
+
+        if candidates.len() == 1 {
+            match kept.first().map(String::as_str) {
+                Some("") if element.name_is("img") => {
+                    missing_all = true;
+                    replacements.push((value_range, String::new()));
+                }
+                // Не картинка: плейсхолдер на месте `src` был бы враньём о
+                // разметке, а пустое значение — запросом документа. Атрибут
+                // убирается целиком, а отсутствие файла уже названо сводкой
+                // состояния.
+                Some("") => {
+                    replacements.push((attribute_removal(html, element, attribute), String::new()));
+                }
+                Some(path) => replacements.push((value_range, path.to_string())),
+                None => {}
+            }
+            continue;
+        }
+
+        // `srcset`: отсутствующие кандидаты убираются, потому что «пустой адрес»
+        // в списке кандидатов браузер понял бы как запрос текущего документа.
+        let remaining: Vec<&String> = kept
+            .iter()
+            .filter(|candidate| !candidate.is_empty())
+            .collect();
+        if remaining.is_empty() {
+            missing_all = true;
+            replacements.push((value_range, String::new()));
+        } else if remaining.len() != kept.len() {
+            let joined = remaining
+                .iter()
+                .map(|candidate| candidate.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            replacements.push((value_range, joined));
+        }
+    }
+
+    if missing_all && element.name_is("img") {
+        let Some(attribute) = element.attributes.iter().find(|attribute| {
+            media_index::attribute_carries_media(element.name, attribute.name)
+                && attribute.value_range.is_some()
+        }) else {
+            return html[element.start..element.end + 1].to_string();
+        };
+        let value = &html[attribute.value_range.clone().expect("проверено выше")];
+        return missing_image_placeholder(value, state);
+    }
+
+    if replacements.is_empty() {
+        return html[element.start..element.end + 1].to_string();
+    }
+
+    let mut out = String::with_capacity(element.end + 1 - element.start);
+    let mut cursor = element.start;
+    for (range, replacement) in replacements {
+        out.push_str(&html[cursor..range.start]);
+        out.push_str(&replacement);
+        cursor = range.end;
+    }
+    out.push_str(&html[cursor..element.end + 1]);
+    out
+}
+
+/// Диапазон удаления атрибута вместе с пробелом перед ним.
+///
+/// Без этого в теге остаётся лишний пробел: `<audio ></audio>`. Разметку отчёта
+/// читает человек, и «мусор от подстановки» в ней выглядел бы как дефект отчёта.
+fn attribute_removal(
+    html: &str,
+    element: &htmlscan::Element<'_>,
+    attribute: &htmlscan::Attribute<'_>,
+) -> Range<usize> {
+    let mut start = attribute.span.start;
+    while start > element.start && htmlscan::is_whitespace(html.as_bytes()[start - 1]) {
+        start -= 1;
+    }
+    start..attribute.span.end
 }
 
 /// Плейсхолдер отсутствующей картинки: говорит basename и то, что файла нет.
@@ -1985,38 +2148,6 @@ fn missing_image_placeholder(reference: &str, state: SideState) -> String {
         escape_attr(&title),
         escape_attr(&name)
     )
-}
-
-/// Открывающий тег, внутри атрибутов которого находится позиция `position`.
-///
-/// Возвращает индекс `<` и имя тега в нижнем регистре. Если между `<` и позицией
-/// уже встретился `>`, то `src=` стоит не в атрибутах тега, и трогать нечего.
-fn enclosing_open_tag(html: &str, position: usize) -> Option<(usize, String)> {
-    let start = html[..position].rfind('<')?;
-    let head = &html[start + 1..position];
-    if head.contains('>') {
-        return None;
-    }
-    let name: String = head
-        .chars()
-        .take_while(|character| character.is_ascii_alphanumeric())
-        .collect();
-    Some((start, name.to_ascii_lowercase()))
-}
-
-/// Индекс `>`, закрывающего тег, начиная с `from`, с учётом кавычек в атрибутах.
-fn closing_bracket(html: &str, from: usize) -> Option<usize> {
-    let mut quote: Option<char> = None;
-    for (offset, character) in html[from..].char_indices() {
-        match quote {
-            Some(open) if character == open => quote = None,
-            Some(_) => {}
-            None if character == '"' || character == '\'' => quote = Some(character),
-            None if character == '>' => return Some(from + offset),
-            None => {}
-        }
-    }
-    None
 }
 
 /// Экранирует значение атрибута.
@@ -2092,7 +2223,7 @@ fn push_media_diagnostics(plan: &MediaPlan, diagnostics: &mut Vec<Diagnostic>) {
 
 /// Проверяет и при необходимости создаёт каталог отчёта.
 fn ensure_out_dir(out: &Path, export_dirs: &[PathBuf]) -> Result<PathBuf, DomainError> {
-    let canonical = canonical_ish(out);
+    let canonical = paths::canonical_ish(out);
 
     if canonical
         .components()
@@ -2202,39 +2333,6 @@ fn out_dir_error(path: &Path, error: &std::io::Error) -> DomainError {
             "path" => path.display().to_string(),
         },
     )
-}
-
-/// Канонизирует настолько, насколько это возможно для ещё не созданного пути.
-fn canonical_ish(path: &Path) -> PathBuf {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return canonical;
-    }
-
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-
-    let mut existing = absolute.clone();
-    let mut tail: Vec<OsString> = Vec::new();
-    while !existing.exists() {
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_os_string());
-                existing = parent.to_path_buf();
-            }
-            _ => break,
-        }
-    }
-
-    let mut result = fs::canonicalize(&existing).unwrap_or(existing);
-    for name in tail.iter().rev() {
-        result.push(name);
-    }
-    result
 }
 
 #[cfg(test)]
@@ -2543,7 +2641,7 @@ mod tests {
         let dir = TempDir::new("visual-report-out-overlap");
         let export = dir.path().join("export");
         fs::create_dir_all(&export).expect("каталог");
-        let export = canonical_ish(&export);
+        let export = paths::canonical_ish(&export);
 
         let error = ensure_out_dir(&export.join("report"), std::slice::from_ref(&export))
             .expect_err("отказ");
@@ -2730,8 +2828,12 @@ mod tests {
         assert_eq!(resolved, ["media/after/竹.gif".to_string()].into());
     }
 
-    /// Чип встаёт только вместо картинки: ссылка на media у другого элемента
-    /// остаётся его собственной ссылкой.
+    /// Чип встаёт только вместо картинки.
+    ///
+    /// У другого элемента подменять разметку нельзя — `<span>` внутри `<audio>`
+    /// сломал бы сам элемент, — но и оставить адрес отсутствующего файла нельзя:
+    /// браузер запросил бы его. Атрибут убирается, а отсутствие файла называет
+    /// состояние этого экспорта в диагностике.
     #[test]
     fn only_an_image_element_is_replaced_by_the_missing_placeholder() {
         let dir = TempDir::new("visual-report-placeholder-tag");
@@ -2751,8 +2853,12 @@ mod tests {
         let rewritten =
             rewrite_preview_references(html, SideState::After, &plan, &mut resolved, &mut missing);
 
-        assert!(rewritten.contains("<audio src=\"нет.png\"></audio>"));
-        assert!(rewritten.contains("class=\"report-media-missing\""));
+        assert_eq!(
+            rewritten,
+            "<audio></audio><span class=\"report-media-missing\" \
+        title=\"файл нет.png отсутствует в состоянии «after»: превью осталось без него\">missing: \
+        нет.png</span>"
+        );
     }
 
     #[test]

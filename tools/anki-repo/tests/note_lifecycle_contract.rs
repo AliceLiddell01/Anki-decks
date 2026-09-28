@@ -432,6 +432,408 @@ fn create_refuses_media_references_in_new_values() {
     assert_eq!(error_of(exit, &stdout)["code"], "media_forbidden");
 }
 
+// --- media_forbidden: политика распознавания ссылок ------------------------
+
+/// Гейт обязан срабатывать на любой валидной записи той же ссылки, а не только
+/// на текстовой форме `src="…"`: HTML не различает регистр в именах элементов и
+/// атрибутов, допускает пробелы вокруг `=`, unquoted-значения и одинарные
+/// кавычки. Всё это — та же ссылка, которую увидит Anki.
+#[test]
+fn create_refuses_every_valid_spelling_of_a_media_reference() {
+    let cases: [&str; 16] = [
+        "<img src=\"a.png\">",
+        "<img SRC=\"a.png\">",
+        "<IMG SRC=\"a.png\">",
+        "<img src = \"a.png\">",
+        "<img\nsrc\t=\n\"a.png\">",
+        "<img src=a.png>",
+        "<img src='a.png'>",
+        "<audio src=\"a.png\"></audio>",
+        "<video src=\"a.png\"></video>",
+        "<source src=\"a.png\">",
+        "<embed src=\"a.png\">",
+        "<object data=\"a.png\"></object>",
+        "<img srcset=\"a.png 1x, b.png 2x\">",
+        "<video poster=\"a.png\"></video>",
+        // Тег не закрыт: значение поля Anki склеивает с шаблоном, поэтому
+        // незакрытая конструкция с media-атрибутом отвергается (fail-closed),
+        // хотя сама по себе элемента в документе не создаёт.
+        "<img src=\"a.png\"",
+        "<img src=\"незакрытый>",
+    ];
+
+    for value in cases {
+        let dir = canonical_base_export("create-media-spelling");
+        let before = dir.deck_json_bytes();
+        let request = create_request(&[note_spec(fields("新語", value, ""))]);
+        let path = write_request(&dir, "create.json", &request);
+
+        let (exit, stdout, _) = run_cli_in(
+            None,
+            &[
+                "create",
+                dir.path().to_str().expect("путь"),
+                "--json",
+                "--request",
+                path.to_str().expect("путь"),
+                "--apply",
+            ],
+        );
+
+        let error = error_of(exit, &stdout);
+        assert_eq!(
+            error["code"], "media_forbidden",
+            "разметка {value:?} обязана отвергаться"
+        );
+        assert_eq!(exit, 3, "разметка {value:?}");
+        assert_eq!(
+            dir.deck_json_bytes(),
+            before,
+            "разметка {value:?}: отказ не пишет файл"
+        );
+    }
+}
+
+/// Зеркальная половина того же контракта: текст, который лишь похож на ссылку,
+/// обязан быть принят. Ложный `media_forbidden` — это тоже ошибка гейта.
+#[test]
+fn create_accepts_values_that_only_look_like_media_references() {
+    let cases: [&str; 6] = [
+        "src=noquotes — обычный текст",
+        "функция src=x в коде",
+        "<img alt=\"a.png\">",
+        "<!-- <img src=\"a.png\"> -->",
+        "1 < 2 и 3 < 4",
+        "используй <img тег",
+    ];
+
+    for value in cases {
+        let dir = canonical_base_export("create-media-negative");
+        let request = create_request(&[note_spec(fields("新語", value, ""))]);
+        let path = write_request(&dir, "create.json", &request);
+
+        let (exit, stdout, _) = run_cli_in(
+            None,
+            &[
+                "create",
+                dir.path().to_str().expect("путь"),
+                "--json",
+                "--request",
+                path.to_str().expect("путь"),
+            ],
+        );
+
+        assert_eq!(exit, 0, "значение {value:?} обязано приниматься: {stdout}");
+    }
+}
+
+// --- create --emit-resolved: граница транзакции ----------------------------
+
+/// Разрешённый запрос не может быть записан поверх самого экспорта.
+///
+/// Проверка обязана видеть алиас, а не написание: `deck.json`, `./deck.json` и
+/// `не_создано/../deck.json` — один и тот же файл. Иначе `create --apply`
+/// успешно публикует экспорт, а следующая за ней запись артефакта его
+/// уничтожает уже после того, как безопасная публикация прошла.
+#[test]
+fn create_refuses_to_emit_the_resolved_request_over_its_own_export() {
+    let aliases: [&str; 3] = ["deck.json", "./deck.json", "нет-такого/../deck.json"];
+
+    for alias in aliases {
+        let dir = canonical_base_export("create-emit-alias");
+        let before = dir.deck_json_bytes();
+        let request = create_request(&[note_spec(fields("新語", "новое слово", ""))]);
+        let path = write_request(&dir, "create.json", &request);
+
+        let (exit, stdout, _) = run_cli_in(
+            Some(dir.path()),
+            &[
+                "create",
+                dir.path().to_str().expect("путь"),
+                "--json",
+                "--request",
+                path.to_str().expect("путь"),
+                "--apply",
+                "--emit-resolved",
+                alias,
+            ],
+        );
+
+        let error = error_of(exit, &stdout);
+        assert_eq!(error["code"], "invalid_request", "псевдоним {alias:?}");
+        assert_eq!(error["details"]["reason"], "emit_resolved_aliases_source");
+        assert_eq!(
+            dir.deck_json_bytes(),
+            before,
+            "псевдоним {alias:?}: экспорт не тронут и остался экспортом"
+        );
+        assert!(
+            serde_json::from_slice::<Value>(&dir.deck_json_bytes()).is_ok(),
+            "псевдоним {alias:?}: deck.json остался JSON-экспортом"
+        );
+    }
+}
+
+/// Отказ записи разрешённого запроса обязан происходить до мутации экспорта.
+///
+/// Каталог для артефакта заранее не создаётся, поэтому запись обязана провалиться
+/// — и провалиться раньше, чем изменится `deck.json`.
+#[test]
+fn an_unwritable_resolved_path_leaves_the_export_untouched() {
+    let dir = canonical_base_export("create-emit-unwritable");
+    let before = dir.deck_json_bytes();
+    let request = create_request(&[note_spec(fields("新語", "новое слово", ""))]);
+    let path = write_request(&dir, "create.json", &request);
+    let resolved = dir.path().join("нет-такого-каталога").join("resolved.json");
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+            "--emit-resolved",
+            resolved.to_str().expect("путь"),
+        ],
+    );
+
+    let error = error_of(exit, &stdout);
+    assert_eq!(error["code"], "write_failed");
+    assert_eq!(
+        dir.deck_json_bytes(),
+        before,
+        "заметка не создана, файл не изменён"
+    );
+    assert!(!resolved.exists());
+    assert!(!dir.path().join("нет-такого-каталога").exists());
+    assert_no_report_leftovers(dir.path());
+}
+
+/// Отказ публикации экспорта после записи артефакта не теряет разрешённый guid.
+///
+/// Порядок такой: артефакт публикуется первым, поэтому к моменту отказа
+/// `deck.json` остаётся исходным (заметка не создана), а разрешённый запрос уже
+/// на диске. Повтор по нему создаёт ровно одну заметку — второй не появляется.
+#[test]
+#[cfg(unix)]
+fn a_failed_export_publication_still_leaves_the_resolved_request_recoverable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = canonical_base_export("create-emit-recoverable");
+    let before = dir.deck_json_bytes();
+    let request = create_request(&[note_spec(fields("新語", "новое слово", ""))]);
+    let path = write_request(&dir, "create.json", &request);
+    // Артефакт лежит в отдельном каталоге: недоступным для записи становится
+    // именно каталог экспорта, и отказ приходит на публикации `deck.json`, а не
+    // раньше — на записи артефакта.
+    let artifacts = dir.path().join("artifacts");
+    std::fs::create_dir(&artifacts).expect("каталог артефактов");
+    let resolved = artifacts.join("resolved.json");
+
+    // Каталог экспорта становится недоступным для записи, но читаемым: запись
+    // артефакта проходит, публикация `deck.json` — нет.
+    let export = dir.path().to_path_buf();
+    let original = std::fs::metadata(&export)
+        .expect("метаданные")
+        .permissions();
+    let mut readonly = original.clone();
+    readonly.set_mode(0o555);
+
+    let probe = export.join(".write-probe");
+    if std::fs::write(&probe, b"x").is_err() {
+        // Уже недоступен для записи: ничего менять не нужно.
+    } else {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&export, readonly).expect("права каталога");
+
+        // Процесс с правами root игнорирует mode-биты: сценарий тогда
+        // невоспроизводим, и проверка снимается явно, а не считается пройденной.
+        let reproducible = std::fs::write(&probe, b"x").is_err();
+        let _ = std::fs::remove_file(&probe);
+
+        if reproducible {
+            let (exit, stdout, _) = run_cli_in(
+                None,
+                &[
+                    "create",
+                    dir.path().to_str().expect("путь"),
+                    "--json",
+                    "--request",
+                    path.to_str().expect("путь"),
+                    "--apply",
+                    "--emit-resolved",
+                    resolved.to_str().expect("путь"),
+                ],
+            );
+
+            let error = error_of(exit, &stdout);
+            assert_eq!(
+                error["code"], "write_failed",
+                "публикация deck.json обязана отказать: {stdout}"
+            );
+            assert_eq!(
+                dir.deck_json_bytes(),
+                before,
+                "экспорт не изменён ни на байт: заметка не создана"
+            );
+
+            let emitted: Value = serde_json::from_slice(
+                &std::fs::read(&resolved).expect("разрешённый запрос на диске"),
+            )
+            .expect("разрешённый запрос — JSON");
+            let guid = emitted["notes"][0]["guid"]
+                .as_str()
+                .expect("guid разрешён")
+                .to_string();
+            assert!(!guid.is_empty());
+        }
+
+        std::fs::set_permissions(&export, original).expect("права каталога восстановлены");
+    }
+
+    // Повтор по разрешённому запросу создаёт ровно одну заметку, а не вторую.
+    if let Ok(raw) = std::fs::read(&resolved) {
+        let emitted: Value = serde_json::from_slice(&raw).expect("JSON");
+        let guid = emitted["notes"][0]["guid"]
+            .as_str()
+            .expect("guid")
+            .to_string();
+        assert_eq!(
+            dir.deck_json()["notes"]
+                .as_array()
+                .expect("notes")
+                .iter()
+                .filter(|note| note["guid"] == json!(guid))
+                .count(),
+            0,
+            "до повтора заметки с этим guid нет"
+        );
+
+        let (exit, stdout, _) = run_cli_in(
+            None,
+            &[
+                "create",
+                dir.path().to_str().expect("путь"),
+                "--json",
+                "--request",
+                resolved.to_str().expect("путь"),
+                "--apply",
+            ],
+        );
+        let result = result_of(exit, &stdout);
+        assert_eq!(result["notes_created"], 1);
+        assert_eq!(result["outcomes"][0]["guid"], guid);
+        assert_eq!(
+            dir.deck_json()["notes"]
+                .as_array()
+                .expect("notes")
+                .iter()
+                .filter(|note| note["guid"] == json!(guid))
+                .count(),
+            1,
+            "ровно одна заметка, без дубля"
+        );
+    }
+}
+
+/// Dry-run с `--emit-resolved` пишет артефакт и не трогает экспорт.
+#[test]
+fn create_dry_run_emits_the_resolved_request_without_writing_the_export() {
+    let dir = canonical_base_export("create-dry-run-emit");
+    let before = dir.deck_json_bytes();
+    let request = create_request(&[note_spec(fields("新語", "новое слово", ""))]);
+    let path = write_request(&dir, "create.json", &request);
+    let resolved = dir.path().join("resolved.json");
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--emit-resolved",
+            resolved.to_str().expect("путь"),
+        ],
+    );
+    let result = result_of(exit, &stdout);
+    assert_eq!(result["dry_run"], true);
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["outcomes"][0]["status"], "dry_run");
+    assert_eq!(dir.deck_json_bytes(), before, "экспорт не тронут");
+
+    let emitted: Value =
+        serde_json::from_slice(&std::fs::read(&resolved).expect("артефакт")).expect("JSON");
+    assert_eq!(emitted["notes"][0]["guid"], result["outcomes"][0]["guid"]);
+    assert_eq!(emitted["notes"][0]["model"]["mode"], "explicit");
+
+    // Планирование и запись — единственная пара: повтор по разрешённому запросу
+    // создаёт ровно ту заметку, которую запланировал dry-run.
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            resolved.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+    let applied = result_of(exit, &stdout);
+    assert_eq!(applied["notes_created"], 1);
+    assert_eq!(
+        applied["outcomes"][0]["guid"],
+        result["outcomes"][0]["guid"]
+    );
+    assert_eq!(
+        dir.deck_json()["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .filter(|note| note["guid"] == result["outcomes"][0]["guid"])
+            .count(),
+        1
+    );
+}
+
+/// В каталоге не остаётся временных файлов после отказов `--emit-resolved`.
+fn assert_no_report_leftovers(directory: &std::path::Path) {
+    let mut leftovers: Vec<String> = Vec::new();
+    collect_leftovers(directory, directory, &mut leftovers);
+    assert!(
+        leftovers.is_empty(),
+        "остались временные файлы: {leftovers:?}"
+    );
+}
+
+/// Рекурсивно собирает имена файлов, похожие на временные.
+fn collect_leftovers(root: &std::path::Path, current: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_leftovers(root, &path, out);
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".tmp-") || name.ends_with('~') {
+            out.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+}
+
 #[test]
 fn create_refuses_field_set_that_no_model_matches() {
     let dir = canonical_base_export("create-unknown-field");

@@ -31,16 +31,20 @@ use crate::details;
 use crate::error::{DomainError, ErrorCode};
 use crate::guid;
 use crate::index::ExportIndex;
+use crate::loader;
 use crate::media;
 use crate::model::FieldValue;
 use crate::ops::deck_select::DeckSelector;
 use crate::ops::models::{self, ModelMode, ModelSelector, ResolvedModel};
 use crate::ops::publish;
 use crate::ops::source::{
-    ValidationDelta, deck_child_paths, internal, load_editable_source, node_mut, validation_delta,
+    EditableSource, ValidationDelta, deck_child_paths, internal, load_editable_source, node_mut,
+    validation_delta,
 };
 use crate::ops::structural::{DEFAULT_PATH_LIMIT, changed_paths, deck_path_pointer};
+use crate::paths;
 use crate::text::bounded_sample;
+use crate::write;
 
 /// Жёсткий максимум числа заметок в одном запросе.
 pub const MAX_NOTES: usize = 20_000;
@@ -459,14 +463,24 @@ fn validate_tag(tag: &str, note_index: usize) -> Result<(), DomainError> {
 
 /// Заказывает создание заметок по запросу.
 ///
+/// `resolved_artifact` — необязательный путь, по которому команда обязана
+/// оставить разрешённый запрос. Он публикуется **до** первой мутации экспорта, и
+/// это часть контракта, а не деталь реализации: отказ его записи обязан
+/// оставлять `deck.json` исходным, а успешный `--apply` — совместимым с уже
+/// лежащим на диске разрешённым запросом. Поэтому же запрещена запись артефакта
+/// поверх самого `deck.json`: это уничтожило бы экспорт уже после того, как
+/// безопасная публикация прошла.
+///
 /// # Errors
 ///
 /// Ошибки чтения исходника, разрешения колоды и модели, media-ссылок в новых
-/// значениях, конфликта `guid`, проверки кандидата и записи файла.
+/// значениях, конфликта `guid`, проверки кандидата, записи файла и записи
+/// resolved-артефакта.
 pub fn create(
     export_dir: &Path,
     request: &CreateRequest,
     apply: bool,
+    resolved_artifact: Option<&Path>,
 ) -> Result<CreateResult, DomainError> {
     let source = load_editable_source(export_dir)?;
     let index = ExportIndex::build(&source.root);
@@ -570,6 +584,8 @@ pub fn create(
         .count();
     let notes_already_applied = outcomes.len() - notes_created;
 
+    let resolved_request = resolved_document(&planned);
+
     let (candidate, applied, validation) = if notes_created == 0 {
         (
             None,
@@ -584,10 +600,22 @@ pub fn create(
 
         verify_only_notes_appended(&source.value, &candidate_value, &ranges, &buckets)?;
         let candidate = publish::prepare(&source, export_dir, candidate_value)?;
+
+        // Порядок здесь и есть исправление: resolved-артефакт публикуется до
+        // того, как изменится экспорт. Поэтому отказ его записи оставляет
+        // `deck.json` нетронутым, а состояние «apply прошёл, а разрешённый guid
+        // потерян» становится недостижимым: артефакт уже на диске к моменту
+        // первой мутации экспорта.
+        commit_resolved(resolved_artifact, &resolved_request, &source)?;
+
         let publication = publish::publish(&source, &candidate, apply)?;
         let validation = candidate.validation.clone();
         (Some(candidate), publication.applied, validation)
     };
+
+    if notes_created == 0 {
+        commit_resolved(resolved_artifact, &resolved_request, &source)?;
+    }
 
     let candidate_bytes = candidate
         .as_ref()
@@ -629,8 +657,44 @@ pub fn create(
             only_notes_appended: candidate.is_some(),
             appended_notes_verified: candidate.is_some(),
         },
-        resolved_request: resolved_document(&planned),
+        resolved_request,
     })
+}
+
+/// Публикует разрешённый запрос по заказанному пути.
+///
+/// Проверка алиаса обязана стоять здесь, а не в CLI: путь приходит из аргументов
+/// и может указывать на тот же файл, что и `deck.json`, — напрямую, через
+/// `..` или через символическую ссылку. Запись поверх экспорта после успешной
+/// публикации уничтожила бы его, поэтому отказ выдаётся до любых изменений.
+fn commit_resolved(
+    resolved_artifact: Option<&Path>,
+    resolved_request: &Value,
+    source: &EditableSource,
+) -> Result<(), DomainError> {
+    let Some(path) = resolved_artifact else {
+        return Ok(());
+    };
+
+    if paths::paths_alias(path, &source.deck_json) {
+        return Err(DomainError::with_details(
+            ErrorCode::InvalidRequest,
+            format!(
+                "--emit-resolved указывает на сам {}: разрешённый запрос не может \
+                 перезаписать экспорт, который эта же команда публикует",
+                source.deck_json.display()
+            ),
+            details! {
+                "reason" => "emit_resolved_aliases_source",
+                "path" => path.display().to_string(),
+                "deck_json" => source.deck_json.display().to_string(),
+            },
+        ));
+    }
+
+    let bytes = loader::render_canonical_bytes(resolved_request)?;
+    write::replace_document_atomically(path, &bytes)?;
+    Ok(())
 }
 
 /// Заказанная заметка после разрешения колоды, модели и `guid`.

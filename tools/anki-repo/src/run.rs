@@ -12,7 +12,6 @@ use std::path::Path;
 use crate::cli::{Cli, Command, MatchArg};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
-use crate::loader;
 use crate::loader::load_export;
 use crate::ops::create as create_op;
 use crate::ops::deck_select::DeckSelector;
@@ -272,10 +271,9 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             let raw = read_document(request_file, create_op::MAX_REQUEST_BYTES, "запрос")?;
             let label = request_file.display().to_string();
             let request = create_op::parse_request_bytes(&raw, &label)?;
-            let result = create_op::create(export_dir, &request, *apply)?;
-            if let Some(path) = emit_resolved {
-                write_json_document(path, &result.resolved_request)?;
-            }
+            // Разрешённый запрос публикуется внутри самой операции и до
+            // мутации экспорта: см. `create_op::create`.
+            let result = create_op::create(export_dir, &request, *apply, emit_resolved.as_deref())?;
             Ok(Rendered {
                 command: "create",
                 stdout: if cli.json {
@@ -429,20 +427,6 @@ fn build_retire_request(
 ///
 /// Канонические байты дают побайтовую воспроизводимость: повторный прогон
 /// создаёт тот же файл, а не «почти тот же».
-fn write_json_document(path: &Path, value: &serde_json::Value) -> Result<(), DomainError> {
-    let bytes = loader::render_canonical_bytes(value)?;
-    std::fs::write(path, bytes).map_err(|error| {
-        DomainError::with_details(
-            ErrorCode::WriteFailed,
-            format!("не удалось записать {}: {error}", path.display()),
-            crate::details! {
-                "reason" => "document_write_failed",
-                "path" => path.display().to_string(),
-            },
-        )
-    })
-}
-
 /// Собирает запрос на правку из аргументов CLI.
 ///
 /// `--request` читается целиком и разбирается; `-` означает stdin.

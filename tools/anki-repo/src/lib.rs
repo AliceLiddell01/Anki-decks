@@ -26,12 +26,14 @@
 pub mod cli;
 pub mod error;
 pub mod guid;
+pub mod htmlscan;
 pub mod index;
 pub mod loader;
 pub mod media;
 pub mod model;
 pub mod ops;
 pub mod output;
+pub mod paths;
 pub mod proposal;
 pub mod qa;
 pub mod render;

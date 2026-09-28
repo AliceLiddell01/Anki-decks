@@ -28,6 +28,7 @@ use std::fmt::Write as _;
 
 use crate::report::SideState;
 use crate::report::runtime::{self, CARD_RUNTIME_JS, INDEX_RUNTIME_JS};
+use crate::report::sanitize::{self, Blocked, Page};
 use crate::report::style::{CARD_BASE_CSS, REPORT_CSS};
 
 /// Единственный переключатель темы отчёта.
@@ -252,9 +253,29 @@ pub struct CardFile {
     pub sides: Vec<CardSide>,
 }
 
+/// Готовый документ отчёта и то, что в нём не показано.
+///
+/// Документ возвращается вместе со списком отвергнутого: «не показали и
+/// промолчали» — это не граница доверия, а её отсутствие.
+#[derive(Debug, Clone)]
+pub struct RenderedPage {
+    /// Полный HTML документа.
+    pub html: String,
+    /// Конструкции, которые не показаны.
+    pub blocked: Vec<Blocked>,
+}
+
 /// Собирает `cards/*.html`.
+///
+/// CSS модели приходит из экспорта, то есть снаружи, поэтому он проходит ту же
+/// очистку, что и разметка: правило вида `background: url(https://…)` в модели —
+/// это запрос, которого офлайн-отчёт делать не имеет права. Безопасность здесь
+/// следует из устройства: непроверенной разметки в документе просто не остаётся,
+/// а не «случается так, что она не исполнилась».
 #[must_use]
-pub fn card_html(card: &CardFile) -> String {
+pub fn card_html(card: &CardFile) -> RenderedPage {
+    let model_css = sanitize::css(&card.model_css, Page::Card);
+    let mut blocked: Vec<Blocked> = model_css.blocked;
     let mut out = String::with_capacity(card.model_css.len() + 1024);
     out.push_str("<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
@@ -264,7 +285,7 @@ pub fn card_html(card: &CardFile) -> String {
     out.push_str("</style>\n<style>\n");
     // CSS модели идёт после базовых правил: в Anki модель перекрывает базовые
     // стили, и превью обязано вести себя так же.
-    out.push_str(&card.model_css);
+    out.push_str(&model_css.css);
     out.push_str("\n</style>\n</head>\n<body>\n");
 
     for side in &card.sides {
@@ -273,11 +294,13 @@ pub fn card_html(card: &CardFile) -> String {
             "<section class=\"report-side\"><h2 class=\"report-side-label\">{}</h2>",
             escape_html(&side.label)
         );
+        let body = sanitize::html(&side.html, Page::Card);
+        blocked.extend(body.blocked);
         let _ = writeln!(
             out,
             "<div class=\"{}\">{}</div>",
             escape_html(&side.classes),
-            neutralize_scripts(&side.html)
+            body.html
         );
         if !side.issues.is_empty() {
             out.push_str("<ul class=\"report-side-issues\">\n");
@@ -303,7 +326,17 @@ pub fn card_html(card: &CardFile) -> String {
     out.push_str(CARD_RUNTIME_JS);
     out.push_str("</script>\n");
     out.push_str("</body>\n</html>\n");
-    out
+
+    // Последний шаг — независимая проверка того, что получилось: она не зависит
+    // от того, как собирался документ, и отвечает на вопрос «осталось ли здесь
+    // исполняемое или сетевое».
+    debug_assert!(
+        sanitize::inspect(&out, Page::Card).is_empty(),
+        "документ превью обязан проходить общую проверку: {:?}",
+        sanitize::inspect(&out, Page::Card)
+    );
+
+    RenderedPage { html: out, blocked }
 }
 
 /// Собирает `index.html`.
@@ -642,17 +675,6 @@ fn render_previews(out: &mut String, previews: &[ReportPreview]) {
     }
 }
 
-/// Обезвреживает `<script>` из данных модели или значения поля.
-///
-/// Отказ от отрисовки стороны оставляет неподдержанную конструкцию видимой — и
-/// это правильно, ревьюер должен видеть, что именно не отрисовано. Но видимый
-/// текст и исполняемый тег — разные вещи: без этой замены браузер, открыв файл
-/// отчёта, выполнил бы код шаблона Anki. Тег показан текстом, а не исполнен.
-fn neutralize_scripts(html: &str) -> String {
-    html.replace("<script", "&lt;script")
-        .replace("</script", "&lt;/script")
-}
-
 /// Рендерит фрагменты diff для одной колонки: «было» показывает общие и
 /// удалённые фрагменты, «стало» — общие и добавленные.
 ///
@@ -753,7 +775,7 @@ mod tests {
             }],
         };
 
-        let html = card_html(&card);
+        let html = card_html(&card).html;
         assert!(html.contains("data-report-runtime=\"card\""));
         assert!(html.contains("nightMode"));
         assert!(html.contains("report:height"));
@@ -835,7 +857,7 @@ mod tests {
             }],
         };
 
-        let html = card_html(&card);
+        let html = card_html(&card).html;
         let base = html.find("font-family: arial").expect("базовые стили");
         let model = html.find(".card { color: red; }").expect("CSS модели");
         assert!(base < model, "CSS модели обязан идти после базовых правил");

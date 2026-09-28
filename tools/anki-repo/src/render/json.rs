@@ -1574,6 +1574,7 @@ struct ReportChecksDto {
     out_dir_outside_decks: bool,
     all_files_inside_out_dir: bool,
     index_without_external_assets: bool,
+    every_generated_page_offline: bool,
     media_confined_to_out_dir: bool,
 }
 
@@ -1669,6 +1670,7 @@ impl<'a> From<&'a VisualReportResult> for VisualReportDto<'a> {
                 out_dir_outside_decks: result.checks.out_dir_outside_decks,
                 all_files_inside_out_dir: result.checks.all_files_inside_out_dir,
                 index_without_external_assets: result.checks.index_without_external_assets,
+                every_generated_page_offline: result.checks.every_generated_page_offline,
                 media_confined_to_out_dir: result.checks.media_confined_to_out_dir,
             },
         }

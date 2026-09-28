@@ -228,29 +228,8 @@ fn report_writes_a_self_contained_offline_document() {
     );
     assert!(index.contains("Ограничения этого отчёта"));
 
-    // Отчёт открывается офлайн: внешних ссылок нет ни в одном записанном файле.
-    for path in walk(out.path()) {
-        let text = std::fs::read_to_string(out.path().join(&path)).expect("файл отчёта");
-        // Упоминание схемы в тексте ограничений допустимо, а ссылка — нет.
-        for marker in [
-            "src=\"http",
-            "src='http",
-            "src=\"//",
-            "src='//",
-            "href=\"http",
-            "href='http",
-            "href=\"//",
-            "href='//",
-            "url(http",
-            "@import",
-        ] {
-            assert!(
-                !text.contains(marker),
-                "{path} не должен ссылаться в сеть: {marker}"
-            );
-        }
-        assert_report_scripts_are_own(&text, &path);
-    }
+    // Отчёт открывается офлайн: каждый записанный файл проходит общую проверку.
+    assert_every_page_is_offline(&out);
 
     // Интерактивность отчёта — собственный код, записанный в сами файлы. Он
     // обязан быть на месте, иначе высота кадра и ночная тема не работают.
@@ -297,31 +276,143 @@ fn report_writes_a_self_contained_offline_document() {
 
 /// Каждый `<script>` в файле отчёта обязан быть собственным runtime отчёта.
 ///
-/// Это и есть граница доверия в проверяемом виде: код шаблона Anki не
-/// исполняется, а внешних скриптов нет вовсе — ни `src`, ни `type`.
+/// Проверка структурная: тег и его тело разбираются сканером HTML, поэтому
+/// «запрещённой подстроки нет» здесь недостаточно — сравнивается само тело
+/// скрипта с runtime отчёта, и регистр тега, кавычек и пробелов ничего не меняет.
 fn assert_report_scripts_are_own(text: &str, path: &str) {
-    let mut rest = text;
     let mut found = 0usize;
-    while let Some(position) = rest.find("<script") {
-        let tail = &rest[position..];
-        let end = tail.find('>').expect("открывающий тег скрипта");
-        let tag = &tail[..end];
+    for tag in anki_repo::htmlscan::scan_tags(text) {
+        let anki_repo::htmlscan::Tag::RawText {
+            name,
+            body,
+            close_end,
+            ..
+        } = tag
+        else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("script") {
+            continue;
+        }
+        assert!(close_end.is_some(), "{path}: скрипт обязан быть закрыт");
+        let script = &text[body];
         assert!(
-            tag.contains("data-report-runtime=\""),
-            "{path}: посторонний скрипт запрещён: {tag}"
-        );
-        assert!(
-            !tag.contains("src="),
-            "{path}: внешний скрипт запрещён: {tag}"
-        );
-        assert!(
-            !tag.contains("type="),
-            "{path}: у runtime отчёта нет отдельного типа: {tag}"
+            script.trim() == anki_repo::report::runtime::CARD_RUNTIME_JS.trim()
+                || script.trim() == anki_repo::report::runtime::INDEX_RUNTIME_JS.trim(),
+            "{path}: исполняться может только runtime отчёта"
         );
         found += 1;
-        rest = &tail[end..];
     }
     assert!(found > 0, "{path}: runtime отчёта обязан быть в файле");
+}
+
+/// Класс страницы по её месту в отчёте.
+///
+/// Не-HTML-файлы (скопированная media) страницами не являются и проверку
+/// разметки не проходят — их проверяет отдельный контракт media.
+fn page_of(relative: &str) -> Option<anki_repo::report::sanitize::Page> {
+    use anki_repo::report::sanitize::Page;
+    if relative == "index.html" {
+        return Some(Page::Index);
+    }
+    if relative.starts_with("cards/") {
+        return Some(Page::Card);
+    }
+    assert!(
+        !relative.ends_with(".html"),
+        "неизвестная страница отчёта: {relative}"
+    );
+    None
+}
+
+/// Значения адресных атрибутов документа.
+///
+/// Разбор тот же, что у отчёта: таблица «что здесь адрес» — не второй список в
+/// тесте, а та же самая.
+fn address_values(text: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for tag in anki_repo::htmlscan::scan_tags(text) {
+        let anki_repo::htmlscan::Tag::Element(element) = tag else {
+            continue;
+        };
+        for attribute in &element.attributes {
+            if anki_repo::media::attribute_is_address(element.name, attribute.name) {
+                found.push((
+                    attribute.name.to_ascii_lowercase(),
+                    attribute.value.to_string(),
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// Имена обработчиков событий, оставшихся атрибутами документа.
+///
+/// Упоминание `onerror` в тексте превью — это объяснение, а атрибут — это код,
+/// поэтому проверяется разбор, а не подстрока.
+fn event_handlers(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for tag in anki_repo::htmlscan::scan_tags(text) {
+        let anki_repo::htmlscan::Tag::Element(element) = tag else {
+            continue;
+        };
+        for attribute in &element.attributes {
+            if attribute.name.to_ascii_lowercase().starts_with("on") {
+                found.push(attribute.name.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Тела всех `<script>` документа.
+fn script_bodies(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for tag in anki_repo::htmlscan::scan_tags(text) {
+        let anki_repo::htmlscan::Tag::RawText { name, body, .. } = tag else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("script") {
+            found.push(text[body].to_string());
+        }
+    }
+    found
+}
+
+/// Содержимое всех `<style>` документа.
+fn style_texts(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for tag in anki_repo::htmlscan::scan_tags(text) {
+        let anki_repo::htmlscan::Tag::RawText { name, body, .. } = tag else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("style") {
+            found.push(text[body].to_string());
+        }
+    }
+    found
+}
+
+/// Проверяет, что каждый записанный файл отчёта описывается как его страница и
+/// проходит общую границу доверия.
+///
+/// Это та же проверка, которой пользуется сам отчёт перед записью: у теста нет
+/// отдельного списка запрещённых подстрок, который неизбежно отстал бы от
+/// контракта.
+fn assert_every_page_is_offline(out: &TempDir) {
+    for path in walk(out.path()) {
+        let Some(page) = page_of(&path) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(out.path().join(&path)).expect("файл отчёта");
+        let violations = anki_repo::report::sanitize::inspect(&text, page);
+        assert!(
+            violations.is_empty(),
+            "{path} не проходит границу доверия: {violations:?}"
+        );
+        assert_report_scripts_are_own(&text, &path);
+    }
 }
 
 #[test]
@@ -1480,5 +1571,252 @@ fn report_keeps_the_theme_control_reachable_while_scrolling() {
         index.matches("data-report-theme=").count(),
         0,
         "тема хранится в атрибуте, который ставит runtime, а не в разметке панели"
+    );
+}
+
+/// Значение поля — это HTML, который Anki показывает вместе с шаблоном, то есть
+/// недоверенная разметка. Ни один её тег не имеет права исполниться: регистр,
+/// кавычки и пробелы в записи тега ничего не меняют.
+#[test]
+fn data_markup_never_executes_in_any_register() {
+    let before = canonical_base("report-trust-before");
+    let after = canonical_base("report-trust-after");
+    set_field(
+        &after,
+        "guid-2",
+        0,
+        "<SCRIPT>alert('верхний регистр')</SCRIPT>\
+         <sCrIpT src=\"https://evil.example/x.js\"></ScRiPt>\
+         <img src=\"b.png\" ONERROR=\"alert('обработчик')\" onLoad = \"alert('второй')\">\
+         <b>законная разметка</b>",
+    );
+    after.write_media(&["b.png"]);
+
+    let out = TempDir::new("report-trust-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    // Данные показаны текстом: читатель видит, что именно не отрисовано.
+    assert_eq!(
+        script_bodies(&card).len(),
+        1,
+        "исполняется только runtime отчёта, и он в файле один"
+    );
+    assert!(card.contains("&lt;SCRIPT>"), "скрипт показан текстом");
+    assert!(card.contains("alert('верхний регистр')"), "видно, что было");
+    assert!(
+        event_handlers(&card).is_empty(),
+        "обработчик события не остаётся атрибутом: {:?}",
+        event_handlers(&card)
+    );
+    // Законная разметка не ломается: превью показывает модель, а не отчёт о ней.
+    assert!(
+        card.contains("<b>законная разметка</b>"),
+        "обычный тег остаётся"
+    );
+    // Отвергнутое названо: молчание выглядело бы как «этого и не было».
+    assert!(
+        card.contains("не показано"),
+        "превью объясняет, что не показано"
+    );
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .expect("диагностика")
+            .iter()
+            .any(|item| item["code"] == "preview_construct_blocked"),
+        "диагностика называет отвергнутую конструкцию: {result}"
+    );
+}
+
+/// Внешний адрес в значении поля не превращается в запрос.
+#[test]
+fn data_cannot_start_an_http_request() {
+    let before = canonical_base("report-remote-before");
+    let after = canonical_base("report-remote-after");
+    set_field(
+        &after,
+        "guid-2",
+        0,
+        "<img src=\"https://evil.example/a.png\">\
+         <img src=\"//evil.example/b.png\">\
+         <a href=\"https://evil.example/page\">ссылка</a>\
+         <img srcset=\"https://evil.example/c.png 1x, https://evil.example/d.png 2x\">\
+         <video poster=\"https://evil.example/e.png\"></video>\
+         <object data=\"https://evil.example/f.svg\"></object>\
+         <img src=\"нет-файла.png\">",
+    );
+
+    let out = TempDir::new("report-remote-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let _ = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    let addresses = address_values(&card);
+    for (attribute, value) in &addresses {
+        assert!(
+            !value.trim().is_empty(),
+            "пустой адрес — это запрос самого документа, а не «ничего»: {attribute}"
+        );
+        assert!(
+            !value.contains("://") && !value.starts_with("//"),
+            "внешний адрес не остаётся адресом: {attribute}={value}"
+        );
+    }
+    assert!(
+        addresses.is_empty(),
+        "после очистки в превью не остаётся ни одного адреса: {addresses:?}"
+    );
+    // Ссылка на отсутствующий локальный файл не выдумывается и названа состоянием.
+    assert!(
+        !card.contains("media/after/нет-файла.png"),
+        "отсутствующий файл не подставляется"
+    );
+    assert!(
+        card.contains("нет-файла.png"),
+        "имя отсутствующего файла видно"
+    );
+}
+
+/// CSS модели приходит из экспорта и не имеет права тянуть внешнее.
+#[test]
+fn model_css_cannot_pull_remote_assets() {
+    let before = canonical_base("report-css-before");
+    let after = canonical_base("report-css-after");
+    let mut export = after.deck_json();
+    export["note_models"][0]["css"] = json!(
+        ".card { background: url(\"https://evil.example/a.png\") no-repeat; }\
+         @import url(\"https://evil.example/b.css\");\
+         .card::after { content: \"</style><script>alert('выход из стиля')</script>\"; }"
+    );
+    after.write_canonical_deck_json(&export);
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let out = TempDir::new("report-css-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let _ = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    let styles = style_texts(&card);
+    let css = styles.join("\n");
+    assert!(!css.is_empty(), "CSS страницы превью обязан быть");
+    assert!(
+        !css.to_ascii_lowercase().contains("@import"),
+        "внешняя таблица стилей не подключается: {css}"
+    );
+    assert!(
+        !css.contains("evil.example"),
+        "адрес из CSS не остаётся адресом: {css}"
+    );
+    // Оформление при этом сохраняется: убрать CSS целиком значило бы сломать превью.
+    assert!(css.contains(".card"), "CSS модели остаётся подключённым");
+    assert!(
+        css.contains("background: none"),
+        "нелокальный адрес заменён инертным значением: {css}"
+    );
+    assert!(
+        !card.contains("<script>alert"),
+        "CSS не может закрыть свой тег и начать разметку"
+    );
+}
+
+/// Runtime отчёта — единственный исполняемый код в файлах отчёта, и он обязан
+/// оставаться работоспособным: тема, высота кадра и звук — это и есть отчёт.
+#[test]
+fn report_owned_runtime_survives_the_trust_boundary() {
+    let before = canonical_base("report-runtime-before");
+    let after = canonical_base("report-runtime-after");
+    set_field(&after, "guid-2", 0, "<img src=\"b.png\">[sound:a.mp3]");
+    for dir in [&before, &after] {
+        dir.write_media(&["a.mp3", "b.png"]);
+    }
+    set_field(&after, "guid-2", 2, "изменение ради превью");
+
+    let out = TempDir::new("report-runtime-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_eq!(
+        result["checks"]["every_generated_page_offline"],
+        json!(true)
+    );
+    assert_every_page_is_offline(&out);
+
+    let index = card_text(&out, "index.html");
+    assert!(index.contains("data-report-runtime=\"index\""));
+    assert!(index.contains("report:hello"));
+    assert!(index.contains("report:height"));
+    assert!(index.contains("report:theme"));
+    assert!(index.contains("data-report-theme-value=\"night\""));
+    // Кадр превью не изолируется атрибутом `sandbox`: без `allow-same-origin`
+    // документ внутри кадра теряет доступ к своей теме и к своей же media.
+    assert!(
+        !index.contains("sandbox"),
+        "ограничение кадра не должно ломать тему, высоту и звук"
+    );
+
+    let card = card_text(&out, "cards/card-0002.html");
+    assert!(card.contains("class=\"report-side\""));
+    assert!(
+        card.contains("../media/after/b.png"),
+        "локальная картинка работает"
+    );
+    assert!(card.contains("class=\"replay-button\""));
+    assert!(card.contains("class=\"report-audio\""));
+    assert!(
+        card.contains("../media/after/a.mp3"),
+        "звук своего состояния"
+    );
+}
+
+/// Отсутствие media и неподдержанная конструкция видны в самом превью: отчёт,
+/// который молча показывает меньше, чем должен, вводит читателя в заблуждение.
+#[test]
+fn blocked_and_missing_content_is_named_in_the_preview() {
+    let before = canonical_base("report-honest-before");
+    let after = canonical_base("report-honest-after");
+    set_field(
+        &after,
+        "guid-2",
+        0,
+        "<img src=\"нет.png\"><img src=\"есть.png\">",
+    );
+    after.write_media(&["есть.png"]);
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let out = TempDir::new("report-honest-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    assert!(
+        card.contains("report-media-missing"),
+        "отсутствие названо в превью"
+    );
+    assert!(
+        card.contains("missing: нет.png"),
+        "названо, чего именно нет"
+    );
+    assert!(
+        card.contains("../media/after/есть.png"),
+        "существующий файл показан"
+    );
+
+    let missing: Vec<&str> = result["diagnostics"]
+        .as_array()
+        .expect("диагностика")
+        .iter()
+        .filter(|item| item["code"] == "missing_media")
+        .map(|item| item["subject"].as_str().expect("subject"))
+        .collect();
+    assert_eq!(
+        missing,
+        vec!["after:нет.png"],
+        "состояние отсутствия названо"
     );
 }

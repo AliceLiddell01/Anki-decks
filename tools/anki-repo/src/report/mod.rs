@@ -12,6 +12,7 @@ pub mod diff;
 pub mod html;
 pub mod media;
 pub mod runtime;
+pub mod sanitize;
 pub mod style;
 
 /// Состояние экспорта, к которому относится превью.

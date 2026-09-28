@@ -166,6 +166,70 @@ fn lock_exclusive(path: &Path, _file: &File) -> Result<(), DomainError> {
     ))
 }
 
+/// Публикует документ, у которого нет предусловия на прежнее содержимое.
+///
+/// Этим путём пишутся артефакты, которые не являются чьим-то изменяемым
+/// исходником: resolved-запрос `create --emit-resolved` и файл-манифест отчёта.
+/// Проверять у них «источник не изменился» нечем и незачем — они и есть результат
+/// команды, — но частично записанный документ недопустим так же, как частично
+/// записанный `deck.json`: читатель не должен видеть половину файла.
+///
+/// Поэтому публикация идёт тем же способом, что и у `deck.json` (временный файл
+/// рядом с целью, `sync_all`, затем `rename`), и остаётся единственной в
+/// toolkit'е: второй реализации атомарной записи здесь не появляется.
+///
+/// # Errors
+///
+/// [`ErrorCode::WriteFailed`] для любого отказа файловой системы. Временный файл
+/// не переживает неуспешную публикацию.
+pub fn replace_document_atomically(
+    path: &Path,
+    document: &[u8],
+) -> Result<PublishedFile, DomainError> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let saved_permissions = fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.permissions());
+
+    let (temp_path, file, temp_attempt) = create_temp(path, directory)?;
+
+    let outcome = write_new_document(&temp_path, file, saved_permissions.as_ref(), document)
+        .and_then(|()| {
+            fs::rename(&temp_path, path).map_err(|error| write_error(path, "rename", &error))
+        });
+
+    if outcome.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    outcome.map(|()| PublishedFile {
+        path: path.to_path_buf(),
+        bytes: document.len(),
+        temp_attempt,
+    })
+}
+
+/// Записывает документ во временный файл и сбрасывает его на диск.
+fn write_new_document(
+    temp_path: &Path,
+    mut file: File,
+    saved_permissions: Option<&fs::Permissions>,
+    document: &[u8],
+) -> Result<(), DomainError> {
+    file.write_all(document)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| write_error(temp_path, "write_candidate", &error))?;
+
+    if let Some(permissions) = saved_permissions {
+        file.set_permissions(permissions.clone())
+            .map_err(|error| write_error(temp_path, "set_permissions", &error))?;
+    }
+
+    drop(file);
+    Ok(())
+}
+
 /// Публикует `candidate` вместо `path`, ожидая там байты `expected_source`.
 ///
 /// # Errors
