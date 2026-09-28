@@ -10,6 +10,7 @@
 
 pub mod diff;
 pub mod html;
+pub mod manifest;
 pub mod media;
 pub mod runtime;
 pub mod sanitize;

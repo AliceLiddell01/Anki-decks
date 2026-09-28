@@ -257,6 +257,13 @@ pub struct AttributeValue {
     /// Нужен тому, кто подменяет ссылку: замена на месте сохраняет остальную
     /// запись значения, включая дескрипторы `srcset`.
     pub range: Range<usize>,
+    /// Байтовый диапазон всего кандидата внутри значения атрибута — вместе с
+    /// дескрипторами `srcset` (`200w`, `2x`) и без запятой-разделителя.
+    ///
+    /// Нужен тому, кто убирает кандидата целиком: список пересобирается из
+    /// кандидатов, и «выкинуть ссылку, оставив её дескриптор» — не то же самое,
+    /// что выкинуть кандидата.
+    pub segment: Range<usize>,
 }
 
 /// Разбирает значение атрибута на отдельные ссылки вместе с их местом.
@@ -277,6 +284,7 @@ pub fn split_attribute_values(attribute: &str, value: &str) -> Vec<AttributeValu
             vec![AttributeValue {
                 text: text.to_string(),
                 range: trimmed_start..trimmed_end,
+                segment: trimmed_start..trimmed_end,
             }]
         };
     }
@@ -286,14 +294,15 @@ pub fn split_attribute_values(attribute: &str, value: &str) -> Vec<AttributeValu
     for candidate in value.split(',') {
         let start = offset;
         offset += candidate.len() + 1;
-        let Some(url) = candidate.split_whitespace().next() else {
+        let piece = candidate.trim();
+        let Some(url) = piece.split_whitespace().next() else {
             continue;
         };
-        let url_start = candidate.len() - candidate.trim_start().len();
-        let url_end = url_start + url.len();
+        let segment_start = start + (candidate.len() - candidate.trim_start().len());
         found.push(AttributeValue {
             text: url.to_string(),
-            range: start + url_start..start + url_end,
+            range: segment_start..segment_start + url.len(),
+            segment: segment_start..segment_start + piece.len(),
         });
     }
     found

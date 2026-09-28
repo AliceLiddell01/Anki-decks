@@ -42,6 +42,7 @@ use crate::report::html::{
     CardFile, CardSide, DiffMark, FieldDiff, ReportCard, ReportCounts, ReportDiagnosticView,
     ReportDocument, ReportPreview, ReportSection, card_html, index_html,
 };
+use crate::report::manifest::{self, Ownership};
 use crate::report::media::{self, MediaPlan};
 use crate::report::sanitize;
 use crate::template::{
@@ -378,6 +379,14 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
         &request.out,
         &[canonical_before.clone(), canonical_after.clone()],
     )?;
+    // Владение проверяется до любой записи: чужой каталог и испорченный манифест
+    // отвергаются, ничего не тронув.
+    let ownership = manifest::inspect(&out_dir)?;
+    // Сборка идёт рядом с целевым каталогом, поэтому отказ генерации — разбор
+    // экспорта, планирование media, проверка границы доверия, нехватка места —
+    // оставляет прежний отчёт на месте.
+    let staging = manifest::Staging::begin(&out_dir, &ownership)?;
+    let target_dir = staging.path().to_path_buf();
     let preview_limit = request.preview_limit.clamp(1, MAX_PREVIEW_LIMIT);
 
     let classification = classify(&before, &after, request.retire_tag.as_deref());
@@ -452,7 +461,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
         (SideState::Before, before.summary.export_dir.clone()),
         (SideState::After, after.summary.export_dir.clone()),
     ];
-    let mut media_plan = media::plan(&source_exports, &build.media_references, &out_dir)?;
+    let mut media_plan = media::plan(&source_exports, &build.media_references, &target_dir)?;
     media::note_symlinks(&mut media_plan, &source_exports, &build.media_references);
     push_media_diagnostics(&media_plan, &mut diagnostics);
     diagnostics.append(&mut build.preview_issues);
@@ -476,8 +485,6 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     // Подстановка ссылок выполняется после планирования media: до него неизвестно,
     // какие файлы окажутся рядом с отчётом. Ссылка состояния подставляется только
     // на файл своего состояния, а звук без файла честно помечается отсутствующим.
-    let mut written: Vec<PathBuf> = Vec::new();
-    let mut cards_offline = true;
     let mut preview_files: Vec<PreviewFileFact> = Vec::new();
     let documents = std::mem::take(&mut build.card_documents);
     for document in &documents {
@@ -547,10 +554,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
                 },
             ));
         }
-        let path = out_dir.join(&document.file);
-        write_report_file(&path, page.html.as_bytes())?;
-        cards_offline = true;
-        written.push(path);
+        write_report_file(&target_dir.join(&document.file), page.html.as_bytes())?;
         preview_files.push(PreviewFileFact {
             file: document.file.clone(),
             state: document.state,
@@ -593,6 +597,46 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
 
     let card_files_total = build.card_files.len();
     counts.previews = card_files_total;
+
+    // Полный набор файлов отчёта известен до записи точки входа: он же —
+    // доказательство владения для следующего прогона.
+    let mut report_files: Vec<String> = Vec::new();
+    for state in SideState::ALL {
+        for name in &media_plan.state(state).copied {
+            report_files.push(format!("{}/{name}", state.media_dir()));
+        }
+    }
+    report_files.extend(documents.iter().map(|document| document.file.clone()));
+    report_files.push(INDEX_HTML.to_string());
+
+    // Устаревшее и чужое называются в самом отчёте: «файл исчез» и «файл не наш»
+    // — разные события, и молчать о любом из них нельзя.
+    let stale = stale_files(&ownership, &report_files);
+    if !stale.is_empty() {
+        diagnostics.push(Diagnostic::info(
+            "out_dir_stale_removed",
+            format!(
+                "из каталога отчёта убрано {} файлов прежнего отчёта, которых нет в текущем: {}",
+                stale.len(),
+                stale.join(", ")
+            ),
+            None,
+        ));
+    }
+    if let Ownership::Owned { foreign, .. } = &ownership
+        && !foreign.is_empty()
+    {
+        diagnostics.push(Diagnostic::warning(
+            "out_dir_foreign_files",
+            format!(
+                "в каталоге отчёта лежат {} записей, которых отчёт не создавал, и они оставлены \
+                 без изменений: {}",
+                foreign.len(),
+                foreign.join(", ")
+            ),
+            None,
+        ));
+    }
 
     let limitations = limitations();
     let document = ReportDocument {
@@ -637,10 +681,41 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
             },
         ));
     }
-    write_report_file(&index_path, index.as_bytes())?;
-    written.push(index_path.clone());
+    write_report_file(&target_dir.join(INDEX_HTML), index.as_bytes())?;
 
-    let all_inside = written.iter().all(|path| path.starts_with(&out_dir));
+    // Перенос собранного отчёта в целевой каталог: новые файлы занимают свои
+    // места, устаревшие файлы прежнего отчёта удаляются, манифест пишется
+    // последним. До этого шага каталог отчёта не менялся вообще.
+    let commit = staging.commit(&report_files)?;
+    debug_assert_eq!(commit.files, {
+        let mut files = report_files.clone();
+        files.sort();
+        files.dedup();
+        files
+    });
+
+    // Проверка офлайна повторяется по записанным файлам, а не по строкам в памяти:
+    // проверяться обязан артефакт, который читает человек.
+    let mut cards_offline = true;
+    for relative in report_files
+        .iter()
+        .filter(|relative| relative.ends_with(".html"))
+    {
+        let path = out_dir.join(relative);
+        let text = fs::read_to_string(&path).map_err(|error| out_dir_error(&path, &error))?;
+        let page = if relative == INDEX_HTML {
+            sanitize::Page::Index
+        } else {
+            sanitize::Page::Card
+        };
+        if !sanitize::inspect(&text, page).is_empty() {
+            cards_offline = false;
+        }
+    }
+
+    let all_inside = report_files
+        .iter()
+        .all(|relative| manifest::is_inner_path(relative) && out_dir.join(relative).is_file());
     // Скопированный файл обязан лежать в подкаталоге media своего состояния:
     // проверка повторяет границу каталога независимо от того, как планировщик
     // сложил пути.
@@ -706,6 +781,24 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
             media_confined_to_out_dir: media_confined,
         },
     })
+}
+
+/// Файлы прежнего отчёта, которых нет в текущем.
+///
+/// Считается по манифесту, то есть по доказательству владения: удаляется только
+/// то, что отчёт сам когда-то создал.
+fn stale_files(ownership: &Ownership, current: &[String]) -> Vec<String> {
+    let Ownership::Owned { files, .. } = ownership else {
+        return Vec::new();
+    };
+    let current: BTreeSet<&str> = current.iter().map(String::as_str).collect();
+    let mut stale: Vec<String> = files
+        .iter()
+        .filter(|file| !current.contains(file.as_str()))
+        .cloned()
+        .collect();
+    stale.sort();
+    stale
 }
 
 /// Ограничения отчёта — то, что он заведомо не показывает.
@@ -2043,6 +2136,37 @@ fn rewrite_element(
         };
         let value = &html[value_range.clone()];
         let candidates = media_index::split_attribute_values(attribute.name, value);
+
+        // Список кандидатов (`srcset`) пересобирается только из показанных
+        // файлов: кандидат, которого нет рядом с отчётом, — это адрес, за
+        // которым браузер пошёл бы в сеть. Подмена идёт на месте ссылки, поэтому
+        // дескрипторы (`2x`, `200w`) остаются частью своего кандидата.
+        if candidates.len() > 1 {
+            let mut segments: Vec<String> = Vec::new();
+            for candidate in &candidates {
+                let media::PreviewReference::Copied(path) =
+                    plan.preview_reference(state, &candidate.text)
+                else {
+                    continue;
+                };
+                resolved_media.insert(path.to_string());
+                let mut segment = value[candidate.segment.clone()].to_string();
+                let offset = candidate.range.start - candidate.segment.start;
+                let resolved = format!("../{path}");
+                segment.replace_range(offset..offset + candidate.range.len(), &resolved);
+                segments.push(segment.trim().to_string());
+            }
+            if segments.is_empty() {
+                // Пустой список кандидатов браузер понял бы как запрос
+                // текущего документа, поэтому больше не остаётся ничего.
+                missing_all = true;
+                replacements.push((value_range, String::new()));
+            } else {
+                replacements.push((value_range, segments.join(", ")));
+            }
+            continue;
+        }
+
         let mut kept: Vec<String> = Vec::new();
         for candidate in &candidates {
             match plan.preview_reference(state, &candidate.text) {
@@ -2072,24 +2196,6 @@ fn rewrite_element(
                 None => {}
             }
             continue;
-        }
-
-        // `srcset`: отсутствующие кандидаты убираются, потому что «пустой адрес»
-        // в списке кандидатов браузер понял бы как запрос текущего документа.
-        let remaining: Vec<&String> = kept
-            .iter()
-            .filter(|candidate| !candidate.is_empty())
-            .collect();
-        if remaining.is_empty() {
-            missing_all = true;
-            replacements.push((value_range, String::new()));
-        } else if remaining.len() != kept.len() {
-            let joined = remaining
-                .iter()
-                .map(|candidate| candidate.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            replacements.push((value_range, joined));
         }
     }
 
@@ -2275,32 +2381,13 @@ fn ensure_out_dir(out: &Path, export_dirs: &[PathBuf]) -> Result<PathBuf, Domain
     }
 
     if canonical.is_dir() {
-        let mut entries = 0usize;
-        for entry in fs::read_dir(&canonical).map_err(|error| out_dir_error(&canonical, &error))? {
-            entry.map_err(|error| out_dir_error(&canonical, &error))?;
-            entries += 1;
-        }
-
-        // Перезапись собственного отчёта разрешена: в каталоге уже лежит
-        // `index.html`. Любой другой непустой каталог — чужой, и стирать его
-        // содержимое инструмент не имеет права.
-        if entries > 0 && !canonical.join(INDEX_HTML).is_file() {
-            return Err(DomainError::with_details(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "каталог отчёта {} не пуст и не похож на каталог отчёта: {entries} записей",
-                    canonical.display()
-                ),
-                details! {
-                    "reason" => "out_dir_not_empty",
-                    "out_dir" => canonical.display().to_string(),
-                    "entries" => entries,
-                },
-            ));
-        }
+        // Непустой каталог обязан доказать, что он наш: признаком владения
+        // служит манифест отчёта, а не похожесть содержимого. Каталог с обычным
+        // `index.html` без манифеста — чужой, и отчёт в него не пишется.
+        manifest::inspect(&canonical)?;
+    } else {
+        fs::create_dir_all(&canonical).map_err(|error| out_dir_error(&canonical, &error))?;
     }
-
-    fs::create_dir_all(&canonical).map_err(|error| out_dir_error(&canonical, &error))?;
     Ok(canonical)
 }
 
@@ -2656,7 +2743,24 @@ mod tests {
         fs::write(out.join("чужое.txt"), b"x").expect("файл");
 
         let error = ensure_out_dir(&out, &[]).expect_err("отказ");
-        assert_eq!(error.details["reason"], "out_dir_not_empty");
+        assert_eq!(error.details["reason"], "out_dir_not_owned");
+        assert_eq!(
+            fs::read(out.join("чужое.txt")).expect("файл"),
+            b"x",
+            "отказ ничего не меняет"
+        );
+    }
+
+    #[test]
+    fn a_foreign_index_html_is_not_a_proof_of_ownership() {
+        let dir = TempDir::new("visual-report-out-foreign-index");
+        let out = dir.path().join("out");
+        fs::create_dir_all(out.join("cards")).expect("каталог");
+        fs::write(out.join(INDEX_HTML), "<html>чужой отчёт</html>".as_bytes()).expect("файл");
+
+        let error = ensure_out_dir(&out, &[]).expect_err("отказ");
+        assert_eq!(error.details["reason"], "out_dir_not_owned");
+        assert!(out.join(INDEX_HTML).is_file(), "чужой index не перезаписан");
     }
 
     #[test]
@@ -2664,7 +2768,13 @@ mod tests {
         let dir = TempDir::new("visual-report-out-reuse");
         let out = dir.path().join("out");
         fs::create_dir_all(&out).expect("каталог");
+        let manifest = crate::report::manifest::Manifest::new(&[INDEX_HTML.to_string()]);
         fs::write(out.join(INDEX_HTML), b"<html></html>").expect("файл");
+        fs::write(
+            out.join(crate::report::manifest::MANIFEST_FILE),
+            manifest.bytes().expect("байты"),
+        )
+        .expect("манифест");
 
         assert!(ensure_out_dir(&out, &[]).is_ok());
     }

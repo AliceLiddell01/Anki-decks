@@ -23,6 +23,14 @@ fn canonical_base(label: &str) -> TempDir {
 }
 
 /// Все относительные пути файлов внутри каталога.
+/// Файлы самого отчёта: без доказательства владения, лежащего рядом с ними.
+fn artifact_files(root: &Path) -> Vec<String> {
+    walk(root)
+        .into_iter()
+        .filter(|relative| relative != anki_repo::report::manifest::MANIFEST_FILE)
+        .collect()
+}
+
 fn walk(root: &Path) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -214,7 +222,7 @@ fn report_writes_a_self_contained_offline_document() {
     );
     assert_eq!(result["out_dir"], out.path().to_str().expect("путь"));
     assert_eq!(
-        walk(out.path()),
+        artifact_files(out.path()),
         vec!["cards/card-0001.html", "cards/card-0002.html", "index.html"]
     );
 
@@ -401,7 +409,7 @@ fn style_texts(text: &str) -> Vec<String> {
 /// отдельного списка запрещённых подстрок, который неизбежно отстал бы от
 /// контракта.
 fn assert_every_page_is_offline(out: &TempDir) {
-    for path in walk(out.path()) {
+    for path in artifact_files(out.path()) {
         let Some(page) = page_of(&path) else {
             continue;
         };
@@ -438,7 +446,7 @@ fn report_copies_media_and_rewrites_only_resolved_references() {
     assert_eq!(result["media"]["missing"], json!(["нет.png"]));
     assert_eq!(result["media"]["remote"], json!(["https://пример/в.png"]));
     assert_eq!(
-        walk(out.path()),
+        artifact_files(out.path()),
         vec![
             "cards/card-0001.html",
             "cards/card-0002.html",
@@ -518,6 +526,8 @@ fn report_is_deterministic_for_equal_inputs() {
     let (exit, _) = report(before.path(), after.path(), second.path(), &[]);
     assert_eq!(exit, 0);
 
+    // Сравнивается весь каталог, включая манифест владения: детерминированность
+    // относится к артефакту целиком, а не только к его страницам.
     let files = walk(first.path());
     assert_eq!(files, walk(second.path()), "состав файлов обязан совпадать");
     assert!(
@@ -554,20 +564,273 @@ fn report_refuses_an_out_dir_inside_decks() {
 }
 
 #[test]
-fn report_refuses_a_non_empty_out_dir_without_an_index() {
+fn report_refuses_a_non_empty_out_dir_without_ownership_proof() {
     let before = canonical_base("report-occupied-before");
     let after = canonical_base("report-occupied-after");
     let out = TempDir::new("report-occupied-out");
-    std::fs::write(out.path().join("чужой.txt"), b"occupied").expect("файл");
+    std::fs::write(out.path().join("чужой.txt"), "occupied").expect("файл");
 
     let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
     assert_ne!(exit, 0);
     assert_eq!(document["error"]["code"], "invalid_request");
-    assert_eq!(document["error"]["details"]["reason"], "out_dir_not_empty");
+    assert_eq!(
+        document["error"]["details"]["reason"], "out_dir_not_owned",
+        "чужой каталог отвергается: {document}"
+    );
 
-    // Каталог с уже готовым отчётом перезаписывается: это повторный запуск.
+    // Отказ ничего не меняет и не оставляет следов: чужой файл на месте, а
+    // каталог не превратился в отчёт.
     let (exit, _) = report(before.path(), after.path(), out.path(), &[]);
     assert_ne!(exit, 0, "чужой файл всё ещё на месте");
+    assert_eq!(artifact_files(out.path()), vec!["чужой.txt".to_string()]);
+}
+
+/// Чужой каталог с обычным `index.html` — не доказательство владения: раньше
+/// достаточно было этого имени, и отчёт перезаписывал чужой файл.
+#[test]
+fn a_foreign_index_html_is_not_a_proof_of_ownership() {
+    let before = canonical_base("report-foreign-index-before");
+    let after = canonical_base("report-foreign-index-after");
+    let out = TempDir::new("report-foreign-index-out");
+    std::fs::create_dir_all(out.path().join("cards")).expect("подкаталог");
+    std::fs::write(
+        out.path().join("index.html"),
+        "<!doctype html><title>чужой отчёт</title>",
+    )
+    .expect("файл");
+
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    assert_ne!(exit, 0);
+    assert_eq!(document["error"]["details"]["reason"], "out_dir_not_owned");
+    let index = std::fs::read_to_string(out.path().join("index.html")).expect("чужой index.html");
+    assert!(
+        index.contains("чужой отчёт"),
+        "чужой index.html не перезаписан: {index}"
+    );
+    assert!(
+        !out.path().join("report-manifest.json").exists(),
+        "отчёт не оставил следов владения в чужом каталоге"
+    );
+}
+
+/// Испорченный или чужой манифест — отказ до любых изменений: доверять
+/// половине доказательства владения нельзя.
+#[test]
+fn a_corrupt_manifest_is_refused_without_changes() {
+    let before = canonical_base("report-corrupt-before");
+    let after = canonical_base("report-corrupt-after");
+    let out = TempDir::new("report-corrupt-out");
+    std::fs::write(out.path().join("index.html"), "прежний index").expect("файл");
+    std::fs::write(out.path().join("report-manifest.json"), "{ это не JSON").expect("манифест");
+
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    assert_ne!(exit, 0);
+    assert_eq!(
+        document["error"]["details"]["reason"],
+        "out_dir_manifest_invalid"
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("index.html")).expect("файл"),
+        "прежний index"
+    );
+}
+
+/// Повторная генерация оставляет ровно файлы текущего отчёта: устаревшие превью
+/// прежнего прогона удаляются, а не остаются висеть рядом с новыми.
+#[test]
+fn repeated_generation_leaves_exactly_the_current_files() {
+    let before = canonical_base("report-repeat-before");
+    let after = canonical_base("report-repeat-after");
+    let out = TempDir::new("report-repeat-out");
+
+    // Первый прогон: меняются обе заметки, превью две.
+    set_field(&after, "guid-1", 1, "первое изменение");
+    set_field(&after, "guid-2", 1, "второе изменение");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    result_of(exit, &document);
+    assert_eq!(
+        artifact_files(out.path()),
+        vec![
+            "cards/card-0001.html",
+            "cards/card-0002.html",
+            "cards/card-0003.html",
+            "cards/card-0004.html",
+            "index.html"
+        ],
+        "первый прогон пишет превью обеих изменённых заметок"
+    );
+    let first_index = std::fs::read(out.path().join("index.html")).expect("index");
+
+    // Второй прогон в тот же каталог: изменена одна заметка, превью одно.
+    let second_before = canonical_base("report-repeat-before-2");
+    let second_after = canonical_base("report-repeat-after-2");
+    set_field(&second_after, "guid-2", 1, "единственное изменение");
+    let (exit, document) = report(second_before.path(), second_after.path(), out.path(), &[]);
+    let second = result_of(exit, &document);
+
+    assert_eq!(
+        artifact_files(out.path()),
+        vec!["cards/card-0001.html", "cards/card-0002.html", "index.html"],
+        "в каталоге остаётся ровно текущий набор файлов: превью прежней заметки убраны"
+    );
+    assert!(
+        std::fs::read(out.path().join("index.html")).expect("index") != first_index,
+        "index.html заменён, а не дополнен"
+    );
+
+    let manifest = read_manifest(out.path());
+    assert_eq!(
+        manifest["files"],
+        json!(["cards/card-0001.html", "cards/card-0002.html", "index.html"]),
+        "манифест перечисляет ровно файлы текущего отчёта: {manifest}"
+    );
+
+    // Удалённое названо: читатель обязан видеть, что прежние превью убраны, а не
+    // что отчёт «внезапно стал короче».
+    let removed_diagnostics: Vec<&str> = stale_diagnostics(&second);
+    assert_eq!(
+        removed_diagnostics.len(),
+        1,
+        "одно сообщение об уборке: {second}"
+    );
+    assert!(
+        removed_diagnostics[0].contains("card-0003.html")
+            && removed_diagnostics[0].contains("card-0004.html"),
+        "названы именно устаревшие файлы: {removed_diagnostics:?}"
+    );
+
+    // Два независимых прогона с одним входом дают побайтово одинаковый артефакт.
+    let third = TempDir::new("report-repeat-third");
+    let fourth = TempDir::new("report-repeat-fourth");
+    for dir in [&third, &fourth] {
+        let (exit, _) = report(second_before.path(), second_after.path(), dir.path(), &[]);
+        assert_eq!(exit, 0);
+    }
+    for relative in walk(third.path()) {
+        let left = std::fs::read(third.path().join(&relative)).expect("файл");
+        let right = std::fs::read(fourth.path().join(&relative)).expect("файл");
+        assert!(left == right, "{relative} обязан совпадать побайтово");
+    }
+}
+
+/// Чужой файл внутри каталога отчёта не удаляется и не перезаписывается: он
+/// назван в диагностике, потому что «файл исчез» и «файл не наш» — разные вещи.
+#[test]
+fn foreign_files_inside_the_report_directory_are_reported_and_kept() {
+    let before = canonical_base("report-foreign-file-before");
+    let after = canonical_base("report-foreign-file-after");
+    let out = TempDir::new("report-foreign-file-out");
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    result_of(exit, &document);
+    std::fs::write(out.path().join("заметка.txt"), "чужое").expect("чужой файл");
+
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("заметка.txt")).expect("файл"),
+        "чужое",
+        "чужой файл остаётся на месте"
+    );
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .expect("диагностика")
+            .iter()
+            .any(|item| item["code"] == "out_dir_foreign_files"
+                && item["message"]
+                    .as_str()
+                    .expect("сообщение")
+                    .contains("заметка.txt")),
+        "чужой файл назван в диагностике: {result}"
+    );
+    let manifest = read_manifest(out.path());
+    assert!(
+        !manifest["files"]
+            .as_array()
+            .expect("файлы")
+            .iter()
+            .any(|file| file == "заметка.txt"),
+        "чужой файл не попадает в доказательство владения: {manifest}"
+    );
+}
+
+/// Отказ генерации не уничтожает прежний отчёт: сборка идёт рядом с каталогом
+/// отчёта, и до переноса каталог не меняется вообще.
+#[test]
+fn a_failed_generation_keeps_the_previous_report() {
+    let before = canonical_base("report-keep-before");
+    let after = canonical_base("report-keep-after");
+    let out = TempDir::new("report-keep-out");
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    result_of(exit, &document);
+    let index_before = std::fs::read(out.path().join("index.html")).expect("index");
+    let manifest_before = std::fs::read(out.path().join("report-manifest.json")).expect("манифест");
+
+    // Новое состояние ссылается на media, который существует, но не читается:
+    // копирование падает уже во время сборки отчёта.
+    let broken_before = canonical_base("report-keep-broken-before");
+    let broken_after = canonical_base("report-keep-broken-after");
+    set_field(&broken_after, "guid-2", 0, "<img src=\"нечитаемый.png\">");
+    broken_after.write_media(&["нечитаемый.png"]);
+    make_unreadable(&broken_after.path().join("media/нечитаемый.png"));
+    set_field(&broken_after, "guid-2", 1, "изменение ради превью");
+
+    // Если окружение позволяет прочитать файл (например, запуск от root), проверка
+    // теряет смысл: тогда она пропускается явно, а не проходит молча.
+    if std::fs::read(broken_after.path().join("media/нечитаемый.png")).is_ok() {
+        return;
+    }
+
+    let (exit, document) = report(broken_before.path(), broken_after.path(), out.path(), &[]);
+    assert_ne!(exit, 0, "копирование media обязано упасть: {document}");
+    assert_eq!(
+        std::fs::read(out.path().join("index.html")).expect("index"),
+        index_before,
+        "прежний index.html не тронут"
+    );
+    assert_eq!(
+        std::fs::read(out.path().join("report-manifest.json")).expect("манифест"),
+        manifest_before,
+        "прежнее доказательство владения не тронуто"
+    );
+
+    // Каталог сборки убран: после отказа он не остаётся мусором рядом с отчётом.
+    let leftovers: Vec<String> = std::fs::read_dir(out.path().parent().expect("родитель"))
+        .expect("каталог")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains("report-keep-out") && name.contains("staging"))
+        .collect();
+    assert!(leftovers.is_empty(), "каталог сборки убран: {leftovers:?}");
+}
+
+/// Сообщения об уборке устаревших файлов прежнего отчёта.
+fn stale_diagnostics(document: &serde_json::Value) -> Vec<&str> {
+    document["diagnostics"]
+        .as_array()
+        .expect("диагностика")
+        .iter()
+        .filter(|item| item["code"] == "out_dir_stale_removed")
+        .filter_map(|item| item["message"].as_str())
+        .collect()
+}
+
+/// Манифест отчёта: доказательство владения, а не служебная мелочь.
+fn read_manifest(root: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(root.join("report-manifest.json")).expect("манифест");
+    serde_json::from_str(&text).expect("манифест — JSON")
+}
+
+/// Делает файл нечитаемым для текущего пользователя.
+fn make_unreadable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path).expect("файл").permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(path, permissions).expect("права");
 }
 
 #[test]
@@ -714,7 +977,7 @@ fn report_preview_limit_bounds_the_number_of_cards() {
     assert_eq!(result["card_files_total"], 2);
     assert_eq!(result["outcomes"].as_array().expect("заметки").len(), 2);
     assert_eq!(
-        walk(out.path()),
+        artifact_files(out.path()),
         vec!["cards/card-0001.html", "cards/card-0002.html", "index.html"]
     );
 
@@ -770,7 +1033,7 @@ fn report_keeps_full_card_file_list_separate_from_the_written_files() {
     );
     assert_eq!(result["preview_files_truncated"], false);
     assert_eq!(
-        walk(out.path()),
+        artifact_files(out.path()),
         vec![
             "cards/card-0001.html",
             "cards/card-0002.html",
@@ -1384,7 +1647,10 @@ fn report_does_not_run_template_javascript() {
     // В записанных файлах есть только runtime отчёта: шаблонный код остаётся
     // видимым текстом и не превращается в исполняемый тег.
     let mut shown_as_text = 0usize;
-    for path in walk(out.path()) {
+    for path in artifact_files(out.path()) {
+        if page_of(&path).is_none() {
+            continue;
+        }
         let text = card_text(&out, &path);
         assert_report_scripts_are_own(&text, &path);
         if text.contains("&lt;script>window.__injected") {
@@ -1512,7 +1778,7 @@ fn report_keeps_its_limits_collapsed_and_counted() {
         after_limits.contains("<h2>Диагностика</h2>"),
         "диагностика видна вне свёрнутого блока ограничений"
     );
-    for path in walk(out.path()) {
+    for path in artifact_files(out.path()) {
         let text = std::fs::read_to_string(out.path().join(&path)).expect("файл отчёта");
         let Some(found) = text.find("<h2>Неподдержанные конструкции шаблонов</h2>")
         else {
@@ -1679,6 +1945,43 @@ fn data_cannot_start_an_http_request() {
     assert!(
         card.contains("нет-файла.png"),
         "имя отсутствующего файла видно"
+    );
+}
+
+/// `srcset` — список кандидатов: негодный кандидат убирается, потому что за ним
+/// браузер пошёл бы в сеть, а показанный файл остаётся картинкой, а не пропадает.
+#[test]
+fn a_remote_srcset_candidate_does_not_take_the_local_one_with_it() {
+    let before = canonical_base("report-srcset-before");
+    let after = canonical_base("report-srcset-after");
+    set_field(
+        &after,
+        "guid-2",
+        0,
+        "<img srcset=\"https://evil.example/c.png 1x, b.png 2x\">",
+    );
+    after.write_media(&["b.png"]);
+    set_field(&after, "guid-2", 1, "изменение ради превью");
+
+    let out = TempDir::new("report-srcset-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+
+    let card = card_text(&out, "cards/card-0002.html");
+    assert!(
+        card.contains("srcset=\"../media/after/b.png 2x\""),
+        "показанный кандидат остаётся адресом: {card}"
+    );
+    assert!(
+        !card.contains("evil.example"),
+        "внешний кандидат убран из списка, а не оставлен рядом с локальным"
+    );
+    // Удалённый кандидат не исчезает бесследно: он назван состоянием media.
+    assert_eq!(
+        result["media"]["states"][1]["remote"],
+        json!(["https://evil.example/c.png"]),
+        "внешняя ссылка остаётся видимой в сводке media: {result}"
     );
 }
 

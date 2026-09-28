@@ -417,6 +417,64 @@ mod tests {
     }
 
     #[test]
+    fn creates_a_document_that_did_not_exist() {
+        let dir = TempDir::new("write-document-new");
+        let artifacts = dir.path().join("artifacts");
+        fs::create_dir_all(&artifacts).expect("каталог");
+        let path = artifacts.join("resolved.json");
+
+        let published =
+            replace_document_atomically(&path, b"{\"note\":1}").expect("документ записан");
+
+        assert_eq!(published.bytes, 10);
+        assert_eq!(fs::read(&path).expect("файл"), b"{\"note\":1}");
+        assert_temp_files_absent(&dir.path().join("artifacts"));
+    }
+
+    #[test]
+    fn replaces_a_document_whole() {
+        let dir = TempDir::new("write-document-replace");
+        let path = dir.path().join("resolved.json");
+        fs::write(&path, "прежнее содержимое".as_bytes()).expect("файл");
+
+        replace_document_atomically(&path, "новое".as_bytes()).expect("замена");
+
+        assert_eq!(fs::read(&path).expect("файл"), "новое".as_bytes());
+        assert_temp_files_absent(dir.path());
+    }
+
+    #[test]
+    fn a_missing_parent_directory_is_a_write_failure() {
+        let dir = TempDir::new("write-document-missing");
+        let path = dir.path().join("нет-такого").join("resolved.json");
+
+        let error = replace_document_atomically(&path, b"x").expect_err("нет каталога");
+
+        assert_eq!(error.code, ErrorCode::WriteFailed);
+        assert_eq!(error.details["operation"], "create_temp");
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_document_is_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("write-document-readonly");
+        let path = dir.path().join("resolved.json");
+        fs::write(&path, "прежнее".as_bytes()).expect("файл");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        // Каталог только для чтения: временный файл создать нельзя, и прежнее
+        // содержимое обязано остаться нетронутым.
+        let error = replace_document_atomically(&path, "новое".as_bytes()).expect_err("отказ");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(error.code, ErrorCode::WriteFailed);
+        assert_eq!(fs::read(&path).expect("файл"), "прежнее".as_bytes());
+    }
+
+    #[test]
     fn refuses_to_replace_modified_source() {
         let dir = TempDir::new("write-conflict");
         let path = dir.path().join("deck.json");
