@@ -511,6 +511,100 @@ fn report_copies_media_and_rewrites_only_resolved_references() {
 }
 
 #[test]
+fn report_does_not_copy_a_media_name_it_cannot_address() {
+    let before = canonical_base("report-unusable-name-before");
+    let after = canonical_base("report-unusable-name-after");
+    // Имена взяты из двух групп: их нельзя записать в адрес отчёта (кавычка
+    // ломает атрибут, решётка и процент меняют смысл адреса, амперсанд и угловая
+    // скобка при записи в разметку превращаются в другой адрес), а пробел — можно.
+    // Разница видна только на готовом артефакте, поэтому проверяется он.
+    // Порядок — тот, в котором отчёт называет имена: он их сортирует.
+    let unusable = [
+        "амперсанд&и.png",
+        "кавычка\"и.png",
+        "процент%.png",
+        "решётка#а.png",
+        "скобка<и.png",
+    ];
+    set_field(
+        &after,
+        "guid-2",
+        2,
+        "<img src='кавычка\"и.png'><img src=\"решётка#а.png\"><img src=\"процент%.png\">\
+         <img src=\"амперсанд&и.png\"><img src=\"скобка<и.png\">\
+         <img src=\"пробел имя.png\">[sound:кавычка\"и.png][sound:пробел имя.png]",
+    );
+    after.write_media(&[
+        "кавычка\"и.png",
+        "решётка#а.png",
+        "процент%.png",
+        "амперсанд&и.png",
+        "скобка<и.png",
+        "пробел имя.png",
+    ]);
+
+    let out = TempDir::new("report-unusable-name-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    let result = result_of(exit, &document);
+
+    // Отчёт собирается, а не падает: непригодное имя — свойство данных экспорта.
+    assert_eq!(
+        result["checks"]["every_generated_page_offline"],
+        json!(true)
+    );
+    assert_eq!(result["media"]["missing"], json!([]));
+    assert_eq!(result["media"]["traversal"], json!(unusable));
+    assert_eq!(result["media"]["copied"], 1);
+    assert_eq!(
+        artifact_files(out.path()),
+        vec![
+            "cards/card-0001.html",
+            "cards/card-0002.html",
+            "index.html",
+            "media/after/пробел имя.png"
+        ],
+        "копируется только то имя, которое политика адресов способна назвать"
+    );
+
+    let after_card = card_text(&out, "cards/card-0002.html");
+    assert!(
+        after_card.contains("src=\"../media/after/пробел имя.png\"")
+            && after_card.contains("src=\"../media/after/пробел имя.png\"></audio>"),
+        "имя с пробелом остаётся работоспособным адресом: {after_card}"
+    );
+    // Ни одна непригодная ссылка не попадает в разметку адресом: иначе имя из
+    // экспорта открыло бы в документе чужие атрибуты.
+    assert!(
+        !after_card.contains("src=\"../media/after/кавычка")
+            && !after_card.contains("../media/after/решётка")
+            && !after_card.contains("../media/after/процент"),
+        "непригодное имя не становится адресом: {after_card}"
+    );
+    assert!(
+        !after_card.contains("src='") && !after_card.contains(" onerror="),
+        "документ не наследует кавычки и атрибуты из имени файла: {after_card}"
+    );
+
+    let diagnostics = result["diagnostics"].as_array().expect("диагностика");
+    let unusable_diagnostics: Vec<&Value> = diagnostics
+        .iter()
+        .filter(|item| item["code"] == "media_name_unusable")
+        .collect();
+    assert_eq!(
+        unusable_diagnostics.len(),
+        unusable.len(),
+        "каждое непригодное имя названо отдельно: {diagnostics:?}"
+    );
+    for item in &unusable_diagnostics {
+        let message = item["message"].as_str().expect("сообщение");
+        assert!(
+            !message.contains("содержит путь"),
+            "причина названа верно, а не как путь: {message}"
+        );
+    }
+}
+
+#[test]
 fn report_is_deterministic_for_equal_inputs() {
     let before = canonical_base("report-determinism-before");
     let after = canonical_base("report-determinism-after");

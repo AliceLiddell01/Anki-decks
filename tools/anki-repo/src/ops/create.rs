@@ -782,7 +782,12 @@ fn plan_note(
 
     let (guid, guid_generated) = match spec.guid.as_deref() {
         Some(guid) => (guid.to_string(), false),
-        None => (guid::generate()?, true),
+        None => (
+            free_generated_guid(note_index, guid::generate, |candidate| {
+                !index.note_positions_by_guid(candidate).is_empty()
+            })?,
+            true,
+        ),
     };
     guid::validate(&guid, "notes[].guid").map_err(|error| with_note_index(note_index, error))?;
 
@@ -805,6 +810,46 @@ fn plan_note(
         tags: spec.tags.clone(),
         value,
     })
+}
+
+/// Сколько раз подряд разрешено заново генерировать `guid`.
+///
+/// Anki-совместимый `guid` — это `base91` от случайного `u64`, поэтому одна
+/// попытка совпадает с существующей заметкой с вероятностью порядка `2⁻⁶⁴`.
+/// Предел нужен не ради вероятности, а ради честного отказа: бесконечный цикл
+/// скрыл бы сломанный источник энтропии или усечённый алфавит.
+const GENERATED_GUID_ATTEMPTS: usize = 8;
+
+/// Подбирает свободный `guid` для новой заметки.
+///
+/// Уникальность внутри экспорта обеспечивает вызывающий, а не [`guid::generate`]:
+/// генератор отвечает только за формат. Сгенерированный `guid` — не то, что заказал
+/// пользователь, поэтому совпадение здесь повод повторить попытку, а не отказ:
+/// отказ остаётся на случай, когда свободного `guid` не нашлось.
+fn free_generated_guid(
+    note_index: usize,
+    mut next: impl FnMut() -> Result<String, DomainError>,
+    occupied: impl Fn(&str) -> bool,
+) -> Result<String, DomainError> {
+    for _ in 0..GENERATED_GUID_ATTEMPTS {
+        let candidate = next()?;
+        if !occupied(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(DomainError::with_details(
+        ErrorCode::GuidCollision,
+        format!(
+            "заметка #{note_index}: свободный guid не найден: {GENERATED_GUID_ATTEMPTS} \
+             сгенерированных подряд уже заняты"
+        ),
+        details! {
+            "note_index" => note_index,
+            "attempts" => GENERATED_GUID_ATTEMPTS,
+            "reason" => "no_free_generated_guid",
+        },
+    ))
 }
 
 /// Собирает значения полей в порядке `ord` модели.
@@ -876,9 +921,14 @@ fn assemble_values(
 }
 
 /// Запрещает media-ссылки в новых значениях полей.
+///
+/// Ссылкой считается адрес в разметке, адрес в CSS (`style`-атрибут и
+/// `<style>`, включая `@import`) и литерал `[sound:…]`: браузер пойдёт по любому
+/// из них за файлом, а гейт отвечает не за разметку, а за то, что значение поля
+/// ссылается на файл, которого toolkit не создаёт.
 fn ensure_media_free(values: &[(String, String)], note_index: usize) -> Result<(), DomainError> {
     for (name, value) in values {
-        let references = media::extract_media_references(value);
+        let references = media::forbidden_media_references(value);
         if references.is_empty() {
             continue;
         }
@@ -1285,4 +1335,56 @@ fn with_note_index(note_index: usize, error: DomainError) -> DomainError {
         format!("заметка #{note_index}: {}", error.message),
         details,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Занятые имена отвечают на вопрос «свободен ли `guid`», а генератор здесь
+    /// подменён: проверяется подбор, а не источник случайности.
+    #[test]
+    fn a_generated_guid_that_is_taken_is_generated_again() {
+        let mut candidates = ["занят", "тоже занят", "свободен"].into_iter();
+        let guid = free_generated_guid(
+            3,
+            || Ok(candidates.next().expect("кандидат").to_string()),
+            |candidate| candidate != "свободен",
+        )
+        .expect("свободный guid обязан найтись");
+
+        assert_eq!(guid, "свободен");
+    }
+
+    /// Отказ, а не бесконечный цикл: если свободного `guid` нет, заметка не
+    /// добавляется, и причина названа кодом возврата.
+    #[test]
+    fn a_generated_guid_that_stays_taken_is_a_collision() {
+        let error = free_generated_guid(2, || Ok("занят".to_string()), |_| true)
+            .expect_err("свободного guid нет");
+
+        assert_eq!(error.code, ErrorCode::GuidCollision);
+        assert_eq!(error.details["reason"], "no_free_generated_guid");
+        assert_eq!(error.details["note_index"], 2);
+        assert_eq!(error.details["attempts"], GENERATED_GUID_ATTEMPTS);
+    }
+
+    /// Ошибка генератора не подменяется отказом гейта: причина остаётся своей.
+    #[test]
+    fn a_broken_entropy_source_is_not_reported_as_a_collision() {
+        let error = free_generated_guid(
+            1,
+            || {
+                Err(DomainError::with_details(
+                    ErrorCode::Internal,
+                    "источник энтропии сломан".to_string(),
+                    details! { "source" => "getrandom" },
+                ))
+            },
+            |_| false,
+        )
+        .expect_err("генерация не удалась");
+
+        assert_eq!(error.code, ErrorCode::Internal);
+    }
 }

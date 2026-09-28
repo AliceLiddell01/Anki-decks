@@ -237,9 +237,28 @@ impl Page {
     }
 }
 
-/// Имя файла без пути: оно и есть единица владения отчёта.
-fn is_plain_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+/// Может ли это имя быть последним сегментом адреса внутри отчёта.
+///
+/// Вопрос один и тот же у двух потребителей: у политики адресов (здесь) и у гейта
+/// копирования media ([`crate::report::media`]). Второй не имеет права быть слабее
+/// первого: скопированный файл, имя которого нельзя записать в адрес, — это файл,
+/// на который не может сослаться ни одна страница отчёта.
+///
+/// Запрещено всё, что делает имя не одним сегментом пути (`/`) либо расходится при
+/// записи в разметку и чтении из неё: разделитель пути (`\`), символы, меняющие
+/// смысл адреса (`:`, `?`, `#`, `%`), символы, которые экранируются в атрибуте
+/// (`"`, `&`, `<`, `>`), и служебные символы. Имя файла на диске и имя в адресе
+/// обязаны совпадать: иначе адрес указывал бы не на тот файл, который скопирован.
+pub(crate) fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|character| {
+            matches!(
+                character,
+                '/' | '\\' | ':' | '?' | '#' | '%' | '"' | '&' | '<' | '>'
+            ) || character.is_control()
+        })
 }
 
 /// Точный набор ресурсов, которые есть в каталоге отчёта.
@@ -556,7 +575,9 @@ impl Sanitizer<'_> {
                 format!("<{name}>"),
                 "элемент исполняет код или запрашивает ресурс: тег удалён, содержимое осталось текстом",
             ));
-            self.pos = element.end;
+            // Удаляется тег целиком, вместе с его `>`: иначе закрывающая скобка
+            // осталась бы в тексте превью как обычный символ.
+            self.pos = element.end + 1;
             return;
         }
 
@@ -773,6 +794,41 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_element_leaves_no_stray_bracket_behind() {
+        // Удаляется тег, который действует, а не запись о нём: содержимое
+        // остаётся текстом, и закрывающий тег тоже (сканер разметки закрывающие
+        // теги не сообщает, а второго разбора здесь нет). Обрезать тег посередине
+        // нельзя: `<object>` не имеет права превратиться в голую `>`.
+        for (fragment, text) in [
+            ("<object data=\"a.png\">текст</object>", "текст</object>"),
+            (
+                "<iframe src=\"https://evil.example\"></iframe>",
+                "</iframe>",
+            ),
+            ("<OBJECT data=\"a.png\"/>слово", "слово"),
+        ] {
+            let result = sanitize(fragment);
+            assert_eq!(result.html, text, "{fragment:?} → {result:?}");
+            assert_eq!(result.blocked.len(), 1, "{fragment:?}: {result:?}");
+            assert!(clean(&result.html), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_element_does_not_hide_what_it_contained() {
+        // Отбрасывается только сам элемент: вложенная в него разметка проходит ту
+        // же очистку, что и любая другая, и адрес внутри неё не выживает.
+        let result = sanitize(
+            "<object><style>a{background:url(https://evil.example/a.png)}</style></object>",
+        );
+
+        assert!(!result.html.contains("https://evil.example"), "{result:?}");
+        assert!(!result.html.contains("<object"), "{result:?}");
+        assert!(result.html.contains("background"), "{result:?}");
+        assert!(clean(&result.html), "{result:?}");
+    }
+
+    #[test]
     fn event_handlers_are_dropped_in_any_register() {
         for fragment in [
             "<img src=\"../media/before/a.png\" onerror=\"alert(1)\">",
@@ -983,20 +1039,17 @@ mod tests {
     #[test]
     fn every_generated_document_passes_the_same_check() {
         let resources = resources();
-        let index = crate::report::html::index_html(
-            &crate::report::html::ReportDocument {
-                title: "Отчёт".to_string(),
-                before_label: "до".to_string(),
-                after_label: "после".to_string(),
-                retire_tag: None,
-                counts: crate::report::html::ReportCounts::default(),
-                sections: Vec::new(),
-                diagnostics: Vec::new(),
-                limitations: vec!["ограничение".to_string()],
-                unsupported_constructs: Vec::new(),
-            },
-            &resources,
-        );
+        let index = crate::report::html::index_html(&crate::report::html::ReportDocument {
+            title: "Отчёт".to_string(),
+            before_label: "до".to_string(),
+            after_label: "после".to_string(),
+            retire_tag: None,
+            counts: crate::report::html::ReportCounts::default(),
+            sections: Vec::new(),
+            diagnostics: Vec::new(),
+            limitations: vec!["ограничение".to_string()],
+            unsupported_constructs: Vec::new(),
+        });
         assert!(
             inspect(&index, Page::Index, &resources).is_empty(),
             "{:?}",

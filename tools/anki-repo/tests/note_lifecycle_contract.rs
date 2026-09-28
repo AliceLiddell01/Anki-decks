@@ -447,15 +447,47 @@ fn create_refuses_media_references_in_new_values() {
     assert_eq!(error_of(exit, &stdout)["code"], "media_forbidden");
 }
 
+#[test]
+fn create_refuses_a_guid_that_is_not_free() {
+    let dir = canonical_base_export("create-guid-collision");
+    let before = dir.deck_json_bytes();
+
+    // Один и тот же явный guid у двух заметок: вторая заметка сломала бы
+    // адресацию обеих, поэтому отказ приходит до записи.
+    let mut first = note_spec(fields("新語", "слово", ""));
+    first["guid"] = json!("z9y8x7");
+    let mut second = note_spec(fields("別の語", "другое слово", ""));
+    second["guid"] = json!("z9y8x7");
+    let request = create_request(&[first, second]);
+    let path = write_request(&dir, "create-duplicate-guid.json", &request);
+
+    let (exit, stdout, _) = run_cli_in(
+        None,
+        &[
+            "create",
+            dir.path().to_str().expect("путь"),
+            "--json",
+            "--request",
+            path.to_str().expect("путь"),
+            "--apply",
+        ],
+    );
+
+    let error = error_of(exit, &stdout);
+    assert_eq!(error["code"], "guid_collision");
+    assert_eq!(exit, 6);
+    assert_eq!(dir.deck_json_bytes(), before, "отказ не пишет файл");
+}
+
 // --- media_forbidden: политика распознавания ссылок ------------------------
 
 /// Гейт обязан срабатывать на любой валидной записи той же ссылки, а не только
 /// на текстовой форме `src="…"`: HTML не различает регистр в именах элементов и
 /// атрибутов, допускает пробелы вокруг `=`, unquoted-значения и одинарные
-/// кавычки. Всё это — та же ссылка, которую увидит Anki.
+/// кавычки, а адрес бывает и в CSS. Всё это — та же ссылка, которую увидит Anki.
 #[test]
 fn create_refuses_every_valid_spelling_of_a_media_reference() {
-    let cases: [&str; 16] = [
+    let cases: [&str; 22] = [
         "<img src=\"a.png\">",
         "<img SRC=\"a.png\">",
         "<IMG SRC=\"a.png\">",
@@ -475,6 +507,15 @@ fn create_refuses_every_valid_spelling_of_a_media_reference() {
         // хотя сама по себе элемента в документе не создаёт.
         "<img src=\"a.png\"",
         "<img src=\"незакрытый>",
+        // CSS — такая же ссылка на файл: браузер пойдёт по этим адресам, а
+        // значение поля попадёт в карточку. Разбором владеет владелец политики
+        // адресов отчёта, поэтому здесь нет ни одного своего правила.
+        "<style>body{background:url(a.png)}</style>",
+        "<style>body{background:URL( a.png )}</style>",
+        "<img style=\"background:url(a.png)\">",
+        "<style>body{background:image('a.png')}</style>",
+        "<style>@import url(a.css);</style>",
+        "<style>@font-face{font-family:x;src:url(a.woff2)}</style>",
     ];
 
     for value in cases {
@@ -513,13 +554,21 @@ fn create_refuses_every_valid_spelling_of_a_media_reference() {
 /// обязан быть принят. Ложный `media_forbidden` — это тоже ошибка гейта.
 #[test]
 fn create_accepts_values_that_only_look_like_media_references() {
-    let cases: [&str; 6] = [
+    let cases: [&str; 12] = [
         "src=noquotes — обычный текст",
         "функция src=x в коде",
         "<img alt=\"a.png\">",
         "<!-- <img src=\"a.png\"> -->",
         "1 < 2 и 3 < 4",
         "используй <img тег",
+        // CSS без адреса ссылкой не является: ни правила, ни строки в позиции,
+        // где браузер запрашивает файл.
+        "<style>body{color:red}</style>",
+        "<div style=\"color:red;font-weight:bold\">текст</div>",
+        "<style>.a{background:linear-gradient(red, blue)}</style>",
+        "<style>.a{content:\"a.png\"}</style>",
+        "<style>.a{font-family:\"a.png\"}</style>",
+        "<script>var a = \"a.png\";</script>",
     ];
 
     for value in cases {

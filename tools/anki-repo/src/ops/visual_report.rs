@@ -672,7 +672,7 @@ pub fn report(request: &ReportRequest) -> Result<VisualReportResult, DomainError
     };
 
     let index_path = out_dir.join(INDEX_HTML);
-    let index = index_html(&document, &resources);
+    let index = index_html(&document);
     // Та же проверка, что и у документов превью: точка входа — такой же файл
     // отчёта, и правило для неё не может быть отдельным.
     let index_violations = sanitize::inspect(&index, sanitize::Page::Index, &resources);
@@ -2123,7 +2123,8 @@ fn sound_player(
             resolved_media.insert(path.to_string());
             format!(
                 "<span class=\"replay-button\"><audio class=\"report-audio\" controls \
-                 preload=\"none\" src=\"../{path}\"></audio></span>"
+                 preload=\"none\" src=\"{}\"></audio></span>",
+                preview_address(path)
             )
         }
         None => {
@@ -2185,7 +2186,7 @@ fn rewrite_element(
                 resolved_media.insert(path.to_string());
                 let mut segment = value[candidate.segment.clone()].to_string();
                 let offset = candidate.range.start - candidate.segment.start;
-                let resolved = format!("../{path}");
+                let resolved = preview_address(path);
                 segment.replace_range(offset..offset + candidate.range.len(), &resolved);
                 segments.push(segment.trim().to_string());
             }
@@ -2205,7 +2206,7 @@ fn rewrite_element(
             match plan.preview_reference(state, &candidate.text) {
                 media::PreviewReference::Copied(path) => {
                     resolved_media.insert(path.to_string());
-                    kept.push(format!("../{path}"));
+                    kept.push(preview_address(path));
                 }
                 media::PreviewReference::MissingLocal => kept.push(String::new()),
                 media::PreviewReference::NotAPreviewFile => kept.push(candidate.text.clone()),
@@ -2298,6 +2299,21 @@ fn escape_attr(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Адрес файла отчёта в атрибуте документа превью.
+///
+/// Адрес вставляется прямо в существующую разметку, поэтому имя файла обязано
+/// пережить запись в атрибут без изменения смысла разметки: имя приходит из
+/// экспорта, и незакрытая кавычка в нём открыла бы в документе чужие атрибуты.
+///
+/// Гейт копирования такие имена уже отсеивает
+/// ([`crate::report::sanitize::is_plain_name`]), поэтому для скопированных файлов
+/// экранировать нечего, и функция возвращает путь как есть. Остаётся она не
+/// ради этого случая, а ради независимости: целостность готового документа не
+/// должна зависеть от того, что гейт не изменится.
+fn preview_address(path: &str) -> String {
+    format!("../{}", escape_attr(path))
+}
+
 /// Добавляет диагностику по работе с media.
 ///
 /// Диагностика называется вместе с состоянием: «файла нет» — это утверждение о
@@ -2316,13 +2332,30 @@ fn push_media_diagnostics(plan: &MediaPlan, diagnostics: &mut Vec<Diagnostic>) {
             ));
         }
         for reference in &state_media.traversal {
-            diagnostics.push(Diagnostic::warning(
-                "media_path_traversal",
-                format!(
-                    "ссылка {reference:?} содержит путь: в отчёт попадает только базовое имя файла"
-                ),
-                Some(reference.clone()),
-            ));
+            // Непригодное имя — не то же самое, что ссылка с путём: базовое имя
+            // здесь уже есть, и читателю важно узнать, какое именно правило его
+            // отклонило, а не искать в имени несуществующий путь.
+            let named = media_index::normalize_media_name(reference);
+            let (code, message) = if named != *reference {
+                (
+                    "media_path_traversal",
+                    format!(
+                        "ссылка {reference:?} содержит путь: в отчёт попадает только базовое имя файла"
+                    ),
+                )
+            } else {
+                // Ссылка с путём сюда не доходит: у неё базовое имя отличается от
+                // ссылки, поэтому перечислять разделители пути незачем.
+                (
+                    "media_name_unusable",
+                    format!(
+                        "имя media {reference:?} нельзя записать в адрес отчёта: в адресе \
+                         допускается только обычное имя файла, без символов адреса (`:`, `?`, \
+                         `#`, `%`), символов разметки (`\"`, `&`, `<`, `>`) и управляющих символов"
+                    ),
+                )
+            };
+            diagnostics.push(Diagnostic::warning(code, message, Some(reference.clone())));
         }
         for reference in &state_media.remote {
             diagnostics.push(Diagnostic::info(
@@ -2481,6 +2514,25 @@ fn out_dir_error(path: &Path, error: &std::io::Error) -> DomainError {
 mod tests {
     use super::*;
     use crate::test_support::{MINIMAL_EXPORT, TempDir, export_with};
+
+    #[test]
+    fn a_path_in_an_attribute_cannot_open_another_attribute() {
+        // Имя с пробелом — обычное дело и обычный адрес.
+        assert_eq!(
+            preview_address("media/after/пробел имя.png"),
+            "../media/after/пробел имя.png"
+        );
+        // Кавычка в пути не имеет права закрыть атрибут и впустить в документ
+        // чужой атрибут: адрес обязан остаться одним значением.
+        assert_eq!(
+            preview_address("media/after/файл\" onerror=\"чужое.png"),
+            "../media/after/файл&quot; onerror=&quot;чужое.png"
+        );
+        assert!(
+            !preview_address("media/after/файл\" onerror=\"чужое.png").contains('"'),
+            "незаэкранированной кавычки в адресе быть не может"
+        );
+    }
 
     fn write_export(dir: &Path, json: &str) {
         fs::create_dir_all(dir).expect("каталог экспорта");

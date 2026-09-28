@@ -280,3 +280,65 @@ pub const CARD_RUNTIME_JS: &str = r#"
   watch();
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Протокол описан дважды: константами Rust и литералами внутри записанного
+    /// JavaScript. Сборка расхождение не заметит — родитель просто перестанет
+    /// понимать кадр, — поэтому литералы сверяются с константами здесь.
+    ///
+    /// Проверяются обе стороны протокола: сообщения и классы, по которым
+    /// разговаривают документы, и границы высоты, которые кадр зажимает той же
+    /// парой значений, что и родитель.
+    #[test]
+    fn runtime_literals_match_the_protocol_constants() {
+        let shared = [
+            ("HELLO_MESSAGE", HELLO_MESSAGE),
+            ("HEIGHT_MESSAGE", HEIGHT_MESSAGE),
+            ("THEME_MESSAGE", THEME_MESSAGE),
+            ("THEME_NIGHT", THEME_NIGHT),
+        ];
+        let index_only = [
+            ("THEME_LIGHT", THEME_LIGHT),
+            ("PREVIEW_CLASS", PREVIEW_CLASS),
+            ("REPORT_NIGHT_CLASS", REPORT_NIGHT_CLASS),
+            ("THEME_ATTRIBUTE", THEME_ATTRIBUTE),
+            ("THEME_CONTROL_ATTRIBUTE", THEME_CONTROL_ATTRIBUTE),
+        ];
+        let card_only = [("NIGHT_CLASS", NIGHT_CLASS)];
+
+        for (runtime, name, strings) in [
+            (
+                INDEX_RUNTIME_JS,
+                "INDEX_RUNTIME_JS",
+                shared.iter().chain(index_only.iter()).collect::<Vec<_>>(),
+            ),
+            (
+                CARD_RUNTIME_JS,
+                "CARD_RUNTIME_JS",
+                shared.iter().chain(card_only.iter()).collect::<Vec<_>>(),
+            ),
+        ] {
+            for (constant, value) in strings {
+                assert!(
+                    runtime.contains(&format!("'{value}'")),
+                    "{name} не содержит литерал {constant} = {value:?}"
+                );
+            }
+            for (constant, value) in [
+                ("MIN_PREVIEW_HEIGHT_PX", MIN_PREVIEW_HEIGHT_PX),
+                ("MAX_PREVIEW_HEIGHT_PX", MAX_PREVIEW_HEIGHT_PX),
+            ] {
+                // Границы объявлены своими переменными, потому что значение
+                // используется в зажиме; сверяется именно значение.
+                let literal = format!("= {value};");
+                assert!(
+                    runtime.contains(&literal),
+                    "{name} не содержит границу {constant} ({literal})"
+                );
+            }
+        }
+    }
+}

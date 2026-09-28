@@ -19,10 +19,15 @@
 //!
 //! - [`visible_media_references`] отвечает «что увидит браузер» — только полные
 //!   элементы (незакрытый тег в документе элемента не создаёт);
-//! - [`extract_media_references`] — это гейт `create`, и он **fail-closed**:
+//! - [`forbidden_media_references`] — это гейт `create`, и он **fail-closed**:
 //!   значение поля не является документом, Anki склеивает его с шаблоном, и
 //!   незакрытый тег может закрыться уже там. Поэтому незакрытая конструкция с
-//!   media-атрибутом считается ссылкой.
+//!   media-атрибутом считается ссылкой, а адрес из CSS — такой же ссылкой, как
+//!   `src`.
+//!
+//! Разбор самой разметки выполняет [`crate::htmlscan`], разбор CSS — владелец
+//! политики адресов [`crate::report::css`]: гейт не заводит второй парсер, иначе
+//! «что здесь адрес» решалось бы в двух местах и разъезжалось.
 //!
 //! Гейт используется только для отказа; ссылок он не читает и файлов не
 //! открывает.
@@ -34,6 +39,7 @@ use std::path::Path;
 
 use crate::htmlscan::{self, Tag};
 use crate::index::ExportIndex;
+use crate::report::css;
 
 /// Имя каталога media внутри экспорта.
 pub const MEDIA_DIR: &str = "media";
@@ -249,6 +255,9 @@ pub fn visible_media_references(html: &str) -> Vec<String> {
 /// считается незакрытая конструкция с media-атрибутом. Значение поля — не
 /// документ: Anki склеивает его с шаблоном, и незакрытый тег может закрыться
 /// уже там, превратившись в настоящий запрос файла.
+///
+/// Сам гейт спрашивает не её, а [`forbidden_media_references`]: та добавляет к
+/// этому набору адреса из CSS.
 #[must_use]
 pub fn extract_media_references(text: &str) -> Vec<String> {
     let mut found = visible_media_references(text);
@@ -275,6 +284,78 @@ pub fn extract_media_references(text: &str) -> Vec<String> {
     }
 
     found
+}
+
+/// Все ссылки на media, которые гейт `create` обязан отвергнуть.
+///
+/// Кроме ссылок в разметке ([`extract_media_references`]) сюда входят адреса из
+/// CSS внутри значения поля: `url(…)` в `style`-атрибуте и в `<style>`, а также
+/// `@import`. Причина та же, что у незакрытого тега: браузер пойдёт по этому
+/// адресу за файлом, а значение поля Anki склеит с шаблоном и покажет в карточке.
+/// Отдельного признака «это CSS, здесь можно» у ссылки нет: адрес есть адрес.
+#[must_use]
+pub fn forbidden_media_references(text: &str) -> Vec<String> {
+    let mut found = extract_media_references(text);
+    found.extend(css_media_references(text));
+    found
+}
+
+/// Адреса, найденные в CSS внутри значения поля.
+///
+/// CSS встречается здесь ровно в двух записях: значение `style`-атрибута и тело
+/// `<style>`. Находит их [`htmlscan`], а сами адреса называет
+/// [`crate::report::css`] — тот же владелец политики адресов, что и у
+/// `visual-report`, поэтому расхождение между гейтом и отчётом невозможно.
+/// Незакрытый тег обрабатывается как та же запись атрибута: конструкция неполная,
+/// но значение прочитано, и браузер прочитает его так же.
+fn css_media_references(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for tag in htmlscan::scan_tags(text) {
+        match tag {
+            Tag::Element(element) => {
+                for attribute in &element.attributes {
+                    if !attribute.name.eq_ignore_ascii_case("style") {
+                        continue;
+                    }
+                    found.extend(css_addresses(attribute.value));
+                }
+            }
+            Tag::RawText { name, body, .. } => {
+                if name.eq_ignore_ascii_case("style") {
+                    found.extend(css_addresses(&text[body.clone()]));
+                }
+            }
+            // CSS в незакрытом теге тоже читает браузер: значение поля склеится с
+            // шаблоном, и атрибут закроется уже там.
+            Tag::Unterminated { attributes, .. } => {
+                for attribute in &attributes {
+                    if !attribute.name.eq_ignore_ascii_case("style") {
+                        continue;
+                    }
+                    found.extend(css_addresses(attribute.value));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Адреса одного фрагмента CSS в записи владельца политики.
+///
+/// `@import` называется правилом целиком: адрес внутри него отдельным событием
+/// не становится, а гейту важно назвать нарушение так, чтобы его можно было
+/// найти в значении поля.
+fn css_addresses(style: &str) -> Vec<String> {
+    css::scan(style)
+        .into_iter()
+        .filter_map(|event| match event {
+            css::Event::Address(address) => {
+                let target = address.target.trim();
+                (!target.is_empty()).then(|| target.to_string())
+            }
+            css::Event::Import(span) => Some(style[span].trim().to_string()),
+        })
+        .collect()
 }
 
 /// Отдельная ссылка внутри значения атрибута и её место в этом значении.

@@ -331,21 +331,22 @@ pub fn card_html(card: &CardFile, resources: &Resources) -> RenderedPage {
     out.push_str("</script>\n");
     out.push_str("</body>\n</html>\n");
 
-    // Последний шаг — независимая проверка того, что получилось: она не зависит
-    // от того, как собирался документ, и отвечает на вопрос «осталось ли здесь
-    // исполняемое или сетевое».
-    debug_assert!(
-        sanitize::inspect(&out, Page::Card, resources).is_empty(),
-        "документ превью обязан проходить общую проверку: {:?}",
-        sanitize::inspect(&out, Page::Card, resources)
-    );
+    // Независимая проверка того, что получилось, живёт у вызывающего: он
+    // проверяет каждый готовый документ общей [`sanitize::inspect`] и отказывает
+    // в отчёте с точной причиной (`preview_not_offline`). Здесь проверки нет
+    // намеренно: `debug_assert!` превратил бы этот отказ в панику сборки с
+    // отладкой, то есть в аварийное завершение вместо названной причины.
 
     RenderedPage { html: out, blocked }
 }
 
 /// Собирает `index.html`.
+///
+/// Набора ресурсов здесь нет намеренно: этот документ не проверяет себя сам —
+/// проверкой владеет вызывающий, у которого есть и точная причина отказа, и
+/// [`crate::report::sanitize::inspect`] для [`Page::Index`].
 #[must_use]
-pub fn index_html(document: &ReportDocument, resources: &Resources) -> String {
+pub fn index_html(document: &ReportDocument) -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
@@ -517,13 +518,10 @@ pub fn index_html(document: &ReportDocument, resources: &Resources) -> String {
     out.push_str("</script>\n");
     out.push_str("</body>\n</html>\n");
 
-    // Та же независимая проверка, что и у документов превью: точка входа —
-    // такой же файл отчёта, и правило для неё не может быть отдельным.
-    debug_assert!(
-        sanitize::inspect(&out, Page::Index, resources).is_empty(),
-        "точка входа обязана проходить общую проверку: {:?}",
-        sanitize::inspect(&out, Page::Index, resources)
-    );
+    // Правило для точки входа не отдельное, но и проверка здесь не живёт: её
+    // выполняет вызывающий — такой же [`sanitize::inspect`] по [`Page::Index`] с
+    // отказом `index_not_offline`. `debug_assert!` на этом месте не проверял бы
+    // документ, а падал бы вместо названной причины.
 
     out
 }
@@ -769,7 +767,7 @@ mod tests {
             unsupported_constructs: Vec::new(),
         };
 
-        let html = index_html(&document, &resources());
+        let html = index_html(&document);
         assert!(html.starts_with("<!doctype html>"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
@@ -851,7 +849,7 @@ mod tests {
             unsupported_constructs: Vec::new(),
         };
 
-        let html = index_html(&document, &resources());
+        let html = index_html(&document);
         assert!(html.contains("class=\"report-compare\""));
         assert!(html.contains("data-state=\"before\""));
         assert!(html.contains("data-state=\"after\""));
@@ -859,7 +857,7 @@ mod tests {
 
         // Одно состояние — одна колонка: выдуманной стороны быть не должно.
         document.sections[0].cards[0].previews.truncate(1);
-        let single = index_html(&document, &resources());
+        let single = index_html(&document);
         assert!(!single.contains("class=\"report-compare\""));
         assert!(!single.contains("data-report-state=\"after\""));
         assert!(!single.contains("class=\"report-compare-side\" data-state=\"after\""));
