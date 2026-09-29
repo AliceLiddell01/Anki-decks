@@ -193,7 +193,7 @@ impl SemanticDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
-    /// Стабильный тип источника, на первом этапе — `local_import`.
+    /// Стабильный тип источника; поддерживается `local_import`.
     pub source_kind: String,
     /// Имя явно переданного файла; абсолютный host path не сохраняется.
     pub source_name: String,

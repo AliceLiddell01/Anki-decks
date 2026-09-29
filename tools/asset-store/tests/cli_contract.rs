@@ -328,6 +328,26 @@ fn cli_reports_unsupported_manifest_schema_with_a_stable_json_code() {
 }
 
 #[test]
+fn cli_argument_usage_error_writes_stderr_without_json_stdout() {
+    let temp = TempDir::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_kanji-assets"))
+        .arg("--output")
+        .arg("json")
+        .arg("invalid-command")
+        .current_dir(temp.path())
+        .output()
+        .expect("CLI запускается");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    assert!(
+        !temp.path().join(".asset-store/kanji").exists(),
+        "parse error does not execute a store operation"
+    );
+}
+
+#[test]
 fn default_store_resolves_to_workspace_root_when_run_from_a_subdirectory() {
     let temp = TempDir::new();
     let repository = temp.path().join("repository");

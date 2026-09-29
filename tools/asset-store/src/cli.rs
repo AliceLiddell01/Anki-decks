@@ -52,7 +52,7 @@ pub enum Command {
     },
     /// Проверяет integrity и выводит текущие записи manifest.
     List,
-    /// Показывает детерминированный набор целей; CV validator на этом этапе нет.
+    /// Показывает детерминированный набор целей; CV validator не реализован.
     Plan {
         #[arg(long, value_enum)]
         mode: ModeArg,

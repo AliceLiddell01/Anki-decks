@@ -957,6 +957,7 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
         ));
     }
     let mut previous_identity: Option<&AssetIdentity> = None;
+    let mut verified_hashes = BTreeSet::new();
     for record in &manifest.assets {
         record
             .identity
@@ -1013,8 +1014,9 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
             ));
         }
         validate_object(root, record)?;
+        verified_hashes.insert(record.sha256.clone());
     }
-    validate_object_directory(root)?;
+    validate_object_directory(root, &verified_hashes)?;
     Ok(())
 }
 
@@ -1058,7 +1060,10 @@ fn validate_object(root: &File, record: &AssetRecord) -> Result<(), AssetError> 
     Ok(())
 }
 
-fn validate_object_directory(root: &File) -> Result<(), AssetError> {
+fn validate_object_directory(
+    root: &File,
+    verified_hashes: &BTreeSet<String>,
+) -> Result<(), AssetError> {
     let objects = open_directory_at(root, OBJECTS_DIR).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AssetError::new(
@@ -1084,12 +1089,14 @@ fn validate_object_directory(root: &File) -> Result<(), AssetError> {
         };
         validate_hash(hash)?;
         let file = open_regular_at(&objects, entry.file_name(), ErrorCode::MissingAssetFile)?;
-        let (actual_hash, _, _) = hash_file(file)?;
-        if actual_hash != hash {
-            return Err(AssetError::new(
-                ErrorCode::IntegrityMismatch,
-                format!("object {name} не соответствует своему SHA-256"),
-            ));
+        if !verified_hashes.contains(hash) {
+            let (actual_hash, _, _) = hash_file(file)?;
+            if actual_hash != hash {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("object {name} не соответствует своему SHA-256"),
+                ));
+            }
         }
         // Незарегистрированный content-addressed object возможен, если процесс
         // завершился после публикации bytes и до manifest. Он не является

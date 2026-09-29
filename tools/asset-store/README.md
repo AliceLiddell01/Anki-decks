@@ -8,8 +8,11 @@ manifest, content hash, integrity и lifecycle.
 ## Граница владения
 
 Инструмент работает только в явно выбранном store root. По умолчанию это
-`.asset-store/kanji` в найденном корне Cargo workspace; если workspace не найден,
-путь берётся относительно текущего каталога. Содержимое исключено из Git.
+`.asset-store/kanji` в найденном корне workspace: сначала CLI ищет его среди
+предков `--repository-root`, затем среди предков текущего каталога. Корнем
+workspace считается каталог, содержащий и `Cargo.toml`, и `decks/`. Если оба
+поиска не находят такой каталог, `.asset-store/kanji` задаётся относительно
+текущего каталога. Содержимое исключено из Git.
 Для kanji CLI store проверяет, что root не пересекается с `decks/`: учитываются
 заданный `--repository-root`, текущий каталог и прямые `decks/` у предков пути
 store. Проверка смотрит только границы путей и не обходит `decks/`.
@@ -134,22 +137,24 @@ JSON имеет `schema_version`, `operation`, `store`, `mode`, `assets`, `chang
 `unsupported_schema_version`, `manifest_corrupt`, `missing_asset_file`,
 `integrity_mismatch`, `source_file_missing`, `invalid_validation_evidence` и
 `io_failure`. Exit categories:
-`0` — успешная операция или no-op, `3` — invalid input/conflict, `4` — boundary,
-schema или integrity blocker, `5` — I/O failure. Для точного контракта используйте
-JSON `error.code`, а не prose или exit code отдельно.
+`2` — ошибка разбора аргументов CLI: `clap` пишет usage error в stderr, stdout
+остаётся без JSON независимо от `--output`; `0` — успешная операция или no-op,
+`3` — invalid input/conflict, `4` — boundary, schema или integrity blocker,
+`5` — I/O failure. Для точного контракта используйте JSON `error.code`, а не
+prose или exit code отдельно.
 
-## Ограничения текущего этапа
+## Ограничения
 
-- сетевого acquisition и браузерной логики нет;
-- Yarxi integration ещё нет;
-- kanji semantic CV/OCR/visual validator ещё нет;
+- сетевой acquisition и браузерная логика не реализованы;
+- Yarxi integration не реализована;
+- kanji semantic CV/OCR/visual validator не реализован;
 - наличие candidate asset не означает `verified`;
 - инструмент не подтверждает соответствие изображения character identity;
 - пользовательские Anki media не входят в store;
 - assets не копируются в `decks/**/media/`, `media_files` и `anki-repo create` не
   изменяются;
-- реальные third-party fixtures и решения о распространении будущего корпуса не
-  добавлены.
+- реальные third-party fixtures отсутствуют, а решения о распространении корпуса
+  не определены.
 
 Тесты используют только синтетические bytes и временные каталоги. Общие проверки
 запускаются из workspace по контракту корневого `AGENTS.md`.

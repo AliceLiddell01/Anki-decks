@@ -350,6 +350,22 @@ fn integrity_failures_are_explicit_and_traversal_is_rejected() {
 }
 
 #[test]
+fn orphan_object_hash_is_checked_even_without_a_manifest_record() {
+    let temp = TempDir::new("orphan-object");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    let orphan = root
+        .join("objects")
+        .join(format!("{}.blob", "0".repeat(64)));
+    fs::write(&orphan, b"unregistered bytes").expect("synthetic orphan object is written");
+
+    assert_eq!(
+        store.verify_integrity().unwrap_err().code,
+        ErrorCode::IntegrityMismatch
+    );
+}
+
+#[test]
 fn absent_file_unsupported_schema_corrupt_json_and_traversal_fail_closed() {
     let temp = TempDir::new("manifest-errors");
     let root = temp.path().join("store");
