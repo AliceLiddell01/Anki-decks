@@ -1,0 +1,29 @@
+[package]
+name = "asset-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Переиспользуемый lifecycle store для программно принадлежащих assets"
+publish = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rustix = { version = "1.1", features = ["fs"] }
+thiserror = "2"
+
+[lib]
+name = "asset_store"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kanji-assets"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

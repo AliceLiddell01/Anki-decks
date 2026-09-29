@@ -29,6 +29,7 @@
 Профильные владельцы вне `.codex/context/`:
 
 - `tools/anki-repo/README.md` — контракт toolkit `anki-repo`: команды, вывод, exit codes, реестр QA-правил и границы `edit`;
+- `tools/asset-store/README.md` — публичный контракт общего asset store и kanji CLI, filesystem ownership, lifecycle, `new`/`full` и machine-readable outcomes;
 - `.agents/skills/anki-git-workflow/` — обычная процедура Git/GitHub;
 - `.agents/skills/anki-coderabbit-review/` — явно запрошенный CodeRabbit review cycle.
 

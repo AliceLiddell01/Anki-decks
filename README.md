@@ -19,7 +19,8 @@
 │   └── japanese/
 │       └── words/           # японская словарная колода CrowdAnki
 └── tools/
-    └── anki-repo/           # toolkit анализа, QA-review и точечной правки CrowdAnki-экспорта
+    ├── anki-repo/           # toolkit анализа, QA-review и точечной правки CrowdAnki-экспорта
+    └── asset-store/         # общий program-owned asset core и kanji-assets CLI
 ```
 
 Сами JSON-экспорты добавляются в соответствующие каталоги колод отдельными изменениями. В базовом каркасе репозитория содержимое колод намеренно отсутствует.
@@ -55,6 +56,8 @@ skill, а не README:
 ## Инструменты
 
 `tools/anki-repo` — самостоятельный Rust CLI для анализа одного CrowdAnki-экспорта, QA-review его содержимого и одной строго ограниченной правки. Он разрешает связи `note_model_uuid` → `note_models[].flds[].ord` → `Note.fields` и выполняет восемь операций: `inspect`, `find`, `stats`, `validate`, `qa`, `review`, `review-check` и `edit`. У каждой операции есть человекочитаемый вывод и отдельный стабильный JSON-вывод.
+
+`tools/asset-store` содержит общий program-owned asset lifecycle core и kanji-specific CLI `kanji-assets`. Его единственный публичный контракт, filesystem boundary и ограничения описаны в `tools/asset-store/README.md`; инструмент не читает `decks/**/media/` и не интегрирован с карточками.
 
 Toolkit работает с произвольным CrowdAnki-экспортом и не знает имён полей конкретной модели: имя поля всегда задаёт вызывающая сторона (`--field`), а `--value` и `--match` уточняют отбор.
 

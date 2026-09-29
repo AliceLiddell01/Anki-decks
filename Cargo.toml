@@ -6,7 +6,7 @@
 # Это не отдельный crate: корень остаётся репозиторием колод, а Cargo — его
 # repository-level границей для Rust-кода.
 [workspace]
-members = ["tools/anki-repo"]
+members = ["tools/anki-repo", "tools/asset-store"]
 resolver = "3"
 
 [workspace.package]
