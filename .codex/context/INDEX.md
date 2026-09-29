@@ -18,6 +18,7 @@
 | `02-CROWDANKI-JSON.md` | устройство CrowdAnki JSON, связи сущностей и безопасная навигация |
 | `03-VERIFICATION.md` | минимальные проверки JSON и структурных инвариантов после изменения, проверки CI и локальное воспроизведение набора |
 | `tools/anki-repo/README.md` | контракт toolkit `anki-repo`: команды, вывод, exit codes, правила QA, границы записи `edit`/`create`/`retire` и границы статического отчёта `visual-report` |
+| `tools/asset-store/README.md` | единственный публичный контракт program-owned asset store и kanji CLI: filesystem boundary, manifest/lifecycle, `new`/`full`, JSON outcomes и ограничения текущего этапа |
 | `.agents/skills/anki-git-workflow/` | обычная процедура Git/GitHub: branch, staging, commit, push, проверка удалённого состояния, PR, merge |
 | `.agents/skills/anki-coderabbit-review/` | явно запрошенный CodeRabbit review cycle текущего checkout |
 
@@ -28,6 +29,8 @@ repository skills из `.agents/skills/`: маршрутизируй к ним, 
 ## Инструменты
 
 `tools/anki-repo` — самостоятельный Rust CLI для одного CrowdAnki-экспорта. Он разрешает связи `note_model_uuid` → `flds[].ord` → `fields` и умеет `inspect`, `find`, `stats`, `validate`, `qa`, `review`, `review-check`, `models` и `visual-report` с человекочитаемым и JSON-выводом; предпочитай его ручному чтению многомегабайтного `deck.json`. Для проверки содержимого карточек используй `qa` (детерминированные findings по фиксированному реестру правил) и `review` (компактный batch заметок для внешнего агента), а предложения агента проверяй через `review-check`: он ничего не пишет и выдаёт готовый запрос для `edit`. Перед созданием заметки смотри фактическую схему полей командой `models`. Мутирующих команд три — `edit` (значение существующего поля), `create` (новая заметка в существующей колоде существующей модели) и `retire` (тег вывода из обращения вместо удаления); каждая по умолчанию работает как dry-run и требует `--apply` для записи. `visual-report` собирает статический офлайн-отчёт о различиях двух состояний экспорта и ничего не пишет в сам экспорт. Toolkit не вызывает LLM API: содержательное суждение делает внешний агент.
+
+`tools/asset-store/README.md` — канонический контракт отдельного Rust library package и бинарника `kanji-assets` для program-owned assets. Он не читает пользовательские media и не зависит от содержимого колод.
 
 ## Что здесь не хранить
 
