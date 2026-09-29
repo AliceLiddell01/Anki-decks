@@ -9,6 +9,7 @@ pub enum ErrorCode {
     InvalidValidatorIdentity,
     InvalidStoreRoot,
     BoundaryViolation,
+    StoreMissing,
     StoreNotOwned,
     UnsupportedSchemaVersion,
     ManifestCorrupt,
@@ -34,6 +35,7 @@ impl ErrorCode {
             Self::InvalidValidatorIdentity => "invalid_validator_identity",
             Self::InvalidStoreRoot => "invalid_store_root",
             Self::BoundaryViolation => "boundary_violation",
+            Self::StoreMissing => "store_missing",
             Self::StoreNotOwned => "store_not_owned",
             Self::UnsupportedSchemaVersion => "unsupported_schema_version",
             Self::ManifestCorrupt => "manifest_corrupt",
@@ -65,6 +67,7 @@ impl ErrorCode {
             | Self::InvalidValidationEvidence => 3,
             Self::InvalidStoreRoot
             | Self::BoundaryViolation
+            | Self::StoreMissing
             | Self::StoreNotOwned
             | Self::UnsupportedSchemaVersion
             | Self::ManifestCorrupt

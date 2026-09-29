@@ -153,6 +153,18 @@ impl StoreLock {
 impl AssetStore {
     /// Открывает существующий или создаёт новый store после проверки boundary.
     pub fn open(options: StoreOptions) -> Result<Self, AssetError> {
+        Self::open_with_creation(options, true)
+    }
+
+    /// Открывает только существующий owned store без создания или ремонта файлов.
+    pub fn open_existing(options: StoreOptions) -> Result<Self, AssetError> {
+        Self::open_with_creation(options, false)
+    }
+
+    fn open_with_creation(
+        options: StoreOptions,
+        create_if_missing: bool,
+    ) -> Result<Self, AssetError> {
         let requested_root = resolve_store_root(&options.root)?;
         for protected in &options.protected_roots {
             for protected in resolve_protected_paths(protected)? {
@@ -169,7 +181,11 @@ impl AssetStore {
             }
         }
 
-        let (root_handle, root_created) = open_or_create_store_root(&requested_root, |_| {})?;
+        let (root_handle, root_created) = if create_if_missing {
+            open_or_create_store_root(&requested_root, |_| {})?
+        } else {
+            (open_existing_store_root(&requested_root)?, false)
+        };
         let canonical_root = fd_canonical_path(&root_handle)?;
         if canonical_root != requested_root {
             return Err(AssetError::new(
@@ -202,9 +218,15 @@ impl AssetStore {
             )
         })?;
         let state = preflight_root_ownership(&root_handle, root_created)?;
+        if !create_if_missing && state != RootState::Owned {
+            return Err(AssetError::new(
+                ErrorCode::StoreNotOwned,
+                "store root не содержит инициализированный asset store",
+            ));
+        }
         let lock = match state {
             RootState::NewlyCreated | RootState::ExistingEmpty => create_lock_file(&root_handle)?,
-            RootState::Owned => open_lock_file(&root_handle, true)?,
+            RootState::Owned => open_lock_file(&root_handle, create_if_missing)?,
         };
         flock(&lock, FlockOperation::LockExclusive).map_err(|error| {
             AssetError::io(
@@ -212,7 +234,11 @@ impl AssetStore {
                 std::io::Error::from(error),
             )
         })?;
-        let initialized_on_open = initialize_or_load(&root_handle, state)?;
+        let initialized_on_open = if create_if_missing {
+            initialize_or_load(&root_handle, state)?
+        } else {
+            false
+        };
 
         let manifest = load_manifest(&root_handle)?;
         validate_manifest(&root_handle, &manifest)?;
@@ -1522,6 +1548,18 @@ fn resolve_store_root(root: &Path) -> Result<PathBuf, AssetError> {
 /// symlink; отсутствующие компоненты создаёт через тот же directory handle.
 fn open_or_create_store_root(
     path: &Path,
+    after_component: impl FnMut(&Path),
+) -> Result<(File, bool), AssetError> {
+    open_store_root(path, true, after_component)
+}
+
+fn open_existing_store_root(path: &Path) -> Result<File, AssetError> {
+    open_store_root(path, false, |_| {}).map(|(root, _)| root)
+}
+
+fn open_store_root(
+    path: &Path,
+    create_missing: bool,
     mut after_component: impl FnMut(&Path),
 ) -> Result<(File, bool), AssetError> {
     let mut current = File::open("/")
@@ -1550,6 +1588,12 @@ fn open_or_create_store_root(
         match open_directory_at(&current, part) {
             Ok(directory) => current = directory,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create_missing {
+                    return Err(AssetError::new(
+                        ErrorCode::StoreMissing,
+                        "store root не существует",
+                    ));
+                }
                 match mkdirat(&current, part, Mode::from_raw_mode(0o755)) {
                     Ok(()) => {
                         if index + 1 == parts.len() {

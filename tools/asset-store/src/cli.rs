@@ -243,7 +243,13 @@ pub fn execute(cli: Cli) -> CliOutput {
     for protected_root in protected_roots {
         options = options.protect_from(protected_root);
     }
-    match AssetStore::open(options) {
+    let open_existing = matches!(&cli.command, Command::List | Command::Plan { .. });
+    let open_result = if open_existing {
+        AssetStore::open_existing(options)
+    } else {
+        AssetStore::open(options)
+    };
+    match open_result {
         Ok(store) => {
             let store_summary = StoreSummary {
                 path: store.root().display().to_string(),

@@ -159,6 +159,45 @@ fn cli_reports_store_unicode_selection_idempotency_and_conflicts_as_json() {
 }
 
 #[test]
+fn list_and_plan_reject_a_missing_store_without_creating_it() {
+    let temp = TempDir::new();
+    let missing_store = temp.path().join("owned-store");
+    let list = cli(&temp, &["list"]);
+    assert_eq!(list.status.code(), Some(4));
+    assert_eq!(json(&list)["error"]["code"], "store_missing");
+    assert!(!missing_store.exists());
+
+    let plan = cli(
+        &temp,
+        &[
+            "plan",
+            "--mode",
+            "new",
+            "--validator-id",
+            "kanji-cv",
+            "--validator-version",
+            "future-1",
+        ],
+    );
+    assert_eq!(plan.status.code(), Some(4));
+    assert_eq!(json(&plan)["error"]["code"], "store_missing");
+    assert!(!missing_store.exists());
+}
+
+#[test]
+fn list_does_not_initialize_an_existing_empty_directory() {
+    let temp = TempDir::new();
+    let store = temp.path().join("owned-store");
+    fs::create_dir(&store).expect("empty store path exists");
+
+    let output = cli(&temp, &["list"]);
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(json(&output)["error"]["code"], "store_not_owned");
+    assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+}
+
+#[test]
 fn cli_rejects_store_under_decks_before_creating_it() {
     let temp = TempDir::new();
     let store = temp.path().join("repository/decks/kanji-assets");

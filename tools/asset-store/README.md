@@ -63,6 +63,14 @@ Root с `..`, symlink-компонентом или чужими файлами 
   проверенных bytes и `evidence`;
 - необязательный `domain_metadata`, который generic core не интерпретирует.
 
+Явная замена через `--replace-expected-sha256` с новым SHA-256 публикует новый
+immutable object и переключает на него запись manifest; прежний object остаётся
+в `objects/` как orphan. Сборщика garbage collection пока нет. Каждый проход
+`validate_object_directory` повторно читает и хеширует все orphan objects;
+поэтому время validation растёт вместе с их числом и размером. Первоначальная
+проверка при `open` удерживает exclusive directory lock и `.lock` на время этого
+чтения, что увеличивает ожидание конкурирующих операций.
+
 Для kanji в `domain_metadata` сохраняются точная строка `character` и список
 `unicode_codepoints` вида `U+6F22`. Строка не нормализуется и не выводится из имени
 файла. Unicode representation здесь фиксирует identity, но не доказывает, что
@@ -119,6 +127,10 @@ cargo run --quiet --bin kanji-assets -- --output json plan \
 ровно один явный файл. Формат и hash определяются по bytes. Для явной замены
 добавьте `--replace-expected-sha256 <текущий-hash>`.
 
+`init` и `ingest` создают отсутствующий store. `list` и `plan` работают только с
+уже инициализированным store: отсутствующий root возвращает `store_missing`, а
+пустой или не принадлежащий asset store каталог не инициализируется.
+
 `init` сообщает `initialized` и `changed: true` при создании state либо
 `already_initialized` и `changed: false` при повторе. Все команды отражают
 инициализацию нового store в поле `changed`.
@@ -136,10 +148,11 @@ JSON имеет `schema_version`, `operation`, `store`, `mode`, `assets`, `chang
 `boundary_violation`, `path_traversal`, `store_not_owned`,
 `unsupported_schema_version`, `manifest_corrupt`, `missing_asset_file`,
 `integrity_mismatch`, `source_file_missing`, `invalid_validation_evidence` и
-`io_failure`. Exit categories:
+`store_missing`, `io_failure`. Exit categories:
 `2` — ошибка разбора аргументов CLI: `clap` пишет usage error в stderr, stdout
 остаётся без JSON независимо от `--output`; `0` — успешная операция или no-op,
-`3` — invalid input/conflict, `4` — boundary, schema или integrity blocker,
+`3` — invalid input/conflict, `4` — отсутствующий store, boundary, schema или
+integrity blocker,
 `5` — I/O failure. Для точного контракта используйте JSON `error.code`, а не
 prose или exit code отдельно.
 
