@@ -22,7 +22,9 @@ Root с `..`, symlink-компонентом или чужими файлами 
 Пользовательские `decks/**/media/` и CrowdAnki `media_files` не являются
 источниками или частью asset store.
 
-На Linux store root открывается по компонентам через directory handles без
+Реализация `asset-store` поддерживает только Linux: filesystem boundary
+использует Linux descriptor-relative операции и `/proc/self/fd`. Store root
+открывается по компонентам через directory handles без
 следования symlink; последующие операции привязаны к открытому root handle, а не
 повторно разрешают исходный pathname. Для инициализации принимается только новый
 или существующий пустой root. Любой непустой root без согласованных `.owner.json`

@@ -354,3 +354,41 @@ fn default_store_resolves_to_workspace_root_when_run_from_a_subdirectory() {
         expected.display().to_string()
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_store_resolves_symlinked_repository_root_with_parent_components() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new();
+    let repository = temp.path().join("repository");
+    let nested = repository.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(repository.join("decks")).unwrap();
+    fs::write(repository.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let alias = temp.path().join("repository-alias");
+    symlink(&repository, &alias).unwrap();
+    let repository_argument = alias.join("nested").join("..");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kanji-assets"))
+        .arg("--repository-root")
+        .arg(&repository_argument)
+        .arg("--output")
+        .arg("json")
+        .arg("init")
+        .current_dir(temp.path())
+        .output()
+        .expect("CLI запускается");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = repository.join(".asset-store/kanji");
+    assert!(expected.exists());
+    assert_eq!(
+        json(&output)["store"]["path"],
+        expected.display().to_string()
+    );
+}

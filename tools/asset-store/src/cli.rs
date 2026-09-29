@@ -348,12 +348,8 @@ fn default_store_path(repository_root: &std::path::Path) -> PathBuf {
 }
 
 fn find_workspace_root(start: &std::path::Path) -> Option<PathBuf> {
-    let absolute = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(start)
-    };
-    absolute.ancestors().find_map(|ancestor| {
+    let canonical = std::fs::canonicalize(start).ok()?;
+    canonical.ancestors().find_map(|ancestor| {
         (ancestor.join("Cargo.toml").is_file() && ancestor.join("decks").is_dir())
             .then(|| ancestor.to_path_buf())
     })

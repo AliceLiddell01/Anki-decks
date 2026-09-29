@@ -4,6 +4,9 @@
 //! хранятся явные identities, hashes, provenance и semantic decisions. Предметный
 //! CLI `kanji-assets` использует этот API, не дублируя владение store.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("asset-store currently supports Linux only");
+
 pub mod cli;
 pub mod error;
 pub mod model;

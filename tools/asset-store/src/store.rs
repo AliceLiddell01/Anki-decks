@@ -9,8 +9,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
-use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, open, openat, renameat, unlinkat};
+use rustix::fs::{
+    AtFlags, FlockOperation, Mode, OFlags, flock, linkat, mkdirat, open, openat, renameat, unlinkat,
+};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
@@ -137,10 +138,15 @@ struct StoreLock {
 
 impl StoreLock {
     fn unlock(self) -> Result<(), AssetError> {
-        FileExt::unlock(&self.lock_file)
-            .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
-        FileExt::unlock(&self.directory)
-            .map_err(|error| AssetError::io("не удалось снять directory lock store", error))
+        flock(&self.lock_file, FlockOperation::Unlock).map_err(|error| {
+            AssetError::io("не удалось снять lock store", std::io::Error::from(error))
+        })?;
+        flock(&self.directory, FlockOperation::Unlock).map_err(|error| {
+            AssetError::io(
+                "не удалось снять directory lock store",
+                std::io::Error::from(error),
+            )
+        })
     }
 }
 
@@ -189,15 +195,23 @@ impl AssetStore {
 
         // Directory flock сериализует первоначальную проверку и bootstrap,
         // не оставляя lock-файла в существующем unowned root.
-        FileExt::lock_exclusive(&root_handle)
-            .map_err(|error| AssetError::io("не удалось заблокировать store root", error))?;
+        flock(&root_handle, FlockOperation::LockExclusive).map_err(|error| {
+            AssetError::io(
+                "не удалось заблокировать store root",
+                std::io::Error::from(error),
+            )
+        })?;
         let state = preflight_root_ownership(&root_handle, root_created)?;
         let lock = match state {
             RootState::NewlyCreated | RootState::ExistingEmpty => create_lock_file(&root_handle)?,
             RootState::Owned => open_lock_file(&root_handle, true)?,
         };
-        FileExt::lock_exclusive(&lock)
-            .map_err(|error| AssetError::io("не удалось заблокировать store", error))?;
+        flock(&lock, FlockOperation::LockExclusive).map_err(|error| {
+            AssetError::io(
+                "не удалось заблокировать store",
+                std::io::Error::from(error),
+            )
+        })?;
         let initialized_on_open = initialize_or_load(&root_handle, state)?;
 
         let manifest = load_manifest(&root_handle)?;
@@ -213,10 +227,15 @@ impl AssetStore {
             #[cfg(test)]
             lock_test_hooks: std::sync::Mutex::new(None),
         };
-        FileExt::unlock(&lock)
-            .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
-        FileExt::unlock(&store.root_handle)
-            .map_err(|error| AssetError::io("не удалось снять lock store root", error))?;
+        flock(&lock, FlockOperation::Unlock).map_err(|error| {
+            AssetError::io("не удалось снять lock store", std::io::Error::from(error))
+        })?;
+        flock(&store.root_handle, FlockOperation::Unlock).map_err(|error| {
+            AssetError::io(
+                "не удалось снять lock store root",
+                std::io::Error::from(error),
+            )
+        })?;
         Ok(store)
     }
 
@@ -525,19 +544,29 @@ impl AssetStore {
         if let Some(hooks) = &hooks {
             (hooks.before_lock)(&directory);
         }
-        if exclusive {
-            FileExt::lock_exclusive(&directory)
+        let directory_operation = if exclusive {
+            FlockOperation::LockExclusive
         } else {
-            FileExt::lock_shared(&directory)
-        }
-        .map_err(|error| AssetError::io("не удалось заблокировать store directory", error))?;
+            FlockOperation::LockShared
+        };
+        flock(&directory, directory_operation).map_err(|error| {
+            AssetError::io(
+                "не удалось заблокировать store directory",
+                std::io::Error::from(error),
+            )
+        })?;
         let lock_file = open_lock_file(&self.root_handle, false)?;
-        if exclusive {
-            FileExt::lock_exclusive(&lock_file)
+        let lock_operation = if exclusive {
+            FlockOperation::LockExclusive
         } else {
-            FileExt::lock_shared(&lock_file)
-        }
-        .map_err(|error| AssetError::io("не удалось заблокировать store", error))?;
+            FlockOperation::LockShared
+        };
+        flock(&lock_file, lock_operation).map_err(|error| {
+            AssetError::io(
+                "не удалось заблокировать store",
+                std::io::Error::from(error),
+            )
+        })?;
         #[cfg(test)]
         if let Some(hooks) = &hooks {
             (hooks.after_lock)(&directory);
@@ -1777,12 +1806,12 @@ mod tests {
         let before_count_hook = Arc::clone(&before_count);
         let before_lock = Arc::new(move |lock: &File| {
             if before_count_hook.fetch_add(1, Ordering::SeqCst) == 1 {
-                let probe = FileExt::try_lock_exclusive(lock);
+                let probe = flock(lock, FlockOperation::NonBlockingLockExclusive);
                 let blocked = probe
                     .as_ref()
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+                    .is_err_and(|error| *error == Errno::WOULDBLOCK);
                 if probe.is_ok() {
-                    FileExt::unlock(lock).expect("successful lock probe is released");
+                    flock(lock, FlockOperation::Unlock).expect("successful lock probe is released");
                 }
                 second_probe_tx
                     .send(blocked)
