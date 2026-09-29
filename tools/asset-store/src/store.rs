@@ -28,6 +28,7 @@ const OWNER_FILE: &str = ".owner.json";
 const LOCK_FILE: &str = ".lock";
 const ASSETS_DIR: &str = "assets";
 const TEMP_DIR: &str = ".tmp";
+const RUNTIME_DIR: &str = ".runtime";
 const OWNER_SCHEMA_VERSION: u32 = 1;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +63,8 @@ pub struct AssetStore {
     root: PathBuf,
     /// Открытый directory handle — все store I/O остаётся привязанным к этому inode.
     root_handle: File,
+    /// Локальное хранилище записей `Pending` и `Quarantined`; оно целиком исключено из Git.
+    runtime_handle: File,
     store_id: String,
     initialized_on_open: bool,
     #[cfg(test)]
@@ -203,7 +206,9 @@ impl AssetStore {
         Self::open_with_creation(options, true)
     }
 
-    /// Открывает только существующий owned store без создания или ремонта файлов.
+    /// Открывает существующее принадлежащее asset-store хранилище без создания нового корня.
+    /// При открытии инициализирует отсутствующий `.runtime` и переносит туда
+    /// прежние записи `Pending` и `Quarantined`, чтобы восстановить границу жизненного цикла.
     pub fn open_existing(options: StoreOptions) -> Result<Self, AssetError> {
         Self::open_with_creation(options, false)
     }
@@ -287,13 +292,23 @@ impl AssetStore {
             false
         };
 
+        let canonical_manifest = load_manifest(&root_handle)?;
+        let runtime_handle =
+            open_or_initialize_runtime(&root_handle, &canonical_manifest.store_id)?;
         recover_publications(&root_handle)?;
+        recover_publications(&runtime_handle)?;
         let manifest = load_manifest(&root_handle)?;
-        validate_manifest(&root_handle, &manifest)?;
+        let runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
+        reconcile_runtime_boundary(&root_handle, &runtime_handle, &manifest, &runtime_manifest)?;
+        let manifest = load_manifest(&root_handle)?;
+        let runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
+        validate_verified_manifest(&root_handle, &manifest)?;
+        validate_runtime_manifest(&runtime_handle, &runtime_manifest, &manifest.store_id)?;
 
         let store = Self {
             root: canonical_root,
             root_handle,
+            runtime_handle,
             store_id: manifest.store_id,
             initialized_on_open,
             #[cfg(test)]
@@ -333,10 +348,87 @@ impl AssetStore {
     pub fn verify_integrity(&self) -> Result<Vec<AssetRecord>, AssetError> {
         let lock = self.lock_shared()?;
         let manifest = load_manifest(&self.root_handle)?;
-        validate_manifest(&self.root_handle, &manifest)?;
-        let assets = manifest.assets;
+        validate_verified_manifest(&self.root_handle, &manifest)?;
+        let runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        let mut assets = manifest.assets;
+        assets.extend(runtime_manifest.assets);
+        assets.sort_by(|left, right| left.identity.cmp(&right.identity));
         lock.unlock()?;
         Ok(assets)
+    }
+
+    /// Проверяет публикуемое в Git представление корпуса кандзи без создания,
+    /// восстановления или изменения файлов. Отсутствующий корпус допустим.
+    pub fn verify_publishable_corpus(root: impl AsRef<Path>) -> Result<(), AssetError> {
+        let requested_root = resolve_store_root(root.as_ref())?;
+        let root_handle = match open_existing_store_root(&requested_root) {
+            Ok(root) => root,
+            Err(error) if error.code == ErrorCode::StoreMissing => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        // Все изменяющие хранилище операции сначала берут исключительную
+        // блокировку flock каталога. Эта проверка только для чтения берёт
+        // совместную блокировку того же inode; `.lock` игнорируется Git и может
+        // отсутствовать в чистой копии репозитория.
+        let directory_lock = open_directory_at(&root_handle, ".")
+            .map_err(|error| AssetError::io("не удалось открыть каталог корпуса кандзи", error))?;
+        flock(&directory_lock, FlockOperation::LockShared).map_err(|error| {
+            AssetError::io(
+                "не удалось заблокировать каталог корпуса кандзи для проверки",
+                std::io::Error::from(error),
+            )
+        })?;
+        let result = (|| {
+            let names = inspect_top_level(&root_handle, ErrorCode::UnexpectedPath)?;
+            if !names.contains(OWNER_FILE) || !names.contains(MANIFEST_FILE) {
+                return Err(AssetError::new(
+                    ErrorCode::StoreNotOwned,
+                    "в публикуемом корпусе отсутствует файл `.owner.json` или `manifest.json`",
+                ));
+            }
+            let owner = read_owner_marker(&root_handle)?;
+            let manifest = load_manifest(&root_handle)?;
+            if manifest.store_id != owner.store_id {
+                return Err(AssetError::new(
+                    ErrorCode::ManifestCorrupt,
+                    "значение `store_id` в публикуемом манифесте не совпадает с маркером владельца",
+                ));
+            }
+            validate_publishable_manifest(&root_handle, &manifest)?;
+            ensure_directory_empty(&root_handle, TEMP_DIR)?;
+            if names.contains(RUNTIME_DIR) {
+                let runtime = open_directory_at(&root_handle, RUNTIME_DIR)
+                    .map_err(|error| directory_entry_error(RUNTIME_DIR, error))?;
+                let runtime_manifest = load_runtime_manifest(&runtime, &manifest.store_id)?;
+                validate_runtime_manifest(&runtime, &runtime_manifest, &manifest.store_id)?;
+                let published: BTreeSet<_> = manifest
+                    .assets
+                    .iter()
+                    .map(|asset| &asset.identity)
+                    .collect();
+                if runtime_manifest
+                    .assets
+                    .iter()
+                    .any(|asset| published.contains(&asset.identity))
+                {
+                    return Err(AssetError::new(
+                        ErrorCode::ManifestCorrupt,
+                        "локальный кандидат пересекается с опубликованной идентичностью",
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        let unlock = flock(&directory_lock, FlockOperation::Unlock).map_err(|error| {
+            AssetError::io(
+                "не удалось снять блокировку каталога корпуса кандзи",
+                std::io::Error::from(error),
+            )
+        });
+        result?;
+        unlock?;
+        Ok(())
     }
 
     /// Явно импортирует один файл, вычисляя SHA-256 по скопированным bytes.
@@ -375,12 +467,30 @@ impl AssetStore {
         validate_validator_identity(&validator_id)?;
         let staged = stage_bytes(&self.root_handle, &request.bytes)?;
         let lock = self.lock_exclusive()?;
+        recover_publications(&self.root_handle)?;
+        recover_publications(&self.runtime_handle)?;
         let mut manifest = load_manifest(&self.root_handle)?;
-        validate_manifest(&self.root_handle, &manifest)?;
+        let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
+        reconcile_runtime_boundary(
+            &self.root_handle,
+            &self.runtime_handle,
+            &manifest,
+            &runtime_manifest,
+        )?;
+        manifest = load_manifest(&self.root_handle)?;
+        runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
         let existing = manifest
             .assets
             .iter()
             .find(|asset| asset.identity == request.identity)
+            .or_else(|| {
+                runtime_manifest
+                    .assets
+                    .iter()
+                    .find(|asset| asset.identity == request.identity)
+            })
             .cloned();
         if let Some(current) = &existing {
             if current.sha256 == staged.sha256
@@ -470,10 +580,15 @@ impl AssetStore {
             content_sha256: staged.sha256.clone(),
             evidence: decision.evidence.clone(),
         });
+        let previous_canonical = manifest
+            .assets
+            .iter()
+            .find(|asset| asset.identity == record.identity)
+            .cloned();
         commit_asset_record(
             &self.root_handle,
             &staged,
-            existing.as_ref(),
+            previous_canonical.as_ref(),
             &record,
             &mut manifest,
             |root, manifest| {
@@ -492,6 +607,14 @@ impl AssetStore {
                 }
             },
         )?;
+        if let Some(candidate) = runtime_manifest
+            .assets
+            .iter()
+            .find(|asset| asset.identity == record.identity)
+            .cloned()
+        {
+            remove_record_from_area(&self.runtime_handle, &mut runtime_manifest, &candidate)?;
+        }
         let sha256 = staged.sha256.clone();
         let byte_length = staged.byte_length;
         drop(staged);
@@ -517,9 +640,21 @@ impl AssetStore {
             .validate()
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
         let lock = self.lock_exclusive()?;
+        recover_publications(&self.root_handle)?;
+        recover_publications(&self.runtime_handle)?;
         let mut manifest = load_manifest(&self.root_handle)?;
-        validate_manifest(&self.root_handle, &manifest)?;
-        let staged = stage_source(&self.root_handle, source)?;
+        let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
+        reconcile_runtime_boundary(
+            &self.root_handle,
+            &self.runtime_handle,
+            &manifest,
+            &runtime_manifest,
+        )?;
+        manifest = load_manifest(&self.root_handle)?;
+        runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        let staged = stage_source(&self.runtime_handle, source)?;
         let source_name = request
             .source_path
             .file_name()
@@ -527,11 +662,18 @@ impl AssetStore {
             .unwrap_or("unnamed")
             .to_owned();
 
-        let existing = manifest
+        let existing_runtime = runtime_manifest
             .assets
             .iter()
             .find(|asset| asset.identity == request.identity)
             .cloned();
+        let existing = existing_runtime.clone().or_else(|| {
+            manifest
+                .assets
+                .iter()
+                .find(|asset| asset.identity == request.identity)
+                .cloned()
+        });
 
         if let Some(existing) = &existing {
             if existing.sha256 == staged.sha256 {
@@ -585,11 +727,11 @@ impl AssetStore {
             domain_metadata: request.domain_metadata,
         };
         commit_asset_record(
-            &self.root_handle,
+            &self.runtime_handle,
             &staged,
-            existing.as_ref(),
+            existing_runtime.as_ref(),
             &record,
-            &mut manifest,
+            &mut runtime_manifest,
             |root, manifest| {
                 #[cfg(test)]
                 {
@@ -606,6 +748,16 @@ impl AssetStore {
                 }
             },
         )?;
+        if let Some(canonical) = manifest
+            .assets
+            .iter()
+            .find(|asset| asset.identity == record.identity)
+            .cloned()
+        {
+            remove_record_from_area(&self.root_handle, &mut manifest, &canonical)?;
+        }
+        validate_verified_manifest(&self.root_handle, &manifest)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
         drop(staged);
         lock.unlock()?;
         Ok(IngestOutcome {
@@ -624,8 +776,12 @@ impl AssetStore {
         validate_validator_identity(validator)?;
         let lock = self.lock_shared()?;
         let manifest = load_manifest(&self.root_handle)?;
-        validate_manifest(&self.root_handle, &manifest)?;
-        let assets = select_assets(&manifest.assets, mode, validator)
+        validate_verified_manifest(&self.root_handle, &manifest)?;
+        let runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        let mut records = manifest.assets;
+        records.extend(runtime_manifest.assets);
+        let assets = select_assets(&records, mode, validator)
             .into_iter()
             .cloned()
             .collect();
@@ -644,20 +800,39 @@ impl AssetStore {
         let validator_id = validator.identity();
         validate_validator_identity(&validator_id)?;
         let lock = self.lock_exclusive()?;
+        recover_publications(&self.root_handle)?;
+        recover_publications(&self.runtime_handle)?;
         let mut manifest = load_manifest(&self.root_handle)?;
-        validate_manifest(&self.root_handle, &manifest)?;
-        let selected: Vec<_> = select_assets(&manifest.assets, mode, &validator_id)
+        let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
+        reconcile_runtime_boundary(
+            &self.root_handle,
+            &self.runtime_handle,
+            &manifest,
+            &runtime_manifest,
+        )?;
+        manifest = load_manifest(&self.root_handle)?;
+        runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        let mut records = manifest.assets.clone();
+        records.extend(runtime_manifest.assets.clone());
+        let selected: Vec<_> = select_assets(&records, mode, &validator_id)
             .into_iter()
             .cloned()
             .collect();
         let mut report = ValidationReport::new(mode, validator_id.clone());
         report.considered = selected.len();
 
-        // Сначала выполняются все domain calls и проверяется evidence. До этого
-        // места manifest и trusted state не меняются.
+        // Сначала выполняются все вызовы предметной проверки и проверяются
+        // доказательства (`evidence`). До этого места манифесты и опубликованные данные не меняются.
         let mut decisions: Vec<(AssetRecord, SemanticDecision)> = Vec::new();
         for record in selected {
-            let mut file = checked_asset_file(&self.root_handle, &record)?;
+            let area = if record.lifecycle == LifecycleState::Verified {
+                &self.root_handle
+            } else {
+                &self.runtime_handle
+            };
+            let mut file = checked_asset_file(area, &record)?;
             let original_state = record.lifecycle;
             match validator.validate(&record, &mut file) {
                 Ok(decision) => {
@@ -682,7 +857,6 @@ impl AssetStore {
             }
         }
 
-        let mut changed_records = Vec::new();
         for (old_record, decision) in decisions {
             let lifecycle = match decision.status {
                 SemanticStatus::Verified => LifecycleState::Verified,
@@ -702,13 +876,89 @@ impl AssetStore {
             let changed = new_record.lifecycle != old_record.lifecycle
                 || new_record.validation != old_record.validation;
             if changed {
-                let target = manifest
-                    .assets
-                    .iter_mut()
-                    .find(|asset| asset.identity == new_record.identity)
-                    .expect("selected identity remains in locked manifest");
-                *target = new_record.clone();
-                changed_records.push(new_record.clone());
+                match (old_record.lifecycle, lifecycle) {
+                    (LifecycleState::Verified, LifecycleState::Verified) => {
+                        replace_manifest_record(&mut manifest, &new_record)?;
+                        save_manifest_revision(
+                            &self.root_handle,
+                            &mut manifest,
+                            #[cfg(test)]
+                            Some(&self.fail_next_manifest_write),
+                            #[cfg(not(test))]
+                            None,
+                        )?;
+                    }
+                    (LifecycleState::Verified, LifecycleState::Quarantined) => {
+                        let source = checked_asset_file(&self.root_handle, &old_record)?;
+                        let staged = stage_source(&self.runtime_handle, source)?;
+                        let previous_runtime = runtime_manifest
+                            .assets
+                            .iter()
+                            .find(|asset| asset.identity == new_record.identity)
+                            .cloned();
+                        commit_asset_record(
+                            &self.runtime_handle,
+                            &staged,
+                            previous_runtime.as_ref(),
+                            &new_record,
+                            &mut runtime_manifest,
+                            |root, manifest| save_manifest(root, manifest, false),
+                        )?;
+                        remove_record_from_area(&self.root_handle, &mut manifest, &old_record)?;
+                    }
+                    (
+                        LifecycleState::Pending | LifecycleState::Quarantined,
+                        LifecycleState::Verified,
+                    ) => {
+                        let source = checked_asset_file(&self.runtime_handle, &old_record)?;
+                        let staged = stage_source(&self.root_handle, source)?;
+                        let previous = manifest
+                            .assets
+                            .iter()
+                            .find(|asset| asset.identity == new_record.identity)
+                            .cloned();
+                        commit_asset_record(
+                            &self.root_handle,
+                            &staged,
+                            previous.as_ref(),
+                            &new_record,
+                            &mut manifest,
+                            |root, manifest| {
+                                #[cfg(test)]
+                                {
+                                    save_manifest_with_test_hook(
+                                        root,
+                                        manifest,
+                                        false,
+                                        &self.fail_next_manifest_write,
+                                    )
+                                }
+                                #[cfg(not(test))]
+                                {
+                                    save_manifest(root, manifest, false)
+                                }
+                            },
+                        )?;
+                        remove_record_from_area(
+                            &self.runtime_handle,
+                            &mut runtime_manifest,
+                            &old_record,
+                        )?;
+                    }
+                    (
+                        LifecycleState::Pending | LifecycleState::Quarantined,
+                        LifecycleState::Quarantined,
+                    ) => {
+                        replace_manifest_record(&mut runtime_manifest, &new_record)?;
+                        save_manifest_revision(&self.runtime_handle, &mut runtime_manifest, None)?;
+                    }
+                    _ => {
+                        return Err(AssetError::new(
+                            ErrorCode::ManifestCorrupt,
+                            "недопустимый переход состояния жизненного цикла при проверке",
+                        ));
+                    }
+                }
             }
             report.attempts.push(ValidationAttempt {
                 identity: old_record.identity,
@@ -723,33 +973,18 @@ impl AssetStore {
             });
         }
 
-        // Validator мог работать параллельно с процессом, не использующим наш
-        // lock. Повторно проверяем bytes перед тем, как зафиксировать decision.
-        for record in &changed_records {
-            validate_asset(&self.root_handle, record)?;
-        }
-
         report
             .attempts
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         report.blockers.sort();
         report.blockers.dedup();
-        report.changed = changed_records.len();
-        if report.changed > 0 {
-            sort_assets(&mut manifest.assets);
-            manifest.revision = manifest.revision.checked_add(1).ok_or_else(|| {
-                AssetError::new(ErrorCode::ManifestCorrupt, "revision manifest переполнен")
-            })?;
-            #[cfg(test)]
-            save_manifest_with_test_hook(
-                &self.root_handle,
-                &manifest,
-                false,
-                &self.fail_next_manifest_write,
-            )?;
-            #[cfg(not(test))]
-            save_manifest(&self.root_handle, &manifest, false)?;
-        }
+        report.changed = report
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.changed)
+            .count();
+        validate_verified_manifest(&self.root_handle, &load_manifest(&self.root_handle)?)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
         lock.unlock()?;
         Ok(report)
     }
@@ -882,6 +1117,37 @@ fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError>
     }
 }
 
+fn open_or_initialize_runtime(root: &File, store_id: &str) -> Result<File, AssetError> {
+    let runtime = ensure_dir_entry(root, RUNTIME_DIR)?;
+    let names = inspect_top_level(&runtime, ErrorCode::StoreNotOwned)?;
+    if names.is_empty() {
+        ensure_dir_entry(&runtime, ASSETS_DIR)?;
+        ensure_dir_entry(&runtime, TEMP_DIR)?;
+        write_owner_marker(&runtime, store_id)?;
+        save_manifest(&runtime, &Manifest::empty(store_id.to_owned()), true)?;
+    } else {
+        if !names.contains(OWNER_FILE) || !names.contains(MANIFEST_FILE) {
+            return Err(AssetError::new(
+                ErrorCode::StoreNotOwned,
+                "непустой корневой каталог `.runtime` без файлов `.owner.json` и `manifest.json` не принадлежит `asset-store`",
+            ));
+        }
+        let owner = read_owner_marker(&runtime)?;
+        if owner.store_id != store_id {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "значение `store_id` в маркере владельца `.runtime` не совпадает со значением в каноническом манифесте",
+            ));
+        }
+        let manifest = load_runtime_manifest(&runtime, store_id)?;
+        check_schema(&manifest)?;
+        ensure_dir_entry(&runtime, ASSETS_DIR)?;
+        ensure_dir_entry(&runtime, TEMP_DIR)?;
+    }
+    ensure_top_level(&runtime)?;
+    Ok(runtime)
+}
+
 /// Classifies root without creating files or directories.
 fn preflight_root_ownership(root: &File, root_created: bool) -> Result<RootState, AssetError> {
     let names = inspect_top_level(root, ErrorCode::StoreNotOwned)?;
@@ -928,7 +1194,7 @@ fn inspect_top_level(root: &File, unknown_code: ErrorCode) -> Result<BTreeSet<St
         let name = entry.file_name().to_string_lossy().into_owned();
         if !matches!(
             name.as_str(),
-            LOCK_FILE | OWNER_FILE | MANIFEST_FILE | ASSETS_DIR | TEMP_DIR
+            LOCK_FILE | OWNER_FILE | MANIFEST_FILE | ASSETS_DIR | TEMP_DIR | RUNTIME_DIR
         ) {
             return Err(AssetError::new(
                 unknown_code,
@@ -943,7 +1209,7 @@ fn inspect_top_level(root: &File, unknown_code: ErrorCode) -> Result<BTreeSet<St
                 format!("symlink запрещён в store root: {name}"),
             ));
         }
-        if matches!(name.as_str(), ASSETS_DIR | TEMP_DIR) && !metadata.is_dir() {
+        if matches!(name.as_str(), ASSETS_DIR | TEMP_DIR | RUNTIME_DIR) && !metadata.is_dir() {
             return Err(AssetError::new(
                 unknown_code,
                 format!("{name} существует, но не является каталогом"),
@@ -1087,6 +1353,20 @@ fn open_lock_file(root: &File, create_if_missing: bool) -> Result<File, AssetErr
     }
 }
 
+fn ensure_directory_empty(root: &File, name: &str) -> Result<(), AssetError> {
+    let directory =
+        open_directory_at(root, name).map_err(|error| directory_entry_error(name, error))?;
+    let mut entries = fs::read_dir(fd_path(&directory))
+        .map_err(|error| AssetError::io(format!("не удалось прочитать {name}"), error))?;
+    if entries.next().is_some() {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            format!("в публикуемом хранилище остались незавершённые временные файлы в {name}"),
+        ));
+    }
+    Ok(())
+}
+
 fn write_owner_marker(root: &File, store_id: &str) -> Result<(), AssetError> {
     let marker = OwnerMarker {
         schema_version: OWNER_SCHEMA_VERSION,
@@ -1106,6 +1386,26 @@ fn load_manifest(root: &File) -> Result<Manifest, AssetError> {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
             "store_id manifest не совпадает с owner marker",
+        ));
+    }
+    Ok(manifest)
+}
+
+fn load_runtime_manifest(root: &File, store_id: &str) -> Result<Manifest, AssetError> {
+    ensure_top_level(root)?;
+    let owner = read_owner_marker(root)?;
+    if owner.store_id != store_id {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "значение `store_id` в маркере владельца не совпадает со значением в каноническом манифесте",
+        ));
+    }
+    let manifest = read_manifest_file(root)?;
+    check_schema(&manifest)?;
+    if manifest.store_id != store_id {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "значение `store_id` в локальном манифесте не совпадает со значением в каноническом манифесте",
         ));
     }
     Ok(manifest)
@@ -1254,6 +1554,242 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
     Ok(())
 }
 
+fn validate_verified_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
+    validate_manifest(root, manifest)?;
+    if manifest.assets.iter().any(|asset| {
+        asset.lifecycle != LifecycleState::Verified
+            || asset
+                .validation
+                .as_ref()
+                .is_none_or(|decision| decision.status != SemanticStatus::Verified)
+    }) {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "канонический манифест допускает только записи, у которых `lifecycle` и `validation.status` равны `verified`",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_manifest(
+    root: &File,
+    manifest: &Manifest,
+    store_id: &str,
+) -> Result<(), AssetError> {
+    if manifest.store_id != store_id {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "значение `store_id` в локальном манифесте не совпадает со значением в каноническом манифесте",
+        ));
+    }
+    validate_manifest(root, manifest)?;
+    if manifest
+        .assets
+        .iter()
+        .any(|asset| asset.lifecycle == LifecycleState::Verified)
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "локальный манифест не может содержать записи со статусом `verified`",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_publishable_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
+    validate_verified_manifest(root, manifest)?;
+    for asset in &manifest.assets {
+        if asset.identity.namespace != "kanji" || kanji_character(&asset.identity).is_none() {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!(
+                    "публикуемый корпус кандзи содержит чужую идентичность {}",
+                    asset.identity
+                ),
+            ));
+        }
+    }
+    validate_asset_directory_exact(root, manifest)?;
+    Ok(())
+}
+
+fn reconcile_runtime_boundary(
+    root: &File,
+    runtime: &File,
+    canonical_manifest: &Manifest,
+    runtime_manifest: &Manifest,
+) -> Result<(), AssetError> {
+    let mut canonical = canonical_manifest.clone();
+    let mut local = runtime_manifest.clone();
+
+    // Старые версии хранили все состояния жизненного цикла в публикуемом
+    // манифесте. Сначала переносим байты в игнорируемую `.runtime`-область,
+    // затем удаляем прежние записи.
+    let legacy_candidates: Vec<_> = canonical
+        .assets
+        .iter()
+        .filter(|asset| asset.lifecycle != LifecycleState::Verified)
+        .cloned()
+        .collect();
+    for candidate in legacy_candidates {
+        if local
+            .assets
+            .iter()
+            .any(|asset| asset.identity == candidate.identity)
+        {
+            continue;
+        }
+        let source = checked_asset_file(root, &candidate)?;
+        let staged = stage_source(runtime, source)?;
+        commit_asset_record(
+            runtime,
+            &staged,
+            None,
+            &candidate,
+            &mut local,
+            |root, manifest| save_manifest(root, manifest, false),
+        )?;
+    }
+
+    // Совпадающая идентичность в `.runtime` и каноническом манифесте означает,
+    // что перенос в карантин или замена кандидатом прервались. Сохраняем
+    // локальное состояние и завершаем удаление старой опубликованной записи.
+    // Проверка публикации отклоняет такое совпадение до завершения восстановления.
+    let overlaps: Vec<_> = canonical
+        .assets
+        .iter()
+        .filter(|asset| {
+            local
+                .assets
+                .iter()
+                .any(|candidate| candidate.identity == asset.identity)
+        })
+        .cloned()
+        .collect();
+    for previous in overlaps {
+        remove_record_from_area(root, &mut canonical, &previous)?;
+    }
+
+    cleanup_matching_orphans(root, &canonical, &local)?;
+    cleanup_matching_orphans(runtime, &local, &canonical)?;
+    validate_verified_manifest(root, &canonical)?;
+    validate_runtime_manifest(runtime, &local, &canonical.store_id)?;
+    Ok(())
+}
+
+fn cleanup_matching_orphans(
+    area: &File,
+    current: &Manifest,
+    other: &Manifest,
+) -> Result<(), AssetError> {
+    let registered: BTreeSet<_> = current
+        .assets
+        .iter()
+        .map(|asset| asset.storage_path.as_str())
+        .collect();
+    let assets = open_directory_at(area, ASSETS_DIR)
+        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
+    for entry in fs::read_dir(fd_path(&assets))
+        .map_err(|error| AssetError::io("не удалось прочитать каталог `assets`", error))?
+    {
+        let entry = entry.map_err(|error| {
+            AssetError::io("не удалось прочитать запись в каталоге `assets`", error)
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = format!("{ASSETS_DIR}/{name}");
+        if registered.contains(path.as_str()) {
+            continue;
+        }
+        if let Some(record) = other.assets.iter().find(|asset| asset.storage_path == path) {
+            remove_if_hash(
+                &assets,
+                &name,
+                &record.sha256,
+                "запись о незавершённом переносе актива",
+            )?;
+        }
+    }
+    sync_directory(&assets)
+}
+
+fn replace_manifest_record(
+    manifest: &mut Manifest,
+    record: &AssetRecord,
+) -> Result<(), AssetError> {
+    let target = manifest
+        .assets
+        .iter_mut()
+        .find(|asset| asset.identity == record.identity)
+        .ok_or_else(|| {
+            AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!("манифест потерял запись {}", record.identity),
+            )
+        })?;
+    *target = record.clone();
+    sort_assets(&mut manifest.assets);
+    Ok(())
+}
+
+fn save_manifest_revision(
+    root: &File,
+    manifest: &mut Manifest,
+    #[cfg(test)] fail_before_commit: Option<&std::sync::atomic::AtomicBool>,
+    #[cfg(not(test))] _fail_before_commit: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), AssetError> {
+    manifest.revision = manifest.revision.checked_add(1).ok_or_else(|| {
+        AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "поле `revision` в манифесте переполнено",
+        )
+    })?;
+    #[cfg(test)]
+    if let Some(fail_before_commit) = fail_before_commit {
+        return save_manifest_with_test_hook(root, manifest, false, fail_before_commit);
+    }
+    save_manifest(root, manifest, false)
+}
+
+fn remove_record_from_area(
+    root: &File,
+    manifest: &mut Manifest,
+    record: &AssetRecord,
+) -> Result<(), AssetError> {
+    let Some(index) = manifest
+        .assets
+        .iter()
+        .position(|asset| asset.identity == record.identity)
+    else {
+        return Ok(());
+    };
+    if manifest.assets[index].sha256 != record.sha256 {
+        return Err(AssetError::new(
+            ErrorCode::IdentityConflict,
+            format!(
+                "идентичность {} изменилась во время удаления записи жизненного цикла",
+                record.identity
+            ),
+        ));
+    }
+    manifest.assets.remove(index);
+    manifest.revision = manifest.revision.checked_add(1).ok_or_else(|| {
+        AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "поле `revision` в манифесте переполнено",
+        )
+    })?;
+    save_manifest(root, manifest, false)?;
+    let assets = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
+    remove_if_hash(
+        &assets,
+        asset_name(&record.storage_path)?,
+        &record.sha256,
+        "байты удаляемой записи жизненного цикла",
+    )?;
+    sync_directory(&assets)
+}
+
 fn validate_validation_record(
     record: &AssetRecord,
     validation: &ValidationRecord,
@@ -1298,6 +1834,23 @@ fn validate_asset_directory(
     root: &File,
     registered_paths: &BTreeSet<String>,
 ) -> Result<(), AssetError> {
+    validate_asset_directory_impl(root, registered_paths, false)
+}
+
+fn validate_asset_directory_exact(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
+    let registered_paths = manifest
+        .assets
+        .iter()
+        .map(|asset| asset.storage_path.clone())
+        .collect();
+    validate_asset_directory_impl(root, &registered_paths, true)
+}
+
+fn validate_asset_directory_impl(
+    root: &File,
+    registered_paths: &BTreeSet<String>,
+    reject_orphans: bool,
+) -> Result<(), AssetError> {
     let assets = open_directory_at(root, ASSETS_DIR).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AssetError::new(
@@ -1327,6 +1880,12 @@ fn validate_asset_directory(
                 ));
             }
         } else {
+            if reject_orphans {
+                return Err(AssetError::new(
+                    ErrorCode::UnexpectedPath,
+                    format!("незарегистрированный файл в публикуемом корпусе: {name}"),
+                ));
+            }
             let Some(hash) = embedded_content_hash(&name) else {
                 return Err(AssetError::new(
                     ErrorCode::UnexpectedPath,
@@ -1355,6 +1914,12 @@ fn validate_asset_directory(
         return Err(AssetError::new(
             ErrorCode::MissingAssetFile,
             "manifest ссылается на отсутствующий canonical asset",
+        ));
+    }
+    if reject_orphans && !observed_paths.is_subset(registered_paths) {
+        return Err(AssetError::new(
+            ErrorCode::UnexpectedPath,
+            "в публикуемом корпусе есть незарегистрированные байты",
         ));
     }
     // Generic immutable objects can leave a verified-by-hash orphan after a
@@ -1425,7 +1990,7 @@ fn kanji_character(identity: &AssetIdentity) -> Option<char> {
     }
     let mut chars = identity.key.chars();
     let character = chars.next()?;
-    (chars.next().is_none() && !character.is_control() && character != '/' && character != '\\')
+    (chars.next().is_none() && crate::kanji_domain::is_supported_han(character))
         .then_some(character)
 }
 
@@ -1783,7 +2348,10 @@ where
 {
     recover_publications(root)?;
     let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
-        AssetError::new(ErrorCode::ManifestCorrupt, "revision manifest переполнен")
+        AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "поле `revision` в манифесте переполнено",
+        )
     })?;
     let needs_stable_publication = kanji_character(&record.identity).is_some()
         && previous.is_none_or(|asset| {
@@ -1837,7 +2405,7 @@ fn prepare_publication(
     if kanji_character(&next.identity).is_none() {
         return Err(AssetError::new(
             ErrorCode::InvalidIdentity,
-            "stable publication разрешена только для односимвольной kanji identity",
+            "публикация с постоянным именем допустима только для идентичности `kanji` из одного символа",
         ));
     }
     let assets = open_directory_at(root, ASSETS_DIR)

@@ -26,11 +26,14 @@ This repository does not redistribute the TTF. The generated catalog contains
 6,428 normalized 64x64 binary glyph masks for the Unicode characters also
 present in the pinned KanjiVG catalog. `build_yarxi_font_reference.rs` checks
 the source TTF hash before generating these masks with the locked `resvg`
-dependency.
+dependency and the shared `normalize_binary_mask` routine. It crops binary
+foreground bounds, aspect-fits within 56x56, centers the mask in a 64x64 canvas,
+and samples nearest-neighbor pixels from source-cell centers using
+`floor((2 * output_index + 1) * source_size / (2 * output_size))`.
 
 Generated file: yarxi-noto-serif-jp-r1.maskdb.zlib
 Generated file SHA-256:
-  a3a9b1e6c49c89b747e9fe1551425776662e80c670ba19f8daa4160f72733024
+  ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c
 
 To regenerate, obtain the Yarxi source font above and run from the workspace root:
 

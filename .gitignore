@@ -5,8 +5,8 @@
 # репозитория, поэтому build output принадлежит корневому `target/`.
 /target
 
-# Canonical verified kanji corpus сохраняется в Git. Из runtime state остаются
-# локальными только lock и незавершённая временная публикация.
+# В Git попадает только verified-only представление kanji corpus. Candidate и
+# quarantine manifests/bytes лежат в локальном runtime overlay.
 /.asset-store/*
 !/.asset-store/kanji/
 /.asset-store/kanji/*
@@ -16,6 +16,7 @@
 /.asset-store/kanji/assets/*
 !/.asset-store/kanji/assets/*.gif
 !/.asset-store/kanji/assets/*.png
+/.asset-store/kanji/.runtime/
 /.asset-store/kanji/.lock
 /.asset-store/kanji/.tmp/
 

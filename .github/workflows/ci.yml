@@ -53,6 +53,16 @@ jobs:
       - name: Собрать и выполнить тесты
         run: cargo test --workspace --locked
 
+      - name: Проверить verified-only kanji corpus
+        # Ветка без tracked corpus допустима. Если store присутствует (в том числе
+        # как symlink), read-only gate обязан подтвердить verified-only содержимое.
+        run: |
+          if [ -e .asset-store/kanji ] || [ -L .asset-store/kanji ]; then
+            cargo run --quiet --locked --bin kanji-corpus-gate
+          else
+            echo "Канонический kanji corpus отсутствует; проверка пропущена"
+          fi
+
       - name: Проверить найденные CrowdAnki-экспорты
         # Шаг сам находит экспорты внутри `decks/` и ничего не знает о конкретных
         # колодах, уровнях, моделях заметок и именах полей. Отсутствие экспортов —

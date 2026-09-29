@@ -34,6 +34,10 @@ name = "kanji-assets"
 path = "src/main.rs"
 
 [[bin]]
+name = "kanji-corpus-gate"
+path = "src/bin/kanji_corpus_gate.rs"
+
+[[bin]]
 name = "build-kanjivg-reference"
 path = "src/bin/build_kanjivg_reference.rs"
 required-features = ["reference-generator"]

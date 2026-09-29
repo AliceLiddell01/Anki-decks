@@ -9,6 +9,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AssetError, ErrorCode};
+use crate::kanji_domain::parse_kanji_character;
 use crate::kanji_validator::KanjiImageValidator;
 use crate::model::{
     AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, SemanticStatus, ValidationEvidence,
@@ -118,12 +119,7 @@ impl FromStr for KanjiCharacter {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.chars().count() != 1 || value.len() > 4 || value.chars().any(char::is_control) {
-            return Err(
-                "character должен содержать ровно один Unicode scalar без управляющих символов"
-                    .into(),
-            );
-        }
+        parse_kanji_character(value)?;
         Ok(Self(value.to_owned()))
     }
 }
@@ -1068,6 +1064,22 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn kanji_character_accepts_supported_han_and_rejects_other_unicode() {
+        for character in ['漢', '㐀', '𠀀', '𰀀'] {
+            assert_eq!(
+                character.to_string().parse::<KanjiCharacter>(),
+                Ok(KanjiCharacter(character.to_string()))
+            );
+        }
+        for value in ["A", "あ", "😀", "\n", "/", "漢字", ""] {
+            assert!(
+                value.parse::<KanjiCharacter>().is_err(),
+                "неподдерживаемый ввод {value:?} отклоняется"
+            );
+        }
+    }
 
     struct TempDir(PathBuf);
 

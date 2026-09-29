@@ -65,6 +65,15 @@ fn ingest(
         .expect("explicit ingest успешен")
 }
 
+fn asset_path(root: &Path, record: &asset_store::AssetRecord) -> PathBuf {
+    let area = if record.lifecycle == LifecycleState::Verified {
+        root.to_path_buf()
+    } else {
+        root.join(".runtime")
+    };
+    area.join(&record.storage_path)
+}
+
 struct FixedValidator {
     identity: ValidatorIdentity,
     status: SemanticStatus,
@@ -390,6 +399,244 @@ fn verified_ingest_publishes_only_verified_bytes_and_is_idempotent() {
 }
 
 #[test]
+fn pending_and_quarantined_kanji_assets_stay_outside_publishable_tree() {
+    let temp = TempDir::new("runtime-candidates");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    let record = ingest(
+        &store,
+        AssetIdentity::new("kanji", "漢").unwrap(),
+        temp.write("candidate.gif", b"GIF89a pending candidate"),
+    )
+    .asset;
+
+    assert_eq!(record.lifecycle, LifecycleState::Pending);
+    assert!(!root.join("assets/漢.gif").exists());
+    assert!(root.join(".runtime/assets/漢.gif").exists());
+    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+
+    let report = store
+        .validate(
+            SelectionMode::Full,
+            &FixedValidator::new(SemanticStatus::Uncertain),
+        )
+        .expect("candidate quarantine сохраняется в runtime store");
+    assert_eq!(report.changed, 1);
+    let records = store.verify_integrity().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].lifecycle, LifecycleState::Quarantined);
+    assert!(!root.join("assets/漢.gif").exists());
+    assert!(root.join(".runtime/assets/漢.gif").exists());
+    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+}
+
+#[test]
+fn pending_replacement_removes_previous_bytes_from_publishable_tree() {
+    let temp = TempDir::new("pending-replacement");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    let verified = store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("kanji", "文").unwrap(),
+                bytes: b"GIF89a verified old bytes".to_vec(),
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: "old.gif".into(),
+                },
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            },
+            &FixedValidator::new(SemanticStatus::Verified),
+        )
+        .unwrap()
+        .asset
+        .unwrap();
+
+    let replacement = store
+        .ingest(IngestRequest {
+            identity: verified.identity.clone(),
+            source_path: temp.write("replacement.gif", b"GIF89a unvalidated new bytes"),
+            domain_metadata: None,
+            replace_expected_sha256: Some(verified.sha256.clone()),
+        })
+        .unwrap();
+    assert_eq!(replacement.previous.unwrap().sha256, verified.sha256);
+    assert_eq!(replacement.asset.lifecycle, LifecycleState::Pending);
+    assert!(!root.join(&verified.storage_path).exists());
+    assert!(
+        root.join(".runtime")
+            .join(&replacement.asset.storage_path)
+            .exists()
+    );
+    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+}
+
+#[test]
+fn legacy_nonverified_manifest_is_moved_to_runtime_when_store_opens() {
+    let temp = TempDir::new("legacy-runtime-migration");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    let record = ingest(
+        &store,
+        AssetIdentity::new("kanji", "書").unwrap(),
+        temp.write("legacy.gif", b"GIF89a legacy pending bytes"),
+    )
+    .asset;
+    let runtime_asset_path = root.join(".runtime").join(&record.storage_path);
+    let canonical_asset_path = root.join(&record.storage_path);
+    fs::copy(&runtime_asset_path, &canonical_asset_path).unwrap();
+
+    let runtime_manifest_path = root.join(".runtime/manifest.json");
+    let mut runtime_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&runtime_manifest_path).unwrap()).unwrap();
+    let legacy_record = runtime_manifest["assets"][0].clone();
+    runtime_manifest["assets"] = serde_json::json!([]);
+    fs::write(
+        &runtime_manifest_path,
+        serde_json::to_vec_pretty(&runtime_manifest).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&runtime_asset_path).unwrap();
+
+    let canonical_manifest_path = root.join("manifest.json");
+    let mut canonical_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&canonical_manifest_path).unwrap()).unwrap();
+    canonical_manifest["assets"] = serde_json::json!([legacy_record]);
+    fs::write(
+        &canonical_manifest_path,
+        serde_json::to_vec_pretty(&canonical_manifest).unwrap(),
+    )
+    .unwrap();
+    drop(store);
+
+    let reopened = open_store(&root);
+    let records = reopened.verify_integrity().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].lifecycle, LifecycleState::Pending);
+    assert!(!canonical_asset_path.exists());
+    assert!(
+        root.join(".runtime")
+            .join(&records[0].storage_path)
+            .exists()
+    );
+    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+}
+
+#[test]
+fn revalidation_downgrade_atomically_removes_asset_from_publishable_tree() {
+    let temp = TempDir::new("verified-demotion");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    let identity = AssetIdentity::new("kanji", "字").unwrap();
+    let verified = store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: identity.clone(),
+                bytes: b"GIF89a verified fixture".to_vec(),
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: "verified.gif".into(),
+                },
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            },
+            &FixedValidator::new(SemanticStatus::Verified),
+        )
+        .unwrap()
+        .asset
+        .unwrap();
+    assert!(root.join(&verified.storage_path).exists());
+
+    let report = store
+        .validate(
+            SelectionMode::Full,
+            &FixedValidator::new(SemanticStatus::Uncertain),
+        )
+        .expect("неуверенная revalidation уводит bytes в quarantine");
+    assert_eq!(report.changed, 1);
+    let records = store.verify_integrity().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].identity, identity);
+    assert_eq!(records[0].lifecycle, LifecycleState::Quarantined);
+    assert!(!root.join(&verified.storage_path).exists());
+    assert!(root.join(".runtime").join(&verified.storage_path).exists());
+    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+}
+
+#[test]
+fn publishable_gate_rejects_nonverified_records_and_unregistered_bytes() {
+    let nonverified = TempDir::new("publishable-nonverified");
+    let root = nonverified.path().join("store");
+    let store = open_store(&root);
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("kanji", "中").unwrap(),
+                bytes: b"GIF89a verified fixture".to_vec(),
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: "verified.gif".into(),
+                },
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            },
+            &FixedValidator::new(SemanticStatus::Verified),
+        )
+        .unwrap();
+    let manifest_path = root.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["assets"][0]["lifecycle"] = serde_json::json!("pending");
+    manifest["assets"][0]["validation"] = serde_json::Value::Null;
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        AssetStore::verify_publishable_corpus(&root)
+            .unwrap_err()
+            .code,
+        ErrorCode::ManifestCorrupt
+    );
+
+    let orphaned = TempDir::new("publishable-orphan");
+    let orphan_root = orphaned.path().join("store");
+    open_store(&orphan_root);
+    fs::write(orphan_root.join("assets/unregistered.png"), b"orphan bytes").unwrap();
+    assert!(AssetStore::verify_publishable_corpus(&orphan_root).is_err());
+
+    assert!(AssetStore::verify_publishable_corpus(orphaned.path().join("absent")).is_ok());
+}
+
+#[test]
+fn publishable_gate_is_read_only_when_ignored_lock_file_is_absent() {
+    let temp = TempDir::new("publishable-without-lock");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("kanji", "日").unwrap(),
+                bytes: b"GIF89a verified fixture".to_vec(),
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: "verified.gif".into(),
+                },
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            },
+            &FixedValidator::new(SemanticStatus::Verified),
+        )
+        .unwrap();
+
+    fs::remove_file(root.join(".lock")).unwrap();
+    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(!root.join(".lock").exists());
+}
+
+#[test]
 fn kanji_filename_is_stable_across_cas_and_format_changes_without_duplicate_identity() {
     let temp = TempDir::new("kanji-stable-cas");
     let root = temp.path().join("store");
@@ -483,7 +730,7 @@ fn integrity_failures_are_explicit_and_traversal_is_rejected() {
     let store = open_store(&root);
     let source = temp.write("asset.bin", b"integrity fixture");
     let record = ingest(&store, identity("one"), source).asset;
-    let object = root.join(&record.storage_path);
+    let object = asset_path(&root, &record);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -540,14 +787,15 @@ fn absent_file_unsupported_schema_corrupt_json_and_traversal_fail_closed() {
     let root = temp.path().join("store");
     let store = open_store(&root);
     let record = ingest(&store, identity("one"), temp.write("asset.bin", b"payload")).asset;
-    fs::remove_file(root.join(&record.storage_path)).expect("test удаляет owned file");
+    let path = asset_path(&root, &record);
+    fs::remove_file(&path).expect("test удаляет owned file");
     assert_eq!(
         store.verify_integrity().unwrap_err().code,
         ErrorCode::MissingAssetFile
     );
-    fs::write(root.join(&record.storage_path), b"payload").expect("owned file восстанавливается");
+    fs::write(&path, b"payload").expect("owned file восстанавливается");
 
-    let manifest_path = root.join("manifest.json");
+    let manifest_path = root.join(".runtime/manifest.json");
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).expect("manifest читается"))
             .expect("manifest json valid");
@@ -701,7 +949,7 @@ fn symlink_store_root_and_object_symlink_are_rejected() {
         temp.write("asset.bin", b"asset"),
     )
     .asset;
-    let object_path = root.join(&record.storage_path);
+    let object_path = asset_path(&root, &record);
     let external = temp.write("outside.bin", b"outside");
     fs::remove_file(&object_path).expect("owned object удалён для symlink fixture");
     symlink(&external, &object_path).expect("object symlink создаётся");

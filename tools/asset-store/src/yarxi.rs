@@ -1,4 +1,4 @@
-//! Browser provider for the dynamic Yarxi article and its left-hand media.
+//! Browser provider для динамических статей Yarxi и изображений слева от них.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,7 +9,8 @@ use base64::Engine as _;
 use chromiumoxide::{
     Browser, BrowserConfig, Page,
     cdp::browser_protocol::page::{
-        CaptureScreenshotFormat, EnableParams, GetResourceContentParams, GetResourceTreeParams,
+        CaptureScreenshotFormat, EnableParams, GetFrameTreeParams, GetResourceContentParams,
+        GetResourceTreeParams,
     },
     cdp::browser_protocol::{
         emulation::{MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams},
@@ -24,15 +25,19 @@ use futures::StreamExt;
 use image::{GenericImageView, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout_at};
 use url::Url;
 
 const PROVIDER_ID: &str = "yarxi-suu-browser";
-const PROVIDER_VERSION: &str = "6";
+const PROVIDER_VERSION: &str = "7";
 const SITE_URL: &str = "https://www.yarxi.su/";
 const SITE_HOST: &str = "www.yarxi.su";
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const ITEM_TIMEOUT: Duration = Duration::from_secs(90);
+const TLS_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const BATCH_PACING: Duration = Duration::from_millis(900);
+const RETRY_BACKOFF: Duration = Duration::from_millis(300);
+const MAX_ACQUISITION_ATTEMPTS: u8 = 2;
 const CAPTURE_VIEWPORT_WIDTH: i64 = 1280;
 const CAPTURE_VIEWPORT_HEIGHT: i64 = 900;
 const CAPTURE_DEVICE_SCALE_FACTOR: f64 = 2.175;
@@ -46,7 +51,7 @@ const MAX_NETWORK_OUTCOMES: usize = 256;
 const MAX_NETWORK_DIAGNOSTIC_ITEMS: usize = 3;
 const MAX_NETWORK_DIAGNOSTIC_PATH_CHARS: usize = 160;
 
-/// Источник bytes и bounded evidence browser acquisition.
+/// Источник bytes и ограниченный набор evidence при работе браузера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionResult {
@@ -55,8 +60,8 @@ pub enum SelectionResult {
     RenderedFontSamplePng,
 }
 
-/// Explicit acquisition intent. `PreferredSource` is the production default;
-/// `RenderedFontSamplePng` exists for a deliberate browser-render acceptance.
+/// Явный выбор источника. `PreferredSource` используется по умолчанию;
+/// `RenderedFontSamplePng` предназначен для отдельной приёмки browser-render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcquisitionTarget {
@@ -76,7 +81,7 @@ pub struct AcquiredMedia {
     pub evidence: AcquisitionEvidence,
 }
 
-/// Сохраняемое evidence выбора источника, без browser/session state.
+/// Сохраняемое evidence выбора источника без состояния браузера и сеанса.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcquisitionEvidence {
@@ -91,9 +96,57 @@ pub struct AcquisitionEvidence {
     pub fallback_absence_proof: Option<String>,
     pub rendered_font_sample: Option<RenderedFontSampleEvidence>,
     pub source_url: String,
+    #[serde(default)]
+    pub browser_runtime: Option<BrowserRuntimeProvenance>,
+    #[serde(default)]
+    pub tls_exception: Option<TlsExceptionProvenance>,
+    #[serde(default = "one_acquisition_attempt")]
+    pub acquisition_attempts: u8,
 }
 
-/// Evidence for a PNG rasterized from one visible Yarxi font sample DOM element.
+fn one_acquisition_attempt() -> u8 {
+    1
+}
+
+/// Версия browser runtime, влияющая на raster; локальные пути не сохраняются.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRuntimeProvenance {
+    pub product: String,
+    pub protocol_version: String,
+    pub revision: String,
+    pub user_agent: String,
+    pub js_version: String,
+    pub executable_source: BrowserExecutableSource,
+}
+
+/// Способ выбора browser executable без сохранения абсолютного пути.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserExecutableSource {
+    ChromeBinEnvironment,
+    ChromiumBinEnvironment,
+    PathLookup,
+    PlaywrightCache,
+    ChromiumoxideDefault,
+}
+
+/// Принятое по явному флагу TLS-исключение для точного host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsExceptionProvenance {
+    pub host: String,
+    pub error_code: String,
+}
+
+#[derive(Debug, Clone)]
+struct ApprovedTlsException {
+    request_id: String,
+    blocked_url: String,
+    provenance: TlsExceptionProvenance,
+}
+
+/// Evidence PNG, созданного рендерингом видимого DOM-элемента font-sample Yarxi.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenderedFontSampleEvidence {
@@ -142,7 +195,7 @@ pub struct CssRect {
     pub height: f64,
 }
 
-/// Чёткое состояние primary GIF для policy/fake tests.
+/// Чёткое состояние primary GIF для проверки политики и fake-тестов.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrimaryGifState {
     PresentLoaded { url: String },
@@ -162,6 +215,8 @@ struct ImageElementState {
 struct NetworkRequestState {
     resource_type: ResourceType,
     url: String,
+    epoch: u64,
+    is_top_level: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +224,10 @@ struct NetworkOutcome {
     resource_type: ResourceType,
     url: Option<String>,
     failure_reason: Option<String>,
+    request_id: String,
+    epoch: u64,
+    status_code: Option<u16>,
+    is_top_level: bool,
 }
 
 #[derive(Debug, Default)]
@@ -176,8 +235,11 @@ struct BrowserRuntimeEvidence {
     relevant_requests: HashMap<String, NetworkRequestState>,
     network_failures: Vec<NetworkOutcome>,
     http_errors: Vec<NetworkOutcome>,
-    javascript_exceptions: u32,
+    javascript_exceptions: HashMap<u64, u32>,
     monitor_failed: bool,
+    main_frame_id: String,
+    active_epoch: u64,
+    next_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,11 +252,18 @@ struct RuntimeReadiness {
 }
 
 impl BrowserRuntimeEvidence {
-    fn readiness(&self, excluded_primary_gif: Option<&str>) -> RuntimeReadiness {
+    fn begin_acquisition(&mut self) -> u64 {
+        self.next_epoch = self.next_epoch.saturating_add(1).max(1);
+        self.active_epoch = self.next_epoch;
+        self.active_epoch
+    }
+
+    fn readiness(&self, epoch: u64, excluded_primary_gif: Option<&str>) -> RuntimeReadiness {
         RuntimeReadiness {
             pending_relevant_requests: self
                 .relevant_requests
                 .values()
+                .filter(|request| request_in_scope(request.epoch, epoch))
                 .filter(|request| {
                     request.resource_type != ResourceType::Image
                         || Some(request.url.as_str()) != excluded_primary_gif
@@ -203,23 +272,30 @@ impl BrowserRuntimeEvidence {
             network_failures: self
                 .network_failures
                 .iter()
+                .filter(|failure| request_in_scope(failure.epoch, epoch))
                 .filter(|failure| !is_excluded_primary_gif(failure, excluded_primary_gif))
                 .count() as u32,
             http_errors: self
                 .http_errors
                 .iter()
+                .filter(|failure| request_in_scope(failure.epoch, epoch))
                 .filter(|failure| !is_excluded_primary_gif(failure, excluded_primary_gif))
                 .count() as u32,
-            javascript_exceptions: self.javascript_exceptions,
+            javascript_exceptions: self.javascript_exceptions_for(epoch),
             monitor_failed: self.monitor_failed,
         }
     }
 
-    fn font_sample_readiness(&self, selected_image_urls: &HashSet<String>) -> RuntimeReadiness {
+    fn font_sample_readiness(
+        &self,
+        epoch: u64,
+        selected_image_urls: &HashSet<String>,
+    ) -> RuntimeReadiness {
         RuntimeReadiness {
             pending_relevant_requests: self
                 .relevant_requests
                 .values()
+                .filter(|request| request_in_scope(request.epoch, epoch))
                 .filter(|request| {
                     is_relevant_font_sample_resource(
                         &request.resource_type,
@@ -231,6 +307,7 @@ impl BrowserRuntimeEvidence {
             network_failures: self
                 .network_failures
                 .iter()
+                .filter(|failure| request_in_scope(failure.epoch, epoch))
                 .filter(|failure| {
                     is_relevant_font_sample_resource(
                         &failure.resource_type,
@@ -242,6 +319,7 @@ impl BrowserRuntimeEvidence {
             http_errors: self
                 .http_errors
                 .iter()
+                .filter(|failure| request_in_scope(failure.epoch, epoch))
                 .filter(|failure| {
                     is_relevant_font_sample_resource(
                         &failure.resource_type,
@@ -250,10 +328,107 @@ impl BrowserRuntimeEvidence {
                     )
                 })
                 .count() as u32,
-            javascript_exceptions: self.javascript_exceptions,
+            javascript_exceptions: self.javascript_exceptions_for(epoch),
             monitor_failed: self.monitor_failed,
         }
     }
+
+    fn javascript_exceptions_for(&self, epoch: u64) -> u32 {
+        self.javascript_exceptions
+            .get(&0)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(self.javascript_exceptions.get(&epoch).copied().unwrap_or(0))
+    }
+
+    fn record_javascript_exception(&mut self) {
+        let current = self
+            .javascript_exceptions
+            .entry(self.active_epoch)
+            .or_default();
+        *current = current.saturating_add(1);
+        if self.javascript_exceptions.len() > MAX_NETWORK_OUTCOMES {
+            self.monitor_failed = true;
+        }
+    }
+
+    fn retryable_failures_only(&self, epoch: u64) -> bool {
+        self.retryable_failure_state(epoch, true)
+    }
+
+    fn retryable_timeout(&self, epoch: u64) -> bool {
+        self.retryable_failure_state(epoch, false)
+    }
+
+    fn retryable_failure_state(&self, epoch: u64, require_failure: bool) -> bool {
+        let network_failures: Vec<_> = self
+            .network_failures
+            .iter()
+            .filter(|failure| failure.epoch == epoch)
+            .collect();
+        let http_errors: Vec<_> = self
+            .http_errors
+            .iter()
+            .filter(|failure| failure.epoch == epoch)
+            .collect();
+        let bootstrap_failure = self
+            .network_failures
+            .iter()
+            .any(|failure| failure.epoch == 0)
+            || self.http_errors.iter().any(|failure| failure.epoch == 0)
+            || self.javascript_exceptions.get(&0).copied().unwrap_or(0) > 0;
+        !self.monitor_failed
+            && !bootstrap_failure
+            && self.javascript_exceptions.get(&epoch).copied().unwrap_or(0) == 0
+            && (!require_failure || !network_failures.is_empty() || !http_errors.is_empty())
+            && network_failures.iter().all(|failure| {
+                failure
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(is_retryable_network_error)
+            })
+            && http_errors
+                .iter()
+                .all(|failure| failure.status_code.is_some_and(is_retryable_http_status))
+    }
+}
+
+fn request_in_scope(request_epoch: u64, requested_epoch: u64) -> bool {
+    request_epoch == 0 || request_epoch == requested_epoch
+}
+
+fn is_retryable_http_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+fn is_retryable_network_error(reason: &str) -> bool {
+    matches!(
+        reason.trim().to_ascii_uppercase().as_str(),
+        "NET::ERR_TIMED_OUT"
+            | "ERR_TIMED_OUT"
+            | "NET::ERR_CONNECTION_RESET"
+            | "ERR_CONNECTION_RESET"
+            | "NET::ERR_CONNECTION_CLOSED"
+            | "ERR_CONNECTION_CLOSED"
+            | "NET::ERR_CONNECTION_REFUSED"
+            | "ERR_CONNECTION_REFUSED"
+            | "NET::ERR_NETWORK_CHANGED"
+            | "ERR_NETWORK_CHANGED"
+            | "NET::ERR_ABORTED"
+            | "ERR_ABORTED"
+    )
+}
+
+fn is_expected_yarxi_tls_url(raw_url: &str) -> bool {
+    Url::parse(raw_url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(SITE_HOST))
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 fn is_relevant_font_sample_resource(
@@ -275,7 +450,7 @@ fn is_excluded_primary_gif(outcome: &NetworkOutcome, excluded_primary_gif: Optio
 
 fn sanitized_network_location(raw_url: &str) -> String {
     let Ok(url) = Url::parse(raw_url) else {
-        return "<unparseable URL>".into();
+        return "<URL не удалось разобрать>".into();
     };
     if !matches!(url.scheme(), "http" | "https") || !url.origin().is_tuple() {
         return format!("<{} resource>", url.scheme());
@@ -298,14 +473,14 @@ fn sanitized_network_location(raw_url: &str) -> String {
 fn sanitized_network_failure_reason(raw_reason: &str) -> String {
     let upper = raw_reason.trim().to_ascii_uppercase();
     let Some(suffix) = upper.strip_prefix("NET::ERR_") else {
-        return "unclassified network error".into();
+        return "не классифицированная сетевая ошибка".into();
     };
     if suffix.is_empty()
         || !suffix
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
     {
-        return "unclassified network error".into();
+        return "не классифицированная сетевая ошибка".into();
     }
     format!("net::ERR_{suffix}")
 }
@@ -317,35 +492,96 @@ struct BrowserEvidenceMonitor {
 }
 
 impl BrowserEvidenceMonitor {
-    fn readiness(&self, excluded_primary_gif: Option<&str>) -> RuntimeReadiness {
+    fn begin_acquisition(&self) -> u64 {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .readiness(excluded_primary_gif)
+            .begin_acquisition()
     }
 
-    fn font_sample_readiness(&self, selected_image_urls: &HashSet<String>) -> RuntimeReadiness {
+    fn readiness(&self, epoch: u64, excluded_primary_gif: Option<&str>) -> RuntimeReadiness {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .font_sample_readiness(selected_image_urls)
+            .readiness(epoch, excluded_primary_gif)
     }
 
-    fn clear_explicitly_approved_tls_interstitial_failure(&self) {
+    fn font_sample_readiness(
+        &self,
+        epoch: u64,
+        selected_image_urls: &HashSet<String>,
+    ) -> RuntimeReadiness {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .font_sample_readiness(epoch, selected_image_urls)
+    }
+
+    fn tls_navigation_failure(&self) -> Option<NetworkOutcome> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .network_failures
+            .iter()
+            .rev()
+            .find(|failure| {
+                failure.epoch == 0
+                    && failure.resource_type == ResourceType::Document
+                    && failure.is_top_level
+                    && failure
+                        .url
+                        .as_deref()
+                        .is_some_and(is_expected_yarxi_tls_url)
+                    && failure.failure_reason.as_deref().is_some_and(|reason| {
+                        reason.eq_ignore_ascii_case("net::ERR_CERT_AUTHORITY_INVALID")
+                    })
+            })
+            .cloned()
+    }
+
+    fn clear_explicitly_approved_tls_interstitial_failure(
+        &self,
+        request_id: &str,
+        blocked_url: &str,
+    ) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .network_failures
             .retain(|failure| {
-                !(failure.resource_type == ResourceType::Document
-                    && failure.url.as_deref() == Some(SITE_URL)
+                !(failure.epoch == 0
+                    && failure.resource_type == ResourceType::Document
+                    && failure.is_top_level
+                    && failure.request_id == request_id
+                    && failure.url.as_deref() == Some(blocked_url)
                     && failure.failure_reason.as_deref().is_some_and(|reason| {
                         reason.eq_ignore_ascii_case("net::ERR_CERT_AUTHORITY_INVALID")
                     }))
             });
     }
 
-    fn network_failure_details(&self, excluded_primary_gif: Option<&str>) -> String {
+    fn retryable_failures_only(&self, epoch: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retryable_failures_only(epoch)
+    }
+
+    fn retryable_timeout(&self, epoch: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retryable_timeout(epoch)
+    }
+
+    fn monitor_failed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .monitor_failed
+    }
+
+    fn network_failure_details(&self, epoch: u64, excluded_primary_gif: Option<&str>) -> String {
         let state = self
             .state
             .lock()
@@ -353,10 +589,11 @@ impl BrowserEvidenceMonitor {
         let failures: Vec<_> = state
             .network_failures
             .iter()
+            .filter(|failure| request_in_scope(failure.epoch, epoch))
             .filter(|failure| !is_excluded_primary_gif(failure, excluded_primary_gif))
             .collect();
         if failures.is_empty() {
-            return "none".into();
+            return "нет".into();
         }
         let mut details = failures
             .iter()
@@ -366,25 +603,29 @@ impl BrowserEvidenceMonitor {
                     .url
                     .as_deref()
                     .map(sanitized_network_location)
-                    .unwrap_or_else(|| "<url unavailable>".into());
+                    .unwrap_or_else(|| "<URL недоступен>".into());
                 let reason = failure
                     .failure_reason
                     .as_deref()
                     .map(sanitized_network_failure_reason)
-                    .unwrap_or_else(|| "unclassified network error".into());
+                    .unwrap_or_else(|| "не классифицированная сетевая ошибка".into());
                 format!("{:?} {location} {reason}", failure.resource_type)
             })
             .collect::<Vec<_>>();
         if failures.len() > MAX_NETWORK_DIAGNOSTIC_ITEMS {
             details.push(format!(
-                "+{} more network failures",
+                "ещё сетевых ошибок: {}",
                 failures.len() - MAX_NETWORK_DIAGNOSTIC_ITEMS
             ));
         }
         details.join("; ")
     }
 
-    fn font_sample_network_failure_details(&self, selected_image_urls: &HashSet<String>) -> String {
+    fn font_sample_network_failure_details(
+        &self,
+        epoch: u64,
+        selected_image_urls: &HashSet<String>,
+    ) -> String {
         let state = self
             .state
             .lock()
@@ -392,6 +633,7 @@ impl BrowserEvidenceMonitor {
         let failures: Vec<_> = state
             .network_failures
             .iter()
+            .filter(|failure| request_in_scope(failure.epoch, epoch))
             .filter(|failure| {
                 is_relevant_font_sample_resource(
                     &failure.resource_type,
@@ -401,7 +643,7 @@ impl BrowserEvidenceMonitor {
             })
             .collect();
         if failures.is_empty() {
-            return "none".into();
+            return "нет".into();
         }
         let mut details = failures
             .iter()
@@ -411,28 +653,34 @@ impl BrowserEvidenceMonitor {
                     .url
                     .as_deref()
                     .map(sanitized_network_location)
-                    .unwrap_or_else(|| "<url unavailable>".into());
+                    .unwrap_or_else(|| "<URL недоступен>".into());
                 let reason = failure
                     .failure_reason
                     .as_deref()
                     .map(sanitized_network_failure_reason)
-                    .unwrap_or_else(|| "unclassified network error".into());
+                    .unwrap_or_else(|| "не классифицированная сетевая ошибка".into());
                 format!("{:?} {location} {reason}", failure.resource_type)
             })
             .collect::<Vec<_>>();
         if failures.len() > MAX_NETWORK_DIAGNOSTIC_ITEMS {
             details.push(format!(
-                "+{} more network failures",
+                "ещё сетевых ошибок: {}",
                 failures.len() - MAX_NETWORK_DIAGNOSTIC_ITEMS
             ));
         }
         details.join("; ")
     }
 
-    fn abort(self) {
-        for task in self.tasks {
+    fn abort(&self) {
+        for task in &self.tasks {
             task.abort();
         }
+    }
+}
+
+impl Drop for BrowserEvidenceMonitor {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -451,9 +699,9 @@ fn classify_primary_state(
         }
         return PrimaryGifState::Unknown {
             reason: if image.complete {
-                "primary GIF exists but natural dimensions are zero (failed load)".into()
+                "элемент primary GIF есть, но загрузка завершилась без естественных размеров".into()
             } else {
-                "primary GIF element exists and is still loading".into()
+                "элемент primary GIF существует, загрузка ещё не завершена".into()
             },
         };
     }
@@ -465,7 +713,7 @@ fn classify_primary_state(
     if information_area_ready && dom_stable && all_images_complete {
         PrimaryGifState::AbsentConfirmed {
             proof: format!(
-                "information area ready; article Unicode exact; all DOM images complete; DOM stable for 2 seconds; no img.kakijun-gif; CDP Network/Runtime clean (pending={}, failed={}, HTTP errors={}, JS exceptions={})",
+                "область информации готова; Unicode статьи совпадает; все DOM-изображения загружены; DOM стабилен 2 секунды; img.kakijun-gif отсутствует; CDP Network/Runtime чисты (ожидают={}, ошибок сети={}, HTTP-ошибок={}, JS-исключений={})",
                 runtime.pending_relevant_requests,
                 runtime.network_failures,
                 runtime.http_errors,
@@ -474,7 +722,8 @@ fn classify_primary_state(
         }
     } else {
         PrimaryGifState::Unknown {
-            reason: "information/media area is not yet complete and stable".into(),
+            reason: "область информации или media ещё не завершила загрузку и не стабилизировалась"
+                .into(),
         }
     }
 }
@@ -489,7 +738,7 @@ fn runtime_is_clean(runtime: RuntimeReadiness) -> bool {
 
 fn runtime_failure_reason(runtime: RuntimeReadiness) -> String {
     format!(
-        "network/runtime path is not clean (monitor_failed={}, pending={}, failed={}, HTTP errors={}, JS exceptions={})",
+        "сетевая/runtime-среда не чиста (monitor_failed={}, ожидают={}, сетевых ошибок={}, HTTP-ошибок={}, JS-исключений={})",
         runtime.monitor_failed,
         runtime.pending_relevant_requests,
         runtime.network_failures,
@@ -511,8 +760,8 @@ enum MediaSourceChoice {
     },
 }
 
-/// Выбирает raw image bytes или точный видимый font sample как PNG raster.
-/// Right-side kakijun URL никогда не входит в допустимые источники.
+/// Выбирает исходные image bytes или PNG, отрендеренный из точного видимого font-sample.
+/// URL Kakijun справа никогда не используется как источник.
 #[cfg(test)]
 fn choose_media_source(
     primary: PrimaryGifState,
@@ -547,7 +796,9 @@ fn choose_media_source_for_target(
                 absence_proof: None,
             })
         }
-        PrimaryGifState::PresentLoaded { .. } => unreachable!("preferred GIF returned above"),
+        PrimaryGifState::PresentLoaded { .. } => {
+            unreachable!("ветка для primary GIF обработана выше")
+        }
         PrimaryGifState::AbsentConfirmed { proof } => {
             let sample = choose_font_sample(font_samples, expected_character)?;
             if let Some(image) = sample.images.first() {
@@ -612,8 +863,8 @@ fn choose_font_sample(
         })
 }
 
-/// Выполняет один изолированный browser batch. Certificate interstitial можно
-/// пропустить только при явном флаге, только на точном host Yarxi.
+/// Выполняет изолированный browser batch. TLS interstitial можно
+/// пропустить только с явным флагом и только для точного host Yarxi.
 pub fn acquire_many(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -625,9 +876,9 @@ pub fn acquire_many(
     )
 }
 
-/// Acquires media with an explicitly selected source policy. Acceptance tools
-/// may request a rendered font-sample PNG; regular callers should use
-/// [`acquire_many`] and retain the primary-GIF preference.
+/// Получает media с явно выбранной политикой источника. Инструменты приёмки
+/// могут запросить PNG из font-sample; обычные вызовы используют [`acquire_many`]
+/// с предпочтением primary GIF.
 pub fn acquire_many_with_target(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -636,7 +887,7 @@ pub fn acquire_many_with_target(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|error| format!("browser runtime: {error}"))?;
+        .map_err(|error| format!("среда browser runtime: {error}"))?;
     runtime
         .block_on(async move { acquire_many_async(characters, allow_insecure_tls, target).await })
 }
@@ -646,20 +897,34 @@ async fn acquire_many_async(
     allow_insecure_tls: bool,
     target: AcquisitionTarget,
 ) -> Result<Vec<Result<AcquiredMedia, String>>, String> {
+    if characters.is_empty() {
+        return Ok(Vec::new());
+    }
+    for character in characters {
+        crate::kanji_domain::parse_kanji_character(character)
+            .map_err(|error| format!("invalid_kanji_identity: {error}"))?;
+    }
+
+    let session_deadline = Instant::now() + OPERATION_TIMEOUT;
+    let executable = find_browser_executable();
+    let executable_source = executable
+        .as_ref()
+        .map(|selection| selection.source)
+        .unwrap_or(BrowserExecutableSource::ChromiumoxideDefault);
     let mut config = BrowserConfig::builder()
         .incognito()
         .respect_https_errors()
         .launch_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_secs(30));
-    if let Some(executable) = find_browser_executable() {
-        config = config.chrome_executable(executable);
+    if let Some(executable) = executable {
+        config = config.chrome_executable(executable.path);
     }
     let config = config
         .build()
-        .map_err(|error| format!("browser config: {error}"))?;
+        .map_err(|error| format!("настройка browser: {error}"))?;
     let (mut browser, mut handler) = Browser::launch(config)
         .await
-        .map_err(|error| format!("browser launch: {error}"))?;
+        .map_err(|error| format!("запуск browser: {error}"))?;
     let handler_task = tokio::spawn(async move {
         while let Some(event) = handler.next().await {
             if event.is_err() {
@@ -668,11 +933,23 @@ async fn acquire_many_async(
         }
     });
 
-    let operation = timeout(OPERATION_TIMEOUT, async {
+    let setup_result = timeout_at(session_deadline, async {
+        let version = browser
+            .version()
+            .await
+            .map_err(|error| format!("CDP Browser.getVersion: {error}"))?;
+        let browser_runtime = BrowserRuntimeProvenance {
+            product: version.product,
+            protocol_version: version.protocol_version,
+            revision: version.revision,
+            user_agent: version.user_agent,
+            js_version: version.js_version,
+            executable_source,
+        };
         let page = browser
             .new_page("about:blank")
             .await
-            .map_err(|error| format!("browser page: {error}"))?;
+            .map_err(|error| format!("создание browser page: {error}"))?;
         page.execute(EnableParams::default())
             .await
             .map_err(|error| format!("CDP Page.enable: {error}"))?;
@@ -692,37 +969,46 @@ async fn acquire_many_async(
         .await
         .map_err(|error| format!("CDP Emulation.setEmulatedMedia: {error}"))?;
         let evidence_monitor = start_browser_evidence_monitor(&page).await?;
-        let tls_interstitial_approved = match page.goto(SITE_URL).await {
+        let tls_exception = match page.goto(SITE_URL).await {
             Err(error) => {
-                async_error_or_tls_interstitial(&page, allow_insecure_tls, error).await?;
-                true
+                Some(
+                    async_error_or_tls_interstitial(
+                        &page,
+                        &evidence_monitor,
+                        allow_insecure_tls,
+                        error,
+                    )
+                    .await?,
+                )
             }
             Ok(_) => {
                 let tls_probe: Value = page
                     .evaluate("() => ({ code: document.querySelector('#error-code')?.textContent?.trim() || '', proceed: Boolean(document.querySelector('#proceed-link')) })")
                     .await
-                    .map_err(|error| format!("TLS page check: {error}"))?
+                    .map_err(|error| format!("проверка TLS-страницы: {error}"))?
                     .into_value()
-                    .map_err(|error| format!("TLS page check result: {error}"))?;
+                    .map_err(|error| format!("ответ проверки TLS-страницы: {error}"))?;
                 if !tls_probe["code"].as_str().unwrap_or_default().is_empty() {
-                    async_error_or_tls_interstitial(
-                        &page,
-                        allow_insecure_tls,
-                        tls_probe["code"].as_str().unwrap_or_default(),
+                    Some(
+                        async_error_or_tls_interstitial(
+                            &page,
+                            &evidence_monitor,
+                            allow_insecure_tls,
+                            tls_probe["code"].as_str().unwrap_or_default(),
+                        )
+                        .await?,
                     )
-                    .await?;
-                    true
                 } else {
-                    false
+                    None
                 }
             }
         };
         let site_host: bool = page
             .evaluate(format!("location.hostname === {SITE_HOST:?}"))
             .await
-            .map_err(|error| format!("Yarxi host check: {error}"))?
+            .map_err(|error| format!("проверка host Yarxi: {error}"))?
             .into_value()
-            .map_err(|error| format!("Yarxi host check result: {error}"))?;
+            .map_err(|error| format!("ответ проверки host Yarxi: {error}"))?;
         if !site_host {
             return Err("provider_host_mismatch: загрузка ушла с www.yarxi.su".into());
         }
@@ -730,43 +1016,306 @@ async fn acquire_many_async(
             "Boolean([...document.querySelectorAll('.kanji-search-form input[placeholder=\"Чтение\"]')].find(node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden'))"
         })
         .await?;
-        if tls_interstitial_approved {
-            evidence_monitor.clear_explicitly_approved_tls_interstitial_failure();
+        if let Some(approved) = &tls_exception {
+            evidence_monitor.clear_explicitly_approved_tls_interstitial_failure(
+                &approved.request_id,
+                &approved.blocked_url,
+            );
         }
         if target == AcquisitionTarget::RenderedFontSamplePng {
             apply_dark_theme(&page).await?;
         }
-
-        let mut outcomes = Vec::with_capacity(characters.len());
-        for (index, character) in characters.iter().enumerate() {
-            if index > 0 {
-                sleep(BATCH_PACING).await;
-            }
-            outcomes.push(acquire_one(&page, character, target, &evidence_monitor).await);
-        }
-        evidence_monitor.abort();
-        Ok::<_, String>(outcomes)
+        Ok::<_, String>((page, evidence_monitor, tls_exception, browser_runtime))
     })
     .await
-    .map_err(|_| "browser operation timeout".to_owned())
+    .map_err(|_| "browser_setup_timeout: истёк срок подготовки сеанса браузера".to_owned())
     .and_then(|result| result);
 
-    let close_result = browser.close().await;
-    handler_task.abort();
-    if let Err(error) = close_result
-        && operation.is_ok()
-    {
-        return Err(format!("browser cleanup: {error}"));
+    let (page, evidence_monitor, tls_exception, browser_runtime) = match setup_result {
+        Ok(setup) => setup,
+        Err(error) => {
+            let _ = timeout_at(Instant::now() + Duration::from_secs(2), browser.close()).await;
+            handler_task.abort();
+            return Err(error);
+        }
+    };
+
+    let mut outcomes = Vec::with_capacity(characters.len());
+    for (index, character) in characters.iter().enumerate() {
+        if index > 0
+            && timeout_at(session_deadline, sleep(BATCH_PACING))
+                .await
+                .is_err()
+        {
+            append_session_deadline_outcomes(&mut outcomes, characters.len() - index);
+            break;
+        }
+        if Instant::now() >= session_deadline {
+            append_session_deadline_outcomes(&mut outcomes, characters.len() - index);
+            break;
+        }
+        let (outcome, stop_reason) = acquire_one_with_retries(
+            &page,
+            character,
+            target,
+            &evidence_monitor,
+            &browser_runtime,
+            tls_exception
+                .as_ref()
+                .map(|approved| approved.provenance.clone()),
+            session_deadline,
+        )
+        .await;
+        outcomes.push(outcome);
+        if let Some(stop_reason) = stop_reason {
+            append_batch_stopped_outcomes(
+                &mut outcomes,
+                characters.len().saturating_sub(index + 1),
+                &stop_reason,
+            );
+            break;
+        }
     }
-    operation
+    evidence_monitor.abort();
+    let _ = timeout_at(Instant::now() + Duration::from_secs(2), browser.close()).await;
+    handler_task.abort();
+    Ok(outcomes)
 }
 
-fn find_browser_executable() -> Option<PathBuf> {
-    for variable in ["CHROME_BIN", "CHROMIUM_BIN"] {
+fn append_session_deadline_outcomes<T>(outcomes: &mut Vec<Result<T, String>>, count: usize) {
+    append_batch_stopped_outcomes(outcomes, count, &BatchStopReason::SessionDeadline);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchStopReason {
+    SessionDeadline,
+    ItemTimeout,
+    RetryRecoveryFailed(String),
+}
+
+fn append_batch_stopped_outcomes<T>(
+    outcomes: &mut Vec<Result<T, String>>,
+    count: usize,
+    reason: &BatchStopReason,
+) {
+    let error = match reason {
+        BatchStopReason::SessionDeadline => {
+            "browser_session_deadline: общий срок пакета истёк".to_owned()
+        }
+        BatchStopReason::ItemTimeout => "browser_batch_stopped_after_item_timeout: обработка предыдущего символа отменена по timeout; сеанс браузера остановлен, чтобы поздний ответ не изменил страницу".to_owned(),
+        BatchStopReason::RetryRecoveryFailed(detail) => format!(
+            "browser_batch_stopped_after_retry_recovery_failure: не удалось безопасно восстановить страницу: {detail}"
+        ),
+    };
+    outcomes.extend((0..count).map(|_| Err(error.clone())));
+}
+
+async fn acquire_one_with_retries(
+    page: &Page,
+    character: &str,
+    target: AcquisitionTarget,
+    evidence_monitor: &BrowserEvidenceMonitor,
+    browser_runtime: &BrowserRuntimeProvenance,
+    tls_exception: Option<TlsExceptionProvenance>,
+    session_deadline: Instant,
+) -> (Result<AcquiredMedia, String>, Option<BatchStopReason>) {
+    for attempt in 1..=MAX_ACQUISITION_ATTEMPTS {
+        if Instant::now() >= session_deadline {
+            return (
+                Err("browser_session_deadline: общий срок пакета истёк".into()),
+                Some(BatchStopReason::SessionDeadline),
+            );
+        }
+        let epoch = evidence_monitor.begin_acquisition();
+        let item_deadline = (Instant::now() + ITEM_TIMEOUT).min(session_deadline);
+        let acquisition = timeout_at(
+            item_deadline,
+            acquire_one(
+                page,
+                character,
+                target,
+                epoch,
+                evidence_monitor,
+                browser_runtime,
+                tls_exception.clone(),
+            ),
+        )
+        .await;
+        let (result, timed_out) = match acquisition {
+            Ok(result) => (result, false),
+            Err(_) if Instant::now() >= session_deadline => {
+                return (
+                    Err("browser_session_deadline: общий срок пакета истёк".into()),
+                    Some(BatchStopReason::SessionDeadline),
+                );
+            }
+            Err(_) => (
+                Err("browser_item_timeout: превышен ограниченный срок обработки символа".into()),
+                true,
+            ),
+        };
+
+        match result {
+            Ok(mut media) => {
+                media.evidence.acquisition_attempts = attempt;
+                return (Ok(media), None);
+            }
+            Err(error) => {
+                if should_retry_acquisition(&error, evidence_monitor, epoch, attempt) {
+                    if timeout_at(session_deadline, sleep(RETRY_BACKOFF))
+                        .await
+                        .is_err()
+                    {
+                        return (
+                            Err("browser_session_deadline: общий срок пакета истёк".into()),
+                            Some(BatchStopReason::SessionDeadline),
+                        );
+                    }
+                    let recovery_deadline = (Instant::now()
+                        + ITEM_TIMEOUT.min(Duration::from_secs(30)))
+                    .min(session_deadline);
+                    match timeout_at(
+                        recovery_deadline,
+                        recover_page_for_retry(page, target, evidence_monitor, recovery_deadline),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Err(_) if Instant::now() >= session_deadline => {
+                            return (
+                                Err("browser_session_deadline: общий срок пакета истёк при восстановлении страницы".into()),
+                                Some(BatchStopReason::SessionDeadline),
+                            );
+                        }
+                        Ok(Err(recovery_error)) => {
+                            return (
+                                Err(format!(
+                                    "{error}; browser_retry_recovery_failed: {recovery_error}"
+                                )),
+                                Some(BatchStopReason::RetryRecoveryFailed(recovery_error)),
+                            );
+                        }
+                        Err(_) => {
+                            let error = "восстановление страницы превысило ограниченный срок";
+                            return (
+                                Err(format!("{error}; browser_retry_recovery_failed")),
+                                Some(BatchStopReason::RetryRecoveryFailed(error.to_owned())),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if timed_out {
+                    return (Err(error), Some(BatchStopReason::ItemTimeout));
+                }
+                return (Err(error), None);
+            }
+        }
+    }
+    (
+        Err("browser_retry_exhausted: лимит попыток acquisition исчерпан".into()),
+        None,
+    )
+}
+
+fn is_retryable_acquisition_error(
+    error: &str,
+    evidence_monitor: &BrowserEvidenceMonitor,
+    epoch: u64,
+) -> bool {
+    !evidence_monitor.monitor_failed()
+        && ((error.starts_with("browser_item_timeout:")
+            && evidence_monitor.retryable_timeout(epoch))
+            || error.starts_with("browser_readiness_timeout:")
+            || (error.starts_with("browser_network_runtime_failure:")
+                && evidence_monitor.retryable_failures_only(epoch)))
+}
+
+fn should_retry_acquisition(
+    error: &str,
+    evidence_monitor: &BrowserEvidenceMonitor,
+    epoch: u64,
+    attempt: u8,
+) -> bool {
+    attempt < MAX_ACQUISITION_ATTEMPTS
+        && is_retryable_acquisition_error(error, evidence_monitor, epoch)
+}
+
+async fn recover_page_for_retry(
+    page: &Page,
+    target: AcquisitionTarget,
+    evidence_monitor: &BrowserEvidenceMonitor,
+    recovery_deadline: Instant,
+) -> Result<(), String> {
+    let recovery_epoch = evidence_monitor.begin_acquisition();
+    page.goto("about:blank")
+        .await
+        .map_err(|error| format!("browser_retry_recovery_blank: {error}"))?;
+    page.goto(SITE_URL)
+        .await
+        .map_err(|error| format!("browser_retry_recovery_navigation: {error}"))?;
+    let site_host: bool = page
+        .evaluate(format!("location.hostname === {SITE_HOST:?}"))
+        .await
+        .map_err(|error| format!("browser_retry_recovery_host_check: {error}"))?
+        .into_value()
+        .map_err(|error| format!("browser_retry_recovery_host_result: {error}"))?;
+    if !site_host {
+        return Err("browser_retry_recovery_host_mismatch: загрузка ушла с www.yarxi.su".into());
+    }
+    wait_until(page, Duration::from_secs(20), || {
+        "Boolean([...document.querySelectorAll('.kanji-search-form input[placeholder=\"Чтение\"]')].find(node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden'))"
+    })
+    .await
+    .map_err(|error| format!("browser_retry_recovery_form: {error}"))?;
+    if target == AcquisitionTarget::RenderedFontSamplePng {
+        apply_dark_theme(page)
+            .await
+            .map_err(|error| format!("browser_retry_recovery_dark_theme: {error}"))?;
+    }
+
+    loop {
+        if Instant::now() >= recovery_deadline {
+            return Err(
+                "browser_retry_recovery_timeout: истёк срок восстановления страницы".into(),
+            );
+        }
+        let runtime = evidence_monitor.readiness(recovery_epoch, None);
+        if runtime.monitor_failed
+            || runtime.network_failures > 0
+            || runtime.http_errors > 0
+            || runtime.javascript_exceptions > 0
+        {
+            return Err(format!(
+                "browser_retry_recovery_runtime_failure: {}",
+                runtime_failure_reason(runtime)
+            ));
+        }
+        if runtime.pending_relevant_requests == 0 {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserExecutableSelection {
+    path: PathBuf,
+    source: BrowserExecutableSource,
+}
+
+fn find_browser_executable() -> Option<BrowserExecutableSelection> {
+    for (variable, source) in [
+        ("CHROME_BIN", BrowserExecutableSource::ChromeBinEnvironment),
+        (
+            "CHROMIUM_BIN",
+            BrowserExecutableSource::ChromiumBinEnvironment,
+        ),
+    ] {
         if let Some(path) = std::env::var_os(variable).map(PathBuf::from)
             && is_executable_file(&path)
         {
-            return Some(path);
+            return Some(BrowserExecutableSelection { path, source });
         }
     }
     if let Some(path_entries) = std::env::var_os("PATH") {
@@ -774,7 +1323,10 @@ fn find_browser_executable() -> Option<PathBuf> {
             for name in ["chromium", "chromium-browser", "google-chrome", "chrome"] {
                 let path = directory.join(name);
                 if is_executable_file(&path) {
-                    return Some(path);
+                    return Some(BrowserExecutableSelection {
+                        path,
+                        source: BrowserExecutableSource::PathLookup,
+                    });
                 }
             }
         }
@@ -792,7 +1344,13 @@ fn find_browser_executable() -> Option<PathBuf> {
         candidates.push(entry.path().join("chrome-linux/chrome"));
     }
     candidates.sort();
-    candidates.into_iter().find(|path| is_executable_file(path))
+    candidates
+        .into_iter()
+        .find(|path| is_executable_file(path))
+        .map(|path| BrowserExecutableSelection {
+            path,
+            source: BrowserExecutableSource::PlaywrightCache,
+        })
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -802,26 +1360,35 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 async fn start_browser_evidence_monitor(page: &Page) -> Result<BrowserEvidenceMonitor, String> {
+    let main_frame_id = page
+        .execute(GetFrameTreeParams::default())
+        .await
+        .map_err(|error| format!("CDP Page.getFrameTree: {error}"))?
+        .frame_tree
+        .frame
+        .id
+        .as_ref()
+        .to_owned();
     let request_events = page
         .event_listener::<EventRequestWillBeSent>()
         .await
-        .map_err(|error| format!("CDP Network.requestWillBeSent listener: {error}"))?;
+        .map_err(|error| format!("обработчик CDP Network.requestWillBeSent: {error}"))?;
     let finished_events = page
         .event_listener::<EventLoadingFinished>()
         .await
-        .map_err(|error| format!("CDP Network.loadingFinished listener: {error}"))?;
+        .map_err(|error| format!("обработчик CDP Network.loadingFinished: {error}"))?;
     let failed_events = page
         .event_listener::<EventLoadingFailed>()
         .await
-        .map_err(|error| format!("CDP Network.loadingFailed listener: {error}"))?;
+        .map_err(|error| format!("обработчик CDP Network.loadingFailed: {error}"))?;
     let response_events = page
         .event_listener::<EventResponseReceived>()
         .await
-        .map_err(|error| format!("CDP Network.responseReceived listener: {error}"))?;
+        .map_err(|error| format!("обработчик CDP Network.responseReceived: {error}"))?;
     let exception_events = page
         .event_listener::<EventExceptionThrown>()
         .await
-        .map_err(|error| format!("CDP Runtime.exceptionThrown listener: {error}"))?;
+        .map_err(|error| format!("обработчик CDP Runtime.exceptionThrown: {error}"))?;
 
     page.execute(NetworkEnableParams::default())
         .await
@@ -830,7 +1397,10 @@ async fn start_browser_evidence_monitor(page: &Page) -> Result<BrowserEvidenceMo
         .await
         .map_err(|error| format!("CDP Runtime.enable: {error}"))?;
 
-    let state = Arc::new(Mutex::new(BrowserRuntimeEvidence::default()));
+    let state = Arc::new(Mutex::new(BrowserRuntimeEvidence {
+        main_frame_id,
+        ..BrowserRuntimeEvidence::default()
+    }));
     let mut tasks = Vec::with_capacity(5);
 
     {
@@ -853,11 +1423,21 @@ async fn start_browser_evidence_monitor(page: &Page) -> Result<BrowserEvidenceMo
                         state.monitor_failed = true;
                         continue;
                     }
+                    let epoch = state
+                        .relevant_requests
+                        .get(&id)
+                        .map_or(state.active_epoch, |request| request.epoch);
+                    let is_top_level = event
+                        .frame_id
+                        .as_ref()
+                        .is_some_and(|frame_id| frame_id.as_ref() == state.main_frame_id);
                     state.relevant_requests.insert(
                         id.clone(),
                         NetworkRequestState {
                             resource_type: resource_type.clone(),
                             url: event.request.url.clone(),
+                            epoch,
+                            is_top_level,
                         },
                     );
                 }
@@ -893,13 +1473,22 @@ async fn start_browser_evidence_monitor(page: &Page) -> Result<BrowserEvidenceMo
                     if state.network_failures.len() >= MAX_NETWORK_OUTCOMES {
                         state.monitor_failed = true;
                     } else {
+                        let epoch = tracked
+                            .as_ref()
+                            .map_or(state.active_epoch, |request| request.epoch);
+                        let is_top_level =
+                            tracked.as_ref().is_some_and(|request| request.is_top_level);
                         state.network_failures.push(NetworkOutcome {
                             resource_type: tracked
                                 .as_ref()
                                 .map(|request| request.resource_type.clone())
                                 .unwrap_or_else(|| event.r#type.clone()),
-                            url: tracked.map(|request| request.url),
+                            url: tracked.as_ref().map(|request| request.url.clone()),
                             failure_reason: Some(event.error_text.clone()),
+                            request_id: id.to_owned(),
+                            epoch,
+                            status_code: None,
+                            is_top_level,
                         });
                     }
                 }
@@ -919,10 +1508,23 @@ async fn start_browser_evidence_monitor(page: &Page) -> Result<BrowserEvidenceMo
                     if state.http_errors.len() >= MAX_NETWORK_OUTCOMES {
                         state.monitor_failed = true;
                     } else {
+                        let request_id = event.request_id.as_ref().to_owned();
+                        let epoch = state
+                            .relevant_requests
+                            .get(&request_id)
+                            .map_or(state.active_epoch, |request| request.epoch);
+                        let is_top_level = state
+                            .relevant_requests
+                            .get(&request_id)
+                            .is_some_and(|request| request.is_top_level);
                         state.http_errors.push(NetworkOutcome {
                             resource_type: event.r#type.clone(),
                             url: Some(event.response.url.clone()),
                             failure_reason: None,
+                            request_id,
+                            epoch,
+                            status_code: Some(event.response.status as u16),
+                            is_top_level,
                         });
                     }
                 }
@@ -938,7 +1540,7 @@ async fn start_browser_evidence_monitor(page: &Page) -> Result<BrowserEvidenceMo
                 let mut state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.javascript_exceptions = state.javascript_exceptions.saturating_add(1);
+                state.record_javascript_exception();
             }
             mark_monitor_failed(&state);
         }));
@@ -969,19 +1571,19 @@ fn is_relevant_resource_type(resource_type: &ResourceType) -> bool {
 
 async fn apply_dark_theme(page: &Page) -> Result<(), String> {
     let style_id = serde_json::to_string(YARXI_DARK_THEME_STYLE_ID)
-        .map_err(|error| format!("dark theme style id serialization: {error}"))?;
+        .map_err(|error| format!("сериализация ID стиля тёмной темы: {error}"))?;
     let style_text = serde_json::to_string(YARXI_DARK_THEME_STYLE)
-        .map_err(|error| format!("dark theme stylesheet serialization: {error}"))?;
+        .map_err(|error| format!("сериализация stylesheet тёмной темы: {error}"))?;
     let script = format!(
         r#"() => {{
             const root = document.documentElement;
-            if (!root) return {{ error: 'document root is missing' }};
+            if (!root) return {{ error: 'корневой элемент document отсутствует' }};
             root.dataset.theme = 'dark';
             const styleId = {style_id};
             const styleText = {style_text};
             let style = document.getElementById(styleId);
             if (style && style.textContent !== styleText)
-                return {{ error: 'dark theme stylesheet id is already in use' }};
+                return {{ error: 'идентификатор stylesheet тёмной темы уже занят' }};
             if (!style) {{
                 style = document.createElement('style');
                 style.id = styleId;
@@ -1036,7 +1638,7 @@ async fn apply_dark_theme(page: &Page) -> Result<(), String> {
         && state["style_text"].as_str() == Some(YARXI_DARK_THEME_STYLE);
     if !dark_state {
         return Err(format!(
-            "yarxi_dark_theme_unavailable: Yarxi base palette or page-level text inheritance did not enter the verified dark state: {state}"
+            "yarxi_dark_theme_unavailable: палитра Yarxi или наследование цвета текста страницы не перешли в проверенное тёмное состояние: {state}"
         ));
     }
     Ok(())
@@ -1044,9 +1646,10 @@ async fn apply_dark_theme(page: &Page) -> Result<(), String> {
 
 async fn async_error_or_tls_interstitial(
     page: &Page,
+    evidence_monitor: &BrowserEvidenceMonitor,
     allow_insecure_tls: bool,
     original: impl std::fmt::Display,
-) -> std::result::Result<&Page, String> {
+) -> Result<ApprovedTlsException, String> {
     if !allow_insecure_tls {
         return Err(format!(
             "TLS-сертификат Yarxi отклонён браузером: {original}; повторите только после явного --allow-insecure-tls"
@@ -1061,13 +1664,14 @@ async fn async_error_or_tls_interstitial(
         .into_value()
         .map_err(|error| format!("TLS interstitial вернул некорректный ответ: {error}"))?;
     let code = interstitial["code"].as_str().unwrap_or_default();
+    let failed_request = wait_for_tls_navigation_failure(evidence_monitor).await?;
+    let blocked_url = failed_request
+        .url
+        .as_deref()
+        .ok_or_else(|| "TLS interstitial не связан с URL ошибочного Document request".to_owned())?;
     if let Err(reason) = check_tls_exception(
         allow_insecure_tls,
-        Url::parse(SITE_URL)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .as_deref()
-            .unwrap_or_default(),
+        blocked_url,
         code,
         &original.to_string(),
         interstitial["proceed"].as_bool().unwrap_or(false),
@@ -1076,8 +1680,8 @@ async fn async_error_or_tls_interstitial(
             "TLS exception отклонён: {reason}; original={original}; interstitial={interstitial}"
         ));
     }
-    // Chrome's interstitial `proceed` is origin-scoped. No global
-    // ignore-certificate-errors switch is enabled for the browser process.
+    // Переход Chrome interstitial действует только для origin; глобальный
+    // ignore-certificate-errors для процесса браузера не включён.
     page.evaluate("() => document.querySelector('#proceed-link').click()")
         .await
         .map_err(|error| format!("не удалось принять исключение Yarxi: {error}"))?;
@@ -1085,12 +1689,36 @@ async fn async_error_or_tls_interstitial(
         "location.hostname === 'www.yarxi.su' && Boolean(document.querySelector('.kanji-search-form input[placeholder=\"Чтение\"]'))"
     })
     .await?;
-    Ok(page)
+    Ok(ApprovedTlsException {
+        request_id: failed_request.request_id,
+        blocked_url: blocked_url.to_owned(),
+        provenance: TlsExceptionProvenance {
+            host: SITE_HOST.to_owned(),
+            error_code: "NET::ERR_CERT_AUTHORITY_INVALID".to_owned(),
+        },
+    })
+}
+
+async fn wait_for_tls_navigation_failure(
+    evidence_monitor: &BrowserEvidenceMonitor,
+) -> Result<NetworkOutcome, String> {
+    let deadline = Instant::now() + TLS_EVIDENCE_TIMEOUT;
+    loop {
+        if let Some(failure) = evidence_monitor.tls_navigation_failure() {
+            return Ok(failure);
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "TLS interstitial не связан с ошибкой top-level Document event Yarxi".into(),
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn check_tls_exception(
     explicitly_allowed: bool,
-    interstitial_host: &str,
+    blocked_url: &str,
     interstitial_code: &str,
     original_error: &str,
     proceed_link_present: bool,
@@ -1098,8 +1726,12 @@ fn check_tls_exception(
     if !explicitly_allowed {
         return Err("нужен явный --allow-insecure-tls".into());
     }
-    if !interstitial_host.eq_ignore_ascii_case(SITE_HOST) {
-        return Err(format!("неожиданный host {interstitial_host:?}"));
+    let parsed_blocked_url =
+        Url::parse(blocked_url).map_err(|_| "URL ошибочного Document некорректен")?;
+    if !is_expected_yarxi_tls_url(blocked_url) {
+        return Err(format!(
+            "неожиданный URL ошибочного Document {parsed_blocked_url}"
+        ));
     }
     if !interstitial_code.eq_ignore_ascii_case("NET::ERR_CERT_AUTHORITY_INVALID")
         || !original_error
@@ -1109,7 +1741,7 @@ fn check_tls_exception(
         return Err("разрешена только ERR_CERT_AUTHORITY_INVALID".into());
     }
     if !proceed_link_present {
-        return Err("Chrome interstitial не предоставляет ссылку перехода".into());
+        return Err("interstitial Chrome не предоставляет ссылку перехода".into());
     }
     Ok(())
 }
@@ -1118,13 +1750,15 @@ async fn acquire_one(
     page: &Page,
     character: &str,
     target: AcquisitionTarget,
+    epoch: u64,
     evidence_monitor: &BrowserEvidenceMonitor,
+    browser_runtime: &BrowserRuntimeProvenance,
+    tls_exception: Option<TlsExceptionProvenance>,
 ) -> Result<AcquiredMedia, String> {
-    if character.chars().count() != 1 {
-        return Err("expected_one_kanji: ensure принимает один Unicode-символ".into());
-    }
+    crate::kanji_domain::parse_kanji_character(character)
+        .map_err(|error| format!("invalid_kanji_identity: {error}"))?;
     let character_json = serde_json::to_string(character)
-        .map_err(|error| format!("character serialization: {error}"))?;
+        .map_err(|error| format!("сериализация символа: {error}"))?;
     let search_script = format!(
         "() => {{ const visible = node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none'; const container = [...document.querySelectorAll('.kanji-search-form')].find(visible); const input = container && [...container.querySelectorAll('input[placeholder=\\\"Чтение\\\"]')].find(visible); if (!input) return false; const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; set.call(input, {character_json}); input.dispatchEvent(new Event('input', {{ bubbles: true }})); input.dispatchEvent(new Event('change', {{ bubbles: true }})); const button = [...container.querySelectorAll('button,[role=button],input[type=submit],input[type=button],a')].find(node => visible(node) && (node.innerText || node.value || node.getAttribute('aria-label') || '').trim() === 'Найти' && !node.disabled); if (button) {{ button.click(); return true; }} input.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }})); return true; }}"
     );
@@ -1141,7 +1775,7 @@ async fn acquire_one(
         .chars()
         .next()
         .map(|ch| format!("{:X}", u32::from(ch)))
-        .expect("one character checked above");
+        .expect("выше проверен один символ");
     wait_until(page, Duration::from_secs(20), || {
         "Boolean([...document.querySelectorAll('button,[role=tab]')].find(node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden' && node.innerText.trim() === 'Информация'))"
     })
@@ -1159,8 +1793,15 @@ async fn acquire_one(
     }
     let article = wait_for_article(page, &expected_code).await?;
 
-    let mut snapshot =
-        wait_for_media_snapshot(page, character, &expected_code, evidence_monitor, target).await?;
+    let mut snapshot = wait_for_media_snapshot(
+        page,
+        character,
+        &expected_code,
+        epoch,
+        evidence_monitor,
+        target,
+    )
+    .await?;
     let mut choice = choose_media_source_for_target(
         snapshot.primary.clone(),
         &snapshot.font_samples,
@@ -1171,9 +1812,15 @@ async fn acquire_one(
         && matches!(choice, MediaSourceChoice::RenderedFontSample { .. })
     {
         apply_dark_theme(page).await?;
-        snapshot =
-            wait_for_media_snapshot(page, character, &expected_code, evidence_monitor, target)
-                .await?;
+        snapshot = wait_for_media_snapshot(
+            page,
+            character,
+            &expected_code,
+            epoch,
+            evidence_monitor,
+            target,
+        )
+        .await?;
         choice = choose_media_source_for_target(
             snapshot.primary.clone(),
             &snapshot.font_samples,
@@ -1219,6 +1866,9 @@ async fn acquire_one(
         fallback_absence_proof: absence_proof,
         rendered_font_sample,
         source_url: source_url.clone(),
+        browser_runtime: Some(browser_runtime.clone()),
+        tls_exception,
+        acquisition_attempts: 1,
     };
     Ok(AcquiredMedia {
         character: character.to_owned(),
@@ -1322,6 +1972,7 @@ async fn wait_for_media_snapshot(
     page: &Page,
     expected_character: &str,
     expected_code: &str,
+    epoch: u64,
     evidence_monitor: &BrowserEvidenceMonitor,
     target: AcquisitionTarget,
 ) -> Result<MediaSnapshot, String> {
@@ -1400,7 +2051,7 @@ async fn wait_for_media_snapshot(
             height: node["height"].as_u64().unwrap_or(0) as u32,
         });
         let stable_key = serde_json::to_string(&(&font_samples, &current_code))
-            .expect("serializing DOM snapshot cannot fail");
+            .expect("сериализация DOM-снимка не должна завершаться ошибкой");
         let selected_font_sample = (target == AcquisitionTarget::RenderedFontSamplePng)
             .then(|| choose_font_sample(&font_samples, expected_character).ok())
             .flatten();
@@ -1410,15 +2061,16 @@ async fn wait_for_media_snapshot(
             .flat_map(|sample| sample.images.iter().map(|image| image.url.clone()))
             .collect();
         let runtime = if target == AcquisitionTarget::RenderedFontSamplePng {
-            evidence_monitor.font_sample_readiness(&selected_sample_image_urls)
+            evidence_monitor.font_sample_readiness(epoch, &selected_sample_image_urls)
         } else {
-            evidence_monitor.readiness(None)
+            evidence_monitor.readiness(epoch, None)
         };
         if runtime.monitor_failed || runtime.network_failures > 0 || runtime.http_errors > 0 {
             let network_details = if target == AcquisitionTarget::RenderedFontSamplePng {
-                evidence_monitor.font_sample_network_failure_details(&selected_sample_image_urls)
+                evidence_monitor
+                    .font_sample_network_failure_details(epoch, &selected_sample_image_urls)
             } else {
-                evidence_monitor.network_failure_details(None)
+                evidence_monitor.network_failure_details(epoch, None)
             };
             return Err(format!(
                 "browser_network_runtime_failure: {}; network_failures=[{network_details}]",
@@ -1460,7 +2112,7 @@ async fn wait_for_media_snapshot(
             ready,
             dom_stable,
             !pending,
-            evidence_monitor.readiness(None),
+            evidence_monitor.readiness(epoch, None),
         );
         if target == AcquisitionTarget::RenderedFontSamplePng
             && ready
@@ -1489,20 +2141,21 @@ async fn wait_for_media_snapshot(
                     font_samples,
                 });
             }
-            PrimaryGifState::Unknown { reason } if reason.contains("zero natural dimensions") => {
+            PrimaryGifState::Unknown { reason } if reason.contains("без естественных размеров") =>
+            {
                 return Err(format!("gif_present_but_failed: {reason}"));
             }
             PrimaryGifState::Unknown { .. } => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            let reason = runtime_failure_reason(evidence_monitor.readiness(None));
+            let reason = runtime_failure_reason(evidence_monitor.readiness(epoch, None));
             if primary.as_ref().is_some_and(|image| !image.complete) {
                 return Err(format!(
-                    "gif_pending: primary GIF did not finish loading; {reason}"
+                    "gif_pending: загрузка primary GIF не завершилась; {reason}"
                 ));
             }
             return Err(format!(
-                "gif_unknown: media area did not reach a complete, stable state; {reason}"
+                "gif_unknown: область media не достигла завершённого и стабильного состояния; {reason}"
             ));
         }
         sleep(Duration::from_millis(200)).await;
@@ -1512,26 +2165,31 @@ async fn wait_for_media_snapshot(
 async fn resource_bytes(page: &Page, resource_url: &str) -> Result<Vec<u8>, String> {
     if resource_url.starts_with("data:") || resource_url.starts_with("blob:") {
         let url_json = serde_json::to_string(resource_url)
-            .map_err(|error| format!("resource URL serialization: {error}"))?;
+            .map_err(|error| format!("сериализация URL ресурса: {error}"))?;
         let script = format!(
             "async () => {{ const response = await fetch({url_json}); if (!response.ok) throw new Error('HTTP ' + response.status); const bytes = new Uint8Array(await response.arrayBuffer()); let binary = ''; for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(binary); }}"
         );
         let encoded: String = page
             .evaluate(script)
             .await
-            .map_err(|error| format!("browser managed resource fetch failed: {error}"))?
+            .map_err(|error| {
+                format!("не удалось получить ресурс, обслуживаемый браузером: {error}")
+            })?
             .into_value()
-            .map_err(|error| format!("browser managed resource returned invalid bytes: {error}"))?;
+            .map_err(|error| {
+                format!("обслуживаемый браузером ресурс вернул некорректные bytes: {error}")
+            })?;
         return base64::engine::general_purpose::STANDARD
             .decode(encoded)
-            .map_err(|error| format!("browser managed resource base64: {error}"));
+            .map_err(|error| format!("декодирование base64 для ресурса браузера: {error}"));
     }
-    let url = Url::parse(resource_url).map_err(|error| format!("invalid media URL: {error}"))?;
+    let url =
+        Url::parse(resource_url).map_err(|error| format!("некорректный media URL: {error}"))?;
     if url.scheme() != "https"
         || url.host_str().is_none()
         || url.host_str().is_some_and(is_kakijun_host)
     {
-        return Err("source_url_rejected: expected a non-kakijun HTTPS resource".into());
+        return Err("source_url_rejected: ожидается HTTPS resource, не связанный с Kakijun".into());
     }
     let tree = page
         .execute(GetResourceTreeParams::default())
@@ -1543,11 +2201,11 @@ async fn resource_bytes(page: &Page, resource_url: &str) -> Result<Vec<u8>, Stri
         .await
         .map_err(|error| format!("CDP Page.getResourceContent: {error}"))?;
     if !content.result.base64_encoded {
-        return Err("media_response_not_binary: browser did not preserve original bytes".into());
+        return Err("media_response_not_binary: browser не сохранил исходные bytes".into());
     }
     base64::engine::general_purpose::STANDARD
         .decode(content.result.content)
-        .map_err(|error| format!("media base64 decode: {error}"))
+        .map_err(|error| format!("декодирование media из base64: {error}"))
 }
 
 async fn render_font_sample_png(
@@ -1557,15 +2215,15 @@ async fn render_font_sample_png(
     expected_code: &str,
 ) -> Result<(Vec<u8>, RenderedFontSampleEvidence), String> {
     let expected_json = serde_json::to_string(expected_character)
-        .map_err(|error| format!("font sample character serialization: {error}"))?;
+        .map_err(|error| format!("сериализация символа font-sample: {error}"))?;
     let expected_code_json = serde_json::to_string(expected_code)
-        .map_err(|error| format!("font sample Unicode serialization: {error}"))?;
+        .map_err(|error| format!("сериализация Unicode font-sample: {error}"))?;
     let expected_class_json = serde_json::to_string(&sample.class_name)
-        .map_err(|error| format!("font sample class serialization: {error}"))?;
+        .map_err(|error| format!("сериализация класса font-sample: {error}"))?;
     let expected_title_json = serde_json::to_string(&sample.title)
-        .map_err(|error| format!("font sample title serialization: {error}"))?;
+        .map_err(|error| format!("сериализация title font-sample: {error}"))?;
     let expected_text_json = serde_json::to_string(&sample.text)
-        .map_err(|error| format!("font sample text serialization: {error}"))?;
+        .map_err(|error| format!("сериализация текста font-sample: {error}"))?;
     let script = r#"() => {
         const expected = __EXPECTED__;
         const expectedCode = __EXPECTED_CODE__.toUpperCase();
@@ -1576,7 +2234,7 @@ async fn render_font_sample_png(
         const body = document.body?.innerText || '';
         const unicodeMatches = [...body.matchAll(/Unicode:\s*([0-9a-f]+)/ig)];
         if (unicodeMatches.length !== 1 || unicodeMatches[0][1].toUpperCase() !== expectedCode)
-            return { error: 'article Unicode changed or is ambiguous' };
+            return { error: 'Unicode статьи изменился или неоднозначен' };
         const visible = node => node.getClientRects().length > 0
             && getComputedStyle(node).visibility !== 'hidden'
             && getComputedStyle(node).display !== 'none';
@@ -1595,11 +2253,11 @@ async fn render_font_sample_png(
           .sort((left, right) => left.rect.left - right.rect.left
             || left.rect.top - right.rect.top || left.index - right.index);
         const selected = candidates[0];
-        if (!selected) return { error: 'no visible exact-character font sample' };
+        if (!selected) return { error: 'нет видимого font-sample с точным символом' };
         if (selected.index !== expectedIndex || selected.className !== expectedClass
             || selected.text !== expectedText
             || (selected.node.getAttribute('title') || '') !== expectedTitle)
-            return { error: 'leftmost font sample identity changed before capture' };
+            return { error: 'идентичность крайнего левого font-sample изменилась до capture' };
         const parseColor = value => {
             const parts = (value.match(/[0-9]+(?:\.[0-9]+)?/g) || []).slice(0, 4).map(Number);
             return parts.length >= 3 ? [parts[0], parts[1], parts[2], parts.length > 3 ? parts[3] : 1] : null;
@@ -1649,12 +2307,12 @@ async fn render_font_sample_png(
             ? borderColor : outlineColor;
         const styleAttribute = selected.node.getAttribute('style');
         if (styleAttribute && styleAttribute.length > 4096)
-            return { error: 'font sample inline style exceeds bounded evidence limit' };
+            return { error: 'inline style font-sample превышает ограничение evidence' };
         if (root.dataset.theme !== 'dark' || !matchMedia('(prefers-color-scheme: dark)').matches
             || luminance(pageBackground) === null || luminance(pageBackground) >= 0.20
             || luminance(tileBackground) === null || luminance(tileBackground) >= 0.20
             || luminance(foreground) === null || luminance(foreground) <= 0.75 || !borderVisible)
-            return { error: `rendered tile setup failed (theme_class=${String(root.className).slice(0, 64)}; prefers_dark=${matchMedia('(prefers-color-scheme: dark)').matches}; page_bg=${String(pageBackground).slice(0, 64)}; tile_bg=${String(tileBackground).slice(0, 64)}; foreground=${String(foreground).slice(0, 64)}; border=${String(visibleBorderWidth).slice(0, 32)} ${String(visibleBorderStyle).slice(0, 32)} ${String(visibleBorderColor).slice(0, 64)}; border_visible=${borderVisible})` };
+            return { error: `не удалось подготовить плитку к рендерингу (theme_class=${String(root.className).slice(0, 64)}; prefers_dark=${matchMedia('(prefers-color-scheme: dark)').matches}; page_bg=${String(pageBackground).slice(0, 64)}; tile_bg=${String(tileBackground).slice(0, 64)}; foreground=${String(foreground).slice(0, 64)}; border=${String(visibleBorderWidth).slice(0, 32)} ${String(visibleBorderStyle).slice(0, 32)} ${String(visibleBorderColor).slice(0, 64)}; border_visible=${borderVisible})` };
         const bounded = (value, limit) => String(value || '').slice(0, limit);
         const fingerprint = value => {
             const text = value === null ? '<null>' : value;
@@ -1730,7 +2388,7 @@ async fn render_font_sample_png(
         .await
         .map_err(|error| format!("font_sample_png_capture: {error}"))?;
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err("font_sample_png_invalid: element capture did not return PNG bytes".into());
+        return Err("font_sample_png_invalid: снимок элемента не вернул PNG bytes".into());
     }
     let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
         .map_err(|error| format!("font_sample_png_decode: {error}"))?;
@@ -1738,13 +2396,13 @@ async fn render_font_sample_png(
     validate_capture_dimensions(pixel_width, pixel_height)?;
     let pixel_evidence = analyze_capture_pixels(&decoded.to_rgba8())?;
     let style_json = serde_json::to_string(&initial["inline_style_json"].as_str())
-        .map_err(|error| format!("font sample style serialization: {error}"))?;
+        .map_err(|error| format!("сериализация стиля font-sample: {error}"))?;
     let document_theme_json = serde_json::to_string(&initial["document_theme"].as_str())
-        .map_err(|error| format!("document theme serialization: {error}"))?;
+        .map_err(|error| format!("сериализация темы document: {error}"))?;
     let style_id_json = serde_json::to_string(YARXI_DARK_THEME_STYLE_ID)
-        .map_err(|error| format!("dark theme style id serialization: {error}"))?;
+        .map_err(|error| format!("сериализация ID стиля тёмной темы: {error}"))?;
     let style_text_json = serde_json::to_string(YARXI_DARK_THEME_STYLE)
-        .map_err(|error| format!("dark theme stylesheet serialization: {error}"))?;
+        .map_err(|error| format!("сериализация stylesheet тёмной темы: {error}"))?;
     let post_capture_script = format!(
         "() => {{ const node=[...document.querySelectorAll('.font-sample')][{}]; const root=document.documentElement; const style=document.getElementById({style_id_json}); return Boolean(node && node.getAttribute('style') === {style_json} && root.dataset.theme === {document_theme_json} && root.dataset.theme === 'dark' && style && style.textContent === {style_text_json} && matchMedia('(prefers-color-scheme: dark)').matches); }}",
         sample.index
@@ -1757,7 +2415,7 @@ async fn render_font_sample_png(
         .map_err(|error| format!("font_sample_post_capture_check_result: {error}"))?;
     if !inline_style_unchanged {
         return Err(
-            "font_sample_style_changed: selected tile style or dark theme changed during capture"
+            "font_sample_style_changed: стиль выбранной плитки или тёмная тема изменились во время снимка"
                 .into(),
         );
     }
@@ -1775,7 +2433,7 @@ async fn render_font_sample_png(
             .unwrap_or_default()
             .to_owned(),
         font_size: initial["font_size"].as_str().unwrap_or_default().to_owned(),
-        capture: "Chromium element screenshot of the unmodified rendered .font-sample tile under Yarxi data-theme=dark".into(),
+        capture: "Снимок Chromium самого отрендеренного элемента .font-sample без изменений при Yarxi data-theme=dark".into(),
         css_rect: serde_json::from_value(initial["css_rect"].clone())
             .map_err(|error| format!("font_sample_css_rect: {error}"))?,
         pixel_width,
@@ -1787,7 +2445,7 @@ async fn render_font_sample_png(
         prefers_color_scheme_dark: initial["prefers_color_scheme_dark"]
             .as_bool()
             .unwrap_or(false),
-        dark_environment: "Yarxi data-theme=dark; color-scheme=dark; page-level #app color inherits --w-base-color-rgb".into(),
+        dark_environment: "Yarxi data-theme=dark; color-scheme=dark; цвет #app наследуется от --w-base-color-rgb на уровне страницы".into(),
         document_theme: initial["document_theme"]
             .as_str()
             .unwrap_or_default()
@@ -1927,19 +2585,19 @@ fn analyze_capture_pixels(image: &RgbaImage) -> Result<TilePixelEvidence, String
     let total_pixels = width.saturating_mul(height);
     if dark.count < total_pixels / 4 {
         return Err(format!(
-            "font_sample_pixel_contract: too few dark tile pixels ({}/{total_pixels})",
+            "font_sample_pixel_contract: недостаточно тёмных пикселей плитки ({}/{total_pixels})",
             dark.count
         ));
     }
     if glyph.count < 16 {
         return Err(format!(
-            "font_sample_pixel_contract: no sufficient light glyph pixels ({})",
+            "font_sample_pixel_contract: недостаточно светлых пикселей glyph ({})",
             glyph.count
         ));
     }
     if frame.count < 8 {
         return Err(format!(
-            "font_sample_pixel_contract: no visible mid-tone frame pixels ({})",
+            "font_sample_pixel_contract: недостаточно видимых пикселей рамки среднего тона ({})",
             frame.count
         ));
     }
@@ -1986,14 +2644,16 @@ async fn wait_until(
         let ready: bool = page
             .evaluate(expression())
             .await
-            .map_err(|error| format!("browser readiness check: {error}"))?
+            .map_err(|error| format!("проверка готовности browser: {error}"))?
             .into_value()
-            .map_err(|error| format!("browser readiness response: {error}"))?;
+            .map_err(|error| format!("ответ проверки готовности browser: {error}"))?;
         if ready {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("browser readiness timeout".into());
+            return Err(
+                "browser_readiness_timeout: истёк срок ожидания готовности страницы".into(),
+            );
         }
         sleep(Duration::from_millis(200)).await;
     }
@@ -2031,7 +2691,7 @@ mod tests {
         assert!(
             choose_media_source(
                 PrimaryGifState::Unknown {
-                    reason: "request pending".into(),
+                    reason: "запрос ещё выполняется".into(),
                 },
                 &[font_sample(0, 0.0, "柘", "font-sample serif", false)],
                 "柘"
@@ -2053,7 +2713,7 @@ mod tests {
                 url: "https://yosida.com/left.gif".into(),
                 absence_proof: None,
             },
-            "unrelated right-side Kakijun link never replaces the left GIF"
+            "ссылка Kakijun справа не должна заменять GIF слева"
         );
     }
 
@@ -2090,6 +2750,196 @@ mod tests {
             javascript_exceptions: 0,
             monitor_failed: false,
         }
+    }
+
+    fn test_outcome(
+        resource_type: ResourceType,
+        url: Option<&str>,
+        failure_reason: Option<&str>,
+        request_id: &str,
+        epoch: u64,
+        status_code: Option<u16>,
+    ) -> NetworkOutcome {
+        NetworkOutcome {
+            resource_type,
+            url: url.map(str::to_owned),
+            failure_reason: failure_reason.map(str::to_owned),
+            request_id: request_id.to_owned(),
+            epoch,
+            status_code,
+            is_top_level: false,
+        }
+    }
+
+    #[test]
+    fn item_runtime_evidence_isolated_by_request_epoch_and_fatal_state_is_global() {
+        let mut state = BrowserRuntimeEvidence::default();
+        let item_a = state.begin_acquisition();
+        state.network_failures.push(test_outcome(
+            ResourceType::Fetch,
+            Some("https://example.test/item-a"),
+            Some("net::ERR_CONNECTION_RESET"),
+            "request-a",
+            item_a,
+            None,
+        ));
+        state.http_errors.push(test_outcome(
+            ResourceType::Xhr,
+            Some("https://example.test/item-a.json"),
+            None,
+            "http-a",
+            item_a,
+            Some(503),
+        ));
+        state.record_javascript_exception();
+
+        let item_b = state.begin_acquisition();
+        assert_eq!(state.readiness(item_a, None).network_failures, 1);
+        assert_eq!(state.readiness(item_a, None).http_errors, 1);
+        assert_eq!(state.readiness(item_a, None).javascript_exceptions, 1);
+        assert_eq!(state.readiness(item_b, None), clean_runtime());
+
+        state.monitor_failed = true;
+        assert!(state.readiness(item_b, None).monitor_failed);
+    }
+
+    #[test]
+    fn retry_policy_accepts_only_bounded_transient_network_and_http_classes() {
+        assert!(is_retryable_network_error("net::ERR_TIMED_OUT"));
+        assert!(is_retryable_network_error("net::ERR_ABORTED"));
+        assert!(!is_retryable_network_error("net::ERR_CERT_DATE_INVALID"));
+        assert!(!is_retryable_network_error("details: ERR_CONNECTION_RESET"));
+        assert!(is_retryable_http_status(429));
+        assert!(is_retryable_http_status(503));
+        assert!(!is_retryable_http_status(404));
+
+        let mut state = BrowserRuntimeEvidence::default();
+        let epoch = state.begin_acquisition();
+        state.network_failures.push(test_outcome(
+            ResourceType::Fetch,
+            Some("https://example.test/retry"),
+            Some("net::ERR_CONNECTION_RESET"),
+            "retryable",
+            epoch,
+            None,
+        ));
+        assert!(state.retryable_failures_only(epoch));
+        let monitor = BrowserEvidenceMonitor {
+            state: Arc::new(Mutex::new(state)),
+            tasks: Vec::new(),
+        };
+        assert!(monitor.retryable_timeout(epoch));
+        assert!(is_retryable_acquisition_error(
+            "browser_item_timeout: ограниченный срок истёк",
+            &monitor,
+            epoch,
+        ));
+        assert!(should_retry_acquisition(
+            "browser_item_timeout: ограниченный срок истёк",
+            &monitor,
+            epoch,
+            1,
+        ));
+        assert!(!should_retry_acquisition(
+            "browser_item_timeout: ограниченный срок истёк",
+            &monitor,
+            epoch,
+            2,
+        ));
+        monitor
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_javascript_exception();
+        assert!(!monitor.retryable_timeout(epoch));
+        assert!(!is_retryable_acquisition_error(
+            "browser_item_timeout: ограниченный срок истёк",
+            &monitor,
+            epoch,
+        ));
+        monitor
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .http_errors
+            .push(test_outcome(
+                ResourceType::Fetch,
+                Some("https://example.test/not-retryable"),
+                None,
+                "permanent",
+                epoch,
+                Some(404),
+            ));
+        assert!(
+            !monitor
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retryable_failures_only(epoch)
+        );
+    }
+
+    #[test]
+    fn session_deadline_outcomes_keep_completed_prefix_and_fill_remaining_items() {
+        let mut outcomes = vec![Ok("first"), Ok("second")];
+        append_session_deadline_outcomes(&mut outcomes, 2);
+        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes[0], Ok("first"));
+        assert_eq!(outcomes[1], Ok("second"));
+        assert!(
+            outcomes[2]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("browser_session_deadline:")
+        );
+        assert!(
+            outcomes[3]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("browser_session_deadline:")
+        );
+    }
+
+    #[test]
+    fn item_timeout_keeps_completed_prefix_and_uses_a_distinct_batch_stop_reason() {
+        let mut outcomes = vec![
+            Ok("first"),
+            Ok("second"),
+            Err("browser_item_timeout: item".into()),
+        ];
+        append_batch_stopped_outcomes(&mut outcomes, 2, &BatchStopReason::ItemTimeout);
+
+        assert_eq!(outcomes.len(), 5);
+        assert_eq!(outcomes[0], Ok("first"));
+        assert_eq!(outcomes[1], Ok("second"));
+        assert!(
+            outcomes[2]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("browser_item_timeout:")
+        );
+        for outcome in &outcomes[3..] {
+            let error = outcome.as_ref().unwrap_err();
+            assert!(error.starts_with("browser_batch_stopped_after_item_timeout:"));
+            assert!(!error.starts_with("browser_session_deadline:"));
+        }
+    }
+
+    #[test]
+    fn browser_runtime_provenance_keeps_selection_method_without_local_paths() {
+        let provenance = BrowserRuntimeProvenance {
+            product: "Chrome/140.0.0.0".into(),
+            protocol_version: "1.3".into(),
+            revision: "abc123".into(),
+            user_agent: "Mozilla/5.0 Chrome/140".into(),
+            js_version: "14.0".into(),
+            executable_source: BrowserExecutableSource::PathLookup,
+        };
+        let encoded = serde_json::to_string(&provenance).unwrap();
+        assert!(encoded.contains("path_lookup"));
+        assert!(encoded.contains("Chrome/140.0.0.0"));
+        assert!(!encoded.contains("/home/"));
+        assert!(!encoded.contains("C:\\"));
     }
 
     #[test]
@@ -2140,7 +2990,7 @@ mod tests {
         assert_eq!(
             choose_media_source(
                 PrimaryGifState::AbsentConfirmed {
-                    proof: "stable complete DOM".into(),
+                    proof: "стабильный и полностью загруженный DOM".into(),
                 },
                 &[left_text.clone(), later_image],
                 "柘",
@@ -2148,9 +2998,9 @@ mod tests {
             .unwrap(),
             MediaSourceChoice::RenderedFontSample {
                 sample: left_text,
-                absence_proof: Some("stable complete DOM".into()),
+                absence_proof: Some("стабильный и полностью загруженный DOM".into()),
             },
-            "a PNG inside a tile to the right must not replace the leftmost font sample"
+            "PNG в плитке справа не должен заменять крайний левый font-sample"
         );
 
         let left_image = FontSampleState {
@@ -2166,7 +3016,7 @@ mod tests {
         assert_eq!(
             choose_media_source(
                 PrimaryGifState::AbsentConfirmed {
-                    proof: "stable complete DOM".into(),
+                    proof: "стабильный и полностью загруженный DOM".into(),
                 },
                 &[left_image, later_text],
                 "柘",
@@ -2175,7 +3025,7 @@ mod tests {
             MediaSourceChoice::Url {
                 selection: SelectionResult::LeftmostPngFallback,
                 url: "https://example.test/first.png".into(),
-                absence_proof: Some("stable complete DOM".into()),
+                absence_proof: Some("стабильный и полностью загруженный DOM".into()),
             }
         );
 
@@ -2191,7 +3041,7 @@ mod tests {
         assert!(
             choose_media_source(
                 PrimaryGifState::AbsentConfirmed {
-                    proof: "stable complete DOM".into(),
+                    proof: "стабильный и полностью загруженный DOM".into(),
                 },
                 &[kakijun_sample],
                 "柘",
@@ -2212,7 +3062,7 @@ mod tests {
         assert_eq!(
             choose_media_source(
                 PrimaryGifState::AbsentConfirmed {
-                    proof: "stable complete DOM".into(),
+                    proof: "стабильный и полностью загруженный DOM".into(),
                 },
                 &samples,
                 "柘",
@@ -2220,13 +3070,13 @@ mod tests {
             .unwrap(),
             MediaSourceChoice::RenderedFontSample {
                 sample: samples[1].clone(),
-                absence_proof: Some("stable complete DOM".into()),
+                absence_proof: Some("стабильный и полностью загруженный DOM".into()),
             }
         );
         assert!(
             choose_media_source(
                 PrimaryGifState::AbsentConfirmed {
-                    proof: "stable complete DOM".into(),
+                    proof: "стабильный и полностью загруженный DOM".into(),
                 },
                 &[],
                 "柘",
@@ -2276,6 +3126,8 @@ mod tests {
             NetworkRequestState {
                 resource_type: ResourceType::Image,
                 url: "https://example.test/primary.gif".into(),
+                epoch: 0,
+                is_top_level: false,
             },
         );
         browser.relevant_requests.insert(
@@ -2283,26 +3135,34 @@ mod tests {
             NetworkRequestState {
                 resource_type: ResourceType::Script,
                 url: "https://example.test/article.js".into(),
+                epoch: 0,
+                is_top_level: false,
             },
         );
-        browser.network_failures.push(NetworkOutcome {
-            resource_type: ResourceType::Image,
-            url: Some("https://example.test/primary.gif".into()),
-            failure_reason: Some("net::ERR_FAILED".into()),
-        });
-        browser.http_errors.push(NetworkOutcome {
-            resource_type: ResourceType::Image,
-            url: Some("https://example.test/primary.gif".into()),
-            failure_reason: None,
-        });
-        assert_eq!(browser.readiness(None).pending_relevant_requests, 2);
-        let explicit = browser.readiness(Some("https://example.test/primary.gif"));
+        browser.network_failures.push(test_outcome(
+            ResourceType::Image,
+            Some("https://example.test/primary.gif"),
+            Some("net::ERR_FAILED"),
+            "gif",
+            0,
+            None,
+        ));
+        browser.http_errors.push(test_outcome(
+            ResourceType::Image,
+            Some("https://example.test/primary.gif"),
+            None,
+            "gif",
+            0,
+            Some(404),
+        ));
+        assert_eq!(browser.readiness(1, None).pending_relevant_requests, 2);
+        let explicit = browser.readiness(1, Some("https://example.test/primary.gif"));
         assert_eq!(explicit.pending_relevant_requests, 1);
         assert_eq!(explicit.network_failures, 0);
         assert_eq!(explicit.http_errors, 0);
         assert_eq!(
             browser
-                .readiness(Some("https://example.test/other.gif"))
+                .readiness(1, Some("https://example.test/other.gif"))
                 .network_failures,
             1
         );
@@ -2320,6 +3180,8 @@ mod tests {
                     NetworkRequestState {
                         resource_type: ResourceType::Image,
                         url: selected_url.into(),
+                        epoch: 1,
+                        is_top_level: false,
                     },
                 ),
                 (
@@ -2327,6 +3189,8 @@ mod tests {
                     NetworkRequestState {
                         resource_type: ResourceType::Image,
                         url: sibling_url.into(),
+                        epoch: 1,
+                        is_top_level: false,
                     },
                 ),
                 (
@@ -2334,30 +3198,41 @@ mod tests {
                     NetworkRequestState {
                         resource_type: ResourceType::Script,
                         url: "https://example.test/article.js".into(),
+                        epoch: 1,
+                        is_top_level: false,
                     },
                 ),
             ]),
             network_failures: vec![
-                NetworkOutcome {
-                    resource_type: ResourceType::Image,
-                    url: Some(sibling_url.into()),
-                    failure_reason: Some("net::ERR_ABORTED".into()),
-                },
-                NetworkOutcome {
-                    resource_type: ResourceType::Image,
-                    url: Some(selected_url.into()),
-                    failure_reason: Some("net::ERR_FAILED".into()),
-                },
-                NetworkOutcome {
-                    resource_type: ResourceType::Script,
-                    url: Some("https://example.test/article.js".into()),
-                    failure_reason: Some("net::ERR_FAILED".into()),
-                },
+                test_outcome(
+                    ResourceType::Image,
+                    Some(sibling_url),
+                    Some("net::ERR_ABORTED"),
+                    "sibling-image",
+                    1,
+                    None,
+                ),
+                test_outcome(
+                    ResourceType::Image,
+                    Some(selected_url),
+                    Some("net::ERR_FAILED"),
+                    "selected-image",
+                    1,
+                    None,
+                ),
+                test_outcome(
+                    ResourceType::Script,
+                    Some("https://example.test/article.js"),
+                    Some("net::ERR_FAILED"),
+                    "script",
+                    1,
+                    None,
+                ),
             ],
             ..BrowserRuntimeEvidence::default()
         };
 
-        let readiness = browser.font_sample_readiness(&selected_images);
+        let readiness = browser.font_sample_readiness(1, &selected_images);
         assert_eq!(readiness.pending_relevant_requests, 2);
         assert_eq!(readiness.network_failures, 2);
         assert_eq!(readiness.http_errors, 0);
@@ -2365,23 +3240,44 @@ mod tests {
 
     #[test]
     fn tls_exception_clears_only_the_approved_exact_document_failure() {
+        let mut approved_failure = test_outcome(
+            ResourceType::Document,
+            Some(SITE_URL),
+            Some("net::ERR_CERT_AUTHORITY_INVALID"),
+            "approved-request",
+            0,
+            None,
+        );
+        approved_failure.is_top_level = true;
+        let mut attacker_failure = test_outcome(
+            ResourceType::Document,
+            Some("https://attacker.example/"),
+            Some("net::ERR_CERT_AUTHORITY_INVALID"),
+            "attacker-request",
+            0,
+            None,
+        );
+        attacker_failure.is_top_level = true;
         let browser = BrowserRuntimeEvidence {
             network_failures: vec![
-                NetworkOutcome {
-                    resource_type: ResourceType::Document,
-                    url: Some(SITE_URL.into()),
-                    failure_reason: Some("net::ERR_CERT_AUTHORITY_INVALID".into()),
-                },
-                NetworkOutcome {
-                    resource_type: ResourceType::Document,
-                    url: Some("https://attacker.example/".into()),
-                    failure_reason: Some("net::ERR_CERT_AUTHORITY_INVALID".into()),
-                },
-                NetworkOutcome {
-                    resource_type: ResourceType::Document,
-                    url: Some(SITE_URL.into()),
-                    failure_reason: Some("net::ERR_CERT_DATE_INVALID".into()),
-                },
+                approved_failure,
+                attacker_failure,
+                test_outcome(
+                    ResourceType::Document,
+                    Some(SITE_URL),
+                    Some("net::ERR_CERT_AUTHORITY_INVALID"),
+                    "iframe-request",
+                    0,
+                    None,
+                ),
+                test_outcome(
+                    ResourceType::Document,
+                    Some(SITE_URL),
+                    Some("net::ERR_CERT_DATE_INVALID"),
+                    "different-error",
+                    0,
+                    None,
+                ),
             ],
             ..BrowserRuntimeEvidence::default()
         };
@@ -2389,12 +3285,18 @@ mod tests {
             state: Arc::new(Mutex::new(browser)),
             tasks: Vec::new(),
         };
-        monitor.clear_explicitly_approved_tls_interstitial_failure();
+        assert_eq!(
+            monitor
+                .tls_navigation_failure()
+                .map(|failure| failure.request_id),
+            Some("approved-request".into())
+        );
+        monitor.clear_explicitly_approved_tls_interstitial_failure("approved-request", SITE_URL);
         let state = monitor
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(state.network_failures.len(), 2);
+        assert_eq!(state.network_failures.len(), 3);
         assert!(
             state
                 .network_failures
@@ -2410,19 +3312,22 @@ mod tests {
     fn network_failure_diagnostics_strip_query_fragment_and_credentials() {
         let browser = BrowserRuntimeEvidence {
             network_failures: vec![
-                NetworkOutcome {
-                    resource_type: ResourceType::Script,
-                    url: Some(
-                        "https://user:password@example.test/assets/app.js?token=secret#fragment"
-                            .into(),
-                    ),
-                    failure_reason: Some("net::ERR_CONNECTION_RESET".into()),
-                },
-                NetworkOutcome {
-                    resource_type: ResourceType::Image,
-                    url: Some("https://example.test/primary.gif?cache=1".into()),
-                    failure_reason: Some("net::ERR_FAILED".into()),
-                },
+                test_outcome(
+                    ResourceType::Script,
+                    Some("https://user:password@example.test/assets/app.js?token=secret#fragment"),
+                    Some("net::ERR_CONNECTION_RESET"),
+                    "script",
+                    1,
+                    None,
+                ),
+                test_outcome(
+                    ResourceType::Image,
+                    Some("https://example.test/primary.gif?cache=1"),
+                    Some("net::ERR_FAILED"),
+                    "primary-image",
+                    1,
+                    None,
+                ),
             ],
             ..BrowserRuntimeEvidence::default()
         };
@@ -2430,7 +3335,7 @@ mod tests {
             state: Arc::new(Mutex::new(browser)),
             tasks: Vec::new(),
         };
-        let details = monitor.network_failure_details(None);
+        let details = monitor.network_failure_details(1, None);
         assert!(
             details.contains("Script https://example.test/assets/app.js net::ERR_CONNECTION_RESET")
         );
@@ -2441,11 +3346,11 @@ mod tests {
         assert!(!details.contains("fragment"));
 
         let exact_primary =
-            monitor.network_failure_details(Some("https://example.test/primary.gif?cache=1"));
+            monitor.network_failure_details(1, Some("https://example.test/primary.gif?cache=1"));
         assert!(!exact_primary.contains("primary.gif"));
         assert!(exact_primary.contains("ERR_CONNECTION_RESET"));
-        let other_primary =
-            monitor.network_failure_details(Some("https://example.test/primary.gif?cache=other"));
+        let other_primary = monitor
+            .network_failure_details(1, Some("https://example.test/primary.gif?cache=other"));
         assert!(other_primary.contains("primary.gif"));
     }
 
@@ -2460,6 +3365,10 @@ mod tests {
                 } else {
                     "net::ERR_FAILED".into()
                 }),
+                request_id: format!("request-{index}"),
+                epoch: 1,
+                status_code: None,
+                is_top_level: false,
             })
             .collect();
         let monitor = BrowserEvidenceMonitor {
@@ -2469,13 +3378,13 @@ mod tests {
             })),
             tasks: Vec::new(),
         };
-        let details = monitor.network_failure_details(None);
+        let details = monitor.network_failure_details(1, None);
         assert_eq!(
             details.matches("Fetch ").count(),
             MAX_NETWORK_DIAGNOSTIC_ITEMS
         );
-        assert!(details.contains("+2 more network failures"));
-        assert!(details.contains("unclassified network error"));
+        assert!(details.contains("ещё сетевых ошибок: 2"));
+        assert!(details.contains("не классифицированная сетевая ошибка"));
         assert!(!details.contains("secret"));
         assert!(!details.contains("hidden"));
     }
@@ -2569,13 +3478,13 @@ mod tests {
         assert!(
             analyze_capture_pixels(&blank_dark)
                 .unwrap_err()
-                .contains("light glyph")
+                .contains("светлых пикселей glyph")
         );
         let white = RgbaImage::from_pixel(160, 160, image::Rgba([255, 255, 255, 255]));
         assert!(
             analyze_capture_pixels(&white)
                 .unwrap_err()
-                .contains("dark tile pixels")
+                .contains("тёмных пикселей плитки")
         );
     }
 
@@ -2584,7 +3493,7 @@ mod tests {
         let text = "Статья №773\nUnicode: 5143\nЧастотность\n192";
         assert_eq!(article_unicode(text), Some("5143".into()));
         assert_ne!(article_unicode(text).as_deref(), Some("672A"));
-        assert_eq!(article_unicode("no article metadata"), None);
+        assert_eq!(article_unicode("нет метаданных статьи"), None);
         assert_eq!(article_number(text), Some(773));
         assert_eq!(frequency_index(text), Some(192));
         assert_eq!(article_number("№773\nUnicode: 5143"), Some(773));
@@ -2593,12 +3502,12 @@ mod tests {
     }
 
     #[test]
-    fn tls_exception_requires_explicit_flag_exact_host_and_exact_error() {
+    fn tls_exception_requires_explicit_flag_exact_failed_url_and_exact_error() {
         let expected_error = "net::ERR_CERT_AUTHORITY_INVALID";
         assert!(
             check_tls_exception(
                 true,
-                "www.yarxi.su",
+                SITE_URL,
                 "NET::ERR_CERT_AUTHORITY_INVALID",
                 expected_error,
                 true,
@@ -2608,7 +3517,7 @@ mod tests {
         assert!(
             check_tls_exception(
                 false,
-                "www.yarxi.su",
+                SITE_URL,
                 "NET::ERR_CERT_AUTHORITY_INVALID",
                 expected_error,
                 true,
@@ -2618,7 +3527,7 @@ mod tests {
         assert!(
             check_tls_exception(
                 true,
-                "attacker.example",
+                "https://attacker.example/",
                 "NET::ERR_CERT_AUTHORITY_INVALID",
                 expected_error,
                 true,
@@ -2628,7 +3537,27 @@ mod tests {
         assert!(
             check_tls_exception(
                 true,
-                "www.yarxi.su",
+                "https://www.yarxi.su.evil.example/",
+                "NET::ERR_CERT_AUTHORITY_INVALID",
+                expected_error,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            check_tls_exception(
+                true,
+                "https://www.yarxi.su:444/",
+                "NET::ERR_CERT_AUTHORITY_INVALID",
+                expected_error,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            check_tls_exception(
+                true,
+                SITE_URL,
                 "NET::ERR_CERT_DATE_INVALID",
                 "net::ERR_CERT_DATE_INVALID",
                 true,
@@ -2638,7 +3567,7 @@ mod tests {
         assert!(
             check_tls_exception(
                 true,
-                "www.yarxi.su",
+                SITE_URL,
                 "NET::ERR_CERT_AUTHORITY_INVALID",
                 expected_error,
                 false,

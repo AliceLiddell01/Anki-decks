@@ -18,13 +18,16 @@ Creative Commons Attribution-ShareAlike 3.0 Unported license (CC BY-SA 3.0):
 https://creativecommons.org/licenses/by-sa/3.0/
 
 The generated catalog contains 6,430 CJK templates. Each source SVG was
-rasterized with the pinned `resvg` dependency, cropped to its foreground,
-normalized to a centered 64x64 binary mask, and compressed. This is adapted data;
-the generated catalog is provided under CC BY-SA 3.0.
+rasterized with the pinned `resvg` dependency, converted to a binary foreground
+mask, and normalized with the shared `normalize_binary_mask` routine. The
+routine crops foreground bounds, aspect-fits within 56x56, centers the mask in a
+64x64 canvas, then samples nearest-neighbor pixels from source-cell centers:
+`floor((2 * output_index + 1) * source_size / (2 * output_size))`. This is
+adapted data; the generated catalog is provided under CC BY-SA 3.0.
 
 Generated file: kanjivg-r20250816.maskdb.zlib
 Generated file SHA-256:
-  b0a4e140e2358f7a055b72b2f42088a5742e03730a5d3b6a79fd0ded200e8b7c
+  5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff
 
 To regenerate from the pinned release archive, extract its `kanji/` directory
 and run from the workspace root:
