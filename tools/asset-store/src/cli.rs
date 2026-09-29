@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::error::{AssetError, ErrorCode};
 use crate::model::{AssetIdentity, AssetRecord, LifecycleState, SemanticStatus, ValidatorIdentity};
 use crate::selection::SelectionMode;
-use crate::store::{AssetStore, IngestRequest, StoreOptions};
+use crate::store::{AssetStore, IngestRequest, StoreOptions, fd_canonical_path, open_source_file};
 
 /// Командная строка `kanji-assets`.
 #[derive(Debug, Parser)]
@@ -211,20 +211,20 @@ pub fn execute(cli: Cli) -> CliOutput {
             .parse::<KanjiCharacter>()
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))
             .and_then(|character| {
-                validate_explicit_source(file, &protected_roots)?;
-                Ok(Some(character.identity()))
+                validate_explicit_source(file, &protected_roots)
+                    .map(|source| (Some(character.identity()), Some(source)))
             }),
         Command::Plan {
             validator_id,
             validator_version,
             ..
         } => ValidatorIdentity::new(validator_id.clone(), validator_version.clone())
-            .map(|_| None)
+            .map(|_| (None, None))
             .map_err(|message| AssetError::new(ErrorCode::InvalidValidatorIdentity, message)),
-        _ => Ok(None),
+        _ => Ok((None, None)),
     };
-    let selected_identity = match prevalidated {
-        Ok(identity) => identity,
+    let (selected_identity, source_file) = match prevalidated {
+        Ok((identity, source)) => (identity, source),
         Err(error) => {
             return render_error(
                 operation,
@@ -249,7 +249,7 @@ pub fn execute(cli: Cli) -> CliOutput {
                 path: store.root().display().to_string(),
                 store_id: Some(store.store_id().to_owned()),
             };
-            match execute_with_store(&store, store_summary.clone(), cli.command) {
+            match execute_with_store(&store, store_summary.clone(), cli.command, source_file) {
                 Ok((response, exit_code)) => render_response(response, cli.output, exit_code),
                 Err(error) => render_error(
                     operation,
@@ -278,28 +278,21 @@ pub fn execute(cli: Cli) -> CliOutput {
 fn validate_explicit_source(
     path: &std::path::Path,
     protected_roots: &BTreeSet<PathBuf>,
-) -> Result<(), AssetError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            AssetError::new(
-                ErrorCode::SourceMissing,
-                format!("explicit source file отсутствует: {}", path.display()),
-            )
-        } else {
-            AssetError::io("не удалось проверить explicit source", error)
-        }
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AssetError::new(
-            ErrorCode::SourceNotRegular,
-            "explicit source должен быть обычным файлом без symlink",
-        ));
-    }
+) -> Result<std::fs::File, AssetError> {
     let lexical_source = normalize_absolute_path(path)?;
-    let canonical_source = std::fs::canonicalize(path)
-        .map_err(|error| AssetError::io("не удалось разрешить explicit source", error))?;
     for protected_root in protected_roots {
         let lexical_root = normalize_absolute_path(protected_root)?;
+        if lexical_source.starts_with(&lexical_root) {
+            return Err(AssetError::new(
+                ErrorCode::BoundaryViolation,
+                "kanji CLI не читает source из защищённого дерева decks",
+            ));
+        }
+    }
+
+    let source = open_source_file(path)?;
+    let opened_source = fd_canonical_path(&source)?;
+    for protected_root in protected_roots {
         let canonical_root = match std::fs::canonicalize(protected_root) {
             Ok(root) => Some(root),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -310,25 +303,14 @@ fn validate_explicit_source(
                 ));
             }
         };
-        if lexical_source.starts_with(&lexical_root)
-            || canonical_root.is_some_and(|root| canonical_source.starts_with(root))
-        {
+        if canonical_root.is_some_and(|root| opened_source.starts_with(root)) {
             return Err(AssetError::new(
                 ErrorCode::BoundaryViolation,
                 "kanji CLI не читает source из защищённого дерева decks",
             ));
         }
     }
-    std::fs::File::open(path).map(|_| ()).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            AssetError::new(
-                ErrorCode::SourceMissing,
-                format!("explicit source file отсутствует: {}", path.display()),
-            )
-        } else {
-            AssetError::io("explicit source недоступен для чтения", error)
-        }
-    })
+    Ok(source)
 }
 
 fn normalize_absolute_path(path: &std::path::Path) -> Result<PathBuf, AssetError> {
@@ -425,6 +407,7 @@ fn execute_with_store(
     store: &AssetStore,
     store_summary: StoreSummary,
     command: Command,
+    mut source_file: Option<std::fs::File>,
 ) -> Result<(Response, u8), AssetError> {
     match command {
         Command::Init => {
@@ -453,12 +436,20 @@ fn execute_with_store(
             let character = character
                 .parse::<KanjiCharacter>()
                 .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
-            let outcome = store.ingest(IngestRequest {
-                identity: character.identity(),
-                source_path: file,
-                domain_metadata: Some(character.metadata()),
-                replace_expected_sha256,
-            })?;
+            let outcome = store.ingest_from_file(
+                IngestRequest {
+                    identity: character.identity(),
+                    source_path: file,
+                    domain_metadata: Some(character.metadata()),
+                    replace_expected_sha256,
+                },
+                source_file.take().ok_or_else(|| {
+                    AssetError::new(
+                        ErrorCode::IoFailure,
+                        "CLI потерял проверенный explicit source handle",
+                    )
+                })?,
+            )?;
             let summary = AssetSummary {
                 identity: outcome.asset.identity.clone(),
                 from_state: outcome.previous.as_ref().map(|asset| asset.lifecycle),
@@ -706,5 +697,84 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> C
                 exit_code,
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sha2::{Digest, Sha256};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "kanji-assets-source-boundary-{}-{count}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("synthetic test root is created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn source_replacement_after_boundary_check_keeps_the_opened_object() {
+        let temp = TempDir::new();
+        let repository = temp.0.join("repository");
+        let decks = repository.join("decks");
+        fs::create_dir_all(&decks).expect("protected tree is created");
+        let protected_source = decks.join("protected.bin");
+        let protected_bytes = b"must not be read from decks";
+        fs::write(&protected_source, protected_bytes).expect("protected fixture writes");
+
+        let candidate = temp.0.join("candidate.bin");
+        let candidate_bytes = b"opened candidate remains the source";
+        fs::write(&candidate, candidate_bytes).expect("safe fixture writes");
+        let protected_roots = BTreeSet::from([decks.clone()]);
+        let opened = validate_explicit_source(&candidate, &protected_roots)
+            .expect("source handle passes boundary check");
+
+        fs::remove_file(&candidate).expect("original pathname removed");
+        symlink(&protected_source, &candidate).expect("path now points into protected tree");
+
+        let store_root = temp.0.join("store");
+        let store = AssetStore::open(StoreOptions::new(&store_root).protect_from(&decks))
+            .expect("separate store opens");
+        let outcome = store
+            .ingest_from_file(
+                IngestRequest {
+                    identity: AssetIdentity::new("generic", "source-boundary").unwrap(),
+                    source_path: candidate,
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                opened,
+            )
+            .expect("ingest consumes the checked open handle");
+
+        assert_eq!(
+            outcome.asset.sha256,
+            format!("{:x}", Sha256::digest(candidate_bytes)),
+            "the bytes belong to the descriptor checked before pathname replacement"
+        );
+        assert_ne!(
+            outcome.asset.sha256,
+            format!("{:x}", Sha256::digest(protected_bytes))
+        );
     }
 }

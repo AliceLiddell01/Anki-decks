@@ -1,13 +1,17 @@
 //! Program-owned filesystem store с атомарным versioned manifest.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, open, openat, renameat, unlinkat};
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AssetError, ErrorCode};
@@ -53,11 +57,29 @@ impl StoreOptions {
 /// Открытый, проверяемый asset store.
 #[derive(Debug)]
 pub struct AssetStore {
+    /// Канонический путь для вывода пользователю.
     root: PathBuf,
+    /// Открытый directory handle — все store I/O остаётся привязанным к этому inode.
+    root_handle: File,
     store_id: String,
     initialized_on_open: bool,
     #[cfg(test)]
     fail_next_manifest_write: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    lock_test_hooks: std::sync::Mutex<Option<std::sync::Arc<LockTestHooks>>>,
+}
+
+#[cfg(test)]
+struct LockTestHooks {
+    before_lock: std::sync::Arc<dyn Fn(&File) + Send + Sync>,
+    after_lock: std::sync::Arc<dyn Fn(&File) + Send + Sync>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for LockTestHooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LockTestHooks")
+    }
 }
 
 /// Запрос explicit ingest одного названного локального файла.
@@ -89,12 +111,13 @@ struct OwnerMarker {
 
 #[derive(Debug)]
 struct TempArtifact {
-    path: PathBuf,
+    directory: File,
+    name: OsString,
 }
 
 impl Drop for TempArtifact {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = unlinkat(&self.directory, &self.name, AtFlags::empty());
     }
 }
 
@@ -104,6 +127,21 @@ struct StagedObject {
     sha256: String,
     byte_length: u64,
     format: DetectedFormat,
+}
+
+#[derive(Debug)]
+struct StoreLock {
+    directory: File,
+    lock_file: File,
+}
+
+impl StoreLock {
+    fn unlock(self) -> Result<(), AssetError> {
+        FileExt::unlock(&self.lock_file)
+            .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
+        FileExt::unlock(&self.directory)
+            .map_err(|error| AssetError::io("не удалось снять directory lock store", error))
+    }
 }
 
 impl AssetStore {
@@ -125,44 +163,60 @@ impl AssetStore {
             }
         }
 
-        fs::create_dir_all(&requested_root)
-            .map_err(|error| AssetError::io("не удалось создать store root", error))?;
-        let canonical_root = fs::canonicalize(&requested_root)
-            .map_err(|error| AssetError::io("не удалось разрешить store root", error))?;
+        let (root_handle, root_created) = open_or_create_store_root(&requested_root, |_| {})?;
+        let canonical_root = fd_canonical_path(&root_handle)?;
         if canonical_root != requested_root {
             return Err(AssetError::new(
                 ErrorCode::BoundaryViolation,
-                "store root изменился через symlink или alias во время открытия",
+                "store root изменился во время открытия",
             ));
         }
-        ensure_directory(&canonical_root)?;
-        preflight_root_ownership(&canonical_root)?;
 
-        let lock_path = canonical_root.join(LOCK_FILE);
-        ensure_lock_path(&lock_path)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| AssetError::io("не удалось открыть lock store", error))?;
+        for protected in &options.protected_roots {
+            for protected in resolve_protected_paths(protected)? {
+                if paths_overlap(&canonical_root, &protected) {
+                    return Err(AssetError::new(
+                        ErrorCode::BoundaryViolation,
+                        format!(
+                            "store root {} пересекается с защищённым каталогом {}",
+                            canonical_root.display(),
+                            protected.display()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Directory flock сериализует первоначальную проверку и bootstrap,
+        // не оставляя lock-файла в существующем unowned root.
+        FileExt::lock_exclusive(&root_handle)
+            .map_err(|error| AssetError::io("не удалось заблокировать store root", error))?;
+        let state = preflight_root_ownership(&root_handle, root_created)?;
+        let lock = match state {
+            RootState::NewlyCreated | RootState::ExistingEmpty => create_lock_file(&root_handle)?,
+            RootState::Owned => open_lock_file(&root_handle, true)?,
+        };
         FileExt::lock_exclusive(&lock)
             .map_err(|error| AssetError::io("не удалось заблокировать store", error))?;
+        let initialized_on_open = initialize_or_load(&root_handle, state)?;
 
-        let initialized_on_open = initialize_or_load(&canonical_root)?;
-        let manifest = load_manifest(&canonical_root)?;
-        validate_manifest(&canonical_root, &manifest)?;
+        let manifest = load_manifest(&root_handle)?;
+        validate_manifest(&root_handle, &manifest)?;
 
         let store = Self {
             root: canonical_root,
+            root_handle,
             store_id: manifest.store_id,
             initialized_on_open,
             #[cfg(test)]
             fail_next_manifest_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            lock_test_hooks: std::sync::Mutex::new(None),
         };
         FileExt::unlock(&lock)
             .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
+        FileExt::unlock(&store.root_handle)
+            .map_err(|error| AssetError::io("не удалось снять lock store root", error))?;
         Ok(store)
     }
 
@@ -185,11 +239,10 @@ impl AssetStore {
     /// Проверяет manifest и каждый файл, на который он ссылается.
     pub fn verify_integrity(&self) -> Result<Vec<AssetRecord>, AssetError> {
         let lock = self.lock_shared()?;
-        let manifest = load_manifest(&self.root)?;
-        validate_manifest(&self.root, &manifest)?;
+        let manifest = load_manifest(&self.root_handle)?;
+        validate_manifest(&self.root_handle, &manifest)?;
         let assets = manifest.assets;
-        FileExt::unlock(&lock)
-            .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
+        lock.unlock()?;
         Ok(assets)
     }
 
@@ -200,10 +253,24 @@ impl AssetStore {
             .identity
             .validate()
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        let source = open_source_file(&request.source_path)?;
+        self.ingest_from_file(request, source)
+    }
+
+    /// Импортирует уже открытый и проверенный CLI source handle.
+    pub(crate) fn ingest_from_file(
+        &self,
+        request: IngestRequest,
+        source: File,
+    ) -> Result<IngestOutcome, AssetError> {
+        request
+            .identity
+            .validate()
+            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
         let lock = self.lock_exclusive()?;
-        let mut manifest = load_manifest(&self.root)?;
-        validate_manifest(&self.root, &manifest)?;
-        let staged = stage_source(&self.root, &request.source_path)?;
+        let mut manifest = load_manifest(&self.root_handle)?;
+        validate_manifest(&self.root_handle, &manifest)?;
+        let staged = stage_source(&self.root_handle, source)?;
         let source_name = request
             .source_path
             .file_name()
@@ -220,8 +287,7 @@ impl AssetStore {
         if let Some(existing) = &existing {
             if existing.sha256 == staged.sha256 {
                 drop(staged);
-                FileExt::unlock(&lock)
-                    .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
+                lock.unlock()?;
                 return Ok(IngestOutcome {
                     asset: existing.clone(),
                     previous: Some(existing.clone()),
@@ -255,8 +321,7 @@ impl AssetStore {
         }
 
         let storage_path = object_relative_path(&staged.sha256);
-        let object_path = self.root.join(&storage_path);
-        publish_object(&staged, &object_path)?;
+        publish_object(&staged, &self.root_handle, &staged.sha256)?;
         let record = AssetRecord {
             identity: request.identity,
             storage_path,
@@ -271,7 +336,7 @@ impl AssetStore {
             validation: None,
             domain_metadata: request.domain_metadata,
         };
-        validate_object(&self.root, &record)?;
+        validate_object(&self.root_handle, &record)?;
 
         if existing.is_some() {
             let slot = manifest
@@ -287,10 +352,9 @@ impl AssetStore {
         manifest.revision = manifest.revision.checked_add(1).ok_or_else(|| {
             AssetError::new(ErrorCode::ManifestCorrupt, "revision manifest переполнен")
         })?;
-        save_manifest(&self.root, &manifest, false)?;
+        save_manifest(&self.root_handle, &manifest, false)?;
         drop(staged);
-        FileExt::unlock(&lock)
-            .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
+        lock.unlock()?;
         Ok(IngestOutcome {
             asset: record,
             previous: existing,
@@ -306,14 +370,13 @@ impl AssetStore {
     ) -> Result<Vec<AssetRecord>, AssetError> {
         validate_validator_identity(validator)?;
         let lock = self.lock_shared()?;
-        let manifest = load_manifest(&self.root)?;
-        validate_manifest(&self.root, &manifest)?;
+        let manifest = load_manifest(&self.root_handle)?;
+        validate_manifest(&self.root_handle, &manifest)?;
         let assets = select_assets(&manifest.assets, mode, validator)
             .into_iter()
             .cloned()
             .collect();
-        FileExt::unlock(&lock)
-            .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
+        lock.unlock()?;
         Ok(assets)
     }
 
@@ -328,8 +391,8 @@ impl AssetStore {
         let validator_id = validator.identity();
         validate_validator_identity(&validator_id)?;
         let lock = self.lock_exclusive()?;
-        let mut manifest = load_manifest(&self.root)?;
-        validate_manifest(&self.root, &manifest)?;
+        let mut manifest = load_manifest(&self.root_handle)?;
+        validate_manifest(&self.root_handle, &manifest)?;
         let selected: Vec<_> = select_assets(&manifest.assets, mode, &validator_id)
             .into_iter()
             .cloned()
@@ -341,8 +404,7 @@ impl AssetStore {
         // места manifest и trusted state не меняются.
         let mut decisions: Vec<(AssetRecord, SemanticDecision)> = Vec::new();
         for record in selected {
-            let path = checked_object_path(&self.root, &record)?;
-            let mut file = open_regular_file(&path, ErrorCode::MissingAssetFile)?;
+            let mut file = checked_object_file(&self.root_handle, &record)?;
             let original_state = record.lifecycle;
             match validator.validate(&record, &mut file) {
                 Ok(decision) => {
@@ -411,7 +473,7 @@ impl AssetStore {
         // Validator мог работать параллельно с процессом, не использующим наш
         // lock. Повторно проверяем bytes перед тем, как зафиксировать decision.
         for record in &changed_records {
-            validate_object(&self.root, record)?;
+            validate_object(&self.root_handle, record)?;
         }
 
         report
@@ -426,47 +488,64 @@ impl AssetStore {
                 AssetError::new(ErrorCode::ManifestCorrupt, "revision manifest переполнен")
             })?;
             #[cfg(test)]
-            let inject_failure = self.fail_next_manifest_write.swap(false, Ordering::SeqCst);
+            save_manifest_with_test_hook(
+                &self.root_handle,
+                &manifest,
+                false,
+                &self.fail_next_manifest_write,
+            )?;
             #[cfg(not(test))]
-            let inject_failure = false;
-            if inject_failure {
-                return Err(AssetError::new(
-                    ErrorCode::IoFailure,
-                    "тестовая ошибка перед атомарной публикацией manifest",
-                ));
-            }
-            save_manifest(&self.root, &manifest, false)?;
+            save_manifest(&self.root_handle, &manifest, false)?;
         }
-        FileExt::unlock(&lock)
-            .map_err(|error| AssetError::io("не удалось снять lock store", error))?;
+        lock.unlock()?;
         Ok(report)
     }
 
-    fn lock_shared(&self) -> Result<File, AssetError> {
+    fn lock_shared(&self) -> Result<StoreLock, AssetError> {
         self.lock(false)
     }
 
-    fn lock_exclusive(&self) -> Result<File, AssetError> {
+    fn lock_exclusive(&self) -> Result<StoreLock, AssetError> {
         self.lock(true)
     }
 
-    fn lock(&self, exclusive: bool) -> Result<File, AssetError> {
-        ensure_directory(&self.root)?;
-        let path = self.root.join(LOCK_FILE);
-        ensure_lock_path(&path)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(false)
-            .open(path)
-            .map_err(|error| AssetError::io("не удалось открыть lock store", error))?;
-        if exclusive {
-            FileExt::lock_exclusive(&lock)
+    fn lock(&self, exclusive: bool) -> Result<StoreLock, AssetError> {
+        let directory = open_directory_at(&self.root_handle, ".")
+            .map_err(|error| AssetError::io("не удалось открыть store directory handle", error))?;
+        #[cfg(test)]
+        let hooks = if exclusive {
+            self.lock_test_hooks
+                .lock()
+                .expect("lock test hook mutex is not poisoned")
+                .clone()
         } else {
-            FileExt::lock_shared(&lock)
+            None
+        };
+        #[cfg(test)]
+        if let Some(hooks) = &hooks {
+            (hooks.before_lock)(&directory);
+        }
+        if exclusive {
+            FileExt::lock_exclusive(&directory)
+        } else {
+            FileExt::lock_shared(&directory)
+        }
+        .map_err(|error| AssetError::io("не удалось заблокировать store directory", error))?;
+        let lock_file = open_lock_file(&self.root_handle, false)?;
+        if exclusive {
+            FileExt::lock_exclusive(&lock_file)
+        } else {
+            FileExt::lock_shared(&lock_file)
         }
         .map_err(|error| AssetError::io("не удалось заблокировать store", error))?;
-        Ok(lock)
+        #[cfg(test)]
+        if let Some(hooks) = &hooks {
+            (hooks.after_lock)(&directory);
+        }
+        Ok(StoreLock {
+            directory,
+            lock_file,
+        })
     }
 
     #[cfg(test)]
@@ -510,89 +589,87 @@ fn stable_failure_code(failure: &ValidatorFailure) -> String {
     }
 }
 
-fn initialize_or_load(root: &Path) -> Result<bool, AssetError> {
-    ensure_top_level(root)?;
-    ensure_dir_entry(root, OBJECTS_DIR)?;
-    ensure_dir_entry(root, TEMP_DIR)?;
-
-    let owner_path = root.join(OWNER_FILE);
-    let manifest_path = root.join(MANIFEST_FILE);
-    let owner_exists = path_exists_no_symlink(&owner_path)?;
-    let manifest_exists = path_exists_no_symlink(&manifest_path)?;
-
-    if owner_exists {
-        let bytes = fs::read(&owner_path)
-            .map_err(|error| AssetError::io("не удалось прочитать owner marker", error))?;
-        let marker: OwnerMarker = serde_json::from_slice(&bytes).map_err(|error| {
-            AssetError::new(
-                ErrorCode::ManifestCorrupt,
-                format!("owner marker невалиден: {error}"),
-            )
-        })?;
-        if marker.schema_version != OWNER_SCHEMA_VERSION {
-            return Err(AssetError::new(
-                ErrorCode::UnsupportedSchemaVersion,
-                format!(
-                    "неподдерживаемая версия owner marker {}",
-                    marker.schema_version
-                ),
-            ));
-        }
-        if !manifest_exists {
-            return Err(AssetError::new(
-                ErrorCode::ManifestMissing,
-                "owner marker существует, но canonical manifest отсутствует",
-            ));
-        }
-        let manifest = read_manifest_file(&manifest_path)?;
-        check_schema(&manifest)?;
-        if manifest.store_id != marker.store_id {
-            return Err(AssetError::new(
-                ErrorCode::ManifestCorrupt,
-                "store_id manifest не совпадает с owner marker",
-            ));
-        }
-        return Ok(false);
-    }
-
-    if manifest_exists {
-        let manifest = read_manifest_file(&manifest_path)?;
-        check_schema(&manifest)?;
-        if manifest.revision != 0 || !manifest.assets.is_empty() {
-            return Err(AssetError::new(
-                ErrorCode::StoreNotOwned,
-                "manifest без owner marker не доказывает владение существующими assets",
-            ));
-        }
-        write_owner_marker(root, &manifest.store_id)?;
-        return Ok(true);
-    }
-
-    ensure_empty_owned_directories(root)?;
-    let store_id = new_store_id();
-    let manifest = Manifest::empty(store_id.clone());
-    save_manifest(root, &manifest, true)?;
-    write_owner_marker(root, &store_id)?;
-    Ok(true)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootState {
+    NewlyCreated,
+    ExistingEmpty,
+    Owned,
 }
 
-/// Не создаёт lock-файл в существующем каталоге, пока не подтверждено, что
-/// directory пуст либо имеет только файлы/каталоги, принадлежащие этому store.
-fn preflight_root_ownership(root: &Path) -> Result<(), AssetError> {
+fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError> {
+    match state {
+        RootState::NewlyCreated | RootState::ExistingEmpty => {
+            // Empty root is the only unowned state safe to initialize. Both
+            // the directory bootstrap lock and the store lock are held.
+            let _objects = ensure_dir_entry(root, OBJECTS_DIR)?;
+            let _temporary = ensure_dir_entry(root, TEMP_DIR)?;
+            let store_id = new_store_id();
+            let manifest = Manifest::empty(store_id.clone());
+            write_owner_marker(root, &store_id)?;
+            save_manifest(root, &manifest, true)?;
+            Ok(true)
+        }
+        RootState::Owned => {
+            // Missing internal directories may be repaired only after both
+            // independent ownership files have been validated.
+            ensure_dir_entry(root, OBJECTS_DIR)?;
+            ensure_dir_entry(root, TEMP_DIR)?;
+            Ok(false)
+        }
+    }
+}
+
+/// Classifies root without creating files or directories.
+fn preflight_root_ownership(root: &File, root_created: bool) -> Result<RootState, AssetError> {
+    let names = inspect_top_level(root, ErrorCode::StoreNotOwned)?;
+    if names.is_empty() {
+        return Ok(if root_created {
+            RootState::NewlyCreated
+        } else {
+            RootState::ExistingEmpty
+        });
+    }
+    if !names.contains(OWNER_FILE) {
+        return Err(AssetError::new(
+            ErrorCode::StoreNotOwned,
+            "непустой store root без owner marker не принадлежит asset store",
+        ));
+    }
+    if !names.contains(MANIFEST_FILE) {
+        return Err(AssetError::new(
+            ErrorCode::ManifestMissing,
+            "owner marker существует, но canonical manifest отсутствует",
+        ));
+    }
+
+    let owner = read_owner_marker(root)?;
+    let manifest = read_manifest_file(root)?;
+    check_schema(&manifest)?;
+    if manifest.store_id != owner.store_id {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "store_id manifest не совпадает с owner marker",
+        ));
+    }
+    Ok(RootState::Owned)
+}
+
+fn inspect_top_level(root: &File, unknown_code: ErrorCode) -> Result<BTreeSet<String>, AssetError> {
+    let root_path = fd_path(root);
     let mut names = BTreeSet::new();
-    for entry in fs::read_dir(root)
-        .map_err(|error| AssetError::io("не удалось проверить store root", error))?
+    for entry in fs::read_dir(&root_path)
+        .map_err(|error| AssetError::io("не удалось прочитать store root", error))?
     {
         let entry =
-            entry.map_err(|error| AssetError::io("не удалось проверить store entry", error))?;
+            entry.map_err(|error| AssetError::io("не удалось прочитать store entry", error))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if !matches!(
             name.as_str(),
             LOCK_FILE | OWNER_FILE | MANIFEST_FILE | OBJECTS_DIR | TEMP_DIR
         ) {
             return Err(AssetError::new(
-                ErrorCode::StoreNotOwned,
-                format!("каталог не принадлежит asset store; найдено: {name}"),
+                unknown_code,
+                format!("неожиданный файл в store root: {name}"),
             ));
         }
         let metadata = fs::symlink_metadata(entry.path())
@@ -605,148 +682,163 @@ fn preflight_root_ownership(root: &Path) -> Result<(), AssetError> {
         }
         if matches!(name.as_str(), OBJECTS_DIR | TEMP_DIR) && !metadata.is_dir() {
             return Err(AssetError::new(
-                ErrorCode::StoreNotOwned,
+                unknown_code,
                 format!("{name} существует, но не является каталогом"),
             ));
         }
         if matches!(name.as_str(), LOCK_FILE | OWNER_FILE | MANIFEST_FILE) && !metadata.is_file() {
             return Err(AssetError::new(
-                ErrorCode::StoreNotOwned,
+                unknown_code,
                 format!("{name} существует, но не является обычным файлом"),
             ));
         }
         names.insert(name);
     }
-    if !names.contains(OWNER_FILE) && !names.contains(MANIFEST_FILE) && !names.contains(LOCK_FILE) {
-        for name in [OBJECTS_DIR, TEMP_DIR] {
-            let path = root.join(name);
-            if path.exists()
-                && fs::read_dir(&path)
-                    .map_err(|error| AssetError::io("не удалось проверить новый store", error))?
-                    .next()
-                    .is_some()
+    Ok(names)
+}
+
+fn ensure_top_level(root: &File) -> Result<(), AssetError> {
+    inspect_top_level(root, ErrorCode::UnexpectedPath).map(|_| ())
+}
+
+fn open_directory_at(parent: &File, name: impl rustix::path::Arg) -> std::io::Result<File> {
+    let fd = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(File::from(fd))
+}
+
+fn ensure_dir_entry(root: &File, name: &str) -> Result<File, AssetError> {
+    match open_directory_at(root, name) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match mkdirat(root, name, Mode::from_raw_mode(0o755)) {
+                Ok(()) => open_directory_at(root, name)
+                    .map_err(|error| directory_entry_error(name, error)),
+                Err(create_error)
+                    if std::io::Error::from(create_error).kind()
+                        == std::io::ErrorKind::AlreadyExists =>
+                {
+                    open_directory_at(root, name)
+                        .map_err(|error| directory_entry_error(name, error))
+                }
+                Err(create_error) => Err(AssetError::io(
+                    format!("не удалось создать {name}"),
+                    std::io::Error::from(create_error),
+                )),
+            }
+        }
+        Err(error) => Err(directory_entry_error(name, error)),
+    }
+}
+
+fn directory_entry_error(name: &str, error: std::io::Error) -> AssetError {
+    if is_symlink_error(&error) || error.kind() == std::io::ErrorKind::NotADirectory {
+        AssetError::new(
+            ErrorCode::BoundaryViolation,
+            format!("{name} должен быть обычным каталогом без symlink"),
+        )
+    } else {
+        AssetError::io(format!("не удалось проверить {name}"), error)
+    }
+}
+
+fn create_lock_file(root: &File) -> Result<File, AssetError> {
+    let lock = openat(
+        root,
+        LOCK_FILE,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|error| {
+        let error = std::io::Error::from(error);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AssetError::new(
+                ErrorCode::StoreNotOwned,
+                "lock появился в root до подтверждения program ownership",
+            )
+        } else {
+            AssetError::io("не удалось создать lock store", error)
+        }
+    })?;
+    let lock = File::from(lock);
+    if !lock
+        .metadata()
+        .map_err(|error| AssetError::io("не удалось проверить lock store", error))?
+        .is_file()
+    {
+        return Err(AssetError::new(
+            ErrorCode::BoundaryViolation,
+            "lock path должен быть обычным файлом",
+        ));
+    }
+    Ok(lock)
+}
+
+fn open_lock_file(root: &File, create_if_missing: bool) -> Result<File, AssetError> {
+    match openat(
+        root,
+        LOCK_FILE,
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let lock = File::from(fd);
+            if !lock
+                .metadata()
+                .map_err(|error| AssetError::io("не удалось проверить lock store", error))?
+                .is_file()
             {
                 return Err(AssetError::new(
-                    ErrorCode::StoreNotOwned,
-                    format!("каталог без owner marker содержит данные в {name}"),
+                    ErrorCode::BoundaryViolation,
+                    "lock path должен быть обычным файлом без symlink",
                 ));
+            }
+            Ok(lock)
+        }
+        Err(error) if std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => {
+            if create_if_missing {
+                create_lock_file(root)
+            } else {
+                Err(AssetError::new(
+                    ErrorCode::ManifestCorrupt,
+                    "lock отсутствует в program-owned store",
+                ))
+            }
+        }
+        Err(error) => {
+            let error = std::io::Error::from(error);
+            if is_symlink_error(&error) {
+                Err(AssetError::new(
+                    ErrorCode::BoundaryViolation,
+                    "lock path должен быть обычным файлом без symlink",
+                ))
+            } else {
+                Err(AssetError::io("не удалось открыть lock store", error))
             }
         }
     }
-    Ok(())
 }
 
-fn ensure_top_level(root: &Path) -> Result<(), AssetError> {
-    for entry in fs::read_dir(root)
-        .map_err(|error| AssetError::io("не удалось прочитать store root", error))?
-    {
-        let entry =
-            entry.map_err(|error| AssetError::io("не удалось прочитать store entry", error))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !matches!(
-            name.as_ref(),
-            LOCK_FILE | OWNER_FILE | MANIFEST_FILE | OBJECTS_DIR | TEMP_DIR
-        ) {
-            return Err(AssetError::new(
-                ErrorCode::UnexpectedPath,
-                format!("неожиданный файл в store root: {name}"),
-            ));
-        }
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|error| AssetError::io("не удалось проверить store entry", error))?;
-        if metadata.file_type().is_symlink() {
-            return Err(AssetError::new(
-                ErrorCode::BoundaryViolation,
-                format!("symlink запрещён в store root: {name}"),
-            ));
-        }
-        if matches!(name.as_ref(), OBJECTS_DIR | TEMP_DIR) && !metadata.is_dir() {
-            return Err(AssetError::new(
-                ErrorCode::UnexpectedPath,
-                format!("{name} должен быть каталогом"),
-            ));
-        }
-        if matches!(name.as_ref(), LOCK_FILE | OWNER_FILE | MANIFEST_FILE) && !metadata.is_file() {
-            return Err(AssetError::new(
-                ErrorCode::UnexpectedPath,
-                format!("{name} должен быть обычным файлом"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_empty_owned_directories(root: &Path) -> Result<(), AssetError> {
-    for name in [OBJECTS_DIR, TEMP_DIR] {
-        let path = root.join(name);
-        ensure_dir_entry(root, name)?;
-        if fs::read_dir(&path)
-            .map_err(|error| AssetError::io("не удалось проверить новый store", error))?
-            .next()
-            .is_some()
-        {
-            return Err(AssetError::new(
-                ErrorCode::StoreNotOwned,
-                format!("неинициализированный каталог {name} уже содержит файлы"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_dir_entry(root: &Path, name: &str) -> Result<(), AssetError> {
-    let path = root.join(name);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(AssetError::new(
-                ErrorCode::BoundaryViolation,
-                format!("{name} должен быть обычным каталогом без symlink"),
-            ))
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&path)
-            .map_err(|error| AssetError::io(format!("не удалось создать {name}"), error)),
-        Err(error) => Err(AssetError::io(
-            format!("не удалось проверить {name}"),
-            error,
-        )),
-    }
-}
-
-fn write_owner_marker(root: &Path, store_id: &str) -> Result<(), AssetError> {
+fn write_owner_marker(root: &File, store_id: &str) -> Result<(), AssetError> {
     let marker = OwnerMarker {
         schema_version: OWNER_SCHEMA_VERSION,
         store_id: store_id.to_owned(),
     };
     let bytes = serde_json::to_vec_pretty(&marker)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
-    atomic_write(root, &root.join(OWNER_FILE), &bytes, true)
+    atomic_write(root, OWNER_FILE, &bytes, true, None)
 }
 
-fn load_manifest(root: &Path) -> Result<Manifest, AssetError> {
+fn load_manifest(root: &File) -> Result<Manifest, AssetError> {
     ensure_top_level(root)?;
-    let path = root.join(MANIFEST_FILE);
-    ensure_regular_file(&path, ErrorCode::ManifestMissing)?;
-    let manifest = read_manifest_file(&path)?;
+    let manifest = read_manifest_file(root)?;
     check_schema(&manifest)?;
-    let owner_bytes = fs::read(root.join(OWNER_FILE))
-        .map_err(|error| AssetError::io("не удалось прочитать owner marker", error))?;
-    let owner: OwnerMarker = serde_json::from_slice(&owner_bytes).map_err(|error| {
-        AssetError::new(
-            ErrorCode::ManifestCorrupt,
-            format!("owner marker невалиден: {error}"),
-        )
-    })?;
-    if owner.schema_version != OWNER_SCHEMA_VERSION {
-        return Err(AssetError::new(
-            ErrorCode::UnsupportedSchemaVersion,
-            format!(
-                "неподдерживаемая версия owner marker {}",
-                owner.schema_version
-            ),
-        ));
-    }
+    let owner = read_owner_marker(root)?;
     if owner.store_id != manifest.store_id {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
@@ -756,9 +848,11 @@ fn load_manifest(root: &Path) -> Result<Manifest, AssetError> {
     Ok(manifest)
 }
 
-fn read_manifest_file(path: &Path) -> Result<Manifest, AssetError> {
-    let bytes =
-        fs::read(path).map_err(|error| AssetError::io("не удалось прочитать manifest", error))?;
+fn read_manifest_file(root: &File) -> Result<Manifest, AssetError> {
+    let mut file = open_regular_at(root, MANIFEST_FILE, ErrorCode::ManifestMissing)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| AssetError::io("не удалось прочитать manifest", error))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
     let schema_version = value
@@ -783,6 +877,35 @@ fn read_manifest_file(path: &Path) -> Result<Manifest, AssetError> {
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))
 }
 
+fn read_owner_marker(root: &File) -> Result<OwnerMarker, AssetError> {
+    let mut file = open_regular_at(root, OWNER_FILE, ErrorCode::StoreNotOwned)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| AssetError::io("не удалось прочитать owner marker", error))?;
+    let marker: OwnerMarker = serde_json::from_slice(&bytes).map_err(|error| {
+        AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            format!("owner marker невалиден: {error}"),
+        )
+    })?;
+    if marker.schema_version != OWNER_SCHEMA_VERSION {
+        return Err(AssetError::new(
+            ErrorCode::UnsupportedSchemaVersion,
+            format!(
+                "неподдерживаемая версия owner marker {}",
+                marker.schema_version
+            ),
+        ));
+    }
+    if marker.store_id.is_empty() {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "owner marker store_id пуст",
+        ));
+    }
+    Ok(marker)
+}
+
 fn check_schema(manifest: &Manifest) -> Result<(), AssetError> {
     if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
         return Err(AssetError::new(
@@ -796,7 +919,7 @@ fn check_schema(manifest: &Manifest) -> Result<(), AssetError> {
     Ok(())
 }
 
-fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<(), AssetError> {
+fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
     check_schema(manifest)?;
     if manifest.store_id.is_empty() || manifest.revision > i64::MAX as u64 {
         return Err(AssetError::new(
@@ -894,9 +1017,9 @@ fn validate_validation_record(
     Ok(())
 }
 
-fn validate_object(root: &Path, record: &AssetRecord) -> Result<(), AssetError> {
-    let path = checked_object_path(root, record)?;
-    let (sha256, byte_length, format) = hash_file(&path)?;
+fn validate_object(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
+    let file = checked_object_file(root, record)?;
+    let (sha256, byte_length, format) = hash_file(file)?;
     if sha256 != record.sha256 || byte_length != record.byte_length || format != record.format {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
@@ -906,22 +1029,22 @@ fn validate_object(root: &Path, record: &AssetRecord) -> Result<(), AssetError> 
     Ok(())
 }
 
-fn validate_object_directory(root: &Path) -> Result<(), AssetError> {
-    let path = root.join(OBJECTS_DIR);
-    ensure_directory(&path)?;
-    for entry in fs::read_dir(&path)
+fn validate_object_directory(root: &File) -> Result<(), AssetError> {
+    let objects = open_directory_at(root, OBJECTS_DIR).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "каталог objects отсутствует в program-owned store",
+            )
+        } else {
+            AssetError::io("не удалось открыть object store", error)
+        }
+    })?;
+    for entry in fs::read_dir(fd_path(&objects))
         .map_err(|error| AssetError::io("не удалось прочитать object store", error))?
     {
         let entry =
             entry.map_err(|error| AssetError::io("не удалось прочитать object entry", error))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|error| AssetError::io("не удалось проверить object entry", error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(AssetError::new(
-                ErrorCode::BoundaryViolation,
-                "object store содержит symlink или вложенный каталог",
-            ));
-        }
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let Some(hash) = name.strip_suffix(".blob") else {
@@ -931,7 +1054,8 @@ fn validate_object_directory(root: &Path) -> Result<(), AssetError> {
             ));
         };
         validate_hash(hash)?;
-        let (actual_hash, _, _) = hash_file(&entry.path())?;
+        let file = open_regular_at(&objects, entry.file_name(), ErrorCode::MissingAssetFile)?;
+        let (actual_hash, _, _) = hash_file(file)?;
         if actual_hash != hash {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
@@ -967,12 +1091,21 @@ fn validate_relative_path(actual: &str, expected: &str) -> Result<(), AssetError
     Ok(())
 }
 
-fn checked_object_path(root: &Path, record: &AssetRecord) -> Result<PathBuf, AssetError> {
+fn checked_object_file(root: &File, record: &AssetRecord) -> Result<File, AssetError> {
     let expected = object_relative_path(&record.sha256);
     validate_relative_path(&record.storage_path, &expected)?;
-    let objects = root.join(OBJECTS_DIR);
-    ensure_directory(&objects)?;
-    Ok(root.join(expected))
+    let objects = open_directory_at(root, OBJECTS_DIR).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "каталог objects отсутствует в program-owned store",
+            )
+        } else {
+            AssetError::io("не удалось открыть object store", error)
+        }
+    })?;
+    let name = format!("{}.blob", record.sha256);
+    open_regular_at(&objects, &name, ErrorCode::MissingAssetFile)
 }
 
 fn object_relative_path(hash: &str) -> String {
@@ -993,26 +1126,17 @@ fn validate_hash(hash: &str) -> Result<(), AssetError> {
     Ok(())
 }
 
-fn stage_source(root: &Path, source: &Path) -> Result<StagedObject, AssetError> {
-    ensure_directory(&root.join(TEMP_DIR))?;
-    let source_metadata = fs::symlink_metadata(source).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            AssetError::new(
-                ErrorCode::SourceMissing,
-                format!("explicit source file отсутствует: {}", source.display()),
-            )
-        } else {
-            AssetError::io("не удалось проверить source file", error)
-        }
-    })?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+fn stage_source(root: &File, mut input: File) -> Result<StagedObject, AssetError> {
+    if !input
+        .metadata()
+        .map_err(|error| AssetError::io("не удалось проверить source handle", error))?
+        .is_file()
+    {
         return Err(AssetError::new(
             ErrorCode::SourceNotRegular,
             "explicit source должен быть обычным файлом без symlink",
         ));
     }
-    let mut input = File::open(source)
-        .map_err(|error| AssetError::io("не удалось открыть source file", error))?;
     let (artifact, mut output) = create_temp_file(root, "ingest")?;
     let mut digest = Sha256::new();
     let mut byte_length = 0_u64;
@@ -1050,63 +1174,64 @@ fn stage_source(root: &Path, source: &Path) -> Result<StagedObject, AssetError> 
     })
 }
 
-fn publish_object(staged: &StagedObject, destination: &Path) -> Result<(), AssetError> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| AssetError::new(ErrorCode::InvalidStoreRoot, "object path без parent"))?;
-    ensure_directory(parent)?;
-    match fs::symlink_metadata(destination) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(AssetError::new(
-                    ErrorCode::BoundaryViolation,
-                    "content-addressed destination должен быть обычным файлом",
-                ));
-            }
-            let (hash, length, format) = hash_file(destination)?;
-            if hash != staged.sha256 || length != staged.byte_length || format != staged.format {
-                return Err(AssetError::new(
-                    ErrorCode::IntegrityMismatch,
-                    "существующий object path не совпадает с вычисленным content hash",
-                ));
-            }
-            make_readonly(destination)?;
-            sync_directory(parent)
+fn publish_object(staged: &StagedObject, root: &File, hash: &str) -> Result<(), AssetError> {
+    let objects = open_directory_at(root, OBJECTS_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть object store", error))?;
+    let name = format!("{hash}.blob");
+    match open_regular_at(&objects, &name, ErrorCode::MissingAssetFile) {
+        Ok(existing) => {
+            verify_staged_file(staged, existing)?;
+            sync_directory(&objects)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::hard_link(&staged.artifact.path, destination) {
+        Err(error) if error.code == ErrorCode::MissingAssetFile => {
+            match linkat(
+                &staged.artifact.directory,
+                &staged.artifact.name,
+                &objects,
+                &name,
+                AtFlags::empty(),
+            ) {
                 Ok(()) => {
-                    make_readonly(destination)?;
-                    sync_directory(parent)
+                    let object = open_regular_at(&objects, &name, ErrorCode::MissingAssetFile)?;
+                    verify_staged_file(staged, object)?;
+                    sync_directory(&objects)
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let (hash, length, format) = hash_file(destination)?;
-                    if hash == staged.sha256
-                        && length == staged.byte_length
-                        && format == staged.format
-                    {
-                        Ok(())
-                    } else {
-                        Err(AssetError::new(
-                            ErrorCode::IntegrityMismatch,
-                            "object path создан конкурентным процессом с другими bytes",
-                        ))
-                    }
+                Err(link_error)
+                    if std::io::Error::from(link_error).kind()
+                        == std::io::ErrorKind::AlreadyExists =>
+                {
+                    let existing = open_regular_at(&objects, &name, ErrorCode::MissingAssetFile)?;
+                    verify_staged_file(staged, existing)
                 }
-                Err(error) => Err(AssetError::io("не удалось опубликовать object", error)),
+                Err(link_error) => Err(AssetError::io(
+                    "не удалось опубликовать object",
+                    std::io::Error::from(link_error),
+                )),
             }
         }
-        Err(error) => Err(AssetError::io(
-            "не удалось проверить object destination",
-            error,
-        )),
+        Err(error) => Err(error),
     }
 }
 
-fn make_readonly(path: &Path) -> Result<(), AssetError> {
-    let metadata = fs::symlink_metadata(path)
+fn verify_staged_file(staged: &StagedObject, file: File) -> Result<(), AssetError> {
+    let (hash, length, format) = hash_file(
+        file.try_clone()
+            .map_err(|error| AssetError::io("не удалось открыть опубликованный object", error))?,
+    )?;
+    if hash != staged.sha256 || length != staged.byte_length || format != staged.format {
+        return Err(AssetError::new(
+            ErrorCode::IntegrityMismatch,
+            "content-addressed object не совпадает с вычисленным hash",
+        ));
+    }
+    make_readonly(&file)
+}
+
+fn make_readonly(file: &File) -> Result<(), AssetError> {
+    let metadata = file
+        .metadata()
         .map_err(|error| AssetError::io("не удалось проверить object permissions", error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if !metadata.is_file() {
         return Err(AssetError::new(
             ErrorCode::BoundaryViolation,
             "object должен быть обычным файлом",
@@ -1114,35 +1239,75 @@ fn make_readonly(path: &Path) -> Result<(), AssetError> {
     }
     let mut permissions = metadata.permissions();
     permissions.set_readonly(true);
-    fs::set_permissions(path, permissions)
+    file.set_permissions(permissions)
         .map_err(|error| AssetError::io("не удалось защитить object от случайной записи", error))?;
-    File::open(path)
-        .and_then(|file| file.sync_all())
+    file.sync_all()
         .map_err(|error| AssetError::io("не удалось синхронизировать object metadata", error))
 }
 
-fn save_manifest(root: &Path, manifest: &Manifest, initial: bool) -> Result<(), AssetError> {
+fn save_manifest(root: &File, manifest: &Manifest, initial: bool) -> Result<(), AssetError> {
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
-    atomic_write(root, &root.join(MANIFEST_FILE), &bytes, initial)
+    atomic_write(root, MANIFEST_FILE, &bytes, initial, None)
+}
+
+#[cfg(test)]
+fn save_manifest_with_test_hook(
+    root: &File,
+    manifest: &Manifest,
+    initial: bool,
+    fail_before_commit: &std::sync::atomic::AtomicBool,
+) -> Result<(), AssetError> {
+    let bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    atomic_write(
+        root,
+        MANIFEST_FILE,
+        &bytes,
+        initial,
+        Some(fail_before_commit),
+    )
 }
 
 fn atomic_write(
-    root: &Path,
-    destination: &Path,
+    root: &File,
+    destination: &str,
     bytes: &[u8],
     initial: bool,
+    #[allow(unused_variables)] fail_before_commit: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(), AssetError> {
-    ensure_directory(&root.join(TEMP_DIR))?;
     let (temporary, mut file) = create_temp_file(root, "state")?;
     file.write_all(bytes)
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
         .map_err(|error| AssetError::io("не удалось синхронизировать state file", error))?;
     drop(file);
-    match fs::rename(&temporary.path, destination) {
+
+    #[cfg(test)]
+    if fail_before_commit.is_some_and(|hook| hook.swap(false, Ordering::SeqCst)) {
+        return Err(AssetError::new(
+            ErrorCode::IoFailure,
+            "тестовая ошибка после подготовки temporary manifest и до canonical commit",
+        ));
+    }
+
+    let published = if initial {
+        linkat(
+            &temporary.directory,
+            &temporary.name,
+            root,
+            destination,
+            AtFlags::empty(),
+        )
+    } else {
+        renameat(&temporary.directory, &temporary.name, root, destination)
+    };
+    match published {
         Ok(()) => sync_directory(root),
-        Err(error) if initial && error.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(error)
+            if initial
+                && std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists =>
+        {
             Err(AssetError::new(
                 ErrorCode::StoreNotOwned,
                 "state file уже существует при инициализации нового store",
@@ -1150,21 +1315,37 @@ fn atomic_write(
         }
         Err(error) => Err(AssetError::io(
             "не удалось атомарно опубликовать state file",
-            error,
+            std::io::Error::from(error),
         )),
     }
 }
 
-fn create_temp_file(root: &Path, prefix: &str) -> Result<(TempArtifact, File), AssetError> {
-    let directory = root.join(TEMP_DIR);
-    ensure_directory(&directory)?;
+fn create_temp_file(root: &File, prefix: &str) -> Result<(TempArtifact, File), AssetError> {
+    let directory = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
     for _ in 0..128 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!("{prefix}-{}-{counter}.tmp", std::process::id()));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((TempArtifact { path }, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(AssetError::io("не удалось создать временный файл", error)),
+        let name = OsString::from(format!("{prefix}-{}-{counter}.tmp", std::process::id()));
+        match openat(
+            &directory,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(file) => {
+                return Ok((TempArtifact { directory, name }, File::from(file)));
+            }
+            Err(error)
+                if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(AssetError::io(
+                    "не удалось создать временный файл",
+                    std::io::Error::from(error),
+                ));
+            }
         }
     }
     Err(AssetError::new(
@@ -1173,8 +1354,7 @@ fn create_temp_file(root: &Path, prefix: &str) -> Result<(TempArtifact, File), A
     ))
 }
 
-fn hash_file(path: &Path) -> Result<(String, u64, DetectedFormat), AssetError> {
-    let mut file = open_regular_file(path, ErrorCode::MissingAssetFile)?;
+fn hash_file(mut file: File) -> Result<(String, u64, DetectedFormat), AssetError> {
     let mut digest = Sha256::new();
     let mut byte_length = 0_u64;
     let mut signature = Vec::with_capacity(12);
@@ -1202,83 +1382,78 @@ fn hash_file(path: &Path) -> Result<(String, u64, DetectedFormat), AssetError> {
     ))
 }
 
-fn open_regular_file(path: &Path, missing_code: ErrorCode) -> Result<File, AssetError> {
-    ensure_regular_file(path, missing_code)?;
-    File::open(path).map_err(|error| {
+pub(crate) fn open_source_file(path: &Path) -> Result<File, AssetError> {
+    let file = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        let error = std::io::Error::from(error);
         if error.kind() == std::io::ErrorKind::NotFound {
             AssetError::new(
-                missing_code,
-                format!("файл исчез перед чтением: {}", path.display()),
+                ErrorCode::SourceMissing,
+                format!("explicit source file отсутствует: {}", path.display()),
+            )
+        } else if is_symlink_error(&error) {
+            AssetError::new(
+                ErrorCode::SourceNotRegular,
+                "explicit source должен быть обычным файлом без symlink",
             )
         } else {
-            AssetError::io("не удалось открыть файл", error)
+            AssetError::io("не удалось открыть explicit source", error)
         }
-    })
+    })?;
+    let file = File::from(file);
+    if !file
+        .metadata()
+        .map_err(|error| AssetError::io("не удалось проверить explicit source", error))?
+        .is_file()
+    {
+        return Err(AssetError::new(
+            ErrorCode::SourceNotRegular,
+            "explicit source должен быть обычным файлом без symlink",
+        ));
+    }
+    Ok(file)
 }
 
-fn ensure_regular_file(path: &Path, missing_code: ErrorCode) -> Result<(), AssetError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(AssetError::new(
-            ErrorCode::BoundaryViolation,
-            format!("symlink запрещён внутри asset store: {}", path.display()),
-        )),
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => Err(AssetError::new(
+fn open_regular_at(
+    directory: &File,
+    name: impl rustix::path::Arg,
+    missing_code: ErrorCode,
+) -> Result<File, AssetError> {
+    let file = openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        let error = std::io::Error::from(error);
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AssetError::new(missing_code, "файл отсутствует в program-owned store")
+        } else if is_symlink_error(&error) {
+            AssetError::new(
+                ErrorCode::BoundaryViolation,
+                "symlink запрещён внутри asset store",
+            )
+        } else {
+            AssetError::io("не удалось открыть файл store", error)
+        }
+    })?;
+    let file = File::from(file);
+    if !file
+        .metadata()
+        .map_err(|error| AssetError::io("не удалось проверить файл store", error))?
+        .is_file()
+    {
+        return Err(AssetError::new(
             ErrorCode::UnexpectedPath,
-            format!("ожидался обычный файл: {}", path.display()),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(AssetError::new(
-            missing_code,
-            format!("файл отсутствует: {}", path.display()),
-        )),
-        Err(error) => Err(AssetError::io("не удалось проверить файл", error)),
+            "вместо обычного файла найден другой filesystem object",
+        ));
     }
-}
-
-fn ensure_directory(path: &Path) -> Result<(), AssetError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(AssetError::new(
-                ErrorCode::BoundaryViolation,
-                format!(
-                    "каталог должен быть обычным и без symlink: {}",
-                    path.display()
-                ),
-            ))
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(AssetError::new(
-            ErrorCode::ManifestCorrupt,
-            format!("каталог store отсутствует: {}", path.display()),
-        )),
-        Err(error) => Err(AssetError::io("не удалось проверить каталог", error)),
-    }
-}
-
-fn ensure_lock_path(path: &Path) -> Result<(), AssetError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(AssetError::new(
-                ErrorCode::BoundaryViolation,
-                "lock path должен быть обычным файлом без symlink",
-            ))
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(AssetError::io("не удалось проверить lock path", error)),
-    }
-}
-
-fn path_exists_no_symlink(path: &Path) -> Result<bool, AssetError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(AssetError::new(
-            ErrorCode::BoundaryViolation,
-            format!("symlink запрещён: {}", path.display()),
-        )),
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(AssetError::io("не удалось проверить путь", error)),
-    }
+    Ok(file)
 }
 
 fn resolve_store_root(root: &Path) -> Result<PathBuf, AssetError> {
@@ -1289,9 +1464,8 @@ fn resolve_store_root(root: &Path) -> Result<PathBuf, AssetError> {
             .map_err(|error| AssetError::io("не удалось определить cwd", error))?
             .join(root)
     };
-    let components: Vec<_> = absolute.components().collect();
     let mut normalized = PathBuf::new();
-    for (position, component) in components.iter().enumerate() {
+    for component in absolute.components() {
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
@@ -1304,45 +1478,126 @@ fn resolve_store_root(root: &Path) -> Result<PathBuf, AssetError> {
             }
             Component::Normal(part) => normalized.push(part),
         }
-        match fs::symlink_metadata(&normalized) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+    }
+    Ok(normalized)
+}
+
+/// Открывает каждый компонент относительно уже открытого родителя без follow
+/// symlink; отсутствующие компоненты создаёт через тот же directory handle.
+fn open_or_create_store_root(
+    path: &Path,
+    mut after_component: impl FnMut(&Path),
+) -> Result<(File, bool), AssetError> {
+    let mut current = File::open("/")
+        .map_err(|error| AssetError::io("не удалось открыть filesystem root", error))?;
+    let parts: Vec<OsString> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let mut root_created = false;
+    let mut expected_parent = PathBuf::from("/");
+
+    for (index, part) in parts.iter().enumerate() {
+        if fd_canonical_path(&current)? != expected_parent {
+            return Err(AssetError::new(
+                ErrorCode::BoundaryViolation,
+                format!(
+                    "компонент store root изменился во время открытия: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let checked_path = expected_parent.join(part);
+        match open_directory_at(&current, part) {
+            Ok(directory) => current = directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match mkdirat(&current, part, Mode::from_raw_mode(0o755)) {
+                    Ok(()) => {
+                        if index + 1 == parts.len() {
+                            root_created = true;
+                        }
+                    }
+                    Err(create_error)
+                        if std::io::Error::from(create_error).kind()
+                            == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_error) => {
+                        return Err(AssetError::io(
+                            "не удалось создать компонент store root",
+                            std::io::Error::from(create_error),
+                        ));
+                    }
+                }
+                current = open_directory_at(&current, part).map_err(|open_error| {
+                    if is_symlink_error(&open_error)
+                        || (open_error.kind() == std::io::ErrorKind::NotADirectory
+                            && fs::symlink_metadata(&checked_path)
+                                .is_ok_and(|metadata| metadata.file_type().is_symlink()))
+                    {
+                        AssetError::new(
+                            ErrorCode::BoundaryViolation,
+                            format!("store root проходит через symlink: {}", path.display()),
+                        )
+                    } else if open_error.kind() == std::io::ErrorKind::NotADirectory {
+                        AssetError::new(
+                            ErrorCode::InvalidStoreRoot,
+                            format!(
+                                "компонент store root не является каталогом: {}",
+                                path.display()
+                            ),
+                        )
+                    } else {
+                        AssetError::io("не удалось открыть компонент store root", open_error)
+                    }
+                })?;
+            }
+            Err(error) if is_symlink_error(&error) => {
                 return Err(AssetError::new(
                     ErrorCode::BoundaryViolation,
-                    format!(
-                        "store root проходит через symlink: {}",
-                        normalized.display()
-                    ),
+                    format!("store root проходит через symlink: {}", path.display()),
                 ));
             }
-            Ok(metadata) if !metadata.is_dir() && normalized != absolute => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                if fs::symlink_metadata(&checked_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(AssetError::new(
+                        ErrorCode::BoundaryViolation,
+                        format!("store root проходит через symlink: {}", path.display()),
+                    ));
+                }
                 return Err(AssetError::new(
                     ErrorCode::InvalidStoreRoot,
                     format!(
-                        "родитель store root не является каталогом: {}",
-                        normalized.display()
+                        "компонент store root не является каталогом: {}",
+                        path.display()
                     ),
                 ));
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                for remaining in &components[position + 1..] {
-                    match remaining {
-                        Component::Normal(part) => normalized.push(part),
-                        Component::CurDir => {}
-                        _ => {
-                            return Err(AssetError::new(
-                                ErrorCode::InvalidStoreRoot,
-                                "store root должен состоять из обычных path components",
-                            ));
-                        }
-                    }
-                }
-                break;
+            Err(error) => {
+                return Err(AssetError::io("не удалось открыть store root", error));
             }
-            Err(error) => return Err(AssetError::io("не удалось проверить store root", error)),
         }
+        expected_parent = checked_path;
+        after_component(&expected_parent);
     }
-    Ok(normalized)
+
+    Ok((current, root_created))
+}
+
+fn fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+pub(crate) fn fd_canonical_path(file: &File) -> Result<PathBuf, AssetError> {
+    fs::canonicalize(fd_path(file))
+        .map_err(|error| AssetError::io("не удалось разрешить открытый filesystem object", error))
+}
+
+fn is_symlink_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(Errno::LOOP.raw_os_error())
 }
 
 fn resolve_protected_paths(path: &Path) -> Result<Vec<PathBuf>, AssetError> {
@@ -1395,22 +1650,18 @@ fn new_store_id() -> String {
     format!("{:x}", Sha256::digest(material.as_bytes()))
 }
 
-fn sync_directory(path: &Path) -> Result<(), AssetError> {
-    #[cfg(unix)]
-    {
-        File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| AssetError::io("не удалось синхронизировать каталог store", error))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+fn sync_directory(directory: &File) -> Result<(), AssetError> {
+    directory
+        .sync_all()
+        .map_err(|error| AssetError::io("не удалось синхронизировать каталог store", error))
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
 
     use super::*;
     use crate::model::{SemanticDecision, ValidationEvidence};
@@ -1482,12 +1733,25 @@ mod tests {
             })
             .expect("candidate ingests");
 
+        let previous_manifest = fs::read(root.join(MANIFEST_FILE)).expect("manifest exists");
         store.fail_next_manifest_write();
         let error = store
             .validate(SelectionMode::Full, &VerifiedValidator)
             .expect_err("injected publication failure is surfaced");
         assert_eq!(error.code, ErrorCode::IoFailure);
         drop(store);
+        assert_eq!(
+            fs::read(root.join(MANIFEST_FILE)).expect("canonical manifest remains readable"),
+            previous_manifest,
+            "failure before rename keeps the previous canonical bytes"
+        );
+        assert_eq!(
+            fs::read_dir(root.join(TEMP_DIR))
+                .expect("temporary directory exists")
+                .count(),
+            0,
+            "failed temporary publication is cleaned up"
+        );
 
         let reopened = AssetStore::open(StoreOptions::new(&root)).expect("store remains readable");
         let records = reopened
@@ -1496,5 +1760,168 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].lifecycle, LifecycleState::Pending);
         assert!(records[0].validation.is_none());
+    }
+
+    fn run_serialization_probe(contested_identity: bool) {
+        let temp = TempDir::new();
+        let root = temp.0.join("store");
+        let store = Arc::new(AssetStore::open(StoreOptions::new(&root)).expect("store opens"));
+        let before_count = Arc::new(AtomicUsize::new(0));
+        let after_count = Arc::new(AtomicUsize::new(0));
+        let (first_locked_tx, first_locked_rx) = mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
+        let (second_probe_tx, second_probe_rx) = mpsc::sync_channel(1);
+        let (second_locked_tx, second_locked_rx) = mpsc::sync_channel(1);
+        let release_first_rx = std::sync::Mutex::new(release_first_rx);
+
+        let before_count_hook = Arc::clone(&before_count);
+        let before_lock = Arc::new(move |lock: &File| {
+            if before_count_hook.fetch_add(1, Ordering::SeqCst) == 1 {
+                let probe = FileExt::try_lock_exclusive(lock);
+                let blocked = probe
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+                if probe.is_ok() {
+                    FileExt::unlock(lock).expect("successful lock probe is released");
+                }
+                second_probe_tx
+                    .send(blocked)
+                    .expect("main test receives the second writer probe");
+            }
+        });
+
+        let after_count_hook = Arc::clone(&after_count);
+        let after_lock = Arc::new(move |_lock: &File| {
+            if after_count_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                first_locked_tx
+                    .send(())
+                    .expect("main test observes first writer holding the lock");
+                release_first_rx
+                    .lock()
+                    .expect("release receiver mutex is healthy")
+                    .recv()
+                    .expect("main test releases the first writer");
+            } else {
+                second_locked_tx
+                    .send(())
+                    .expect("main test observes second writer acquire the lock");
+            }
+        });
+        *store
+            .lock_test_hooks
+            .lock()
+            .expect("test hook mutex is healthy") = Some(Arc::new(LockTestHooks {
+            before_lock,
+            after_lock,
+        }));
+
+        let first_source = temp.0.join("first.bin");
+        let second_source = temp.0.join("second.bin");
+        fs::write(&first_source, b"first writer bytes").expect("first source writes");
+        fs::write(&second_source, b"second writer bytes").expect("second source writes");
+        let first_store = Arc::clone(&store);
+        let first = thread::spawn(move || {
+            first_store.ingest(IngestRequest {
+                identity: AssetIdentity::new(
+                    "generic",
+                    if contested_identity { "same" } else { "first" },
+                )
+                .unwrap(),
+                source_path: first_source,
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            })
+        });
+        first_locked_rx
+            .recv()
+            .expect("first writer entered the exclusive lock section");
+
+        let second_store = Arc::clone(&store);
+        let second = thread::spawn(move || {
+            second_store.ingest(IngestRequest {
+                identity: AssetIdentity::new(
+                    "generic",
+                    if contested_identity { "same" } else { "second" },
+                )
+                .unwrap(),
+                source_path: second_source,
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            })
+        });
+        let second_was_blocked = second_probe_rx
+            .recv()
+            .expect("second writer probes the lock while the first holds it");
+        release_first_tx.send(()).expect("release first writer");
+        let first_result = first.join().expect("first writer thread completes");
+        let second_result = second.join().expect("second writer thread completes");
+        second_locked_rx
+            .recv()
+            .expect("second writer acquires the lock after release");
+
+        assert!(
+            second_was_blocked,
+            "the second writer must observe the first writer's held exclusive lock"
+        );
+        assert!(first_result.is_ok());
+        if contested_identity {
+            assert_eq!(second_result.unwrap_err().code, ErrorCode::IdentityConflict);
+            assert_eq!(store.verify_integrity().unwrap().len(), 1);
+        } else {
+            second_result.expect("different-identity writer succeeds");
+            assert_eq!(store.verify_integrity().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_are_serialized_inside_the_mutation_lock() {
+        run_serialization_probe(false);
+    }
+
+    #[test]
+    fn same_identity_writers_have_one_winner_inside_the_mutation_lock() {
+        run_serialization_probe(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn store_root_component_replacement_is_detected_before_nested_creation() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let parent = temp.0.join("requested-parent");
+        let moved_parent = temp.0.join("moved-parent");
+        let outside = temp.0.join("outside");
+        fs::create_dir(&parent).expect("requested parent exists");
+        fs::create_dir(&outside).expect("symlink target exists");
+        let requested_root = parent.join("store");
+        let mut replaced = false;
+
+        let error = open_or_create_store_root(&requested_root, |opened_component| {
+            if !replaced && opened_component == parent {
+                fs::rename(&parent, &moved_parent).expect("opened parent moves");
+                symlink(&outside, &parent).expect("original pathname becomes a symlink");
+                replaced = true;
+            }
+        })
+        .expect_err("the changed parent handle is rejected before creating its child");
+
+        assert!(
+            replaced,
+            "the test replaced the component after it was opened"
+        );
+        assert_eq!(error.code, ErrorCode::BoundaryViolation);
+        assert!(
+            !requested_root.exists(),
+            "store state is not created via the new symlink"
+        );
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "external target remains untouched"
+        );
+        assert!(
+            fs::read_dir(&moved_parent).unwrap().next().is_none(),
+            "pinned original directory remains untouched"
+        );
     }
 }

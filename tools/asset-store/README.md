@@ -22,6 +22,19 @@ Root с `..`, symlink-компонентом или чужими файлами 
 Пользовательские `decks/**/media/` и CrowdAnki `media_files` не являются
 источниками или частью asset store.
 
+На Linux store root открывается по компонентам через directory handles без
+следования symlink; последующие операции привязаны к открытому root handle, а не
+повторно разрешают исходный pathname. Для инициализации принимается только новый
+или существующий пустой root. Любой непустой root без согласованных `.owner.json`
+и `manifest.json` отклоняется без записи; одинокий manifest не усыновляется.
+Прерванная инициализация без обоих файлов ownership не восстанавливается
+автоматически и требует отдельного ручного решения.
+
+`kanji-assets ingest` открывает source один раз без follow конечного symlink,
+проверяет protected boundary для фактически открытого объекта и копирует bytes из
+того же file descriptor. Замена pathname после проверки не меняет прочитанный
+объект.
+
 Внутри root лежат `.owner.json`, `.lock`, versioned `manifest.json`, каталог
 `objects/` с неизменяемыми объектами `objects/<sha256>.blob` и каталог `.tmp/` для
 временной публикации. Objects адресуются фактическим SHA-256 bytes, а не именем
@@ -55,8 +68,9 @@ Root с `..`, symlink-компонентом или чужими файлами 
 файлов manifest по hash, размеру и формату. Изменённый или отсутствующий object,
 повреждённый/неподдерживаемый manifest, path traversal и symlink дают fail-closed
 ошибку. Записи manifest публикуются через синхронизированный временный файл и
-атомарную замену; `.tmp/` не считается canonical state. Межпроцессные writers
-сериализуются одним store lock.
+атомарную замену; `.tmp/` не считается canonical state. Межпроцессные readers и
+writers сериализуются shared/exclusive directory lock и `.lock`; открытый directory
+handle удерживает операции в том же store root при изменении его pathname.
 
 ## Lifecycle и validation
 

@@ -2,8 +2,6 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
-use std::thread;
 
 use asset_store::{
     AssetIdentity, AssetStore, DetectedFormat, ErrorCode, IngestRequest, LifecycleState,
@@ -417,13 +415,78 @@ fn store_root_must_not_overlap_protected_decks_tree_or_use_parent_aliases() {
 
     let unowned = temp.path().join("user-directory");
     fs::create_dir_all(&unowned).unwrap();
-    fs::write(unowned.join("important.txt"), b"user-owned").unwrap();
+    let important = unowned.join("important.txt");
+    fs::write(&important, b"user-owned").unwrap();
     let error = AssetStore::open(StoreOptions::new(&unowned)).unwrap_err();
     assert_eq!(error.code, ErrorCode::StoreNotOwned);
+    assert_eq!(fs::read(&important).unwrap(), b"user-owned");
     assert!(
         !unowned.join(".lock").exists(),
         "отказ не оставляет lock-файл"
     );
+    for name in ["objects", ".tmp", ".owner.json"] {
+        assert!(!unowned.join(name).exists(), "отказ не создаёт {name}");
+    }
+    let remaining: Vec<_> = fs::read_dir(&unowned)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(remaining, ["important.txt"]);
+
+    let manifest_only = temp.path().join("manifest-only");
+    fs::create_dir(&manifest_only).unwrap();
+    let manifest_path = manifest_only.join("manifest.json");
+    let foreign_manifest = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "store_id": "unowned-empty-state",
+        "revision": 0,
+        "assets": []
+    }))
+    .unwrap();
+    fs::write(&manifest_path, &foreign_manifest).unwrap();
+    let error = AssetStore::open(StoreOptions::new(&manifest_only)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::StoreNotOwned);
+    assert_eq!(fs::read(&manifest_path).unwrap(), foreign_manifest);
+    for name in [".lock", "objects", ".tmp", ".owner.json"] {
+        assert!(
+            !manifest_only.join(name).exists(),
+            "manifest не усыновлен; {name} отсутствует"
+        );
+    }
+
+    let interrupted_init = temp.path().join("owner-without-manifest");
+    fs::create_dir(&interrupted_init).unwrap();
+    let owner_path = interrupted_init.join(".owner.json");
+    let owner_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "store_id": "incomplete-initialization"
+    }))
+    .unwrap();
+    fs::write(&owner_path, &owner_bytes).unwrap();
+    let error = AssetStore::open(StoreOptions::new(&interrupted_init)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::ManifestMissing);
+    assert_eq!(fs::read(&owner_path).unwrap(), owner_bytes);
+    for name in [".lock", "objects", ".tmp", "manifest.json"] {
+        assert!(
+            !interrupted_init.join(name).exists(),
+            "incomplete initialization fails closed without creating {name}"
+        );
+    }
+
+    let new_root = temp.path().join("new-empty-store");
+    let new_store = AssetStore::open(StoreOptions::new(&new_root)).unwrap();
+    assert!(new_store.initialized_on_open());
+    drop(new_store);
+    let reopened = AssetStore::open(StoreOptions::new(&new_root)).unwrap();
+    assert!(!reopened.initialized_on_open());
+
+    let empty_root = temp.path().join("preexisting-empty-store");
+    fs::create_dir(&empty_root).unwrap();
+    let empty_store = AssetStore::open(StoreOptions::new(&empty_root)).unwrap();
+    assert!(empty_store.initialized_on_open());
+    drop(empty_store);
+    let reopened = AssetStore::open(StoreOptions::new(&empty_root)).unwrap();
+    assert!(!reopened.initialized_on_open());
 
     fs::write(decks.join("japanese/media/user.bin"), b"user-owned").unwrap();
     let store = open_store(&repository.join(".asset-store/kanji"));
@@ -481,79 +544,6 @@ fn symlink_store_root_and_object_symlink_are_rejected() {
             .unwrap_err();
     assert_eq!(error.code, ErrorCode::BoundaryViolation);
     assert!(!outside_alias.exists());
-}
-
-#[test]
-fn concurrent_writers_serialize_manifest_updates_without_lost_records() {
-    let temp = TempDir::new("concurrent");
-    let root = temp.path().join("store");
-    open_store(&root);
-    let barrier = Arc::new(Barrier::new(2));
-    let mut workers = Vec::new();
-    for (key, bytes) in [
-        ("left", b"left-bytes".as_slice()),
-        ("right", b"right-bytes".as_slice()),
-    ] {
-        let root = root.clone();
-        let source = temp.write(&format!("{key}.bin"), bytes);
-        let barrier = Arc::clone(&barrier);
-        workers.push(thread::spawn(move || {
-            let store = open_store(&root);
-            barrier.wait();
-            ingest(&store, identity(key), source)
-        }));
-    }
-    for worker in workers {
-        worker.join().expect("writer completes");
-    }
-    let records = open_store(&root)
-        .verify_integrity()
-        .expect("concurrent manifest valid");
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].identity.key, "left");
-    assert_eq!(records[1].identity.key, "right");
-}
-
-#[test]
-fn concurrent_different_bytes_for_one_identity_have_one_winner_and_one_conflict() {
-    let temp = TempDir::new("concurrent-identity");
-    let root = temp.path().join("store");
-    open_store(&root);
-    let barrier = Arc::new(Barrier::new(2));
-    let mut workers = Vec::new();
-    for bytes in [b"first-version".as_slice(), b"second-version".as_slice()] {
-        let root = root.clone();
-        let barrier = Arc::clone(&barrier);
-        let source = temp.write(&format!("candidate-{}.bin", workers.len()), bytes);
-        workers.push(thread::spawn(move || {
-            let store = open_store(&root);
-            barrier.wait();
-            store.ingest(IngestRequest {
-                identity: identity("contested"),
-                source_path: source,
-                domain_metadata: None,
-                replace_expected_sha256: None,
-            })
-        }));
-    }
-
-    let results: Vec<_> = workers
-        .into_iter()
-        .map(|worker| worker.join().expect("writer completes"))
-        .collect();
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    let conflicts: Vec<_> = results
-        .iter()
-        .filter_map(|result| result.as_ref().err())
-        .collect();
-    assert_eq!(conflicts.len(), 1);
-    assert_eq!(conflicts[0].code, ErrorCode::IdentityConflict);
-
-    let records = open_store(&root)
-        .verify_integrity()
-        .expect("winner state valid");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].identity.key, "contested");
 }
 
 #[test]
