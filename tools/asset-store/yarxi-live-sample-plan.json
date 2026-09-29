@@ -1,0 +1,2070 @@
+{
+  "schema_version": 3,
+  "status": "frozen",
+  "prepared_on": "2026-09-29",
+  "source": {
+    "site": "https://www.yarxi.su/",
+    "article_endpoint": "https://www.yarxi.su/api.php",
+    "metadata_flow": "search_kanji -> get_kanji_article.FrOfUse",
+    "database_version": "2021-11-02",
+    "web_interface_version": "2024-08-19",
+    "rank_semantics": "FrOfUse is the Yarxi kanji frequency index; smaller positive values mean more frequent use.",
+    "scouted_candidate_count": 228,
+    "ranked_candidate_count": 214
+  },
+  "sampling_rule": {
+    "seed": "yarxi-live-acceptance-v1",
+    "ordering": "Within each fixed rank interval, sort by ascending SHA-256(seed + \":\" + character).",
+    "candidate_pool": "The ordered lists below are frozen before the acceptance run. They retain primary-GIF-absent candidates so the provider can exercise its confirmed fallback path or record a fail-closed outcome.",
+    "replacement_rule": "For each stratum, attempt candidates in listed order and accept only exact article + pixel-validator VERIFIED outcomes. Stop after 10 verified assets; a failed candidate is replaced by the next listed candidate in the same stratum.",
+    "calibration_exclusions": [
+      "元",
+      "土",
+      "士",
+      "己",
+      "巳",
+      "未",
+      "末"
+    ]
+  },
+  "validator": {
+    "id": "kanjivg-pixel-chamfer",
+    "version": "kanjivg-r20250816-noto-serif-jp-24fc2d26-mask64-v5",
+    "verified_max_distance": 0.02,
+    "verified_minimum_margin": 0.004,
+    "rejected_minimum_gap": 0.015
+  },
+  "strata": [
+    {
+      "id": "rank_1_100",
+      "label": "Очень частые",
+      "frequency_index_min": 1,
+      "frequency_index_max": 100,
+      "target_verified_assets": 10,
+      "candidates": [
+        {
+          "character": "議",
+          "unicode_codepoint": "U+8B70",
+          "yarxi_article_number": 506,
+          "frequency_index": 25,
+          "stroke_count": 20,
+          "primary_gif_advertised": true,
+          "order_sha256": "07123b1f2e8e0df9b288da26c1dabb8f43951b7b8d5cab7584c7cb42a201d7e4"
+        },
+        {
+          "character": "金",
+          "unicode_codepoint": "U+91D1",
+          "yarxi_article_number": 630,
+          "frequency_index": 53,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "0a5ce5fd374b52636f974dcff8b48f5d6191d5e28f16929bb5c24043f407b1c8"
+        },
+        {
+          "character": "大",
+          "unicode_codepoint": "U+5927",
+          "yarxi_article_number": 1763,
+          "frequency_index": 7,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "0d687e3ffbcc02256c0348f0bcf259d6b18db014c0d49f09333f9e188c9437a4"
+        },
+        {
+          "character": "生",
+          "unicode_codepoint": "U+751F",
+          "yarxi_article_number": 1528,
+          "frequency_index": 29,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "0edc3a2e3852a1bf4189584ff847637ea7edc25838036f6613668aa72bfd1e1e"
+        },
+        {
+          "character": "後",
+          "unicode_codepoint": "U+5F8C",
+          "yarxi_article_number": 821,
+          "frequency_index": 26,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "18568869d5cce8a3dde355ebe55dc777a1021453c1f7714c3743dadb8a1af066"
+        },
+        {
+          "character": "法",
+          "unicode_codepoint": "U+6CD5",
+          "yarxi_article_number": 2539,
+          "frequency_index": 100,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "21280e90d3130734028975adce24584d9663331e1d5cbbc00fababcfc42fe1b5"
+        },
+        {
+          "character": "会",
+          "unicode_codepoint": "U+4F1A",
+          "yarxi_article_number": 269,
+          "frequency_index": 4,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "234470e1426b8e4235c65a8fee97d463ad6d5bf3c9395a0ccf98566bcdcd2d25"
+        },
+        {
+          "character": "行",
+          "unicode_codepoint": "U+884C",
+          "yarxi_article_number": 898,
+          "frequency_index": 20,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "24012b7104c1bad964d51e4c8d6db028076cc0b6468dcd9ca8f1765c03ceff9b"
+        },
+        {
+          "character": "市",
+          "unicode_codepoint": "U+5E02",
+          "yarxi_article_number": 1086,
+          "frequency_index": 42,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "2597366d35e95ea188ff80cf27a2a996c6b57683b981e696ef9468d314ffe4f0"
+        },
+        {
+          "character": "入",
+          "unicode_codepoint": "U+5165",
+          "yarxi_article_number": 2162,
+          "frequency_index": 56,
+          "stroke_count": 2,
+          "primary_gif_advertised": true,
+          "order_sha256": "29effdaa3c19871fc24b99b0c49aacb7d8965d71027acb280306a82b9947566b"
+        },
+        {
+          "character": "明",
+          "unicode_codepoint": "U+660E",
+          "yarxi_article_number": 2664,
+          "frequency_index": 67,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "387d06f3acb65eda8cc4161382056469aad7e2dc2a86585d497ab819c698d420"
+        },
+        {
+          "character": "学",
+          "unicode_codepoint": "U+5B66",
+          "yarxi_article_number": 338,
+          "frequency_index": 63,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "3a12e4561d0083fafd34782738326c6c46b1091d9e54af03e50c0cee2fbb2549"
+        },
+        {
+          "character": "問",
+          "unicode_codepoint": "U+554F",
+          "yarxi_article_number": 2700,
+          "frequency_index": 64,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "422d55810bc8cad218616e1d805ab50d95b3ad6f272a187cffbc2d6810074bec"
+        },
+        {
+          "character": "定",
+          "unicode_codepoint": "U+5B9A",
+          "yarxi_article_number": 1954,
+          "frequency_index": 48,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "476e09ccd8f6d7679cb941597ecc55838cd7644f1d028bdf5df4c33a22843af9"
+        },
+        {
+          "character": "六",
+          "unicode_codepoint": "U+516D",
+          "yarxi_article_number": 2941,
+          "frequency_index": 93,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "481c22c8e629eacaaba9b8f0eb52a8ad233e47a4abe73aa25d79bc552f17ce7c"
+        },
+        {
+          "character": "八",
+          "unicode_codepoint": "U+516B",
+          "yarxi_article_number": 2268,
+          "frequency_index": 92,
+          "stroke_count": 2,
+          "primary_gif_advertised": true,
+          "order_sha256": "50600ff25b17ceb87564885203eaabcf12f8e9a861a75c78bc19acd38c05de28"
+        },
+        {
+          "character": "円",
+          "unicode_codepoint": "U+5186",
+          "yarxi_article_number": 157,
+          "frequency_index": 69,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "5b4c846cf6140f1cfedd311bc68b8c858469d3b361d9af79aee16086edf4b708"
+        },
+        {
+          "character": "場",
+          "unicode_codepoint": "U+5834",
+          "yarxi_article_number": 1392,
+          "frequency_index": 52,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "5f603bd25fdb0ab26aef8b37b1e0a6c7040ef5e0c8bbdb85caa77d3a9298341b"
+        },
+        {
+          "character": "月",
+          "unicode_codepoint": "U+6708",
+          "yarxi_article_number": 736,
+          "frequency_index": 23,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "6a97e7550162b85cdd0e8e55cbaafa90bd98087715faa1d306f0bf2c390ec883"
+        },
+        {
+          "character": "下",
+          "unicode_codepoint": "U+4E0B",
+          "yarxi_article_number": 216,
+          "frequency_index": 97,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "6b910b4c36539f0079cede80fe386638ee53d8816dc3fcc9f7cb4d90d492499d"
+        },
+        {
+          "character": "一",
+          "unicode_codepoint": "U+4E00",
+          "yarxi_article_number": 76,
+          "frequency_index": 2,
+          "stroke_count": 1,
+          "primary_gif_advertised": true,
+          "order_sha256": "6b9f8b7fde6883b013937b35eca899e84426e0aab831c50a55317d46271f8efd"
+        },
+        {
+          "character": "意",
+          "unicode_codepoint": "U+610F",
+          "yarxi_article_number": 53,
+          "frequency_index": 99,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "706cff04487df9d5ed22eb9a2577655e8cf652a6a36832dfc3c5a80cf4e31e6f"
+        },
+        {
+          "character": "子",
+          "unicode_codepoint": "U+5B50",
+          "yarxi_article_number": 1084,
+          "frequency_index": 72,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "7224c93abe2ec4adb350f8fdbc25f397406714247ca8db434e086b21a4381eef"
+        },
+        {
+          "character": "人",
+          "unicode_codepoint": "U+4EBA",
+          "yarxi_article_number": 1455,
+          "frequency_index": 5,
+          "stroke_count": 2,
+          "primary_gif_advertised": true,
+          "order_sha256": "78039d1e5a45233b25773d8dec8b19a075d9136cead16551ff2733b68e2a5dd9"
+        },
+        {
+          "character": "題",
+          "unicode_codepoint": "U+984C",
+          "yarxi_article_number": 1766,
+          "frequency_index": 96,
+          "stroke_count": 18,
+          "primary_gif_advertised": true,
+          "order_sha256": "7a86988f09fbf7495618707e3c7d789227302cff319d08e35dd05812f309697c"
+        },
+        {
+          "character": "十",
+          "unicode_codepoint": "U+5341",
+          "yarxi_article_number": 1251,
+          "frequency_index": 8,
+          "stroke_count": 2,
+          "primary_gif_advertised": true,
+          "order_sha256": "7cc8f37905484809640e9d071a8cabae423467522805b491f6e7d7da45556546"
+        },
+        {
+          "character": "体",
+          "unicode_codepoint": "U+4F53",
+          "yarxi_article_number": 1738,
+          "frequency_index": 88,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "82d2dfe59a674207c070463215190548ac2cba2479fa035f8d3bf030998d324d"
+        },
+        {
+          "character": "主",
+          "unicode_codepoint": "U+4E3B",
+          "yarxi_article_number": 1199,
+          "frequency_index": 95,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "8c9f6204efcaf9968e51102be2a39efb2af13169d8ddfd574eb208ee0d4bf743"
+        },
+        {
+          "character": "前",
+          "unicode_codepoint": "U+524D",
+          "yarxi_article_number": 1614,
+          "frequency_index": 27,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "903fd3e2b69bc25c8ccece03f814fba8d17896b1c29c71404f4f948ce5d4a9f0"
+        },
+        {
+          "character": "手",
+          "unicode_codepoint": "U+624B",
+          "yarxi_article_number": 1202,
+          "frequency_index": 60,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "91b0388595d71b6ebe3cda0c2b48a23352cf65f049bcaa5fe0e29fc60ffdd4df"
+        },
+        {
+          "character": "東",
+          "unicode_codepoint": "U+6771",
+          "yarxi_article_number": 2050,
+          "frequency_index": 37,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "b35bf2c735999930204e3d0d5922fb8af3e5542a7d920eddad8b132034dcc67b"
+        },
+        {
+          "character": "事",
+          "unicode_codepoint": "U+4E8B",
+          "yarxi_article_number": 1120,
+          "frequency_index": 18,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "b49ed7cfcd60823b1d10df53169bda4244246d708a1d6d51924baaca05519f11"
+        },
+        {
+          "character": "中",
+          "unicode_codepoint": "U+4E2D",
+          "yarxi_article_number": 1856,
+          "frequency_index": 11,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "b922a82dc932f6f9e04c782f1e49b8e410470aeacfafdeac45ca932562a107a0"
+        },
+        {
+          "character": "外",
+          "unicode_codepoint": "U+5916",
+          "yarxi_article_number": 298,
+          "frequency_index": 81,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "bb3c6e20d3ee9c3010d3b9749b7e6f7ed139ec6afe763d16e380310d282d9177"
+        },
+        {
+          "character": "日",
+          "unicode_codepoint": "U+65E5",
+          "yarxi_article_number": 2160,
+          "frequency_index": 1,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "c1aeaf9d48ae9015ea5bd28e8bb56f8aa84e4e7debe3c1176aa2a614fe87e402"
+        },
+        {
+          "character": "長",
+          "unicode_codepoint": "U+9577",
+          "yarxi_article_number": 1905,
+          "frequency_index": 12,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "c3c1c10592d760f5866c1032e1d46e1163e742a352249cd0b9f462e267cd01b7"
+        },
+        {
+          "character": "三",
+          "unicode_codepoint": "U+4E09",
+          "yarxi_article_number": 1050,
+          "frequency_index": 14,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "c5a0a9e0d2ad6d4ca9c32836792968cc2868ecc2369502fe7fd21fefdf5be557"
+        },
+        {
+          "character": "本",
+          "unicode_codepoint": "U+672C",
+          "yarxi_article_number": 2598,
+          "frequency_index": 10,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "c92a235c89a3230f676baf18680f907834b2ed74fe9214be31a891f9fa97713f"
+        },
+        {
+          "character": "出",
+          "unicode_codepoint": "U+51FA",
+          "yarxi_article_number": 1270,
+          "frequency_index": 13,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "cbebe25fca98a3265e1786ccd7fced7a965a82fad2c99e39ea39e8cc549367e1"
+        },
+        {
+          "character": "新",
+          "unicode_codepoint": "U+65B0",
+          "yarxi_article_number": 1433,
+          "frequency_index": 51,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "d26817d20cab0ac1a99c573357403d4f171dfccb7a2465dc0bc9c369aacbd351"
+        },
+        {
+          "character": "国",
+          "unicode_codepoint": "U+56FD",
+          "yarxi_article_number": 927,
+          "frequency_index": 3,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "da226c2a54c3d9bdef7d423429beac92c3985c08247b1eb6288d99f24d7d88cc"
+        },
+        {
+          "character": "九",
+          "unicode_codepoint": "U+4E5D",
+          "yarxi_article_number": 633,
+          "frequency_index": 55,
+          "stroke_count": 2,
+          "primary_gif_advertised": true,
+          "order_sha256": "dada03d2098337adffc02622a35949ca20eb14b9f80c49e9e49bbcb29a5babfd"
+        },
+        {
+          "character": "高",
+          "unicode_codepoint": "U+9AD8",
+          "yarxi_article_number": 912,
+          "frequency_index": 65,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "e1c447121647bfd9c77854202fe85d05793a8e2ba8bbec2ad18544b90dfbebb1"
+        },
+        {
+          "character": "時",
+          "unicode_codepoint": "U+6642",
+          "yarxi_article_number": 1128,
+          "frequency_index": 16,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "e74198cd2ce427b59e991e9ca23e74d79d43063cfad7e13593089f5965087548"
+        },
+        {
+          "character": "見",
+          "unicode_codepoint": "U+898B",
+          "yarxi_article_number": 763,
+          "frequency_index": 22,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "ecc5ef4b183811264a7409349e2f5196bd7fa2ce5048d6f54bcfd00698026c67"
+        },
+        {
+          "character": "年",
+          "unicode_codepoint": "U+5E74",
+          "yarxi_article_number": 2177,
+          "frequency_index": 6,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "f6416c6b345e3c157fec3de5393cd2d517f7d90c0c627802405a52cbd96a02a8"
+        }
+      ],
+      "sample_characters": [
+        "後",
+        "会",
+        "市",
+        "入",
+        "明",
+        "定",
+        "八",
+        "円",
+        "場",
+        "月"
+      ]
+    },
+    {
+      "id": "rank_101_250",
+      "label": "Частые",
+      "frequency_index_min": 101,
+      "frequency_index_max": 250,
+      "target_verified_assets": 10,
+      "candidates": [
+        {
+          "character": "画",
+          "unicode_codepoint": "U+753B",
+          "yarxi_article_number": 260,
+          "frequency_index": 199,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "1fd2b16821f3b044156525c163d47b2327bde5f73c3350e5b04be3490db65271"
+        },
+        {
+          "character": "野",
+          "unicode_codepoint": "U+91CE",
+          "yarxi_article_number": 2710,
+          "frequency_index": 120,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "205344f816eece3d4840f040cbb5d63dc7ec68e932ccb82d996a803253da3cbf"
+        },
+        {
+          "character": "七",
+          "unicode_codepoint": "U+4E03",
+          "yarxi_article_number": 1151,
+          "frequency_index": 115,
+          "stroke_count": 2,
+          "primary_gif_advertised": true,
+          "order_sha256": "21455fce3d03942b75f87c74c1a5d7a69cd4b24cce9f9cf4b8a1af6b7be7439e"
+        },
+        {
+          "character": "知",
+          "unicode_codepoint": "U+77E5",
+          "yarxi_article_number": 1832,
+          "frequency_index": 205,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "21eff1e4077c7a6453e85bb9c7d345ecacfb9cda8b602dad794fcedd23c0da23"
+        },
+        {
+          "character": "係",
+          "unicode_codepoint": "U+4FC2",
+          "yarxi_article_number": 682,
+          "frequency_index": 232,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "24815cbe432a45dae0b71771880e48167e06ace902f82d990652545dfdbee665"
+        },
+        {
+          "character": "北",
+          "unicode_codepoint": "U+5317",
+          "yarxi_article_number": 2582,
+          "frequency_index": 153,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "295577535a9a327126c2586e3028204b749438a7a81bc72bb17d3be64c5f9aa7"
+        },
+        {
+          "character": "気",
+          "unicode_codepoint": "U+6C17",
+          "yarxi_article_number": 474,
+          "frequency_index": 113,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "2d076d5930d2208f32489a6b2ea078416adf2fdcaabd2fedb30040e0997bb884"
+        },
+        {
+          "character": "心",
+          "unicode_codepoint": "U+5FC3",
+          "yarxi_article_number": 1430,
+          "frequency_index": 157,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "2d8300d4d79f15c020f927de636190f4930207133fe3eba935b2e93787e97933"
+        },
+        {
+          "character": "島",
+          "unicode_codepoint": "U+5CF6",
+          "yarxi_article_number": 2045,
+          "frequency_index": 245,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "2f6d7659539466c20ccb63187c9530df6d443a4bd4e6882c58ac288c5a4c1472"
+        },
+        {
+          "character": "朝",
+          "unicode_codepoint": "U+671D",
+          "yarxi_article_number": 1891,
+          "frequency_index": 248,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "399212c675068363e86e5d7fd1527a4635b49102118d460ec10d1dcb6acf88f6"
+        },
+        {
+          "character": "成",
+          "unicode_codepoint": "U+6210",
+          "yarxi_article_number": 1518,
+          "frequency_index": 116,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "40eb342461e06f9e7e801f8fe5e680fe4a31c05fc4794c70d768ae6ec488dccb"
+        },
+        {
+          "character": "海",
+          "unicode_codepoint": "U+6D77",
+          "yarxi_article_number": 286,
+          "frequency_index": 200,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "48980ce64e387e85f3e9961b9b5e0e61ec64f4fd08769e11cfad064cb35bba02"
+        },
+        {
+          "character": "川",
+          "unicode_codepoint": "U+5DDD",
+          "yarxi_article_number": 1582,
+          "frequency_index": 181,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "531809324d874efd07ce7680564b70e43e305df95fc94768d08d1131c31a7cc3"
+        },
+        {
+          "character": "話",
+          "unicode_codepoint": "U+8A71",
+          "yarxi_article_number": 2949,
+          "frequency_index": 134,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "5b94b83878ab7f49fa4cbe7ed1c6845cbb827d44a95c90206b3733fa90b05de8"
+        },
+        {
+          "character": "取",
+          "unicode_codepoint": "U+53D6",
+          "yarxi_article_number": 1200,
+          "frequency_index": 122,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "6330686a13aa752e882ceafaba5e454f9b88de018e0e97a7de527b504ff04245"
+        },
+        {
+          "character": "機",
+          "unicode_codepoint": "U+6A5F",
+          "yarxi_article_number": 471,
+          "frequency_index": 127,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "70b036ca1b019c11a72ac523eb8b31dff3ae90dd8238914487a70ef66563a6dc"
+        },
+        {
+          "character": "午",
+          "unicode_codepoint": "U+5348",
+          "yarxi_article_number": 817,
+          "frequency_index": 154,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "7db02f7b5fb9a126f863d28efe1dd4971cce00afd79a9da33a0769f773ec7313"
+        },
+        {
+          "character": "済",
+          "unicode_codepoint": "U+6E08",
+          "yarxi_article_number": 989,
+          "frequency_index": 168,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "82d8cb5f43766a37a2f59bb9db57343edf68f7decbfb46f54ac404008c3b0f35"
+        },
+        {
+          "character": "世",
+          "unicode_codepoint": "U+4E16",
+          "yarxi_article_number": 1508,
+          "frequency_index": 135,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "864c97e2d70ce4359830f7f84a116cdfeae53cd96a46e8ca41a4823d302e1047"
+        },
+        {
+          "character": "近",
+          "unicode_codepoint": "U+8FD1",
+          "yarxi_article_number": 629,
+          "frequency_index": 194,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "86cbe4fb06aa9643ee9804f5f6386a903ca8fa4965fe17dddd87c0ec0440d9c4"
+        },
+        {
+          "character": "強",
+          "unicode_codepoint": "U+5F37",
+          "yarxi_article_number": 579,
+          "frequency_index": 112,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "9444733c27096a164b85eb1546d208fae80bbc2d1a6ab8bc91bf4e9281e14117"
+        },
+        {
+          "character": "水",
+          "unicode_codepoint": "U+6C34",
+          "yarxi_article_number": 1479,
+          "frequency_index": 223,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "9a19840430d5626345aecc60a2e31de8f1bb61bfde739252091f5c7b181f76ea"
+        },
+        {
+          "character": "県",
+          "unicode_codepoint": "U+770C",
+          "yarxi_article_number": 761,
+          "frequency_index": 140,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "9cb0a4a7cf7cf86ed0b4232541bd5a4fc9252875d08837f18f081c1bf43bd75e"
+        },
+        {
+          "character": "小",
+          "unicode_codepoint": "U+5C0F",
+          "yarxi_article_number": 1330,
+          "frequency_index": 114,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "9d2fd08a8be20210514e03eece55013bbc4905c45355b588c8af6b95233b9dab"
+        },
+        {
+          "character": "売",
+          "unicode_codepoint": "U+58F2",
+          "yarxi_article_number": 2230,
+          "frequency_index": 202,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "9e520a70e542d5f04f8f4ccdadbe7adeb4adbabc128e221bd37382ce739375cb"
+        },
+        {
+          "character": "千",
+          "unicode_codepoint": "U+5343",
+          "yarxi_article_number": 1577,
+          "frequency_index": 195,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "a3e3e91628522e66716a63659ff91fa2832e54c2b2bcaebd686d1cd69b43ca2b"
+        },
+        {
+          "character": "論",
+          "unicode_codepoint": "U+8AD6",
+          "yarxi_article_number": 2946,
+          "frequency_index": 227,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "a6ff7f2effcd0731a1bbae202d9ba8ec6e6cded881701dee8685307d5684ebbb"
+        },
+        {
+          "character": "使",
+          "unicode_codepoint": "U+4F7F",
+          "yarxi_article_number": 1074,
+          "frequency_index": 219,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "a7906ff1da274988aae5d1443b3a8974a79b5478dd7a41dea8e28900ac641823"
+        },
+        {
+          "character": "名",
+          "unicode_codepoint": "U+540D",
+          "yarxi_article_number": 2662,
+          "frequency_index": 177,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "c4727d01f8449196d57c79ee3e5f1c4f7cc4699ef1b29aa8d997f8906b58745f"
+        },
+        {
+          "character": "来",
+          "unicode_codepoint": "U+6765",
+          "yarxi_article_number": 2798,
+          "frequency_index": 102,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "d445c15718c9236a95bdde99d651bdb449671d5b392c55ac33ad558cddd0395b"
+        },
+        {
+          "character": "先",
+          "unicode_codepoint": "U+5148",
+          "yarxi_article_number": 1576,
+          "frequency_index": 173,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "d9d4f350a56dcb9b64e9d80a0a8c213773883a8d75eb618647cf39c5ed2fa337"
+        },
+        {
+          "character": "計",
+          "unicode_codepoint": "U+8A08",
+          "yarxi_article_number": 713,
+          "frequency_index": 228,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "e84812c13d380b0ff73b4938fe1c41f1ae73bddfc65283eeee8f8c2b60883ed2"
+        },
+        {
+          "character": "山",
+          "unicode_codepoint": "U+5C71",
+          "yarxi_article_number": 1053,
+          "frequency_index": 131,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "eef5d3148b44e2db3135416e56a1f8e67c9aa2829cfd9662546cdfb7f3086244"
+        },
+        {
+          "character": "物",
+          "unicode_codepoint": "U+7269",
+          "yarxi_article_number": 2454,
+          "frequency_index": 215,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "f25bd9f3df8a9a3caee5e76a251536b783b344f47641d7622268284431197fc7"
+        },
+        {
+          "character": "求",
+          "unicode_codepoint": "U+6C42",
+          "yarxi_article_number": 535,
+          "frequency_index": 220,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "f336ffaa7f8345834c524c3f8d7c98b9ebbfd5ca953733abc732e3896185aa1a"
+        },
+        {
+          "character": "女",
+          "unicode_codepoint": "U+5973",
+          "yarxi_article_number": 1309,
+          "frequency_index": 151,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "f6470a5a589a17af2061e7d3603ac62297950a38fd5e00fa56416e9f7888af63"
+        }
+      ],
+      "sample_characters": [
+        "野",
+        "知",
+        "係",
+        "北",
+        "心",
+        "島",
+        "朝",
+        "成",
+        "川",
+        "取"
+      ]
+    },
+    {
+      "id": "rank_251_500",
+      "label": "Средние",
+      "frequency_index_min": 251,
+      "frequency_index_max": 500,
+      "target_verified_assets": 10,
+      "candidates": [
+        {
+          "character": "病",
+          "unicode_codepoint": "U+75C5",
+          "yarxi_article_number": 2384,
+          "frequency_index": 384,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "0cadb53c91b8a07b43501e28d76e15640faed2f499a2a774e979a357ef86b84b"
+        },
+        {
+          "character": "万",
+          "unicode_codepoint": "U+4E07",
+          "yarxi_article_number": 2630,
+          "frequency_index": 375,
+          "stroke_count": 3,
+          "primary_gif_advertised": true,
+          "order_sha256": "0d7a5a0114a4647c57fa1031d830af9882ce1b69deedb6018bfa20e408527cca"
+        },
+        {
+          "character": "働",
+          "unicode_codepoint": "U+50CD",
+          "yarxi_article_number": 2083,
+          "frequency_index": 417,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "19c276ddef7188eb2b2ba6f361ad7676b3fb65226bc44d1ff2b94f3751bed303"
+        },
+        {
+          "character": "毎",
+          "unicode_codepoint": "U+6BCE",
+          "yarxi_article_number": 2610,
+          "frequency_index": 436,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "1eab33aa25b87035931746ef5c4ad6dc4d20159709a12201a2028301cfa930dd"
+        },
+        {
+          "character": "断",
+          "unicode_codepoint": "U+65AD",
+          "yarxi_article_number": 1825,
+          "frequency_index": 338,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "241e0e7e5f78e5bb7d06fa07acd30eae1ba59e33730e94603dc5b00cadb8c542"
+        },
+        {
+          "character": "違",
+          "unicode_codepoint": "U+9055",
+          "yarxi_article_number": 67,
+          "frequency_index": 344,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "2545b98bb54a10fca654f3a85c057fd4a8b50a2d86ec8abf51588d65d956fa7b"
+        },
+        {
+          "character": "港",
+          "unicode_codepoint": "U+6E2F",
+          "yarxi_article_number": 879,
+          "frequency_index": 495,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "31e5ae42f99d3d6788d7f0240ac90037580a5dce65a9f1ec20de9cd095311e94"
+        },
+        {
+          "character": "町",
+          "unicode_codepoint": "U+753A",
+          "yarxi_article_number": 1894,
+          "frequency_index": 292,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "402ee401a78dff1304f509fa21cb34295390373e868d453585c189568a5f1e51"
+        },
+        {
+          "character": "車",
+          "unicode_codepoint": "U+8ECA",
+          "yarxi_article_number": 1182,
+          "frequency_index": 333,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "470ffa158f3a8023f1c3a7bb6a6888fe408d42fe9744360c65c9ee8cfb43f8b1"
+        },
+        {
+          "character": "西",
+          "unicode_codepoint": "U+897F",
+          "yarxi_article_number": 1534,
+          "frequency_index": 259,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "4d89747815d826cba174360aa6fc77aa418a81cb431daaa142d8c9cfff3dd278"
+        },
+        {
+          "character": "白",
+          "unicode_codepoint": "U+767D",
+          "yarxi_article_number": 2244,
+          "frequency_index": 483,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "5f49bbdda17c499c1453f7a5dd1d2510c1c012a5f9935fd31e253b2fdd105656"
+        },
+        {
+          "character": "村",
+          "unicode_codepoint": "U+6751",
+          "yarxi_article_number": 1720,
+          "frequency_index": 253,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "648c2dd56f4132663ca42131c9b017712592916097002e6a7b2a9f97f209cde7"
+        },
+        {
+          "character": "夜",
+          "unicode_codepoint": "U+591C",
+          "yarxi_article_number": 2707,
+          "frequency_index": 487,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "6aded0af06ee33508c11c8770f6650879b13a36cfedd918f691095e2c6fbad1e"
+        },
+        {
+          "character": "衛",
+          "unicode_codepoint": "U+885B",
+          "yarxi_article_number": 144,
+          "frequency_index": 400,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "749060b7a2f77b16648f81f128380ae276f0e365e2066806316cd135c3099abd"
+        },
+        {
+          "character": "訪",
+          "unicode_codepoint": "U+8A2A",
+          "yarxi_article_number": 2550,
+          "frequency_index": 372,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "81076d5057a332b8d781f5740c5b4ad86e8e6eeea11cf342fe659f8b970bd96f"
+        },
+        {
+          "character": "験",
+          "unicode_codepoint": "U+9A13",
+          "yarxi_article_number": 771,
+          "frequency_index": 410,
+          "stroke_count": 18,
+          "primary_gif_advertised": true,
+          "order_sha256": "85118b364038c3380c86488ac38a4322fcd4735c042da23f64241d9741fb1b28"
+        },
+        {
+          "character": "技",
+          "unicode_codepoint": "U+6280",
+          "yarxi_article_number": 497,
+          "frequency_index": 434,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "85cd6375f88e4cfe7f2f52181e2491d96fc8981da3d7976bab0657445028bbe0"
+        },
+        {
+          "character": "費",
+          "unicode_codepoint": "U+8CBB",
+          "yarxi_article_number": 2337,
+          "frequency_index": 321,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "9b1de26e4b3e5c7f3e364766a499886ae3a23b3de28cd24c4cc8dcfe8dec1731"
+        },
+        {
+          "character": "席",
+          "unicode_codepoint": "U+5E2D",
+          "yarxi_article_number": 1546,
+          "frequency_index": 370,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "9cbc747d61ee1f0210714f57a3aa799734582e08b08d4c9bdba0e5d629b62729"
+        },
+        {
+          "character": "望",
+          "unicode_codepoint": "U+671B",
+          "yarxi_article_number": 2568,
+          "frequency_index": 470,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "9da099d90acae96478f4fc207dd5c67282f55ba2c81ad87cd265dd774b55a3cf"
+        },
+        {
+          "character": "南",
+          "unicode_codepoint": "U+5357",
+          "yarxi_article_number": 2146,
+          "frequency_index": 341,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "a22b21519f1a611bbbd4e7911cebe74952b39030494b94d82cf16dfb32e9714e"
+        },
+        {
+          "character": "足",
+          "unicode_codepoint": "U+8DB3",
+          "yarxi_article_number": 1705,
+          "frequency_index": 343,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "abbdbbeae6fd8fa7546cc20fa63910b2abd73a2782e6be4d3b61d493497d0d2e"
+        },
+        {
+          "character": "個",
+          "unicode_codepoint": "U+500B",
+          "yarxi_article_number": 788,
+          "frequency_index": 451,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "cdbc7e1407d59e92628c096e2446e4c8ff5dc23380772720fc488b4e2eb674d5"
+        },
+        {
+          "character": "何",
+          "unicode_codepoint": "U+4F55",
+          "yarxi_article_number": 219,
+          "frequency_index": 340,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "d6f548635a892138c60e0a4b5532c5d66fc4d861a272623cab0bedd0888ab6ac"
+        },
+        {
+          "character": "景",
+          "unicode_codepoint": "U+666F",
+          "yarxi_article_number": 700,
+          "frequency_index": 419,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "d7281f24c0fa72fb64c30f8f09ab4035e5ae104c909fe29795255a0305397cb5"
+        },
+        {
+          "character": "研",
+          "unicode_codepoint": "U+7814",
+          "yarxi_article_number": 758,
+          "frequency_index": 336,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "e3d158be90930e3703f29f595aaba0389c33022a253eaca58af3331cd528898a"
+        },
+        {
+          "character": "好",
+          "unicode_codepoint": "U+597D",
+          "yarxi_article_number": 851,
+          "frequency_index": 423,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "ebe55551e9b55718ec4623d9b4d556e7321f137aeff30460ff61071c5a306c66"
+        },
+        {
+          "character": "域",
+          "unicode_codepoint": "U+57DF",
+          "yarxi_article_number": 72,
+          "frequency_index": 396,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "f05a72ab088630c598de3038a995d3cbe8121482907cf6e82e21edb5e1efd839"
+        },
+        {
+          "character": "失",
+          "unicode_codepoint": "U+5931",
+          "yarxi_article_number": 1154,
+          "frequency_index": 447,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "f47bf11b7b94e55337affebc15a40c01b14a1463bbddcdb10f41d5e216057a28"
+        },
+        {
+          "character": "答",
+          "unicode_codepoint": "U+7B54",
+          "yarxi_article_number": 2064,
+          "frequency_index": 486,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "f553afd52f574524e650516cff74098e83fd9df9dcee8fa48aa7e4b2f69f8439"
+        },
+        {
+          "character": "神",
+          "unicode_codepoint": "U+795E",
+          "yarxi_article_number": 1442,
+          "frequency_index": 347,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "f7781fa395b30728a77cab2abe29fcd913b41b7d2723af29c64fa8a63da65700"
+        },
+        {
+          "character": "説",
+          "unicode_codepoint": "U+8AAC",
+          "yarxi_article_number": 1570,
+          "frequency_index": 326,
+          "stroke_count": 14,
+          "primary_gif_advertised": true,
+          "order_sha256": "fb96c26dc3b5b5d55b07a0fd1f5a251dda13f19b8bc0dbb70c16f16e371d890b"
+        },
+        {
+          "character": "低",
+          "unicode_codepoint": "U+4F4E",
+          "yarxi_article_number": 1947,
+          "frequency_index": 435,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "fcf4f8402745a555d3c2cf39f7903d84a296893e79052352e4137c1c1f9b5638"
+        }
+      ],
+      "sample_characters": [
+        "病",
+        "万",
+        "港",
+        "西",
+        "白",
+        "村",
+        "夜",
+        "訪",
+        "技",
+        "費"
+      ]
+    },
+    {
+      "id": "rank_501_1000",
+      "label": "Редкие",
+      "frequency_index_min": 501,
+      "frequency_index_max": 1000,
+      "target_verified_assets": 10,
+      "candidates": [
+        {
+          "character": "薬",
+          "unicode_codepoint": "U+85AC",
+          "yarxi_article_number": 2716,
+          "frequency_index": 702,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "06e30cae62e5555569cf4daf9e4eb997b3bdfc210495de8f0965d8a392c37d86"
+        },
+        {
+          "character": "庫",
+          "unicode_codepoint": "U+5EAB",
+          "yarxi_article_number": 795,
+          "frequency_index": 852,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "0bc31cab62645f39801aa7825c38914adc761cf8d0c343e80eb66cb1eb411296"
+        },
+        {
+          "character": "許",
+          "unicode_codepoint": "U+8A31",
+          "yarxi_article_number": 556,
+          "frequency_index": 720,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "0ed1740f67c3e7054fa9d8b532d93d0802593a07243f796d5d88dbf3dd94508f"
+        },
+        {
+          "character": "階",
+          "unicode_codepoint": "U+968E",
+          "yarxi_article_number": 294,
+          "frequency_index": 513,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "10322b47ac1d63ba2d8a4b92d95e1a439102eda39ce2dbdab240c4aa084ac64b"
+        },
+        {
+          "character": "困",
+          "unicode_codepoint": "U+56F0",
+          "yarxi_article_number": 944,
+          "frequency_index": 843,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "1829c46c9b425bcc02c511ff294c362c877c12ac592ba7727ff8bf05abba63f7"
+        },
+        {
+          "character": "走",
+          "unicode_codepoint": "U+8D70",
+          "yarxi_article_number": 1684,
+          "frequency_index": 626,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "1c8a9085b5ea892b254d41426e32bcbd99f97bdf9642b34523090b11478f3aa4"
+        },
+        {
+          "character": "危",
+          "unicode_codepoint": "U+5371",
+          "yarxi_article_number": 453,
+          "frequency_index": 606,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "337dbc913f1cf0b710e67c0ac178ca37f2608a9a2bfa12c0aa635a7b5a01452d"
+        },
+        {
+          "character": "史",
+          "unicode_codepoint": "U+53F2",
+          "yarxi_article_number": 1077,
+          "frequency_index": 511,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "3c3b3063f51095e8b35e4da85a48d0009cca75413fd091e8afaaf96fe7d4ea76"
+        },
+        {
+          "character": "迎",
+          "unicode_codepoint": "U+8FCE",
+          "yarxi_article_number": 720,
+          "frequency_index": 625,
+          "stroke_count": 7,
+          "primary_gif_advertised": true,
+          "order_sha256": "3ef633807712e1e65b7a67e74b5b33c559f6fb3788817c84d3109f949b3af4a7"
+        },
+        {
+          "character": "為",
+          "unicode_codepoint": "U+70BA",
+          "yarxi_article_number": 57,
+          "frequency_index": 831,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "4464539cfdc96787a3af496d0d3d5bf58e3d3c8d64daf666051330624508a3b2"
+        },
+        {
+          "character": "周",
+          "unicode_codepoint": "U+5468",
+          "yarxi_article_number": 1222,
+          "frequency_index": 562,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "4cc7d65f2fd007016ff2288c9010daa0b52ac860616a9a85f5d63ae5f1f632f5"
+        },
+        {
+          "character": "厚",
+          "unicode_codepoint": "U+539A",
+          "yarxi_article_number": 844,
+          "frequency_index": 768,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "54b2643cdd88a1bc40b1d74f383109a9377a0044ae945ad7366ab2ad43bdf498"
+        },
+        {
+          "character": "読",
+          "unicode_codepoint": "U+8AAD",
+          "yarxi_article_number": 2109,
+          "frequency_index": 618,
+          "stroke_count": 14,
+          "primary_gif_advertised": true,
+          "order_sha256": "574ff32d8f95aa0e2cd29812a5ffc06d80a1567f5d59f8079f2003e58f9d575f"
+        },
+        {
+          "character": "劇",
+          "unicode_codepoint": "U+5287",
+          "yarxi_article_number": 722,
+          "frequency_index": 662,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "58480f85bc05b8f3994946734ca15ff5512bd0337ccb0cc1031cc58e341a3092"
+        },
+        {
+          "character": "管",
+          "unicode_codepoint": "U+7BA1",
+          "yarxi_article_number": 417,
+          "frequency_index": 517,
+          "stroke_count": 14,
+          "primary_gif_advertised": true,
+          "order_sha256": "6934c1fd2991a77f9d012b5821d6ecbc4632aacfbdf8d8fe40c4d80fba51e023"
+        },
+        {
+          "character": "迷",
+          "unicode_codepoint": "U+8FF7",
+          "yarxi_article_number": 2666,
+          "frequency_index": 942,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "6f499cb71255ecc81875aa74569797a4cc9053628b94747cfcd73561f1067cb4"
+        },
+        {
+          "character": "敗",
+          "unicode_codepoint": "U+6557",
+          "yarxi_article_number": 2214,
+          "frequency_index": 516,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "70c43fffd31391142ef735332049a05c7b39bb59717dd2f0fc140387bed24fa1"
+        },
+        {
+          "character": "険",
+          "unicode_codepoint": "U+967A",
+          "yarxi_article_number": 769,
+          "frequency_index": 707,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "713c4fcc14ad6a4f0c08aa9e0088a68384f397c209eebd700e1a04a0c2262bfb"
+        },
+        {
+          "character": "喜",
+          "unicode_codepoint": "U+559C",
+          "yarxi_article_number": 454,
+          "frequency_index": 769,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "73246977cc7076bd618c04dfbbaa7c823456d05b888b333f77d6a301270009c6"
+        },
+        {
+          "character": "老",
+          "unicode_codepoint": "U+8001",
+          "yarxi_article_number": 2937,
+          "frequency_index": 803,
+          "stroke_count": 6,
+          "primary_gif_advertised": true,
+          "order_sha256": "7434ebc4747fa27a6fecf441290e3ebef9667687987f01d3d15aa15f64e46609"
+        },
+        {
+          "character": "苦",
+          "unicode_codepoint": "U+82E6",
+          "yarxi_article_number": 640,
+          "frequency_index": 623,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "97d5c227d0b6b87fe3ddc31d99208810f17e5e4213bb08cdf6081138d5e402e0"
+        },
+        {
+          "character": "母",
+          "unicode_codepoint": "U+6BCD",
+          "yarxi_article_number": 2520,
+          "frequency_index": 570,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "982bbcb04665e4a7bbdb9b187c42eac593aa7c53720325ca04477cb578eb3230"
+        },
+        {
+          "character": "練",
+          "unicode_codepoint": "U+7DF4",
+          "yarxi_article_number": 2913,
+          "frequency_index": 788,
+          "stroke_count": 14,
+          "primary_gif_advertised": true,
+          "order_sha256": "9b2474f9fb73708413d3f5571e278e8396cec1ab0c27fa69b0787c21900bdd58"
+        },
+        {
+          "character": "黒",
+          "unicode_codepoint": "U+9ED2",
+          "yarxi_article_number": 931,
+          "frequency_index": 573,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "a1e7adbc1479317efe50e146ab25011985073b265971fb5347ef9b5cb5293788"
+        },
+        {
+          "character": "促",
+          "unicode_codepoint": "U+4FC3",
+          "yarxi_article_number": 1697,
+          "frequency_index": 998,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "ace26d6d4a450030627473b78ae23e858a8674008820a54d1b11277cb6f74bfa"
+        },
+        {
+          "character": "暴",
+          "unicode_codepoint": "U+66B4",
+          "yarxi_article_number": 2567,
+          "frequency_index": 692,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "b263412a5a581c20de2fe67f114af6ee4c865b6a121adca0249d62e1ee2c555e"
+        },
+        {
+          "character": "河",
+          "unicode_codepoint": "U+6CB3",
+          "yarxi_article_number": 235,
+          "frequency_index": 663,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "b37d9fb4eb115590a2221b8a16f9e81b94f5ee3c906cd6182b820eb349d319a3"
+        },
+        {
+          "character": "針",
+          "unicode_codepoint": "U+91DD",
+          "yarxi_article_number": 1453,
+          "frequency_index": 505,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "bfd953f1a71f9b34124b693b6b06dfc53ff2b16ead6f039727d82bf14dd567ff"
+        },
+        {
+          "character": "細",
+          "unicode_codepoint": "U+7D30",
+          "yarxi_article_number": 997,
+          "frequency_index": 537,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "c1e2d9635d90711147b3601de4b29f9a6dadf4ebd9550ad851ebc4c6a2437c79"
+        },
+        {
+          "character": "旅",
+          "unicode_codepoint": "U+65C5",
+          "yarxi_article_number": 2845,
+          "frequency_index": 783,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "c7323c6c16ba07dd81c19451c5499690a805646290a39b1d6a3d8051e1db5899"
+        },
+        {
+          "character": "天",
+          "unicode_codepoint": "U+5929",
+          "yarxi_article_number": 1997,
+          "frequency_index": 512,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "d30195f68d48822f1540d75b2d9166a63e12c52d4696493652eb89f96e946f15"
+        },
+        {
+          "character": "右",
+          "unicode_codepoint": "U+53F3",
+          "yarxi_article_number": 100,
+          "frequency_index": 602,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "dc64f9312248b0bf90439943e97fc1c9d12a2fa9e71d19eb0d1a45e650cfff8d"
+        },
+        {
+          "character": "屋",
+          "unicode_codepoint": "U+5C4B",
+          "yarxi_article_number": 204,
+          "frequency_index": 616,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "e7ae8f645ad1ce4181dcf5514fd5c6a43ea2ed2064ab8df904e3a8dde6eaf159"
+        },
+        {
+          "character": "登",
+          "unicode_codepoint": "U+767B",
+          "yarxi_article_number": 2022,
+          "frequency_index": 566,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "ef16468082b355b31f414b392f538808ab5424288ff937b256e84dc6f65315ee"
+        },
+        {
+          "character": "塁",
+          "unicode_codepoint": "U+5841",
+          "yarxi_article_number": 2881,
+          "frequency_index": 651,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "f100e5b68891c593a53b78f59284eed8505ef018cf37ca87272c89b06998a506"
+        },
+        {
+          "character": "橋",
+          "unicode_codepoint": "U+6A4B",
+          "yarxi_article_number": 586,
+          "frequency_index": 553,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "f2d686aa749cc4c59432f8ca6bb2274fd8bedc5c9074cd405b2263e3d3739cde"
+        },
+        {
+          "character": "火",
+          "unicode_codepoint": "U+706B",
+          "yarxi_article_number": 236,
+          "frequency_index": 574,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "f307bcdbd4bd3613902b01ac90cb599801af454760d48cb7fc7abe5edd72a4f5"
+        },
+        {
+          "character": "遠",
+          "unicode_codepoint": "U+9060",
+          "yarxi_article_number": 177,
+          "frequency_index": 887,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "f63f5f5e9450ac1f26efaf3323e75bc0f8b0fe820c910feaab4441ef9b6b4eab"
+        },
+        {
+          "character": "塚",
+          "unicode_codepoint": "U+585A",
+          "yarxi_article_number": 1925,
+          "frequency_index": 869,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "f81ce91c171f047cff5e9cf3d159849a14c0e9895fb728a82f74ae2a13ddf2b6"
+        }
+      ],
+      "sample_characters": [
+        "薬",
+        "庫",
+        "階",
+        "走",
+        "危",
+        "史",
+        "周",
+        "厚",
+        "迷",
+        "険"
+      ]
+    },
+    {
+      "id": "rank_1001_plus",
+      "label": "Очень редкие",
+      "frequency_index_min": 1001,
+      "frequency_index_max": null,
+      "target_verified_assets": 10,
+      "candidates": [
+        {
+          "character": "釘",
+          "unicode_codepoint": "U+91D8",
+          "yarxi_article_number": 1977,
+          "frequency_index": 2496,
+          "stroke_count": 10,
+          "primary_gif_advertised": false,
+          "order_sha256": "03318e9aea82a2b579fe2656f16b80a62657f19e70353e95a3b66461afc945a7"
+        },
+        {
+          "character": "隻",
+          "unicode_codepoint": "U+96BB",
+          "yarxi_article_number": 1545,
+          "frequency_index": 1546,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "0a1e06fb0cdb05ab4671814004f060d0bb698030404693db1ceadeab8d884ae2"
+        },
+        {
+          "character": "凧",
+          "unicode_codepoint": "U+51E7",
+          "yarxi_article_number": 1784,
+          "frequency_index": 2117,
+          "stroke_count": 5,
+          "primary_gif_advertised": false,
+          "order_sha256": "0ff2d7787367e1a2479eda1530481e17c0da04453ee7dbfb5cf0f65071221f4b"
+        },
+        {
+          "character": "薪",
+          "unicode_codepoint": "U+85AA",
+          "yarxi_article_number": 1447,
+          "frequency_index": 2182,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "13ccc087c3e8969b3da7adf8e19067c30c0b31bd4f7b429736c3e789ec0e9764"
+        },
+        {
+          "character": "墓",
+          "unicode_codepoint": "U+5893",
+          "yarxi_article_number": 2516,
+          "frequency_index": 1337,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "17ebc20531053baab6f36a5bc3dc4e908bc967436ee89c2cb13cf50d8932d96d"
+        },
+        {
+          "character": "銃",
+          "unicode_codepoint": "U+9283",
+          "yarxi_article_number": 1260,
+          "frequency_index": 1013,
+          "stroke_count": 14,
+          "primary_gif_advertised": true,
+          "order_sha256": "1979e380b1f72ad20952305f853cd57f3834b805eea9f8a27101c78882d10173"
+        },
+        {
+          "character": "髪",
+          "unicode_codepoint": "U+9AEA",
+          "yarxi_article_number": 2273,
+          "frequency_index": 1474,
+          "stroke_count": 14,
+          "primary_gif_advertised": true,
+          "order_sha256": "26c56593106036e5e7b3f31fdf3c9afb1ae7aa113d78ed95f851f86211afe82f"
+        },
+        {
+          "character": "賢",
+          "unicode_codepoint": "U+8CE2",
+          "yarxi_article_number": 765,
+          "frequency_index": 1159,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "2e9fb55ef320cd4d330c1cc935af7632c81d423f31ca2e8a13c39317adb41d30"
+        },
+        {
+          "character": "鍋",
+          "unicode_codepoint": "U+934B",
+          "yarxi_article_number": 2141,
+          "frequency_index": 1810,
+          "stroke_count": 17,
+          "primary_gif_advertised": true,
+          "order_sha256": "33bc4ed2bdace9e24e9312ec7b985339597a29b5b36332b10b6319b2ad2b9990"
+        },
+        {
+          "character": "穴",
+          "unicode_codepoint": "U+7A74",
+          "yarxi_article_number": 732,
+          "frequency_index": 1366,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "341d89f57c34e44af9bdb496937d95260eba63f7f3549430acfeb217e833333c"
+        },
+        {
+          "character": "醜",
+          "unicode_codepoint": "U+919C",
+          "yarxi_article_number": 1247,
+          "frequency_index": 2074,
+          "stroke_count": 17,
+          "primary_gif_advertised": true,
+          "order_sha256": "34f068fe77b8c5d643b2a75f66ac23480b9dcfde7445e8811eb8589a8a20ffaa"
+        },
+        {
+          "character": "洞",
+          "unicode_codepoint": "U+6D1E",
+          "yarxi_article_number": 2090,
+          "frequency_index": 1618,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "3771e2e284f6f5dff15fbd364949c856d4b66f0cacb1338e2177847a7b059a7b"
+        },
+        {
+          "character": "砲",
+          "unicode_codepoint": "U+7832",
+          "yarxi_article_number": 2542,
+          "frequency_index": 1268,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "3774a6b9e4d195aedcde289828a175a8ad563e4d57e9da0d12d7f83575d42870"
+        },
+        {
+          "character": "暗",
+          "unicode_codepoint": "U+6697",
+          "yarxi_article_number": 37,
+          "frequency_index": 1040,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "383a45cbf2b1369ee7bb4dfcc2f9c708133a53cb5e053f0c06db0bcd9401fb86"
+        },
+        {
+          "character": "爪",
+          "unicode_codepoint": "U+722A",
+          "yarxi_article_number": 1942,
+          "frequency_index": 2025,
+          "stroke_count": 4,
+          "primary_gif_advertised": true,
+          "order_sha256": "3bac2504c68febb83fb809a1eba908861788155fa1716d0b398ff57ac8778e75"
+        },
+        {
+          "character": "鎖",
+          "unicode_codepoint": "U+9396",
+          "yarxi_article_number": 971,
+          "frequency_index": 1250,
+          "stroke_count": 18,
+          "primary_gif_advertised": true,
+          "order_sha256": "3fd1eb08e0f5ac67c9c64cb77d2ab757db4c4cb8d1661818f0e54d5bce2e56d7"
+        },
+        {
+          "character": "嵐",
+          "unicode_codepoint": "U+5D50",
+          "yarxi_article_number": 2808,
+          "frequency_index": 1910,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "4177e17c9d644705413e3946a89670fbf3a23dfe9731dd38451288ec765f0e65"
+        },
+        {
+          "character": "膝",
+          "unicode_codepoint": "U+819D",
+          "yarxi_article_number": 2358,
+          "frequency_index": 2320,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "432d11bfe839bcdd32bf36890006d34197f67d07d4fd49372d46b2e5a3d4b2f3"
+        },
+        {
+          "character": "柱",
+          "unicode_codepoint": "U+67F1",
+          "yarxi_article_number": 1862,
+          "frequency_index": 1119,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "46600a65ca37bd566eb9c68593925d5608d404b38ebffe944c2b683ca23d3b32"
+        },
+        {
+          "character": "腰",
+          "unicode_codepoint": "U+8170",
+          "yarxi_article_number": 934,
+          "frequency_index": 1306,
+          "stroke_count": 13,
+          "primary_gif_advertised": true,
+          "order_sha256": "48423eed7fd6c2259cb2400bad53f556c47aee9184061054b5ebe6109a820f41"
+        },
+        {
+          "character": "憂",
+          "unicode_codepoint": "U+6182",
+          "yarxi_article_number": 2737,
+          "frequency_index": 1625,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "49b14378cf6a65eb6b88b656df56641ae8c3c1ff94d316590cca3c14fe7267c8"
+        },
+        {
+          "character": "欺",
+          "unicode_codepoint": "U+6B3A",
+          "yarxi_article_number": 499,
+          "frequency_index": 1541,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "5194f07da143740aa4609e1a283a860a129a8b1e6059d7b49463a2e57b25743b"
+        },
+        {
+          "character": "薄",
+          "unicode_codepoint": "U+8584",
+          "yarxi_article_number": 2248,
+          "frequency_index": 1009,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "6011b84648847b640584f128d797c4b8123af78f5d49cc21cc0630a9bb3238ab"
+        },
+        {
+          "character": "剣",
+          "unicode_codepoint": "U+5263",
+          "yarxi_article_number": 743,
+          "frequency_index": 1305,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "6452e95b1dc9b7543548efb4bd1e8ea23d27f63b1a020469912be32794698a63"
+        },
+        {
+          "character": "曇",
+          "unicode_codepoint": "U+66C7",
+          "yarxi_article_number": 2130,
+          "frequency_index": 1899,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "66bcef407c7e7060b07ae7a32ae6422e3bb364c6923276ce360b486532c65462"
+        },
+        {
+          "character": "頻",
+          "unicode_codepoint": "U+983B",
+          "yarxi_article_number": 2399,
+          "frequency_index": 1590,
+          "stroke_count": 17,
+          "primary_gif_advertised": true,
+          "order_sha256": "6ca6ce4e6ccf6b8455aae76179fe08578680daea864d93fcaa8dec8b2172afe8"
+        },
+        {
+          "character": "鑑",
+          "unicode_codepoint": "U+9451",
+          "yarxi_article_number": 429,
+          "frequency_index": 1391,
+          "stroke_count": 23,
+          "primary_gif_advertised": true,
+          "order_sha256": "6d7cbf0d72ad3f99114fc8569a36116d0de2600ada10bd3768767fcd14198274"
+        },
+        {
+          "character": "猫",
+          "unicode_codepoint": "U+732B",
+          "yarxi_article_number": 2175,
+          "frequency_index": 1702,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "70554f9372856df829bb70d3fead0ac3459c1ee40a703e57994cccce89f25677"
+        },
+        {
+          "character": "黙",
+          "unicode_codepoint": "U+9ED9",
+          "yarxi_article_number": 2691,
+          "frequency_index": 1338,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "71ce5ac7f3428a812653217cc770faa380167a7b43c1d9f575365dfd2f07c09b"
+        },
+        {
+          "character": "憶",
+          "unicode_codepoint": "U+61B6",
+          "yarxi_article_number": 205,
+          "frequency_index": 1324,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "74b6a51e4e1975d3dadea6bfe5e4b61aa84eb42e8e6dec4a69e4695a9f9354c7"
+        },
+        {
+          "character": "晴",
+          "unicode_codepoint": "U+6674",
+          "yarxi_article_number": 1522,
+          "frequency_index": 1022,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "85ce5bdd7c23d656e9ba1024859fa8a36823a2c6fecc0527b8e0b90f74992b7b"
+        },
+        {
+          "character": "苗",
+          "unicode_codepoint": "U+82D7",
+          "yarxi_article_number": 2386,
+          "frequency_index": 1713,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "89a25978f745f17f13014b902ea7c98037134e964623df79bb7d8ce7d08a3f49"
+        },
+        {
+          "character": "恥",
+          "unicode_codepoint": "U+6065",
+          "yarxi_article_number": 1835,
+          "frequency_index": 1575,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "8c9c2b0c67d611ea15dfdadd6a4476898e55483833292bedfcdc00f24624fd7b"
+        },
+        {
+          "character": "罷",
+          "unicode_codepoint": "U+7F77",
+          "yarxi_article_number": 2333,
+          "frequency_index": 2104,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "8e854367697991bc41a8f4cdd0ca92c9bc3e4ba5de57df24f0fa91f0a7ce5b25"
+        },
+        {
+          "character": "巷",
+          "unicode_codepoint": "U+5DF7",
+          "yarxi_article_number": 857,
+          "frequency_index": 2415,
+          "stroke_count": 9,
+          "primary_gif_advertised": false,
+          "order_sha256": "9016408ec7ca7101880dbc82b10f4996def78fa965f1ed776ca2607b0c2e2524"
+        },
+        {
+          "character": "渓",
+          "unicode_codepoint": "U+6E13",
+          "yarxi_article_number": 702,
+          "frequency_index": 2063,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "92e1576d75255743091527ab95ad1baf6b3a081c6b4dc8418445aaf4e2ba91cf"
+        },
+        {
+          "character": "淵",
+          "unicode_codepoint": "U+6DF5",
+          "yarxi_article_number": 2449,
+          "frequency_index": 1593,
+          "stroke_count": 12,
+          "primary_gif_advertised": false,
+          "order_sha256": "976fbac971c5bbda4ef244c36c6f228b6f832b291048881be01cf995c8331171"
+        },
+        {
+          "character": "峠",
+          "unicode_codepoint": "U+5CE0",
+          "yarxi_article_number": 2097,
+          "frequency_index": 1941,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "9d25bdd88a4fbaa93dee8825f64c74792a2d87c71cc97b0bdc525ab5cb4cad6e"
+        },
+        {
+          "character": "畔",
+          "unicode_codepoint": "U+7554",
+          "yarxi_article_number": 2298,
+          "frequency_index": 2049,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "a27fc4bd0d1a1ed36ae712d93037fb8d097ae864f664a503c46a1f53f999d577"
+        },
+        {
+          "character": "偽",
+          "unicode_codepoint": "U+507D",
+          "yarxi_article_number": 492,
+          "frequency_index": 1171,
+          "stroke_count": 11,
+          "primary_gif_advertised": true,
+          "order_sha256": "a3cda3822d5d928a06a73b844062410cead172da612b5a82a76ad7f31ccb0fca"
+        },
+        {
+          "character": "遮",
+          "unicode_codepoint": "U+906E",
+          "yarxi_article_number": 1183,
+          "frequency_index": 1865,
+          "stroke_count": 14,
+          "primary_gif_advertised": true,
+          "order_sha256": "a6a4eb2c85fea35cd368dea5fdf48c7499b96c48a3ad9966d64c035475eb031e"
+        },
+        {
+          "character": "拙",
+          "unicode_codepoint": "U+62D9",
+          "yarxi_article_number": 1563,
+          "frequency_index": 1938,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "ab9d51ae838b2390851bde4909b88fb139c506856f8290bdac6f655994375e4f"
+        },
+        {
+          "character": "麓",
+          "unicode_codepoint": "U+9E93",
+          "yarxi_article_number": 2942,
+          "frequency_index": 2366,
+          "stroke_count": 19,
+          "primary_gif_advertised": false,
+          "order_sha256": "afa60dde7822c535ba307e3f09d58cfe194d5b1dab5cf2c47f83dfa55df8408b"
+        },
+        {
+          "character": "畿",
+          "unicode_codepoint": "U+757F",
+          "yarxi_article_number": 476,
+          "frequency_index": 1683,
+          "stroke_count": 15,
+          "primary_gif_advertised": false,
+          "order_sha256": "b22ba8ec6e7708788f5d2a9a04dcf9a7d858c0a71fb3b1f374f8a8ac878002d9"
+        },
+        {
+          "character": "頬",
+          "unicode_codepoint": "U+982C",
+          "yarxi_article_number": 2581,
+          "frequency_index": 2424,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "be9cc6a4febb803e1eb24105d44183a6b277827e122300d7429253eb93511c47"
+        },
+        {
+          "character": "唄",
+          "unicode_codepoint": "U+5504",
+          "yarxi_article_number": 114,
+          "frequency_index": 2051,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "bf0738f995bf2b56da710c875d431874454bc6b868779733cbed1ddec0714c51"
+        },
+        {
+          "character": "姫",
+          "unicode_codepoint": "U+59EB",
+          "yarxi_article_number": 2367,
+          "frequency_index": 1566,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "c7cd7734850576f0b7a1e19fb6e4f79f1ff236eac102c7c5dada15a604e0844d"
+        },
+        {
+          "character": "箸",
+          "unicode_codepoint": "U+7BB8",
+          "yarxi_article_number": 2260,
+          "frequency_index": 2156,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "ccafd5a87d26522bc14e6f29f8af60baeae26c715953e394293fc4057a502d05"
+        },
+        {
+          "character": "礎",
+          "unicode_codepoint": "U+790E",
+          "yarxi_article_number": 1633,
+          "frequency_index": 1224,
+          "stroke_count": 18,
+          "primary_gif_advertised": true,
+          "order_sha256": "ccf111d2e3081a53b9f38dac82a65920e2ec97133688779497be9bb7f7c0c4b3"
+        },
+        {
+          "character": "怖",
+          "unicode_codepoint": "U+6016",
+          "yarxi_article_number": 2411,
+          "frequency_index": 1325,
+          "stroke_count": 8,
+          "primary_gif_advertised": true,
+          "order_sha256": "ce668e34e0411e0bd20678ffd5a03f77829242b422ba4185b3385a72e0f375d0"
+        },
+        {
+          "character": "瀕",
+          "unicode_codepoint": "U+7015",
+          "yarxi_article_number": 2396,
+          "frequency_index": 2367,
+          "stroke_count": 19,
+          "primary_gif_advertised": false,
+          "order_sha256": "cf591e44556802bbf2f1773c74e7d3a9fce8530f478e2d6af0ebfdcd3fafc052"
+        },
+        {
+          "character": "壌",
+          "unicode_codepoint": "U+58CC",
+          "yarxi_article_number": 1393,
+          "frequency_index": 1407,
+          "stroke_count": 16,
+          "primary_gif_advertised": true,
+          "order_sha256": "d7e40852ad26a2e203ecb977dfc61568ec64e3ced4b2fab8211cc629ce181d06"
+        },
+        {
+          "character": "麗",
+          "unicode_codepoint": "U+9E97",
+          "yarxi_article_number": 2899,
+          "frequency_index": 1758,
+          "stroke_count": 19,
+          "primary_gif_advertised": true,
+          "order_sha256": "df6cc2d7b70e59357e2028da60a90d0cfdaa6e167f5b96df9d134e58c6d98547"
+        },
+        {
+          "character": "浴",
+          "unicode_codepoint": "U+6D74",
+          "yarxi_article_number": 2791,
+          "frequency_index": 1136,
+          "stroke_count": 10,
+          "primary_gif_advertised": true,
+          "order_sha256": "e47379d60414938582eacd4a75e8a38446b57797b371ab3e5af5b9b4a1bf2d21"
+        },
+        {
+          "character": "壕",
+          "unicode_codepoint": "U+58D5",
+          "yarxi_article_number": 918,
+          "frequency_index": 2273,
+          "stroke_count": 17,
+          "primary_gif_advertised": false,
+          "order_sha256": "e769c0f7ce3141222021b6d7992e2e4c354d7a7148888a1138d65450b0819399"
+        },
+        {
+          "character": "趣",
+          "unicode_codepoint": "U+8DA3",
+          "yarxi_article_number": 1209,
+          "frequency_index": 1153,
+          "stroke_count": 15,
+          "primary_gif_advertised": true,
+          "order_sha256": "eab52e3f40ed6189252fc7d48f74001359d5620d7893e9f711331ef1402d77dd"
+        },
+        {
+          "character": "汁",
+          "unicode_codepoint": "U+6C41",
+          "yarxi_article_number": 1255,
+          "frequency_index": 1843,
+          "stroke_count": 5,
+          "primary_gif_advertised": true,
+          "order_sha256": "ec87f00df9ad78716b1c849dbf39beb8ca3f2337f2440e55f11bdb064c20516e"
+        },
+        {
+          "character": "喉",
+          "unicode_codepoint": "U+5589",
+          "yarxi_article_number": 848,
+          "frequency_index": 2390,
+          "stroke_count": 12,
+          "primary_gif_advertised": true,
+          "order_sha256": "f2e07ef5e0a737ab5f26218c5529070606bd15784c438b9e00587fd93711f18c"
+        },
+        {
+          "character": "巌",
+          "unicode_codepoint": "U+5DCC",
+          "yarxi_article_number": 440,
+          "frequency_index": 1986,
+          "stroke_count": 20,
+          "primary_gif_advertised": true,
+          "order_sha256": "fa2e0c6a8e1e536470370412328e20eca214da300d8d79abd6a71cc13d85026a"
+        },
+        {
+          "character": "眉",
+          "unicode_codepoint": "U+7709",
+          "yarxi_article_number": 2349,
+          "frequency_index": 2177,
+          "stroke_count": 9,
+          "primary_gif_advertised": true,
+          "order_sha256": "fc89a367db32d21c63cb3b5a8a4208984db5d762eab0bcfb6f09ca0b317b81bb"
+        }
+      ],
+      "sample_characters": [
+        "隻",
+        "髪",
+        "賢",
+        "穴",
+        "醜",
+        "暗",
+        "膝",
+        "腰",
+        "欺",
+        "剣"
+      ]
+    }
+  ]
+}

@@ -5,9 +5,19 @@
 # репозитория, поэтому build output принадлежит корневому `target/`.
 /target
 
-# Runtime state локального инструмента `kanji-assets`; не является источником
-# версионируемых assets и не должен попадать в историю репозитория.
-/.asset-store/
+# Canonical verified kanji corpus сохраняется в Git. Из runtime state остаются
+# локальными только lock и незавершённая временная публикация.
+/.asset-store/*
+!/.asset-store/kanji/
+/.asset-store/kanji/*
+!/.asset-store/kanji/.owner.json
+!/.asset-store/kanji/manifest.json
+!/.asset-store/kanji/assets/
+/.asset-store/kanji/assets/*
+!/.asset-store/kanji/assets/*.gif
+!/.asset-store/kanji/assets/*.png
+/.asset-store/kanji/.lock
+/.asset-store/kanji/.tmp/
 
 # Каталог статического отчёта `anki-repo visual-report`: это результат единичного
 # прогона (сотни файлов превью и копий media), а не данные репозитория. Каталог

@@ -6,11 +6,21 @@ use std::str::FromStr;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::{AssetError, ErrorCode};
-use crate::model::{AssetIdentity, AssetRecord, LifecycleState, SemanticStatus, ValidatorIdentity};
+use crate::kanji_validator::KanjiImageValidator;
+use crate::model::{
+    AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, SemanticStatus, ValidationEvidence,
+    ValidatorIdentity,
+};
 use crate::selection::SelectionMode;
-use crate::store::{AssetStore, IngestRequest, StoreOptions, fd_canonical_path, open_source_file};
+use crate::store::{
+    AssetStore, IngestRequest, StoreOptions, VerifiedIngestRequest, fd_canonical_path,
+    open_source_file,
+};
+use crate::validation::SemanticValidator;
+use crate::yarxi::{AcquiredMedia, SelectionResult, acquire_many};
 
 /// Командная строка `kanji-assets`.
 #[derive(Debug, Parser)]
@@ -29,6 +39,9 @@ pub struct Cli {
     /// Формат вывода.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
     pub output: OutputFormat,
+    /// Разрешает пройти ожидаемый TLS interstitial только для www.yarxi.su.
+    #[arg(long, global = true)]
+    pub allow_insecure_tls: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -52,7 +65,7 @@ pub enum Command {
     },
     /// Проверяет integrity и выводит текущие записи manifest.
     List,
-    /// Показывает детерминированный набор целей; CV validator не реализован.
+    /// Показывает детерминированный набор целей без записи.
     Plan {
         #[arg(long, value_enum)]
         mode: ModeArg,
@@ -60,6 +73,17 @@ pub enum Command {
         validator_id: String,
         #[arg(long)]
         validator_version: String,
+    },
+    /// Получает media через Yarxi и публикует только после semantic VERIFIED.
+    Ensure {
+        /// Один или несколько символов; каждый аргумент должен содержать один Unicode scalar.
+        #[arg(required = true, num_args = 1..)]
+        characters: Vec<String>,
+    },
+    /// Запускает production semantic validator для существующего корпуса.
+    Validate {
+        #[arg(long, value_enum)]
+        mode: ModeArg,
     },
 }
 
@@ -94,9 +118,10 @@ impl FromStr for KanjiCharacter {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        if value.chars().count() != 1 || value.len() > 4 || value.chars().any(char::is_control) {
             return Err(
-                "character должен быть непустой Unicode-строкой без управляющих символов".into(),
+                "character должен содержать ровно один Unicode scalar без управляющих символов"
+                    .into(),
             );
         }
         Ok(Self(value.to_owned()))
@@ -134,14 +159,16 @@ struct StoreSummary {
 struct AssetSummary {
     identity: AssetIdentity,
     from_state: Option<LifecycleState>,
-    to_state: LifecycleState,
-    sha256: String,
+    to_state: Option<LifecycleState>,
+    sha256: Option<String>,
     previous_sha256: Option<String>,
     validation_status: Option<SemanticStatus>,
     validator: Option<ValidatorIdentity>,
     evidence: Vec<crate::model::ValidationEvidence>,
     domain_metadata: Option<serde_json::Value>,
     changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_outcome: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +248,13 @@ pub fn execute(cli: Cli) -> CliOutput {
         } => ValidatorIdentity::new(validator_id.clone(), validator_version.clone())
             .map(|_| (None, None))
             .map_err(|message| AssetError::new(ErrorCode::InvalidValidatorIdentity, message)),
+        Command::Ensure { characters } => characters
+            .iter()
+            .map(|value| value.parse::<KanjiCharacter>())
+            .collect::<Result<Vec<_>, _>>()
+            .map(|_| (None, None))
+            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message)),
+        Command::Validate { .. } => Ok((None, None)),
         _ => Ok((None, None)),
     };
     let (selected_identity, source_file) = match prevalidated {
@@ -243,7 +277,10 @@ pub fn execute(cli: Cli) -> CliOutput {
     for protected_root in protected_roots {
         options = options.protect_from(protected_root);
     }
-    let open_existing = matches!(&cli.command, Command::List | Command::Plan { .. });
+    let open_existing = matches!(
+        &cli.command,
+        Command::List | Command::Plan { .. } | Command::Validate { .. }
+    );
     let open_result = if open_existing {
         AssetStore::open_existing(options)
     } else {
@@ -255,7 +292,13 @@ pub fn execute(cli: Cli) -> CliOutput {
                 path: store.root().display().to_string(),
                 store_id: Some(store.store_id().to_owned()),
             };
-            match execute_with_store(&store, store_summary.clone(), cli.command, source_file) {
+            match execute_with_store(
+                &store,
+                store_summary.clone(),
+                cli.command,
+                source_file,
+                cli.allow_insecure_tls,
+            ) {
                 Ok((response, exit_code)) => render_response(response, cli.output, exit_code),
                 Err(error) => render_error(
                     operation,
@@ -401,6 +444,8 @@ impl Command {
             Self::Ingest { .. } => "ingest",
             Self::List => "list",
             Self::Plan { .. } => "plan",
+            Self::Ensure { .. } => "ensure",
+            Self::Validate { .. } => "validate",
         }
     }
 }
@@ -410,6 +455,7 @@ fn execute_with_store(
     store_summary: StoreSummary,
     command: Command,
     mut source_file: Option<std::fs::File>,
+    allow_insecure_tls: bool,
 ) -> Result<(Response, u8), AssetError> {
     match command {
         Command::Init => {
@@ -455,8 +501,8 @@ fn execute_with_store(
             let summary = AssetSummary {
                 identity: outcome.asset.identity.clone(),
                 from_state: outcome.previous.as_ref().map(|asset| asset.lifecycle),
-                to_state: outcome.asset.lifecycle,
-                sha256: outcome.asset.sha256.clone(),
+                to_state: Some(outcome.asset.lifecycle),
+                sha256: Some(outcome.asset.sha256.clone()),
                 previous_sha256: outcome.previous.as_ref().map(|asset| asset.sha256.clone()),
                 validation_status: outcome
                     .asset
@@ -476,6 +522,11 @@ fn execute_with_store(
                     .unwrap_or_default(),
                 domain_metadata: outcome.asset.domain_metadata.clone(),
                 changed: outcome.changed,
+                item_outcome: Some(if outcome.changed {
+                    "candidate_created".into()
+                } else {
+                    "already_present".into()
+                }),
             };
             let changed = outcome.changed || store.initialized_on_open();
             Ok((
@@ -527,12 +578,316 @@ fn execute_with_store(
                 store.initialized_on_open(),
                 "planned",
             );
-            response
-                .blockers
-                .push("semantic_validator_unavailable".to_owned());
-            response.validator_available = Some(false);
+            response.validator_available = Some(true);
             Ok((response, 0))
         }
+        Command::Ensure { characters } => {
+            ensure_characters(store, store_summary, characters, allow_insecure_tls)
+        }
+        Command::Validate { mode } => {
+            let selection_mode: SelectionMode = mode.into();
+            let validator = KanjiImageValidator::new();
+            let report = store.validate(selection_mode, &validator)?;
+            let mut summaries = Vec::with_capacity(report.attempts.len());
+            let mut blockers = report.blockers.clone();
+            for attempt in &report.attempts {
+                let successful =
+                    attempt.status == Some(SemanticStatus::Verified) && attempt.blocker.is_none();
+                if !successful {
+                    blockers.push(format!(
+                        "{}:{}",
+                        attempt.identity,
+                        attempt
+                            .blocker
+                            .as_deref()
+                            .or_else(|| attempt.status.map(SemanticStatus::as_str))
+                            .unwrap_or("validation_failed")
+                    ));
+                }
+                summaries.push(AssetSummary {
+                    identity: attempt.identity.clone(),
+                    from_state: Some(attempt.from_state),
+                    to_state: Some(attempt.to_state),
+                    sha256: Some(attempt.content_sha256.clone()),
+                    previous_sha256: None,
+                    validation_status: attempt.status,
+                    validator: Some(report.validator.clone()),
+                    evidence: attempt.evidence.clone(),
+                    domain_metadata: None,
+                    changed: attempt.changed,
+                    item_outcome: Some(if successful {
+                        "verified".into()
+                    } else {
+                        attempt.blocker.clone().unwrap_or_else(|| {
+                            attempt
+                                .status
+                                .map(|status| status.as_str())
+                                .unwrap_or("failed")
+                                .to_owned()
+                        })
+                    }),
+                });
+            }
+            let mut response = response(
+                "validate",
+                store_summary,
+                Some(selection_mode.as_str().to_owned()),
+                summaries,
+                report.changed > 0 || store.initialized_on_open(),
+                if blockers.is_empty() {
+                    "validated"
+                } else {
+                    "validation_blocked"
+                },
+            );
+            response.blockers = blockers.clone();
+            response.validator_available = Some(true);
+            Ok((response, if blockers.is_empty() { 0 } else { 3 }))
+        }
+    }
+}
+
+fn ensure_characters(
+    store: &AssetStore,
+    store_summary: StoreSummary,
+    raw_characters: Vec<String>,
+    allow_insecure_tls: bool,
+) -> Result<(Response, u8), AssetError> {
+    let characters = raw_characters
+        .iter()
+        .map(|value| {
+            value
+                .parse::<KanjiCharacter>()
+                .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let validator = KanjiImageValidator::new();
+    let validator_id = validator.identity();
+    let current = store.verify_integrity()?;
+    let mut summaries = Vec::with_capacity(characters.len());
+    let mut missing = Vec::new();
+    let mut missing_indices = Vec::new();
+    let mut blockers = Vec::new();
+
+    for character in &characters {
+        let existing = current
+            .iter()
+            .find(|asset| asset.identity == character.identity());
+        let is_current = existing.is_some_and(|asset| {
+            asset.lifecycle == LifecycleState::Verified
+                && asset.validation.as_ref().is_some_and(|decision| {
+                    decision.status == SemanticStatus::Verified
+                        && decision.content_sha256 == asset.sha256
+                        && decision.validator == validator_id
+                })
+        });
+        if is_current {
+            let mut summary =
+                summary_for_current(existing.expect("verified record exists").clone());
+            summary.item_outcome = Some("already_verified".into());
+            summaries.push(Some(summary));
+        } else {
+            missing_indices.push(summaries.len());
+            missing.push(character.0.clone());
+            summaries.push(None);
+        }
+    }
+
+    if !missing.is_empty() {
+        match acquire_many(&missing, allow_insecure_tls) {
+            Err(error) => {
+                for (offset, character) in missing.iter().enumerate() {
+                    blockers.push(format!("acquisition_failed:{character}"));
+                    summaries[missing_indices[offset]] = Some(failed_summary(
+                        character,
+                        "acquisition_failed",
+                        &error,
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
+            Ok(acquired) => {
+                for (offset, character) in missing.iter().enumerate() {
+                    let target_index = missing_indices[offset];
+                    let old = current.iter().find(|asset| {
+                        asset.identity == KanjiCharacter(character.clone()).identity()
+                    });
+                    let result = acquired.get(offset);
+                    let Some(Ok(media)) = result else {
+                        let message = match result {
+                            Some(Err(message)) => message.as_str(),
+                            None => "provider outcome count mismatch",
+                            Some(Ok(_)) => unreachable!(),
+                        };
+                        blockers.push(format!("acquisition_failed:{character}"));
+                        summaries[target_index] = Some(failed_summary(
+                            character,
+                            "acquisition_failed",
+                            message,
+                            old.map(|asset| asset.lifecycle),
+                            None,
+                            Vec::new(),
+                            None,
+                        ));
+                        continue;
+                    };
+                    let metadata = acquired_metadata(character, media);
+                    if let Err(message) = validate_selected_format(media.selection, &media.bytes) {
+                        blockers.push(format!("media_format_mismatch:{character}"));
+                        summaries[target_index] = Some(failed_summary(
+                            character,
+                            "media_format_mismatch",
+                            &message,
+                            old.map(|asset| asset.lifecycle),
+                            Some(format!("{:x}", Sha256::digest(&media.bytes))),
+                            Vec::new(),
+                            Some(metadata),
+                        ));
+                        continue;
+                    }
+                    let source_name = match media.selection {
+                        SelectionResult::PrimaryGif => "yarxi-primary.gif",
+                        SelectionResult::LeftmostPngFallback => "yarxi-leftmost.png",
+                        SelectionResult::RenderedFontSamplePng => "yarxi-font-sample.png",
+                    };
+                    let request = VerifiedIngestRequest {
+                        identity: KanjiCharacter(character.clone()).identity(),
+                        bytes: media.bytes.clone(),
+                        provenance: crate::model::Provenance {
+                            source_kind: media.evidence.provider.clone(),
+                            source_name: source_name.into(),
+                        },
+                        domain_metadata: Some(metadata.clone()),
+                        replace_expected_sha256: old.map(|asset| asset.sha256.clone()),
+                    };
+                    match store.ingest_verified(request, &validator) {
+                        Ok(outcome) => {
+                            if outcome.status != SemanticStatus::Verified {
+                                blockers.push(format!("{}:{character}", outcome.status.as_str()));
+                                summaries[target_index] = Some(AssetSummary {
+                                    identity: KanjiCharacter(character.clone()).identity(),
+                                    from_state: old.map(|asset| asset.lifecycle),
+                                    to_state: None,
+                                    sha256: Some(outcome.sha256),
+                                    previous_sha256: old.map(|asset| asset.sha256.clone()),
+                                    validation_status: Some(outcome.status),
+                                    validator: Some(validator_id.clone()),
+                                    evidence: outcome.evidence,
+                                    domain_metadata: Some(metadata),
+                                    changed: false,
+                                    item_outcome: Some(outcome.status.as_str().to_owned()),
+                                });
+                            } else if let Some(record) = outcome.asset {
+                                let mut summary = summary_for_current(record);
+                                summary.changed = outcome.changed;
+                                summary.previous_sha256 = old.map(|asset| asset.sha256.clone());
+                                summary.item_outcome = Some(if outcome.changed {
+                                    "verified_published".into()
+                                } else {
+                                    "already_verified".into()
+                                });
+                                summaries[target_index] = Some(summary);
+                            }
+                        }
+                        Err(error) => {
+                            blockers.push(format!("{}:{character}", error.code.as_str()));
+                            let candidate_hash = format!("{:x}", Sha256::digest(&media.bytes));
+                            summaries[target_index] = Some(failed_summary(
+                                character,
+                                error.code.as_str(),
+                                &error.message,
+                                old.map(|asset| asset.lifecycle),
+                                Some(candidate_hash),
+                                Vec::new(),
+                                Some(metadata),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let assets: Vec<_> = summaries.into_iter().flatten().collect();
+    let successful = blockers.is_empty()
+        && assets.iter().all(|asset| {
+            asset.validation_status == Some(SemanticStatus::Verified)
+                && asset.to_state == Some(LifecycleState::Verified)
+        });
+    let changed = assets.iter().any(|asset| asset.changed) || store.initialized_on_open();
+    let mut response = response(
+        "ensure",
+        store_summary,
+        None,
+        assets,
+        changed,
+        if successful {
+            "verified"
+        } else {
+            "partial_failure"
+        },
+    );
+    response.blockers = blockers;
+    response.validator_available = Some(true);
+    Ok((response, if successful { 0 } else { 3 }))
+}
+
+fn validate_selected_format(selection: SelectionResult, bytes: &[u8]) -> Result<(), String> {
+    let actual = DetectedFormat::from_signature(bytes);
+    let expected = match selection {
+        SelectionResult::PrimaryGif => DetectedFormat::Gif,
+        SelectionResult::LeftmostPngFallback | SelectionResult::RenderedFontSamplePng => {
+            DetectedFormat::Png
+        }
+    };
+    if actual != expected {
+        return Err(format!(
+            "selected {selection:?} requires {expected:?} magic bytes, received {actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn acquired_metadata(character: &str, media: &AcquiredMedia) -> serde_json::Value {
+    let mut metadata = KanjiCharacter(character.to_owned()).metadata();
+    metadata["yarxi"] = serde_json::to_value(&media.evidence).unwrap_or(serde_json::Value::Null);
+    metadata
+}
+
+fn failed_summary(
+    character: &str,
+    outcome: &str,
+    message: &str,
+    from_state: Option<LifecycleState>,
+    hash: Option<String>,
+    evidence: Vec<ValidationEvidence>,
+    domain_metadata: Option<serde_json::Value>,
+) -> AssetSummary {
+    AssetSummary {
+        identity: KanjiCharacter(character.to_owned()).identity(),
+        from_state,
+        to_state: None,
+        sha256: hash,
+        previous_sha256: None,
+        validation_status: None,
+        validator: None,
+        evidence: if message.is_empty() {
+            evidence
+        } else {
+            let mut evidence = evidence;
+            evidence.push(ValidationEvidence {
+                kind: outcome.to_owned(),
+                summary: message.chars().take(500).collect(),
+                details: None,
+            });
+            evidence
+        },
+        domain_metadata,
+        changed: false,
+        item_outcome: Some(outcome.to_owned()),
     }
 }
 
@@ -540,8 +895,8 @@ fn summary_for_current(record: AssetRecord) -> AssetSummary {
     AssetSummary {
         identity: record.identity,
         from_state: Some(record.lifecycle),
-        to_state: record.lifecycle,
-        sha256: record.sha256,
+        to_state: Some(record.lifecycle),
+        sha256: Some(record.sha256),
         previous_sha256: None,
         validation_status: record
             .validation
@@ -557,6 +912,7 @@ fn summary_for_current(record: AssetRecord) -> AssetSummary {
             .unwrap_or_default(),
         domain_metadata: record.domain_metadata,
         changed: false,
+        item_outcome: None,
     }
 }
 
@@ -683,8 +1039,8 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> C
                 text.push_str(&format!(
                     "{}  {}  {}  {}\n",
                     asset.identity,
-                    asset.to_state,
-                    asset.sha256,
+                    asset.to_state.map_or("-", LifecycleState::as_str),
+                    asset.sha256.as_deref().unwrap_or("-"),
                     asset
                         .validation_status
                         .map_or("no decision", |status| status.as_str())
@@ -777,6 +1133,24 @@ mod tests {
         assert_ne!(
             outcome.asset.sha256,
             format!("{:x}", Sha256::digest(protected_bytes))
+        );
+    }
+
+    #[test]
+    fn misleading_source_url_or_selection_cannot_override_magic_bytes() {
+        let png_magic = b"\x89PNG\r\n\x1a\nsynthetic";
+        assert!(validate_selected_format(SelectionResult::PrimaryGif, png_magic).is_err());
+        assert!(
+            validate_selected_format(SelectionResult::LeftmostPngFallback, b"GIF89a synthetic")
+                .is_err()
+        );
+        assert!(
+            validate_selected_format(SelectionResult::RenderedFontSamplePng, b"GIF89a synthetic")
+                .is_err()
+        );
+        assert!(validate_selected_format(SelectionResult::PrimaryGif, b"GIF89a synthetic").is_ok());
+        assert!(
+            validate_selected_format(SelectionResult::RenderedFontSamplePng, png_magic).is_ok()
         );
     }
 }

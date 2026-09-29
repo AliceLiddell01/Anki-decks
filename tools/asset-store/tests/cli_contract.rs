@@ -116,8 +116,8 @@ fn cli_reports_store_unicode_selection_idempotency_and_conflicts_as_json() {
     let plan_json = json(&plan);
     assert_eq!(plan_json["mode"], "new");
     assert_eq!(plan_json["assets"].as_array().unwrap().len(), 1);
-    assert_eq!(plan_json["validator_available"], false);
-    assert_eq!(plan_json["blockers"][0], "semantic_validator_unavailable");
+    assert_eq!(plan_json["validator_available"], true);
+    assert_eq!(plan_json["blockers"].as_array().unwrap().len(), 0);
 
     let full = cli(
         &temp,

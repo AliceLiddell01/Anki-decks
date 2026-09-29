@@ -26,7 +26,7 @@ use crate::validation::{SemanticValidator, ValidationAttempt, ValidationReport, 
 const MANIFEST_FILE: &str = "manifest.json";
 const OWNER_FILE: &str = ".owner.json";
 const LOCK_FILE: &str = ".lock";
-const OBJECTS_DIR: &str = "objects";
+const ASSETS_DIR: &str = "assets";
 const TEMP_DIR: &str = ".tmp";
 const OWNER_SCHEMA_VERSION: u32 = 1;
 
@@ -95,11 +95,33 @@ pub struct IngestRequest {
     pub replace_expected_sha256: Option<String>,
 }
 
+/// Запрос acquire→validate→publish: candidate остаётся во временном staging,
+/// пока semantic validator не вернул `verified`.
+#[derive(Debug, Clone)]
+pub struct VerifiedIngestRequest {
+    pub identity: AssetIdentity,
+    pub bytes: Vec<u8>,
+    pub provenance: Provenance,
+    pub domain_metadata: Option<serde_json::Value>,
+    pub replace_expected_sha256: Option<String>,
+}
+
 /// Итог explicit ingest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestOutcome {
     pub asset: AssetRecord,
     pub previous: Option<AssetRecord>,
+    pub changed: bool,
+}
+
+/// Итог атомарной публикации только semantic-verified bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedIngestOutcome {
+    pub asset: Option<AssetRecord>,
+    pub status: SemanticStatus,
+    pub evidence: Vec<crate::model::ValidationEvidence>,
+    pub sha256: String,
+    pub byte_length: u64,
     pub changed: bool,
 }
 
@@ -128,6 +150,31 @@ struct StagedObject {
     sha256: String,
     byte_length: u64,
     format: DetectedFormat,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationObject {
+    storage_path: String,
+    sha256: String,
+    format: DetectedFormat,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationTransaction {
+    schema_version: u32,
+    identity: AssetIdentity,
+    previous: Option<PublicationObject>,
+    next: PublicationObject,
+    staged_name: String,
+    backup_name: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingPublication {
+    marker_name: OsString,
+    transaction: PublicationTransaction,
 }
 
 #[derive(Debug)]
@@ -240,6 +287,7 @@ impl AssetStore {
             false
         };
 
+        recover_publications(&root_handle)?;
         let manifest = load_manifest(&root_handle)?;
         validate_manifest(&root_handle, &manifest)?;
 
@@ -300,6 +348,162 @@ impl AssetStore {
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
         let source = open_source_file(&request.source_path)?;
         self.ingest_from_file(request, source)
+    }
+
+    /// Проверяет bytes до публикации и добавляет в manifest только `verified`.
+    /// Ошибка validator'а и любой non-verified статус оставляют canonical state
+    /// неизменным. Повтор текущих hash/version возвращает idempotent success.
+    pub fn ingest_verified<V: SemanticValidator>(
+        &self,
+        request: VerifiedIngestRequest,
+        validator: &V,
+    ) -> Result<VerifiedIngestOutcome, AssetError> {
+        request
+            .identity
+            .validate()
+            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        if request.provenance.source_kind.trim().is_empty()
+            || request.provenance.source_name.trim().is_empty()
+            || request.provenance.source_name.contains(['/', '\\'])
+        {
+            return Err(AssetError::new(
+                ErrorCode::InvalidIdentity,
+                "Yarxi provenance должен содержать тип и имя источника без path",
+            ));
+        }
+        let validator_id = validator.identity();
+        validate_validator_identity(&validator_id)?;
+        let staged = stage_bytes(&self.root_handle, &request.bytes)?;
+        let lock = self.lock_exclusive()?;
+        let mut manifest = load_manifest(&self.root_handle)?;
+        validate_manifest(&self.root_handle, &manifest)?;
+        let existing = manifest
+            .assets
+            .iter()
+            .find(|asset| asset.identity == request.identity)
+            .cloned();
+        if let Some(current) = &existing {
+            if current.sha256 == staged.sha256
+                && current.validation.as_ref().is_some_and(|validation| {
+                    validation.validator == validator_id
+                        && validation.content_sha256 == current.sha256
+                        && validation.status == SemanticStatus::Verified
+                })
+            {
+                let outcome = VerifiedIngestOutcome {
+                    asset: Some(current.clone()),
+                    status: SemanticStatus::Verified,
+                    evidence: current
+                        .validation
+                        .as_ref()
+                        .map(|record| record.evidence.clone())
+                        .unwrap_or_default(),
+                    sha256: current.sha256.clone(),
+                    byte_length: current.byte_length,
+                    changed: false,
+                };
+                drop(staged);
+                lock.unlock()?;
+                return Ok(outcome);
+            }
+            if current.sha256 != staged.sha256
+                && request.replace_expected_sha256.as_deref() != Some(current.sha256.as_str())
+            {
+                return Err(AssetError::with_details(
+                    ErrorCode::IdentityConflict,
+                    format!("identity {} уже привязана к другому hash", current.identity),
+                    serde_json::json!({
+                        "identity": current.identity,
+                        "existing_sha256": current.sha256,
+                        "candidate_sha256": staged.sha256,
+                    }),
+                ));
+            }
+        } else if request.replace_expected_sha256.is_some() {
+            return Err(AssetError::new(
+                ErrorCode::IdentityConflict,
+                "ожидаемый hash замены указан для отсутствующей identity",
+            ));
+        }
+
+        let storage_path = canonical_asset_path(&request.identity, &staged.sha256, staged.format);
+        let mut record = AssetRecord {
+            identity: request.identity,
+            storage_path,
+            sha256: staged.sha256.clone(),
+            byte_length: staged.byte_length,
+            format: staged.format,
+            provenance: request.provenance,
+            lifecycle: LifecycleState::Pending,
+            validation: None,
+            domain_metadata: request.domain_metadata,
+        };
+        let mut candidate = std::io::Cursor::new(request.bytes.as_slice());
+        let decision = validator
+            .validate(&record, &mut candidate)
+            .map_err(|failure| {
+                let blocker = stable_failure_code(&failure);
+                AssetError::with_details(
+                    ErrorCode::ValidatorFailure,
+                    failure.message,
+                    serde_json::json!({ "blocker": blocker }),
+                )
+            })?;
+        validate_decision(&decision)?;
+        if decision.status != SemanticStatus::Verified {
+            let outcome = VerifiedIngestOutcome {
+                asset: None,
+                status: decision.status,
+                evidence: decision.evidence.clone(),
+                sha256: staged.sha256.clone(),
+                byte_length: staged.byte_length,
+                changed: false,
+            };
+            drop(staged);
+            lock.unlock()?;
+            return Ok(outcome);
+        }
+        record.lifecycle = LifecycleState::Verified;
+        record.validation = Some(ValidationRecord {
+            status: SemanticStatus::Verified,
+            validator: validator_id,
+            content_sha256: staged.sha256.clone(),
+            evidence: decision.evidence.clone(),
+        });
+        commit_asset_record(
+            &self.root_handle,
+            &staged,
+            existing.as_ref(),
+            &record,
+            &mut manifest,
+            |root, manifest| {
+                #[cfg(test)]
+                {
+                    save_manifest_with_test_hook(
+                        root,
+                        manifest,
+                        false,
+                        &self.fail_next_manifest_write,
+                    )
+                }
+                #[cfg(not(test))]
+                {
+                    save_manifest(root, manifest, false)
+                }
+            },
+        )?;
+        let sha256 = staged.sha256.clone();
+        let byte_length = staged.byte_length;
+        drop(staged);
+        lock.unlock()?;
+        Ok(VerifiedIngestOutcome {
+            asset: Some(record),
+            status: SemanticStatus::Verified,
+            evidence: decision.evidence,
+            sha256,
+            byte_length,
+            changed: true,
+        })
     }
 
     /// Импортирует уже открытый и проверенный CLI source handle.
@@ -365,8 +569,7 @@ impl AssetStore {
             ));
         }
 
-        let storage_path = object_relative_path(&staged.sha256);
-        publish_object(&staged, &self.root_handle, &staged.sha256)?;
+        let storage_path = canonical_asset_path(&request.identity, &staged.sha256, staged.format);
         let record = AssetRecord {
             identity: request.identity,
             storage_path,
@@ -381,23 +584,28 @@ impl AssetStore {
             validation: None,
             domain_metadata: request.domain_metadata,
         };
-        validate_object(&self.root_handle, &record)?;
-
-        if existing.is_some() {
-            let slot = manifest
-                .assets
-                .iter_mut()
-                .find(|asset| asset.identity == record.identity)
-                .expect("предварительно найденная identity остаётся в manifest");
-            *slot = record.clone();
-        } else {
-            manifest.assets.push(record.clone());
-        }
-        sort_assets(&mut manifest.assets);
-        manifest.revision = manifest.revision.checked_add(1).ok_or_else(|| {
-            AssetError::new(ErrorCode::ManifestCorrupt, "revision manifest переполнен")
-        })?;
-        save_manifest(&self.root_handle, &manifest, false)?;
+        commit_asset_record(
+            &self.root_handle,
+            &staged,
+            existing.as_ref(),
+            &record,
+            &mut manifest,
+            |root, manifest| {
+                #[cfg(test)]
+                {
+                    save_manifest_with_test_hook(
+                        root,
+                        manifest,
+                        false,
+                        &self.fail_next_manifest_write,
+                    )
+                }
+                #[cfg(not(test))]
+                {
+                    save_manifest(root, manifest, false)
+                }
+            },
+        )?;
         drop(staged);
         lock.unlock()?;
         Ok(IngestOutcome {
@@ -449,7 +657,7 @@ impl AssetStore {
         // места manifest и trusted state не меняются.
         let mut decisions: Vec<(AssetRecord, SemanticDecision)> = Vec::new();
         for record in selected {
-            let mut file = checked_object_file(&self.root_handle, &record)?;
+            let mut file = checked_asset_file(&self.root_handle, &record)?;
             let original_state = record.lifecycle;
             match validator.validate(&record, &mut file) {
                 Ok(decision) => {
@@ -518,7 +726,7 @@ impl AssetStore {
         // Validator мог работать параллельно с процессом, не использующим наш
         // lock. Повторно проверяем bytes перед тем, как зафиксировать decision.
         for record in &changed_records {
-            validate_object(&self.root_handle, record)?;
+            validate_asset(&self.root_handle, record)?;
         }
 
         report
@@ -656,7 +864,7 @@ fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError>
         RootState::NewlyCreated | RootState::ExistingEmpty => {
             // Empty root is the only unowned state safe to initialize. Both
             // the directory bootstrap lock and the store lock are held.
-            let _objects = ensure_dir_entry(root, OBJECTS_DIR)?;
+            let _assets = ensure_dir_entry(root, ASSETS_DIR)?;
             let _temporary = ensure_dir_entry(root, TEMP_DIR)?;
             let store_id = new_store_id();
             let manifest = Manifest::empty(store_id.clone());
@@ -667,7 +875,7 @@ fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError>
         RootState::Owned => {
             // Missing internal directories may be repaired only after both
             // independent ownership files have been validated.
-            ensure_dir_entry(root, OBJECTS_DIR)?;
+            ensure_dir_entry(root, ASSETS_DIR)?;
             ensure_dir_entry(root, TEMP_DIR)?;
             Ok(false)
         }
@@ -720,7 +928,7 @@ fn inspect_top_level(root: &File, unknown_code: ErrorCode) -> Result<BTreeSet<St
         let name = entry.file_name().to_string_lossy().into_owned();
         if !matches!(
             name.as_str(),
-            LOCK_FILE | OWNER_FILE | MANIFEST_FILE | OBJECTS_DIR | TEMP_DIR
+            LOCK_FILE | OWNER_FILE | MANIFEST_FILE | ASSETS_DIR | TEMP_DIR
         ) {
             return Err(AssetError::new(
                 unknown_code,
@@ -735,7 +943,7 @@ fn inspect_top_level(root: &File, unknown_code: ErrorCode) -> Result<BTreeSet<St
                 format!("symlink запрещён в store root: {name}"),
             ));
         }
-        if matches!(name.as_str(), OBJECTS_DIR | TEMP_DIR) && !metadata.is_dir() {
+        if matches!(name.as_str(), ASSETS_DIR | TEMP_DIR) && !metadata.is_dir() {
             return Err(AssetError::new(
                 unknown_code,
                 format!("{name} существует, но не является каталогом"),
@@ -983,7 +1191,7 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
         ));
     }
     let mut previous_identity: Option<&AssetIdentity> = None;
-    let mut verified_hashes = BTreeSet::new();
+    let mut registered_paths = BTreeSet::new();
     for record in &manifest.assets {
         record
             .identity
@@ -1003,7 +1211,7 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
                 "пустой файл должен иметь format unknown",
             ));
         }
-        let expected_path = object_relative_path(&record.sha256);
+        let expected_path = canonical_asset_path(&record.identity, &record.sha256, record.format);
         validate_relative_path(&record.storage_path, &expected_path)?;
         match (&record.lifecycle, &record.validation) {
             (LifecycleState::Pending, None) => {}
@@ -1039,10 +1247,10 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
                 "provenance source_name не должен содержать path",
             ));
         }
-        validate_object(root, record)?;
-        verified_hashes.insert(record.sha256.clone());
+        validate_asset(root, record)?;
+        registered_paths.insert(record.storage_path.clone());
     }
-    validate_object_directory(root, &verified_hashes)?;
+    validate_asset_directory(root, &registered_paths)?;
     Ok(())
 }
 
@@ -1074,8 +1282,8 @@ fn validate_validation_record(
     Ok(())
 }
 
-fn validate_object(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
-    let file = checked_object_file(root, record)?;
+fn validate_asset(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
+    let file = checked_asset_file(root, record)?;
     let (sha256, byte_length, format) = hash_file(file)?;
     if sha256 != record.sha256 || byte_length != record.byte_length || format != record.format {
         return Err(AssetError::new(
@@ -1086,48 +1294,72 @@ fn validate_object(root: &File, record: &AssetRecord) -> Result<(), AssetError> 
     Ok(())
 }
 
-fn validate_object_directory(
+fn validate_asset_directory(
     root: &File,
-    verified_hashes: &BTreeSet<String>,
+    registered_paths: &BTreeSet<String>,
 ) -> Result<(), AssetError> {
-    let objects = open_directory_at(root, OBJECTS_DIR).map_err(|error| {
+    let assets = open_directory_at(root, ASSETS_DIR).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AssetError::new(
                 ErrorCode::ManifestCorrupt,
-                "каталог objects отсутствует в program-owned store",
+                "каталог assets отсутствует в program-owned store",
             )
         } else {
-            AssetError::io("не удалось открыть object store", error)
+            AssetError::io("не удалось открыть canonical asset store", error)
         }
     })?;
-    for entry in fs::read_dir(fd_path(&objects))
-        .map_err(|error| AssetError::io("не удалось прочитать object store", error))?
+    let mut observed_paths = BTreeSet::new();
+    for entry in fs::read_dir(fd_path(&assets))
+        .map_err(|error| AssetError::io("не удалось прочитать canonical asset store", error))?
     {
         let entry =
-            entry.map_err(|error| AssetError::io("не удалось прочитать object entry", error))?;
+            entry.map_err(|error| AssetError::io("не удалось прочитать asset entry", error))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(hash) = name.strip_suffix(".blob") else {
-            return Err(AssetError::new(
-                ErrorCode::UnexpectedPath,
-                format!("неожиданный файл в object store: {name}"),
-            ));
-        };
-        validate_hash(hash)?;
-        let file = open_regular_at(&objects, entry.file_name(), ErrorCode::MissingAssetFile)?;
-        if !verified_hashes.contains(hash) {
-            let (actual_hash, _, _) = hash_file(file)?;
-            if actual_hash != hash {
+        let file = open_regular_at(&assets, entry.file_name(), ErrorCode::MissingAssetFile)?;
+        let (actual_hash, _, format) = hash_file(file)?;
+        let storage_path = format!("{ASSETS_DIR}/{name}");
+        if registered_paths.contains(&storage_path) {
+            if extension_for_format(format) != name.rsplit('.').next().unwrap_or("") {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
-                    format!("object {name} не соответствует своему SHA-256"),
+                    format!("asset {name} не соответствует формату в manifest"),
+                ));
+            }
+        } else {
+            let Some(hash) = embedded_content_hash(&name) else {
+                return Err(AssetError::new(
+                    ErrorCode::UnexpectedPath,
+                    format!("неизвестный файл в canonical asset store: {name}"),
+                ));
+            };
+            if is_hash_suffixed_kanji_filename(&name) {
+                return Err(AssetError::new(
+                    ErrorCode::UnexpectedPath,
+                    format!("устаревшее hash-suffixed имя kanji asset: {name}"),
+                ));
+            }
+            validate_hash(hash)?;
+            if actual_hash != hash
+                || extension_for_format(format) != name.rsplit('.').next().unwrap_or("")
+            {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("asset {name} не соответствует SHA-256/формату в имени"),
                 ));
             }
         }
-        // Незарегистрированный content-addressed object возможен, если процесс
-        // завершился после публикации bytes и до manifest. Он не является
-        // asset без identity в manifest и не попадает в `full` или `new`.
+        observed_paths.insert(storage_path);
     }
+    if !registered_paths.is_subset(&observed_paths) {
+        return Err(AssetError::new(
+            ErrorCode::MissingAssetFile,
+            "manifest ссылается на отсутствующий canonical asset",
+        ));
+    }
+    // Generic immutable objects can leave a verified-by-hash orphan after a
+    // crash. Stable kanji paths use a transaction marker and are recovered
+    // before manifest validation.
     Ok(())
 }
 
@@ -1147,31 +1379,88 @@ fn validate_relative_path(actual: &str, expected: &str) -> Result<(), AssetError
     if actual != expected {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
-            "storage_path не совпадает с content-addressed layout",
+            "storage_path не совпадает с canonical asset layout",
         ));
     }
     Ok(())
 }
 
-fn checked_object_file(root: &File, record: &AssetRecord) -> Result<File, AssetError> {
-    let expected = object_relative_path(&record.sha256);
+fn checked_asset_file(root: &File, record: &AssetRecord) -> Result<File, AssetError> {
+    let expected = canonical_asset_path(&record.identity, &record.sha256, record.format);
     validate_relative_path(&record.storage_path, &expected)?;
-    let objects = open_directory_at(root, OBJECTS_DIR).map_err(|error| {
+    let assets = open_directory_at(root, ASSETS_DIR).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AssetError::new(
                 ErrorCode::ManifestCorrupt,
-                "каталог objects отсутствует в program-owned store",
+                "каталог assets отсутствует в program-owned store",
             )
         } else {
-            AssetError::io("не удалось открыть object store", error)
+            AssetError::io("не удалось открыть canonical asset store", error)
         }
     })?;
-    let name = format!("{}.blob", record.sha256);
-    open_regular_at(&objects, &name, ErrorCode::MissingAssetFile)
+    let name = record
+        .storage_path
+        .strip_prefix("assets/")
+        .ok_or_else(|| AssetError::new(ErrorCode::ManifestCorrupt, "storage_path вне assets/"))?;
+    open_regular_at(&assets, name, ErrorCode::MissingAssetFile)
 }
 
-fn object_relative_path(hash: &str) -> String {
-    format!("{OBJECTS_DIR}/{hash}.blob")
+fn canonical_asset_path(identity: &AssetIdentity, hash: &str, format: DetectedFormat) -> String {
+    if let Some(character) = kanji_character(identity) {
+        return format!("{ASSETS_DIR}/{character}.{}", extension_for_format(format));
+    }
+    let prefix = {
+        let key_hash = format!("{:x}", Sha256::digest(identity.key.as_bytes()));
+        format!("{}-{}", identity.namespace, &key_hash[..16])
+    };
+    format!(
+        "{ASSETS_DIR}/{prefix}-{hash}.{}",
+        extension_for_format(format)
+    )
+}
+
+fn kanji_character(identity: &AssetIdentity) -> Option<char> {
+    if identity.namespace != "kanji" {
+        return None;
+    }
+    let mut chars = identity.key.chars();
+    let character = chars.next()?;
+    (chars.next().is_none() && !character.is_control() && character != '/' && character != '\\')
+        .then_some(character)
+}
+
+fn extension_for_format(format: DetectedFormat) -> &'static str {
+    match format {
+        DetectedFormat::Png => "png",
+        DetectedFormat::Jpeg => "jpg",
+        DetectedFormat::Gif => "gif",
+        DetectedFormat::Webp => "webp",
+        DetectedFormat::Bmp => "bmp",
+        DetectedFormat::Tiff => "tiff",
+        DetectedFormat::Unknown => "bin",
+    }
+}
+
+fn embedded_content_hash(filename: &str) -> Option<&str> {
+    let (stem, extension) = filename.rsplit_once('.')?;
+    if !matches!(
+        extension,
+        "png" | "jpg" | "gif" | "webp" | "bmp" | "tiff" | "bin"
+    ) {
+        return None;
+    }
+    let (_, hash) = stem.rsplit_once('-')?;
+    (hash.len() == 64).then_some(hash)
+}
+
+fn is_hash_suffixed_kanji_filename(filename: &str) -> bool {
+    let Some((stem, _)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    let Some((prefix, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    hash.len() == 64 && prefix.chars().count() == 1
 }
 
 fn validate_hash(hash: &str) -> Result<(), AssetError> {
@@ -1236,37 +1525,59 @@ fn stage_source(root: &File, mut input: File) -> Result<StagedObject, AssetError
     })
 }
 
-fn publish_object(staged: &StagedObject, root: &File, hash: &str) -> Result<(), AssetError> {
-    let objects = open_directory_at(root, OBJECTS_DIR)
-        .map_err(|error| AssetError::io("не удалось открыть object store", error))?;
-    let name = format!("{hash}.blob");
-    match open_regular_at(&objects, &name, ErrorCode::MissingAssetFile) {
+fn stage_bytes(root: &File, bytes: &[u8]) -> Result<StagedObject, AssetError> {
+    let (artifact, mut output) = create_temp_file(root, "candidate")?;
+    output
+        .write_all(bytes)
+        .and_then(|()| output.flush())
+        .and_then(|()| output.sync_all())
+        .map_err(|error| AssetError::io("не удалось синхронизировать candidate staging", error))?;
+    let digest = Sha256::digest(bytes);
+    Ok(StagedObject {
+        artifact,
+        sha256: format!("{digest:x}"),
+        byte_length: bytes.len() as u64,
+        format: DetectedFormat::from_signature(&bytes[..bytes.len().min(12)]),
+    })
+}
+
+fn publish_object(
+    staged: &StagedObject,
+    root: &File,
+    storage_path: &str,
+) -> Result<(), AssetError> {
+    let assets = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
+    let name = storage_path.strip_prefix("assets/").ok_or_else(|| {
+        AssetError::new(ErrorCode::ManifestCorrupt, "publication path вне assets/")
+    })?;
+    match open_regular_at(&assets, name, ErrorCode::MissingAssetFile) {
         Ok(existing) => {
             verify_staged_file(staged, existing)?;
-            sync_directory(&objects)
+            sync_directory(&assets)
         }
         Err(error) if error.code == ErrorCode::MissingAssetFile => {
             match linkat(
                 &staged.artifact.directory,
                 &staged.artifact.name,
-                &objects,
-                &name,
+                &assets,
+                name,
                 AtFlags::empty(),
             ) {
                 Ok(()) => {
-                    let object = open_regular_at(&objects, &name, ErrorCode::MissingAssetFile)?;
-                    verify_staged_file(staged, object)?;
-                    sync_directory(&objects)
+                    let asset = open_regular_at(&assets, name, ErrorCode::MissingAssetFile)?;
+                    verify_staged_file(staged, asset)?;
+                    sync_directory(&assets)
                 }
                 Err(link_error)
                     if std::io::Error::from(link_error).kind()
                         == std::io::ErrorKind::AlreadyExists =>
                 {
-                    let existing = open_regular_at(&objects, &name, ErrorCode::MissingAssetFile)?;
+                    let existing = open_regular_at(&assets, name, ErrorCode::MissingAssetFile)?;
                     verify_staged_file(staged, existing)
                 }
                 Err(link_error) => Err(AssetError::io(
-                    "не удалось опубликовать object",
+                    "не удалось опубликовать canonical asset",
                     std::io::Error::from(link_error),
                 )),
             }
@@ -1283,7 +1594,7 @@ fn verify_staged_file(staged: &StagedObject, file: File) -> Result<(), AssetErro
     if hash != staged.sha256 || length != staged.byte_length || format != staged.format {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "content-addressed object не совпадает с вычисленным hash",
+            "canonical asset не совпадает с вычисленным hash",
         ));
     }
     make_readonly(&file)
@@ -1385,17 +1696,32 @@ fn atomic_write(
 fn create_temp_file(root: &File, prefix: &str) -> Result<(TempArtifact, File), AssetError> {
     let directory = open_directory_at(root, TEMP_DIR)
         .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
+    create_temp_in_directory(&directory, prefix)
+}
+
+fn create_temp_in_directory(
+    directory: &File,
+    prefix: &str,
+) -> Result<(TempArtifact, File), AssetError> {
     for _ in 0..128 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = OsString::from(format!("{prefix}-{}-{counter}.tmp", std::process::id()));
         match openat(
-            &directory,
+            directory,
             &name,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::from_raw_mode(0o600),
         ) {
             Ok(file) => {
-                return Ok((TempArtifact { directory, name }, File::from(file)));
+                return Ok((
+                    TempArtifact {
+                        directory: directory.try_clone().map_err(|error| {
+                            AssetError::io("не удалось клонировать temp dir", error)
+                        })?,
+                        name,
+                    },
+                    File::from(file),
+                ));
             }
             Err(error)
                 if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists =>
@@ -1442,6 +1768,578 @@ fn hash_file(mut file: File) -> Result<(String, u64, DetectedFormat), AssetError
         byte_length,
         DetectedFormat::from_signature(&signature),
     ))
+}
+
+fn commit_asset_record<F>(
+    root: &File,
+    staged: &StagedObject,
+    previous: Option<&AssetRecord>,
+    record: &AssetRecord,
+    manifest: &mut Manifest,
+    save: F,
+) -> Result<(), AssetError>
+where
+    F: FnOnce(&File, &Manifest) -> Result<(), AssetError>,
+{
+    recover_publications(root)?;
+    let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
+        AssetError::new(ErrorCode::ManifestCorrupt, "revision manifest переполнен")
+    })?;
+    let needs_stable_publication = kanji_character(&record.identity).is_some()
+        && previous.is_none_or(|asset| {
+            asset.sha256 != record.sha256 || asset.storage_path != record.storage_path
+        });
+    let publication = if needs_stable_publication {
+        Some(prepare_publication(root, staged, previous, record)?)
+    } else {
+        None
+    };
+
+    let result = (|| {
+        if let Some(publication) = &publication {
+            apply_publication(root, staged, publication)?;
+        } else {
+            publish_object(staged, root, &record.storage_path)?;
+        }
+        validate_asset(root, record)?;
+        if let Some(slot) = manifest
+            .assets
+            .iter_mut()
+            .find(|asset| asset.identity == record.identity)
+        {
+            *slot = record.clone();
+        } else {
+            manifest.assets.push(record.clone());
+        }
+        sort_assets(&mut manifest.assets);
+        manifest.revision = next_revision;
+        save(root, manifest)
+    })();
+
+    if let Err(error) = result {
+        if let Some(publication) = &publication {
+            recover_publication(root, &publication.marker_name)?;
+        }
+        return Err(error);
+    }
+    if let Some(publication) = publication {
+        recover_publication(root, &publication.marker_name)?;
+    }
+    Ok(())
+}
+
+fn prepare_publication(
+    root: &File,
+    staged: &StagedObject,
+    previous: Option<&AssetRecord>,
+    next: &AssetRecord,
+) -> Result<PendingPublication, AssetError> {
+    if kanji_character(&next.identity).is_none() {
+        return Err(AssetError::new(
+            ErrorCode::InvalidIdentity,
+            "stable publication разрешена только для односимвольной kanji identity",
+        ));
+    }
+    let assets = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
+    let next_name = asset_name(&next.storage_path)?;
+    let previous_object = previous.map(|asset| PublicationObject {
+        storage_path: asset.storage_path.clone(),
+        sha256: asset.sha256.clone(),
+        format: asset.format,
+    });
+    if let Some(previous) = previous {
+        let previous_name = asset_name(&previous.storage_path)?;
+        if !file_matches_hash(&assets, previous_name, &previous.sha256)? {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "предыдущий kanji asset изменился до compare-and-swap публикации",
+            ));
+        }
+        if previous.storage_path != next.storage_path {
+            ensure_asset_path_absent(&assets, next_name, &next.storage_path)?;
+        }
+    } else {
+        ensure_asset_path_absent(&assets, next_name, &next.storage_path)?;
+    }
+
+    for _ in 0..128 {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{}-{counter}", std::process::id());
+        let marker_name = OsString::from(format!("publication-{id}.json"));
+        let backup_name = previous_object
+            .as_ref()
+            .filter(|previous| previous.storage_path == next.storage_path)
+            .map(|_| format!("publication-{id}.backup"));
+        let transaction = PublicationTransaction {
+            schema_version: 1,
+            identity: next.identity.clone(),
+            previous: previous_object.clone(),
+            next: PublicationObject {
+                storage_path: next.storage_path.clone(),
+                sha256: next.sha256.clone(),
+                format: next.format,
+            },
+            staged_name: staged.artifact.name.to_string_lossy().into_owned(),
+            backup_name: backup_name.clone(),
+        };
+        if !write_publication_marker(&temporary, &marker_name, &transaction)? {
+            continue;
+        }
+        let pending = PendingPublication {
+            marker_name,
+            transaction,
+        };
+        if let (Some(previous), Some(backup_name)) = (previous, backup_name) {
+            let previous_name = asset_name(&previous.storage_path)?;
+            if let Err(error) = linkat(
+                &assets,
+                previous_name,
+                &temporary,
+                backup_name.as_str(),
+                AtFlags::empty(),
+            ) {
+                recover_publication(root, &pending.marker_name)?;
+                return Err(AssetError::io(
+                    "не удалось сохранить предыдущий kanji asset для CAS",
+                    std::io::Error::from(error),
+                ));
+            }
+            if !file_matches_hash(&temporary, &backup_name, &previous.sha256)? {
+                recover_publication(root, &pending.marker_name)?;
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "backup предыдущего kanji asset не прошёл SHA-256 проверку",
+                ));
+            }
+            sync_directory(&temporary)?;
+        }
+        return Ok(pending);
+    }
+    Err(AssetError::new(
+        ErrorCode::IoFailure,
+        "не удалось выбрать свободное имя publication transaction",
+    ))
+}
+
+fn write_publication_marker(
+    temporary: &File,
+    marker_name: &OsString,
+    transaction: &PublicationTransaction,
+) -> Result<bool, AssetError> {
+    let bytes = serde_json::to_vec_pretty(transaction)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    let (artifact, mut file) = create_temp_in_directory(temporary, "publication-state")?;
+    file.write_all(&bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| AssetError::io("не удалось синхронизировать publication marker", error))?;
+    drop(file);
+    match linkat(
+        &artifact.directory,
+        &artifact.name,
+        temporary,
+        marker_name,
+        AtFlags::empty(),
+    ) {
+        Ok(()) => {
+            if let Err(error) = sync_directory(temporary) {
+                let _ = unlink_if_exists(temporary, marker_name);
+                let _ = sync_directory(temporary);
+                Err(error)
+            } else {
+                Ok(true)
+            }
+        }
+        Err(error) if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(false)
+        }
+        Err(error) => Err(AssetError::io(
+            "не удалось атомарно сохранить publication marker",
+            std::io::Error::from(error),
+        )),
+    }
+}
+
+fn apply_publication(
+    root: &File,
+    staged: &StagedObject,
+    publication: &PendingPublication,
+) -> Result<(), AssetError> {
+    let assets = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
+    let next_name = asset_name(&publication.transaction.next.storage_path)?;
+    let staged_file = open_regular_at(
+        &staged.artifact.directory,
+        &staged.artifact.name,
+        ErrorCode::MissingAssetFile,
+    )?;
+    verify_staged_contents(staged, staged_file)?;
+    renameat(
+        &staged.artifact.directory,
+        &staged.artifact.name,
+        &assets,
+        next_name,
+    )
+    .map_err(|error| {
+        AssetError::io(
+            "не удалось атомарно опубликовать stable kanji asset",
+            std::io::Error::from(error),
+        )
+    })?;
+    sync_directory(&staged.artifact.directory)?;
+    sync_directory(&assets)?;
+    let published = open_regular_at(&assets, next_name, ErrorCode::MissingAssetFile)?;
+    verify_staged_file(staged, published)?;
+    sync_directory(&assets)
+}
+
+fn verify_staged_contents(staged: &StagedObject, file: File) -> Result<(), AssetError> {
+    let (hash, length, format) = hash_file(file)?;
+    if hash != staged.sha256 || length != staged.byte_length || format != staged.format {
+        return Err(AssetError::new(
+            ErrorCode::IntegrityMismatch,
+            "staged kanji asset не совпадает с вычисленным SHA-256",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_publications(root: &File) -> Result<(), AssetError> {
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
+    let mut markers = Vec::new();
+    for entry in fs::read_dir(fd_path(&temporary))
+        .map_err(|error| AssetError::io("не удалось прочитать transaction directory", error))?
+    {
+        let entry = entry
+            .map_err(|error| AssetError::io("не удалось прочитать transaction entry", error))?;
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if text.starts_with("publication-") && text.ends_with(".json") {
+            markers.push(name);
+        }
+    }
+    markers.sort();
+    for marker in markers {
+        recover_publication(root, &marker)?;
+    }
+    Ok(())
+}
+
+fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetError> {
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
+    validate_publication_names(marker_name, None, None)?;
+    let marker_file = open_regular_at(&temporary, marker_name, ErrorCode::MissingAssetFile)?;
+    let transaction: PublicationTransaction = serde_json::from_reader(marker_file)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    validate_publication_transaction(marker_name, &transaction)?;
+    let manifest = load_manifest(root)?;
+    let current = manifest
+        .assets
+        .iter()
+        .find(|asset| asset.identity == transaction.identity);
+    let committed = current.is_some_and(|asset| {
+        asset.sha256 == transaction.next.sha256
+            && asset.storage_path == transaction.next.storage_path
+    });
+    let previous_state = match (&transaction.previous, current) {
+        (Some(previous), Some(asset)) => {
+            asset.sha256 == previous.sha256 && asset.storage_path == previous.storage_path
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let assets = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
+
+    if committed {
+        if !file_matches_hash(
+            &assets,
+            asset_name(&transaction.next.storage_path)?,
+            &transaction.next.sha256,
+        )? {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "manifest commit ссылается на не опубликованный kanji asset",
+            ));
+        }
+        if let Some(previous) = &transaction.previous
+            && previous.storage_path != transaction.next.storage_path
+        {
+            remove_if_hash(
+                &assets,
+                asset_name(&previous.storage_path)?,
+                &previous.sha256,
+                "предыдущий kanji asset",
+            )?;
+        }
+    } else if previous_state {
+        if let Some(previous) = &transaction.previous {
+            let previous_name = asset_name(&previous.storage_path)?;
+            if previous.storage_path == transaction.next.storage_path
+                && !file_matches_hash(&assets, previous_name, &previous.sha256)?
+            {
+                let backup_name = transaction.backup_name.as_deref().ok_or_else(|| {
+                    AssetError::new(
+                        ErrorCode::ManifestCorrupt,
+                        "publication transaction не содержит backup для in-place CAS",
+                    )
+                })?;
+                if !file_matches_hash(&temporary, backup_name, &previous.sha256)? {
+                    return Err(AssetError::new(
+                        ErrorCode::IntegrityMismatch,
+                        "не удалось восстановить предыдущие kanji bytes после сбоя публикации",
+                    ));
+                }
+                renameat(&temporary, backup_name, &assets, previous_name).map_err(|error| {
+                    AssetError::io(
+                        "не удалось откатить атомарную замену kanji asset",
+                        std::io::Error::from(error),
+                    )
+                })?;
+                sync_directory(&temporary)?;
+                sync_directory(&assets)?;
+                if !file_matches_hash(&assets, previous_name, &previous.sha256)? {
+                    return Err(AssetError::new(
+                        ErrorCode::IntegrityMismatch,
+                        "восстановленный kanji asset не совпадает с прежним SHA-256",
+                    ));
+                }
+            } else if !file_matches_hash(&assets, previous_name, &previous.sha256)? {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "предыдущий kanji asset отсутствует после незавершённой публикации",
+                ));
+            }
+        }
+        if transaction
+            .previous
+            .as_ref()
+            .is_none_or(|previous| previous.storage_path != transaction.next.storage_path)
+        {
+            remove_if_hash(
+                &assets,
+                asset_name(&transaction.next.storage_path)?,
+                &transaction.next.sha256,
+                "неподтверждённый kanji asset",
+            )?;
+        }
+    } else {
+        return Err(AssetError::new(
+            ErrorCode::IntegrityMismatch,
+            "publication marker не соответствует текущему manifest",
+        ));
+    }
+
+    remove_if_exists(&temporary, OsString::from(transaction.staged_name.as_str()))?;
+    if let (Some(backup_name), Some(previous)) = (
+        transaction.backup_name.as_deref(),
+        transaction.previous.as_ref(),
+    ) {
+        remove_if_hash(
+            &temporary,
+            backup_name,
+            &previous.sha256,
+            "publication backup",
+        )?;
+    }
+    unlink_if_exists(&temporary, marker_name)?;
+    sync_directory(&assets)?;
+    sync_directory(&temporary)
+}
+
+fn validate_publication_transaction(
+    marker_name: &OsString,
+    transaction: &PublicationTransaction,
+) -> Result<(), AssetError> {
+    if transaction.schema_version != 1
+        || transaction.identity.validate().is_err()
+        || kanji_character(&transaction.identity).is_none()
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "publication marker содержит неподдерживаемую kanji identity/schema",
+        ));
+    }
+    validate_hash(&transaction.next.sha256)?;
+    if transaction.next.storage_path
+        != canonical_asset_path(
+            &transaction.identity,
+            &transaction.next.sha256,
+            transaction.next.format,
+        )
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "publication marker содержит неверный новый storage_path",
+        ));
+    }
+    if let Some(previous) = &transaction.previous {
+        validate_hash(&previous.sha256)?;
+        if previous.storage_path
+            != canonical_asset_path(&transaction.identity, &previous.sha256, previous.format)
+        {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "publication marker содержит неверный предыдущий storage_path",
+            ));
+        }
+        if previous.sha256 == transaction.next.sha256
+            && previous.storage_path == transaction.next.storage_path
+        {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "publication marker не описывает изменение bytes/path",
+            ));
+        }
+    }
+    let marker = marker_name.to_string_lossy();
+    let Some(id) = marker
+        .strip_prefix("publication-")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "неверное имя publication marker",
+        ));
+    };
+    if !valid_numeric_id(id) || !is_temp_artifact_name(&transaction.staged_name) {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "publication marker содержит небезопасное имя temporary file",
+        ));
+    }
+    let expected_backup = transaction
+        .previous
+        .as_ref()
+        .filter(|previous| previous.storage_path == transaction.next.storage_path)
+        .map(|_| format!("publication-{id}.backup"));
+    if transaction.backup_name != expected_backup {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "publication marker содержит неверный backup name",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_publication_names(
+    marker_name: &OsString,
+    staged_name: Option<&str>,
+    backup_name: Option<&str>,
+) -> Result<(), AssetError> {
+    let marker = marker_name.to_string_lossy();
+    let Some(id) = marker
+        .strip_prefix("publication-")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "неверное имя publication marker",
+        ));
+    };
+    if !valid_numeric_id(id)
+        || staged_name.is_some_and(|name| !is_temp_artifact_name(name))
+        || backup_name.is_some_and(|name| name != format!("publication-{id}.backup"))
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "publication marker содержит небезопасное имя temporary file",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_numeric_id(id: &str) -> bool {
+    let Some((pid, counter)) = id.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !counter.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_temp_artifact_name(name: &str) -> bool {
+    ["candidate-", "ingest-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_suffix(".tmp"))
+            .is_some_and(valid_numeric_id)
+    })
+}
+
+fn asset_name(storage_path: &str) -> Result<&str, AssetError> {
+    storage_path
+        .strip_prefix("assets/")
+        .ok_or_else(|| AssetError::new(ErrorCode::ManifestCorrupt, "storage_path вне assets/"))
+}
+
+fn ensure_asset_path_absent(
+    directory: &File,
+    name: &str,
+    storage_path: &str,
+) -> Result<(), AssetError> {
+    match open_regular_at(directory, name, ErrorCode::MissingAssetFile) {
+        Ok(_) => Err(AssetError::new(
+            ErrorCode::UnexpectedPath,
+            format!("путь нового kanji asset уже занят: {storage_path}"),
+        )),
+        Err(error) if error.code == ErrorCode::MissingAssetFile => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn file_matches_hash(
+    directory: &File,
+    name: &str,
+    expected_hash: &str,
+) -> Result<bool, AssetError> {
+    match open_regular_at(directory, name, ErrorCode::MissingAssetFile) {
+        Ok(file) => Ok(hash_file(file)?.0 == expected_hash),
+        Err(error) if error.code == ErrorCode::MissingAssetFile => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_if_hash(
+    directory: &File,
+    name: &str,
+    expected_hash: &str,
+    label: &str,
+) -> Result<(), AssetError> {
+    match open_regular_at(directory, name, ErrorCode::MissingAssetFile) {
+        Ok(file) => {
+            if hash_file(file)?.0 != expected_hash {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("{label} не совпадает с transaction SHA-256"),
+                ));
+            }
+            let owned_name = OsString::from(name);
+            unlink_if_exists(directory, &owned_name)
+        }
+        Err(error) if error.code == ErrorCode::MissingAssetFile => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_if_exists(directory: &File, name: OsString) -> Result<(), AssetError> {
+    unlink_if_exists(directory, &name)
+}
+
+fn unlink_if_exists(directory: &File, name: &OsString) -> Result<(), AssetError> {
+    match unlinkat(directory, name, AtFlags::empty()) {
+        Ok(()) => Ok(()),
+        Err(error) if std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AssetError::io(
+            "не удалось удалить завершённый publication artifact",
+            std::io::Error::from(error),
+        )),
+    }
 }
 
 pub(crate) fn open_source_file(path: &Path) -> Result<File, AssetError> {
@@ -1840,6 +2738,145 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].lifecycle, LifecycleState::Pending);
         assert!(records[0].validation.is_none());
+    }
+
+    #[test]
+    fn failed_kanji_cas_manifest_write_restores_previous_stable_bytes() {
+        let temp = TempDir::new();
+        let root = temp.0.join("store");
+        let store = AssetStore::open(StoreOptions::new(&root)).expect("empty store opens");
+        let validator = VerifiedValidator;
+        let first_bytes = b"GIF89a previous fixture".to_vec();
+        let first = store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: AssetIdentity::new("kanji", "元").unwrap(),
+                    bytes: first_bytes.clone(),
+                    provenance: Provenance {
+                        source_kind: "fixture".to_owned(),
+                        source_name: "previous.gif".to_owned(),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                &validator,
+            )
+            .expect("first verified bytes publish");
+        let previous = first.asset.expect("first asset exists");
+        assert_eq!(previous.storage_path, "assets/元.gif");
+
+        store.fail_next_manifest_write();
+        let error = store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: previous.identity.clone(),
+                    bytes: b"GIF89a replacement fixture".to_vec(),
+                    provenance: Provenance {
+                        source_kind: "fixture".to_owned(),
+                        source_name: "replacement.gif".to_owned(),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: Some(previous.sha256.clone()),
+                },
+                &validator,
+            )
+            .expect_err("injected manifest failure aborts CAS publication");
+        assert_eq!(error.code, ErrorCode::IoFailure);
+        assert_eq!(
+            fs::read(root.join("assets/元.gif")).expect("old stable path restored"),
+            first_bytes
+        );
+        assert_eq!(
+            fs::read_dir(root.join(TEMP_DIR))
+                .expect("temporary directory exists")
+                .count(),
+            0,
+            "rollback removes transaction marker, backup and staged candidate"
+        );
+
+        let reopened = AssetStore::open(StoreOptions::new(&root)).expect("store remains readable");
+        let records = reopened
+            .verify_integrity()
+            .expect("old manifest still matches bytes");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sha256, previous.sha256);
+        assert_eq!(records[0].lifecycle, LifecycleState::Verified);
+    }
+
+    #[test]
+    fn reopening_after_interrupted_kanji_cas_restores_previous_verified_bytes() {
+        let temp = TempDir::new();
+        let root = temp.0.join("store");
+        let store = AssetStore::open(StoreOptions::new(&root)).expect("empty store opens");
+        let previous_bytes = b"GIF89a durable previous fixture".to_vec();
+        let first = store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: AssetIdentity::new("kanji", "元").unwrap(),
+                    bytes: previous_bytes.clone(),
+                    provenance: Provenance {
+                        source_kind: "fixture".to_owned(),
+                        source_name: "previous.gif".to_owned(),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                &VerifiedValidator,
+            )
+            .expect("first verified bytes publish");
+        let previous = first.asset.expect("first asset exists");
+
+        let lock = store.lock_exclusive().expect("CAS lock acquired");
+        let replacement_bytes = b"GIF89a interrupted replacement";
+        let staged = stage_bytes(&store.root_handle, replacement_bytes).expect("new bytes staged");
+        let mut next = previous.clone();
+        next.sha256 = staged.sha256.clone();
+        next.byte_length = staged.byte_length;
+        next.format = staged.format;
+        next.storage_path = canonical_asset_path(&next.identity, &next.sha256, next.format);
+        next.lifecycle = LifecycleState::Pending;
+        next.validation = None;
+
+        let publication = prepare_publication(&store.root_handle, &staged, Some(&previous), &next)
+            .expect("same-path CAS transaction is durable before publication");
+        let marker_name = publication.marker_name.clone();
+        let backup_name = publication
+            .transaction
+            .backup_name
+            .clone()
+            .expect("same-path replacement keeps an old-byte backup");
+        apply_publication(&store.root_handle, &staged, &publication)
+            .expect("new bytes atomically replace the stable path");
+        assert_eq!(
+            fs::read(root.join("assets/元.gif")).expect("replacement is published"),
+            replacement_bytes
+        );
+        assert!(root.join(TEMP_DIR).join(&marker_name).exists());
+        assert!(root.join(TEMP_DIR).join(&backup_name).exists());
+
+        drop(staged);
+        lock.unlock().expect("test releases CAS lock");
+        drop(store);
+
+        let reopened = AssetStore::open(StoreOptions::new(&root))
+            .expect("open recovers interrupted in-place CAS before validation");
+        let records = reopened
+            .verify_integrity()
+            .expect("previous verified manifest and bytes match");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sha256, previous.sha256);
+        assert_eq!(records[0].lifecycle, LifecycleState::Verified);
+        assert_eq!(
+            fs::read(root.join("assets/元.gif")).expect("previous stable bytes restored"),
+            previous_bytes
+        );
+        assert_eq!(
+            fs::read_dir(root.join(TEMP_DIR))
+                .expect("temporary directory exists")
+                .count(),
+            0,
+            "recovery clears the marker, backup and staged artifact"
+        );
     }
 
     fn run_serialization_probe(contested_identity: bool) {

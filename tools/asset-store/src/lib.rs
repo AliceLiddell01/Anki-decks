@@ -9,10 +9,12 @@ compile_error!("asset-store currently supports Linux only");
 
 pub mod cli;
 pub mod error;
+pub mod kanji_validator;
 pub mod model;
 pub mod selection;
 pub mod store;
 pub mod validation;
+pub mod yarxi;
 
 pub use error::{AssetError, ErrorCode};
 pub use model::{
@@ -20,5 +22,8 @@ pub use model::{
     SemanticDecision, SemanticStatus, ValidationEvidence, ValidationRecord, ValidatorIdentity,
 };
 pub use selection::{SelectionMode, select_assets};
-pub use store::{AssetStore, IngestOutcome, IngestRequest, StoreOptions};
+pub use store::{
+    AssetStore, IngestOutcome, IngestRequest, StoreOptions, VerifiedIngestOutcome,
+    VerifiedIngestRequest,
+};
 pub use validation::{SemanticValidator, ValidationReport, ValidatorFailure};
