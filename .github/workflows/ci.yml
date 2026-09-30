@@ -58,9 +58,11 @@ jobs:
           set -euo pipefail
           font=/tmp/NotoSerifJP.ttf
           generated=/tmp/yarxi-noto-serif-jp-r1.maskdb.zlib
-          curl --fail --location --silent --show-error \
-            https://www.yarxi.su/fonts/noto-serif-jp.24fc2d26.ttf \
-            --output "$font"
+          font_url=https://www.yarxi.su/fonts/noto-serif-jp.24fc2d26.ttf
+          if ! curl --fail --location --silent --show-error "$font_url" --output "$font"; then
+            echo "::warning::Yarxi TLS chain is rejected by the runner; retrying this pinned URL with certificate verification disabled"
+            curl --insecure --fail --location --silent --show-error "$font_url" --output "$font"
+          fi
           echo "e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8  $font" \
             | sha256sum --check --strict
           cargo run --quiet --locked -p asset-store --features reference-generator \
