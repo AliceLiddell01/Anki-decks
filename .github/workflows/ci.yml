@@ -53,6 +53,26 @@ jobs:
       - name: Собрать и выполнить тесты
         run: cargo test --workspace --all-features --locked
 
+      - name: Проверить воспроизводимость Yarxi font reference на resvg 0.48
+        run: |
+          set -euo pipefail
+          font=/tmp/NotoSerifJP.ttf
+          generated=/tmp/yarxi-noto-serif-jp-r1.maskdb.zlib
+          curl --fail --location --silent --show-error \
+            https://www.yarxi.su/fonts/noto-serif-jp.24fc2d26.ttf \
+            --output "$font"
+          echo "e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8  $font" \
+            | sha256sum --check --strict
+          cargo run --quiet --locked -p asset-store --features reference-generator \
+            --bin build-yarxi-font-reference -- \
+            --font-file "$font" \
+            --output "$generated"
+          actual=$(sha256sum "$generated" | cut -d' ' -f1)
+          expected=ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c
+          echo "canonical=$expected"
+          echo "generated=$actual"
+          test "$actual" = "$expected"
+
       - name: Проверить verified-only kanji corpus
         # Ветка без tracked corpus допустима. Если store присутствует (в том числе
         # как symlink), read-only gate обязан подтвердить verified-only содержимое.
