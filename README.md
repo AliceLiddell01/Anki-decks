@@ -8,10 +8,11 @@
 ![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-000000?logo=rust&logoColor=white)
 ![CrowdAnki JSON](https://img.shields.io/badge/CrowdAnki-JSON-2f81f7)
 ![Platform Linux](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Версионируемое хранилище Anki-колод и инфраструктура вокруг них: анализ, QA, точечное редактирование, создание заметок, визуальная проверка изменений и управляемые media-assets.
 
-[Что умеет](#что-умеет) · [Как это работает](#как-это-работает) · [Быстрый старт](#быстрый-старт) · [Инструменты](#инструменты) · [Структура](#структура-репозитория)
+[Что умеет](#что-умеет) · [Как это работает](#как-это-работает) · [Быстрый старт](#быстрый-старт) · [Инструменты](#инструменты) · [Структура](#структура-репозитория) · [Лицензия](#лицензия)
 
 </div>
 
@@ -274,6 +275,14 @@ cargo test --workspace --all-features --locked
 ```bash
 cargo run --quiet --locked -p asset-store --bin kanji-corpus-gate
 ```
+
+## Лицензия
+
+Собственный программный код, repository automation/configuration и документация проекта распространяются по **MIT License**.
+
+Содержимое `decks/`, пользовательские media-файлы и сторонние assets/corpora не получают MIT-лицензию автоматически: для них действуют права исходных правообладателей или отдельные условия, если они указаны.
+
+[Полный текст и границы лицензии →](LICENSE)
 
 ---
 
