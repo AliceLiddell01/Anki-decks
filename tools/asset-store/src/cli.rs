@@ -4,8 +4,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
 use crate::kanji_domain::parse_kanji_character;
@@ -21,6 +19,8 @@ use crate::store::{
 };
 use crate::validation::SemanticValidator;
 use crate::yarxi::{AcquiredMedia, SelectionResult, acquire_many};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 
 /// Командная строка `kanji-assets`.
 #[derive(Debug, Parser)]
@@ -1140,10 +1140,7 @@ mod tests {
             sha256_hex(candidate_bytes),
             "the bytes belong to the descriptor checked before pathname replacement"
         );
-        assert_ne!(
-            outcome.asset.sha256,
-            sha256_hex(protected_bytes)
-        );
+        assert_ne!(outcome.asset.sha256, sha256_hex(protected_bytes));
     }
 
     #[test]
