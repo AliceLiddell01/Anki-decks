@@ -1147,6 +1147,11 @@ pub fn create(result: &CreateResult) -> String {
             result.checks.media_references_absent,
         ),
         (
+            "only_notes_and_media_files_appended",
+            result.checks.only_notes_and_media_files_appended,
+        ),
+        ("media_assets_verified", result.checks.media_assets_verified),
+        (
             "guids_resolved_without_conflict",
             result.checks.guids_resolved_without_conflict,
         ),

@@ -810,15 +810,15 @@ UUID колод со словами как данные репозитория.
 | `reason` | код / код возврата | Значение |
 |---|---|---|
 | `config_absent`, `processor_not_enabled` | `media_forbidden` / 3 | Для поля нет явного разрешения |
-| `config_invalid`, `config_unsupported`, `config_stale_field` | `invalid_request` / 3 | Правила невалидны или устарели |
+| `config_invalid`, `config_unsupported`, `config_stale_field`, `config_context` | `invalid_request` / 3 | Правила невалидны или устарели либо не удалось разрешить контекст экспорта |
 | `media_reference_unclaimed` | `media_forbidden` / 3 | Обработчик не допускает эту ссылку |
 | `kanji_asset_missing` | `invalid_request` / 3 | Проверенное изображение или хранилище не найдено |
 | `asset_integrity_invalid` | `invalid_request` / 3 | Несовпадение состояния, решения, контрольной суммы, формата или границ; `asset_code` уточняет причину |
 | `canonical_filename_mismatch`, `stale_pinned_asset` | `expected_mismatch` / 7 | Имя файла не совпадает либо закреплённое изображение изменилось, исчезло или было переименовано |
 | `destination_media_conflict` | `expected_mismatch` / 7 | Целевой путь занят другими байтами или небезопасным объектом |
-| `media_pins_mismatch`, `asset_store_boundary`, `media_declaration_conflict`, `emit_resolved_protected_path` | `invalid_request` / 3 | Непригодные закрепления или пересечение путей |
+| `asset_store_boundary`, `media_declaration_conflict`, `emit_resolved_protected_path` | `invalid_request` / 3 | Пересечение путей или конфликт объявления медиафайлов |
 | `media_materialization_failed`, `media_disappeared`, `media_directory_changed` | `write_failed` / 8 | Отказ при размещении или итоговой проверке медиафайлов |
-| `source_modified`, `source_missing` | `source_changed` / 7 | Исходник изменился под общей блокировкой экспорта |
+| `source_modified`, `source_missing`, `export_directory_changed` | `source_changed` / 7 | Исходник изменился или каталог экспорта был заменён под общей блокировкой |
 
 При отказе публикации JSON сохраняются прежние `write_failed` / код возврата 8 и
 `details.operation`; дополнительные проверенные медиафайлы безопасно используются

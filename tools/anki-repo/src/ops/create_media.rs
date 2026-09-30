@@ -259,7 +259,16 @@ impl Routing {
                         json!({"reference": reference.value}),
                     ));
                 }
-                let identity = AssetIdentity::new("kanji", stem).expect("проверенная identity");
+                let identity = match AssetIdentity::new("kanji", stem) {
+                    Ok(identity) => identity,
+                    Err(_) => {
+                        return Err(blocker(
+                            ErrorCode::MediaForbidden,
+                            "media_reference_unclaimed",
+                            json!({"reference": &reference.value, "field": field}),
+                        ));
+                    }
+                };
                 claimed.push(reference.value.clone());
                 refs.push(Reference {
                     note_index,

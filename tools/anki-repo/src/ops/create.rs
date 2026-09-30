@@ -168,7 +168,8 @@ pub struct CreateChecks {
     pub candidate_reparsed: bool,
     /// Разрешённая модель предъявила свидетельства о схеме полей.
     pub model_resolution_evidenced: bool,
-    /// Ссылки на медиа либо отсутствуют, либо разрешены проверенными файлами.
+    /// В новых значениях нет ссылок на медиа; при разрешённых ссылках проверка
+    /// отражена в `media_assets_verified`.
     pub media_references_absent: bool,
     /// `guid` новых заметок не конфликтуют с существующими заметками.
     pub guids_resolved_without_conflict: bool,
