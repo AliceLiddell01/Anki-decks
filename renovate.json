@@ -19,5 +19,6 @@
     "enabled": true,
     "dependencyDashboardApproval": false,
     "prConcurrentLimit": 1
-  }
+  },
+  "rebaseWhen": "behind-base-branch"
 }
