@@ -1,0 +1,155 @@
+{
+  "repo_notes": [
+    {
+      "content": "Вся DeepWiki этого репозитория должна быть написана на русском языке: заголовки, основной текст, подписи диаграмм, таблицы и пояснения. Не переводить точные технические идентификаторы и внешние имена: пути, имена файлов, Rust symbols, CLI-команды и флаги, JSON-ключи, UUID, CrowdAnki, Anki, HTML/CSS, GitHub, CodeRabbit, DeepWiki, Yarxi и японский текст."
+    },
+    {
+      "content": "Документируй фактическое состояние текущей индексируемой ревизии, а не желаемую архитектуру. Для колод и CrowdAnki источником истины является фактический deck.json и связанные note_models, deck_configurations, children и notes. Для Rust tooling — production-код, Cargo manifests и тесты. README, AGENTS.md и .codex/context помогают понять назначение и ownership, но не должны подменять код или данные."
+    },
+    {
+      "content": "Состав decks/** — пользовательские данные, а не стабильный контракт репозитория. Не представляй текущие уровни JLPT, названия колод, note models, имена полей или конкретные media как обязательную архитектуру. Если они нужны как пример, явно обозначай их как текущее состояние на момент индексации. Универсальные инструменты должны описываться как data-driven и работающие с фактической схемой экспорта."
+    },
+    {
+      "content": "Строго различай два Rust-компонента. tools/anki-repo — детерминированный toolkit для анализа, проверки и ограниченного изменения CrowdAnki-экспортов; он не вызывает LLM API и не владеет загрузкой media. tools/asset-store — отдельный program-owned asset core и kanji-specific tooling; он владеет asset lifecycle, integrity, provenance, Yarxi acquisition и semantic validation, но не читает decks/**/media, не меняет media_files и не интегрирован с карточками. Не изображай между ними несуществующий runtime integration."
+    },
+    {
+      "content": "Подчёркивай safety boundaries мутаций. В anki-repo edit/create/retire по умолчанию работают как dry-run и пишут только по явному --apply; create не создаёт колоды, модели или поля и не разрешает новые значения полей со ссылками на media; retire добавляет тег вместо физического удаления. Asset store публикует в canonical corpus только VERIFIED assets, отделяет локальные Pending/Quarantined состояния и проверяет integrity fail-closed."
+    },
+    {
+      "content": "AGENTS.md, .codex/context/** и .agents/skills/** являются агентской инфраструктурой и владельцами правил/процедур, а не production runtime. Показывай их роль в маршрутизации контекста, Git/GitHub lifecycle и review workflow отдельно от архитектуры данных и Rust tooling. Не дублируй их процедурный текст целиком: объясняй ownership и связи."
+    },
+    {
+      "content": "В архитектурных диаграммах показывай ownership, data flow и trust/filesystem boundaries. Особенно важны связи: decks/** → CrowdAnki deck.json/media; anki-repo → чтение и строго ограниченная запись deck.json; asset-store → .asset-store/kanji и Yarxi; Cargo workspace → оба Rust crate; CI → кодовые проверки и рекурсивная валидация фактически найденных экспортов. Не рисуй прямые связи, которых в коде нет."
+    },
+    {
+      "content": "Описывая verification, различай два инварианта: default Rust tests используют синтетические fixtures и не зависят от live decks/**, а repository CI отдельно рекурсивно валидирует фактически присутствующие CrowdAnki-экспорты как данные репозитория. MSRV и Rust edition принадлежат корневому Cargo.toml; не выдавай копии версий в других местах за самостоятельные источники истины."
+    }
+  ],
+  "pages": [
+    {
+      "title": "Обзор Anki-decks",
+      "purpose": "Дать высокоуровневую карту репозитория: назначение, основные каталоги, CrowdAnki-данные, Rust tooling, агентская инфраструктура и CI. Показать главные связи и указать, какие части являются данными, кодом и procedural context.",
+      "parent": null
+    },
+    {
+      "title": "Архитектура и ownership",
+      "purpose": "Объяснить архитектурные границы и владельцев поведения между decks/**, tools/anki-repo, tools/asset-store, Cargo workspace, .codex/context, .agents/skills и .github/workflows. Сосредоточиться на source-of-truth и запрете параллельных owners. Включить корневой Cargo workspace, его участников, ownership MSRV/edition/Cargo.lock и роль корня как единой точки Rust-проверок.",
+      "parent": "Обзор Anki-decks"
+    },
+    {
+      "title": "Источники истины",
+      "purpose": "Зафиксировать приоритет фактического deck.json и связанных CrowdAnki структур для колод, production-кода и тестов для tooling, а также вспомогательную роль README, AGENTS.md и .codex/context. Привести примеры конфликтов документации с фактическим состоянием.",
+      "parent": "Архитектура и ownership"
+    },
+    {
+      "title": "Данные колод и стабильные контракты",
+      "purpose": "Объяснить, почему состав decks/**, JLPT-уровни, названия моделей и полей являются изменяемым payload, а не API репозитория. Показать, какие свойства действительно считаются стабильными контрактами и почему tooling/CI не должны хардкодить текущие колоды.",
+      "parent": "Архитектура и ownership"
+    },
+    {
+      "title": "CrowdAnki и колоды",
+      "purpose": "Описать представление Anki-колод в репозитории как CrowdAnki JSON плюс media, не привязывая архитектуру к текущему набору колод. Показать дерево deck nodes и связь данных с note models и configurations.",
+      "parent": "Обзор Anki-decks"
+    },
+    {
+      "title": "Структура CrowdAnki JSON",
+      "purpose": "Разобрать корень и вложенные children, notes, note_models, deck_configurations, media_files и основные identity-поля. Объяснить структурные инварианты и границы неизвестных ключей по .codex/context/02-CROWDANKI-JSON.md и фактическому tooling.",
+      "parent": "CrowdAnki и колоды"
+    },
+    {
+      "title": "Модели заметок и поля",
+      "purpose": "Объяснить разрешение note_model_uuid → note_models[].flds[].ord → Note.fields, динамическую природу имён полей, шаблоны карточек и причины, по которым универсальный toolkit не может предполагать «главное поле».",
+      "parent": "CrowdAnki и колоды"
+    },
+    {
+      "title": "Media в CrowdAnki",
+      "purpose": "Документировать различие между media_files, ссылками из HTML/полей и физическими файлами media/. Объяснить basename-oriented validation, предупреждения об отсутствующих файлах и отсутствие общего права tooling произвольно сканировать пользовательские media.",
+      "parent": "CrowdAnki и колоды"
+    },
+    {
+      "title": "Toolkit anki-repo",
+      "purpose": "Дать архитектурный обзор tools/anki-repo: CLI, loader/index/model/media/template layers, операции, human/JSON output, детерминированность и filesystem boundary. Объяснить, что toolkit локальный, без сети и без LLM API.",
+      "parent": "Обзор Anki-decks"
+    },
+    {
+      "title": "Чтение, поиск и модели",
+      "purpose": "Документировать inspect, find, stats и models: какие вопросы они решают, как адресуют export/deck/model/field, какие ограничения и machine-readable результаты предоставляют. Не хардкодить примеры текущих имён полей.",
+      "parent": "Toolkit anki-repo"
+    },
+    {
+      "title": "Структурная валидация и QA",
+      "purpose": "Разделить validate и qa: структурные ERROR/WARNING/INFO против содержательных QA findings, registry правил, addressability и exit-code semantics. Показать, какие дефекты делают экспорт невалидным, а какие являются review evidence.",
+      "parent": "Toolkit anki-repo"
+    },
+    {
+      "title": "Review pipeline",
+      "purpose": "Описать qa → review → внешний содержательный анализ → review-check → edit как pipeline. Показать proposal schema, source_editable/source_blockers, effective proposals и границу ответственности внешнего агента без утверждения, что CLI сам оценивает японский текст.",
+      "parent": "Toolkit anki-repo"
+    },
+    {
+      "title": "Изменение жизненного цикла заметок",
+      "purpose": "Документировать edit, create и retire: dry-run, --apply, identity preservation, schema discovery, запрет media-ссылок при create, retire через тег вместо физического удаления, идемпотентность и проверки кандидата перед записью.",
+      "parent": "Toolkit anki-repo"
+    },
+    {
+      "title": "Visual report",
+      "purpose": "Объяснить visual-report как статический offline before/after артефакт: rendering по фактическим templates, diff manifest, media diagnostics, preview_incomplete/unsupported constructs, расположение отчёта вне decks/** и его роль как evidence, а не source of truth.",
+      "parent": "Toolkit anki-repo"
+    },
+    {
+      "title": "Asset store и kanji-assets",
+      "purpose": "Дать архитектурный обзор tools/asset-store: generic AssetStore core, kanji domain, CLI/binaries, storage ownership, manifest/integrity/provenance, canonical и runtime state. Явно показать отсутствие интеграции с decks/**/media. Включить роль yarxi_dark_acceptance как локального ручного acceptance harness без публикации артефактов.",
+      "parent": "Обзор Anki-decks"
+    },
+    {
+      "title": "Хранилище и lifecycle assets",
+      "purpose": "Документировать .asset-store/kanji, .owner.json, canonical manifest/assets, .runtime, Pending/Quarantined/VERIFIED, content hashes, atomic publication, recovery, compare-and-swap и kanji-corpus-gate.",
+      "parent": "Asset store и kanji-assets"
+    },
+    {
+      "title": "Получение изображений из Yarxi",
+      "purpose": "Описать browser-based acquisition в yarxi.rs: поиск статьи по точному Unicode, приоритет GIF, доказанное отсутствие GIF перед PNG fallback, rendered font sample, dark theme handling, допустимые источники bytes, TLS interstitial policy и provenance.",
+      "parent": "Asset store и kanji-assets"
+    },
+    {
+      "title": "Semantic validator кандзи",
+      "purpose": "Документировать KanjiImageValidator, декодирование PNG/GIF, reference catalogs KanjiVG и Noto Serif JP, нормализацию масок, Chamfer distance, VERIFIED/REJECTED/UNCERTAIN thresholds, pinned data и attribution. Отделить pixel evidence от provenance.",
+      "parent": "Asset store и kanji-assets"
+    },
+    {
+      "title": "Агентская инфраструктура",
+      "purpose": "Объяснить назначение AGENTS.md, .codex/context/INDEX.md и owner-документов, а также .agents/skills как repository-level контекста для агентов. Не смешивать эти процедуры с production runtime или API Rust-инструментов. Включить repository skills anki-git-workflow и anki-coderabbit-review, их trigger boundaries и отдельное разрешение на merge.",
+      "parent": "Обзор Anki-decks"
+    },
+    {
+      "title": "Контекст и маршрутизация",
+      "purpose": "Документировать роль .codex/context/INDEX.md и профильных документов 01-PROJECT-MAP.md, 02-CROWDANKI-JSON.md, 03-VERIFICATION.md: какие вопросы они маршрутизируют и почему фактические JSON/код остаются источниками истины.",
+      "parent": "Агентская инфраструктура"
+    },
+    {
+      "title": "Проверки и CI",
+      "purpose": "Описать .github/workflows/ci.yml и verification contract: cargo fmt, clippy, tests, MSRV и рекурсивную live-payload validation. Отделить CI evidence от содержательного review карточек. Включить тестовую стратегию synthetic fixtures, независимость default tests от decks/** и ближайшие test surfaces обоих Rust crates.",
+      "parent": "Обзор Anki-decks"
+    },
+    {
+      "title": "End-to-end сценарии",
+      "purpose": "Собрать несколько сквозных потоков без выдумывания отсутствующей автоматизации: анализ существующей карточки, содержательная правка, создание заметки без media, retire, visual report и отдельная подготовка kanji asset. Для каждого показать владельцев и validation gates.",
+      "parent": "Обзор Anki-decks"
+    },
+    {
+      "title": "Анализ и правка карточки",
+      "purpose": "Показать типовой flow: inspect/models/find или qa/review → содержательное решение внешнего агента → review-check → edit dry-run → --apply → validate/qa → visual evidence. Указать, где сохраняются identity и какие ошибки требуют перечитать состояние.",
+      "parent": "End-to-end сценарии"
+    },
+    {
+      "title": "Создание и вывод карточки из обращения",
+      "purpose": "Показать flow models → create dry-run → create --apply → повторная проверка → validate/qa, а также retire через тег и последующую адресуемость заметки. Явно отметить, что create не добавляет media и не создаёт новые модели/колоды.",
+      "parent": "End-to-end сценарии"
+    },
+    {
+      "title": "Подготовка kanji asset",
+      "purpose": "Показать отдельный flow asset-store: acquisition из Yarxi → semantic validation → VERIFIED canonical publication или runtime quarantine → integrity/publishability gate → ручная приёмка там, где она требуется. Не соединять этот flow с карточкой автоматически: текущего bridge в decks/**/media нет.",
+      "parent": "End-to-end сценарии"
+    }
+  ]
+}
