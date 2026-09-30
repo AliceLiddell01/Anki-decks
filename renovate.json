@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Постоянная политика dependency maintenance: поддерживать зависимости и GitHub Actions актуальными без автоматического merge.",
+    "Использовать рекомендации Renovate для pin digest, config migrations, abandoned dependency detection и регулярного обслуживания lock-файлов.",
+    "Обычные обновления, включая major, проходят через ограниченный PR/CI budget; security updates получают отдельный быстрый канал."
+  ],
+  "extends": [
+    "config:best-practices"
+  ],
+  "dependencyDashboard": true,
+  "dependencyDashboardApproval": false,
+  "automerge": false,
+  "prConcurrentLimit": 4,
+  "prHourlyLimit": 2,
+  "commitHourlyLimit": 2,
+  "separateMultipleMajor": false,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "dependencyDashboardApproval": false,
+    "prConcurrentLimit": 1
+  }
+}
