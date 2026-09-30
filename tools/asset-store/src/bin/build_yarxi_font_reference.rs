@@ -10,8 +10,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use resvg::usvg::{self, fontdb};
-use sha2::{Digest, Sha256};
-
+use asset_store::hashing::sha256_hex;
 use asset_store::kanji_mask::{MASK_BYTES, Mask, normalize_binary_mask};
 
 const KANJIVG_DB: &[u8] = include_bytes!("../data/kanjivg-r20250816.maskdb.zlib");
@@ -20,7 +19,7 @@ const PINNED_FONT_SHA256: &str = "e6cffcd5cae6a298ddfd17173b42d64888913976b2d705
 fn main() -> Result<(), Box<dyn Error>> {
     let (font_path, output) = arguments()?;
     let font_bytes = fs::read(&font_path)?;
-    let font_sha256 = format!("{:x}", Sha256::digest(&font_bytes));
+    let font_sha256 = sha256_hex(&font_bytes);
     if font_sha256 != PINNED_FONT_SHA256 {
         return Err(format!(
             "SHA-256 исходного шрифта Noto Serif JP не совпадает: ожидалось {PINNED_FONT_SHA256}, получено {font_sha256}"
@@ -70,12 +69,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(&temp, &compressed)?;
     fs::rename(&temp, &output)?;
     println!(
-        "templates={} font_sha256={} raw_bytes={} compressed_bytes={} output_sha256={:x}",
+        "templates={} font_sha256={} raw_bytes={} compressed_bytes={} output_sha256={}",
         raw.len().saturating_sub(8) / (4 + MASK_BYTES),
         font_sha256,
         raw.len(),
         compressed.len(),
-        Sha256::digest(&compressed),
+        sha256_hex(&compressed),
     );
     Ok(())
 }

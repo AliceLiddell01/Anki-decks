@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use asset_store::cli::KanjiCharacter;
+use asset_store::hashing::sha256_hex;
 use asset_store::kanji_validator::KanjiImageValidator;
 use asset_store::model::{
     AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, Provenance, SemanticStatus,
@@ -15,7 +16,6 @@ use asset_store::yarxi::{AcquisitionTarget, SelectionResult, acquire_many_with_t
 use clap::Parser;
 use image::GenericImageView;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -129,7 +129,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let png_signature_valid = media.bytes.starts_with(b"\x89PNG\r\n\x1a\n");
         let decoded = image::load_from_memory_with_format(&media.bytes, image::ImageFormat::Png);
         let dimensions = decoded.as_ref().ok().map(GenericImageView::dimensions);
-        let sha256 = format!("{:x}", Sha256::digest(&media.bytes));
+        let sha256 = sha256_hex(&media.bytes);
         if png_signature_valid && dimensions.is_some() {
             fs::write(report_dir.join(&image_relative_path), &media.bytes)?;
         }

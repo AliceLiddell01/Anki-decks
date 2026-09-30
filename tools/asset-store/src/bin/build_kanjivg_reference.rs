@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image::{ImageBuffer, Rgba, RgbaImage};
-use sha2::{Digest, Sha256};
-
+use asset_store::hashing::sha256_hex;
 use asset_store::kanji_domain::is_supported_han;
 use asset_store::kanji_mask::{MASK_BYTES, Mask, normalize_binary_mask};
 
@@ -60,11 +59,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(&temp, &compressed)?;
     fs::rename(&temp, &output)?;
     println!(
-        "templates={} raw_bytes={} compressed_bytes={} sha256={:x}",
+        "templates={} raw_bytes={} compressed_bytes={} sha256={}",
         raw.len().saturating_sub(8) / (4 + MASK_BYTES),
         raw.len(),
         compressed.len(),
-        Sha256::digest(&compressed),
+        sha256_hex(&compressed),
     );
     Ok(())
 }
