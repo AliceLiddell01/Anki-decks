@@ -698,6 +698,38 @@ fn publishable_gate_rejects_stale_validator_identity() {
 }
 
 #[test]
+fn open_existing_recreates_ignored_service_files() {
+    let temp = TempDir::new("reopen-without-service-files");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("kanji", "日").unwrap(),
+                bytes: b"GIF89a verified fixture".to_vec(),
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: "verified.gif".into(),
+                },
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            },
+            &FixedValidator::new(SemanticStatus::Verified),
+        )
+        .unwrap();
+    drop(store);
+    fs::remove_file(root.join(".lock")).unwrap();
+    fs::remove_dir_all(root.join(".tmp")).unwrap();
+    fs::remove_dir_all(root.join(".runtime")).unwrap();
+
+    let reopened = AssetStore::open_existing(StoreOptions::new(&root)).unwrap();
+    assert_eq!(reopened.verify_integrity().unwrap().len(), 1);
+    assert!(root.join(".lock").exists());
+    assert!(root.join(".tmp").exists());
+    assert!(root.join(".runtime").exists());
+}
+
+#[test]
 fn kanji_filename_is_stable_across_cas_and_format_changes_without_duplicate_identity() {
     let temp = TempDir::new("kanji-stable-cas");
     let root = temp.path().join("store");

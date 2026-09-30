@@ -29,9 +29,18 @@ const LOCK_FILE: &str = ".lock";
 const ASSETS_DIR: &str = "assets";
 const TEMP_DIR: &str = ".tmp";
 const RUNTIME_DIR: &str = ".runtime";
+const REMOVAL_MARKER: &str = "removal.json";
+const REMOVAL_BACKUP: &str = "removal.backup";
+const TRANSITION_MARKER: &str = "transition.json";
 const OWNER_SCHEMA_VERSION: u32 = 1;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_REMOVAL_MANIFEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_AFTER_CANONICAL_TRANSITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Параметры открытия store и защищённых от пересечения каталогов.
 #[derive(Debug, Clone)]
@@ -174,6 +183,29 @@ struct PublicationTransaction {
     backup_name: Option<String>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovalTransaction {
+    schema_version: u32,
+    record: AssetRecord,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransitionTransaction {
+    schema_version: u32,
+    identity: AssetIdentity,
+    target: TransitionTarget,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransitionTarget {
+    Canonical,
+    Runtime,
+}
+
 #[derive(Debug)]
 struct PendingPublication {
     marker_name: OsString,
@@ -278,7 +310,7 @@ impl AssetStore {
         }
         let lock = match state {
             RootState::NewlyCreated | RootState::ExistingEmpty => create_lock_file(&root_handle)?,
-            RootState::Owned => open_lock_file(&root_handle, create_if_missing)?,
+            RootState::Owned => open_lock_file(&root_handle, true)?,
         };
         flock(&lock, FlockOperation::LockExclusive).map_err(|error| {
             AssetError::io(
@@ -289,6 +321,7 @@ impl AssetStore {
         let initialized_on_open = if create_if_missing {
             initialize_or_load(&root_handle, state)?
         } else {
+            ensure_dir_entry(&root_handle, TEMP_DIR)?;
             false
         };
 
@@ -589,6 +622,19 @@ impl AssetStore {
             .iter()
             .find(|asset| asset.identity == record.identity)
             .cloned();
+        let previous_runtime = runtime_manifest
+            .assets
+            .iter()
+            .find(|asset| asset.identity == record.identity)
+            .cloned();
+        if previous_runtime.is_some() {
+            begin_transition(
+                &self.root_handle,
+                &record.identity,
+                TransitionTarget::Canonical,
+                &record.sha256,
+            )?;
+        }
         commit_asset_record(
             &self.root_handle,
             &staged,
@@ -611,13 +657,16 @@ impl AssetStore {
                 }
             },
         )?;
-        if let Some(candidate) = runtime_manifest
-            .assets
-            .iter()
-            .find(|asset| asset.identity == record.identity)
-            .cloned()
-        {
+        if let Some(candidate) = previous_runtime {
+            #[cfg(test)]
+            if FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.replace(false)) {
+                return Err(AssetError::new(
+                    ErrorCode::IoFailure,
+                    "тестовый сбой после canonical commit",
+                ));
+            }
             remove_record_from_area(&self.runtime_handle, &mut runtime_manifest, &candidate)?;
+            clear_transition(&self.root_handle)?;
         }
         let sha256 = staged.sha256.clone();
         let byte_length = staged.byte_length;
@@ -730,6 +779,19 @@ impl AssetStore {
             validation: None,
             domain_metadata: request.domain_metadata,
         };
+        let previous_canonical = manifest
+            .assets
+            .iter()
+            .find(|asset| asset.identity == record.identity)
+            .cloned();
+        if previous_canonical.is_some() {
+            begin_transition(
+                &self.root_handle,
+                &record.identity,
+                TransitionTarget::Runtime,
+                &record.sha256,
+            )?;
+        }
         commit_asset_record(
             &self.runtime_handle,
             &staged,
@@ -752,13 +814,9 @@ impl AssetStore {
                 }
             },
         )?;
-        if let Some(canonical) = manifest
-            .assets
-            .iter()
-            .find(|asset| asset.identity == record.identity)
-            .cloned()
-        {
+        if let Some(canonical) = previous_canonical {
             remove_record_from_area(&self.root_handle, &mut manifest, &canonical)?;
+            clear_transition(&self.root_handle)?;
         }
         validate_verified_manifest(&self.root_handle, &manifest)?;
         validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
@@ -895,6 +953,12 @@ impl AssetStore {
                     (LifecycleState::Verified, LifecycleState::Quarantined) => {
                         let source = checked_asset_file(&self.root_handle, &old_record)?;
                         let staged = stage_source(&self.runtime_handle, source)?;
+                        begin_transition(
+                            &self.root_handle,
+                            &new_record.identity,
+                            TransitionTarget::Runtime,
+                            &new_record.sha256,
+                        )?;
                         let previous_runtime = runtime_manifest
                             .assets
                             .iter()
@@ -909,6 +973,7 @@ impl AssetStore {
                             |root, manifest| save_manifest(root, manifest, false),
                         )?;
                         remove_record_from_area(&self.root_handle, &mut manifest, &old_record)?;
+                        clear_transition(&self.root_handle)?;
                     }
                     (
                         LifecycleState::Pending | LifecycleState::Quarantined,
@@ -916,6 +981,12 @@ impl AssetStore {
                     ) => {
                         let source = checked_asset_file(&self.runtime_handle, &old_record)?;
                         let staged = stage_source(&self.root_handle, source)?;
+                        begin_transition(
+                            &self.root_handle,
+                            &new_record.identity,
+                            TransitionTarget::Canonical,
+                            &new_record.sha256,
+                        )?;
                         let previous = manifest
                             .assets
                             .iter()
@@ -943,11 +1014,19 @@ impl AssetStore {
                                 }
                             },
                         )?;
+                        #[cfg(test)]
+                        if FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.replace(false)) {
+                            return Err(AssetError::new(
+                                ErrorCode::IoFailure,
+                                "тестовый сбой после canonical commit",
+                            ));
+                        }
                         remove_record_from_area(
                             &self.runtime_handle,
                             &mut runtime_manifest,
                             &old_record,
                         )?;
+                        clear_transition(&self.root_handle)?;
                     }
                     (
                         LifecycleState::Pending | LifecycleState::Quarantined,
@@ -1645,6 +1724,7 @@ fn reconcile_runtime_boundary(
 ) -> Result<(), AssetError> {
     let mut canonical = canonical_manifest.clone();
     let mut local = runtime_manifest.clone();
+    let transition = load_transition(root)?;
 
     // Старые версии хранили все состояния жизненного цикла в публикуемом
     // манифесте. Сначала переносим байты в игнорируемую `.runtime`-область,
@@ -1691,7 +1771,54 @@ fn reconcile_runtime_boundary(
         .cloned()
         .collect();
     for previous in overlaps {
-        remove_record_from_area(root, &mut canonical, &previous)?;
+        if let Some(marker) = &transition
+            && marker.identity == previous.identity
+            && matches!(marker.target, TransitionTarget::Canonical)
+        {
+            let target = canonical
+                .assets
+                .iter()
+                .find(|asset| asset.identity == marker.identity);
+            if target.is_none_or(|asset| asset.sha256 != marker.sha256) {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "transition marker не совпадает с canonical asset",
+                ));
+            }
+            let previous_runtime = local
+                .assets
+                .iter()
+                .find(|asset| asset.identity == previous.identity)
+                .cloned()
+                .ok_or_else(|| {
+                    AssetError::new(
+                        ErrorCode::ManifestCorrupt,
+                        "runtime asset исчез при восстановлении перехода",
+                    )
+                })?;
+            remove_record_from_area(runtime, &mut local, &previous_runtime)?;
+        } else {
+            remove_record_from_area(root, &mut canonical, &previous)?;
+        }
+    }
+
+    if let Some(marker) = &transition {
+        let target = match marker.target {
+            TransitionTarget::Canonical => &canonical,
+            TransitionTarget::Runtime => &local,
+        };
+        if let Some(asset) = target
+            .assets
+            .iter()
+            .find(|asset| asset.identity == marker.identity)
+            && asset.sha256 != marker.sha256
+        {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "transition marker не совпадает с целевым asset",
+            ));
+        }
+        clear_transition(root)?;
     }
 
     cleanup_matching_orphans(root, &canonical, &local)?;
@@ -1795,6 +1922,31 @@ fn remove_record_from_area(
             ),
         ));
     }
+    let assets = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
+    let name = asset_name(&record.storage_path)?;
+    if !file_matches_hash(&assets, name, &record.sha256)? {
+        return Err(AssetError::new(
+            ErrorCode::IntegrityMismatch,
+            "байты удаляемой записи не совпадают с manifest",
+        ));
+    }
+    linkat(&assets, name, &temporary, REMOVAL_BACKUP, AtFlags::empty()).map_err(|error| {
+        AssetError::io(
+            "не удалось сохранить bytes перед удалением записи",
+            std::io::Error::from(error),
+        )
+    })?;
+    sync_directory(&temporary)?;
+    let marker = RemovalTransaction {
+        schema_version: 1,
+        record: record.clone(),
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    write_transaction_marker(&temporary, REMOVAL_MARKER, &bytes)?;
     manifest.assets.remove(index);
     manifest.revision = manifest.revision.checked_add(1).ok_or_else(|| {
         AssetError::new(
@@ -1803,15 +1955,21 @@ fn remove_record_from_area(
         )
     })?;
     save_manifest(root, manifest, false)?;
-    let assets = open_directory_at(root, ASSETS_DIR)
-        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
+    #[cfg(test)]
+    if FAIL_AFTER_REMOVAL_MANIFEST.with(|hook| hook.replace(false)) {
+        return Err(AssetError::new(
+            ErrorCode::IoFailure,
+            "тестовый сбой после записи manifest удаления",
+        ));
+    }
     remove_if_hash(
         &assets,
-        asset_name(&record.storage_path)?,
+        name,
         &record.sha256,
         "байты удаляемой записи жизненного цикла",
     )?;
-    sync_directory(&assets)
+    sync_directory(&assets)?;
+    recover_removal(root)
 }
 
 fn validate_validation_record(
@@ -2628,7 +2786,156 @@ fn recover_publications(root: &File) -> Result<(), AssetError> {
     for marker in markers {
         recover_publication(root, &marker)?;
     }
-    Ok(())
+    recover_removal(root)
+}
+
+fn write_transaction_marker(directory: &File, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
+    let (artifact, mut file) = create_temp_in_directory(directory, "transaction-state")?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| AssetError::io("не удалось сохранить transaction marker", error))?;
+    drop(file);
+    renameat(directory, &artifact.name, directory, name).map_err(|error| {
+        AssetError::io(
+            "не удалось опубликовать transaction marker",
+            std::io::Error::from(error),
+        )
+    })?;
+    sync_directory(directory)
+}
+
+fn begin_transition(
+    root: &File,
+    identity: &AssetIdentity,
+    target: TransitionTarget,
+    sha256: &str,
+) -> Result<(), AssetError> {
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
+    let marker = TransitionTransaction {
+        schema_version: 1,
+        identity: identity.clone(),
+        target,
+        sha256: sha256.to_owned(),
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    write_transaction_marker(&temporary, TRANSITION_MARKER, &bytes)
+}
+
+fn load_transition(root: &File) -> Result<Option<TransitionTransaction>, AssetError> {
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
+    let file = match open_regular_at(&temporary, TRANSITION_MARKER, ErrorCode::MissingAssetFile) {
+        Ok(file) => file,
+        Err(error) if error.code == ErrorCode::MissingAssetFile => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let marker: TransitionTransaction = serde_json::from_reader(file)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    if marker.schema_version != 1 || marker.identity.validate().is_err() {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "transition marker повреждён",
+        ));
+    }
+    validate_hash(&marker.sha256)?;
+    Ok(Some(marker))
+}
+
+fn clear_transition(root: &File) -> Result<(), AssetError> {
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
+    unlink_if_exists(&temporary, &OsString::from(TRANSITION_MARKER))?;
+    sync_directory(&temporary)
+}
+
+fn recover_removal(root: &File) -> Result<(), AssetError> {
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
+    let marker_file = match open_regular_at(&temporary, REMOVAL_MARKER, ErrorCode::MissingAssetFile)
+    {
+        Ok(file) => file,
+        Err(error) if error.code == ErrorCode::MissingAssetFile => {
+            unlink_if_exists(&temporary, &OsString::from(REMOVAL_BACKUP))?;
+            return sync_directory(&temporary);
+        }
+        Err(error) => return Err(error),
+    };
+    let transaction: RemovalTransaction = serde_json::from_reader(marker_file)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    if transaction.schema_version != 1 || transaction.record.identity.validate().is_err() {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "removal marker повреждён",
+        ));
+    }
+    validate_hash(&transaction.record.sha256)?;
+    let expected_path = canonical_asset_path(
+        &transaction.record.identity,
+        &transaction.record.sha256,
+        transaction.record.format,
+    );
+    validate_relative_path(&transaction.record.storage_path, &expected_path)?;
+    let assets = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
+    let name = asset_name(&transaction.record.storage_path)?;
+    let manifest = load_manifest(root)?;
+    match manifest
+        .assets
+        .iter()
+        .find(|asset| asset.identity == transaction.record.identity)
+    {
+        Some(current)
+            if current.sha256 == transaction.record.sha256
+                && current.storage_path == transaction.record.storage_path =>
+        {
+            match open_regular_at(&assets, name, ErrorCode::MissingAssetFile) {
+                Ok(file) => {
+                    if hash_file(file)?.0 != current.sha256 {
+                        return Err(AssetError::new(
+                            ErrorCode::IntegrityMismatch,
+                            "байты удаляемого asset изменились во время восстановления",
+                        ));
+                    }
+                }
+                Err(error) if error.code == ErrorCode::MissingAssetFile => {
+                    if !file_matches_hash(&temporary, REMOVAL_BACKUP, &current.sha256)? {
+                        return Err(AssetError::new(
+                            ErrorCode::IntegrityMismatch,
+                            "backup удаляемого asset отсутствует",
+                        ));
+                    }
+                    renameat(&temporary, REMOVAL_BACKUP, &assets, name).map_err(|error| {
+                        AssetError::io(
+                            "не удалось восстановить удаляемый asset",
+                            std::io::Error::from(error),
+                        )
+                    })?;
+                    sync_directory(&assets)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        None => {
+            remove_if_hash(&assets, name, &transaction.record.sha256, "удаляемый asset")?;
+            sync_directory(&assets)?;
+        }
+        Some(_) => {
+            return Err(AssetError::new(
+                ErrorCode::IdentityConflict,
+                "identity изменилась при восстановлении удаления",
+            ));
+        }
+    }
+    remove_if_hash(
+        &temporary,
+        REMOVAL_BACKUP,
+        &transaction.record.sha256,
+        "removal backup",
+    )?;
+    unlink_if_exists(&temporary, &OsString::from(REMOVAL_MARKER))?;
+    sync_directory(&temporary)
 }
 
 fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetError> {
@@ -3325,21 +3632,111 @@ mod tests {
             previous_manifest,
             "failure before rename keeps the previous canonical bytes"
         );
-        assert_eq!(
-            fs::read_dir(root.join(TEMP_DIR))
-                .expect("temporary directory exists")
-                .count(),
-            0,
-            "failed temporary publication is cleaned up"
-        );
+        assert!(root.join(TEMP_DIR).join(TRANSITION_MARKER).exists());
 
         let reopened = AssetStore::open(StoreOptions::new(&root)).expect("store remains readable");
         let records = reopened
             .verify_integrity()
             .expect("canonical state remains valid");
+        assert!(!root.join(TEMP_DIR).join(TRANSITION_MARKER).exists());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].lifecycle, LifecycleState::Pending);
         assert!(records[0].validation.is_none());
+    }
+
+    #[test]
+    fn removal_recovers_after_manifest_commit_before_byte_deletion() {
+        let temp = TempDir::new();
+        let root = temp.0.join("store");
+        let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+        let record = store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: AssetIdentity::new("kanji", "日").unwrap(),
+                    bytes: b"GIF89a durable removal fixture".to_vec(),
+                    provenance: Provenance {
+                        source_kind: "fixture".into(),
+                        source_name: "fixture.gif".into(),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                &VerifiedValidator,
+            )
+            .unwrap()
+            .asset
+            .unwrap();
+        let lock = store.lock_exclusive().unwrap();
+        let mut manifest = load_manifest(&store.root_handle).unwrap();
+        FAIL_AFTER_REMOVAL_MANIFEST.with(|hook| hook.set(true));
+        assert_eq!(
+            remove_record_from_area(&store.root_handle, &mut manifest, &record)
+                .unwrap_err()
+                .code,
+            ErrorCode::IoFailure
+        );
+        assert!(root.join(&record.storage_path).exists());
+        assert!(root.join(TEMP_DIR).join(REMOVAL_MARKER).exists());
+        lock.unlock().unwrap();
+        drop(store);
+
+        let reopened = AssetStore::open_existing(StoreOptions::new(&root)).unwrap();
+        assert!(reopened.verify_integrity().unwrap().is_empty());
+        assert!(!root.join(&record.storage_path).exists());
+        assert!(!root.join(TEMP_DIR).join(REMOVAL_MARKER).exists());
+        assert!(!root.join(TEMP_DIR).join(REMOVAL_BACKUP).exists());
+    }
+
+    #[test]
+    fn canonical_transition_recovery_keeps_verified_result() {
+        for through_validation in [false, true] {
+            let temp = TempDir::new();
+            let root = temp.0.join("store");
+            let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+            let source = temp.0.join("candidate.gif");
+            let bytes = b"GIF89a pending to verified fixture";
+            fs::write(&source, bytes).unwrap();
+            let identity = AssetIdentity::new("kanji", "日").unwrap();
+            store
+                .ingest(IngestRequest {
+                    identity: identity.clone(),
+                    source_path: source,
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                })
+                .unwrap();
+            FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.set(true));
+            let error = if through_validation {
+                store
+                    .validate(SelectionMode::Full, &VerifiedValidator)
+                    .unwrap_err()
+            } else {
+                store
+                    .ingest_verified(
+                        VerifiedIngestRequest {
+                            identity,
+                            bytes: bytes.to_vec(),
+                            provenance: Provenance {
+                                source_kind: "fixture".into(),
+                                source_name: "candidate.gif".into(),
+                            },
+                            domain_metadata: None,
+                            replace_expected_sha256: None,
+                        },
+                        &VerifiedValidator,
+                    )
+                    .unwrap_err()
+            };
+            assert_eq!(error.code, ErrorCode::IoFailure);
+            assert!(root.join(TEMP_DIR).join(TRANSITION_MARKER).exists());
+            drop(store);
+
+            let reopened = AssetStore::open_existing(StoreOptions::new(&root)).unwrap();
+            let records = reopened.verify_integrity().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].lifecycle, LifecycleState::Verified);
+            assert!(!root.join(TEMP_DIR).join(TRANSITION_MARKER).exists());
+        }
     }
 
     #[test]
