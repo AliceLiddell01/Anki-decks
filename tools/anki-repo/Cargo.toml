@@ -6,6 +6,7 @@ version = "0.1.0"
 # Rust-участников репозитория, а CI читает их оттуда же.
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "CLI для детерминированного анализа CrowdAnki-экспортов репозитория Anki-decks и точечной правки значений их полей"
 publish = false
 
