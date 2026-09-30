@@ -1061,7 +1061,12 @@ pub fn create(result: &CreateResult) -> String {
         result.source_bytes, result.candidate_bytes, result.byte_delta
     ));
 
-    out.line(format!("План медиафайлов: {}", result.media.evidence()));
+    out.line(format!(
+        "План медиафайлов: ссылок={}, проверенных файлов={}, новых объявлений media_files={}",
+        result.media.references.len(),
+        result.media.assets_total(),
+        result.media.declarations_added.len()
+    ));
     out.blank();
     out.line(format!(
         "Затронутые колоды ({}):",

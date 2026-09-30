@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::{DomainError, ErrorCode};
+use crate::ops::create::MAX_REPORTED_NOTES;
 use crate::{media, write::ExportLock};
 
 pub const CONFIG_PATH: &str = ".anki-repo/create.yaml";
@@ -378,12 +379,7 @@ impl Routing {
         })?;
         let mut plan = MediaPlan::default();
         for asset in assets {
-            let filename = asset
-                .record
-                .storage_path
-                .strip_prefix("assets/")
-                .expect("store confinement")
-                .to_owned();
+            let filename = verified_asset_filename(&asset.record.storage_path)?.to_owned();
             let pin = Pin {
                 identity: asset.record.identity.clone(),
                 filename: filename.clone(),
@@ -460,14 +456,33 @@ impl MediaPlan {
     pub fn filenames(&self) -> Vec<String> {
         self.items.iter().map(|i| i.pin.filename.clone()).collect()
     }
+    /// Число уникальных проверенных файлов в плане.
+    pub fn assets_total(&self) -> usize {
+        self.items.len()
+    }
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
     pub fn evidence(&self) -> Value {
-        json!({"references": self.references, "assets": self.items.iter().map(|i| json!({"identity": i.pin.identity, "canonical_filename": i.pin.filename, "sha256": i.pin.sha256, "destination": format!("media/{}", i.pin.filename), "action": i.action})).collect::<Vec<_>>(), "media_files_added": self.declarations_added, "mutations_planned": self.items.iter().filter(|i| i.action == "copy").count(), "mutations_applied": self.mutations})
+        let references_total = self.references.len();
+        json!({
+            "references": self.references.iter().take(MAX_REPORTED_NOTES).collect::<Vec<_>>(),
+            "references_total": references_total,
+            "references_truncated": references_total > MAX_REPORTED_NOTES,
+            "assets": self.items.iter().map(|i| json!({"identity": i.pin.identity, "canonical_filename": i.pin.filename, "sha256": i.pin.sha256, "destination": format!("media/{}", i.pin.filename), "action": i.action})).collect::<Vec<_>>(),
+            "media_files_added": self.declarations_added,
+            "mutations_planned": self.items.iter().filter(|i| i.action == "copy").count(),
+            "mutations_applied": self.mutations
+        })
     }
     pub fn materialize(&mut self, guard: &ExportLock) -> Result<(), DomainError> {
-        let media = open_media(&guard.directory, true)?.expect("созданный каталог");
+        let media = open_media(&guard.directory, true)?.ok_or_else(|| {
+            blocker(
+                ErrorCode::WriteFailed,
+                "media_directory_changed",
+                json!({"operation": "create_media_directory"}),
+            )
+        })?;
         for item in &self.items {
             if exact_state(&media, &item.pin.filename, &item.asset.bytes)? == "reuse" {
                 continue;
@@ -476,7 +491,7 @@ impl MediaPlan {
             let temp = format!(".anki-repo-media-{}-{id}", std::process::id());
             let mut file = File::from(
                 openat(
-                    &media,
+                    &guard.directory,
                     temp.as_str(),
                     OFlags::WRONLY
                         | OFlags::CREATE
@@ -493,7 +508,7 @@ impl MediaPlan {
                     .map_err(io_failure)?;
                 checkpoint("before_link")?;
                 match linkat(
-                    &media,
+                    &guard.directory,
                     temp.as_str(),
                     &media,
                     item.pin.filename.as_str(),
@@ -510,9 +525,12 @@ impl MediaPlan {
                 require_present(&media, &item.pin.filename, &item.asset.bytes)?;
                 Ok(())
             })();
-            let cleanup = unlinkat(&media, temp.as_str(), AtFlags::empty()).map_err(io_failure);
+            let cleanup =
+                unlinkat(&guard.directory, temp.as_str(), AtFlags::empty()).map_err(io_failure);
+            let sync_export = guard.directory.sync_all().map_err(io_failure);
             result?;
             cleanup?;
+            sync_export?;
         }
         // Последняя проверка перед публикацией через те же дескрипторы,
         // открытые с `NOFOLLOW`.
@@ -535,6 +553,15 @@ impl MediaPlan {
     }
 }
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+fn verified_asset_filename(storage_path: &str) -> Result<&str, DomainError> {
+    storage_path
+        .strip_prefix("assets/")
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            crate::ops::source::internal("проверенное хранилище вернуло путь вне assets/")
+        })
+}
+
 fn io_failure(e: impl std::fmt::Display) -> DomainError {
     blocker(
         ErrorCode::WriteFailed,

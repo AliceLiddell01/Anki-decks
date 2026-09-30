@@ -1,7 +1,7 @@
 //! Только синтетические exports и изолированные stores. Stub validator задаёт
 //! lifecycle evidence fixture; production pixel algorithm тестируется владельцем.
 use super::*;
-use crate::ops::create::{create_with_options, parse_request_bytes};
+use crate::ops::create::{MAX_REPORTED_NOTES, create_with_options, parse_request_bytes};
 use crate::test_support::{MINIMAL_EXPORT, TempDir};
 use asset_store::{
     AssetRecord, Provenance, SemanticDecision, SemanticStatus, SemanticValidator, StoreOptions,
@@ -497,6 +497,96 @@ fn destination_conflict_and_symlinks_never_overwrite() {
         "destination_media_conflict",
     );
 }
+
+#[test]
+fn media_evidence_caps_references_and_reports_truncation() {
+    let identity = AssetIdentity::new("kanji", "一").unwrap();
+    let references = (0..=MAX_REPORTED_NOTES)
+        .map(|note_index| Reference {
+            note_index,
+            model_uuid: "model".into(),
+            field: "Expression".into(),
+            filename: "一.gif".into(),
+            identity: identity.clone(),
+        })
+        .collect();
+    let plan = MediaPlan {
+        references,
+        ..MediaPlan::default()
+    };
+
+    let evidence = plan.evidence();
+    assert_eq!(
+        evidence["references"].as_array().unwrap().len(),
+        MAX_REPORTED_NOTES
+    );
+    assert_eq!(evidence["references_total"], MAX_REPORTED_NOTES + 1);
+    assert!(evidence["references_truncated"].as_bool().unwrap());
+}
+
+#[test]
+fn invalid_verified_asset_path_is_reported_as_internal_error() {
+    let error = verified_asset_filename("outside/assets/file.gif").unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.details["reason"], "mutation_internal_invariant");
+}
+
+#[test]
+fn materialization_stages_verified_bytes_outside_media() {
+    let f = Fixture::new();
+    f.asset("一", GIF, None);
+    let export = f.export.clone();
+    TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |phase| {
+            if phase == "before_link" {
+                let staged_in_export = fs::read_dir(&export).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".anki-repo-media-")
+                });
+                let staged_in_media = fs::read_dir(export.join("media")).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".anki-repo-media-")
+                });
+                if !staged_in_export || staged_in_media {
+                    return Err(blocker(
+                        ErrorCode::Internal,
+                        "test_staging_boundary_failed",
+                        json!({}),
+                    ));
+                }
+            }
+            Ok(())
+        }));
+    });
+    let result = f.run(&["<img src=一.gif>"], true);
+    TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+    let result = result.unwrap();
+    assert_eq!(result.notes_created, 1);
+    let human = crate::render::human::create(&result);
+    assert!(human.contains(
+        "План медиафайлов: ссылок=1, проверенных файлов=1, новых объявлений media_files=1"
+    ));
+    assert!(!human.contains("\"references\""));
+
+    for directory in [f.export.clone(), f.export.join("media")] {
+        assert!(!fs::read_dir(directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".anki-repo-media-")
+        }));
+    }
+    assert_eq!(fs::read(f.export.join("media/一.gif")).unwrap(), GIF);
+}
+
 #[test]
 fn concurrent_destination_appearance_same_bytes_reuses_different_bytes_conflicts() {
     for bytes in [GIF, b"foreign".as_slice()] {
