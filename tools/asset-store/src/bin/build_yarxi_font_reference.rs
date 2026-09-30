@@ -5,13 +5,14 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use asset_store::hashing::sha256_hex;
-use asset_store::kanji_mask::{MASK_BYTES, Mask, normalize_binary_mask};
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use resvg::usvg::{self, fontdb};
+
+use asset_store::hashing::sha256_hex;
+use asset_store::kanji_mask::{MASK_BYTES, Mask, normalize_binary_mask};
 
 const KANJIVG_DB: &[u8] = include_bytes!("../data/kanjivg-r20250816.maskdb.zlib");
 const PINNED_FONT_SHA256: &str = "e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8";
@@ -32,8 +33,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     if fontdb.faces().next().is_none() {
         return Err("в исходном шрифте не найдено пригодное начертание".into());
     }
-    let mut options = usvg::Options::default();
-    options.fontdb = Arc::new(fontdb);
+    let options = usvg::Options {
+        fontdb: Arc::new(fontdb),
+        ..Default::default()
+    };
 
     let mut templates = BTreeMap::<u32, Mask>::new();
     for codepoint in characters {
