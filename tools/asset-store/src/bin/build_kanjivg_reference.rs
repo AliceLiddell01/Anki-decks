@@ -4,12 +4,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
-use image::{ImageBuffer, Rgba, RgbaImage};
 use asset_store::hashing::sha256_hex;
 use asset_store::kanji_domain::is_supported_han;
 use asset_store::kanji_mask::{MASK_BYTES, Mask, normalize_binary_mask};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use image::{ImageBuffer, Rgba, RgbaImage};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let (input_dir, output) = arguments()?;
