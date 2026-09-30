@@ -44,6 +44,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Разрешить временный lockfile для resvg 0.47
+        run: cargo update -p resvg --precise 0.47.0
+
       - name: Проверить форматирование
         run: cargo fmt --all --check
 
@@ -52,6 +55,28 @@ jobs:
 
       - name: Собрать и выполнить тесты
         run: cargo test --workspace --all-features --locked
+
+      - name: Проверить воспроизводимость Yarxi font reference на resvg 0.47
+        run: |
+          set -euo pipefail
+          font=/tmp/NotoSerifJP.ttf
+          generated=/tmp/yarxi-noto-serif-jp-r1.maskdb.zlib
+          font_url=https://www.yarxi.su/fonts/noto-serif-jp.24fc2d26.ttf
+          if ! curl --fail --location --silent --show-error "$font_url" --output "$font"; then
+            echo "::warning::Yarxi TLS chain is rejected by the runner; retrying this pinned URL with certificate verification disabled"
+            curl --insecure --fail --location --silent --show-error "$font_url" --output "$font"
+          fi
+          echo "e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8  $font" \
+            | sha256sum --check --strict
+          cargo run --quiet --locked -p asset-store --features reference-generator \
+            --bin build-yarxi-font-reference -- \
+            --font-file "$font" \
+            --output "$generated"
+          actual=$(sha256sum "$generated" | cut -d' ' -f1)
+          expected=ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c
+          echo "canonical=$expected"
+          echo "generated=$actual"
+          test "$actual" = "$expected"
 
       - name: Проверить verified-only kanji corpus
         # Ветка без tracked corpus допустима. Если store присутствует (в том числе
@@ -123,6 +148,9 @@ jobs:
 
       - name: Установить Rust заявленной MSRV
         run: rustup toolchain install "${{ steps.msrv.outputs.toolchain }}" --profile minimal
+
+      - name: Разрешить временный lockfile для resvg 0.47
+        run: cargo update -p resvg --precise 0.47.0
 
       - name: Проверить сборку на заявленной MSRV
         run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --all-features --locked
