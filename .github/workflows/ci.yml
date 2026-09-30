@@ -48,10 +48,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Проверить статику Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Собрать и выполнить тесты
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
 
       - name: Проверить verified-only kanji corpus
         # Ветка без tracked corpus допустима. Если store присутствует (в том числе
@@ -125,4 +125,4 @@ jobs:
         run: rustup toolchain install "${{ steps.msrv.outputs.toolchain }}" --profile minimal
 
       - name: Проверить сборку на заявленной MSRV
-        run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --locked
+        run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --all-features --locked
