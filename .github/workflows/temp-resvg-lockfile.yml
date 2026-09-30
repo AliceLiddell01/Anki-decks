@@ -1,0 +1,27 @@
+name: TEMP resvg 0.47 lockfile
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: Вывести Cargo.lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Установить стабильный Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Разрешить resvg 0.47 и вывести lockfile
+        run: |
+          set -euo pipefail
+          cargo update -p resvg --precise 0.47.0
+          echo '=== BEGIN RESVG 0.47 CARGO.LOCK ==='
+          cat Cargo.lock
+          echo '=== END RESVG 0.47 CARGO.LOCK ==='
