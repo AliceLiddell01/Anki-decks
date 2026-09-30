@@ -15,3 +15,4 @@ resolver = "3"
 # `cargo metadata`, а не хранит собственную копию.
 rust-version = "1.88"
 edition = "2024"
+license = "MIT"
