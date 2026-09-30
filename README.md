@@ -9,6 +9,7 @@
 ![CrowdAnki JSON](https://img.shields.io/badge/CrowdAnki-JSON-2f81f7)
 ![Platform Linux](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/AliceLiddell01/Anki-decks)
 
 Версионируемое хранилище Anki-колод и инфраструктура вокруг них: анализ, QA, точечное редактирование, создание заметок, визуальная проверка изменений и управляемые media-assets.
 
