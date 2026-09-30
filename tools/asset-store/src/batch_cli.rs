@@ -789,6 +789,9 @@ fn reconcile_owner_trust(
     state: &mut KanjiBatch,
     issues: &mut Vec<BatchIssue>,
 ) -> Result<(), AssetError> {
+    // Ошибка полной проверки не показывает, какая identity отсутствует;
+    // не сбрасываем доверие всех элементов по частичному/пустому снимку.
+    snapshot.checked()?;
     for item in state.items.clone() {
         let current = snapshot.current(&item.identity);
         let owner_rejection = current
@@ -813,19 +816,15 @@ fn reconcile_owner_trust(
         if !item.is_ready() && !rejected_auto_candidate {
             continue;
         }
-        if snapshot.error.is_none()
-            && current.is_some_and(|record| {
-                record.lifecycle == LifecycleState::Verified
-                    && record.is_trusted_for(&state.policy.validator)
-                    && item.published_sha256.as_deref() == Some(record.sha256.as_str())
-            })
-            && !rejected_auto_candidate
+        if current.is_some_and(|record| {
+            record.lifecycle == LifecycleState::Verified
+                && record.is_trusted_for(&state.policy.validator)
+                && item.published_sha256.as_deref() == Some(record.sha256.as_str())
+        }) && !rejected_auto_candidate
         {
             continue;
         }
-        let error = if let Some(error) = &snapshot.error {
-            copy_error(error)
-        } else if let Some(record) = current {
+        let error = if let Some(record) = current {
             if record.sha256 != item.published_sha256.as_deref().unwrap_or("") {
                 AssetError::new(
                     ErrorCode::IdentityConflict,

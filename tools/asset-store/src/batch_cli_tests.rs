@@ -1112,45 +1112,80 @@ fn owner_rejection_in_another_batch_invalidates_cached_status_review_and_run() {
 }
 
 #[test]
-fn owner_current_hash_change_and_missing_file_clear_saved_readiness() {
-    for missing in [false, true] {
-        let fixture = Fixture::new();
-        let hash = publish_reference(&fixture, "saved-ready");
-        if missing {
-            let record = fixture.store.verify_integrity().unwrap().remove(0);
-            fs::remove_file(fixture.store.root().join(record.storage_path)).unwrap();
-        } else {
-            fixture
-                .store
-                .ingest_verified(
-                    VerifiedIngestRequest {
-                        identity: identity('元'),
-                        bytes: distinct_reference_bytes(),
-                        provenance: Provenance {
-                            source_kind: "synthetic".into(),
-                            source_name: "changed.png".into(),
-                        },
-                        domain_metadata: None,
-                        replace_expected_sha256: Some(hash),
-                    },
-                    &KanjiImageValidator::new(),
-                )
-                .unwrap();
-        }
-        let (response, _) = execute_command(
-            &fixture.store,
-            fixture.summary(),
-            &BatchCommand::Status {
-                batch_id: "saved-ready".into(),
+fn owner_current_hash_change_clears_saved_readiness() {
+    let fixture = Fixture::new();
+    let hash = publish_reference(&fixture, "saved-ready");
+    fixture
+        .store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: identity('元'),
+                bytes: distinct_reference_bytes(),
+                provenance: Provenance {
+                    source_kind: "synthetic".into(),
+                    source_name: "changed.png".into(),
+                },
+                domain_metadata: None,
+                replace_expected_sha256: Some(hash),
             },
-            false,
+            &KanjiImageValidator::new(),
         )
         .unwrap();
-        assert_eq!(response.counts.effective_verified, 0);
-        assert_eq!(response.items[0].state, BatchItemStatus::Reacquire);
-        assert!(response.items[0].published_sha256.is_none());
-        assert!(!fixture.load("saved-ready").is_resolved());
-    }
+
+    let (response, _) = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Status {
+            batch_id: "saved-ready".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(response.counts.effective_verified, 0);
+    assert_eq!(response.items[0].state, BatchItemStatus::Reacquire);
+    assert!(response.items[0].published_sha256.is_none());
+    assert!(!fixture.load("saved-ready").is_resolved());
+}
+
+#[test]
+fn failed_owner_snapshot_preserves_all_cached_ready_items() {
+    let fixture = Fixture::new();
+    fixture.start("snapshot-error", &['元', '漢']);
+    let (before, _, issues) = run_batch(&fixture.store, "snapshot-error", 1, |characters| {
+        Ok(characters
+            .iter()
+            .map(|character| {
+                let value = character.chars().next().unwrap();
+                Ok(media(character, glyph(value)))
+            })
+            .collect())
+    })
+    .unwrap();
+    assert!(issues.is_empty());
+    assert!(before.items.iter().all(|item| item.is_ready()));
+
+    let record = fixture
+        .store
+        .verify_integrity()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.identity == identity('元'))
+        .unwrap();
+    fs::remove_file(fixture.store.root().join(record.storage_path)).unwrap();
+
+    let error = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Status {
+            batch_id: "snapshot-error".into(),
+        },
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MissingAssetFile);
+    let after = fixture.load("snapshot-error");
+    assert_eq!(after.revision, before.revision);
+    assert!(after.items.iter().all(|item| item.is_ready()));
 }
 
 #[test]
