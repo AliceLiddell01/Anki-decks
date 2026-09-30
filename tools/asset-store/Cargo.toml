@@ -20,7 +20,7 @@ rustix = { version = "1.1", features = ["fs"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 url = "2"
-resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
+resvg = { version = "0.48.0", default-features = false, features = ["text"], optional = true }
 
 [features]
 reference-generator = ["dep:resvg"]
