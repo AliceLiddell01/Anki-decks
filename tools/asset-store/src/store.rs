@@ -16,6 +16,7 @@ use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AssetError, ErrorCode};
+use crate::hashing::{encode_lower_hex, sha256_hex};
 use crate::model::{
     AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, MANIFEST_SCHEMA_VERSION, Manifest,
     Provenance, SemanticDecision, SemanticStatus, ValidationRecord, ValidatorIdentity,
@@ -466,7 +467,7 @@ impl AssetStore {
             let format = DetectedFormat::from_signature(&bytes);
             if format != record.format
                 || bytes.len() as u64 != record.byte_length
-                || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+                || sha256_hex(&bytes) != record.sha256
             {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
@@ -2270,7 +2271,7 @@ fn canonical_asset_path(identity: &AssetIdentity, hash: &str, format: DetectedFo
         return format!("{ASSETS_DIR}/{character}.{}", extension_for_format(format));
     }
     let prefix = {
-        let key_hash = format!("{:x}", Sha256::digest(identity.key.as_bytes()));
+        let key_hash = sha256_hex(identity.key.as_bytes());
         format!("{}-{}", identity.namespace, &key_hash[..16])
     };
     format!(
@@ -2376,7 +2377,7 @@ fn stage_source(root: &File, mut input: File) -> Result<StagedObject, AssetError
         .flush()
         .and_then(|()| output.sync_all())
         .map_err(|error| AssetError::io("не удалось синхронизировать staging file", error))?;
-    let sha256 = format!("{:x}", digest.finalize());
+    let sha256 = encode_lower_hex(digest.finalize());
     Ok(StagedObject {
         artifact,
         sha256,
@@ -2395,7 +2396,7 @@ fn stage_bytes(root: &File, bytes: &[u8]) -> Result<StagedObject, AssetError> {
     let digest = Sha256::digest(bytes);
     Ok(StagedObject {
         artifact,
-        sha256: format!("{digest:x}"),
+        sha256: encode_lower_hex(digest),
         byte_length: bytes.len() as u64,
         format: DetectedFormat::from_signature(&bytes[..bytes.len().min(12)]),
     })
@@ -2624,7 +2625,7 @@ fn hash_file(mut file: File) -> Result<(String, u64, DetectedFormat), AssetError
         digest.update(&buffer[..count]);
     }
     Ok((
-        format!("{:x}", digest.finalize()),
+        encode_lower_hex(digest.finalize()),
         byte_length,
         DetectedFormat::from_signature(&signature),
     ))
@@ -3637,7 +3638,7 @@ fn new_store_id() -> String {
         .as_nanos();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let material = format!("{}:{now}:{counter}", std::process::id());
-    format!("{:x}", Sha256::digest(material.as_bytes()))
+    sha256_hex(material.as_bytes())
 }
 
 fn sync_directory(directory: &File) -> Result<(), AssetError> {

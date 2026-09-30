@@ -9,6 +9,7 @@ compile_error!("asset-store currently supports Linux only");
 
 pub mod cli;
 pub mod error;
+pub mod hashing;
 pub mod kanji_domain;
 pub mod kanji_mask;
 pub mod kanji_validator;

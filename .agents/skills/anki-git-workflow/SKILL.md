@@ -2,8 +2,8 @@
 name: anki-git-workflow
 description: >-
   Единый владелец Git/GitHub lifecycle текущего checkout: task branch, staging,
-  commit, push, exact remote-SHA verification, PR create/edit, Draft/Ready,
-  разрешённый merge, конфликты с base, cleanup. Применяй автоматически, когда
+  commit, push, exact remote-SHA verification, PR create/edit, структурированное
+  PR body, Draft/Ready, разрешённый merge, конфликты с base, cleanup. Применяй автоматически, когда
   обычная публикуемая задача доходит до Git/GitHub: локальный commit её не
   завершает — цепочка идёт до проверенного удалённого состояния и Draft PR.
   Сюда же «закоммить», «запушь», «создай PR», «слей PR». Не для объяснения Git
@@ -21,8 +21,8 @@ whenToUse: >-
 
 Skill — **единственный владелец** общей процедуры Git/GitHub для текущего
 checkout: рабочая ветка, index, commit, push, проверка удалённого состояния,
-создание и обновление PR, Draft/Ready, отдельно разрешённый merge и post-merge
-cleanup.
+создание и обновление PR, структурированное PR body, Draft/Ready, отдельно
+разрешённый merge и post-merge cleanup.
 
 Skill не владеет:
 
@@ -41,8 +41,8 @@ Skill не владеет:
 ```text
 anki-git-workflow
     └─ общая процедура Git/GitHub: branch / index / commit / push /
-       exact remote verification / PR create+edit / Draft+Ready /
-       разрешённый merge / conflicts / cleanup
+       exact remote verification / PR create+edit / structured PR body /
+       Draft+Ready / разрешённый merge / conflicts / cleanup
 
 anki-coderabbit-review
     └─ только CodeRabbit workflow: provider invocation / completion /
@@ -112,7 +112,7 @@ remote branch его не содержит
 → commit
 → push текущей task branch
 → проверка exact remote HEAD
-→ создание или актуализация Draft PR
+→ создание или актуализация Draft PR с body по `references/pr-body.md`
 → повторное чтение и проверка опубликованного PR
 → передача пользователю на review
 ```
@@ -171,9 +171,12 @@ skill.
 - [`references/publication.md`](references/publication.md) — branch, staging,
   commit, push, exact remote verification, протокол неизвестного результата
   сетевой операции и запрещённые операции публикации.
+- [`references/pr-body.md`](references/pr-body.md) — содержательная структура
+  PR body, обязательные и условные разделы, формат CodeRabbit disposition table
+  и правила накопительного обновления описания.
 - [`references/pr-lifecycle.md`](references/pr-lifecycle.md) — PR identity,
-  repository-local source файла body, структура body, create/edit и повторная
-  проверка опубликованного PR, Ready, merge, конфликты с base и cleanup.
+  repository-local source файла body, create/edit и повторная проверка
+  опубликованного PR, Ready, merge, конфликты с base и cleanup.
 
 Читай нужный reference перед выполнением соответствующего шага: `SKILL.md` задаёт
 контракт и границы, references владеют порядком действий.

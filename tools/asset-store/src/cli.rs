@@ -4,11 +4,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
-use sha2::{Digest, Sha256};
-
 use crate::error::{AssetError, ErrorCode};
+use crate::hashing::sha256_hex;
 use crate::kanji_domain::parse_kanji_character;
 use crate::kanji_validator::KanjiImageValidator;
 use crate::model::{
@@ -22,6 +19,8 @@ use crate::store::{
 };
 use crate::validation::SemanticValidator;
 use crate::yarxi::{AcquiredMedia, SelectionResult, acquire_many};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 
 /// Командная строка `kanji-assets`.
 #[derive(Debug, Parser)]
@@ -739,7 +738,7 @@ fn ensure_characters(
                             "media_format_mismatch",
                             &message,
                             old.map(|asset| asset.lifecycle),
-                            Some(format!("{:x}", Sha256::digest(&media.bytes))),
+                            Some(sha256_hex(&media.bytes)),
                             Vec::new(),
                             Some(metadata),
                         ));
@@ -791,7 +790,7 @@ fn ensure_characters(
                         }
                         Err(error) => {
                             blockers.push(format!("{}:{character}", error.code.as_str()));
-                            let candidate_hash = format!("{:x}", Sha256::digest(&media.bytes));
+                            let candidate_hash = sha256_hex(&media.bytes);
                             summaries[target_index] = Some(failed_summary(
                                 character,
                                 error.code.as_str(),
@@ -1062,8 +1061,6 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use sha2::{Digest, Sha256};
-
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
@@ -1140,13 +1137,10 @@ mod tests {
 
         assert_eq!(
             outcome.asset.sha256,
-            format!("{:x}", Sha256::digest(candidate_bytes)),
+            sha256_hex(candidate_bytes),
             "the bytes belong to the descriptor checked before pathname replacement"
         );
-        assert_ne!(
-            outcome.asset.sha256,
-            format!("{:x}", Sha256::digest(protected_bytes))
-        );
+        assert_ne!(outcome.asset.sha256, sha256_hex(protected_bytes));
     }
 
     #[test]

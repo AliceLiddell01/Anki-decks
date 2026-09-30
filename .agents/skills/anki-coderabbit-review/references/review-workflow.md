@@ -2,17 +2,19 @@
 
 Этот файл владеет механикой CodeRabbit review cycle: разбор текущего checkout,
 discovery фактического provider interface, invocation, triage findings,
-verification, commit/push, rate-limit handling и отчёт.
+verification, commit/push, накопительное обновление PR body, rate-limit handling
+и отчёт.
 
 Контракт и границы (trigger, `target_iterations`, определение completed
 iteration, clean iteration, инварианты) задаёт `SKILL.md`. Здесь — только порядок
 действий.
 
-Общую процедуру публикации — staging, commit, push, exact remote verification —
-владеет repository skill `anki-git-workflow`
-(`references/publication.md`). Этот файл не дублирует её: он только требует от
-каждой completed iteration того состояния, которое ей нужно, и передаёт саму
-механику этому владельцу.
+Общую процедуру публикации — staging, commit, push, exact remote verification,
+PR create/edit и read-back — владеет repository skill `anki-git-workflow`.
+Содержательную структуру body и cumulative CodeRabbit table задаёт его
+`references/pr-body.md`. Этот файл не дублирует механику Git/GitHub: он только
+определяет CodeRabbit-specific данные, которые каждая completed iteration обязана
+опубликовать через этого владельца.
 
 ## 1. Установить candidate текущего checkout
 
@@ -520,6 +522,50 @@ CodeRabbit-specific требование к результату: к начал�
 force-push, rebase опубликованной истории без отдельной причины, создание другой
 branch, переключение на другой PR, изменение base PR, закрытие PR и публикацию
 несвязанных локальных изменений.
+
+
+### 4.8 Обновление PR body после iteration
+
+После подтверждённого push и exact remote verification **до перехода к следующей
+iteration** опубликуй disposition текущего CodeRabbit review в body текущего PR.
+
+Порядок:
+
+1. Установи единственный PR текущего repository/base/head. Если публикация этой
+   task branch ещё не создала PR, доведи обычный PR lifecycle через
+   `anki-git-workflow`; не создавай второй PR.
+2. Сначала установи source body по recovery-правилам
+   `anki-git-workflow/references/pr-lifecycle.md`: если локальный ignored-файл
+   отсутствует, прочитай **полный** body текущего PR и материализуй его как
+   локальный source; если локальный и remote body расходятся без доказанной
+   причины, явно примири их до mutation. Не реконструируй существующий PR по
+   памяти или prompt'у.
+3. Открой repository-local source body и раздел
+   `## CodeRabbit review и disposition`. Если CodeRabbit запускается впервые,
+   создай раздел и таблицу в формате
+   `anki-git-workflow/references/pr-body.md`.
+4. Для текущей iteration **добавь** строки в существующую cumulative table:
+   provider severity, путь, технический эффект, фактический disposition и
+   реальный результат. Свяжи строки с номером iteration и тем reviewed HEAD,
+   который действительно видел CodeRabbit.
+5. Для authoritative clean review с `0 findings` добавь одну clean summary-row
+   с опубликованным marker commit. Если findings были false positive/stale,
+   сохрани их отдельными строками с честным disposition вместо искусственного
+   `clean`.
+6. Сначала перечитай полный локальный body, затем опубликуй его через
+   `anki-git-workflow` и выполни обязательный read-back опубликованного PR.
+7. Убедись, что предыдущие строки таблицы сохранены, новые строки присутствуют
+   ровно один раз, а опубликованный body совпадает с локальным источником с
+   учётом допустимой нормализации переводов строк.
+
+Только после успешного read-back текущая iteration может увеличить
+`completed_iterations` и открыть следующую. Если результат PR edit неизвестен
+из-за network/provider failure, сначала перечитай удалённый PR и установи
+фактическое состояние; не повторяй mutation вслепую и не создавай duplicate
+rows.
+
+Обновление body не меняет reviewed HEAD и не превращает fix commit текущей
+iteration в CodeRabbit-reviewed: его сможет проверить только следующая iteration.
 
 ## 5. Rate limit handling
 
