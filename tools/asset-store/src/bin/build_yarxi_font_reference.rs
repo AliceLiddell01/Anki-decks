@@ -33,8 +33,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     if fontdb.faces().next().is_none() {
         return Err("в исходном шрифте не найдено пригодное начертание".into());
     }
-    let mut options = usvg::Options::default();
-    options.fontdb = Arc::new(fontdb);
+    let options = usvg::Options {
+        fontdb: Arc::new(fontdb),
+        ..Default::default()
+    };
 
     let mut templates = BTreeMap::<u32, Mask>::new();
     for codepoint in characters {
