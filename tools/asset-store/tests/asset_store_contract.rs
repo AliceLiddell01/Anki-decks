@@ -11,6 +11,10 @@ use asset_store::{
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+fn publishable_validator() -> ValidatorIdentity {
+    FixedValidator::new(SemanticStatus::Verified).identity()
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -413,7 +417,7 @@ fn pending_and_quarantined_kanji_assets_stay_outside_publishable_tree() {
     assert_eq!(record.lifecycle, LifecycleState::Pending);
     assert!(!root.join("assets/漢.gif").exists());
     assert!(root.join(".runtime/assets/漢.gif").exists());
-    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
 
     let report = store
         .validate(
@@ -427,7 +431,7 @@ fn pending_and_quarantined_kanji_assets_stay_outside_publishable_tree() {
     assert_eq!(records[0].lifecycle, LifecycleState::Quarantined);
     assert!(!root.join("assets/漢.gif").exists());
     assert!(root.join(".runtime/assets/漢.gif").exists());
-    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
 }
 
 #[test]
@@ -469,7 +473,7 @@ fn pending_replacement_removes_previous_bytes_from_publishable_tree() {
             .join(&replacement.asset.storage_path)
             .exists()
     );
-    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
 }
 
 #[test]
@@ -520,7 +524,7 @@ fn legacy_nonverified_manifest_is_moved_to_runtime_when_store_opens() {
             .join(&records[0].storage_path)
             .exists()
     );
-    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
 }
 
 #[test]
@@ -561,7 +565,7 @@ fn revalidation_downgrade_atomically_removes_asset_from_publishable_tree() {
     assert_eq!(records[0].lifecycle, LifecycleState::Quarantined);
     assert!(!root.join(&verified.storage_path).exists());
     assert!(root.join(".runtime").join(&verified.storage_path).exists());
-    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
 }
 
 #[test]
@@ -595,7 +599,7 @@ fn publishable_gate_rejects_nonverified_records_and_unregistered_bytes() {
     )
     .unwrap();
     assert_eq!(
-        AssetStore::verify_publishable_corpus(&root)
+        AssetStore::verify_publishable_corpus(&root, &publishable_validator())
             .unwrap_err()
             .code,
         ErrorCode::ManifestCorrupt
@@ -605,9 +609,15 @@ fn publishable_gate_rejects_nonverified_records_and_unregistered_bytes() {
     let orphan_root = orphaned.path().join("store");
     open_store(&orphan_root);
     fs::write(orphan_root.join("assets/unregistered.png"), b"orphan bytes").unwrap();
-    assert!(AssetStore::verify_publishable_corpus(&orphan_root).is_err());
+    assert!(AssetStore::verify_publishable_corpus(&orphan_root, &publishable_validator()).is_err());
 
-    assert!(AssetStore::verify_publishable_corpus(orphaned.path().join("absent")).is_ok());
+    assert!(
+        AssetStore::verify_publishable_corpus(
+            orphaned.path().join("absent"),
+            &publishable_validator()
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -634,7 +644,7 @@ fn publishable_gate_is_read_only_when_ignored_lock_file_is_absent() {
     fs::remove_file(root.join(".lock")).unwrap();
     fs::remove_dir_all(root.join(".tmp")).unwrap();
     fs::remove_dir_all(root.join(".runtime")).unwrap();
-    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
     assert!(!root.join(".lock").exists());
     assert!(!root.join(".tmp").exists());
     assert!(!root.join(".runtime").exists());
@@ -649,10 +659,42 @@ fn publishable_gate_accepts_empty_manifest_without_assets_directory() {
     fs::remove_dir_all(root.join(".tmp")).unwrap();
     fs::remove_dir_all(root.join(".runtime")).unwrap();
 
-    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
     assert!(!root.join("assets").exists());
     assert!(!root.join(".tmp").exists());
     assert!(!root.join(".runtime").exists());
+}
+
+#[test]
+fn publishable_gate_rejects_stale_validator_identity() {
+    let temp = TempDir::new("publishable-stale-validator");
+    let root = temp.path().join("store");
+    let store = open_store(&root);
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("kanji", "日").unwrap(),
+                bytes: b"GIF89a verified fixture".to_vec(),
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: "verified.gif".into(),
+                },
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            },
+            &FixedValidator::new(SemanticStatus::Verified),
+        )
+        .unwrap();
+
+    assert_eq!(
+        AssetStore::verify_publishable_corpus(
+            &root,
+            &ValidatorIdentity::new("synthetic", "2").unwrap(),
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::ManifestCorrupt
+    );
 }
 
 #[test]

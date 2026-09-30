@@ -360,7 +360,11 @@ impl AssetStore {
 
     /// Проверяет публикуемое в Git представление корпуса кандзи без создания,
     /// восстановления или изменения файлов. Отсутствующий корпус допустим.
-    pub fn verify_publishable_corpus(root: impl AsRef<Path>) -> Result<(), AssetError> {
+    pub fn verify_publishable_corpus(
+        root: impl AsRef<Path>,
+        expected_validator: &ValidatorIdentity,
+    ) -> Result<(), AssetError> {
+        validate_validator_identity(expected_validator)?;
         let requested_root = resolve_store_root(root.as_ref())?;
         let root_handle = match open_existing_store_root(&requested_root) {
             Ok(root) => root,
@@ -395,7 +399,7 @@ impl AssetStore {
                     "значение `store_id` в публикуемом манифесте не совпадает с маркером владельца",
                 ));
             }
-            validate_publishable_manifest(&root_handle, &manifest)?;
+            validate_publishable_manifest(&root_handle, &manifest, expected_validator)?;
             ensure_directory_empty(&root_handle, TEMP_DIR)?;
             if names.contains(RUNTIME_DIR) {
                 let runtime = open_directory_at(&root_handle, RUNTIME_DIR)
@@ -1599,9 +1603,26 @@ fn validate_runtime_manifest(
     Ok(())
 }
 
-fn validate_publishable_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
+fn validate_publishable_manifest(
+    root: &File,
+    manifest: &Manifest,
+    expected_validator: &ValidatorIdentity,
+) -> Result<(), AssetError> {
     validate_verified_manifest(root, manifest)?;
     for asset in &manifest.assets {
+        if asset
+            .validation
+            .as_ref()
+            .is_none_or(|validation| &validation.validator != expected_validator)
+        {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!(
+                    "asset {} проверен другой версией валидатора",
+                    asset.identity
+                ),
+            ));
+        }
         if asset.identity.namespace != "kanji" || kanji_character(&asset.identity).is_none() {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,

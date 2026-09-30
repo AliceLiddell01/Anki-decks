@@ -574,7 +574,8 @@ fn execute_with_store(
                 store.initialized_on_open(),
                 "planned",
             );
-            response.validator_available = Some(true);
+            response.validator_available =
+                Some(validator == KanjiImageValidator::validator_identity());
             Ok((response, 0))
         }
         Command::Ensure { characters } => {

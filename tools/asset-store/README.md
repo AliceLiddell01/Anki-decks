@@ -95,9 +95,10 @@ cargo run --quiet --locked -p asset-store --bin kanji-corpus-gate
 ```
 
 Gate возвращает ненулевой код, если в canonical manifest есть состояние кроме
-`VERIFIED`, если в canonical `assets/` обнаружены orphan или незарегистрированные
-bytes, либо если `.runtime/` не проходит структурную проверку или пересекается с
-публикуемой identity. Проверка ничего не меняет и не считает runtime bytes частью
+`VERIFIED` или решение другого валидатора, если в canonical `assets/` обнаружены
+orphan или незарегистрированные bytes, либо если `.runtime/` не проходит
+структурную проверку или пересекается с публикуемой identity. Проверка ничего не
+меняет и не считает runtime bytes частью
 canonical corpus.
 
 ## Получение с Yarxi
@@ -334,7 +335,10 @@ cargo run --locked --bin kanji-assets -- --output json ingest \
 запроса, когда Yarxi выдаёт указанную ошибку сертификата. `ensure` сохраняет
 только `VERIFIED`; повтор уже актуального verified hash не ходит в сеть.
 
-`plan` только показывает выборку `new`/`full` и ничего не меняет. `validate`
+`list`, `plan` и `validate` открывают store; открытие может создать runtime-файлы,
+восстановить незавершённую операцию или перенести legacy-записи через runtime
+boundary. Сама выборка `plan` не записывает данные. `changed: false` не означает,
+что открытие было только для чтения. `validate`
 запускает production validator: `new` выбирает отсутствующие/устаревшие решения,
 `full` перепроверяет весь manifest. Любой неуспешный semantic status попадает в
 quarantine; общий exit code ненулевой, если запрошенная цель не `VERIFIED`.
