@@ -308,11 +308,11 @@ pub enum Command {
         #[arg(long = "emit-resolved", value_name = "PATH")]
         emit_resolved: Option<PathBuf>,
 
-        /// Явная policy создания; по умолчанию .anki-repo/create.yaml контекста export.
+        /// Правила создания; по умолчанию .anki-repo/create.yaml из репозитория экспорта.
         #[arg(long)]
         create_config: Option<PathBuf>,
 
-        /// Canonical kanji store; по умолчанию .asset-store/kanji контекста export.
+        /// Проверенное хранилище изображений кандзи; по умолчанию .asset-store/kanji из репозитория экспорта.
         #[arg(long)]
         asset_store: Option<PathBuf>,
     },

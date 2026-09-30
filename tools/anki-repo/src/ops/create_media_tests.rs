@@ -102,6 +102,14 @@ impl Fixture {
             &self.options,
         )
     }
+    fn resolved_request(&self, fields: &[&str]) -> crate::ops::create::CreateRequest {
+        let result = self.run(fields, false).unwrap();
+        parse_request_bytes(
+            &serde_json::to_vec(&result.resolved_request).unwrap(),
+            "resolved",
+        )
+        .unwrap()
+    }
 }
 const GIF: &[u8] = b"GIF89a-synthetic-one";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-synthetic";
@@ -369,12 +377,96 @@ fn resolved_artifact_pins_hash_and_rejects_changed_corpus() {
     );
     assert_eq!(before, f.bytes());
     assert_eq!(fs::read(f.export.join("media/一.gif")).unwrap(), GIF);
+    fs::write(f.export.join("media/一.gif"), b"GIF89a-synthetic-two").unwrap();
+    reason(
+        &create_with_options(&f.export, &request, true, None, &f.options).unwrap_err(),
+        "stale_pinned_asset",
+    );
+    fs::write(f.export.join("media/一.gif"), GIF).unwrap();
     reason(
         &f.run(&["<img src=一.gif>"], true).unwrap_err(),
         "destination_media_conflict",
     );
     fs::remove_file(f.export.join("media/一.gif")).unwrap();
     f.run(&["<img src=一.gif>"], true).unwrap();
+}
+
+#[test]
+fn pinned_missing_asset_and_filename_drift_are_stale_before_destination_checks() {
+    let f = Fixture::new();
+    f.asset("一", GIF, None);
+    let request = f.resolved_request(&["<img src=一.gif>"]);
+    fs::create_dir(f.export.join("media")).unwrap();
+    fs::write(f.export.join("media/一.gif"), b"foreign destination").unwrap();
+    fs::remove_file(
+        f.options
+            .asset_store
+            .as_ref()
+            .unwrap()
+            .join("assets/一.gif"),
+    )
+    .unwrap();
+    reason(
+        &create_with_options(&f.export, &request, true, None, &f.options).unwrap_err(),
+        "stale_pinned_asset",
+    );
+
+    let f = Fixture::new();
+    let old = f.asset("一", GIF, None);
+    let request = f.resolved_request(&["<img src=一.gif>"]);
+    fs::create_dir(f.export.join("media")).unwrap();
+    fs::write(f.export.join("media/一.gif"), GIF).unwrap();
+    f.asset("一", PNG, Some(old));
+    reason(
+        &create_with_options(&f.export, &request, true, None, &f.options).unwrap_err(),
+        "stale_pinned_asset",
+    );
+}
+
+#[test]
+fn missing_store_is_stale_for_pinned_requests_but_missing_for_unpinned_requests() {
+    let f = Fixture::new();
+    f.asset("一", GIF, None);
+    let pinned = f.resolved_request(&["<img src=一.gif>"]);
+    fs::remove_dir_all(f.options.asset_store.as_ref().unwrap()).unwrap();
+
+    reason(
+        &create_with_options(&f.export, &pinned, false, None, &f.options).unwrap_err(),
+        "stale_pinned_asset",
+    );
+    reason(
+        &f.run(&["<img src=一.gif>"], false).unwrap_err(),
+        "kanji_asset_missing",
+    );
+}
+
+#[test]
+fn resolved_empty_pins_are_distinct_from_legacy_unpinned_requests() {
+    let f = Fixture::new();
+    f.asset("一", GIF, None);
+    let legacy = f.request(&["обычный текст"]);
+    assert_eq!(legacy.media_assets, None);
+
+    let mut resolved = f.resolved_request(&["обычный текст"]);
+    assert_eq!(resolved.media_assets, Some(Vec::new()));
+    let mut null_pins = f.run(&["обычный текст"], false).unwrap().resolved_request;
+    null_pins["media_assets"] = serde_json::Value::Null;
+    assert!(parse_request_bytes(&serde_json::to_vec(&null_pins).unwrap(), "null").is_err());
+    resolved.notes[0]
+        .fields
+        .insert("Заголовок".into(), "<img src=一.gif>".into());
+    reason(
+        &create_with_options(&f.export, &resolved, false, None, &f.options).unwrap_err(),
+        "stale_pinned_asset",
+    );
+    let no_store = MediaOptions {
+        config: f.options.config.clone(),
+        asset_store: None,
+    };
+    reason(
+        &create_with_options(&f.export, &resolved, false, None, &no_store).unwrap_err(),
+        "stale_pinned_asset",
+    );
 }
 #[test]
 fn destination_conflict_and_symlinks_never_overwrite() {

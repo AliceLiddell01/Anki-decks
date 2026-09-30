@@ -42,7 +42,7 @@ thread_local! {
     static FAIL_AFTER_CANONICAL_TRANSITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Проверенный snapshot: record и именно те bytes, чей hash проверен.
+/// Проверенная запись и те же байты, для которых сверена контрольная сумма.
 #[derive(Debug, Clone)]
 pub struct VerifiedAssetBytes {
     pub record: AssetRecord,
@@ -398,10 +398,12 @@ impl AssetStore {
         Ok(assets)
     }
 
-    /// Читает canonical VERIFIED snapshot без bootstrap, recovery и runtime.
-    /// Проверяются ровно возвращаемые bytes, а не путь до последующего чтения.
-    /// Shared directory lock согласован с ingest/validate; no-follow handles
-    /// удерживают confinement даже при внешней замене pathname.
+    /// Читает только проверенные записи канонического хранилища, не создавая
+    /// хранилище, не восстанавливая его и не обращаясь к `.runtime`.
+    /// Проверяются именно возвращаемые байты, а не путь для последующего чтения.
+    /// Общая блокировка каталога согласована с ingest/validate; дескрипторы,
+    /// открытые с `NOFOLLOW`, не дают выйти за границы хранилища даже при
+    /// внешней подмене пути.
     pub fn read_verified(
         root: impl AsRef<Path>,
         identities: &[AssetIdentity],
@@ -420,7 +422,7 @@ impl AssetStore {
         let requested = resolve_store_root(root)?;
         let directory = open_existing_store_root(&requested)?;
         flock(&directory, FlockOperation::LockShared)
-            .map_err(|e| AssetError::io("блокировка чтения corpus", e.into()))?;
+            .map_err(|e| AssetError::io("блокировка чтения набора изображений", e.into()))?;
         let owner = read_owner_marker(&directory)?;
         let manifest = load_manifest(&directory)?;
         if owner.store_id != manifest.store_id {
@@ -442,7 +444,7 @@ impl AssetStore {
                 .ok_or_else(|| {
                     AssetError::with_details(
                         ErrorCode::MissingAssetFile,
-                        "нет canonical VERIFIED asset",
+                        "в каноническом хранилище нет проверенного изображения",
                         serde_json::json!({"identity": identity}),
                     )
                 })?;
@@ -453,14 +455,14 @@ impl AssetStore {
             {
                 return Err(AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
-                    "asset проверен другой версией валидатора",
+                    "изображение проверено другой версией валидатора",
                 ));
             }
             before_read(record);
             let mut bytes = Vec::new();
             checked_asset_file(&directory, record)?
                 .read_to_end(&mut bytes)
-                .map_err(|e| AssetError::io("чтение verified bytes", e))?;
+                .map_err(|e| AssetError::io("чтение проверенных байтов", e))?;
             let format = DetectedFormat::from_signature(&bytes);
             if format != record.format
                 || bytes.len() as u64 != record.byte_length
@@ -468,7 +470,7 @@ impl AssetStore {
             {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
-                    "прочитанные bytes не совпадают с verified record",
+                    "прочитанные байты не совпадают с проверенной записью",
                 ));
             }
             result.push(VerifiedAssetBytes {
@@ -2247,7 +2249,20 @@ fn checked_asset_file(root: &File, record: &AssetRecord) -> Result<File, AssetEr
         .storage_path
         .strip_prefix("assets/")
         .ok_or_else(|| AssetError::new(ErrorCode::ManifestCorrupt, "storage_path вне assets/"))?;
-    open_regular_at(&assets, name, ErrorCode::MissingAssetFile)
+    open_regular_at(&assets, name, ErrorCode::MissingAssetFile).map_err(|error| {
+        if error.code == ErrorCode::MissingAssetFile {
+            AssetError::with_details(
+                error.code,
+                error.message,
+                serde_json::json!({
+                    "identity": record.identity,
+                    "storage_path": record.storage_path,
+                }),
+            )
+        } else {
+            error
+        }
+    })
 }
 
 fn canonical_asset_path(identity: &AssetIdentity, hash: &str, format: DetectedFormat) -> String {

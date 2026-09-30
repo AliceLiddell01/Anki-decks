@@ -9,10 +9,12 @@
 //!   выбирает модель только по структурным свидетельствам (совместимость схемы
 //!   с набором переданных полей и фактическое использование в целевой колоде) и
 //!   падает при неоднозначности. См. [`crate::ops::models`].
-//! - **Opt-in media.** Routing по UUID и точному полю принадлежит create_media;
-//!   разрешены только явно запрошенные canonical VERIFIED kanji img/src.
-//! - **Строгий proof.** Сначала доказываются добавленные notes, затем точные
-//!   additions media_files. Existing notes и unrelated JSON не меняются.
+//! - **Медиа только по явным правилам.** Выбор по UUID и точному полю выполняет
+//!   `create_media`; разрешены только явно указанные ссылки `img/src` на
+//!   канонические проверенные изображения кандзи.
+//! - **Строгая проверка.** Сначала подтверждаются добавленные заметки, затем
+//!   точные добавления в `media_files`. Уже существующие заметки и остальная
+//!   часть JSON не меняются.
 //! - **`guid` — идентичность.** Отсутствующий `guid` генерируется в формате Anki
 //!   (base91, см. [`crate::guid`]) и попадает в `--emit-resolved`, поэтому
 //!   повторный прогон разрешённого запроса идемпотентен: заметка с тем же
@@ -78,8 +80,10 @@ pub struct CreateSpec {
 pub struct CreateRequest {
     /// Заказываемые заметки в порядке запроса.
     pub notes: Vec<CreateSpec>,
-    /// Ожидаемые canonical identity/filename/hash выбранного corpus.
-    pub media_assets: Vec<Pin>,
+    /// Ожидаемые идентичности, имена файлов и SHA-256 закреплённых изображений.
+    /// `None` оставляет старый запрос без закрепления; `Some([])` закрепляет
+    /// пустой набор изображений.
+    pub media_assets: Option<Vec<Pin>>,
 }
 
 /// Итог работы с одной заказываемой заметкой.
@@ -136,9 +140,9 @@ pub struct CreateOutcome {
     pub field_names: Vec<String>,
     /// Теги заметки.
     pub tags: Vec<String>,
-    /// Сколько разрешённых media-ссылок найдено в новых значениях.
+    /// Сколько разрешённых ссылок на медиа найдено в новых значениях.
     pub media_references: usize,
-    /// Поля, для которых matched policy включает processor.
+    /// Поля, для которых выбранные правила включают обработчик.
     pub processor_fields: Vec<String>,
 }
 
@@ -164,15 +168,15 @@ pub struct CreateChecks {
     pub candidate_reparsed: bool,
     /// Разрешённая модель предъявила свидетельства о схеме полей.
     pub model_resolution_evidenced: bool,
-    /// Новые значения полей не содержат media-ссылок.
+    /// Ссылки на медиа либо отсутствуют, либо разрешены проверенными файлами.
     pub media_references_absent: bool,
     /// `guid` новых заметок не конфликтуют с существующими заметками.
     pub guids_resolved_without_conflict: bool,
     /// Структурные различия — ровно добавленные заметки.
     pub only_notes_appended: bool,
-    /// Разрешены ровно добавленные notes и ожидаемые additions media_files.
+    /// Разрешены ровно добавленные заметки и ожидаемые добавления в media_files.
     pub only_notes_and_media_files_appended: bool,
-    /// Каждая media reference разрешена в проверенные canonical bytes.
+    /// Каждая ссылка на медиа разрешена в проверенные канонические байты.
     pub media_assets_verified: bool,
     /// Значения добавленных заметок совпали с задуманными.
     pub appended_notes_verified: bool,
@@ -217,7 +221,8 @@ pub struct CreateResult {
     /// его можно записать в файл и применить повторно. В stdout он не попадает:
     /// выводом владеет [`crate::render`], а не операция.
     pub resolved_request: Value,
-    /// Media resolution и фактическая materialization отдельно от note status.
+    /// Разрешение ссылок на медиа и фактическое размещение файлов отдельно от
+    /// статуса заметки.
     pub media: MediaPlan,
 }
 
@@ -227,8 +232,15 @@ pub struct CreateResult {
 struct RequestFile {
     schema_version: u32,
     notes: Vec<WireNote>,
-    #[serde(default)]
-    media_assets: Vec<Pin>,
+    #[serde(default, deserialize_with = "deserialize_present_media_assets")]
+    media_assets: Option<Vec<Pin>>,
+}
+
+fn deserialize_present_media_assets<'de, D>(deserializer: D) -> Result<Option<Vec<Pin>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<Pin>::deserialize(deserializer).map(Some)
 }
 
 /// Одна заказываемая заметка на проводе.
@@ -486,7 +498,7 @@ fn validate_tag(tag: &str, note_index: usize) -> Result<(), DomainError> {
 ///
 /// # Errors
 ///
-/// Ошибки чтения исходника, разрешения колоды и модели, media-ссылок в новых
+/// Ошибки чтения исходника, выбора колоды и модели, ссылок на медиа в новых
 /// значениях, конфликта `guid`, проверки кандидата, записи файла и записи
 /// resolved-артефакта.
 pub fn create(
@@ -504,7 +516,7 @@ pub fn create(
     )
 }
 
-/// Создание с явным isolated policy/store override.
+/// Создание с явным переопределением правил и хранилища для отдельного экспорта.
 pub fn create_with_options(
     export_dir: &Path,
     request: &CreateRequest,
@@ -532,7 +544,8 @@ pub fn create_with_options(
         )?);
     }
 
-    let mut media_plan = routing.resolve(export_dir, references, &request.media_assets)?;
+    let mut media_plan =
+        routing.resolve(export_dir, references, request.media_assets.as_deref())?;
 
     let mut duplicate_guids: BTreeMap<&str, usize> = BTreeMap::new();
     for note in &planned {
@@ -628,10 +641,8 @@ pub fn create_with_options(
     let notes_already_applied = outcomes.len() - notes_created;
 
     let mut resolved_request = resolved_document(&planned);
-    if !media_plan.is_empty() {
-        resolved_request["media_assets"] =
-            serde_json::to_value(media_plan.pins()).map_err(|e| internal(e.to_string()))?;
-    }
+    resolved_request["media_assets"] =
+        serde_json::to_value(media_plan.pins()).map_err(|e| internal(e.to_string()))?;
     let mut notes_value = source.value.clone();
     for (range, bucket) in ranges.iter().zip(&buckets) {
         append_notes(&mut notes_value, &range.children, bucket)?;
@@ -766,7 +777,7 @@ fn add_media_declarations(
         .entry("media_files")
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .ok_or_else(|| internal("media_files не array"))?;
+        .ok_or_else(|| internal("media_files не является массивом"))?;
     array.extend(plan.declarations_added.iter().map(|n| json!(n)));
     Ok(())
 }
@@ -780,11 +791,11 @@ fn verify_media_additions(
     if !additions.is_empty() {
         let array = expected
             .as_object_mut()
-            .ok_or_else(|| internal("корень не object"))?
+            .ok_or_else(|| internal("корень не является объектом"))?
             .entry("media_files")
             .or_insert_with(|| json!([]))
             .as_array_mut()
-            .ok_or_else(|| internal("media_files не array"))?;
+            .ok_or_else(|| internal("media_files не является массивом"))?;
         array.extend(additions.iter().map(|n| json!(n)));
     }
     if &expected != after {
@@ -801,7 +812,8 @@ fn protect_resolved(
     let Some(path) = path else {
         return Ok(());
     };
-    // Проверка media здесь; policy и corpus защищает Routing.
+    // Здесь проверяется путь отчёта; правила и проверенные изображения защищает
+    // Routing.
     let absolute = paths::canonical_ish(path);
     let media_dir = paths::canonical_ish(&export.join("media"));
     if absolute.starts_with(&media_dir)

@@ -1049,7 +1049,7 @@ pub fn create(result: &CreateResult) -> String {
     out.line(format!("Экспорт: {}", result.export_dir.display()));
     out.line(format!("deck.json: {}", result.deck_json.display()));
     if result.media.mutations > 0 && !result.applied {
-        out.line("Режим: --apply, восстановлены physical media");
+        out.line("Режим: --apply, восстановлены медиафайлы");
     } else {
         out.line(mode_line(result.applied, result.dry_run));
     }
@@ -1061,7 +1061,7 @@ pub fn create(result: &CreateResult) -> String {
         result.source_bytes, result.candidate_bytes, result.byte_delta
     ));
 
-    out.line(format!("План media: {}", result.media.evidence()));
+    out.line(format!("План медиафайлов: {}", result.media.evidence()));
     out.blank();
     out.line(format!(
         "Затронутые колоды ({}):",
@@ -1103,7 +1103,7 @@ pub fn create(result: &CreateResult) -> String {
             outcome.model_uuid
         ));
         out.line(format!(
-            "      поля с processor: {}",
+            "      поля с обработчиком: {}",
             outcome.processor_fields.join(", ")
         ));
         out.line(format!(
@@ -1116,7 +1116,7 @@ pub fn create(result: &CreateResult) -> String {
             outcome.field_names.join(", ")
         ));
         out.line(format!(
-            "      теги: {}; media-ссылок в новых значениях: {}",
+            "      теги: {}; ссылок на медиа в новых значениях: {}",
             if outcome.tags.is_empty() {
                 "—".to_string()
             } else {

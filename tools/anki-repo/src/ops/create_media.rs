@@ -1,4 +1,4 @@
-//! Opt-in policy и локальный materialization plan для create.
+//! Правила явного разрешения и локальный план размещения медиафайлов для create.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -56,7 +56,7 @@ enum ProcessorType {
 pub fn blocker(code: ErrorCode, reason: &str, details: Value) -> DomainError {
     DomainError::with_details(
         code,
-        format!("создание media заблокировано: {reason}"),
+        format!("создание медиафайлов заблокировано: {reason}"),
         json!({"reason": reason, "evidence": details}),
     )
 }
@@ -75,7 +75,8 @@ impl Routing {
                 json!({"message": e.to_string()}),
             )
         })?;
-        // Контекст задаётся export, не cwd: isolated exports не наследуют live policy.
+        // Правила ищутся от каталога экспорта, а не от текущего каталога:
+        // отдельные экспорты не наследуют правила этого репозитория.
         let repository = absolute.ancestors().find(|p| p.join(".git").exists());
         let path = options
             .config
@@ -129,8 +130,8 @@ impl Routing {
         Ok(())
     }
     fn parse(bytes: &[u8]) -> Result<Policy, DomainError> {
-        // Value parser отвергает повтор keys во всём YAML mapping tree
-        // до преобразования в domain structs и BTreeMap.
+        // Разбор YAML в Value отвергает повторяющиеся ключи во всех отображениях
+        // до преобразования в структуры предметной области и BTreeMap.
         let tree: serde_yaml::Value = serde_yaml::from_slice(bytes).map_err(|e| {
             blocker(
                 ErrorCode::InvalidRequest,
@@ -229,8 +230,10 @@ impl Routing {
                 ));
             }
             let html = media::html_media_references(value);
-            // Все fail-closed references должны иметь отдельный допустимый img/src.
-            // CSS, sound, srcset и незакрытые конструкции claim не получают.
+            // Каждая ссылка, запрещённая по умолчанию, должна отдельно
+            // соответствовать допустимому img/src. CSS, ссылки вида
+            // `[sound:...]`, атрибут srcset и незакрытые конструкции не
+            // считаются разрешёнными.
             let mut claimed = Vec::new();
             for reference in html {
                 if reference.element != "img" || reference.attribute != "src" {
@@ -283,30 +286,40 @@ impl Routing {
         &self,
         export: &Path,
         refs: Vec<Reference>,
-        pins: &[Pin],
+        pins: Option<&[Pin]>,
     ) -> Result<MediaPlan, DomainError> {
-        if refs.is_empty() {
-            if !pins.is_empty() {
-                return Err(blocker(
-                    ErrorCode::InvalidRequest,
-                    "media_pins_mismatch",
-                    json!({}),
-                ));
-            }
-            return Ok(MediaPlan::default());
-        }
         let identities = refs
             .iter()
             .map(|r| r.identity.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let root = self.store.as_ref().ok_or_else(|| {
-            blocker(
+            .collect::<BTreeSet<_>>();
+        if let Some(pins) = pins {
+            let pinned_identities = pins
+                .iter()
+                .map(|pin| pin.identity.clone())
+                .collect::<BTreeSet<_>>();
+            if pinned_identities != identities {
+                return Err(blocker(
+                    ErrorCode::ExpectedMismatch,
+                    "stale_pinned_asset",
+                    json!({"expected_identities": pinned_identities, "requested_identities": identities}),
+                ));
+            }
+        }
+        if refs.is_empty() {
+            return Ok(MediaPlan::default());
+        }
+        let identities = identities.into_iter().collect::<Vec<_>>();
+        let root = self.store.as_ref().ok_or_else(|| match pins {
+            Some(pins) => blocker(
+                ErrorCode::ExpectedMismatch,
+                "stale_pinned_asset",
+                json!({"expected": pins, "identities": identities, "store_missing": true}),
+            ),
+            None => blocker(
                 ErrorCode::InvalidRequest,
                 "kanji_asset_missing",
                 json!({"identities": identities}),
-            )
+            ),
         })?;
         let store_path = crate::paths::canonical_ish(root);
         let export_path = crate::paths::canonical_ish(export);
@@ -323,9 +336,26 @@ impl Routing {
             &KanjiImageValidator::validator_identity(),
         )
         .map_err(|e| {
+            let missing_pinned_identity = e
+                .details
+                .get("identity")
+                .and_then(|identity| serde_json::from_value::<AssetIdentity>(identity.clone()).ok())
+                .is_some_and(|identity| {
+                    pins.is_some_and(|pins| pins.iter().any(|pin| pin.identity == identity))
+                });
+            if pins.is_some()
+                && (e.code == asset_store::ErrorCode::StoreMissing || missing_pinned_identity)
+            {
+                return blocker(
+                    ErrorCode::ExpectedMismatch,
+                    "stale_pinned_asset",
+                    json!({"expected": pins, "missing_identity": e.details.get("identity"), "asset_code": e.code.as_str(), "details": e.details, "message": e.message}),
+                );
+            }
             let reason = if e.code == asset_store::ErrorCode::StoreMissing
                 || (e.code == asset_store::ErrorCode::MissingAssetFile
-                    && e.details.get("identity").is_some())
+                    && e.details.get("identity").is_some()
+                    && e.details.get("storage_path").is_none())
             {
                 "kanji_asset_missing"
             } else {
@@ -345,15 +375,6 @@ impl Routing {
                 .strip_prefix("assets/")
                 .expect("store confinement")
                 .to_owned();
-            for r in refs.iter().filter(|r| r.identity == asset.record.identity) {
-                if r.filename != filename {
-                    return Err(blocker(
-                        ErrorCode::ExpectedMismatch,
-                        "canonical_filename_mismatch",
-                        json!({"requested": r.filename, "canonical_filename": filename}),
-                    ));
-                }
-            }
             let pin = Pin {
                 identity: asset.record.identity.clone(),
                 filename: filename.clone(),
@@ -365,15 +386,28 @@ impl Routing {
                 asset,
             });
         }
-        if !pins.is_empty() && pins != plan.pins() {
+        let actual_pins = plan.pins();
+        if pins.is_some_and(|pins| pins != actual_pins.as_slice()) {
             return Err(blocker(
                 ErrorCode::ExpectedMismatch,
                 "stale_pinned_asset",
-                json!({"expected": pins, "actual": plan.pins()}),
+                json!({"expected": pins, "actual": actual_pins}),
             ));
         }
-        // Pins проверяются раньше destination: stale corpus не маскируется
-        // конфликтом ранее материализованного файла.
+        for item in &plan.items {
+            for reference in refs.iter().filter(|r| r.identity == item.pin.identity) {
+                if reference.filename != item.pin.filename {
+                    return Err(blocker(
+                        ErrorCode::ExpectedMismatch,
+                        "canonical_filename_mismatch",
+                        json!({"requested": reference.filename, "canonical_filename": item.pin.filename}),
+                    ));
+                }
+            }
+        }
+        // Закреплённые значения проверяются раньше целевого файла: изменение
+        // набора изображений не маскируется конфликтом или повторным
+        // использованием уже размещённого файла.
         for item in &mut plan.items {
             item.action = destination(export, &item.pin.filename, &item.asset.bytes)?.into();
         }
@@ -471,7 +505,8 @@ impl MediaPlan {
             result?;
             cleanup?;
         }
-        // Последний pre-publication check по тем же no-follow handles.
+        // Последняя проверка перед публикацией через те же дескрипторы,
+        // открытые с `NOFOLLOW`.
         for item in &self.items {
             require_present(&media, &item.pin.filename, &item.asset.bytes)?;
         }
