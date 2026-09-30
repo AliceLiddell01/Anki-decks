@@ -534,21 +534,27 @@ iteration** опубликуй disposition текущего CodeRabbit review в
 1. Установи единственный PR текущего repository/base/head. Если публикация этой
    task branch ещё не создала PR, доведи обычный PR lifecycle через
    `anki-git-workflow`; не создавай второй PR.
-2. Открой repository-local source body и раздел
+2. Сначала установи source body по recovery-правилам
+   `anki-git-workflow/references/pr-lifecycle.md`: если локальный ignored-файл
+   отсутствует, прочитай **полный** body текущего PR и материализуй его как
+   локальный source; если локальный и remote body расходятся без доказанной
+   причины, явно примири их до mutation. Не реконструируй существующий PR по
+   памяти или prompt'у.
+3. Открой repository-local source body и раздел
    `## CodeRabbit review и disposition`. Если CodeRabbit запускается впервые,
    создай раздел и таблицу в формате
    `anki-git-workflow/references/pr-body.md`.
-3. Для текущей iteration **добавь** строки в существующую cumulative table:
+4. Для текущей iteration **добавь** строки в существующую cumulative table:
    provider severity, путь, технический эффект, фактический disposition и
    реальный результат. Свяжи строки с номером iteration и тем reviewed HEAD,
    который действительно видел CodeRabbit.
-4. Для authoritative clean review с `0 findings` добавь одну clean summary-row
+5. Для authoritative clean review с `0 findings` добавь одну clean summary-row
    с опубликованным marker commit. Если findings были false positive/stale,
    сохрани их отдельными строками с честным disposition вместо искусственного
    `clean`.
-5. Сначала перечитай полный локальный body, затем опубликуй его через
+6. Сначала перечитай полный локальный body, затем опубликуй его через
    `anki-git-workflow` и выполни обязательный read-back опубликованного PR.
-6. Убедись, что предыдущие строки таблицы сохранены, новые строки присутствуют
+7. Убедись, что предыдущие строки таблицы сохранены, новые строки присутствуют
    ровно один раз, а опубликованный body совпадает с локальным источником с
    учётом допустимой нормализации переводов строк.
 
