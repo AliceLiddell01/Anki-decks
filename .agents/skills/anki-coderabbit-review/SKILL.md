@@ -4,7 +4,8 @@ description: >-
   Явно запрошенный CodeRabbit review cycle текущего checkout: прогоняет
   установленный CodeRabbit CLI против committed HEAD, независимо проверяет
   каждый finding, исправляет подтверждённое, верифицирует и завершает каждую
-  iteration отдельным commit + push (default 3 completed iterations, если
+  iteration отдельным commit + push и накопительным обновлением CodeRabbit
+  disposition table в PR body (default 3 completed iterations, если
   пользователь не задал своё положительное число). Используй только при явном
   CodeRabbit intent: «сделай ревью CodeRabbit», «запусти CodeRabbit», «прогони
   кодрэббит», «сделай 3 итерации CodeRabbit», «повтори CodeRabbit ещё 2 раза»,
@@ -25,7 +26,8 @@ whenToUse: >-
 Skill владеет **только** процедурой CodeRabbit-review текущего checkout в этом
 репозитории: получение review от установленного CodeRabbit CLI, независимая
 проверка findings, исправление подтверждённого, верификация и завершение каждой
-iteration отдельным commit + push.
+iteration отдельным commit + push и обновление накопительной CodeRabbit
+таблицы в PR body.
 
 Skill не владеет:
 
@@ -42,7 +44,10 @@ Skill не владеет:
 
 Общую Git/GitHub процедуру этот skill не владеет и не дублирует: branch, index,
 commit, push, exact remote verification, PR create/edit, Draft/Ready, merge и
-cleanup принадлежат repository skill `anki-git-workflow`.
+cleanup принадлежат repository skill `anki-git-workflow`. Содержательная
+структура PR body и формат cumulative CodeRabbit table принадлежат
+`anki-git-workflow/references/pr-body.md`; этот skill поставляет туда только
+фактические review/disposition данные своей iteration.
 
 CodeRabbit cycle **требует** тот terminal state, который нужен конкретной
 iteration, и делегирует публикацию этому владельцу, сохраняя собственные
@@ -108,7 +113,10 @@ target_iterations = explicit_user_count ?? 3
 → отдельный commit
 → публикация текущей ветки через `anki-git-workflow` (push + exact remote
   verification)
-→ подтверждённый новый clean/synchronized HEAD
+→ обновление текущего PR: дополнение cumulative CodeRabbit disposition table
+  данными этой iteration через `anki-git-workflow`
+→ read-back опубликованного PR body
+→ подтверждённый новый clean/synchronized HEAD и актуальный PR body
 ```
 
 Следующая iteration начинается только после подтверждённой публикации предыдущей.
@@ -117,7 +125,8 @@ target_iterations = explicit_user_count ?? 3
 
 Счётчик completed iterations увеличивается только тогда, когда provider review
 фактически завершён **и** вся последовательность iteration дошла до
-верифицированного, запушенного HEAD.
+верифицированного, запушенного HEAD, а cumulative CodeRabbit table текущего PR
+обновлена и подтверждена повторным чтением.
 
 Не считается iteration: rate limit до завершения review; auth failure;
 network/provider failure; invalid или malformed provider result; запуск в
@@ -159,6 +168,9 @@ Clean iteration **не является early stop**: workflow заканчив�
   требует отдельного подтверждения. Это разрешение ограничено текущим cycle и
   текущей веткой; сама публикация выполняется по процедуре `anki-git-workflow` и
   подтверждается фактическим удалённым SHA, а не exit code push.
+- После каждой completed iteration текущий PR body дополняется новыми строками
+  cumulative CodeRabbit disposition table по
+  `anki-git-workflow/references/pr-body.md`; предыдущие iteration не стираются.
 - Skill **не** разрешает merge, force-push, rebase опубликованной истории без
   отдельной причины, создание другой ветки, переключение на другой PR, смену base
   PR, закрытие PR и публикацию несвязанных локальных изменений.
