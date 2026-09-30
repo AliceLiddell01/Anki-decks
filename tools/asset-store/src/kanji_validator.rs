@@ -441,32 +441,28 @@ fn composited_luma(pixel: [u8; 4]) -> f32 {
 fn estimate_background_luma(image: &image::RgbaImage) -> f32 {
     let (width, height) = image.dimensions();
     let mut samples = Vec::new();
-    for (x, y) in corner_patch_coordinates(width) {
-        for (corner_x, corner_y) in [
-            (x, y),
-            (width - 1 - x, y),
-            (x, height - 1 - y),
-            (width - 1 - x, height - 1 - y),
-        ] {
-            samples.push(composited_luma(image.get_pixel(corner_x, corner_y).0));
+    for x in corner_patch_offsets(width) {
+        for y in corner_patch_offsets(height) {
+            for (corner_x, corner_y) in [
+                (x, y),
+                (width - 1 - x, y),
+                (x, height - 1 - y),
+                (width - 1 - x, height - 1 - y),
+            ] {
+                samples.push(composited_luma(image.get_pixel(corner_x, corner_y).0));
+            }
         }
     }
     samples.sort_by(f32::total_cmp);
     samples[samples.len() / 2]
 }
 
-fn corner_patch_coordinates(length: u32) -> Vec<(u32, u32)> {
+fn corner_patch_offsets(length: u32) -> Vec<u32> {
     let inset = (length / 16).min(length.saturating_sub(1) / 2);
     let patch = (length / 24)
         .clamp(1, 5)
         .min(length.saturating_sub(2 * inset).max(1));
-    let mut coordinates = Vec::with_capacity((patch * patch) as usize);
-    for y in 0..patch {
-        for x in 0..patch {
-            coordinates.push((inset + x, inset + y));
-        }
-    }
-    coordinates
+    (0..patch).map(|offset| inset + offset).collect()
 }
 
 /// Удаляет связанные компоненты переднего плана, которые касаются края растра
@@ -997,6 +993,14 @@ mod tests {
             )))
             .is_err()
         );
+    }
+
+    #[test]
+    fn thin_rectangular_pngs_are_corrupt_without_panicking() {
+        for (width, height) in [(100, 5), (5, 100)] {
+            let image = ImageBuffer::from_pixel(width, height, image::Rgba([36, 39, 41, 255]));
+            assert!(decode_media(&png_for_image(image)).is_err());
+        }
     }
 
     #[test]

@@ -36,8 +36,10 @@ Read-only publishability gate подтверждает canonical corpus и пр�
 локальный runtime store, если он есть, структурно исправен и не пересекается с
 опубликованными identity. Runtime assets при этом не становятся публикуемыми.
 Отсутствующий `.asset-store/kanji` не считается ошибкой: репозиторий может пока
-не содержать corpus. При открытии legacy store старые `Pending` и `Quarantined`
-записи переносятся из корневого manifest в `.runtime/` под exclusive lock.
+не содержать corpus. При открытии legacy store с каноническим manifest
+`schema_version: 3` старые `Pending` и `Quarantined` записи переносятся из
+корневого manifest в `.runtime/` под exclusive lock. Store с `schema_version: 1`
+и каталогом `objects/` нужно создать заново: он не мигрируется.
 Если в `.runtime/` уже есть запись с той же identity, при восстановлении она
 сохраняется, а старая canonical запись и bytes удаляются.
 

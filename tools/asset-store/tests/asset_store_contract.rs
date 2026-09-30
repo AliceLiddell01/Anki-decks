@@ -632,8 +632,27 @@ fn publishable_gate_is_read_only_when_ignored_lock_file_is_absent() {
         .unwrap();
 
     fs::remove_file(root.join(".lock")).unwrap();
+    fs::remove_dir_all(root.join(".tmp")).unwrap();
+    fs::remove_dir_all(root.join(".runtime")).unwrap();
     assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
     assert!(!root.join(".lock").exists());
+    assert!(!root.join(".tmp").exists());
+    assert!(!root.join(".runtime").exists());
+}
+
+#[test]
+fn publishable_gate_accepts_empty_manifest_without_assets_directory() {
+    let temp = TempDir::new("publishable-empty-without-assets");
+    let root = temp.path().join("store");
+    open_store(&root);
+    fs::remove_dir_all(root.join("assets")).unwrap();
+    fs::remove_dir_all(root.join(".tmp")).unwrap();
+    fs::remove_dir_all(root.join(".runtime")).unwrap();
+
+    assert!(AssetStore::verify_publishable_corpus(&root).is_ok());
+    assert!(!root.join("assets").exists());
+    assert!(!root.join(".tmp").exists());
+    assert!(!root.join(".runtime").exists());
 }
 
 #[test]

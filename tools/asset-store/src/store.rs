@@ -1354,8 +1354,11 @@ fn open_lock_file(root: &File, create_if_missing: bool) -> Result<File, AssetErr
 }
 
 fn ensure_directory_empty(root: &File, name: &str) -> Result<(), AssetError> {
-    let directory =
-        open_directory_at(root, name).map_err(|error| directory_entry_error(name, error))?;
+    let directory = match open_directory_at(root, name) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(directory_entry_error(name, error)),
+    };
     let mut entries = fs::read_dir(fd_path(&directory))
         .map_err(|error| AssetError::io(format!("не удалось прочитать {name}"), error))?;
     if entries.next().is_some() {
@@ -1851,16 +1854,26 @@ fn validate_asset_directory_impl(
     registered_paths: &BTreeSet<String>,
     reject_orphans: bool,
 ) -> Result<(), AssetError> {
-    let assets = open_directory_at(root, ASSETS_DIR).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            AssetError::new(
+    let assets = match open_directory_at(root, ASSETS_DIR) {
+        Ok(assets) => assets,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && registered_paths.is_empty() =>
+        {
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 "каталог assets отсутствует в program-owned store",
-            )
-        } else {
-            AssetError::io("не удалось открыть canonical asset store", error)
+            ));
         }
-    })?;
+        Err(error) => {
+            return Err(AssetError::io(
+                "не удалось открыть canonical asset store",
+                error,
+            ));
+        }
+    };
     let mut observed_paths = BTreeSet::new();
     for entry in fs::read_dir(fd_path(&assets))
         .map_err(|error| AssetError::io("не удалось прочитать canonical asset store", error))?
