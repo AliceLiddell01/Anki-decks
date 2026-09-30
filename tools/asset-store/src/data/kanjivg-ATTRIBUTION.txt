@@ -1,0 +1,40 @@
+KanjiVG reference data attribution
+=================================
+
+The compressed Unicode-addressed mask catalog in this directory is derived
+from KanjiVG SVG stroke data.
+
+Project: https://github.com/KanjiVG/kanjivg
+Homepage: https://kanjivg.tagaini.net/
+Release: r20250816
+Pinned source commit: bd13ffbcc9d85cb86ae98bbbf001d9069220b901
+Source archive:
+  https://github.com/KanjiVG/kanjivg/releases/download/r20250816/kanjivg-20250816-main.zip
+Source archive SHA-256:
+  69a2944ec1183086fdee5ba9c1f48bc306b867480a95b2f337f3203bf50689a3
+
+KanjiVG is copyright Ulrich Apel and contributors and is released under the
+Creative Commons Attribution-ShareAlike 3.0 Unported license (CC BY-SA 3.0):
+https://creativecommons.org/licenses/by-sa/3.0/
+
+The generated catalog contains 6,430 CJK templates. Each source SVG was
+rasterized with the pinned `resvg` dependency, converted to a binary foreground
+mask, and normalized with the shared `normalize_binary_mask` routine. The
+routine crops foreground bounds, aspect-fits within 56x56, centers the mask in a
+64x64 canvas, then samples nearest-neighbor pixels from source-cell centers:
+`floor((2 * output_index + 1) * source_size / (2 * output_size))`. This is
+adapted data; the generated catalog is provided under CC BY-SA 3.0.
+
+Generated file: kanjivg-r20250816.maskdb.zlib
+Generated file SHA-256:
+  5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff
+
+To regenerate from the pinned release archive, extract its `kanji/` directory
+and run from the workspace root:
+
+  cargo run --locked -p asset-store --features reference-generator \
+    --bin build-kanjivg-reference -- \
+    --source-dir /path/to/kanjivg/kanji \
+    --output tools/asset-store/src/data/kanjivg-r20250816.maskdb.zlib
+
+The generated output hash must match the value above.
