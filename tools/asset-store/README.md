@@ -101,6 +101,25 @@ orphan или незарегистрированные bytes, либо если 
 меняет и не считает runtime bytes частью
 canonical corpus.
 
+## Verified read boundary для consumers
+
+`AssetStore::read_verified(root, identities, expected_validator)` — read-only
+snapshot canonical assets. Он не вызывает `open`/`open_existing`, не создаёт
+runtime/lock/staging, не мигрирует и не восстанавливает store. Missing store или
+identity — явный отказ. `.runtime` не читается и не является source bytes.
+
+API удерживает shared flock canonical directory, согласованный с mutating API,
+проверяет owner/store_id, manifest/lifecycle/status, decision hash и expected
+validator, confinement и integrity. Возвращаемый `VerifiedAssetBytes` содержит
+record и именно те bytes, чей SHA-256, size и format проверены после чтения через
+no-follow handle. Отдельного check-path → copy-path нет. Изменённые внешним writer
+bytes или symlink после manifest validation дают отказ. Consumer использует
+snapshot bytes и может pin identity/filename/hash для следующей операции.
+
+API не приобретает assets и не запускает validator заново: он проверяет уже
+сохранённое актуальное решение. Незавершённая store transaction должна быть
+восстановлена mutating owner API до успешного read-only consumption.
+
 ## Получение с Yarxi
 
 `ensure` открывает отдельную headless Chromium-сессию и работает с фактическим

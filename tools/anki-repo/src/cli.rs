@@ -307,6 +307,14 @@ pub enum Command {
         /// Записать разрешённый запрос в файл: его повторный прогон идемпотентен.
         #[arg(long = "emit-resolved", value_name = "PATH")]
         emit_resolved: Option<PathBuf>,
+
+        /// Явная policy создания; по умолчанию .anki-repo/create.yaml контекста export.
+        #[arg(long)]
+        create_config: Option<PathBuf>,
+
+        /// Canonical kanji store; по умолчанию .asset-store/kanji контекста export.
+        #[arg(long)]
+        asset_store: Option<PathBuf>,
     },
 
     /// Вывод заметок из обращения: тег вместо физического удаления.

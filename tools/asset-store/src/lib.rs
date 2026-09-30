@@ -25,7 +25,7 @@ pub use model::{
 };
 pub use selection::{SelectionMode, select_assets};
 pub use store::{
-    AssetStore, IngestOutcome, IngestRequest, StoreOptions, VerifiedIngestOutcome,
-    VerifiedIngestRequest,
+    AssetStore, IngestOutcome, IngestRequest, StoreOptions, VerifiedAssetBytes,
+    VerifiedIngestOutcome, VerifiedIngestRequest,
 };
 pub use validation::{SemanticValidator, ValidationReport, ValidatorFailure};

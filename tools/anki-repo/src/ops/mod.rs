@@ -5,6 +5,7 @@
 //! renderers — только два представления одного и того же результата.
 
 pub mod create;
+pub mod create_media;
 pub mod deck_select;
 pub mod edit;
 pub mod find;

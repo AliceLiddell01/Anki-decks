@@ -38,7 +38,8 @@ cargo run --quiet --bin anki-repo -- edit decks/japanese/words/Words__N3 \
   (`changed_lines`), а `git diff --numstat` подтверждает его независимо.
 - `create` и `retire` закрывают пункт 7 так же: обе пишут только канонический
   `deck.json`, переразбирают кандидата до записи, подтверждают, что изменилась
-  ровно ожидаемая поверхность (`only_notes_appended` / `only_tags_appended`), и
+  ровно ожидаемая поверхность (`only_notes_and_media_files_appended` /
+  `only_tags_appended`), и
   сравнивают коды `validation` до и после.
 
 `validate` возвращает exit code `0`, если в экспорте нет ни одного issue уровня
@@ -190,9 +191,13 @@ cargo run --quiet --bin anki-repo -- qa "$EXPORT"
 
 Что именно проверять по отчётам:
 
-- `create`: `notes_created`, `byte_delta`, `checks` (все семь обязаны быть `true`),
+- `create`: `notes_created`, `byte_delta`, `checks` (proof и verified checks
+  обязаны быть `true`; `media_references_absent` и `only_notes_appended` отражают
+  фактический media plan),
   `validation.before`/`after` — новых `ERROR` быть не должно; затем
-  `git diff --numstat` по `deck.json` и `git status` по `media/` (media не менялся).
+  `git diff --numstat` по `deck.json` и `git status` по `media/`. Для opt-in media
+  сверяй exact filenames/hashes и declarations из `media` результата; без
+  configured media `media/` и `media_files` не меняются.
 - `retire`: `notes_retired`, `checks` (все пять), `outcomes[].previous_tags` и
   `outcomes[].tags` — в тегах должен появиться ровно один новый тег, а `fields`
   заметки в diff'е меняться не должны.
@@ -220,10 +225,10 @@ cargo run --quiet --bin anki-repo -- visual-report \
   Перечитай схему через `models`; опечатка в имени поля выглядит именно так.
 - `ambiguous_model` (5) / `deck_identity_mismatch` (3) — догадка запрещена:
   назови модель или колоду идентичностью явно.
-- `media_forbidden` (3) — значение нового поля ссылается на файл. Наличие файла в
-  `media/` этого отказа не отменяет: `create` не создаёт и не копирует media, а
-  ссылка на файл живёт в модели карточки, поэтому новое поле приходит без неё.
-  Ссылку добавляет тот, кто правит модель, а не `create`.
+- `media_forbidden` (3) — поле/model не opt-in или reference не допускается
+  настроенным processor. Наличие файла в `media/` не заменяет policy и canonical
+  VERIFIED evidence. Media-aware маршрут и machine-readable blockers принадлежат
+  `tools/anki-repo/README.md`.
 - `guid_conflict` (6) — заметка с таким `guid` уже есть и отличается от запроса.
   Это задача `edit`, а не `create`.
 - `guid_collision` (6) — `guid` новой заметки не свободен: он повторён в самом

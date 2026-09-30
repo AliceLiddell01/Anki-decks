@@ -1,0 +1,8 @@
+# Policy создания: UUID — данные текущих экспортов, не контракт кода.
+schema_version: 1
+note_models:
+  - crowdanki_uuid: "7d34c201-426f-11f1-83de-701ab829193f"
+    fields:
+      Слово:
+        processors:
+          - type: kanji_assets

@@ -1244,6 +1244,7 @@ struct CreateDto<'a> {
     outcomes_truncated: bool,
     validation: ValidationDeltaDto,
     checks: CreateChecksDto,
+    media: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -1271,6 +1272,7 @@ struct CreateOutcomeDto<'a> {
     field_names: &'a [String],
     tags: &'a [String],
     media_references: usize,
+    processor_fields: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -1281,6 +1283,8 @@ struct CreateChecksDto {
     media_references_absent: bool,
     guids_resolved_without_conflict: bool,
     only_notes_appended: bool,
+    only_notes_and_media_files_appended: bool,
+    media_assets_verified: bool,
     appended_notes_verified: bool,
 }
 
@@ -1290,6 +1294,7 @@ impl<'a> From<&'a CreateResult> for CreateDto<'a> {
             export_dir: result.export_dir.display().to_string(),
             deck_json: result.deck_json.display().to_string(),
             dry_run: result.dry_run,
+            media: result.media.evidence(),
             applied: result.applied,
             source_bytes: result.source_bytes,
             candidate_bytes: result.candidate_bytes,
@@ -1326,6 +1331,7 @@ impl<'a> From<&'a CreateResult> for CreateDto<'a> {
                     field_names: &outcome.field_names,
                     tags: &outcome.tags,
                     media_references: outcome.media_references,
+                    processor_fields: &outcome.processor_fields,
                 })
                 .collect(),
             outcomes_truncated: result.outcomes_truncated,
@@ -1337,6 +1343,10 @@ impl<'a> From<&'a CreateResult> for CreateDto<'a> {
                 media_references_absent: result.checks.media_references_absent,
                 guids_resolved_without_conflict: result.checks.guids_resolved_without_conflict,
                 only_notes_appended: result.checks.only_notes_appended,
+                only_notes_and_media_files_appended: result
+                    .checks
+                    .only_notes_and_media_files_appended,
+                media_assets_verified: result.checks.media_assets_verified,
                 appended_notes_verified: result.checks.appended_notes_verified,
             },
         }

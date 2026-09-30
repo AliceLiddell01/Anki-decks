@@ -1,74 +1,8 @@
-//! Атомарная замена `deck.json` при точечной правке.
-//!
-//! Здесь нет доменной логики правки: модуль только безопасно публикует уже
-//! полностью проверенные байты кандидата. Гарантии:
-//!
-//! * читатель никогда не видит частично записанный `deck.json`;
-//! * исходный файл не теряется: при любом отказе до `rename` он остаётся на
-//!   месте, а временный файл удаляется;
-//! * права доступа сохраняются (`rename` переносит права временного файла,
-//!   поэтому права копируются заранее);
-//! * если файл изменился между чтением и публикацией, запись отклоняется
-//!   с [`ErrorCode::SourceChanged`].
-//!
-//! # Защита от lost update
-//!
-//! Одной проверки «прочитать — сравнить — переименовать» для последней гарантии
-//! недостаточно: между сравнением и `rename` остаётся окно, в которое другой
-//! процесс может опубликовать свой кандидат, после чего наш `rename` молча
-//! затрёт более новый результат. Отдельные `fs::read` и `fs::rename` не дают
-//! compare-and-swap семантики, и любое число повторных проверок лишь сужает окно.
-//!
-//! Поэтому сравнение и публикация выполняются под эксклюзивной advisory-
-//! блокировкой самого целевого файла (`SourceLock`): публикация становится
-//! критической секцией, а не парой независимых операций.
-//!
-//! Две гарантии различаются явно:
-//!
-//! 1. Два конкурентных `anki-repo edit --apply` одного экспорта сериализуются
-//!    блокировкой. Ожидающий writer дожидается своей очереди, после чего
-//!    проверяет байты под блокировкой: если исходное предусловие уже устарело,
-//!    он получает контролируемый [`ErrorCode::SourceChanged`] / exit 7, а не
-//!    затирает победивший результат. Молчаливая потеря update при обычной
-//!    конкурентной правке невозможна; единственная оговорка — блокировка
-//!    прежнего inode, описанная ниже.
-//! 2. Произвольный внешний writer, который не участвует в этом протоколе,
-//!    блокировку не соблюдает. Для него байтовое сравнение под блокировкой —
-//!    best-effort обнаружение: изменение, попавшее в файл до сравнения,
-//!    отклоняется, но изменение, случившееся между сравнением и `rename`,
-//!    остаётся в окне. Более сильная гарантия для некооперирующегося процесса
-//!    portable-средствами `std` недостижима.
-//!
-//! У гарантии 1 есть узкая оговорка, и внутри протокола anki-repo она не
-//! исчезает: блокировка берётся на дескриптор, открытый по пути, поэтому
-//! `rename` поверх целевого файла между `open` и `flock` оставляет блокировку на
-//! прежнем inode. Кооперирующийся `anki-repo` тоже может выполнить такой
-//! `rename`: он снимает блокировку прежнего inode своим `rename` (см.
-//! [`SourceLock`]), и второй процесс, успевший открыть прежний inode,
-//! блокирует уже отвязанный файл.
-//!
-//! Практическое следствие ограничено сравнением под блокировкой, но не нулевое:
-//! два процесса могут оказаться в критической секции по разным inode, и если
-//! оба увидят в файле ровно свой снимок, второй `rename` затрёт публикацию
-//! первого. Для кооперирующихся writers это требует, чтобы содержимое файла
-//! совпало со снимком отставшего процесса, то есть чтобы значение вернули
-//! именно к тому состоянию, из которого он строил кандидат: обычная
-//! конкурентная правка такого совпадения не даёт. Гарантией «без оговорок»
-//! пункт 1 поэтому не является, и повторные проверки окно только сужают:
-//! полностью его снимает лишь блокировка отдельного, не переименовываемого
-//! файла, а сам `deck.json` как стабильный объект блокировки не годится.
-//!
-//! Сама блокировка снимается ядром при завершении процесса или закрытии
-//! дескриптора, поэтому падение процесса не оставляет «залипший» лок.
-//!
-//! # MSRV и `unsafe`
-//!
-//! Crate публикует только безопасный API (`unsafe_code = "forbid"`), а
-//! `File::lock`/`try_lock` стабилизированы лишь в Rust 1.89 при MSRV 1.88.
-//! Поэтому блокировка берётся через `fs2` — тонкую обёртку над `flock(2)`,
-//! которая на Linux сводится к `libc`. Платформы без поддерживаемой
-//! blocking-блокировки отклоняют публикацию с [`ErrorCode::WriteFailed`] вместо
-//! того, чтобы выдавать её за защищённую.
+//! Атомарная публикация документов. Все mutations deck.json используют один
+//! стабильный export-directory lock. Media-aware create удерживает тот же lock
+//! от проверки исходника до materialization и публикации JSON.
+//! Внешние writers, не соблюдающие advisory lock, требуют собственного
+//! согласования: portable compare-and-swap filesystem API для них отсутствует.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -92,41 +26,63 @@ pub struct PublishedFile {
     pub temp_attempt: u32,
 }
 
-/// Эксклюзивная блокировка целевого файла на время проверки и публикации.
-///
-/// Дескриптор держится открытым до конца критической секции: снятие блокировки
-/// делает `Drop`, то есть закрытие дескриптора.
-struct SourceLock {
-    /// Открытый целевой файл, на котором удерживается блокировка.
-    _file: File,
+/// Стабильный lock domain всех mutations одного CrowdAnki export.
+/// Каталог не заменяется при публикации JSON; lock не создаёт файлов.
+pub struct ExportLock {
+    pub(crate) directory: File,
 }
 
-impl SourceLock {
-    /// Берёт эксклюзивную блокировку целевого файла.
-    ///
-    /// Вызов блокирующий: если блокировку уже держит другой `anki-repo`, текущий
-    /// процесс ждёт своей очереди, а не отказывается сразу. Это осознанный
-    /// выбор — ожидание превращает гонку в последовательные критические секции,
-    /// где проигравший обнаруживает устаревшее предусловие и получает
-    /// `source_changed`, а не произвольный отказ захвата лока.
-    ///
-    /// # Errors
-    ///
-    /// * [`ErrorCode::SourceChanged`], если файла уже нет: предусловие правки
-    ///   устарело;
-    /// * [`ErrorCode::WriteFailed`], если файл не открывается или блокировка
-    ///   недоступна.
-    fn acquire(path: &Path) -> Result<Self, DomainError> {
-        let file = File::open(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
+impl ExportLock {
+    pub fn acquire(path: &Path) -> Result<Self, DomainError> {
+        let directory = File::open(path).map_err(|e| write_error(path, "lock_export", &e))?;
+        if !directory
+            .metadata()
+            .map_err(|e| write_error(path, "lock_export", &e))?
+            .is_dir()
+        {
+            return Err(DomainError::new(
+                ErrorCode::WriteFailed,
+                "export lock требует каталог",
+            ));
+        }
+        lock_exclusive(path, &directory)?;
+        Ok(Self { directory })
+    }
+
+    pub fn check_source(&self, path: &Path, expected: &[u8]) -> Result<(), DomainError> {
+        use std::os::unix::fs::MetadataExt;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let current_dir =
+            fs::metadata(parent).map_err(|e| write_error(path, "verify_export", &e))?;
+        let locked_dir = self
+            .directory
+            .metadata()
+            .map_err(|e| write_error(path, "verify_export", &e))?;
+        if current_dir.dev() != locked_dir.dev() || current_dir.ino() != locked_dir.ino() {
+            return Err(source_changed(path, "export_directory_changed"));
+        }
+        let actual = fs::read(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
                 source_changed(path, "source_missing")
             } else {
-                write_error(path, "lock_source", &error)
+                write_error(path, "verify_source", &e)
             }
         })?;
+        if actual != expected {
+            return Err(source_changed(path, "source_modified"));
+        }
+        Ok(())
+    }
 
-        lock_exclusive(path, &file)?;
-        Ok(Self { _file: file })
+    /// Вызывается при уже удерживаемом export lock.
+    pub fn replace(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        candidate: &[u8],
+    ) -> Result<PublishedFile, DomainError> {
+        self.check_source(path, expected)?;
+        replace_locked(path, expected, candidate)
     }
 }
 
@@ -247,6 +203,23 @@ pub fn replace_atomically(
     candidate: &[u8],
 ) -> Result<PublishedFile, DomainError> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    if !directory.is_dir() {
+        return Err(write_error(
+            path,
+            "create_temp",
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "каталог отсутствует"),
+        ));
+    }
+    let guard = ExportLock::acquire(directory)?;
+    guard.replace(path, expected_source, candidate)
+}
+
+fn replace_locked(
+    path: &Path,
+    expected_source: &[u8],
+    candidate: &[u8],
+) -> Result<PublishedFile, DomainError> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let saved_permissions = fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions());
@@ -338,8 +311,7 @@ fn write_and_publish(
     // Закрываем дескриптор до rename: содержимое уже синхронизировано.
     drop(file);
 
-    // Критическая секция: проверка предусловия и публикация неразделимы.
-    let lock = SourceLock::acquire(path)?;
+    // Вызывающий удерживает ExportLock: проверка и rename в одной секции.
 
     let current = fs::read(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -357,7 +329,6 @@ fn write_and_publish(
 
     sync_directory(path);
 
-    drop(lock);
     Ok(())
 }
 
@@ -620,7 +591,7 @@ mod tests {
     /// Контрольный тест: та же последовательность без блокировки действительно
     /// теряет update.
     ///
-    /// Повторяет только сравнение и `rename`, без [`SourceLock`], и показывает, что
+    /// Повторяет только сравнение и `rename`, без [`ExportLock`], и показывает, что
     /// отдельные проверка и `rename` compare-and-swap семантики не дают: второй
     /// writer «успешно» публикуется поверх первого, а результат первого исчезает.
     /// Именно эту последовательность закрывает `write_and_publish`.
@@ -672,7 +643,7 @@ mod tests {
 
     /// Блокировка действительно сериализует публикацию.
     ///
-    /// Пока `deck.json` удерживается [`SourceLock`], публикация не может войти в
+    /// Пока каталог экспорта удерживается [`ExportLock`], публикация не может войти в
     /// критическую секцию: поток остаётся заблокированным на захвате и завершается
     /// только после освобождения. Именно это делает проверку исходника корректной:
     /// вне критической секции второй writer успел бы опубликоваться поверх первого.
@@ -692,7 +663,7 @@ mod tests {
         fs::write(&path, b"old").expect("исходный файл");
 
         // Владелец блокировки: критическая секция занята.
-        let holder_file = File::open(&path).expect("целевой файл");
+        let holder_file = File::open(dir.path()).expect("каталог экспорта");
         holder_file.lock_exclusive().expect("блокировка");
 
         // Публикация в отдельном потоке: она обязана ждать блокировку.

@@ -9,13 +9,10 @@
 //!   выбирает модель только по структурным свидетельствам (совместимость схемы
 //!   с набором переданных полей и фактическое использование в целевой колоде) и
 //!   падает при неоднозначности. См. [`crate::ops::models`].
-//! - **Media-free.** Значения новых полей не имеют права ссылаться на media:
-//!   ни `[sound:NAME]`, ни `src="NAME"`. Toolkit не создаёт и не копирует
-//!   бинарные файлы, поэтому такая ссылка сделала бы экспорт заведомо разъехавшимся.
-//! - **Только добавление.** Новые заметки дописываются в конец `notes` целевого
-//!   узла. Изменение структуры доказывается по путям JSON
-//!   ([`crate::ops::structural`]): разрешены ровно пути добавленных элементов, а
-//!   их значения сравниваются с задуманными точным равенством.
+//! - **Opt-in media.** Routing по UUID и точному полю принадлежит create_media;
+//!   разрешены только явно запрошенные canonical VERIFIED kanji img/src.
+//! - **Строгий proof.** Сначала доказываются добавленные notes, затем точные
+//!   additions media_files. Existing notes и unrelated JSON не меняются.
 //! - **`guid` — идентичность.** Отсутствующий `guid` генерируется в формате Anki
 //!   (base91, см. [`crate::guid`]) и попадает в `--emit-resolved`, поэтому
 //!   повторный прогон разрешённого запроса идемпотентен: заметка с тем же
@@ -32,8 +29,8 @@ use crate::error::{DomainError, ErrorCode};
 use crate::guid;
 use crate::index::ExportIndex;
 use crate::loader;
-use crate::media;
 use crate::model::FieldValue;
+use crate::ops::create_media::{self, MediaOptions, MediaPlan, Pin, Reference, Routing};
 use crate::ops::deck_select::DeckSelector;
 use crate::ops::models::{self, ModelMode, ModelSelector, ResolvedModel};
 use crate::ops::publish;
@@ -44,7 +41,6 @@ use crate::ops::source::{
 };
 use crate::ops::structural::{DEFAULT_PATH_LIMIT, changed_paths, deck_path_pointer};
 use crate::paths;
-use crate::text::bounded_sample;
 use crate::write;
 
 /// Жёсткий максимум числа заметок в одном запросе.
@@ -82,6 +78,8 @@ pub struct CreateSpec {
 pub struct CreateRequest {
     /// Заказываемые заметки в порядке запроса.
     pub notes: Vec<CreateSpec>,
+    /// Ожидаемые canonical identity/filename/hash выбранного corpus.
+    pub media_assets: Vec<Pin>,
 }
 
 /// Итог работы с одной заказываемой заметкой.
@@ -138,8 +136,10 @@ pub struct CreateOutcome {
     pub field_names: Vec<String>,
     /// Теги заметки.
     pub tags: Vec<String>,
-    /// Сколько media-ссылок найдено в новых значениях (всегда ноль при успехе).
+    /// Сколько разрешённых media-ссылок найдено в новых значениях.
     pub media_references: usize,
+    /// Поля, для которых matched policy включает processor.
+    pub processor_fields: Vec<String>,
 }
 
 /// Целевой узел, в который дописываются заметки.
@@ -170,6 +170,10 @@ pub struct CreateChecks {
     pub guids_resolved_without_conflict: bool,
     /// Структурные различия — ровно добавленные заметки.
     pub only_notes_appended: bool,
+    /// Разрешены ровно добавленные notes и ожидаемые additions media_files.
+    pub only_notes_and_media_files_appended: bool,
+    /// Каждая media reference разрешена в проверенные canonical bytes.
+    pub media_assets_verified: bool,
     /// Значения добавленных заметок совпали с задуманными.
     pub appended_notes_verified: bool,
 }
@@ -213,6 +217,8 @@ pub struct CreateResult {
     /// его можно записать в файл и применить повторно. В stdout он не попадает:
     /// выводом владеет [`crate::render`], а не операция.
     pub resolved_request: Value,
+    /// Media resolution и фактическая materialization отдельно от note status.
+    pub media: MediaPlan,
 }
 
 /// Форма документа запроса на проводе.
@@ -221,6 +227,8 @@ pub struct CreateResult {
 struct RequestFile {
     schema_version: u32,
     notes: Vec<WireNote>,
+    #[serde(default)]
+    media_assets: Vec<Pin>,
 }
 
 /// Одна заказываемая заметка на проводе.
@@ -294,6 +302,7 @@ pub fn parse_request_bytes(raw: &[u8], label: &str) -> Result<CreateRequest, Dom
     }
 
     let request = CreateRequest {
+        media_assets: file.media_assets,
         notes: file
             .notes
             .into_iter()
@@ -486,14 +495,44 @@ pub fn create(
     apply: bool,
     resolved_artifact: Option<&Path>,
 ) -> Result<CreateResult, DomainError> {
+    create_with_options(
+        export_dir,
+        request,
+        apply,
+        resolved_artifact,
+        &MediaOptions::default(),
+    )
+}
+
+/// Создание с явным isolated policy/store override.
+pub fn create_with_options(
+    export_dir: &Path,
+    request: &CreateRequest,
+    apply: bool,
+    resolved_artifact: Option<&Path>,
+    options: &MediaOptions,
+) -> Result<CreateResult, DomainError> {
+    validate_request(request)?;
     let source = load_editable_source(export_dir)?;
+    let routing = Routing::load(export_dir, options)?;
     let index = ExportIndex::build(&source.root);
     let child_paths = deck_child_paths(&source.value)?;
 
+    let mut references = Vec::new();
     let mut planned: Vec<PlannedNote> = Vec::new();
     for (note_index, spec) in request.notes.iter().enumerate() {
-        planned.push(plan_note(&index, &child_paths, note_index, spec, apply)?);
+        planned.push(plan_note(
+            &index,
+            &child_paths,
+            note_index,
+            spec,
+            apply,
+            &routing,
+            &mut references,
+        )?);
     }
+
+    let mut media_plan = routing.resolve(export_dir, references, &request.media_assets)?;
 
     let mut duplicate_guids: BTreeMap<&str, usize> = BTreeMap::new();
     for note in &planned {
@@ -588,38 +627,49 @@ pub fn create(
         .count();
     let notes_already_applied = outcomes.len() - notes_created;
 
-    let resolved_request = resolved_document(&planned);
-
-    let (candidate, applied, validation) = if notes_created == 0 {
-        (
-            None,
-            false,
-            validation_delta(&source.before, &source.before),
-        )
-    } else {
-        let mut candidate_value = source.value.clone();
-        for (range, bucket) in ranges.iter().zip(&buckets) {
-            append_notes(&mut candidate_value, &range.children, bucket)?;
-        }
-
-        verify_only_notes_appended(&source.value, &candidate_value, &ranges, &buckets)?;
-        let candidate = publish::prepare(&source, export_dir, candidate_value)?;
-
-        // Порядок здесь и есть исправление: resolved-артефакт публикуется до
-        // того, как изменится экспорт. Поэтому отказ его записи оставляет
-        // `deck.json` нетронутым, а состояние «apply прошёл, а разрешённый guid
-        // потерян» становится недостижимым: артефакт уже на диске к моменту
-        // первой мутации экспорта.
-        commit_resolved(resolved_artifact, &resolved_request, &source)?;
-
-        let publication = publish::publish(&source, &candidate, apply)?;
-        let validation = candidate.validation.clone();
-        (Some(candidate), publication.applied, validation)
-    };
-
-    if notes_created == 0 {
-        commit_resolved(resolved_artifact, &resolved_request, &source)?;
+    let mut resolved_request = resolved_document(&planned);
+    if !media_plan.is_empty() {
+        resolved_request["media_assets"] =
+            serde_json::to_value(media_plan.pins()).map_err(|e| internal(e.to_string()))?;
     }
+    let mut notes_value = source.value.clone();
+    for (range, bucket) in ranges.iter().zip(&buckets) {
+        append_notes(&mut notes_value, &range.children, bucket)?;
+    }
+    verify_only_notes_appended(&source.value, &notes_value, &ranges, &buckets)?;
+    let mut candidate_value = notes_value.clone();
+    add_media_declarations(&mut candidate_value, &index, &mut media_plan)?;
+    verify_media_additions(
+        &notes_value,
+        &candidate_value,
+        &media_plan.declarations_added,
+    )?;
+    let changed = candidate_value != source.value;
+    let candidate = if changed {
+        Some(publish::prepare(&source, export_dir, candidate_value)?)
+    } else {
+        None
+    };
+    protect_resolved(resolved_artifact, export_dir, &media_plan)?;
+    routing.protect_artifact(resolved_artifact)?;
+    commit_resolved(resolved_artifact, &resolved_request, &source)?;
+    if apply && (changed || !media_plan.is_empty()) {
+        create_media::checkpoint("before_export_lock")?;
+        let guard = write::ExportLock::acquire(export_dir)?;
+        guard.check_source(&source.deck_json, &source.source)?;
+        if !media_plan.is_empty() {
+            media_plan.materialize(&guard)?;
+        }
+        create_media::checkpoint("before_deck_publish")?;
+        if let Some(candidate) = &candidate {
+            guard.replace(&source.deck_json, &source.source, &candidate.bytes)?;
+        }
+    }
+    let applied = apply && changed;
+    let validation = candidate.as_ref().map_or_else(
+        || validation_delta(&source.before, &source.before),
+        |c| c.validation.clone(),
+    );
 
     let candidate_bytes = candidate
         .as_ref()
@@ -662,13 +712,111 @@ pub fn create(
             source_canonical: true,
             candidate_reparsed: true,
             model_resolution_evidenced: true,
-            media_references_absent: true,
+            media_references_absent: media_plan.is_empty(),
             guids_resolved_without_conflict: true,
-            only_notes_appended: true,
+            only_notes_appended: media_plan.declarations_added.is_empty(),
+            only_notes_and_media_files_appended: true,
+            media_assets_verified: true,
             appended_notes_verified: true,
         },
         resolved_request,
+        media: media_plan,
     })
+}
+
+fn add_media_declarations(
+    value: &mut Value,
+    index: &ExportIndex<'_>,
+    plan: &mut MediaPlan,
+) -> Result<(), DomainError> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let mut declared = BTreeSet::new();
+    let required: BTreeSet<_> = plan.filenames().into_iter().collect();
+    let mut counts = BTreeMap::new();
+    for node in &index.nodes {
+        for name in &node.node.media_files {
+            *counts.entry(name.clone()).or_insert(0usize) += 1;
+            declared.insert(name.clone());
+        }
+    }
+    if let Some(name) = required
+        .iter()
+        .find(|n| counts.get(*n).is_some_and(|c| *c > 1))
+    {
+        return Err(create_media::blocker(
+            ErrorCode::InvalidRequest,
+            "media_declaration_conflict",
+            json!({"filename": name}),
+        ));
+    }
+    plan.declarations_added = plan
+        .filenames()
+        .into_iter()
+        .filter(|n| !declared.contains(n))
+        .collect();
+    if plan.declarations_added.is_empty() {
+        return Ok(());
+    }
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| internal("корень не object"))?;
+    let array = map
+        .entry("media_files")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| internal("media_files не array"))?;
+    array.extend(plan.declarations_added.iter().map(|n| json!(n)));
+    Ok(())
+}
+
+fn verify_media_additions(
+    before: &Value,
+    after: &Value,
+    additions: &[String],
+) -> Result<(), DomainError> {
+    let mut expected = before.clone();
+    if !additions.is_empty() {
+        let array = expected
+            .as_object_mut()
+            .ok_or_else(|| internal("корень не object"))?
+            .entry("media_files")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| internal("media_files не array"))?;
+        array.extend(additions.iter().map(|n| json!(n)));
+    }
+    if &expected != after {
+        return Err(internal("неожиданное изменение вне добавлений media_files"));
+    }
+    Ok(())
+}
+
+fn protect_resolved(
+    path: Option<&Path>,
+    export: &Path,
+    plan: &MediaPlan,
+) -> Result<(), DomainError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    // Проверка media здесь; policy и corpus защищает Routing.
+    let absolute = paths::canonical_ish(path);
+    let media_dir = paths::canonical_ish(&export.join("media"));
+    if absolute.starts_with(&media_dir)
+        || plan
+            .filenames()
+            .iter()
+            .any(|n| paths::paths_alias(path, &export.join("media").join(n)))
+    {
+        return Err(create_media::blocker(
+            ErrorCode::InvalidRequest,
+            "emit_resolved_protected_path",
+            json!({}),
+        ));
+    }
+    Ok(())
 }
 
 /// Публикует разрешённый запрос по заказанному пути.
@@ -724,6 +872,8 @@ struct PlannedNote {
     values: Vec<(String, String)>,
     tags: Vec<String>,
     value: Value,
+    processor_fields: Vec<String>,
+    media_references: usize,
 }
 
 impl PlannedNote {
@@ -743,7 +893,8 @@ impl PlannedNote {
             fields_total: self.values.len(),
             field_names: self.field_names.clone(),
             tags: self.tags.clone(),
-            media_references: 0,
+            media_references: self.media_references,
+            processor_fields: self.processor_fields.clone(),
         }
     }
 }
@@ -755,6 +906,8 @@ fn plan_note(
     note_index: usize,
     spec: &CreateSpec,
     apply: bool,
+    routing: &Routing,
+    references: &mut Vec<Reference>,
 ) -> Result<PlannedNote, DomainError> {
     let deck = spec
         .deck
@@ -782,7 +935,11 @@ fn plan_note(
         .map_err(|error| with_note_index(note_index, error))?;
 
     let values = assemble_values(&model, &spec.fields, note_index)?;
-    ensure_media_free(&values, note_index)?;
+    let before_refs = references.len();
+    let processor_fields = routing
+        .collect(note_index, &model.crowdanki_uuid, &values, references)
+        .map_err(|e| with_note_index(note_index, e))?;
+    let media_references = references.len() - before_refs;
 
     let (guid, guid_generated) = match spec.guid.as_deref() {
         Some(guid) => (guid.to_string(), false),
@@ -813,6 +970,8 @@ fn plan_note(
         values,
         tags: spec.tags.clone(),
         value,
+        processor_fields,
+        media_references,
     })
 }
 
@@ -922,43 +1081,6 @@ fn assemble_values(
             )
         })
         .collect())
-}
-
-/// Запрещает media-ссылки в новых значениях полей.
-///
-/// Ссылкой считается адрес в разметке, адрес в CSS (`style`-атрибут и
-/// `<style>`, включая `@import`) и литерал `[sound:…]`: браузер пойдёт по любому
-/// из них за файлом, а гейт отвечает не за разметку, а за то, что значение поля
-/// ссылается на файл, которого toolkit не создаёт.
-fn ensure_media_free(values: &[(String, String)], note_index: usize) -> Result<(), DomainError> {
-    for (name, value) in values {
-        let references = media::forbidden_media_references(value);
-        if references.is_empty() {
-            continue;
-        }
-        let mut normalized: Vec<String> = references
-            .iter()
-            .map(|reference| media::normalize_media_name(reference))
-            .collect();
-        normalized.sort();
-        normalized.dedup();
-
-        return Err(DomainError::with_details(
-            ErrorCode::MediaForbidden,
-            format!(
-                "заметка #{note_index}: поле {name:?} ссылается на media ({}); \
-                 создание заметок не создаёт и не копирует файлы media",
-                normalized.join(", ")
-            ),
-            details! {
-                "note_index" => note_index,
-                "field" => name.clone(),
-                "references" => normalized,
-                "sample" => bounded_sample(value),
-            },
-        ));
-    }
-    Ok(())
 }
 
 /// Собирает JSON новой заметки.

@@ -42,6 +42,13 @@ thread_local! {
     static FAIL_AFTER_CANONICAL_TRANSITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Проверенный snapshot: record и именно те bytes, чей hash проверен.
+#[derive(Debug, Clone)]
+pub struct VerifiedAssetBytes {
+    pub record: AssetRecord,
+    pub bytes: Vec<u8>,
+}
+
 /// Параметры открытия store и защищённых от пересечения каталогов.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
@@ -389,6 +396,87 @@ impl AssetStore {
         assets.sort_by(|left, right| left.identity.cmp(&right.identity));
         lock.unlock()?;
         Ok(assets)
+    }
+
+    /// Читает canonical VERIFIED snapshot без bootstrap, recovery и runtime.
+    /// Проверяются ровно возвращаемые bytes, а не путь до последующего чтения.
+    /// Shared directory lock согласован с ingest/validate; no-follow handles
+    /// удерживают confinement даже при внешней замене pathname.
+    pub fn read_verified(
+        root: impl AsRef<Path>,
+        identities: &[AssetIdentity],
+        expected_validator: &ValidatorIdentity,
+    ) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
+        Self::read_verified_snapshot(root.as_ref(), identities, expected_validator, |_| {})
+    }
+
+    fn read_verified_snapshot(
+        root: &Path,
+        identities: &[AssetIdentity],
+        expected_validator: &ValidatorIdentity,
+        mut before_read: impl FnMut(&AssetRecord),
+    ) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
+        validate_validator_identity(expected_validator)?;
+        let requested = resolve_store_root(root)?;
+        let directory = open_existing_store_root(&requested)?;
+        flock(&directory, FlockOperation::LockShared)
+            .map_err(|e| AssetError::io("блокировка чтения corpus", e.into()))?;
+        let owner = read_owner_marker(&directory)?;
+        let manifest = load_manifest(&directory)?;
+        if owner.store_id != manifest.store_id {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "store_id отличается от owner",
+            ));
+        }
+        validate_verified_manifest(&directory, &manifest)?;
+        let mut result = Vec::new();
+        for identity in identities {
+            identity
+                .validate()
+                .map_err(|e| AssetError::new(ErrorCode::InvalidIdentity, e))?;
+            let record = manifest
+                .assets
+                .iter()
+                .find(|a| &a.identity == identity)
+                .ok_or_else(|| {
+                    AssetError::with_details(
+                        ErrorCode::MissingAssetFile,
+                        "нет canonical VERIFIED asset",
+                        serde_json::json!({"identity": identity}),
+                    )
+                })?;
+            if record
+                .validation
+                .as_ref()
+                .is_none_or(|v| &v.validator != expected_validator)
+            {
+                return Err(AssetError::new(
+                    ErrorCode::InvalidValidationEvidence,
+                    "asset проверен другой версией валидатора",
+                ));
+            }
+            before_read(record);
+            let mut bytes = Vec::new();
+            checked_asset_file(&directory, record)?
+                .read_to_end(&mut bytes)
+                .map_err(|e| AssetError::io("чтение verified bytes", e))?;
+            let format = DetectedFormat::from_signature(&bytes);
+            if format != record.format
+                || bytes.len() as u64 != record.byte_length
+                || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+            {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "прочитанные bytes не совпадают с verified record",
+                ));
+            }
+            result.push(VerifiedAssetBytes {
+                record: record.clone(),
+                bytes,
+            });
+        }
+        Ok(result)
     }
 
     /// Проверяет публикуемое в Git представление корпуса кандзи без создания,
@@ -3602,6 +3690,92 @@ mod tests {
                 }],
             ))
         }
+    }
+
+    #[test]
+    fn verified_snapshot_is_read_only_and_rechecks_the_returned_bytes() {
+        let temp = TempDir::new();
+        let root = temp.0.join("store");
+        let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+        let identity = AssetIdentity::new("kanji", "一").unwrap();
+        store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: identity.clone(),
+                    bytes: b"GIF89a-synthetic".to_vec(),
+                    provenance: Provenance {
+                        source_kind: "local_import".into(),
+                        source_name: "fixture".into(),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                &VerifiedValidator,
+            )
+            .unwrap();
+        drop(store);
+        fs::remove_dir_all(root.join(RUNTIME_DIR)).unwrap();
+        fs::remove_file(root.join(LOCK_FILE)).unwrap();
+        let before = fs::read(root.join(MANIFEST_FILE)).unwrap();
+        let read = AssetStore::read_verified(
+            &root,
+            std::slice::from_ref(&identity),
+            &VerifiedValidator.identity(),
+        )
+        .unwrap();
+        assert_eq!(read[0].bytes, b"GIF89a-synthetic");
+        assert_eq!(fs::read(root.join(MANIFEST_FILE)).unwrap(), before);
+        assert!(!root.join(RUNTIME_DIR).exists());
+        assert!(!root.join(LOCK_FILE).exists());
+        let error = AssetStore::read_verified_snapshot(
+            &root,
+            std::slice::from_ref(&identity),
+            &VerifiedValidator.identity(),
+            |record| {
+                let path = root.join(&record.storage_path);
+                fs::remove_file(&path).unwrap();
+                fs::write(&path, b"GIF89a-swapped").unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::IntegrityMismatch);
+    }
+
+    #[test]
+    fn verified_snapshot_rejects_symlink_replacement_after_validation() {
+        let temp = TempDir::new();
+        let root = temp.0.join("store");
+        let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+        let identity = AssetIdentity::new("kanji", "二").unwrap();
+        store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: identity.clone(),
+                    bytes: b"GIF89a-original".to_vec(),
+                    provenance: Provenance {
+                        source_kind: "local_import".into(),
+                        source_name: "fixture".into(),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                &VerifiedValidator,
+            )
+            .unwrap();
+        let outside = temp.0.join("outside.gif");
+        fs::write(&outside, b"GIF89a-original").unwrap();
+        let error = AssetStore::read_verified_snapshot(
+            &root,
+            &[identity],
+            &VerifiedValidator.identity(),
+            |record| {
+                let path = root.join(&record.storage_path);
+                fs::remove_file(&path).unwrap();
+                std::os::unix::fs::symlink(&outside, path).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BoundaryViolation);
     }
 
     #[test]

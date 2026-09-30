@@ -11,14 +11,14 @@ CrowdAnki-экспорта репозитория `Anki-decks` и строго �
 
 - `edit` меняет **значения** уже существующих полей уже существующих заметок;
 - `create` **добавляет** новые заметки в уже существующую колоду уже
-  существующей модели;
+  существующей модели и по opt-in policy материализует verified kanji media;
 - `retire` **дописывает тег** вывода из обращения к уже существующей заметке.
 
 Физического удаления в toolkit'е нет вовсе: заметка, которую пора убрать из
 работы, помечается тегом, а удаляет её человек в Anki. Ни одна команда не создаёт
 и не удаляет колоды, модели, поля и конфигурации, не перемещает сущности, не
-трогает `media/`, `guid`, `note_model_uuid`, `crowdanki_uuid` и
-`deck_config_uuid`, и по умолчанию вообще ничего не записывает: запись возможна
+меняет идентичности существующих сущностей (`guid`, `note_model_uuid`,
+`crowdanki_uuid`, `deck_config_uuid`), и по умолчанию ничего не записывает: запись возможна
 только по явному `--apply`.
 
 `qa`, `review` и `review-check` образуют конвейер внешней проверки содержимого
@@ -62,6 +62,7 @@ CrowdAnki-экспорта репозитория `Anki-decks` и строго �
 
 ## Требования
 
+- Linux: verified read boundary использует существующий Linux-only `asset-store`.
 - Rust toolchain с edition 2024. Минимальная поддерживаемая версия (MSRV)
   объявлена один раз — в `[workspace.package] rust-version` корневого
   `Cargo.toml`; участники workspace наследуют её (`edition.workspace = true`,
@@ -649,9 +650,9 @@ cat "$REQUEST" | anki-repo create "$EXPORT" --request -
 
 #### Что гарантируется
 
-- Новые значения полей обязаны быть свободны от ссылок на media — это
-  `media_forbidden` (exit 3). Toolkit не создаёт и не копирует файлы, а заметка,
-  ссылающаяся на несуществующий файл, ломает карточку тихо.
+- По умолчанию новые значения полей свободны от media (`media_forbidden`,
+  exit 3). Исключение — явно настроенный `kanji_assets` processor из policy,
+  описанной ниже; он допускает только verified kanji `img/src`.
 
   Ссылкой считается:
 
@@ -703,11 +704,109 @@ cat "$REQUEST" | anki-repo create "$EXPORT" --request -
 - Заметка добавляется **в конец** `notes` целевого узла, остальные заметки не
   сдвигаются и не переписываются.
 - Перед записью кандидат переразбирается и проверяется (`candidate_reparsed`,
-  `appended_notes_verified`, `only_notes_appended`, `guids_resolved_without_conflict`),
+  `appended_notes_verified`, `only_notes_and_media_files_appended`, `guids_resolved_without_conflict`),
   а `validation` сравнивает коды до и после: если кандидат приносит новую ошибку,
   записи не будет.
 - Требуется канонический `deck.json`; запись атомарна и защищена от конкурентной
   правки так же, как в `edit`.
+
+#### Opt-in policy и canonical media
+
+`create` ищет ближайший ancestor каталога экспорта с `.git` (каталог или
+worktree marker), затем читает `.anki-repo/create.yaml` в этом checkout.
+Текущий каталог процесса на routing не влияет. Если policy отсутствует,
+сохраняется прежнее media-free поведение. Явные `--create-config PATH` и
+`--asset-store PATH` позволяют работать с isolated policy и corpus; отсутствующий
+явно указанный config — ошибка. Default store — `.asset-store/kanji` того же
+checkout. Без media references store не открывается.
+
+```yaml
+schema_version: 1
+note_models:
+  - crowdanki_uuid: "identity-from-models"
+    fields:
+      ExactFieldName:
+        processors:
+          - type: kanji_assets
+```
+
+Identity модели — фактический `crowdanki_uuid`, поле — точное имя из `models`.
+Имена моделей не участвуют в выборе processor. Rule другого экспорта допустима;
+несуществующее поле rule выбранной модели — `config_stale_field`. Unsupported
+version, unknown keys/types, повтор keys/UUID/fields/processors и неоднозначная
+структура YAML отвергаются целиком. Policy хранит routing, а не inventory assets.
+Tracked policy описывает сегодняшние UUID word exports как данные репозитория.
+
+Значение поля задаётся самим запросом. Processor принимает только complete
+`img/src`, распознанный общим HTML parser: basename с одним поддерживаемым Han/CJK
+scalar и точным `.gif` или `.png`, например `<IMG SRC = '漢.gif'>`. URL, путь,
+query, fragment, sound, CSS, `srcset` и другие references остаются запрещёнными.
+Processor не генерирует HTML и не подменяет расширение: filename mismatch
+сообщает доступное canonical filename.
+
+`asset-store::AssetStore::read_verified` возвращает проверенные bytes и record.
+Для создания требуются canonical VERIFIED lifecycle/status, decision текущего
+`KanjiImageValidator`, hash/size/format и confined no-follow file handle.
+`.runtime` не используется. Resolution не приобретает assets и не ходит в сеть;
+missing asset — blocker для отдельного acquisition через `kanji-assets`.
+
+Dry-run выполняет весь preflight без записи JSON, media, policy и corpus.
+JSON `media` содержит `references` (note index, model UUID, field, filename, identity),
+`assets` (identity, `canonical_filename`, `sha256`, relative `destination`,
+`action: copy|reuse`), `media_files_added`, `mutations_planned` и
+`mutations_applied`. Destination conflict возвращается ошибкой с
+`action: conflict`. `outcomes[].processor_fields` сообщает matched поля даже
+у media-free запроса; `media_references` больше не обязан быть нулём.
+Human result показывает тот же media plan.
+
+Resolved v1 artifact дополнительно содержит `media_assets`: отсортированные
+identity/filename/SHA-256 pins без host paths. Его можно передать обратно в
+`--request`; изменённый corpus даёт `stale_pinned_asset`. Для нового resolution
+следует использовать исходный request без старых pins. Старые media-free v1
+requests продолжают приниматься. `--emit-resolved` публикуется до media mutations
+и не может перезаписать исходник, media, policy или corpus.
+
+Apply проверяет request, policy, assets, все exact destinations и candidate до
+первой mutation экспорта. Общий стабильный directory lock экспорта сериализует
+`edit`, `retire` и `create`; stale source отклоняется до materialization.
+Проверенные bytes записываются во временный файл и публикуются hard link без
+замены существующего destination. Concurrent appearance с теми же bytes — reuse,
+с другими bytes — conflict. Symlinks и non-regular destinations отвергаются.
+Инвентаризация всего пользовательского `media/` для resolution не проводится.
+
+Только после physical media публикуется `deck.json`. Имена добавляются в корневой
+`media_files`, если они ещё не объявлены ни одним узлом; прежние декларации и их
+порядок сохраняются. Proof сначала доказывает точные добавленные notes, затем
+точные additions в `media_files` через сравнение всего JSON.
+`only_notes_and_media_files_appended` и `media_assets_verified` подтверждают
+эти проверки; `only_notes_appended` истинно только без additions деклараций.
+`media_references_absent` сообщает фактическое отсутствие media.
+
+При partial failure JSON не публикуется; корректные уже скопированные orphan
+files остаются для безопасного reuse. Повтор одинаковой note ремонтирует missing
+physical media/declaration без duplicate note; `already_applied` относится к note,
+`media.mutations_applied` — к media repair. Полный повтор после convergence —
+no-op. Advisory lock гарантирует согласованность кооперирующихся writers;
+произвольный внешний writer должен соблюдать этот же протокол или быть остановлен.
+
+Новые причины доступны как `error.details.reason`, дополнительные данные —
+`error.details.evidence`; русское сообщение не является API:
+
+| reason | code / exit | Значение |
+|---|---|---|
+| `config_absent`, `processor_not_enabled` | `media_forbidden` / 3 | Поле не opt-in |
+| `config_invalid`, `config_unsupported`, `config_stale_field` | `invalid_request` / 3 | Policy невалидна/устарела |
+| `media_reference_unclaimed` | `media_forbidden` / 3 | Processor не допускает reference |
+| `kanji_asset_missing` | `invalid_request` / 3 | Нет canonical verified asset/store |
+| `asset_integrity_invalid` | `invalid_request` / 3 | Lifecycle/decision/hash/format/boundary отказ; `asset_code` уточняет причину |
+| `canonical_filename_mismatch`, `stale_pinned_asset` | `expected_mismatch` / 7 | Filename или pinned bytes изменились |
+| `destination_media_conflict` | `expected_mismatch` / 7 | Destination занят другими bytes/небезопасным файлом |
+| `media_pins_mismatch`, `asset_store_boundary`, `media_declaration_conflict`, `emit_resolved_protected_path` | `invalid_request` / 3 | Непригодные pins или пересечение путей |
+| `media_materialization_failed`, `media_disappeared`, `media_directory_changed` | `write_failed` / 8 | Отказ materialization/pre-publication check |
+| `source_modified`, `source_missing` | `source_changed` / 7 | Stale source под общим export lock |
+
+Отказы публикации JSON сохраняют прежние `write_failed` / exit 8 и
+`details.operation`; extra verified media безопасно переиспользуются при повторе.
 
 #### Отчёт
 
@@ -720,7 +819,7 @@ cat "$REQUEST" | anki-repo create "$EXPORT" --request -
 | `outcomes` | отчёт по заметкам (до 50 записей) и `outcomes_truncated` |
 | `decks_touched` | колоды с числом заметок до и сколько добавлено |
 | `validation` | счётчики и новые коды до/после |
-| `checks` | результаты семи обязательных проверок |
+| `checks` | результаты proof, model/GUID и verified-media проверок |
 | `resolved_request` | **не** входит в `--json`: он записывается в файл, названный `--emit-resolved`, и содержит тот же запрос, где у каждой заметки заполнены `guid`, идентичность колоды и явный выбор модели. Файл либо записан, либо команда завершилась ошибкой `write_failed` |
 
 ### `retire`
@@ -1283,23 +1382,17 @@ tool, поэтому завершается кодом `internal_error` (70) б�
 
 Сравнение исходника с публикацией кандидата выполняются как одна критическая
 секция: перед проверкой байтов `deck.json` берётся эксклюзивная advisory-
-блокировка самого целевого файла, и она удерживается до конца `rename`. Отдельные
+блокировка стабильного каталога экспорта, и она удерживается до конца `rename`. Отдельные
 `read → compare → rename` такой гарантии не дают: между сравнением и `rename`
 другой writer успевает опубликовать более новый результат, который затем молча
 затирается.
 
 Что это значит практически:
 
-- два одновременных `anki-repo edit --apply` одного экспорта сериализуются:
-  writer'ы выстраиваются в очередь, а проигравший проверяет байты уже под
-  блокировкой и получает `source_changed` (exit code `7`) вместо молчаливой
-  перезаписи. Чтобы потерять результат молча, отставшему writer'у нужно увидеть
-  в файле ровно свой снимок, поэтому обычная конкурентная правка этого не даёт;
-- у блокировки есть узкая оговорка, действующая и между процессами `anki-repo`:
-  она берётся на дескриптор, открытый по пути, поэтому `rename` поверх
-  `deck.json` между `open` и `flock` оставляет блокировку на прежнем inode. Окно
-  измеряется одним syscall'ом, повторные проверки его только сужают, а снимает
-  полностью лишь блокировка отдельного, не переименовываемого файла;
+- одновременные `edit`, `retire` и `create --apply` одного экспорта используют
+  один directory lock. Проигравший проверяет исходник под блокировкой и получает
+  `source_changed` (exit 7), если snapshot устарел. Замена inode `deck.json`
+  не заменяет объект directory lock, поэтому публикация остаётся сериализованной;
 - блокировка снимается ядром при завершении процесса, поэтому падение
   `anki-repo` не оставляет «залипший» лок;
 - ожидание освобождения блокировки блокирующее: процесс не отказывается сразу, а
@@ -1347,8 +1440,9 @@ tool, поэтому завершается кодом `internal_error` (70) б�
 
 - Добавлены `models`, `create`, `retire` и `visual-report`. Мутирующих команд стало
   три (`edit`, `create`, `retire`), читающих — девять. Ни одна из новых команд не
-  расширяет область записи: `create` только добавляет заметку в существующую
-  колоду существующей модели, `retire` только дописывает тег.
+  создаёт колоды или модели: `create` добавляет заметку в существующую
+  колоду существующей модели и по opt-in policy материализует verified media;
+  `retire` только дописывает тег.
 - `visual-report` пишет новый каталог отчёта и **никогда** не пишет внутрь экспорта
   или `decks/**`: это проверяется до первой записи и подтверждается списком
   фактически записанных путей.
@@ -1501,7 +1595,7 @@ exit code.
 | `note_not_found` | 4 | `edit`: в экспорте нет заметки с указанным `guid`; в отчёте `review-check` — код проблемы предложения (доменной ошибкой не является) |
 | `ambiguous` | 5 | `find --guid` и `review --guid`: `guid` не разрешается однозначно. Для `edit` и `review-check` эта ветка недостижима как *код возврата*: повтор `guid` отсекается раньше как `export_invalid` (6), а в отчёте `review-check` он остаётся статусом предложения `invalid`/`ambiguous_guid` |
 | `unknown_model` | 3 | `create`: подходящей модели нет — ни явно указанной, ни совместимой с набором полей запроса в режиме `auto` (сообщение перечисляет фактически запрошенные имена полей) |
-| `media_forbidden` | 3 | `create`: значение нового поля ссылается на media (`[sound:…]`, media-атрибут у элемента, который его несёт, — по таблице `ADDRESS_ATTRIBUTES`, — или адрес в CSS значения поля); запись тега и атрибута значения не имеет, а незакрытая конструкция отвергается. Создание заметок не создаёт и не копирует файлы |
+| `media_forbidden` | 3 | `create`: значение нового поля ссылается на media (`[sound:…]`, media-атрибут у элемента, который его несёт, — по таблице `ADDRESS_ATTRIBUTES`, — или адрес в CSS значения поля); запись тега и атрибута значения не имеет, а незакрытая конструкция отвергается. Исключение — настроенный `kanji_assets` для complete `img/src` |
 | `unresolved_guid` | 3 | `retire`: в экспорте нет заметки с указанным `guid`. Пакетный запрос `create` с явным `guid` этой ошибки не даёт: совпавший по содержимому `guid` — это `already_applied`, а разошедшийся по содержимому — `guid_conflict` (6) |
 | `unresolved_deck_identity` | 3 | `create --apply`: целевая колода не объявляет `crowdanki_uuid`, поэтому адресовать цель после записи нечем |
 | `deck_identity_mismatch` | 3 | `models` и `create`: указанные селекторы колоды указывают на разные узлы; выбор одного из них был бы догадкой |
@@ -1581,8 +1675,9 @@ exit code.
   их и не переносит заметки между колодами.
 - `create` не редактирует существующие заметки: совпадение `guid` при другом
   содержимом — это `guid_conflict`, а не обновление.
-- `create` не работает с media: новые значения обязаны быть без ссылок на файлы, а
-  сами файлы не создаются, не копируются и не проверяются на существование.
+- `create` разрешает media только через opt-in policy `kanji_assets`: exact
+  kanji `img/src` из canonical VERIFIED store. Audio, pitch accents, CSS media,
+  `srcset`, произвольные картинки и unconfigured fields остаются forbidden.
 - `retire` не удаляет заметки физически и не умеет снимать тег: он только
   дописывает тег вывода из обращения. Удаление — действие человека в Anki.
 - `visual-report` не рендерит карточки как Anki: он собирает статические превью по
