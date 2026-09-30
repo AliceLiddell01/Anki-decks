@@ -1,0 +1,27 @@
+name: TEMP lock-file maintenance
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: Вывести обновлённый Cargo.lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Установить стабильный Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Обновить и вывести lockfile
+        run: |
+          set -euo pipefail
+          cargo update
+          echo '=== BEGIN MAINTAINED CARGO.LOCK ==='
+          cat Cargo.lock
+          echo '=== END MAINTAINED CARGO.LOCK ==='
