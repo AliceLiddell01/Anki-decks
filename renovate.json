@@ -20,5 +20,25 @@
     "dependencyDashboardApproval": false,
     "prConcurrentLimit": 1
   },
-  "rebaseWhen": "behind-base-branch"
+  "rebaseWhen": "behind-base-branch",
+  "packageRules": [
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "resvg"
+      ],
+      "allowedVersions": "<0.48.0"
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "fs2"
+      ],
+      "abandonmentThreshold": null
+    }
+  ]
 }
