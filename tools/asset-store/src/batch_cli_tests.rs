@@ -591,7 +591,7 @@ fn aggregate_publication_is_exact_versioned_and_decoded() {
     let second = encoded.into_inner();
     let mut runtime = BatchRuntime::open(fixture.store.root(), "aggregate").unwrap();
     let mut state = runtime.load().unwrap().unwrap();
-    for (bytes, distance, margin) in [(&first, 0.025, 0.010), (&second, 0.005, -0.001)] {
+    for (bytes, distance, margin) in [(&first, 0.025, 0.010), (&second, 0.005, 0.005)] {
         let record = ValidationRecord {
             status: SemanticStatus::Uncertain,
             validator: KanjiImageValidator::validator_identity(),

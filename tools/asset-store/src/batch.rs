@@ -27,7 +27,7 @@ use crate::model::{
 };
 
 pub const BATCH_SCHEMA_VERSION: u32 = 1;
-pub const AGGREGATE_POLICY_VERSION: &str = "kanji-distinct-mean-v1";
+pub const AGGREGATE_POLICY_VERSION: &str = "kanji-distinct-mean-v2";
 pub const MAX_ACQUISITION_ROUNDS: u32 = 5;
 pub(crate) const MAX_HUMAN_REASON_BYTES: usize = 4096;
 const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
@@ -616,7 +616,7 @@ impl KanjiBatch {
             .clone();
         let evidence = ValidationEvidence {
             kind: "kanji_batch_aggregate".into(),
-            summary: "Средние метрики разных технически допустимых SHA-256 без REJECTED удовлетворяют неизменённым порогам проверки изображений; точный канонический кандидат выбран детерминированно".into(),
+            summary: "Средние метрики разных технически допустимых SHA-256 без REJECTED удовлетворяют неизменённым порогам проверки изображений, а выбранный кандидат проходит порог отступа; точный канонический кандидат выбран детерминированно".into(),
             details: Some(serde_json::json!({
                 "batch_id": self.batch_id,
                 "identity": identity,
@@ -920,12 +920,14 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     let expected_distance =
         MetricSummary::calculate(samples.iter().map(|(_, metrics)| metrics.expected_distance));
     let margin = MetricSummary::calculate(samples.iter().map(|(_, metrics)| metrics.margin));
+    let selected_aggregate = samples.first();
     let accepted = expected_distance
         .as_ref()
         .is_some_and(|metric| metric.mean <= policy.maximum_expected_distance)
         && margin
             .as_ref()
-            .is_some_and(|metric| metric.mean >= policy.minimum_margin);
+            .is_some_and(|metric| metric.mean >= policy.minimum_margin)
+        && selected_aggregate.is_some_and(|(_, metrics)| metrics.margin >= policy.minimum_margin);
     // Отдельный VERIFIED уже является достаточным свидетельством; агрегат
     // может выбрать любой отличный допустимый образец только при положительном среднем.
     let individually_verified = display_candidates
@@ -936,7 +938,7 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
         })
         .min_by(|left, right| left.sha256.cmp(&right.sha256));
     let selected = individually_verified
-        .or_else(|| samples.first().map(|(candidate, _)| *candidate))
+        .or_else(|| selected_aggregate.map(|(candidate, _)| *candidate))
         .or_else(|| {
             // Запасной выбор нужен только для проверки: если есть другой кандидат,
             // REJECTED не становится текущим, но полностью отклонённый элемент
@@ -959,7 +961,7 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     item.aggregate = AggregateEvidence {
         policy_version: policy.version.clone(), distinct_valid_hashes, expected_distance, margin,
         accepted, selected_sha256: selected_hash.clone(),
-        selection_reason: if individually_verified.is_some() { "отдельный статус VERIFIED; при равенстве выбирается минимальный SHA-256" } else { "минимальная ожидаемая дистанция, максимальный отступ, затем минимальный SHA-256; учитываются только разные допустимые SHA" }.into(),
+        selection_reason: if individually_verified.is_some() { "отдельный статус VERIFIED; при равенстве выбирается минимальный SHA-256" } else { "минимальная ожидаемая дистанция, максимальный отступ, затем минимальный SHA-256; агрегат принимается, только если выбранный образец также проходит порог отступа; учитываются только разные допустимые SHA" }.into(),
     };
     item.current_sha256 = selected_hash;
     if individually_verified.is_some() || accepted {
@@ -1441,7 +1443,11 @@ fn ensure_directory(parent: &File, name: &str) -> Result<File, AssetError> {
     ))
 }
 
-fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetError> {
+fn open_regular_runtime_file(
+    parent: &File,
+    name: &str,
+    maximum: u64,
+) -> Result<Option<File>, AssetError> {
     let descriptor = openat(
         parent,
         name,
@@ -1457,7 +1463,12 @@ fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetEr
         } else {
             boundary_io(error)
         }
-    })?;
+    });
+    let descriptor = match descriptor {
+        Ok(descriptor) => descriptor,
+        Err(error) if error.code == ErrorCode::MissingAssetFile => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let file = File::from(descriptor);
     let metadata = file
         .metadata()
@@ -1468,6 +1479,16 @@ fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetEr
             "запись runtime должна быть ограниченным обычным файлом",
         ));
     }
+    Ok(Some(file))
+}
+
+fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetError> {
+    let file = open_regular_runtime_file(parent, name, maximum)?.ok_or_else(|| {
+        AssetError::new(
+            ErrorCode::MissingAssetFile,
+            "файл runtime-данных отсутствует",
+        )
+    })?;
     let mut bytes = Vec::new();
     file.take(maximum + 1)
         .read_to_end(&mut bytes)
@@ -1482,13 +1503,8 @@ fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetEr
 }
 
 fn atomic_write(parent: &File, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
-    // Перед заменой фиксированное назначение не должно быть символической
-    // ссылкой или специальным файлом.
-    match read_file(parent, name, MAX_STATE_BYTES) {
-        Ok(_) => {}
-        Err(error) if error.code == ErrorCode::MissingAssetFile => {}
-        Err(error) => return Err(error),
-    }
+    // Проверяем тип назначения без чтения старых данных перед атомарной заменой.
+    let _existing = open_regular_runtime_file(parent, name, MAX_STATE_BYTES)?;
     let temporary = format!(
         ".tmp-{}-{}",
         std::process::id(),

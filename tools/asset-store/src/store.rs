@@ -2429,22 +2429,8 @@ fn validate_asset(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
             format!("файл asset {} не совпадает с manifest", record.identity),
         ));
     }
-    if record.current_human_decision() == Some(HumanDecision::Approve)
-        && record.effective_status() == Some(SemanticStatus::Verified)
-    {
-        let bytes = read_bounded_asset_bytes(
-            checked_asset_file(root, record)?,
-            MAX_MEDIA_BYTES,
-            "чтение байтов, одобренных человеком",
-        )?;
-        if sha256_hex(&bytes) != record.sha256 {
-            return Err(AssetError::new(
-                ErrorCode::IntegrityMismatch,
-                "байты, одобренные человеком, изменились",
-            ));
-        }
-        validate_image_decode(&bytes)?;
-    }
+    // Approval fully decodes candidate bytes in `attest`; later manifest checks
+    // only need to stream the hash. `read_verified` decodes before returning bytes.
     Ok(())
 }
 

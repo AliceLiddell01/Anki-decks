@@ -442,10 +442,11 @@ state заново и отбрасывает результат, если item �
 Exact single `VERIFIED` candidate проходит owner validator и atomic canonical
 commit. Distinct technically valid hashes дают aggregate по mean/min/max/count
 для `expected_distance` и nearest-reference margin; exact duplicate SHA не
-увеличивает sample count. `kanji-distinct-mean-v1` сохраняет исходные пороги
-`0.020` и `0.004` и deterministic exact selected SHA. Aggregate trust не
-подменяет automated status самого selected candidate: versioned aggregate
-evidence сохраняется отдельным решением.
+увеличивает sample count. `kanji-distinct-mean-v2` сохраняет исходные пороги
+`0.020` и `0.004`, требует, чтобы выбранный кандидат сам проходил порог
+nearest-reference margin, и фиксирует deterministic exact selected SHA.
+Aggregate trust не подменяет automated status самого selected candidate:
+versioned aggregate evidence сохраняется отдельным решением.
 
 После исчерпания пяти раундов unresolved items получают `awaiting_human` state.
 `batch review` пишет ignored локальный HTML с анимированными GIF, всеми distinct

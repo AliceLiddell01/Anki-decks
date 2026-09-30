@@ -151,7 +151,7 @@ fn duplicate_hashes_do_not_inflate_semantic_count() {
 fn complementary_distinct_samples_allow_versioned_exact_aggregate() {
     let mut state = batch(&['漢']);
     let farther = candidate("farther", SemanticStatus::Uncertain, 0.025, 0.010);
-    let close = candidate("close", SemanticStatus::Uncertain, 0.005, -0.001);
+    let close = candidate("close", SemanticStatus::Uncertain, 0.005, 0.005);
     let selected = close.sha256.clone();
     acquire(&mut state, '漢', farther);
     acquire(&mut state, '漢', close);
@@ -185,6 +185,40 @@ fn complementary_distinct_samples_allow_versioned_exact_aggregate() {
         .unwrap();
     assert!(state.is_resolved());
     state.validate().unwrap();
+}
+
+#[test]
+fn aggregate_waits_for_human_when_selected_sample_margin_fails() {
+    let mut state = batch(&['漢']);
+    let farther = candidate(
+        "farther-low-margin",
+        SemanticStatus::Uncertain,
+        0.025,
+        0.010,
+    );
+    let close = candidate("close-low-margin", SemanticStatus::Uncertain, 0.005, -0.001);
+    let selected = close.sha256.clone();
+    acquire(&mut state, '漢', farther);
+    acquire(&mut state, '漢', close.clone());
+    for _ in 0..3 {
+        acquire(&mut state, '漢', close.clone());
+    }
+
+    let item = &state.items[0];
+    assert_eq!(item.status, BatchItemStatus::AwaitingHuman);
+    assert_eq!(item.current_sha256.as_deref(), Some(selected.as_str()));
+    assert!(!item.aggregate.accepted);
+    assert_eq!(item.aggregate.margin.as_ref().unwrap().count, 2);
+    assert!((item.aggregate.margin.as_ref().unwrap().mean - 0.0045).abs() < 1e-12);
+    assert!(state.aggregate_decision(&identity('漢')).unwrap().is_none());
+    state.validate().unwrap();
+}
+
+#[test]
+fn previous_aggregate_policy_version_is_rejected() {
+    let mut state = batch(&['漢']);
+    state.policy.version = "kanji-distinct-mean-v1".into();
+    assert!(state.validate().is_err());
 }
 
 #[test]
