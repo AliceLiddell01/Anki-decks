@@ -18,8 +18,9 @@ use sha2::{Digest, Sha256};
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::{encode_lower_hex, sha256_hex};
 use crate::model::{
-    AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, MANIFEST_SCHEMA_VERSION, Manifest,
-    Provenance, SemanticDecision, SemanticStatus, ValidationRecord, ValidatorIdentity,
+    AssetIdentity, AssetRecord, DetectedFormat, HumanAttestation, HumanDecision, LifecycleState,
+    MANIFEST_SCHEMA_VERSION, Manifest, Provenance, SemanticDecision, SemanticStatus,
+    ValidationRecord, ValidatorIdentity,
 };
 use crate::selection::{SelectionMode, select_assets};
 use crate::validation::{SemanticValidator, ValidationAttempt, ValidationReport, ValidatorFailure};
@@ -30,6 +31,9 @@ const LOCK_FILE: &str = ".lock";
 const ASSETS_DIR: &str = "assets";
 const TEMP_DIR: &str = ".tmp";
 const RUNTIME_DIR: &str = ".runtime";
+// Domain-neutral local batch state. Его содержимое принадлежит batch owner;
+// generic store проверяет только отдельный directory boundary.
+const BATCHES_DIR: &str = "batches";
 const REMOVAL_MARKER: &str = "removal.json";
 const REMOVAL_BACKUP: &str = "removal.backup";
 const TRANSITION_MARKER: &str = "transition.json";
@@ -108,6 +112,8 @@ impl std::fmt::Debug for LockTestHooks {
 pub struct IngestRequest {
     pub identity: AssetIdentity,
     pub source_path: PathBuf,
+    /// Exact source CAS перед записью: bytes review не подменяются pending import.
+    pub expected_source_sha256: Option<String>,
     /// Доменное расширение identity, которое generic core сохраняет без
     /// интерпретации (например character и Unicode code points для kanji).
     pub domain_metadata: Option<serde_json::Value>,
@@ -124,6 +130,15 @@ pub struct VerifiedIngestRequest {
     pub provenance: Provenance,
     pub domain_metadata: Option<serde_json::Value>,
     pub replace_expected_sha256: Option<String>,
+}
+
+/// Явное пользовательское решение, защищённое compare-and-swap текущего hash.
+#[derive(Debug, Clone)]
+pub struct HumanAttestationRequest {
+    pub identity: AssetIdentity,
+    pub expected_sha256: String,
+    pub decision: HumanDecision,
+    pub reason: String,
 }
 
 /// Итог explicit ingest.
@@ -449,11 +464,7 @@ impl AssetStore {
                         serde_json::json!({"identity": identity}),
                     )
                 })?;
-            if record
-                .validation
-                .as_ref()
-                .is_none_or(|v| &v.validator != expected_validator)
-            {
+            if !record.is_trusted_for(expected_validator) {
                 return Err(AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
                     "изображение проверено другой версией валидатора",
@@ -473,6 +484,9 @@ impl AssetStore {
                     ErrorCode::IntegrityMismatch,
                     "прочитанные байты не совпадают с проверенной записью",
                 ));
+            }
+            if record.current_human_decision() == Some(HumanDecision::Approve) {
+                validate_image_decode(&bytes)?;
             }
             result.push(VerifiedAssetBytes {
                 record: record.clone(),
@@ -622,12 +636,14 @@ impl AssetStore {
             .cloned();
         if let Some(current) = &existing {
             if current.sha256 == staged.sha256
-                && current.validation.as_ref().is_some_and(|validation| {
-                    validation.validator == validator_id
-                        && validation.content_sha256 == current.sha256
-                        && validation.status == SemanticStatus::Verified
-                })
+                && current.current_human_decision() == Some(HumanDecision::Reject)
             {
+                return Err(AssetError::new(
+                    ErrorCode::InvalidTransition,
+                    "эти bytes явно отклонены человеком; требуется новое решение или другой hash",
+                ));
+            }
+            if current.sha256 == staged.sha256 && current.is_trusted_for(&validator_id) {
                 let outcome = VerifiedIngestOutcome {
                     asset: Some(current.clone()),
                     status: SemanticStatus::Verified,
@@ -674,8 +690,13 @@ impl AssetStore {
             provenance: request.provenance,
             lifecycle: LifecycleState::Pending,
             validation: None,
+            human_attestation: None,
             domain_metadata: request.domain_metadata,
         };
+        record.human_attestation = existing
+            .as_ref()
+            .filter(|current| current.sha256 == record.sha256)
+            .and_then(|current| current.human_attestation.clone());
         let mut candidate = std::io::Cursor::new(request.bytes.as_slice());
         let decision = validator
             .validate(&record, &mut candidate)
@@ -783,6 +804,20 @@ impl AssetStore {
             .identity
             .validate()
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        if let Some(expected) = &request.expected_source_sha256 {
+            validate_hash(expected)?;
+        }
+        let staged = stage_source(&self.runtime_handle, source)?;
+        if request
+            .expected_source_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &staged.sha256)
+        {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "source bytes изменились после exact candidate review",
+            ));
+        }
         let lock = self.lock_exclusive()?;
         recover_publications(&self.root_handle)?;
         recover_publications(&self.runtime_handle)?;
@@ -798,7 +833,6 @@ impl AssetStore {
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest)?;
         validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
-        let staged = stage_source(&self.runtime_handle, source)?;
         let source_name = request
             .source_path
             .file_name()
@@ -868,6 +902,7 @@ impl AssetStore {
             },
             lifecycle: LifecycleState::Pending,
             validation: None,
+            human_attestation: None,
             domain_metadata: request.domain_metadata,
         };
         let previous_canonical = manifest
@@ -950,6 +985,34 @@ impl AssetStore {
         mode: SelectionMode,
         validator: &V,
     ) -> Result<ValidationReport, AssetError> {
+        self.validate_selection(mode, validator, None)
+    }
+
+    /// Проверяет одну identity/hash и сохраняет исходное automated evidence.
+    /// Scope не распространяется на соседние unresolved candidates других batch.
+    pub fn validate_exact<V: SemanticValidator>(
+        &self,
+        identity: &AssetIdentity,
+        expected_sha256: &str,
+        validator: &V,
+    ) -> Result<ValidationReport, AssetError> {
+        identity
+            .validate()
+            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        validate_hash(expected_sha256)?;
+        self.validate_selection(
+            SelectionMode::Full,
+            validator,
+            Some((identity, expected_sha256)),
+        )
+    }
+
+    fn validate_selection<V: SemanticValidator>(
+        &self,
+        mode: SelectionMode,
+        validator: &V,
+        exact: Option<(&AssetIdentity, &str)>,
+    ) -> Result<ValidationReport, AssetError> {
         let validator_id = validator.identity();
         validate_validator_identity(&validator_id)?;
         let lock = self.lock_exclusive()?;
@@ -973,6 +1036,26 @@ impl AssetStore {
             .into_iter()
             .cloned()
             .collect();
+        let selected = if let Some((identity, expected_sha256)) = exact {
+            let record = selected
+                .into_iter()
+                .find(|record| &record.identity == identity)
+                .ok_or_else(|| {
+                    AssetError::new(
+                        ErrorCode::MissingAssetFile,
+                        "exact validation identity отсутствует",
+                    )
+                })?;
+            if record.sha256 != expected_sha256 {
+                return Err(AssetError::new(
+                    ErrorCode::IdentityConflict,
+                    "exact validation candidate изменился",
+                ));
+            }
+            vec![record]
+        } else {
+            selected
+        };
         let mut report = ValidationReport::new(mode, validator_id.clone());
         report.considered = selected.len();
 
@@ -1011,12 +1094,6 @@ impl AssetStore {
         }
 
         for (old_record, decision) in decisions {
-            let lifecycle = match decision.status {
-                SemanticStatus::Verified => LifecycleState::Verified,
-                SemanticStatus::Rejected | SemanticStatus::Uncertain | SemanticStatus::Corrupt => {
-                    LifecycleState::Quarantined
-                }
-            };
             let validation = ValidationRecord {
                 status: decision.status,
                 validator: validator_id.clone(),
@@ -1024,115 +1101,22 @@ impl AssetStore {
                 evidence: decision.evidence.clone(),
             };
             let mut new_record = old_record.clone();
-            new_record.lifecycle = lifecycle;
             new_record.validation = Some(validation);
+            let lifecycle = if new_record.effective_status() == Some(SemanticStatus::Verified) {
+                LifecycleState::Verified
+            } else {
+                LifecycleState::Quarantined
+            };
+            new_record.lifecycle = lifecycle;
             let changed = new_record.lifecycle != old_record.lifecycle
                 || new_record.validation != old_record.validation;
             if changed {
-                match (old_record.lifecycle, lifecycle) {
-                    (LifecycleState::Verified, LifecycleState::Verified) => {
-                        replace_manifest_record(&mut manifest, &new_record)?;
-                        save_manifest_revision(
-                            &self.root_handle,
-                            &mut manifest,
-                            #[cfg(test)]
-                            Some(&self.fail_next_manifest_write),
-                            #[cfg(not(test))]
-                            None,
-                        )?;
-                    }
-                    (LifecycleState::Verified, LifecycleState::Quarantined) => {
-                        let source = checked_asset_file(&self.root_handle, &old_record)?;
-                        let staged = stage_source(&self.runtime_handle, source)?;
-                        begin_transition(
-                            &self.root_handle,
-                            &new_record.identity,
-                            TransitionTarget::Runtime,
-                            &new_record.sha256,
-                        )?;
-                        let previous_runtime = runtime_manifest
-                            .assets
-                            .iter()
-                            .find(|asset| asset.identity == new_record.identity)
-                            .cloned();
-                        commit_asset_record(
-                            &self.runtime_handle,
-                            &staged,
-                            previous_runtime.as_ref(),
-                            &new_record,
-                            &mut runtime_manifest,
-                            |root, manifest| save_manifest(root, manifest, false),
-                        )?;
-                        remove_record_from_area(&self.root_handle, &mut manifest, &old_record)?;
-                        clear_transition(&self.root_handle)?;
-                    }
-                    (
-                        LifecycleState::Pending | LifecycleState::Quarantined,
-                        LifecycleState::Verified,
-                    ) => {
-                        let source = checked_asset_file(&self.runtime_handle, &old_record)?;
-                        let staged = stage_source(&self.root_handle, source)?;
-                        begin_transition(
-                            &self.root_handle,
-                            &new_record.identity,
-                            TransitionTarget::Canonical,
-                            &new_record.sha256,
-                        )?;
-                        let previous = manifest
-                            .assets
-                            .iter()
-                            .find(|asset| asset.identity == new_record.identity)
-                            .cloned();
-                        commit_asset_record(
-                            &self.root_handle,
-                            &staged,
-                            previous.as_ref(),
-                            &new_record,
-                            &mut manifest,
-                            |root, manifest| {
-                                #[cfg(test)]
-                                {
-                                    save_manifest_with_test_hook(
-                                        root,
-                                        manifest,
-                                        false,
-                                        &self.fail_next_manifest_write,
-                                    )
-                                }
-                                #[cfg(not(test))]
-                                {
-                                    save_manifest(root, manifest, false)
-                                }
-                            },
-                        )?;
-                        #[cfg(test)]
-                        if FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.replace(false)) {
-                            return Err(AssetError::new(
-                                ErrorCode::IoFailure,
-                                "тестовый сбой после canonical commit",
-                            ));
-                        }
-                        remove_record_from_area(
-                            &self.runtime_handle,
-                            &mut runtime_manifest,
-                            &old_record,
-                        )?;
-                        clear_transition(&self.root_handle)?;
-                    }
-                    (
-                        LifecycleState::Pending | LifecycleState::Quarantined,
-                        LifecycleState::Quarantined,
-                    ) => {
-                        replace_manifest_record(&mut runtime_manifest, &new_record)?;
-                        save_manifest_revision(&self.runtime_handle, &mut runtime_manifest, None)?;
-                    }
-                    _ => {
-                        return Err(AssetError::new(
-                            ErrorCode::ManifestCorrupt,
-                            "недопустимый переход состояния жизненного цикла при проверке",
-                        ));
-                    }
-                }
+                self.commit_lifecycle_change(
+                    &old_record,
+                    &new_record,
+                    &mut manifest,
+                    &mut runtime_manifest,
+                )?;
             }
             report.attempts.push(ValidationAttempt {
                 identity: old_record.identity,
@@ -1161,6 +1145,215 @@ impl AssetStore {
         validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
         lock.unlock()?;
         Ok(report)
+    }
+
+    /// Применяет явно полученное human decision к текущим exact bytes. Approval
+    /// проверяет весь image decode, а затем использует тот же атомарный lifecycle
+    /// переход, что automated validation. Automated evidence сохраняется.
+    pub fn attest(&self, request: HumanAttestationRequest) -> Result<IngestOutcome, AssetError> {
+        request
+            .identity
+            .validate()
+            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        validate_hash(&request.expected_sha256)?;
+        if request.reason.trim().is_empty() {
+            return Err(AssetError::new(
+                ErrorCode::InvalidValidationEvidence,
+                "human decision требует явного основания",
+            ));
+        }
+        let lock = self.lock_exclusive()?;
+        recover_publications(&self.root_handle)?;
+        recover_publications(&self.runtime_handle)?;
+        let mut manifest = load_manifest(&self.root_handle)?;
+        let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        reconcile_runtime_boundary(
+            &self.root_handle,
+            &self.runtime_handle,
+            &manifest,
+            &runtime_manifest,
+        )?;
+        manifest = load_manifest(&self.root_handle)?;
+        runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest)?;
+        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        let previous = manifest
+            .assets
+            .iter()
+            .chain(&runtime_manifest.assets)
+            .find(|asset| asset.identity == request.identity)
+            .cloned()
+            .ok_or_else(|| {
+                AssetError::new(ErrorCode::MissingAssetFile, "identity отсутствует в store")
+            })?;
+        if previous.sha256 != request.expected_sha256 {
+            return Err(AssetError::new(
+                ErrorCode::IdentityConflict,
+                "candidate изменился после review; требуется решение для текущего hash",
+            ));
+        }
+        if request.decision == HumanDecision::Approve {
+            if previous
+                .validation
+                .as_ref()
+                .is_some_and(|decision| decision.status == SemanticStatus::Corrupt)
+            {
+                return Err(AssetError::new(
+                    ErrorCode::InvalidTransition,
+                    "human approval не может отменить CORRUPT; требуется исправленный candidate",
+                ));
+            }
+            let area = if previous.lifecycle == LifecycleState::Verified {
+                &self.root_handle
+            } else {
+                &self.runtime_handle
+            };
+            let mut bytes = Vec::new();
+            checked_asset_file(area, &previous)?
+                .read_to_end(&mut bytes)
+                .map_err(|error| AssetError::io("чтение candidate для human approval", error))?;
+            if sha256_hex(&bytes) != previous.sha256
+                || bytes.len() as u64 != previous.byte_length
+                || DetectedFormat::from_signature(&bytes) != previous.format
+            {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "candidate изменился при чтении",
+                ));
+            }
+            validate_image_decode(&bytes)?;
+        }
+        let mut record = previous.clone();
+        record.human_attestation = Some(HumanAttestation {
+            identity: request.identity,
+            content_sha256: request.expected_sha256,
+            decision: request.decision,
+            reason: request.reason,
+        });
+        record.lifecycle = if record.effective_status() == Some(SemanticStatus::Verified) {
+            LifecycleState::Verified
+        } else {
+            LifecycleState::Quarantined
+        };
+        let changed = record != previous;
+        if changed {
+            self.commit_lifecycle_change(&previous, &record, &mut manifest, &mut runtime_manifest)?;
+        }
+        lock.unlock()?;
+        Ok(IngestOutcome {
+            asset: record,
+            previous: Some(previous),
+            changed,
+        })
+    }
+
+    fn commit_lifecycle_change(
+        &self,
+        old_record: &AssetRecord,
+        new_record: &AssetRecord,
+        manifest: &mut Manifest,
+        runtime_manifest: &mut Manifest,
+    ) -> Result<(), AssetError> {
+        manifest.schema_version = MANIFEST_SCHEMA_VERSION;
+        runtime_manifest.schema_version = MANIFEST_SCHEMA_VERSION;
+        match (old_record.lifecycle, new_record.lifecycle) {
+            (LifecycleState::Verified, LifecycleState::Verified) => {
+                replace_manifest_record(manifest, new_record)?;
+                save_manifest_revision(
+                    &self.root_handle,
+                    manifest,
+                    #[cfg(test)]
+                    Some(&self.fail_next_manifest_write),
+                    #[cfg(not(test))]
+                    None,
+                )?;
+            }
+            (LifecycleState::Verified, LifecycleState::Quarantined) => {
+                let source = checked_asset_file(&self.root_handle, old_record)?;
+                let staged = stage_source(&self.runtime_handle, source)?;
+                begin_transition(
+                    &self.root_handle,
+                    &new_record.identity,
+                    TransitionTarget::Runtime,
+                    &new_record.sha256,
+                )?;
+                let previous_runtime = runtime_manifest
+                    .assets
+                    .iter()
+                    .find(|asset| asset.identity == new_record.identity)
+                    .cloned();
+                commit_asset_record(
+                    &self.runtime_handle,
+                    &staged,
+                    previous_runtime.as_ref(),
+                    new_record,
+                    runtime_manifest,
+                    |root, manifest| save_manifest(root, manifest, false),
+                )?;
+                remove_record_from_area(&self.root_handle, manifest, old_record)?;
+                clear_transition(&self.root_handle)?;
+            }
+            (LifecycleState::Pending | LifecycleState::Quarantined, LifecycleState::Verified) => {
+                let source = checked_asset_file(&self.runtime_handle, old_record)?;
+                let staged = stage_source(&self.root_handle, source)?;
+                begin_transition(
+                    &self.root_handle,
+                    &new_record.identity,
+                    TransitionTarget::Canonical,
+                    &new_record.sha256,
+                )?;
+                let previous = manifest
+                    .assets
+                    .iter()
+                    .find(|asset| asset.identity == new_record.identity)
+                    .cloned();
+                commit_asset_record(
+                    &self.root_handle,
+                    &staged,
+                    previous.as_ref(),
+                    new_record,
+                    manifest,
+                    |root, manifest| {
+                        #[cfg(test)]
+                        {
+                            save_manifest_with_test_hook(
+                                root,
+                                manifest,
+                                false,
+                                &self.fail_next_manifest_write,
+                            )
+                        }
+                        #[cfg(not(test))]
+                        {
+                            save_manifest(root, manifest, false)
+                        }
+                    },
+                )?;
+                #[cfg(test)]
+                if FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.replace(false)) {
+                    return Err(AssetError::new(
+                        ErrorCode::IoFailure,
+                        "тестовый сбой после canonical commit",
+                    ));
+                }
+                remove_record_from_area(&self.runtime_handle, runtime_manifest, old_record)?;
+                clear_transition(&self.root_handle)?;
+            }
+            (
+                LifecycleState::Pending | LifecycleState::Quarantined,
+                LifecycleState::Quarantined,
+            ) => {
+                replace_manifest_record(runtime_manifest, new_record)?;
+                save_manifest_revision(&self.runtime_handle, runtime_manifest, None)?;
+            }
+            _ => {
+                return Err(AssetError::new(
+                    ErrorCode::ManifestCorrupt,
+                    "недопустимый переход состояния жизненного цикла при проверке",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn lock_shared(&self) -> Result<StoreLock, AssetError> {
@@ -1293,7 +1486,7 @@ fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError>
 
 fn open_or_initialize_runtime(root: &File, store_id: &str) -> Result<File, AssetError> {
     let runtime = ensure_dir_entry(root, RUNTIME_DIR)?;
-    let names = inspect_top_level(&runtime, ErrorCode::StoreNotOwned)?;
+    let names = inspect_area_top_level(&runtime, ErrorCode::StoreNotOwned, true)?;
     if names.is_empty() {
         ensure_dir_entry(&runtime, ASSETS_DIR)?;
         ensure_dir_entry(&runtime, TEMP_DIR)?;
@@ -1318,7 +1511,7 @@ fn open_or_initialize_runtime(root: &File, store_id: &str) -> Result<File, Asset
         ensure_dir_entry(&runtime, ASSETS_DIR)?;
         ensure_dir_entry(&runtime, TEMP_DIR)?;
     }
-    ensure_top_level(&runtime)?;
+    inspect_area_top_level(&runtime, ErrorCode::UnexpectedPath, true)?;
     Ok(runtime)
 }
 
@@ -1358,6 +1551,14 @@ fn preflight_root_ownership(root: &File, root_created: bool) -> Result<RootState
 }
 
 fn inspect_top_level(root: &File, unknown_code: ErrorCode) -> Result<BTreeSet<String>, AssetError> {
+    inspect_area_top_level(root, unknown_code, false)
+}
+
+fn inspect_area_top_level(
+    root: &File,
+    unknown_code: ErrorCode,
+    runtime_extensions: bool,
+) -> Result<BTreeSet<String>, AssetError> {
     let root_path = fd_path(root);
     let mut names = BTreeSet::new();
     for entry in fs::read_dir(&root_path)
@@ -1369,11 +1570,18 @@ fn inspect_top_level(root: &File, unknown_code: ErrorCode) -> Result<BTreeSet<St
         if !matches!(
             name.as_str(),
             LOCK_FILE | OWNER_FILE | MANIFEST_FILE | ASSETS_DIR | TEMP_DIR | RUNTIME_DIR
-        ) {
+        ) && !(runtime_extensions && name == BATCHES_DIR)
+        {
             return Err(AssetError::new(
                 unknown_code,
                 format!("неожиданный файл в store root: {name}"),
             ));
+        }
+        if runtime_extensions && name == BATCHES_DIR {
+            // Открываем relative to pinned runtime fd с DIRECTORY|NOFOLLOW:
+            // pathname metadata недостаточно при конкурентной подмене.
+            open_directory_at(root, BATCHES_DIR)
+                .map_err(|error| directory_entry_error(BATCHES_DIR, error))?;
         }
         let metadata = fs::symlink_metadata(entry.path())
             .map_err(|error| AssetError::io("не удалось проверить store entry", error))?;
@@ -1556,6 +1764,13 @@ fn write_owner_marker(root: &File, store_id: &str) -> Result<(), AssetError> {
 
 fn load_manifest(root: &File) -> Result<Manifest, AssetError> {
     ensure_top_level(root)?;
+    load_owned_manifest(root)
+}
+
+// Recovery работает с уже проверенным canonical либо runtime directory handle.
+// Имена расширений проверяет вызывающий area-specific loader, а owner/schema
+// проверяются повторно при каждом чтении, включая восстановление транзакций.
+fn load_owned_manifest(root: &File) -> Result<Manifest, AssetError> {
     let manifest = read_manifest_file(root)?;
     check_schema(&manifest)?;
     let owner = read_owner_marker(root)?;
@@ -1569,7 +1784,7 @@ fn load_manifest(root: &File) -> Result<Manifest, AssetError> {
 }
 
 fn load_runtime_manifest(root: &File, store_id: &str) -> Result<Manifest, AssetError> {
-    ensure_top_level(root)?;
+    inspect_area_top_level(root, ErrorCode::UnexpectedPath, true)?;
     let owner = read_owner_marker(root)?;
     if owner.store_id != store_id {
         return Err(AssetError::new(
@@ -1604,7 +1819,7 @@ fn read_manifest_file(root: &File) -> Result<Manifest, AssetError> {
                 "manifest schema_version отсутствует или не является целым числом",
             )
         })?;
-    if schema_version != u64::from(MANIFEST_SCHEMA_VERSION) {
+    if schema_version != 3 && schema_version != u64::from(MANIFEST_SCHEMA_VERSION) {
         return Err(AssetError::new(
             ErrorCode::UnsupportedSchemaVersion,
             format!(
@@ -1647,13 +1862,24 @@ fn read_owner_marker(root: &File) -> Result<OwnerMarker, AssetError> {
 }
 
 fn check_schema(manifest: &Manifest) -> Result<(), AssetError> {
-    if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
+    if manifest.schema_version != 3 && manifest.schema_version != MANIFEST_SCHEMA_VERSION {
         return Err(AssetError::new(
             ErrorCode::UnsupportedSchemaVersion,
             format!(
                 "manifest schema_version {} не поддерживается (ожидается {})",
                 manifest.schema_version, MANIFEST_SCHEMA_VERSION
             ),
+        ));
+    }
+    if manifest.schema_version == 3
+        && manifest
+            .assets
+            .iter()
+            .any(|asset| asset.human_attestation.is_some())
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "schema v3 не поддерживает human attestation",
         ));
     }
     Ok(())
@@ -1690,27 +1916,34 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
         }
         let expected_path = canonical_asset_path(&record.identity, &record.sha256, record.format);
         validate_relative_path(&record.storage_path, &expected_path)?;
-        match (&record.lifecycle, &record.validation) {
-            (LifecycleState::Pending, None) => {}
-            (LifecycleState::Verified, Some(validation))
-                if validation.status == SemanticStatus::Verified =>
+        if let Some(validation) = &record.validation {
+            validate_validation_record(record, validation)?;
+        }
+        if let Some(attestation) = &record.human_attestation {
+            validate_hash(&attestation.content_sha256)?;
+            if attestation.identity != record.identity
+                || attestation.content_sha256 != record.sha256
+                || attestation.reason.trim().is_empty()
             {
-                validate_validation_record(record, validation)?;
-            }
-            (LifecycleState::Quarantined, Some(validation))
-                if validation.status != SemanticStatus::Verified =>
-            {
-                validate_validation_record(record, validation)?;
-            }
-            _ => {
                 return Err(AssetError::new(
                     ErrorCode::ManifestCorrupt,
-                    format!(
-                        "lifecycle и semantic decision не согласованы для {}",
-                        record.identity
-                    ),
+                    "human attestation не привязана к текущим identity/hash или не содержит основания",
                 ));
             }
+        }
+        let expected_lifecycle = match record.effective_status() {
+            Some(SemanticStatus::Verified) => LifecycleState::Verified,
+            Some(_) => LifecycleState::Quarantined,
+            None => LifecycleState::Pending,
+        };
+        if record.lifecycle != expected_lifecycle {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!(
+                    "lifecycle и effective semantic decision не согласованы для {}",
+                    record.identity
+                ),
+            ));
         }
         if record.provenance.source_kind.is_empty() || record.provenance.source_name.is_empty() {
             return Err(AssetError::new(
@@ -1735,14 +1968,11 @@ fn validate_verified_manifest(root: &File, manifest: &Manifest) -> Result<(), As
     validate_manifest(root, manifest)?;
     if manifest.assets.iter().any(|asset| {
         asset.lifecycle != LifecycleState::Verified
-            || asset
-                .validation
-                .as_ref()
-                .is_none_or(|decision| decision.status != SemanticStatus::Verified)
+            || asset.effective_status() != Some(SemanticStatus::Verified)
     }) {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
-            "канонический манифест допускает только записи, у которых `lifecycle` и `validation.status` равны `verified`",
+            "канонический манифест допускает только effective verified записи",
         ));
     }
     Ok(())
@@ -1780,11 +2010,7 @@ fn validate_publishable_manifest(
 ) -> Result<(), AssetError> {
     validate_verified_manifest(root, manifest)?;
     for asset in &manifest.assets {
-        if asset
-            .validation
-            .as_ref()
-            .is_none_or(|validation| &validation.validator != expected_validator)
-        {
+        if !asset.is_trusted_for(expected_validator) {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 format!(
@@ -2091,6 +2317,64 @@ fn validate_validation_record(
     Ok(())
 }
 
+/// Полный decode всех GIF frames либо PNG; magic bytes недостаточно для
+/// пользовательского approval. Decoder limits ограничивают память одного frame.
+pub(crate) fn validate_image_decode(bytes: &[u8]) -> Result<(), AssetError> {
+    use image::{AnimationDecoder, ImageDecoder};
+    let failure = |message: String| {
+        AssetError::new(
+            ErrorCode::InvalidTransition,
+            format!("human approval требует корректного полного image decode: {message}"),
+        )
+    };
+    match DetectedFormat::from_signature(bytes) {
+        DetectedFormat::Gif => {
+            let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+                .map_err(|error| failure(error.to_string()))?;
+            decoder
+                .set_limits(image::Limits::default())
+                .map_err(|error| failure(error.to_string()))?;
+            let mut count = 0;
+            for frame in decoder.into_frames() {
+                frame.map_err(|error| failure(error.to_string()))?;
+                count += 1;
+            }
+            if count == 0 {
+                return Err(failure("GIF не содержит frames".into()));
+            }
+        }
+        DetectedFormat::Png => {
+            let decoder = image::codecs::png::PngDecoder::with_limits(
+                std::io::Cursor::new(bytes),
+                image::Limits::default(),
+            )
+            .map_err(|error| failure(error.to_string()))?;
+            if decoder
+                .is_apng()
+                .map_err(|error| failure(error.to_string()))?
+            {
+                let mut count = 0;
+                for frame in decoder
+                    .apng()
+                    .map_err(|error| failure(error.to_string()))?
+                    .into_frames()
+                {
+                    frame.map_err(|error| failure(error.to_string()))?;
+                    count += 1;
+                }
+                if count == 0 {
+                    return Err(failure("APNG не содержит frames".into()));
+                }
+            } else {
+                image::DynamicImage::from_decoder(decoder)
+                    .map_err(|error| failure(error.to_string()))?;
+            }
+        }
+        _ => return Err(failure("поддерживаются GIF и PNG".into())),
+    }
+    Ok(())
+}
+
 fn validate_asset(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
     let file = checked_asset_file(root, record)?;
     let (sha256, byte_length, format) = hash_file(file)?;
@@ -2099,6 +2383,21 @@ fn validate_asset(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
             ErrorCode::IntegrityMismatch,
             format!("файл asset {} не совпадает с manifest", record.identity),
         ));
+    }
+    if record.current_human_decision() == Some(HumanDecision::Approve)
+        && record.effective_status() == Some(SemanticStatus::Verified)
+    {
+        let mut bytes = Vec::new();
+        checked_asset_file(root, record)?
+            .read_to_end(&mut bytes)
+            .map_err(|error| AssetError::io("чтение human-approved bytes", error))?;
+        if sha256_hex(&bytes) != record.sha256 {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "human-approved bytes изменились",
+            ));
+        }
+        validate_image_decode(&bytes)?;
     }
     Ok(())
 }
@@ -2480,7 +2779,9 @@ fn make_readonly(file: &File) -> Result<(), AssetError> {
 }
 
 fn save_manifest(root: &File, manifest: &Manifest, initial: bool) -> Result<(), AssetError> {
-    let bytes = serde_json::to_vec_pretty(manifest)
+    let mut current = manifest.clone();
+    current.schema_version = MANIFEST_SCHEMA_VERSION;
+    let bytes = serde_json::to_vec_pretty(&current)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
     atomic_write(root, MANIFEST_FILE, &bytes, initial, None)
 }
@@ -2492,7 +2793,9 @@ fn save_manifest_with_test_hook(
     initial: bool,
     fail_before_commit: &std::sync::atomic::AtomicBool,
 ) -> Result<(), AssetError> {
-    let bytes = serde_json::to_vec_pretty(manifest)
+    let mut current = manifest.clone();
+    current.schema_version = MANIFEST_SCHEMA_VERSION;
+    let bytes = serde_json::to_vec_pretty(&current)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
     atomic_write(
         root,
@@ -2984,7 +3287,7 @@ fn recover_removal(root: &File) -> Result<(), AssetError> {
     let assets = open_directory_at(root, ASSETS_DIR)
         .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
     let name = asset_name(&transaction.record.storage_path)?;
-    let manifest = load_manifest(root)?;
+    let manifest = load_owned_manifest(root)?;
     match manifest
         .assets
         .iter()
@@ -3050,7 +3353,7 @@ fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetE
     let transaction: PublicationTransaction = serde_json::from_reader(marker_file)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
     validate_publication_transaction(marker_name, &transaction)?;
-    let manifest = load_manifest(root)?;
+    let manifest = load_owned_manifest(root)?;
     let current = manifest
         .assets
         .iter()
@@ -3805,6 +4108,7 @@ mod tests {
             .ingest(IngestRequest {
                 identity: AssetIdentity::new("generic", "one").unwrap(),
                 source_path: source,
+                expected_source_sha256: None,
                 domain_metadata: None,
                 replace_expected_sha256: None,
             })
@@ -3891,6 +4195,7 @@ mod tests {
                 .ingest(IngestRequest {
                     identity: identity.clone(),
                     source_path: source,
+                    expected_source_sha256: None,
                     domain_metadata: None,
                     replace_expected_sha256: None,
                 })
@@ -4134,6 +4439,7 @@ mod tests {
                 )
                 .unwrap(),
                 source_path: first_source,
+                expected_source_sha256: None,
                 domain_metadata: None,
                 replace_expected_sha256: None,
             })
@@ -4151,6 +4457,7 @@ mod tests {
                 )
                 .unwrap(),
                 source_path: second_source,
+                expected_source_sha256: None,
                 domain_metadata: None,
                 replace_expected_sha256: None,
             })
@@ -4231,3 +4538,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "trust_tests.rs"]
+mod trust_tests;

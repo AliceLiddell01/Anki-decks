@@ -1,6 +1,6 @@
 //! Детерминированный выбор целей semantic validation.
 
-use crate::model::{AssetRecord, ValidatorIdentity};
+use crate::model::{AssetRecord, HumanDecision, ValidatorIdentity};
 
 /// Режим выбора ассетов для проверки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +31,12 @@ pub fn select_assets<'a>(
         .iter()
         .filter(|asset| match mode {
             SelectionMode::Full => true,
-            SelectionMode::New => !asset.validation.as_ref().is_some_and(|decision| {
-                decision.content_sha256 == asset.sha256 && decision.validator == *validator
-            }),
+            SelectionMode::New => {
+                asset.current_human_decision() != Some(HumanDecision::Approve)
+                    && !asset.validation.as_ref().is_some_and(|decision| {
+                        decision.content_sha256 == asset.sha256 && decision.validator == *validator
+                    })
+            }
         })
         .collect();
     selected.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -61,6 +64,7 @@ mod tests {
             },
             lifecycle: LifecycleState::Pending,
             validation,
+            human_attestation: None,
             domain_metadata: None,
         }
     }
@@ -95,5 +99,33 @@ mod tests {
         assert_eq!(selected, ["changed", "fresh"]);
         assert_eq!(select_assets(&assets, SelectionMode::New, &v2).len(), 3);
         assert_eq!(select_assets(&assets, SelectionMode::Full, &v1).len(), 3);
+    }
+
+    #[test]
+    fn new_does_not_repeat_automated_validation_for_exact_human_approval() {
+        use crate::model::{HumanAttestation, HumanDecision};
+
+        let current = ValidatorIdentity::new("fixture", "1").expect("validator valid");
+        let replacement = ValidatorIdentity::new("fixture", "2").expect("validator valid");
+        let mut approved = asset("approved", "sha-a", None);
+        approved.human_attestation = Some(HumanAttestation {
+            identity: approved.identity.clone(),
+            content_sha256: approved.sha256.clone(),
+            decision: HumanDecision::Approve,
+            reason: "проверено человеком".into(),
+        });
+
+        assert!(select_assets(&[approved], SelectionMode::New, &current).is_empty());
+        let mut rejected = asset("rejected", "sha-b", None);
+        rejected.human_attestation = Some(HumanAttestation {
+            identity: rejected.identity.clone(),
+            content_sha256: rejected.sha256.clone(),
+            decision: HumanDecision::Reject,
+            reason: "кандидат отклонён".into(),
+        });
+        assert_eq!(
+            select_assets(&[rejected], SelectionMode::New, &replacement).len(),
+            1
+        );
     }
 }

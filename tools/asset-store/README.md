@@ -11,20 +11,21 @@ content hash, integrity и lifecycle. Предметный CLI `kanji-assets` д
 ## Где лежат данные
 
 Корень по умолчанию — `.asset-store/kanji` в корне workspace. Если он уже
-существует, `list`, `plan` и `validate` работают только с ним. `ensure` создаёт
-store при первом вызове.
+существует, `list`, `plan`, `validate` и batch-resume работают с ним.
+`ensure` и `batch start` создают store при первом вызове.
 
 В store разделены публикуемое состояние и локальные записи проверки:
 
 ```text
 .asset-store/kanji/
 ├── .owner.json             # tracked marker владельца
-├── manifest.json           # tracked: только VERIFIED
-├── assets/                 # tracked: bytes VERIFIED изображений
-├── .runtime/               # ignored: локальные кандидаты и карантин
+├── manifest.json           # tracked: только assets с effective VERIFIED trust
+├── assets/                 # tracked: bytes effective VERIFIED изображений
+├── .runtime/               # ignored: локальные кандидаты, карантин и batch state
 │   ├── .owner.json         # тот же store_id
 │   ├── manifest.json       # Pending и Quarantined
 │   ├── assets/             # bytes локальных кандидатов и карантина
+│   ├── batches/<batch-id>/  # ignored state.json, review.html и candidates/
 │   └── .tmp/               # ignored staging runtime-состояния
 ├── .lock                    # ignored lock
 └── .tmp/                    # ignored staging и транзакционные файлы
@@ -37,7 +38,8 @@ Read-only publishability gate подтверждает canonical corpus и пр�
 опубликованными identity. Runtime assets при этом не становятся публикуемыми.
 Отсутствующий `.asset-store/kanji` не считается ошибкой: репозиторий может пока
 не содержать corpus. При открытии legacy store с каноническим manifest
-`schema_version: 3` старые `Pending` и `Quarantined` записи переносятся из
+`schema_version: 3` automated decisions остаются действующими, а отсутствующее
+поле `human_attestation` читается как `null`. Старые `Pending` и `Quarantined` записи переносятся из
 корневого manifest в `.runtime/` под exclusive lock. Store с `schema_version: 1`
 и каталогом `objects/` нужно создать заново: он не мигрируется.
 Если в `.runtime/` уже есть запись с той же identity, при восстановлении она
@@ -50,7 +52,7 @@ decision; hash не входит в имя kanji asset. Для других name
 сохраняется hash-suffixed layout.
 
 `.gitignore` разрешает публиковать только `.owner.json`, `manifest.json` и
-изображения `.gif`/`.png` в `assets/`; `.runtime/`, lock и незавершённая
+изображения `.gif`/`.png` в `assets/`; `.runtime/`, включая `batches/`, lock и незавершённая
 публикация остаются локальными. Read-only gate отклоняет non-VERIFIED записи,
 orphan-файлы и незарегистрированные bytes в tracked corpus. Другие каталоги и
 файлы store не усыновляются. Root с `..`, symlink-компонентом, неожиданными
@@ -62,7 +64,10 @@ orphan-файлы и незарегистрированные bytes в tracked c
 - фактическим SHA-256, размером и форматом;
 - provenance Yarxi и domain metadata с символом, Unicode, номером статьи,
   выбранным source URL и результатом выбора GIF/PNG;
-- semantic status, validator id/version, content hash решения и pixel evidence.
+- automated semantic status, validator id/version, content hash решения и pixel
+  evidence;
+- optional human decision `approve`/`reject`, основание, та же identity и exact
+  content SHA-256. Human decision является semantic решением, а не подписью.
 
 Acquisition evidence содержит фактические сведения browser runtime, важные для
 воспроизведения rendered PNG: product, protocol version, revision, user agent,
@@ -70,7 +75,12 @@ JavaScript version и источник выбора исполняемого ф�
 `CHROMIUM_BIN`, `PATH`, Playwright cache или default `chromiumoxide`). Абсолютный
 путь, профиль браузера и cookies не сохраняются.
 
-Manifest schema сейчас `3`. Замена bytes для существующей identity требует
+Manifest schema сейчас `4`; schema `3` читается обратно-совместимо, а запись
+обновляет manifest до текущей версии. `human_attestation` не переписывает
+automated decision и действует только для совпадающих identity и content hash.
+Human approval может сделать технически корректный `UNCERTAIN` или `REJECTED`
+asset effective verified; human reject снимает trust даже с ранее автоматически
+подтверждённых текущих bytes. Другой SHA не наследует decision. Замена bytes для существующей identity требует
 compare-and-swap по ожидаемому старому hash. Kanji-файл публикуется атомарным
 rename из staging; transaction marker и backup в `.tmp/` позволяют при открытии
 store восстановить завершённый manifest commit либо откатить незавершённую
@@ -83,7 +93,10 @@ Generic `AssetStore::ingest` сохраняет `Pending` candidate в `.runtime
 файл не попадает в tracked corpus. `AssetStore::ingest_verified` держит bytes во
 временном staging и публикует их в canonical `assets/` только после ответа
 `VERIFIED`. `REJECTED`, `UNCERTAIN`, `CORRUPT` и технический сбой не публикуют
-bytes в canonical corpus. При повторной проверке уже опубликованного asset,
+bytes в canonical corpus через automated ingest. Отдельный `attest(Approve)`
+может повысить технически корректный exact pending/quarantined candidate до
+effective verified только после полного decode; `attest(Reject)` переносит его
+из canonical corpus в runtime quarantine. При повторной проверке уже опубликованного asset,
 который больше не получает `VERIFIED`, его bytes и запись сначала сохраняются в
 локальном runtime quarantine, затем запись и bytes атомарно убираются из
 tracked corpus.
@@ -104,14 +117,16 @@ canonical corpus.
 ## Чтение проверенных данных
 
 `AssetStore::read_verified(root, identities, expected_validator)` только читает
-канонические изображения. Метод не открывает хранилище для изменений, не создаёт
+канонические изображения с effective verified trust. Метод не открывает хранилище для изменений, не создаёт
 `.runtime`, блокировочные и временные файлы, не переносит данные между форматами
 и не восстанавливает хранилище. Отсутствие хранилища или идентичности приводит к
 явному отказу. `.runtime` не читается и не служит источником байтов.
 
 API удерживает общую блокировку каталога, согласованную с изменяющими API,
 проверяет маркер владельца и `store_id`, манифест, состояние и статус жизненного
-цикла, контрольную сумму решения и соответствие ожидаемому валидатору, границы
+цикла. Для automated trust сверяются контрольная сумма решения и expected
+validator; exact human approval текущего hash действует независимо от версии
+automated validator, а human reject запрещает чтение. Затем проверяются границы
 хранилища и целостность. `VerifiedAssetBytes` содержит запись и те же байты, для которых
 после чтения через дескриптор без перехода по символическим ссылкам проверены
 SHA-256, размер и формат. Раздельных шагов проверки пути и последующего чтения
@@ -350,12 +365,29 @@ cargo run --locked --bin kanji-assets -- --output json plan \
 # Вручную импортировать локальный candidate (он останется pending).
 cargo run --locked --bin kanji-assets -- --output json ingest \
   --character 漢 --file ./candidate.png
+
+# Создать batch (ID генерируется автоматически) и пройти до пяти breadth-first раундов.
+cargo run --locked --bin kanji-assets -- --output json batch start 漢 字
+cargo run --locked --bin kanji-assets -- --output json batch run --batch-id <id>
+
+# Продолжить batch позже, посмотреть JSON state или записать локальный review HTML.
+cargo run --locked --bin kanji-assets -- --output json batch status --batch-id <id>
+cargo run --locked --bin kanji-assets -- --output json batch review --batch-id <id>
+
+# Применить явное exact-hash решение пользователя.
+cargo run --locked --bin kanji-assets -- --output json batch decide \
+  --batch-id <id> --character 漢 --sha256 <sha256> \
+  --action confirm --reason "пользователь подтвердил текущий candidate"
+
+# После технической серии failures разрешить новый acquisition generation.
+cargo run --locked --bin kanji-assets -- --output json batch retry \
+  --batch-id <id> --character 字 --reason "источник снова доступен"
 ```
 
 `--store <path>` выбирает root, `--repository-root <path>` задаёт checkout для
 проверки границы `decks/`. `--allow-insecure-tls` нужен только для сетевого
 запроса, когда Yarxi выдаёт указанную ошибку сертификата. `ensure` сохраняет
-только `VERIFIED`; повтор уже актуального verified hash не ходит в сеть.
+только effective `VERIFIED`; повтор уже доверенного exact hash не ходит в сеть.
 
 `list`, `plan` и `validate` открывают store; открытие может создать runtime-файлы,
 восстановить незавершённую операцию или перенести legacy-записи через runtime
@@ -374,6 +406,59 @@ JSON-ответ содержит `schema_version`, `operation`, `store`, `mode`,
 `ingest` читает ровно один явный source file вне `decks/` и создаёт pending
 candidate. Формат/hash определяются по bytes. Для compare-and-swap замены
 добавьте `--replace-expected-sha256 <текущий-hash>`.
+
+### Kanji batch
+
+`batch start [--batch-id ID] CHARACTER...` дедуплицирует identities, создаёт
+versioned state под `.runtime/batches/<id>/` и до acquisition отмечает текущие
+assets, которые owner уже подтверждает как effective verified. Если передать
+существующий ID, requested identity set и validator должны совпасть; команда
+возобновит state, а не начнёт новый batch.
+
+`batch run --batch-id ID [--rounds 1..5]` по умолчанию запускает до пяти
+acquisition rounds. Каждый round целиком проходит текущий frontier до следующего
+retry; опубликованные или уже effective verified identities повторно не
+acquire'ятся. Независимый item failure остаётся в `issues` и не отменяет соседние
+исходы. Browser acquisition проходит без batch lock; после него CLI открывает
+state заново и отбрасывает результат, если item уже вышел из frontier.
+
+До автоматической публикации attempt и candidate bytes записываются в runtime.
+Exact single `VERIFIED` candidate проходит owner validator и atomic canonical
+commit. Distinct technically valid hashes дают aggregate по mean/min/max/count
+для `expected_distance` и nearest-reference margin; exact duplicate SHA не
+увеличивает sample count. `kanji-distinct-mean-v1` сохраняет исходные пороги
+`0.020` и `0.004` и deterministic exact selected SHA. Aggregate trust не
+подменяет automated status самого selected candidate: versioned aggregate
+evidence сохраняется отдельным решением.
+
+После исчерпания пяти раундов unresolved items получают `awaiting_human` state.
+`batch review` пишет ignored локальный HTML с анимированными GIF, всеми distinct
+candidate images, exact SHA, automated outcomes, per-attempt evidence и
+aggregate metrics. Кандидаты остаются по hash-derived путям в `candidates/`;
+HTML не является источником истины.
+
+`batch decide` принимает только структурированные `confirm`, `reject` или
+`reacquire` для текущих `--character` и `--sha256`. `confirm` требует технически
+корректные GIF/PNG bytes, exact source SHA compare-and-swap, automated evidence
+через owner boundary и полный decode перед human approval. `reject` сохраняет
+human decision для exact candidate и отправляет только эту identity в новое
+поколение acquisition. `reacquire` планирует targeted повтор без semantic
+approval. Для item после пяти технических failures без candidate используй
+`batch retry` без `--sha256`; с candidate CLI требует `--sha256`.
+
+`batch status` возвращает state; `batch review` ещё и создаёт artifact. Batch
+JSON содержит `batch_id`, `counts`, per-item `items`, item-level `issues`,
+`blockers`, optional `review_artifact` и полный `batch` state/evidence.
+`run` возвращает exit `0` только при полном canonical resolution и `3` при
+awaiting-human или частичном прогрессе; отдельные ошибки остаются привязаны к
+identity. `start`, `status`, `review`, `decide` и `retry` дают `0` при успешном
+исходе; системные boundary/schema/integrity ошибки используют стандартные exit
+codes asset owner.
+
+После process restart продолжай с тем же ID по `status` → `run`/`review` /
+`decide`; CLI возобновляет exact owner publication из сохранённых candidate и
+human-decision intent без повторного acquisition. Runtime state, HTML и candidate
+bytes не входят в canonical corpus и не предназначены для Git.
 
 ## Проверки
 

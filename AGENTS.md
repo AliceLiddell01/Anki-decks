@@ -30,6 +30,7 @@
 
 - `tools/anki-repo/README.md` — контракт toolkit `anki-repo`: команды, вывод, exit codes, реестр QA-правил и границы `edit`;
 - `tools/asset-store/README.md` — публичный контракт общего asset store и kanji CLI, filesystem ownership, lifecycle, `new`/`full` и machine-readable outcomes;
+- `.agents/skills/anki-card-create/` — агентский workflow создания новых карточек и batch kanji assets;
 - `.agents/skills/anki-git-workflow/` — обычная процедура Git/GitHub;
 - `.agents/skills/anki-coderabbit-review/` — явно запрошенный CodeRabbit review cycle.
 
@@ -135,6 +136,12 @@ cargo test --workspace --locked
 `.agents/skills/<name>/SKILL.md` на skill, с собственными reference-файлами.
 Применяй их, когда текущий запрос подпадает под назначение skill.
 
+- `anki-card-create` — создание новых карточек в существующей колоде от
+  пользовательского запроса до проверенного результата: model evidence,
+  configured processors, kanji asset dependencies, частичный прогресс, human
+  review и отдельная asset-only публикация. Применяется к просьбам создать
+  карточку или batch карточек и продолжить такой flow. Не применяется к правке
+  существующих заметок.
 - `anki-git-workflow` — обычная процедура Git/GitHub текущего checkout.
   Применяется автоматически, когда работа достигает branch, staging, commit,
   push, PR, merge или cleanup, а также по явным просьбам «закоммить», «запушь»,
@@ -147,7 +154,7 @@ cargo test --workspace --locked
   Default — 3 completed iterations, если пользователь не назвал своё
   положительное число. Merge не входит в этот cycle.
 - Обычное «ревью», generic code review без CodeRabbit intent и задачи по
-  изменению самих skills ни в один из этих двух workflow не маршрутизируются.
+  изменению самих skills ни в один из этих трёх workflow не маршрутизируются.
 
 Процедуру каждого workflow владеет сам skill; не дублируй её здесь и не переноси
 в `.codex/context/`.

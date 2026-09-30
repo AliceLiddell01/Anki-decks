@@ -1,0 +1,570 @@
+use super::*;
+use std::fs;
+use std::os::unix::fs::symlink;
+
+fn validator() -> ValidatorIdentity {
+    ValidatorIdentity::new("kanjivg-pixel-chamfer", "synthetic-v1").unwrap()
+}
+
+fn identity(character: char) -> AssetIdentity {
+    AssetIdentity::new("kanji", character.to_string()).unwrap()
+}
+
+fn batch(characters: &[char]) -> KanjiBatch {
+    KanjiBatch::new(
+        "synthetic-batch".into(),
+        characters.iter().copied().map(identity).collect(),
+        validator(),
+    )
+    .unwrap()
+}
+
+fn bytes(label: &str) -> Vec<u8> {
+    // Здесь тестируются state/hash boundaries. Full GIF decode проверяет owner.
+    let mut bytes = b"GIF89a".to_vec();
+    bytes.extend_from_slice(label.as_bytes());
+    bytes
+}
+
+fn record(bytes: &[u8], status: SemanticStatus, distance: f64, margin: f64) -> ValidationRecord {
+    ValidationRecord {
+        status,
+        validator: validator(),
+        content_sha256: sha256_hex(bytes),
+        evidence: vec![ValidationEvidence {
+            kind: "pixel_reference_comparison".into(),
+            summary: "synthetic semantic evidence".into(),
+            details: Some(
+                serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "字"}),
+            ),
+        }],
+    }
+}
+
+fn candidate(label: &str, status: SemanticStatus, distance: f64, margin: f64) -> BatchCandidate {
+    let bytes = bytes(label);
+    let hash = sha256_hex(&bytes);
+    BatchCandidate {
+        storage_path: candidate_path(&hash, DetectedFormat::Gif).unwrap(),
+        sha256: hash,
+        format: DetectedFormat::Gif,
+        technically_valid: status != SemanticStatus::Corrupt,
+        automated: record(&bytes, status, distance, margin),
+        acquisition: None,
+    }
+}
+
+fn acquire(state: &mut KanjiBatch, character: char, candidate: BatchCandidate) {
+    state
+        .record_attempt(
+            &identity(character),
+            BatchAttemptInput::Candidate { candidate },
+        )
+        .unwrap();
+}
+
+fn failed(state: &mut KanjiBatch, character: char) {
+    state
+        .record_attempt(
+            &identity(character),
+            BatchAttemptInput::Failed {
+                code: "network".into(),
+                message: "источник недоступен".into(),
+            },
+        )
+        .unwrap();
+}
+
+struct Temporary {
+    root: PathBuf,
+}
+
+impl Temporary {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "anki-kanji-batch-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        Self { root }
+    }
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+#[test]
+fn large_batch_has_complete_breadth_first_frontier() {
+    let characters: Vec<_> = (0x4E00..0x4E00 + 1000)
+        .map(|code| char::from_u32(code).unwrap())
+        .collect();
+    let mut state = batch(&characters);
+    let first = candidate("first", SemanticStatus::Uncertain, 0.030, 0.001);
+    acquire(&mut state, characters[0], first.clone());
+    assert!(!state.next_round().contains(&identity(characters[0])));
+    assert!(
+        state
+            .record_attempt(
+                &identity(characters[0]),
+                BatchAttemptInput::Candidate { candidate: first }
+            )
+            .is_err()
+    );
+    assert_eq!(state.next_round().len(), 999);
+    for &character in &characters[1..] {
+        failed(&mut state, character);
+    }
+    assert_eq!(state.next_round().len(), 1000);
+    assert!(state.next_round().contains(&identity(characters[0])));
+    state.validate().unwrap();
+}
+
+#[test]
+fn duplicate_hashes_do_not_inflate_semantic_count() {
+    let mut state = batch(&['漢']);
+    let uncertain = candidate("same", SemanticStatus::Uncertain, 0.030, 0.001);
+    for _ in 0..5 {
+        acquire(&mut state, '漢', uncertain.clone());
+    }
+    let item = &state.items[0];
+    assert_eq!(item.status, BatchItemStatus::AwaitingHuman);
+    assert_eq!(item.attempts.len(), 5);
+    assert_eq!(
+        item.attempts
+            .iter()
+            .filter(|attempt| attempt.duplicate_sha256)
+            .count(),
+        4
+    );
+    assert_eq!(item.aggregate.distinct_valid_hashes.len(), 1);
+    assert_eq!(item.aggregate.expected_distance.as_ref().unwrap().count, 1);
+    assert!(state.next_round().is_empty());
+    assert_eq!(state.review_queue().len(), 1);
+    state.validate().unwrap();
+}
+
+#[test]
+fn complementary_distinct_samples_allow_versioned_exact_aggregate() {
+    let mut state = batch(&['漢']);
+    let farther = candidate("farther", SemanticStatus::Uncertain, 0.025, 0.010);
+    let close = candidate("close", SemanticStatus::Uncertain, 0.005, -0.001);
+    let selected = close.sha256.clone();
+    acquire(&mut state, '漢', farther);
+    acquire(&mut state, '漢', close);
+    let item = &state.items[0];
+    assert_eq!(item.status, BatchItemStatus::AutoVerified);
+    assert!(!item.is_ready());
+    assert!(!state.is_resolved());
+    assert_eq!(item.current_sha256.as_deref(), Some(selected.as_str()));
+    let metric = item.aggregate.expected_distance.as_ref().unwrap();
+    assert_eq!(metric.count, 2);
+    assert!((metric.mean - 0.015).abs() < 1e-12);
+    assert_eq!(metric.minimum, 0.005);
+    assert_eq!(metric.maximum, 0.025);
+    let resolution = state.aggregate_decision(&identity('漢')).unwrap().unwrap();
+    assert_eq!(resolution.candidate.sha256, selected);
+    assert_eq!(
+        resolution.candidate.automated.status,
+        SemanticStatus::Uncertain
+    );
+    assert_eq!(resolution.decision.status, SemanticStatus::Verified);
+    assert_eq!(
+        resolution.decision.evidence[0].kind,
+        "kanji_batch_aggregate"
+    );
+    assert_eq!(
+        resolution.decision.evidence[0].details.as_ref().unwrap()["policy"]["version"],
+        AGGREGATE_POLICY_VERSION
+    );
+    state
+        .mark_published_ready(&identity('漢'), &selected, BatchTrustSource::Aggregate)
+        .unwrap();
+    assert!(state.is_resolved());
+    state.validate().unwrap();
+}
+
+#[test]
+fn individual_verified_waits_for_canonical_publication_and_skips_acquisition() {
+    let mut state = batch(&['漢']);
+    let good = candidate("good", SemanticStatus::Verified, 0.01, 0.01);
+    let hash = good.sha256.clone();
+    acquire(&mut state, '漢', good);
+    assert_eq!(state.items[0].status, BatchItemStatus::AutoVerified);
+    assert!(!state.is_resolved());
+    assert!(state.next_round().is_empty());
+    state
+        .mark_published_ready(&identity('漢'), &hash, BatchTrustSource::Automated)
+        .unwrap();
+    assert!(state.items[0].is_ready());
+    assert!(state.is_resolved());
+    state.validate().unwrap();
+}
+
+#[test]
+fn technically_invalid_candidates_are_not_semantic_samples() {
+    let mut state = batch(&['漢']);
+    let mut invalid = candidate("bad-technical", SemanticStatus::Uncertain, 0.0, 1.0);
+    invalid.technically_valid = false;
+    acquire(&mut state, '漢', invalid);
+    acquire(
+        &mut state,
+        '漢',
+        candidate("corrupt", SemanticStatus::Corrupt, 0.0, 1.0),
+    );
+    acquire(
+        &mut state,
+        '漢',
+        candidate("uncertain", SemanticStatus::Uncertain, 0.04, 0.001),
+    );
+    assert_eq!(
+        state.items[0]
+            .aggregate
+            .expected_distance
+            .as_ref()
+            .unwrap()
+            .count,
+        1
+    );
+    assert!(!state.items[0].aggregate.accepted);
+    state.validate().unwrap();
+}
+
+#[test]
+fn metrics_thresholds_and_unknown_policy_fail_closed() {
+    let mut state = batch(&['漢']);
+    acquire(
+        &mut state,
+        '漢',
+        candidate("border", SemanticStatus::Uncertain, 0.0200001, 0.004),
+    );
+    assert!(!state.items[0].aggregate.accepted);
+    state.policy.maximum_expected_distance = 0.03;
+    assert!(state.validate().is_err());
+    state.policy = AggregatePolicy::current(validator());
+    state.policy.version = "unknown".into();
+    assert!(state.validate().is_err());
+}
+
+#[test]
+fn candidate_validator_and_hash_are_pinned() {
+    let mut state = batch(&['漢']);
+    let mut wrong = candidate("wrong-version", SemanticStatus::Uncertain, 0.03, 0.001);
+    wrong.automated.validator.version = "different".into();
+    assert!(
+        state
+            .record_attempt(
+                &identity('漢'),
+                BatchAttemptInput::Candidate { candidate: wrong }
+            )
+            .is_err()
+    );
+    let mut wrong = candidate("wrong-hash", SemanticStatus::Uncertain, 0.03, 0.001);
+    wrong.automated.content_sha256 = "0".repeat(64);
+    assert!(
+        state
+            .record_attempt(
+                &identity('漢'),
+                BatchAttemptInput::Candidate { candidate: wrong }
+            )
+            .is_err()
+    );
+    assert!(state.items[0].attempts.is_empty());
+}
+
+#[test]
+fn human_confirm_retains_automated_status_and_requires_exact_candidate() {
+    let mut state = batch(&['漢']);
+    let candidate = candidate("human", SemanticStatus::Rejected, 0.04, -0.02);
+    let hash = candidate.sha256.clone();
+    for _ in 0..5 {
+        acquire(&mut state, '漢', candidate.clone());
+    }
+    let mut decision = HumanBatchDecision {
+        identity: identity('漢'),
+        candidate_sha256: hash.clone(),
+        action: HumanBatchAction::Confirm,
+        reason: "漢 - подтверждён".into(),
+    };
+    assert!(state.decide(decision.clone(), &bytes("different")).is_err());
+    decision.candidate_sha256 = sha256_hex(bytes("stale"));
+    assert!(state.decide(decision.clone(), &bytes("stale")).is_err());
+    decision.candidate_sha256 = hash.clone();
+    state.decide(decision.clone(), &bytes("human")).unwrap();
+    assert_eq!(state.items[0].status, BatchItemStatus::HumanVerified);
+    assert!(!state.is_resolved());
+    assert_eq!(
+        find_candidate(&state.items[0], &hash)
+            .unwrap()
+            .automated
+            .status,
+        SemanticStatus::Rejected
+    );
+    state
+        .mark_published_ready(&identity('漢'), &hash, BatchTrustSource::Human)
+        .unwrap();
+    let revision = state.revision;
+    state.decide(decision, &bytes("human")).unwrap();
+    assert_eq!(state.revision, revision + 1);
+    assert!(!state.items[0].is_ready());
+    assert_eq!(state.items[0].human_decisions.len(), 1);
+    state
+        .mark_published_ready(&identity('漢'), &hash, BatchTrustSource::Human)
+        .unwrap();
+    state.validate().unwrap();
+}
+
+#[test]
+fn corrupt_candidate_cannot_receive_human_confirmation() {
+    let mut state = batch(&['漢']);
+    let corrupt = candidate("corrupt", SemanticStatus::Corrupt, 0.0, 1.0);
+    acquire(&mut state, '漢', corrupt.clone());
+    let decision = HumanBatchDecision {
+        identity: identity('漢'),
+        candidate_sha256: corrupt.sha256,
+        action: HumanBatchAction::Confirm,
+        reason: "подтверждён".into(),
+    };
+    assert!(state.decide(decision, &bytes("corrupt")).is_err());
+    assert_eq!(state.items[0].status, BatchItemStatus::Unresolved);
+}
+
+#[test]
+fn rejection_of_auto_verified_bytes_overrides_and_only_reacquires_target() {
+    let mut state = batch(&['漢', '字']);
+    let good = candidate("good", SemanticStatus::Verified, 0.01, 0.01);
+    let rejected_hash = good.sha256.clone();
+    acquire(&mut state, '漢', good.clone());
+    state
+        .mark_published_ready(&identity('漢'), &good.sha256, BatchTrustSource::Automated)
+        .unwrap();
+    state
+        .mark_existing_ready(&identity('字'), &"a".repeat(64))
+        .unwrap();
+    let decision = HumanBatchDecision {
+        identity: identity('漢'),
+        candidate_sha256: good.sha256.clone(),
+        action: HumanBatchAction::Reject,
+        reason: "артефакт битый".into(),
+    };
+    state.decide(decision, &bytes("good")).unwrap();
+    assert_eq!(state.next_round(), vec![identity('漢')]);
+    assert!(state.items[1].is_ready());
+    acquire(&mut state, '漢', good);
+    assert_eq!(state.items[0].status, BatchItemStatus::Reacquire);
+    assert_eq!(state.items[0].current_sha256, None);
+    assert!(state.items[0].aggregate.distinct_valid_hashes.is_empty());
+    assert!(state.items[0].attempts[1].duplicate_sha256);
+    acquire(
+        &mut state,
+        '漢',
+        candidate("new-good", SemanticStatus::Verified, 0.01, 0.01),
+    );
+    assert_ne!(
+        state.items[0].current_sha256.as_ref().unwrap(),
+        &rejected_hash
+    );
+    assert_eq!(state.items[0].attempts.len(), 3);
+    state.validate().unwrap();
+}
+
+#[test]
+fn failures_are_item_local_and_candidate_less_queue_can_restart() {
+    let mut state = batch(&['漢', '字']);
+    for round in 0..5 {
+        failed(&mut state, '漢');
+        if round == 0 {
+            acquire(
+                &mut state,
+                '字',
+                candidate("verified-neighbor", SemanticStatus::Verified, 0.01, 0.01),
+            );
+        }
+    }
+    assert_eq!(state.items[0].status, BatchItemStatus::AwaitingHuman);
+    assert_eq!(state.items[1].status, BatchItemStatus::AutoVerified);
+    state
+        .retry_acquisition(
+            &identity('漢'),
+            "повторить после восстановления сети".into(),
+        )
+        .unwrap();
+    assert_eq!(state.next_round(), vec![identity('漢')]);
+    assert_eq!(state.items[0].attempts.len(), 5);
+    state.validate().unwrap();
+}
+
+#[test]
+fn state_and_exact_bytes_resume_after_process_restart() {
+    let temporary = Temporary::new();
+    let mut state = batch(&['漢']);
+    {
+        let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+        assert!(runtime.load().unwrap().is_none());
+        let bytes = bytes("resume");
+        let candidate = runtime
+            .persist_candidate(
+                &bytes,
+                record(&bytes, SemanticStatus::Verified, 0.01, 0.01),
+                true,
+            )
+            .unwrap();
+        acquire(&mut state, '漢', candidate);
+        runtime.save(&state).unwrap();
+    }
+    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    let mut recovered = runtime.load().unwrap().unwrap();
+    assert_eq!(recovered, state);
+    assert!(!recovered.is_resolved());
+    assert!(recovered.next_round().is_empty());
+    let resolution = recovered
+        .aggregate_decision(&identity('漢'))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.read_candidate(&resolution.candidate).unwrap(),
+        bytes("resume")
+    );
+    recovered
+        .mark_published_ready(
+            &identity('漢'),
+            &resolution.candidate.sha256,
+            BatchTrustSource::Automated,
+        )
+        .unwrap();
+    runtime.save(&recovered).unwrap();
+    assert!(recovered.is_resolved());
+}
+
+#[test]
+fn runtime_rejects_path_traversal_symlinks_and_changed_bytes() {
+    let temporary = Temporary::new();
+    assert!(BatchRuntime::open(&temporary.root, "../escape").is_err());
+    let runtime = BatchRuntime::open(&temporary.root, "safe").unwrap();
+    let data = bytes("safe");
+    let mut candidate = runtime
+        .persist_candidate(
+            &data,
+            record(&data, SemanticStatus::Uncertain, 0.03, 0.001),
+            true,
+        )
+        .unwrap();
+    let original_path = candidate.storage_path.clone();
+    candidate.storage_path = "../outside.gif".into();
+    assert_eq!(
+        runtime.read_candidate(&candidate).unwrap_err().code,
+        ErrorCode::PathTraversal
+    );
+    candidate.storage_path = original_path;
+    let actual_path = temporary
+        .root
+        .join(".runtime/batches/safe")
+        .join(&candidate.storage_path);
+    fs::write(&actual_path, bytes("changed")).unwrap();
+    assert_eq!(
+        runtime.read_candidate(&candidate).unwrap_err().code,
+        ErrorCode::IntegrityMismatch
+    );
+    fs::remove_file(&actual_path).unwrap();
+    let outside = temporary.root.join("outside.gif");
+    fs::write(&outside, &data).unwrap();
+    symlink(&outside, &actual_path).unwrap();
+    assert_eq!(
+        runtime.read_candidate(&candidate).unwrap_err().code,
+        ErrorCode::BoundaryViolation
+    );
+}
+
+#[test]
+fn runtime_directory_and_state_symlinks_fail_closed() {
+    let temporary = Temporary::new();
+    let outside = temporary.root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, temporary.root.join(".runtime")).unwrap();
+    assert_eq!(
+        BatchRuntime::open(&temporary.root, "safe")
+            .unwrap_err()
+            .code,
+        ErrorCode::BoundaryViolation
+    );
+    fs::remove_file(temporary.root.join(".runtime")).unwrap();
+    let mut runtime = BatchRuntime::open(&temporary.root, "safe").unwrap();
+    let outside_state = outside.join("state.json");
+    fs::write(&outside_state, "{}").unwrap();
+    symlink(
+        &outside_state,
+        temporary.root.join(".runtime/batches/safe/state.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.load().unwrap_err().code,
+        ErrorCode::BoundaryViolation
+    );
+}
+
+#[test]
+fn interrupted_temporary_write_does_not_replace_durable_state() {
+    let temporary = Temporary::new();
+    let state = batch(&['漢']);
+    {
+        let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+        runtime.save(&state).unwrap();
+        fs::write(
+            temporary
+                .root
+                .join(".runtime/batches/synthetic-batch/.tmp-interrupted"),
+            "{truncated",
+        )
+        .unwrap();
+    }
+    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    assert_eq!(runtime.load().unwrap().unwrap(), state);
+    let mut altered = state.clone();
+    altered.schema_version = 999;
+    assert!(runtime.save(&altered).is_err());
+    assert_eq!(runtime.load().unwrap().unwrap(), state);
+}
+
+#[test]
+fn review_references_exact_gif_and_escapes_machine_evidence() {
+    let temporary = Temporary::new();
+    let mut state = batch(&['漢']);
+    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    let data = bytes("review");
+    let mut automated = record(&data, SemanticStatus::Uncertain, 0.03, 0.001);
+    automated.evidence[0].summary = "<script>alert('unsafe')</script>".into();
+    let candidate = runtime.persist_candidate(&data, automated, true).unwrap();
+    for _ in 0..5 {
+        acquire(&mut state, '漢', candidate.clone());
+    }
+    runtime.save(&state).unwrap();
+    let path = runtime.write_review(&state).unwrap();
+    let html = fs::read_to_string(path).unwrap();
+    assert!(html.contains(&format!("src=\"{}\"", candidate.storage_path)));
+    assert!(html.contains(&candidate.sha256));
+    assert!(!html.contains("<script>"));
+    assert!(html.contains("&lt;script&gt;"));
+    assert!(html.contains("independent valid SHA: 1"));
+    assert_eq!(runtime.load().unwrap().unwrap(), state);
+}
+
+#[test]
+fn tampered_aggregate_and_acquisition_counts_are_rejected() {
+    let mut state = batch(&['漢']);
+    acquire(
+        &mut state,
+        '漢',
+        candidate("uncertain", SemanticStatus::Uncertain, 0.03, 0.001),
+    );
+    let mut tampered = state.clone();
+    tampered.items[0].aggregate.accepted = true;
+    assert!(tampered.validate().is_err());
+    let mut tampered = state.clone();
+    tampered.items[0].attempts[0].round = 5;
+    assert!(tampered.validate().is_err());
+    state.items[0].attempts[0].duplicate_sha256 = true;
+    assert!(state.validate().is_err());
+}

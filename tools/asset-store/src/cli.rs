@@ -22,6 +22,10 @@ use crate::yarxi::{AcquiredMedia, SelectionResult, acquire_many};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+#[path = "batch_cli.rs"]
+mod batch_cli;
+pub use batch_cli::{BatchActionArg, BatchCommand};
+
 /// Командная строка `kanji-assets`.
 #[derive(Debug, Parser)]
 #[command(
@@ -79,6 +83,11 @@ pub enum Command {
         /// Один или несколько символов; каждый аргумент должен содержать один Unicode scalar.
         #[arg(required = true, num_args = 1..)]
         characters: Vec<String>,
+    },
+    /// Resumable acquisition/refinement/human review без Git publication.
+    Batch {
+        #[command(subcommand)]
+        command: BatchCommand,
     },
     /// Запускает production semantic validator для существующего корпуса.
     Validate {
@@ -158,6 +167,8 @@ struct AssetSummary {
     sha256: Option<String>,
     previous_sha256: Option<String>,
     validation_status: Option<SemanticStatus>,
+    effective_status: Option<SemanticStatus>,
+    human_decision: Option<crate::model::HumanDecision>,
     validator: Option<ValidatorIdentity>,
     evidence: Vec<crate::model::ValidationEvidence>,
     domain_metadata: Option<serde_json::Value>,
@@ -249,6 +260,7 @@ pub fn execute(cli: Cli) -> CliOutput {
             .collect::<Result<Vec<_>, _>>()
             .map(|_| (None, None))
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message)),
+        Command::Batch { command } => batch_cli::prevalidate(command).map(|_| (None, None)),
         Command::Validate { .. } => Ok((None, None)),
         _ => Ok((None, None)),
     };
@@ -274,7 +286,16 @@ pub fn execute(cli: Cli) -> CliOutput {
     }
     let open_existing = matches!(
         &cli.command,
-        Command::List | Command::Plan { .. } | Command::Validate { .. }
+        Command::List
+            | Command::Plan { .. }
+            | Command::Validate { .. }
+            | Command::Batch {
+                command: BatchCommand::Run { .. }
+                    | BatchCommand::Status { .. }
+                    | BatchCommand::Review { .. }
+                    | BatchCommand::Decide { .. }
+                    | BatchCommand::Retry { .. }
+            }
     );
     let open_result = if open_existing {
         AssetStore::open_existing(options)
@@ -287,6 +308,15 @@ pub fn execute(cli: Cli) -> CliOutput {
                 path: store.root().display().to_string(),
                 store_id: Some(store.store_id().to_owned()),
             };
+            if let Command::Batch { command } = &cli.command {
+                return batch_cli::execute(
+                    &store,
+                    store_summary,
+                    command,
+                    cli.output,
+                    cli.allow_insecure_tls,
+                );
+            }
             match execute_with_store(
                 &store,
                 store_summary.clone(),
@@ -441,6 +471,7 @@ impl Command {
             Self::Plan { .. } => "plan",
             Self::Ensure { .. } => "ensure",
             Self::Validate { .. } => "validate",
+            Self::Batch { command } => command.operation(),
         }
     }
 }
@@ -483,6 +514,7 @@ fn execute_with_store(
                 IngestRequest {
                     identity: character.identity(),
                     source_path: file,
+                    expected_source_sha256: None,
                     domain_metadata: Some(character.metadata()),
                     replace_expected_sha256,
                 },
@@ -494,6 +526,8 @@ fn execute_with_store(
                 })?,
             )?;
             let summary = AssetSummary {
+                effective_status: outcome.asset.effective_status(),
+                human_decision: outcome.asset.current_human_decision(),
                 identity: outcome.asset.identity.clone(),
                 from_state: outcome.previous.as_ref().map(|asset| asset.lifecycle),
                 to_state: Some(outcome.asset.lifecycle),
@@ -580,6 +614,10 @@ fn execute_with_store(
         Command::Ensure { characters } => {
             ensure_characters(store, store_summary, characters, allow_insecure_tls)
         }
+        Command::Batch { .. } => Err(AssetError::new(
+            ErrorCode::InvalidTransition,
+            "batch требует отдельного CLI adapter",
+        )),
         Command::Validate { mode } => {
             let selection_mode: SelectionMode = mode.into();
             let validator = KanjiImageValidator::new();
@@ -601,6 +639,8 @@ fn execute_with_store(
                     ));
                 }
                 summaries.push(AssetSummary {
+                    effective_status: None,
+                    human_decision: None,
                     identity: attempt.identity.clone(),
                     from_state: Some(attempt.from_state),
                     to_state: Some(attempt.to_state),
@@ -670,12 +710,7 @@ fn ensure_characters(
             .iter()
             .find(|asset| asset.identity == character.identity());
         let is_current = existing.is_some_and(|asset| {
-            asset.lifecycle == LifecycleState::Verified
-                && asset.validation.as_ref().is_some_and(|decision| {
-                    decision.status == SemanticStatus::Verified
-                        && decision.content_sha256 == asset.sha256
-                        && decision.validator == validator_id
-                })
+            asset.lifecycle == LifecycleState::Verified && asset.is_trusted_for(&validator_id)
         });
         if is_current {
             let mut summary =
@@ -764,6 +799,8 @@ fn ensure_characters(
                             if outcome.status != SemanticStatus::Verified {
                                 blockers.push(format!("{}:{character}", outcome.status.as_str()));
                                 summaries[target_index] = Some(AssetSummary {
+                                    effective_status: Some(outcome.status),
+                                    human_decision: None,
                                     identity: KanjiCharacter(character.clone()).identity(),
                                     from_state: old.map(|asset| asset.lifecycle),
                                     to_state: None,
@@ -810,7 +847,7 @@ fn ensure_characters(
     let assets: Vec<_> = summaries.into_iter().flatten().collect();
     let successful = blockers.is_empty()
         && assets.iter().all(|asset| {
-            asset.validation_status == Some(SemanticStatus::Verified)
+            asset.effective_status == Some(SemanticStatus::Verified)
                 && asset.to_state == Some(LifecycleState::Verified)
         });
     let changed = assets.iter().any(|asset| asset.changed) || store.initialized_on_open();
@@ -869,6 +906,8 @@ fn failed_summary(
         sha256: hash,
         previous_sha256: None,
         validation_status: None,
+        effective_status: None,
+        human_decision: None,
         validator: None,
         evidence: if message.is_empty() {
             evidence
@@ -889,6 +928,8 @@ fn failed_summary(
 
 fn summary_for_current(record: AssetRecord) -> AssetSummary {
     AssetSummary {
+        effective_status: record.effective_status(),
+        human_decision: record.current_human_decision(),
         identity: record.identity,
         from_state: Some(record.lifecycle),
         to_state: Some(record.lifecycle),
@@ -1128,6 +1169,7 @@ mod tests {
                 IngestRequest {
                     identity: AssetIdentity::new("generic", "source-boundary").unwrap(),
                     source_path: candidate,
+                    expected_source_sha256: None,
                     domain_metadata: None,
                     replace_expected_sha256: None,
                 },

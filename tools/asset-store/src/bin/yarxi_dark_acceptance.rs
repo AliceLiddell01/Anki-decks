@@ -146,6 +146,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             },
             lifecycle: LifecycleState::Pending,
             validation: None,
+            human_attestation: None,
             domain_metadata: None,
         };
         let decision = validator.validate(&provisional, &mut Cursor::new(&media.bytes));

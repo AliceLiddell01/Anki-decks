@@ -48,10 +48,99 @@ struct Processor {
     #[serde(rename = "type")]
     kind: ProcessorType,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum ProcessorType {
     KanjiAssets,
+}
+
+/// Обработчик владеет только теми ссылками, которые сам распознал. Включение
+/// обработчика на поле не разрешает остальные ссылки и не меняет HTML поля.
+trait MediaProcessor {
+    fn name(&self) -> &'static str;
+    fn claim(&self, reference: &media::MediaReference) -> Option<AssetIdentity>;
+}
+impl MediaProcessor for ProcessorType {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::KanjiAssets => "kanji_assets",
+        }
+    }
+    fn claim(&self, reference: &media::MediaReference) -> Option<AssetIdentity> {
+        match self {
+            Self::KanjiAssets => {
+                if reference.element != "img" || reference.attribute != "src" {
+                    return None;
+                }
+                let (stem, ext) = reference.value.rsplit_once('.')?;
+                if !matches!(ext, "gif" | "png")
+                    || asset_store::kanji_domain::parse_kanji_character(stem).is_err()
+                {
+                    return None;
+                }
+                AssetIdentity::new("kanji", stem).ok()
+            }
+        }
+    }
+}
+
+/// Цепочка исполняется в порядке YAML. План публикуется только после проверки
+/// единственного владельца каждой ссылки и полного fail-closed media-гейта.
+fn collect_processor_chain(
+    processors: &[&dyn MediaProcessor],
+    note_index: usize,
+    uuid: &str,
+    field: &str,
+    value: &str,
+) -> Result<Vec<Reference>, DomainError> {
+    let html = media::html_media_references(value);
+    let mut owners: Vec<Option<(&str, AssetIdentity)>> = vec![None; html.len()];
+    for processor in processors {
+        for (reference, owner) in html.iter().zip(&mut owners) {
+            let Some(identity) = processor.claim(reference) else {
+                continue;
+            };
+            if let Some((previous, previous_identity)) = owner {
+                return Err(blocker(
+                    ErrorCode::MediaForbidden,
+                    "media_reference_conflict",
+                    json!({"field": field, "reference": reference.value,
+                        "processors": [previous, processor.name()],
+                        "identities": [previous_identity, &identity]}),
+                ));
+            }
+            *owner = Some((processor.name(), identity));
+        }
+    }
+    let mut refs = Vec::new();
+    for (reference, owner) in html.into_iter().zip(owners) {
+        let Some((_, identity)) = owner else {
+            return Err(blocker(
+                ErrorCode::MediaForbidden,
+                "media_reference_unclaimed",
+                json!({"field": field, "reference": reference.value}),
+            ));
+        };
+        refs.push(Reference {
+            note_index,
+            model_uuid: uuid.into(),
+            field: field.into(),
+            filename: reference.value,
+            identity,
+        });
+    }
+    let mut observed = media::forbidden_media_references(value);
+    let mut claimed = refs.iter().map(|r| r.filename.clone()).collect::<Vec<_>>();
+    observed.sort();
+    claimed.sort();
+    if observed != claimed {
+        return Err(blocker(
+            ErrorCode::MediaForbidden,
+            "media_reference_unclaimed",
+            json!({"field": field, "references": observed}),
+        ));
+    }
+    Ok(refs)
 }
 
 pub fn blocker(code: ErrorCode, reason: &str, details: Value) -> DomainError {
@@ -167,12 +256,22 @@ impl Routing {
                 ));
             }
             for (name, field) in &rule.fields {
-                if name.is_empty() || field.processors.len() != 1 {
+                if name.is_empty() || field.processors.is_empty() {
                     return Err(blocker(
                         ErrorCode::InvalidRequest,
                         "config_invalid",
                         json!({"field": name}),
                     ));
+                }
+                let mut processors = BTreeSet::new();
+                for processor in &field.processors {
+                    if !processors.insert(&processor.kind) {
+                        return Err(blocker(
+                            ErrorCode::InvalidRequest,
+                            "config_invalid",
+                            json!({"field": name, "duplicate_processor": processor.kind.name()}),
+                        ));
+                    }
                 }
             }
         }
@@ -193,17 +292,7 @@ impl Routing {
                 json!({"model_uuid": uuid, "field": stale}),
             ));
         }
-        Ok(rule
-            .fields
-            .iter()
-            .filter(|(_, field)| {
-                field
-                    .processors
-                    .iter()
-                    .any(|p| matches!(p.kind, ProcessorType::KanjiAssets))
-            })
-            .map(|(name, _)| name.clone())
-            .collect())
+        Ok(rule.fields.keys().cloned().collect())
     }
     pub fn collect(
         &self,
@@ -230,65 +319,25 @@ impl Routing {
                     json!({"model_uuid": uuid, "field": field, "references": forbidden}),
                 ));
             }
-            let html = media::html_media_references(value);
-            // Каждая ссылка, запрещённая по умолчанию, должна отдельно
-            // соответствовать допустимому img/src. CSS, ссылки вида
-            // `[sound:...]`, атрибут srcset и незакрытые конструкции не
-            // считаются разрешёнными.
-            let mut claimed = Vec::new();
-            for reference in html {
-                if reference.element != "img" || reference.attribute != "src" {
-                    return Err(blocker(
-                        ErrorCode::MediaForbidden,
-                        "media_reference_unclaimed",
-                        json!({"reference": reference.value, "field": field}),
-                    ));
-                }
-                let Some((stem, ext)) = reference.value.rsplit_once('.') else {
-                    return Err(blocker(
-                        ErrorCode::MediaForbidden,
-                        "media_reference_unclaimed",
-                        json!({"reference": reference.value}),
-                    ));
-                };
-                if !matches!(ext, "gif" | "png")
-                    || asset_store::kanji_domain::parse_kanji_character(stem).is_err()
-                {
-                    return Err(blocker(
-                        ErrorCode::MediaForbidden,
-                        "media_reference_unclaimed",
-                        json!({"reference": reference.value}),
-                    ));
-                }
-                let identity = match AssetIdentity::new("kanji", stem) {
-                    Ok(identity) => identity,
-                    Err(_) => {
-                        return Err(blocker(
-                            ErrorCode::MediaForbidden,
-                            "media_reference_unclaimed",
-                            json!({"reference": &reference.value, "field": field}),
-                        ));
-                    }
-                };
-                claimed.push(reference.value.clone());
-                refs.push(Reference {
-                    note_index,
-                    model_uuid: uuid.into(),
-                    field: field.clone(),
-                    filename: reference.value,
-                    identity,
-                });
-            }
-            let mut observed = forbidden.clone();
-            observed.sort();
-            claimed.sort();
-            if observed != claimed {
-                return Err(blocker(
-                    ErrorCode::MediaForbidden,
-                    "media_reference_unclaimed",
-                    json!({"field": field, "references": forbidden}),
-                ));
-            }
+            // Выбор строго по UUID и точному полю уже проверен через fields().
+            let chain = &self
+                .policy
+                .as_ref()
+                .and_then(|p| p.note_models.iter().find(|m| m.crowdanki_uuid == uuid))
+                .and_then(|m| m.fields.get(field))
+                .expect("enabled field has a configured processor chain")
+                .processors;
+            let processors = chain
+                .iter()
+                .map(|p| &p.kind as &dyn MediaProcessor)
+                .collect::<Vec<_>>();
+            refs.extend(collect_processor_chain(
+                &processors,
+                note_index,
+                uuid,
+                field,
+                value,
+            )?);
         }
         Ok(enabled.into_iter().collect())
     }

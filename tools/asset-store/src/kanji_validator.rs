@@ -805,7 +805,16 @@ fn relax(distances: &mut [f32], x: usize, y: usize, other_x: usize, other_y: usi
 }
 
 #[cfg(test)]
+pub(crate) fn synthetic_reference_png(character: char) -> Vec<u8> {
+    tests::reference_png(character)
+}
+
+#[cfg(test)]
 mod tests {
+    pub(super) fn reference_png(character: char) -> Vec<u8> {
+        png_for(&reference(character))
+    }
+
     use super::*;
     use image::codecs::gif::GifEncoder;
     use image::{Delay, Frame, ImageBuffer, ImageFormat};
@@ -1247,6 +1256,7 @@ mod tests {
             },
             lifecycle: LifecycleState::Pending,
             validation: None,
+            human_attestation: None,
             domain_metadata: None,
         }
     }
