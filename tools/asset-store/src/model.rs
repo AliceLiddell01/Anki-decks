@@ -209,6 +209,21 @@ pub struct ValidationRecord {
     pub evidence: Vec<ValidationEvidence>,
 }
 
+impl ValidationRecord {
+    /// Проверяет, что автоматическое решение содержит пригодные данные и
+    /// относится к ожидаемому точному хешу.
+    pub(crate) fn is_valid_for_sha(&self, sha256: &str) -> bool {
+        self.content_sha256 == sha256
+            && is_sha256(&self.content_sha256)
+            && ValidatorIdentity::new(self.validator.id.clone(), self.validator.version.clone())
+                .is_ok()
+            && !self.evidence.is_empty()
+            && self.evidence.iter().all(|evidence| {
+                !evidence.kind.trim().is_empty() && !evidence.summary.trim().is_empty()
+            })
+    }
+}
+
 /// Явное semantic решение человека для конкретных bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -256,25 +271,39 @@ impl AssetRecord {
         self.human_attestation
             .as_ref()
             .filter(|attestation| {
-                attestation.identity == self.identity && attestation.content_sha256 == self.sha256
+                attestation.identity == self.identity
+                    && attestation.content_sha256 == self.sha256
+                    && !attestation.reason.trim().is_empty()
             })
             .map(|attestation| attestation.decision)
+    }
+
+    /// Automated decision, только если его hash и evidence корректны для текущих bytes.
+    pub(crate) fn current_validation_status(&self) -> Option<SemanticStatus> {
+        self.validation
+            .as_ref()
+            .filter(|decision| decision.is_valid_for_sha(&self.sha256))
+            .map(|decision| decision.status)
+    }
+
+    /// Есть ли пригодное automated evidence для текущего hash.
+    pub(crate) fn has_current_validation(&self) -> bool {
+        self.current_validation_status().is_some()
     }
 
     /// Semantic trust после применения human override. Вызывающий обязан сначала
     /// проверить physical integrity; этот метод не читает и не декодирует bytes.
     pub fn effective_status(&self) -> Option<SemanticStatus> {
-        let automated = self
-            .validation
-            .as_ref()
-            .filter(|decision| decision.content_sha256 == self.sha256)
-            .map(|decision| decision.status);
+        let automated = self.current_validation_status();
         if automated == Some(SemanticStatus::Corrupt) {
             return automated;
         }
         match self.current_human_decision() {
             Some(HumanDecision::Reject) => Some(SemanticStatus::Rejected),
-            Some(HumanDecision::Approve) => Some(SemanticStatus::Verified),
+            Some(HumanDecision::Approve) if self.has_current_validation() => {
+                Some(SemanticStatus::Verified)
+            }
+            Some(HumanDecision::Approve) => None,
             None => automated,
         }
     }
@@ -283,11 +312,17 @@ impl AssetRecord {
     pub fn is_trusted_for(&self, validator: &ValidatorIdentity) -> bool {
         self.effective_status() == Some(SemanticStatus::Verified)
             && (self.current_human_decision() == Some(HumanDecision::Approve)
-                || self
-                    .validation
-                    .as_ref()
-                    .is_some_and(|decision| &decision.validator == validator))
+                || self.validation.as_ref().is_some_and(|decision| {
+                    decision.is_valid_for_sha(&self.sha256) && &decision.validator == validator
+                }))
     }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Канонический persistent manifest.

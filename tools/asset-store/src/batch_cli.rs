@@ -1,4 +1,4 @@
-//! Thin CLI orchestration of kanji batch state and generic asset owner.
+//! Тонкий CLI-слой для управления пакетами кандзи и общим владельцем ресурсов.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -6,7 +6,8 @@ use std::io::{Cursor, Read};
 
 use crate::batch::{
     AggregateResolution, BatchAttemptInput, BatchCandidate, BatchItemStatus, BatchRuntime,
-    BatchTrustSource, HumanBatchAction, HumanBatchDecision, KanjiBatch,
+    BatchTrustSource, HumanBatchAction, HumanBatchDecision, KanjiBatch, MAX_ACQUISITION_ROUNDS,
+    MAX_HUMAN_REASON_BYTES,
 };
 use crate::model::{HumanDecision, Provenance, SemanticDecision, ValidationRecord};
 use crate::store::{HumanAttestationRequest, validate_image_decode};
@@ -14,31 +15,31 @@ use crate::validation::ValidatorFailure;
 
 #[derive(Debug, Subcommand)]
 pub enum BatchCommand {
-    /// Создаёт persistent batch; trusted corpus reuse проверяется без acquisition.
+    /// Создаёт сохранённый пакет; повторное использование доверенных ресурсов проверяется без нового получения.
     Start {
         #[arg(long)]
         batch_id: Option<String>,
         #[arg(required = true, num_args = 1..)]
         characters: Vec<String>,
     },
-    /// Продолжает batch breadth-first, не более указанного количества раундов.
+    /// Продолжает пакет по уровням, не более указанного числа раундов.
     Run {
         #[arg(long)]
         batch_id: String,
-        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=5))]
+        #[arg(long, default_value_t = MAX_ACQUISITION_ROUNDS)]
         rounds: u32,
     },
-    /// Возвращает state/evidence, не запускает acquisition или publication.
+    /// Возвращает состояние и свидетельства, не запускает получение или публикацию.
     Status {
         #[arg(long)]
         batch_id: String,
     },
-    /// Создаёт локальный HTML по всем unresolved candidates после лимита.
+    /// Создаёт локальную HTML-страницу со всеми неразрешёнными кандидатами после достижения лимита.
     Review {
         #[arg(long)]
         batch_id: String,
     },
-    /// Структурированное human decision для exact текущих bytes.
+    /// Структурированное решение человека для точных текущих байтов.
     Decide {
         #[arg(long)]
         batch_id: String,
@@ -51,7 +52,7 @@ pub enum BatchCommand {
         #[arg(long)]
         reason: String,
     },
-    /// Targeted acquisition restart. При наличии candidate требуется exact SHA.
+    /// Повторно запускает получение для одного элемента. При наличии кандидата требуется точный SHA-256.
     Retry {
         #[arg(long)]
         batch_id: String,
@@ -115,7 +116,7 @@ pub(super) fn prevalidate(command: &BatchCommand) -> Result<(), AssetError> {
                 parse_character(character)?;
             }
             if characters.is_empty() {
-                return Err(invalid("batch не может быть пустым"));
+                return Err(invalid("пакет не может быть пустым"));
             }
         }
         BatchCommand::Decide {
@@ -140,8 +141,10 @@ pub(super) fn prevalidate(command: &BatchCommand) -> Result<(), AssetError> {
             }
             validate_reason(reason)?;
         }
-        BatchCommand::Run { rounds, .. } if !(1..=5).contains(rounds) => {
-            return Err(invalid("rounds должен быть от 1 до 5"));
+        BatchCommand::Run { rounds, .. } if !(1..=MAX_ACQUISITION_ROUNDS).contains(rounds) => {
+            return Err(invalid(format!(
+                "число раундов должно быть от 1 до {MAX_ACQUISITION_ROUNDS}"
+            )));
         }
         _ => {}
     }
@@ -195,7 +198,7 @@ struct BatchResponse {
     issues: Vec<BatchIssue>,
     blockers: Vec<String>,
     review_artifact: Option<String>,
-    /// Domain source of truth remains the persistent owner state.
+    /// Источник истины предметной области остаётся в сохранённом состоянии владельца.
     batch: KanjiBatch,
 }
 
@@ -211,28 +214,31 @@ pub(super) fn execute(
             OutputFormat::Json => CliOutput {
                 stdout: format!(
                     "{}\n",
-                    serde_json::to_string_pretty(&response).expect("finite batch response")
+                    serde_json::to_string_pretty(&response)
+                        .expect("ответ пакета содержит конечные сериализуемые значения")
                 ),
                 stderr: String::new(),
                 exit_code,
             },
             OutputFormat::Human => {
                 let mut text = format!(
-                    "{}: {} (batch={})\n",
-                    response.operation, response.outcome, response.batch_id
+                    "Операция: {}; результат: {}; пакет: {}\n",
+                    localized_operation(&response.operation),
+                    localized_outcome(response.outcome),
+                    response.batch_id
                 );
                 for item in &response.items {
                     text.push_str(&format!(
-                        "{}  {}  {}  attempts={} distinct={}\n",
+                        "{}  {}  {}  попыток_получения={} разных_кандидатов_SHA-256={}\n",
                         item.identity,
-                        item.item_outcome,
+                        localized_item_outcome(item.item_outcome),
                         item.candidate_sha256.as_deref().unwrap_or("-"),
                         item.acquisition_attempts,
                         item.distinct_valid_hashes
                     ));
                 }
                 if let Some(path) = response.review_artifact {
-                    text.push_str(&format!("review: {path}\n"));
+                    text.push_str(&format!("Страница проверки: {path}\n"));
                 }
                 for issue in &response.issues {
                     text.push_str(&format!(
@@ -258,8 +264,47 @@ pub(super) fn execute(
     }
 }
 
-/// One checked full-corpus read. Indexed records are reused for the whole
-/// boundary; mutations keep this local view current via exact owner outcomes.
+fn localized_operation(operation: &str) -> &str {
+    match operation {
+        "batch_start" => "создание пакета",
+        "batch_run" => "обработка пакета",
+        "batch_status" => "просмотр состояния пакета",
+        "batch_review" => "создание страницы проверки",
+        "batch_decide" => "решение человека",
+        "batch_retry" => "повторное получение",
+        other => other,
+    }
+}
+
+fn localized_outcome(outcome: &str) -> &str {
+    match outcome {
+        "started" => "создан",
+        "already_started" => "уже существовал",
+        "resolved" => "разрешён",
+        "partial_progress" => "есть частичный прогресс",
+        "awaiting_human" => "ожидает решения человека",
+        "decision_applied" => "решение применено",
+        "publication_blocked" => "публикация заблокирована",
+        "reacquire_scheduled" => "повторное получение запланировано",
+        "ok" => "успешно",
+        other => other,
+    }
+}
+
+fn localized_item_outcome(outcome: &str) -> &str {
+    match outcome {
+        "effective_verified" => "подтверждён владельцем",
+        "pending_publication" => "ожидает публикации",
+        "awaiting_human" => "ожидает решения человека",
+        "reacquire_scheduled" => "ожидает повторного получения",
+        "unresolved" => "не разрешён",
+        other => other,
+    }
+}
+
+/// Один раз проверенный полный снимок корпуса. Индексированные записи повторно
+/// используются на всей границе; изменения обновляют этот локальный вид по
+/// точным результатам владельца.
 struct OwnerSnapshot {
     records: BTreeMap<AssetIdentity, AssetRecord>,
     error: Option<AssetError>,
@@ -357,7 +402,7 @@ fn execute_command_with_snapshots(
                     || state.policy.validator != KanjiImageValidator::validator_identity()
                 {
                     return Err(invalid(
-                        "batch_id уже принадлежит другому requested set/validator",
+                        "batch_id уже связан с другим набором identity или валидатором",
                     ));
                 }
                 let revision = state.revision;
@@ -523,7 +568,7 @@ fn load_required(runtime: &mut BatchRuntime) -> Result<KanjiBatch, AssetError> {
     runtime.load()?.ok_or_else(|| {
         AssetError::new(
             ErrorCode::MissingAssetFile,
-            "batch отсутствует; сначала выполните batch start",
+            "пакет отсутствует; сначала выполните команду batch start",
         )
     })
 }
@@ -551,6 +596,11 @@ fn run_batch_with_snapshots<F>(
 where
     F: FnMut(&[String]) -> Result<Vec<Result<AcquiredMedia, String>>, String>,
 {
+    if !(1..=MAX_ACQUISITION_ROUNDS).contains(&rounds) {
+        return Err(invalid(format!(
+            "число раундов должно быть от 1 до {MAX_ACQUISITION_ROUNDS}"
+        )));
+    }
     let mut issues = Vec::new();
     let initial_revision;
     {
@@ -562,8 +612,8 @@ where
         reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
         runtime.save(&state)?;
         snapshot.checked()?;
-        // Durable intents resume before reuse; exact owner mutation outcomes
-        // update the snapshot without scanning neighboring corpus files again.
+        // Сначала возобновляются сохранённые намерения; точные результаты
+        // изменений у владельца обновляют снимок без повторного обхода соседних файлов.
         publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
         reuse_existing(&snapshot, &mut state)?;
         runtime.save(&state)?;
@@ -580,7 +630,7 @@ where
                         .items
                         .iter()
                         .find(|item| &item.identity == identity)
-                        .expect("frontier identity");
+                        .expect("элемент границы обхода присутствует в состоянии");
                     (item.generation, item.attempts.len())
                 })
                 .collect();
@@ -593,7 +643,7 @@ where
             .iter()
             .map(|identity| identity.key.clone())
             .collect();
-        // Runtime locks are released during network/browser acquisition.
+        // Блокировка runtime снимается на время получения по сети или в браузере.
         let acquired = acquire(&characters);
         let mut snapshot = reader.capture(store);
         {
@@ -605,9 +655,9 @@ where
             reuse_existing(&snapshot, &mut state)?;
             runtime.save(&state)?;
         }
-        // Один runtime на весь frontier: exclusive lock удерживается от первого
-        // до последнего item, а state читается один раз вместо повторного
-        // чтения и перепроверки candidates на каждый item.
+        // Один runtime на всю границу обхода: исключительная блокировка
+        // удерживается от первого до последнего элемента, состояние читается
+        // один раз вместо повторного чтения и проверки кандидатов для каждого.
         {
             let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
             let mut state = load_required(&mut runtime)?;
@@ -616,7 +666,7 @@ where
                     .items
                     .iter()
                     .find(|item| &item.identity == identity)
-                    .expect("frontier requested identity");
+                    .expect("запрошенная identity присутствует в границе обхода");
                 if (item.generation, item.attempts.len()) != generations[index]
                     || !state.next_round().contains(identity)
                 {
@@ -628,7 +678,7 @@ where
                         Some(Err(message)) => Ok(failure("acquisition_failed", message)),
                         None => Ok(failure(
                             "provider_outcome_mismatch",
-                            "provider outcome count mismatch",
+                            "число результатов поставщика не совпадает с числом запрошенных элементов",
                         )),
                     },
                     Err(message) => Ok(failure("acquisition_failed", message)),
@@ -644,14 +694,15 @@ where
                     }
                     Err(error) => return Err(error),
                 }
-                // Persist each exact outcome; no full owner snapshot inside this loop.
+                // Сохраняем каждый точный результат; полный снимок владельца
+                // внутри этого цикла не перечитывается.
                 runtime.save(&state)?;
             }
         }
         {
             let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
             let mut state = load_required(&mut runtime)?;
-            // A newly acquired hash may already be explicitly rejected by owner.
+            // Владелец мог уже явно отклонить только что полученный SHA-256.
             reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
             runtime.save(&state)?;
             publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
@@ -672,8 +723,9 @@ fn validated_candidate(
     identity: &AssetIdentity,
     media: &AcquiredMedia,
 ) -> Result<BatchAttemptInput, AssetError> {
-    // Provider evidence хранит Unicode статьи как hex code point, а identity —
-    // сам character. Сравнение идёт с точным code point requested identity.
+    // Свидетельства поставщика хранят Unicode статьи как шестнадцатеричную
+    // кодовую точку, а identity — сам символ. Сравнивается точная кодовая точка
+    // запрошенной identity.
     let expected_code = match parse_kanji_character(&identity.key) {
         Ok(character) => format!("{:X}", u32::from(character)),
         Err(message) => return Ok(failure("source_identity_mismatch", &message)),
@@ -687,7 +739,7 @@ fn validated_candidate(
     {
         return Ok(failure(
             "source_identity_mismatch",
-            "Yarxi character/article Unicode не совпадает с requested identity",
+            "символ или Unicode статьи Yarxi не совпадает с запрошенной identity",
         ));
     }
     if let Err(message) = validate_selected_format(media.selection, &media.bytes) {
@@ -729,8 +781,9 @@ fn reuse_existing(snapshot: &OwnerSnapshot, state: &mut KanjiBatch) -> Result<()
     Ok(())
 }
 
-/// Snapshot integrity was checked once by the owner. Readiness uses indexed
-/// exact identity/hash/current trust, never per-item full-manifest reads.
+/// Целостность снимка владелец проверил один раз. Готовность определяется по
+/// индексированной точной identity, SHA-256 и текущему доверию без полного
+/// перечитывания манифеста для каждого элемента.
 fn reconcile_owner_trust(
     snapshot: &OwnerSnapshot,
     state: &mut KanjiBatch,
@@ -747,7 +800,7 @@ fn reconcile_owner_trust(
                 reason: record
                     .human_attestation
                     .as_ref()
-                    .expect("current human decision")
+                    .expect("текущее решение человека присутствует в состоянии")
                     .reason
                     .chars()
                     .take(900)
@@ -776,23 +829,23 @@ fn reconcile_owner_trust(
             if record.sha256 != item.published_sha256.as_deref().unwrap_or("") {
                 AssetError::new(
                     ErrorCode::IdentityConflict,
-                    "saved ready SHA отличается от exact current owner bytes",
+                    "сохранённый готовый SHA-256 отличается от точных текущих байтов владельца",
                 )
             } else {
                 AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
-                    "owner не подтверждает expected canonical trust",
+                    "владелец не подтверждает ожидаемое каноническое доверие",
                 )
             }
         } else {
             AssetError::new(
                 ErrorCode::MissingAssetFile,
-                "ready identity отсутствует в checked owner snapshot",
+                "готовая identity отсутствует в проверенном снимке владельца",
             )
         };
         state.invalidate_owner_trust(
             &item.identity,
-            format!("owner trust утрачен: {}", error.code.as_str()),
+            format!("доверие владельца утрачено: {}", error.code.as_str()),
             owner_rejection,
         )?;
         issues.push(issue(&item.identity, &error));
@@ -870,7 +923,7 @@ fn publish_automated(
         .items
         .iter()
         .find(|item| &item.identity == identity)
-        .expect("batch identity");
+        .expect("identity пакета присутствует в загруженном состоянии");
     let candidate = current_candidate(item)?;
     let bytes = runtime.read_candidate(candidate)?;
     let request = verified_request(snapshot, identity, bytes, candidate)?;
@@ -880,9 +933,9 @@ fn publish_automated(
             BatchTrustSource::Automated,
         )
     } else {
-        let resolution = state
-            .aggregate_decision(identity)?
-            .ok_or_else(|| invalid("auto candidate не имеет положительного aggregate evidence"))?;
+        let resolution = state.aggregate_decision(identity)?.ok_or_else(|| {
+            invalid("автоматический кандидат не имеет положительного свидетельства агрегации")
+        })?;
         (
             store.ingest_verified(request, &AggregateValidator { resolution })?,
             BatchTrustSource::Aggregate,
@@ -890,7 +943,7 @@ fn publish_automated(
     };
     let record = outcome
         .asset
-        .ok_or_else(|| invalid("owner не опубликовал batch candidate"))?;
+        .ok_or_else(|| invalid("владелец не опубликовал кандидата пакета"))?;
     if outcome.status != SemanticStatus::Verified
         || outcome.sha256 != candidate.sha256
         || record.identity != *identity
@@ -899,11 +952,12 @@ fn publish_automated(
         || !record.is_trusted_for(&state.policy.validator)
     {
         return Err(invalid(
-            "exact owner commit не подтверждает batch candidate trust",
+            "точный коммит владельца не подтверждает доверие к кандидату пакета",
         ));
     }
-    // Owner just checked/staged/committed these exact bytes under CAS. A final
-    // boundary snapshot handles later concurrent edits; no full reread per item.
+    // Владелец только что проверил, подготовил или зафиксировал эти точные байты
+    // с помощью CAS. Итоговый снимок границы учитывает последующие конкурентные
+    // изменения; повторное полное чтение для каждого элемента не требуется.
     snapshot.committed(record);
     Ok((candidate.sha256.clone(), source))
 }
@@ -917,11 +971,13 @@ fn publish_human(
     let decision = item
         .human_decisions
         .last()
-        .ok_or_else(|| invalid("human candidate не имеет decision"))?;
+        .ok_or_else(|| invalid("для кандидата человека отсутствует решение"))?;
     let candidate = current_candidate(item)?;
     if decision.action != HumanBatchAction::Confirm || decision.candidate_sha256 != candidate.sha256
     {
-        return Err(invalid("human intent относится к stale candidate"));
+        return Err(invalid(
+            "намерение человека относится к устаревшему кандидату",
+        ));
     }
     let bytes = runtime.read_candidate(candidate)?;
     materialize_candidate(
@@ -948,7 +1004,7 @@ fn publish_human(
             .is_trusted_for(&KanjiImageValidator::validator_identity())
     {
         return Err(invalid(
-            "exact human owner commit не подтверждает candidate trust",
+            "точный коммит владельца после решения человека не подтверждает доверие к кандидату",
         ));
     }
     snapshot.committed(outcome.asset);
@@ -962,8 +1018,8 @@ fn decide_exact(
 ) -> Result<(KanjiBatch, Vec<BatchIssue>), AssetError> {
     let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
     let mut state = load_required(&mut runtime)?;
-    // Решение публикует соседние items текущим validator'ом, поэтому pinned
-    // validator проверяется до любой мутации, а не после неё.
+    // Решение публикует соседние элементы текущим валидатором, поэтому закреплённый
+    // валидатор проверяется до любых изменений, а не после них.
     check_current_validator(&state)?;
     let mut snapshot = StoreSnapshotReader.capture(store);
     snapshot.checked()?;
@@ -972,10 +1028,11 @@ fn decide_exact(
         .items
         .iter()
         .find(|item| item.identity == identity)
-        .ok_or_else(|| invalid("identity не входит в batch"))?;
+        .ok_or_else(|| invalid("identity отсутствует в пакете"))?;
     let candidate = if item.status == BatchItemStatus::ExistingVerified {
-        // A reused canonical item has no runtime attempt. Pin owner bytes and
-        // append local evidence so explicit rejection can still be audited.
+        // Для повторно использованного канонического элемента нет runtime-попытки.
+        // Закрепляем байты владельца и добавляем локальные свидетельства, чтобы
+        // явный отказ всё ещё можно было проверить.
         let verified = AssetStore::read_verified(
             store.root(),
             std::slice::from_ref(&identity),
@@ -984,16 +1041,17 @@ fn decide_exact(
         let record = &verified[0].record;
         if record.sha256 != decision.candidate_sha256 {
             return Err(invalid(
-                "existing canonical candidate изменился после review",
+                "существующий канонический кандидат изменился после проверки",
             ));
         }
-        // Достижимо только через повреждённый извне manifest: все writer'ы
-        // (ingest/ingest_verified/validate_exact) записывают automated evidence
-        // для Verified записи, а schema v3 не допускает human attestation.
+        // Этот путь достижим только при внешнем повреждении манифеста: все
+        // операции записи (`ingest`, `ingest_verified`, `validate_exact`)
+        // сохраняют автоматические свидетельства для записи Verified, а схема v3
+        // не допускает подтверждение человека.
         let automated = record
             .validation
             .clone()
-            .ok_or_else(|| invalid("existing canonical candidate не имеет automated evidence"))?;
+            .ok_or_else(|| invalid("для существующего канонического кандидата отсутствуют автоматические свидетельства"))?;
         runtime.persist_candidate(&verified[0].bytes, automated, true)?
     } else {
         current_candidate(item)?.clone()
@@ -1006,14 +1064,14 @@ fn decide_exact(
         state.retain_existing_candidate(&identity, candidate.clone())?;
     }
     let bytes = runtime.read_candidate(&candidate)?;
-    // No human action is inferred in Rust. This only validates an explicit action.
+    // Здесь не выводится решение человека: проверяется только явно заданное действие.
     state.decide(decision.clone(), &bytes)?;
     runtime.save(&state)?;
     let mut issues = Vec::new();
     if decision.action == HumanBatchAction::Confirm {
         publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
     } else if decision.action == HumanBatchAction::Reject {
-        // Retain both semantic evidence and the human rejection in generic owner.
+        // Сохраняем у общего владельца и семантические свидетельства, и отказ человека.
         if let Err(error) = apply_rejection(
             store,
             &runtime,
@@ -1045,7 +1103,7 @@ fn materialize_candidate(
     if sha256_hex(bytes) != candidate.sha256 {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "materialization bytes/hash mismatch",
+            "байты, подготовленные к публикации, не совпадают с SHA-256",
         ));
     }
     let current = snapshot.current(identity).cloned();
@@ -1084,22 +1142,22 @@ fn validate_exact_snapshot(
     if !report.blockers.is_empty() {
         return Err(AssetError::new(
             ErrorCode::ValidatorFailure,
-            "owner exact automated validation завершилась техническим отказом",
+            "точная автоматическая проверка владельца завершилась техническим отказом",
         ));
     }
     let attempt = report
         .attempts
         .iter()
         .find(|attempt| &attempt.identity == identity && attempt.content_sha256 == sha256)
-        .ok_or_else(|| invalid("owner exact validation не вернула ожидаемый outcome"))?;
+        .ok_or_else(|| invalid("точная проверка владельца не вернула ожидаемый результат"))?;
     let status = attempt
         .status
-        .ok_or_else(|| invalid("owner exact validation отсутствует semantic status"))?;
+        .ok_or_else(|| invalid("в точной проверке владельца отсутствует семантический статус"))?;
     let mut record = snapshot
         .current(identity)
         .filter(|record| record.sha256 == sha256)
         .cloned()
-        .ok_or_else(|| invalid("snapshot не содержит exact validated record"))?;
+        .ok_or_else(|| invalid("в снимке отсутствует запись с точным результатом проверки"))?;
     record.validation = Some(ValidationRecord {
         status,
         validator: report.validator,
@@ -1124,7 +1182,7 @@ fn apply_rejection(
     if sha256_hex(bytes) != candidate.sha256 {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "rejection bytes/hash mismatch",
+            "байты отклоняемого ресурса не совпадают с SHA-256",
         ));
     }
     let current = snapshot.current(identity).cloned();
@@ -1138,7 +1196,7 @@ fn apply_rejection(
         .as_ref()
         .is_none_or(|record| record.validation.is_none());
     if current.is_none() {
-        // CAS=None still protects against an intervening distinct owner B.
+        // CAS=None по-прежнему защищает от промежуточного изменения ресурса другим владельцем.
         let outcome = store.ingest(IngestRequest {
             identity: identity.clone(),
             source_path: store
@@ -1201,7 +1259,8 @@ fn candidate_provenance(candidate: &BatchCandidate) -> Provenance {
 fn candidate_metadata(identity: &AssetIdentity, candidate: &BatchCandidate) -> serde_json::Value {
     let mut metadata = KanjiCharacter(identity.key.clone()).metadata();
     if let Some(evidence) = &candidate.acquisition {
-        metadata["yarxi"] = serde_json::to_value(evidence).expect("typed acquisition evidence");
+        metadata["yarxi"] = serde_json::to_value(evidence)
+            .expect("типизированные свидетельства получения сериализуются");
     }
     metadata
 }
@@ -1246,7 +1305,7 @@ impl SemanticValidator for AggregateValidator {
     ) -> Result<SemanticDecision, ValidatorFailure> {
         let mut actual = Vec::new();
         bytes
-            .take(8 * 1024 * 1024 + 1)
+            .take(crate::kanji_validator::MAX_MEDIA_BYTES as u64 + 1)
             .read_to_end(&mut actual)
             .map_err(|error| ValidatorFailure::new("aggregate_read_failure", error.to_string()))?;
         if asset.identity != self.resolution.identity
@@ -1256,7 +1315,7 @@ impl SemanticValidator for AggregateValidator {
         {
             return Err(ValidatorFailure::new(
                 "aggregate_candidate_mismatch",
-                "aggregate decision не соответствует exact identity/hash/current validator",
+                "решение агрегации не соответствует точным identity, SHA-256 и текущему валидатору",
             ));
         }
         validate_image_decode(&actual)
@@ -1265,17 +1324,17 @@ impl SemanticValidator for AggregateValidator {
         if selected.status == SemanticStatus::Corrupt {
             return Err(ValidatorFailure::new(
                 "aggregate_corrupt_candidate",
-                "CORRUPT candidate не может получить aggregate trust",
+                "кандидат CORRUPT не может получить доверие на основании агрегации",
             ));
         }
         if selected.status == SemanticStatus::Rejected {
             return Err(ValidatorFailure::new(
                 "aggregate_rejected_candidate",
-                "REJECTED candidate не может получить aggregate trust",
+                "кандидат REJECTED не может получить доверие на основании агрегации",
             ));
         }
         let mut decision = self.resolution.decision.clone();
-        // Keep single-candidate automated evidence beside explicit aggregate policy.
+        // Сохраняем автоматические свидетельства одного кандидата рядом с явной политикой агрегации.
         decision.evidence.extend(selected.evidence);
         Ok(decision)
     }
@@ -1305,8 +1364,9 @@ fn current_candidate(item: &crate::batch::BatchItem) -> Result<&BatchCandidate, 
     let hash = item
         .current_sha256
         .as_deref()
-        .ok_or_else(|| invalid("item не имеет current candidate"))?;
-    candidate_by_hash(item, hash).ok_or_else(|| invalid("exact candidate evidence отсутствует"))
+        .ok_or_else(|| invalid("у элемента нет текущего кандидата"))?;
+    candidate_by_hash(item, hash)
+        .ok_or_else(|| invalid("отсутствуют точные свидетельства кандидата"))
 }
 
 fn batch_response(
@@ -1398,7 +1458,12 @@ fn generated_batch_id() -> Result<String, AssetError> {
     let mut entropy = [0_u8; 32];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut entropy))
-        .map_err(|error| AssetError::io("не удалось получить entropy для batch identity", error))?;
+        .map_err(|error| {
+            AssetError::io(
+                "не удалось получить случайные данные для identity пакета",
+                error,
+            )
+        })?;
     Ok(format!("kanji-{}", &sha256_hex(entropy)[..32]))
 }
 
@@ -1406,7 +1471,7 @@ fn check_current_validator(state: &KanjiBatch) -> Result<(), AssetError> {
     if state.policy.validator != KanjiImageValidator::validator_identity() {
         return Err(AssetError::new(
             ErrorCode::InvalidValidatorIdentity,
-            "batch pinned validator отличается от production; требуется новый batch",
+            "закреплённый в пакете валидатор отличается от текущего; требуется новый пакет",
         ));
     }
     Ok(())
@@ -1417,10 +1482,10 @@ fn parse_character(value: &str) -> Result<KanjiCharacter, AssetError> {
         .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))
 }
 fn validate_reason(reason: &str) -> Result<(), AssetError> {
-    if reason.trim().is_empty() || reason.len() > 4096 {
-        Err(invalid(
-            "reason должно быть непустым и не длиннее 4096 bytes",
-        ))
+    if reason.trim().is_empty() || reason.len() > MAX_HUMAN_REASON_BYTES {
+        Err(invalid(format!(
+            "причина должна быть непустой и не длиннее {MAX_HUMAN_REASON_BYTES} байт"
+        )))
     } else {
         Ok(())
     }
@@ -1461,9 +1526,9 @@ mod snapshot_cost_tests {
         }
     }
 
-    /// Exercise the production command and round paths, with the checked owner
-    /// snapshot boundary counted explicitly. The physical corpus is empty, so a
-    /// regression to per-item read_verified cannot silently pass this fixture.
+    /// Проверяет рабочие пути команд и раундов, отдельно считая обращения
+    /// к проверенному снимку владельца. Физический корпус пуст, поэтому
+    /// повторное `read_verified` для каждого элемента не сможет незаметно пройти.
     #[test]
     fn thousand_ready_identities_use_bounded_full_owner_snapshots() {
         let directory = std::env::temp_dir().join(generated_batch_id().unwrap());
@@ -1496,7 +1561,11 @@ mod snapshot_cost_tests {
                         status: SemanticStatus::Verified,
                         validator: KanjiImageValidator::validator_identity(),
                         content_sha256: sha256,
-                        evidence: Vec::new(),
+                        evidence: vec![crate::model::ValidationEvidence {
+                            kind: "snapshot_test_evidence".into(),
+                            summary: "синтетическое свидетельство для проверки снимка".into(),
+                            details: None,
+                        }],
                     }),
                     human_attestation: None,
                     domain_metadata: None,
@@ -1545,7 +1614,7 @@ mod snapshot_cost_tests {
             &store,
             "thousand-ready",
             5,
-            |_| panic!("trusted corpus must not trigger acquisition"),
+            |_| panic!("доверенный корпус не должен запускать получение"),
             &mut reader,
         )
         .unwrap();
@@ -1559,8 +1628,8 @@ mod snapshot_cost_tests {
             reader.captures, 2,
             "ready run uses initial and final snapshots"
         );
-        // The acquisition frontier also pays one boundary capture per round,
-        // independent of the number of item results saved inside that round.
+        // Для границы получения также делается один снимок на раунд,
+        // независимо от числа результатов элементов, сохранённых в раунде.
         reader.records.clear();
         reader.captures = 0;
         execute_command_with_snapshots(
@@ -1606,10 +1675,10 @@ mod candidate_cost_tests {
     use super::*;
     use crate::batch::CANDIDATE_FILE_READS;
 
-    /// Round-trip цикл сохраняет состояние на каждый item, поэтому повторная
-    /// проверка всех candidate-файлов внутри цикла давала квадратичный обход.
-    /// Фикстура держит по одному реальному candidate на identity и падает, если
-    /// стоимость чтений вернётся к O(N^2).
+    /// Цикл сохранения проверяет состояние после каждого элемента, поэтому
+    /// повторная проверка всех файлов кандидатов давала бы квадратичный обход.
+    /// Фикстура хранит по одному настоящему кандидату на identity и падает, если
+    /// число чтений снова станет пропорционально квадрату числа элементов.
     #[test]
     fn frontier_round_reads_each_candidate_a_bounded_number_of_times() {
         const ITEMS: u32 = 200;
@@ -1645,7 +1714,7 @@ mod candidate_cost_tests {
                 content_sha256: sha256.clone(),
                 evidence: vec![ValidationEvidence {
                     kind: "pixel_reference_comparison".into(),
-                    summary: "synthetic independent metrics".into(),
+                    summary: "синтетические независимые метрики".into(),
                     details: Some(serde_json::json!({
                         "expected_distance": 0.5,
                         "nearest_margin": -0.5,
@@ -1671,7 +1740,7 @@ mod candidate_cost_tests {
         let reads = CANDIDATE_FILE_READS.with(std::cell::Cell::get);
         assert_eq!(state.items.len(), ITEMS as usize);
         assert!(state.items.iter().all(|item| item.attempts.len() == 2));
-        // Линейный обход укладывается в несколько чтений на identity; прежний
+        // Линейный обход требует несколько чтений на identity; прежний
         // квадратичный путь давал ITEMS^2 = 40000.
         assert!(
             reads <= 8 * ITEMS as usize,

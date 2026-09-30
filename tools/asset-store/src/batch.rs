@@ -1,8 +1,9 @@
-//! Resumable kanji batch: breadth-first acquisition, evidence и exact human actions.
+//! Возобновляемый пакет кандзи: получение по уровням, свидетельства и точные действия человека.
 //!
-//! Это domain state, а не источник canonical trust. Интегратор сначала проверяет
-//! bytes через asset owner и публикует semantic/human decision, затем фиксирует
-//! результат здесь. Runtime хранится исключительно под `.runtime/batches/`.
+//! Это состояние предметной области, а не источник канонического доверия.
+//! Интегратор сначала проверяет байты владельцем ресурсов и публикует
+//! семантическое решение или решение человека, затем фиксирует результат здесь.
+//! Runtime-данные хранятся только под `.runtime/batches/`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -28,11 +29,12 @@ use crate::model::{
 pub const BATCH_SCHEMA_VERSION: u32 = 1;
 pub const AGGREGATE_POLICY_VERSION: &str = "kanji-distinct-mean-v1";
 pub const MAX_ACQUISITION_ROUNDS: u32 = 5;
+pub(crate) const MAX_HUMAN_REASON_BYTES: usize = 4096;
 const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_CANDIDATE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CANDIDATE_BYTES: u64 = crate::kanji_validator::MAX_MEDIA_BYTES as u64;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Пороги совпадают с текущими f32-порогами kanji validator; policy pinned в state.
+/// Пороги совпадают с текущими порогами f32 валидатора кандзи; версия правил закреплена в состоянии.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregatePolicy {
@@ -44,11 +46,13 @@ pub struct AggregatePolicy {
 
 impl AggregatePolicy {
     pub fn current(validator: ValidatorIdentity) -> Self {
+        let (maximum_expected_distance, minimum_margin) =
+            crate::kanji_validator::registered_aggregate_thresholds();
         Self {
             version: AGGREGATE_POLICY_VERSION.into(),
             validator,
-            maximum_expected_distance: f64::from(0.020_f32),
-            minimum_margin: f64::from(0.004_f32),
+            maximum_expected_distance,
+            minimum_margin,
         }
     }
 }
@@ -86,7 +90,7 @@ pub struct KanjiMetrics {
 }
 
 impl KanjiMetrics {
-    /// Читает только фактическое evidence текущего CV owner.
+    /// Читает только фактические свидетельства текущего владельца проверки изображений.
     pub fn from_validation(record: &ValidationRecord) -> Option<Self> {
         record.evidence.iter().find_map(|evidence| {
             if evidence.kind != "pixel_reference_comparison" {
@@ -112,14 +116,15 @@ impl KanjiMetrics {
     }
 }
 
-/// Exact candidate. Reference всегда относительна batch directory и hash-derived.
+/// Точный кандидат. Ссылка относительна каталогу пакета и вычисляется из SHA-256.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchCandidate {
     pub sha256: String,
     pub storage_path: String,
     pub format: DetectedFormat,
-    /// Только успешная integrity/format/decode проверка owner разрешает `true`.
+    /// Значение `true` разрешено только после успешной проверки целостности,
+    /// формата и декодирования владельцем.
     pub technically_valid: bool,
     pub automated: ValidationRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,7 +139,7 @@ impl BatchCandidate {
     }
 }
 
-/// Все реальные acquisition outcomes сохраняются, включая network failures.
+/// Сохраняются все реальные результаты получения, включая сетевые сбои.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BatchAttemptInput {
@@ -146,11 +151,11 @@ pub enum BatchAttemptInput {
 #[serde(deny_unknown_fields)]
 pub struct BatchAttempt {
     pub index: u32,
-    /// Новый пользовательский reacquire начинает поколение, сохраняя историю.
+    /// Повторное получение по запросу пользователя начинает поколение, сохраняя историю.
     pub generation: u32,
     pub round: u32,
     pub result: BatchAttemptInput,
-    /// Exact duplicate записан как воспроизводимость, а не независимый sample.
+    /// Повтор записывается для воспроизводимости, но не считается отдельным образцом.
     pub duplicate_sha256: bool,
 }
 
@@ -178,7 +183,8 @@ pub enum BatchItemStatus {
 }
 
 impl BatchItemStatus {
-    /// Semantic outcome; canonical publication отдельно проверяет `BatchItem::is_ready`.
+    /// Семантический результат; готовность к канонической публикации отдельно
+    /// проверяет `BatchItem::is_ready`.
     pub fn semantic_resolved(self) -> bool {
         matches!(
             self,
@@ -210,7 +216,7 @@ pub struct HumanBatchDecision {
     pub identity: AssetIdentity,
     pub candidate_sha256: String,
     pub action: HumanBatchAction,
-    /// Указываются сообщение пользователя или однозначная semantic интерпретация.
+    /// Указывается сообщение пользователя или однозначная семантическая интерпретация.
     pub reason: String,
 }
 
@@ -227,7 +233,7 @@ pub struct BatchItem {
     pub existing_candidate: Option<BatchCandidate>,
     pub publication_source: Option<BatchTrustSource>,
     pub human_decisions: Vec<HumanBatchDecision>,
-    /// Уже применённые exact owner Reject: resume не материализует их заново.
+    /// Уже применённые точные отказы владельца: при возобновлении они не применяются повторно.
     #[serde(default)]
     pub observed_owner_rejections: Vec<HumanBatchDecision>,
     pub review_reason: Option<String>,
@@ -242,7 +248,7 @@ impl BatchItem {
     }
 }
 
-/// Runtime state не является manifest и не должен попадать в corpus commit.
+/// Runtime-состояние не является манифестом и не должно попадать в коммит корпуса.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KanjiBatch {
@@ -253,7 +259,7 @@ pub struct KanjiBatch {
     pub items: Vec<BatchItem>,
 }
 
-/// Выбранные bytes доступны через `BatchRuntime::read_candidate`, decision — owner API.
+/// Выбранные байты доступны через `BatchRuntime::read_candidate`, решение — через API владельца.
 #[derive(Debug, Clone)]
 pub struct AggregateResolution {
     pub identity: AssetIdentity,
@@ -293,7 +299,7 @@ impl KanjiBatch {
             });
         }
         if items.is_empty() {
-            return Err(invalid("batch должен содержать хотя бы одну identity"));
+            return Err(invalid("пакет должен содержать хотя бы один identity"));
         }
         Ok(Self {
             schema_version: BATCH_SCHEMA_VERSION,
@@ -304,8 +310,9 @@ impl KanjiBatch {
         })
     }
 
-    /// Frontiers не допускают retry первого item до первого прохода всех остальных.
-    /// Caller сохраняет state после каждого результата, а не только целого раунда.
+    /// Граница обхода не допускает повтор первого элемента до первого прохода
+    /// по всем остальным. Вызывающая сторона сохраняет состояние после каждого
+    /// результата, а не только после целого раунда.
     pub fn next_round(&self) -> Vec<AssetIdentity> {
         let unresolved = self.items.iter().filter(|item| {
             matches!(
@@ -337,7 +344,8 @@ impl KanjiBatch {
             .collect()
     }
 
-    /// Existing effective trust устанавливает caller после `AssetStore::read_verified`.
+    /// Вызывающая сторона задаёт существующее действующее доверие после
+    /// `AssetStore::read_verified`.
     pub fn mark_existing_ready(
         &mut self,
         identity: &AssetIdentity,
@@ -347,7 +355,7 @@ impl KanjiBatch {
         let item = self.item_mut(identity)?;
         if !item.human_decisions.is_empty() {
             return Err(invalid(
-                "reuse после human decision требует explicit exact resolution",
+                "повторное использование после решения человека требует явного разрешения для точных байтов",
             ));
         }
         item.status = BatchItemStatus::ExistingVerified;
@@ -358,8 +366,9 @@ impl KanjiBatch {
         Ok(())
     }
 
-    /// Сохраняет bytes/evidence canonical reuse для будущего exact human review.
-    /// Это не acquisition attempt и не увеличивает независимый count.
+    /// Сохраняет байты и свидетельства повторного использования канонического
+    /// ресурса для последующей проверки точных байтов человеком. Это не попытка
+    /// получения и не увеличивает число независимых образцов.
     pub fn retain_existing_candidate(
         &mut self,
         identity: &AssetIdentity,
@@ -376,7 +385,7 @@ impl KanjiBatch {
             || item.current_sha256.as_deref() != Some(candidate.sha256.as_str())
         {
             return Err(invalid(
-                "existing review candidate не соответствует reused canonical SHA",
+                "кандидат для проверки не соответствует повторно использованному каноническому SHA-256",
             ));
         }
         item.existing_candidate = Some(candidate);
@@ -384,8 +393,9 @@ impl KanjiBatch {
         Ok(())
     }
 
-    /// После canonical owner commit. До вызова exact candidate уже сохранён
-    /// и resume повторяет publication без нового acquisition.
+    /// Вызывается после канонического коммита владельца. До этого точный
+    /// кандидат уже сохранён, поэтому при возобновлении публикация повторяется
+    /// без нового получения.
     pub fn mark_published_ready(
         &mut self,
         identity: &AssetIdentity,
@@ -396,7 +406,7 @@ impl KanjiBatch {
         let item = self.item_mut(identity)?;
         if item.current_sha256.as_deref() != Some(sha256) || !item.status.semantic_resolved() {
             return Err(invalid(
-                "publication относится к stale/unresolved candidate",
+                "публикация относится к устаревшему или неразрешённому кандидату",
             ));
         }
         check_publication_source(item, source)?;
@@ -406,33 +416,36 @@ impl KanjiBatch {
         Ok(())
     }
 
-    /// Owner snapshot больше не подтверждает saved readiness. Exact owner Reject
-    /// сохраняется отдельно и исключает этот SHA из будущей auto aggregation.
+    /// Снимок владельца больше не подтверждает сохранённую готовность. Точный
+    /// отказ владельца сохраняется отдельно и исключает этот SHA-256 из будущей
+    /// автоматической агрегации.
     pub fn invalidate_owner_trust(
         &mut self,
         identity: &AssetIdentity,
         reason: String,
         owner_rejection: Option<HumanBatchDecision>,
     ) -> Result<(), AssetError> {
-        if reason.trim().is_empty() || reason.len() > 4096 {
-            return Err(invalid("owner reconciliation требует bounded reason"));
+        if reason.trim().is_empty() || reason.len() > MAX_HUMAN_REASON_BYTES {
+            return Err(invalid(
+                "для сверки с владельцем требуется непустая ограниченная причина",
+            ));
         }
         if let Some(decision) = &owner_rejection {
             validate_hash(&decision.candidate_sha256)?;
             if &decision.identity != identity
                 || decision.action != HumanBatchAction::Reject
                 || decision.reason.trim().is_empty()
-                || decision.reason.len() > 4096
+                || decision.reason.len() > MAX_HUMAN_REASON_BYTES
             {
                 return Err(invalid(
-                    "owner rejection не является exact identity/SHA semantic Reject",
+                    "отказ владельца не является семантическим Reject для точной identity и SHA-256",
                 ));
             }
         }
         let item = self.item_mut(identity)?;
         if !item.status.semantic_resolved() {
             return Err(invalid(
-                "owner trust invalidation требует ранее resolved item",
+                "для отзыва доверия владельца элемент должен быть ранее разрешён",
             ));
         }
         if let Some(decision) = owner_rejection {
@@ -446,7 +459,7 @@ impl KanjiBatch {
         item.generation = item
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid("generation overflow"))?;
+            .ok_or_else(|| invalid("превышен предел номера поколения"))?;
         item.status = BatchItemStatus::Reacquire;
         item.current_sha256 = None;
         item.published_sha256 = None;
@@ -457,26 +470,28 @@ impl KanjiBatch {
         Ok(())
     }
 
-    /// Restart технического acquisition после пяти failures без candidate.
-    /// Не принимает semantic решения и не может заменить exact candidate review.
+    /// Повторно запускает техническое получение после пяти сбоев без кандидата.
+    /// Не принимает семантических решений и не заменяет проверку точного кандидата.
     pub fn retry_acquisition(
         &mut self,
         identity: &AssetIdentity,
         reason: String,
     ) -> Result<(), AssetError> {
-        if reason.trim().is_empty() || reason.len() > 4096 {
-            return Err(invalid("reacquire требует bounded reason"));
+        if reason.trim().is_empty() || reason.len() > MAX_HUMAN_REASON_BYTES {
+            return Err(invalid(
+                "для повторного получения требуется непустая ограниченная причина",
+            ));
         }
         let item = self.item_mut(identity)?;
         if item.status != BatchItemStatus::AwaitingHuman || item.current_sha256.is_some() {
             return Err(invalid(
-                "candidate-less retry разрешён только после технических failures",
+                "повторное получение без кандидата разрешено только после технических сбоев",
             ));
         }
         item.generation = item
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid("generation overflow"))?;
+            .ok_or_else(|| invalid("превышен предел номера поколения"))?;
         item.status = BatchItemStatus::Reacquire;
         item.review_reason = Some(reason);
         item.aggregate = empty_aggregate();
@@ -491,7 +506,7 @@ impl KanjiBatch {
     ) -> Result<(), AssetError> {
         if !self.next_round().contains(identity) {
             return Err(invalid(
-                "identity не входит в текущий breadth-first frontier",
+                "identity отсутствует в текущей границе обхода по уровням",
             ));
         }
         validate_attempt_input(&result, &self.policy)?;
@@ -513,26 +528,31 @@ impl KanjiBatch {
         Ok(())
     }
 
-    /// Сохраняет exact human intent до owner attestation; Confirm становится
-    /// ready только после `mark_published_ready`. Bytes повторно сверяются с SHA.
+    /// Сохраняет точное намерение человека до подтверждения владельцем; Confirm
+    /// становится готовым только после `mark_published_ready`. Байты повторно
+    /// сверяются с SHA-256.
     pub fn decide(
         &mut self,
         decision: HumanBatchDecision,
         exact_current_bytes: &[u8],
     ) -> Result<(), AssetError> {
         validate_hash(&decision.candidate_sha256)?;
-        if decision.reason.trim().is_empty() || decision.reason.len() > 4096 {
-            return Err(invalid("human decision требует bounded непустое reason"));
+        if decision.reason.trim().is_empty() || decision.reason.len() > MAX_HUMAN_REASON_BYTES {
+            return Err(invalid(
+                "решение человека требует непустую ограниченную причину",
+            ));
         }
         if sha256_hex(exact_current_bytes) != decision.candidate_sha256 {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "bytes human decision не совпадают с exact SHA-256",
+                "байты решения человека не совпадают с точным SHA-256",
             ));
         }
         let item = self.item_mut(&decision.identity)?;
         if item.current_sha256.as_deref() != Some(&decision.candidate_sha256) {
-            return Err(invalid("human decision относится к stale/чужому candidate"));
+            return Err(invalid(
+                "решение человека относится к устаревшему или чужому кандидату",
+            ));
         }
         let repeated = item.human_decisions.last() == Some(&decision);
         if repeated && decision.action != HumanBatchAction::Confirm {
@@ -540,16 +560,17 @@ impl KanjiBatch {
         }
         if decision.action == HumanBatchAction::Confirm {
             let candidate = find_candidate(item, &decision.candidate_sha256)
-                .ok_or_else(|| invalid("candidate bytes/evidence отсутствуют"))?;
+                .ok_or_else(|| invalid("байты или свидетельства кандидата отсутствуют"))?;
             if !candidate.technically_valid || candidate.automated.status == SemanticStatus::Corrupt
             {
                 return Err(invalid(
-                    "technical/corrupt candidate нельзя подтвердить вручную",
+                    "кандидат с технической ошибкой или статусом CORRUPT нельзя подтвердить вручную",
                 ));
             }
             item.status = BatchItemStatus::HumanVerified;
-            // Existing/automated publication не заменяет explicit human owner
-            // attestation. Durable intent должен пройти publish_human при resume.
+            // Существующая или автоматическая публикация не заменяет явное
+            // подтверждение владельца человеком. При возобновлении это намерение
+            // должно пройти через publish_human.
             item.published_sha256 = None;
             item.publication_source = None;
             item.review_reason = None;
@@ -558,7 +579,7 @@ impl KanjiBatch {
             item.generation = item
                 .generation
                 .checked_add(1)
-                .ok_or_else(|| invalid("generation overflow"))?;
+                .ok_or_else(|| invalid("превышен предел номера поколения"))?;
             item.review_reason = Some(decision.reason.clone());
             item.current_sha256 = None;
             item.published_sha256 = None;
@@ -572,8 +593,8 @@ impl KanjiBatch {
         Ok(())
     }
 
-    /// Exact hash и versioned aggregate evidence для публикации owner'ом.
-    /// Individual classifier status при этом никогда не переписывается в state.
+    /// Точный хеш и версионированные свидетельства агрегации для публикации
+    /// владельцем. Индивидуальный статус классификатора не переписывается.
     pub fn aggregate_decision(
         &self,
         identity: &AssetIdentity,
@@ -582,20 +603,20 @@ impl KanjiBatch {
             .items
             .iter()
             .find(|item| &item.identity == identity)
-            .ok_or_else(|| invalid("identity не входит в batch"))?;
+            .ok_or_else(|| invalid("identity отсутствует в пакете"))?;
         if item.status != BatchItemStatus::AutoVerified || !item.aggregate.accepted {
             return Ok(None);
         }
         let hash = item
             .current_sha256
             .as_deref()
-            .ok_or_else(|| invalid("aggregate не имеет exact selected hash"))?;
+            .ok_or_else(|| invalid("у агрегата отсутствует точный выбранный SHA-256"))?;
         let candidate = find_candidate(item, hash)
-            .ok_or_else(|| invalid("aggregate candidate отсутствует"))?
+            .ok_or_else(|| invalid("кандидат агрегата отсутствует"))?
             .clone();
         let evidence = ValidationEvidence {
             kind: "kanji_batch_aggregate".into(),
-            summary: "Средние метрики distinct technically valid SHA-256 без REJECTED удовлетворяют неизменённым CV порогам; exact canonical candidate выбран детерминированно".into(),
+            summary: "Средние метрики разных технически допустимых SHA-256 без REJECTED удовлетворяют неизменённым порогам проверки изображений; точный канонический кандидат выбран детерминированно".into(),
             details: Some(serde_json::json!({
                 "batch_id": self.batch_id,
                 "identity": identity,
@@ -603,8 +624,8 @@ impl KanjiBatch {
                 "aggregate": item.aggregate,
                 "policy": self.policy,
                 "generation": item.generation,
-                // Aggregate не подменяет индивидуальный automated статус
-                // выбранного candidate, поэтому он сохраняется рядом.
+                // Агрегат не подменяет индивидуальный автоматический статус
+                // выбранного кандидата, поэтому он сохраняется рядом.
                 "selected_individual_status": candidate.automated.status,
                 "selected_individual_validator": candidate.automated.validator,
                 "selected_individual_evidence": candidate.automated.evidence,
@@ -622,16 +643,17 @@ impl KanjiBatch {
         self.items
             .iter_mut()
             .find(|item| &item.identity == identity)
-            .ok_or_else(|| invalid("identity не входит в batch"))
+            .ok_or_else(|| invalid("identity отсутствует в пакете"))
     }
 
-    /// Fail closed при подмене derived evidence, unknown policy/schema или refs.
+    /// Отказывает при подмене вычисленных свидетельств, неизвестной политике,
+    /// версии схемы или ссылках на данные.
     pub fn validate(&self) -> Result<(), AssetError> {
         validate_batch_id(&self.batch_id)?;
         if self.schema_version != BATCH_SCHEMA_VERSION {
             return Err(AssetError::new(
                 ErrorCode::UnsupportedSchemaVersion,
-                "неподдерживаемая версия batch state",
+                "версия состояния пакета не поддерживается",
             ));
         }
         ValidatorIdentity::new(
@@ -641,11 +663,11 @@ impl KanjiBatch {
         .map_err(invalid)?;
         if self.policy != AggregatePolicy::current(self.policy.validator.clone()) {
             return Err(invalid(
-                "aggregate policy/thresholds не соответствуют зарегистрированной версии",
+                "политика агрегации и пороги не соответствуют зарегистрированной версии",
             ));
         }
         if self.items.is_empty() {
-            return Err(invalid("пустой batch state"));
+            return Err(invalid("состояние пакета не содержит элементов"));
         }
         let mut identities = BTreeSet::new();
         for item in &self.items {
@@ -659,7 +681,7 @@ impl KanjiBatch {
                 )?;
             }
             if !identities.insert(&item.identity) {
-                return Err(invalid("duplicate requested identity"));
+                return Err(invalid("повторяющаяся запрошенная identity"));
             }
             let mut hashes = BTreeSet::new();
             let mut generations = std::collections::BTreeMap::<u32, u32>::new();
@@ -672,7 +694,9 @@ impl KanjiBatch {
                     || attempt.round != *count
                     || *count > MAX_ACQUISITION_ROUNDS
                 {
-                    return Err(invalid("нарушен acquisition index/round/generation limit"));
+                    return Err(invalid(
+                        "нарушены ограничения номера попытки, раунда или поколения",
+                    ));
                 }
                 let duplicate = match &attempt.result {
                     BatchAttemptInput::Candidate { candidate } => {
@@ -682,7 +706,7 @@ impl KanjiBatch {
                 };
                 if duplicate != attempt.duplicate_sha256 {
                     return Err(invalid(
-                        "duplicate evidence не совпадает с реальными hashes",
+                        "признак повтора не соответствует фактическим SHA-256",
                     ));
                 }
             }
@@ -693,18 +717,25 @@ impl KanjiBatch {
             {
                 if decision.identity != item.identity
                     || decision.reason.trim().is_empty()
-                    || decision.reason.len() > 4096
+                    || decision.reason.len() > MAX_HUMAN_REASON_BYTES
                 {
-                    return Err(invalid("human decision identity/reason невалидны"));
+                    return Err(invalid("недопустимы identity или причина решения человека"));
                 }
                 validate_hash(&decision.candidate_sha256)?;
+            }
+            if item.review_reason.as_ref().is_some_and(|reason| {
+                reason.trim().is_empty() || reason.len() > MAX_HUMAN_REASON_BYTES
+            }) {
+                return Err(invalid(format!(
+                    "причина проверки должна быть непустой и не длиннее {MAX_HUMAN_REASON_BYTES} байт"
+                )));
             }
             if item.observed_owner_rejections.iter().any(|decision| {
                 decision.action != HumanBatchAction::Reject
                     || !item.human_decisions.contains(decision)
             }) {
                 return Err(invalid(
-                    "observed owner rejection не имеет exact semantic Reject evidence",
+                    "зафиксированный отказ владельца не имеет точного семантического свидетельства Reject",
                 ));
             }
             if let Some(hash) = &item.current_sha256 {
@@ -712,41 +743,46 @@ impl KanjiBatch {
                 if item.status != BatchItemStatus::ExistingVerified
                     && find_candidate(item, hash).is_none()
                 {
-                    return Err(invalid("current candidate не имеет сохранённого evidence"));
+                    return Err(invalid(
+                        "для текущего кандидата отсутствуют сохранённые свидетельства",
+                    ));
                 }
             }
             if item.published_sha256.is_some() != item.publication_source.is_some() {
-                return Err(invalid("publication hash/source не согласованы"));
+                return Err(invalid("SHA-256 и источник публикации не согласованы"));
             }
             if let Some(source) = item.publication_source {
                 if !item.is_ready() {
                     return Err(invalid(
-                        "published state относится к stale/unresolved candidate",
+                        "опубликованное состояние относится к устаревшему или неразрешённому кандидату",
                     ));
                 }
                 check_publication_source(item, source)?;
             }
             if item.status == BatchItemStatus::ExistingVerified {
                 if item.current_sha256.is_none() || !item.human_decisions.is_empty() {
-                    return Err(invalid("невалидный existing verified state"));
+                    return Err(invalid(
+                        "недопустимое состояние ранее подтверждённого ресурса",
+                    ));
                 }
             } else if item.status == BatchItemStatus::HumanVerified {
-                let decision = item
-                    .human_decisions
-                    .last()
-                    .ok_or_else(|| invalid("human verified без decision"))?;
+                let decision = item.human_decisions.last().ok_or_else(|| {
+                    invalid("подтверждённому человеком состоянию не хватает решения")
+                })?;
                 let candidate = item
                     .current_sha256
                     .as_deref()
                     .and_then(|hash| find_candidate(item, hash))
-                    .ok_or_else(|| invalid("human verified без candidate"))?;
+                    .ok_or_else(|| {
+                        invalid("подтверждённому человеком состоянию не хватает кандидата")
+                    })?;
                 if decision.action != HumanBatchAction::Confirm
                     || decision.candidate_sha256 != candidate.sha256
                     || !candidate.technically_valid
                     || candidate.automated.status == SemanticStatus::Corrupt
                 {
                     return Err(invalid(
-                        "human verification не привязан к valid exact bytes",
+                        "подтверждение человека не связано с допустимыми точными байтами",
                     ));
                 }
             } else {
@@ -757,7 +793,7 @@ impl KanjiBatch {
                     || item.status != derived.status
                 {
                     return Err(invalid(
-                        "batch derived status/aggregate/candidate evidence подменены",
+                        "вычисленные статус, агрегат или свидетельства кандидата в пакете подменены",
                     ));
                 }
             }
@@ -789,7 +825,7 @@ fn check_publication_source(item: &BatchItem, source: BatchTrustSource) -> Resul
         Ok(())
     } else {
         Err(invalid(
-            "publication trust source не подтверждён domain evidence",
+            "источник доверия публикации не подтверждён свидетельствами предметной области",
         ))
     }
 }
@@ -802,7 +838,7 @@ fn empty_aggregate() -> AggregateEvidence {
         margin: None,
         accepted: false,
         selected_sha256: None,
-        selection_reason: "нет distinct технически валидных semantic samples".into(),
+        selection_reason: "нет разных технически допустимых семантических образцов".into(),
     }
 }
 
@@ -862,10 +898,10 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
             continue;
         }
         display_candidates.push(candidate);
-        // REJECTED означает, что заметно ближе другой эталон Unicode, то есть
-        // изображение, вероятно, изображает другой символ. Это отрицательное
-        // свидетельство: такой candidate не голосует за среднее и не может быть
-        // выбран как canonical.
+        // REJECTED означает, что другой эталон Unicode заметно ближе, то есть
+        // изображение, вероятно, показывает другой символ. Это отрицательное
+        // свидетельство: такой кандидат не участвует в среднем и не может быть
+        // выбран каноническим.
         if matches!(
             candidate.automated.status,
             SemanticStatus::Verified | SemanticStatus::Uncertain
@@ -890,8 +926,8 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
         && margin
             .as_ref()
             .is_some_and(|metric| metric.mean >= policy.minimum_margin);
-    // Individual VERIFIED выигрывает как уже достаточный evidence; aggregate
-    // может выбрать любой distinct valid sample только при положительном mean.
+    // Отдельный VERIFIED уже является достаточным свидетельством; агрегат
+    // может выбрать любой отличный допустимый образец только при положительном среднем.
     let individually_verified = display_candidates
         .iter()
         .copied()
@@ -902,8 +938,8 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     let selected = individually_verified
         .or_else(|| samples.first().map(|(candidate, _)| *candidate))
         .or_else(|| {
-            // Fallback нужен только для review: пока есть любой другой candidate,
-            // REJECTED не выдвигается как текущий, но полностью отвергнутый item
+            // Запасной выбор нужен только для проверки: если есть другой кандидат,
+            // REJECTED не становится текущим, но полностью отклонённый элемент
             // остаётся видимым и доступным для решения человека.
             let rejected_rank = |candidate: &&BatchCandidate| {
                 usize::from(candidate.automated.status == SemanticStatus::Rejected)
@@ -923,7 +959,7 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     item.aggregate = AggregateEvidence {
         policy_version: policy.version.clone(), distinct_valid_hashes, expected_distance, margin,
         accepted, selected_sha256: selected_hash.clone(),
-        selection_reason: if individually_verified.is_some() { "individual VERIFIED; tie-break lowercase SHA-256" } else { "minimum expected_distance, maximum margin, затем lowercase SHA-256; только distinct valid SHA" }.into(),
+        selection_reason: if individually_verified.is_some() { "отдельный статус VERIFIED; при равенстве выбирается минимальный SHA-256" } else { "минимальная ожидаемая дистанция, максимальный отступ, затем минимальный SHA-256; учитываются только разные допустимые SHA" }.into(),
     };
     item.current_sha256 = selected_hash;
     if individually_verified.is_some() || accepted {
@@ -931,7 +967,15 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
         item.review_reason = None;
     } else if generation_attempt_count(item) >= MAX_ACQUISITION_ROUNDS {
         item.status = BatchItemStatus::AwaitingHuman;
-        item.review_reason = Some(if samples.is_empty() { "пять acquisition rounds завершены без пригодных independent semantic samples" } else { "пять acquisition rounds завершены; distinct mean не достигает неизменённых CV thresholds" }.into());
+        item.review_reason = Some(if samples.is_empty() {
+            format!(
+                "достигнут предел числа попыток получения ({MAX_ACQUISITION_ROUNDS}) без пригодных независимых семантических образцов"
+            )
+        } else {
+            format!(
+                "достигнут предел числа попыток получения ({MAX_ACQUISITION_ROUNDS}); среднее разных образцов не достигает неизменённых порогов проверки изображений"
+            )
+        });
     } else {
         item.status = if item.generation > 0 {
             BatchItemStatus::Reacquire
@@ -949,7 +993,7 @@ fn validate_attempt_input(
         BatchAttemptInput::Failed { code, message } => {
             if code.is_empty() || code.len() > 256 || message.len() > 4096 {
                 return Err(invalid(
-                    "failure evidence должно быть bounded и содержать code",
+                    "свидетельство сбоя должно быть ограниченным и содержать код",
                 ));
             }
         }
@@ -961,17 +1005,21 @@ fn validate_attempt_input(
                 || candidate.automated.evidence.is_empty()
             {
                 return Err(invalid(
-                    "candidate path/hash/validator/evidence не совпадают",
+                    "путь кандидата, SHA-256, валидатор и свидетельства не совпадают",
                 ));
             }
             let encoded =
                 serde_json::to_vec(candidate).map_err(|error| invalid(error.to_string()))?;
             if encoded.len() > 128 * 1024 {
-                return Err(invalid("candidate automated evidence превышает 128 KiB"));
+                return Err(invalid(
+                    "автоматические свидетельства кандидата превышают 128 КиБ",
+                ));
             }
             if candidate.automated.status == SemanticStatus::Corrupt && candidate.technically_valid
             {
-                return Err(invalid("CORRUPT не является technically valid sample"));
+                return Err(invalid(
+                    "CORRUPT не считается технически допустимым образцом",
+                ));
             }
         }
     }
@@ -981,7 +1029,7 @@ fn validate_attempt_input(
 fn validate_identity(identity: &AssetIdentity) -> Result<(), AssetError> {
     identity.validate().map_err(invalid)?;
     if identity.namespace != "kanji" {
-        return Err(invalid("batch поддерживает только namespace kanji"));
+        return Err(invalid("пакет поддерживает только пространство имён kanji"));
     }
     parse_kanji_character(&identity.key).map_err(invalid)?;
     Ok(())
@@ -995,7 +1043,7 @@ pub(crate) fn validate_batch_id(batch_id: &str) -> Result<(), AssetError> {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
     {
         return Err(invalid(
-            "batch_id должен содержать до 128 символов a-zA-Z0-9, '-', '_'",
+            "batch_id должен содержать не более 128 символов из a-z, A-Z, 0-9, дефиса и подчёркивания",
         ));
     }
     Ok(())
@@ -1007,7 +1055,9 @@ pub(crate) fn validate_hash(hash: &str) -> Result<(), AssetError> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(invalid("SHA-256 должен содержать 64 lowercase hex символа"));
+        return Err(invalid(
+            "SHA-256 должен содержать 64 строчных шестнадцатеричных символа",
+        ));
     }
     Ok(())
 }
@@ -1017,7 +1067,11 @@ fn candidate_path(hash: &str, format: DetectedFormat) -> Result<String, AssetErr
     let extension = match format {
         DetectedFormat::Gif => "gif",
         DetectedFormat::Png => "png",
-        _ => return Err(invalid("kanji batch candidate должен иметь GIF/PNG format")),
+        _ => {
+            return Err(invalid(
+                "кандидат пакета кандзи должен иметь формат GIF или PNG",
+            ));
+        }
     };
     Ok(format!("candidates/{hash}.{extension}"))
 }
@@ -1028,14 +1082,15 @@ fn invalid(message: impl Into<String>) -> AssetError {
 
 #[cfg(test)]
 thread_local! {
-    /// Наблюдаемость регрессионного теста: сколько раз candidate-файл был реально
-    /// прочитан. Thread-local, поэтому параллельные тесты друг друга не считают.
+    /// Наблюдаемость регрессионного теста: сколько раз файл кандидата был фактически
+    /// прочитан. Счётчик локален для потока, поэтому параллельные тесты не влияют друг на друга.
     pub(crate) static CANDIDATE_FILE_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
-/// FD-relative runtime persistence. Lock освобождается при process exit, включая crash.
-/// Держать открытым во время load/mutate/save, чтобы два процесса не теряли updates.
+/// Сохранение runtime-данных относительно файлового дескриптора. Блокировка
+/// освобождается при завершении процесса, в том числе при аварии. Она удерживается
+/// во время загрузки, изменения и сохранения, чтобы процессы не теряли обновления.
 #[derive(Debug)]
 pub struct BatchRuntime {
     directory: File,
@@ -1043,16 +1098,16 @@ pub struct BatchRuntime {
     batch_id: String,
     loaded_revision: Option<u64>,
     directory_path: PathBuf,
-    /// Candidate files content-addressed и неизменяемы, а exclusive lock
-    /// удерживается на весь lifetime instance, поэтому каждая проверяемая
-    /// комбинация (path, hash, format) читается не более одного раза: иначе
-    /// per-item save обходил бы весь набор заново.
+    /// Файлы кандидатов адресуются по содержимому и неизменяемы, а исключительная
+    /// блокировка удерживается всё время жизни объекта. Поэтому каждая проверяемая
+    /// комбинация (путь, SHA-256, формат) читается не более одного раза: иначе
+    /// сохранение каждого элемента заново обходило бы весь набор.
     verified_candidate_keys: BTreeSet<String>,
 }
 
 impl BatchRuntime {
-    /// Store root должен быть уже открыт/проверен владельцем `AssetStore`.
-    /// Здесь root/descendants открываются NOFOLLOW, runtime не попадает в assets/.
+    /// Корень хранилища должен быть заранее открыт и проверен владельцем `AssetStore`.
+    /// Здесь корень и вложенные каталоги открываются с NOFOLLOW; runtime не попадает в assets/.
     pub fn open(store_root: &Path, batch_id: &str) -> Result<Self, AssetError> {
         validate_batch_id(batch_id)?;
         let root = File::from(
@@ -1094,20 +1149,23 @@ impl BatchRuntime {
         let state: KanjiBatch = serde_json::from_slice(&bytes).map_err(|error| {
             AssetError::new(
                 ErrorCode::ManifestCorrupt,
-                format!("batch JSON повреждён: {error}"),
+                format!("JSON пакета повреждён: {error}"),
             )
         })?;
         state.validate()?;
         if state.batch_id != self.batch_id {
-            return Err(invalid("batch identity не совпадает с runtime directory"));
+            return Err(invalid(
+                "identity пакета не совпадает с каталогом runtime-данных",
+            ));
         }
-        // Every saved candidate remains recoverable, including rejected/corrupt bytes.
+        // Каждый сохранённый кандидат остаётся доступным для проверки, включая
+        // отклонённые и повреждённые данные.
         self.verify_referenced_candidates(&state)?;
         self.loaded_revision = Some(state.revision);
         Ok(Some(state))
     }
 
-    /// Проверяет каждый referenced candidate не более одного раза за instance.
+    /// Проверяет каждую указанную ссылку на кандидата не более одного раза за объект.
     fn verify_referenced_candidates(&mut self, state: &KanjiBatch) -> Result<(), AssetError> {
         for item in &state.items {
             if let Some(candidate) = &item.existing_candidate {
@@ -1123,8 +1181,8 @@ impl BatchRuntime {
     }
 
     fn verify_candidate_once(&mut self, candidate: &BatchCandidate) -> Result<(), AssetError> {
-        // Ключ покрывает всё, что проверяет read_candidate, поэтому две ссылки с
-        // одинаковым ключом проверяются одинаково и второе чтение избыточно.
+        // Ключ охватывает все проверки `read_candidate`, поэтому две ссылки с
+        // одинаковым ключом дают одинаковый результат и повторное чтение избыточно.
         let key = format!(
             "{}|{}|{:?}",
             candidate.storage_path, candidate.sha256, candidate.format
@@ -1140,72 +1198,107 @@ impl BatchRuntime {
     pub fn save(&mut self, state: &KanjiBatch) -> Result<(), AssetError> {
         state.validate()?;
         if state.batch_id != self.batch_id {
-            return Err(invalid("batch identity не совпадает с runtime directory"));
+            return Err(invalid(
+                "identity пакета не совпадает с каталогом runtime-данных",
+            ));
         }
         if let Some(revision) = self.loaded_revision {
             if state.revision < revision {
-                return Err(invalid("batch revision нельзя откатить"));
+                return Err(invalid("номер изменения состояния пакета нельзя уменьшить"));
             }
         } else {
             match read_file(&self.directory, "state.json", MAX_STATE_BYTES) {
-                Ok(_) => return Err(invalid("существующий batch необходимо load перед save")),
+                Ok(_) => {
+                    return Err(invalid(
+                        "существующий пакет нужно загрузить перед сохранением",
+                    ));
+                }
                 Err(error) if error.code == ErrorCode::MissingAssetFile => {}
                 Err(error) => return Err(error),
             }
         }
-        // `save` всегда следует за `load` того же instance, а load уже проверил
-        // каждый referenced candidate; здесь достаточно дешёвой инкрементальной
-        // проверки, а не повторного обхода всего набора на каждый item.
+        // `save` всегда следует за `load` того же объекта, а загрузка уже проверила
+        // каждую указанную ссылку на кандидата. Здесь достаточно дешёвой
+        // инкрементальной проверки без повторного обхода набора для каждого элемента.
         self.verify_referenced_candidates(state)?;
         let bytes = serde_json::to_vec_pretty(state).map_err(|error| invalid(error.to_string()))?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
-            return Err(invalid("batch state превышает bounded runtime limit"));
+            return Err(invalid(
+                "состояние пакета превышает ограничение размера runtime-данных",
+            ));
         }
         atomic_write(&self.directory, "state.json", &bytes)?;
         self.loaded_revision = Some(state.revision);
         Ok(())
     }
 
-    /// Escaped local review UI. Каждый distinct candidate SHA проверяется перед
-    /// выдачей relative image reference; GIF сохраняет полную анимацию.
-    /// Review artifact never changes the machine-readable source of truth.
+    /// Локальная страница проверки с экранированным содержимым. Каждый отдельный
+    /// SHA кандидата проверяется до добавления относительной ссылки на изображение;
+    /// GIF сохраняет полную анимацию.
+    /// Страница проверки не меняет машиночитаемый источник истины.
     pub fn write_review(&self, state: &KanjiBatch) -> Result<PathBuf, AssetError> {
         state.validate()?;
         if state.batch_id != self.batch_id {
             return Err(invalid(
-                "review batch identity не совпадает с runtime directory",
+                "identity пакета проверки не совпадает с каталогом runtime-данных",
             ));
         }
         let mut html = String::from(
-            "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self' file:; style-src 'unsafe-inline'\"><title>Проверка kanji assets</title><style>body{font-family:system-ui;max-width:1100px;margin:auto;padding:1rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px;max-height:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}code{overflow-wrap:anywhere}</style><h1>Проверка kanji assets</h1>",
+            "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self' file:; style-src 'unsafe-inline'\"><title>Проверка изображений кандзи</title><style>body{font-family:system-ui;max-width:1100px;margin:auto;padding:1rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px;max-height:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}code{overflow-wrap:anywhere}</style><h1>Проверка изображений кандзи</h1>",
         );
         write!(
             &mut html,
-            "<p>Batch: <code>{}</code>; policy: <code>{}</code>; revision: {}</p>",
+            "<p>Пакет: <code>{}</code>; версия правил: <code>{}</code>; номер изменения: {}</p>",
             html_escape(&state.batch_id),
             html_escape(&state.policy.version),
             state.revision
         )
-        .expect("String write");
+        .expect("запись в строку не может завершиться ошибкой");
         for item in state.review_queue() {
-            write!(&mut html, "<article><h2>{} · U+{:04X}</h2><p>State: {:?}; acquisition attempts: {}; generation: {}; independent valid SHA: {}</p>", html_escape(&item.identity.key), u32::from(parse_kanji_character(&item.identity.key).map_err(invalid)?), item.status, item.attempts.len(), item.generation, item.aggregate.distinct_valid_hashes.len()).expect("String write");
+            write!(
+                &mut html,
+                "<article><h2>{} · U+{:04X}</h2><p>Состояние: {}; попыток получения: {}; поколение: {}; разных допустимых SHA-256: {}</p>",
+                html_escape(&item.identity.key),
+                u32::from(parse_kanji_character(&item.identity.key).map_err(invalid)?),
+                review_item_status(item.status),
+                item.attempts.len(),
+                item.generation,
+                item.aggregate.distinct_valid_hashes.len()
+            )
+            .expect("запись в строку не может завершиться ошибкой");
             if let Some(hash) = &item.current_sha256 {
                 let candidate = find_candidate(item, hash)
-                    .ok_or_else(|| invalid("review candidate отсутствует"))?;
+                    .ok_or_else(|| invalid("кандидат для проверки отсутствует"))?;
                 self.read_candidate(candidate)?;
-                write!(&mut html, "<img alt=\"{}\" src=\"{}\"><p>Exact SHA-256: <code>{}</code>; format: {:?}; automated: {:?}; technical valid: {}</p>", html_escape(&item.identity.key), html_escape(&candidate.storage_path), candidate.sha256, candidate.format, candidate.automated.status, candidate.technically_valid).expect("String write");
+                write!(
+                    &mut html,
+                    "<img alt=\"{}\" src=\"{}\"><p>Точный SHA-256: <code>{}</code>; формат: {}; автоматический результат: {}; техническая проверка пройдена: {}</p>",
+                    html_escape(&item.identity.key),
+                    html_escape(&candidate.storage_path),
+                    candidate.sha256,
+                    review_format(candidate.format),
+                    candidate.automated.status.as_str(),
+                    candidate.technically_valid
+                )
+                .expect("запись в строку не может завершиться ошибкой");
                 if let Some(metrics) = candidate.metrics() {
                     write!(
                         &mut html,
-                        "<p>Ближайший competing Unicode: {}</p>",
+                        "<p>Ближайший конкурирующий Unicode: {}</p>",
                         html_escape(metrics.nearest_other.as_deref().unwrap_or("нет"))
                     )
-                    .expect("String write");
+                    .expect("запись в строку не может завершиться ошибкой");
                 }
             } else {
-                html.push_str("<p>Нет доступного текущего candidate: acquisition завершился техническим отказом. Нужен новый acquisition, semantic approval недоступен.</p>");
+                html.push_str("<p>Нет доступного текущего кандидата: получение завершилось техническим отказом. Нужно запустить получение повторно; семантическое подтверждение недоступно.</p>");
             }
-            write!(&mut html, "<p>Причина review: {}</p><h3>Aggregate mean / min / max / count</h3><pre>{}</pre><h3>Все acquisition attempts</h3>", html_escape(item.review_reason.as_deref().unwrap_or("")), html_escape(&serde_json::to_string_pretty(&item.aggregate).map_err(|error| invalid(error.to_string()))?)).expect("String write");
+            write!(
+                &mut html,
+                "<p>Причина проверки: {}</p><h3>Среднее, минимум, максимум и количество по агрегату</h3><pre>{}</pre><h3>Все попытки получения</h3>",
+                html_escape(item.review_reason.as_deref().unwrap_or("")),
+                html_escape(&serde_json::to_string_pretty(&item.aggregate).map_err(|error| invalid(error.to_string()))?)
+            )
+            .expect("запись в строку не может завершиться ошибкой");
             let mut shown = BTreeSet::new();
             if let Some(hash) = &item.current_sha256 {
                 shown.insert(hash.clone());
@@ -1215,31 +1308,49 @@ impl BatchRuntime {
                     && shown.insert(candidate.sha256.clone())
                 {
                     self.read_candidate(candidate)?;
-                    write!(&mut html, "<figure><img alt=\"{}\" src=\"{}\"><figcaption>Distinct candidate SHA-256: <code>{}</code>; format: {:?}; automated: {:?}; technical valid: {}</figcaption></figure>", html_escape(&item.identity.key), html_escape(&candidate.storage_path), candidate.sha256, candidate.format, candidate.automated.status, candidate.technically_valid).expect("String write");
+                    write!(
+                        &mut html,
+                        "<figure><img alt=\"{}\" src=\"{}\"><figcaption>Другой кандидат SHA-256: <code>{}</code>; формат: {}; автоматический результат: {}; техническая проверка пройдена: {}</figcaption></figure>",
+                        html_escape(&item.identity.key),
+                        html_escape(&candidate.storage_path),
+                        candidate.sha256,
+                        review_format(candidate.format),
+                        candidate.automated.status.as_str(),
+                        candidate.technically_valid
+                    )
+                    .expect("запись в строку не может завершиться ошибкой");
                 }
             }
             for attempt in &item.attempts {
-                write!(&mut html, "<details><summary>Attempt {} · round {} · generation {} · duplicate SHA: {}</summary>", attempt.index, attempt.round, attempt.generation, attempt.duplicate_sha256).expect("String write");
+                write!(
+                    &mut html,
+                    "<details><summary>Попытка {} · раунд {} · поколение {} · повтор SHA-256: {}</summary>",
+                    attempt.index,
+                    attempt.round,
+                    attempt.generation,
+                    attempt.duplicate_sha256
+                )
+                .expect("запись в строку не может завершиться ошибкой");
                 let description = serde_json::to_string_pretty(&attempt.result)
                     .map_err(|error| invalid(error.to_string()))?;
                 let bounded: String = description.chars().take(6000).collect();
                 write!(&mut html, "<pre>{}</pre></details>", html_escape(&bounded))
-                    .expect("String write");
+                    .expect("запись в строку не может завершиться ошибкой");
             }
             html.push_str("</article>");
         }
         html.push_str("</html>");
         if html.len() as u64 > MAX_STATE_BYTES {
             return Err(invalid(
-                "review HTML превышает bounded runtime limit; разделите batch",
+                "HTML-страница проверки превышает ограничение runtime-данных; разделите пакет",
             ));
         }
         atomic_write(&self.directory, "review.html", html.as_bytes())?;
         Ok(self.directory_path.join("review.html"))
     }
 
-    /// Bytes persist ДО state entry: interruption оставит безопасный orphan,
-    /// который не становится trusted и не блокирует resume предыдущего state.
+    /// Байты сохраняются до записи состояния: прерывание оставит безопасный
+    /// orphan, который не становится доверенным и не мешает возобновить прежнее состояние.
     pub fn persist_candidate(
         &self,
         bytes: &[u8],
@@ -1247,26 +1358,26 @@ impl BatchRuntime {
         technically_valid: bool,
     ) -> Result<BatchCandidate, AssetError> {
         if bytes.len() as u64 > MAX_CANDIDATE_BYTES {
-            return Err(invalid("candidate превышает лимит размера"));
+            return Err(invalid("кандидат превышает ограничение размера"));
         }
         let hash = sha256_hex(bytes);
         if automated.content_sha256 != hash {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "automated record не соответствует candidate bytes",
+                "запись автоматической проверки не соответствует байтам кандидата",
             ));
         }
         let format = DetectedFormat::from_signature(bytes);
         let storage_path = candidate_path(&hash, format)?;
         let name = storage_path
             .strip_prefix("candidates/")
-            .expect("hash-derived path");
+            .expect("путь кандидата вычислен из SHA-256");
         match read_file(&self.candidates, name, MAX_CANDIDATE_BYTES) {
             Ok(existing) if existing == bytes => {}
             Ok(_) => {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
-                    "существующий candidate path содержит другие bytes",
+                    "по существующему пути кандидата сохранены другие байты",
                 ));
             }
             Err(error) if error.code == ErrorCode::MissingAssetFile => {
@@ -1284,19 +1395,20 @@ impl BatchRuntime {
         })
     }
 
-    /// Доступ к bytes для GIF/PNG review или owner attestation. Проверяет path,
-    /// regular file, bounds, format и SHA перед возвращением фактических bytes.
+    /// Доступ к байтам GIF/PNG для проверки или подтверждения владельцем.
+    /// Проверяет путь, обычный файл, ограничения размера, формат и SHA-256
+    /// перед возвращением фактических байтов.
     pub fn read_candidate(&self, candidate: &BatchCandidate) -> Result<Vec<u8>, AssetError> {
         let expected = candidate_path(&candidate.sha256, candidate.format)?;
         if candidate.storage_path != expected {
             return Err(AssetError::new(
                 ErrorCode::PathTraversal,
-                "candidate reference не совпадает с hash-derived relative path",
+                "ссылка кандидата не совпадает с относительным путём, вычисленным из SHA-256",
             ));
         }
         let name = expected
             .strip_prefix("candidates/")
-            .expect("hash-derived path");
+            .expect("путь кандидата вычислен из SHA-256");
         #[cfg(test)]
         CANDIDATE_FILE_READS.with(|reads| reads.set(reads.get() + 1));
         let bytes = read_file(&self.candidates, name, MAX_CANDIDATE_BYTES)?;
@@ -1305,7 +1417,7 @@ impl BatchRuntime {
         {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "candidate bytes/hash/format изменились",
+                "байты, SHA-256 или формат кандидата изменились",
             ));
         }
         Ok(bytes)
@@ -1338,7 +1450,10 @@ fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetEr
     )
     .map_err(|error| {
         if error == rustix::io::Errno::NOENT {
-            AssetError::new(ErrorCode::MissingAssetFile, "runtime file отсутствует")
+            AssetError::new(
+                ErrorCode::MissingAssetFile,
+                "файл runtime-данных отсутствует",
+            )
         } else {
             boundary_io(error)
         }
@@ -1346,28 +1461,29 @@ fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetEr
     let file = File::from(descriptor);
     let metadata = file
         .metadata()
-        .map_err(|error| AssetError::io("runtime metadata", error))?;
+        .map_err(|error| AssetError::io("метаданные runtime-файла", error))?;
     if !metadata.is_file() || metadata.len() > maximum {
         return Err(AssetError::new(
             ErrorCode::BoundaryViolation,
-            "runtime entry должен быть bounded regular file",
+            "запись runtime должна быть ограниченным обычным файлом",
         ));
     }
     let mut bytes = Vec::new();
     file.take(maximum + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| AssetError::io("runtime read", error))?;
+        .map_err(|error| AssetError::io("чтение runtime-файла", error))?;
     if bytes.len() as u64 > maximum {
         return Err(AssetError::new(
             ErrorCode::BoundaryViolation,
-            "runtime entry вырос сверх лимита",
+            "размер записи runtime превысил ограничение",
         ));
     }
     Ok(bytes)
 }
 
 fn atomic_write(parent: &File, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
-    // Fixed destination must not be symlink/special file before replacement.
+    // Перед заменой фиксированное назначение не должно быть символической
+    // ссылкой или специальным файлом.
     match read_file(parent, name, MAX_STATE_BYTES) {
         Ok(_) => {}
         Err(error) if error.code == ErrorCode::MissingAssetFile => {}
@@ -1388,13 +1504,13 @@ fn atomic_write(parent: &File, name: &str, bytes: &[u8]) -> Result<(), AssetErro
     let result = (|| {
         let mut file = File::from(descriptor);
         file.write_all(bytes)
-            .map_err(|error| AssetError::io("runtime write", error))?;
+            .map_err(|error| AssetError::io("запись runtime-файла", error))?;
         file.sync_all()
-            .map_err(|error| AssetError::io("runtime sync", error))?;
+            .map_err(|error| AssetError::io("синхронизация runtime-файла", error))?;
         renameat(parent, temporary.as_str(), parent, name).map_err(boundary_io)?;
         parent
             .sync_all()
-            .map_err(|error| AssetError::io("runtime directory sync", error))?;
+            .map_err(|error| AssetError::io("синхронизация каталога runtime", error))?;
         Ok(())
     })();
     if result.is_err() {
@@ -1412,14 +1528,40 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn review_item_status(status: BatchItemStatus) -> &'static str {
+    match status {
+        BatchItemStatus::Unresolved => "не обработан",
+        BatchItemStatus::AwaitingHuman => "ожидает решения человека",
+        BatchItemStatus::Reacquire => "ожидает повторного получения",
+        BatchItemStatus::AutoVerified => "проверен автоматически",
+        BatchItemStatus::HumanVerified => "подтверждён человеком",
+        BatchItemStatus::ExistingVerified => "уже подтверждён владельцем",
+    }
+}
+
+fn review_format(format: DetectedFormat) -> &'static str {
+    match format {
+        DetectedFormat::Gif => "GIF",
+        DetectedFormat::Png => "PNG",
+        DetectedFormat::Jpeg => "JPEG",
+        DetectedFormat::Webp => "WebP",
+        DetectedFormat::Bmp => "BMP",
+        DetectedFormat::Tiff => "TIFF",
+        DetectedFormat::Unknown => "неизвестный",
+    }
+}
+
 fn boundary_io(error: rustix::io::Errno) -> AssetError {
     if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
         AssetError::new(
             ErrorCode::BoundaryViolation,
-            "runtime path содержит symlink или не является каталогом/regular file",
+            "путь runtime содержит символическую ссылку или ведёт не к каталогу либо обычному файлу",
         )
     } else {
-        AssetError::io("batch runtime filesystem", std::io::Error::from(error))
+        AssetError::io(
+            "файловая система runtime пакета",
+            std::io::Error::from(error),
+        )
     }
 }
 

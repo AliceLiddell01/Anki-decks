@@ -99,6 +99,109 @@ fn png(value: u8) -> Vec<u8> {
 }
 
 #[test]
+fn approval_requires_current_automated_evidence_and_new_does_not_hide_its_absence() {
+    let fixture = Fixture::new();
+    let record = fixture.ingest(&png(35), None);
+    let mut malformed = record.clone();
+    malformed.human_attestation = Some(HumanAttestation {
+        identity: malformed.identity.clone(),
+        content_sha256: malformed.sha256.clone(),
+        decision: HumanDecision::Approve,
+        reason: "проверено человеком".into(),
+    });
+
+    assert_eq!(malformed.effective_status(), None);
+    assert!(!malformed.is_trusted_for(&Classifier(SemanticStatus::Verified).identity()));
+    assert_eq!(
+        select_assets(
+            &[malformed],
+            SelectionMode::New,
+            &Classifier(SemanticStatus::Verified).identity()
+        )
+        .len(),
+        1
+    );
+    let mut stale = record.clone();
+    stale.validation = Some(ValidationRecord {
+        status: SemanticStatus::Uncertain,
+        validator: Classifier(SemanticStatus::Uncertain).identity(),
+        content_sha256: "f".repeat(64),
+        evidence: vec![ValidationEvidence {
+            kind: "fixture-semantic".into(),
+            summary: "устаревшее решение".into(),
+            details: None,
+        }],
+    });
+    stale.human_attestation = Some(HumanAttestation {
+        identity: stale.identity.clone(),
+        content_sha256: stale.sha256.clone(),
+        decision: HumanDecision::Approve,
+        reason: "проверено человеком".into(),
+    });
+    assert_eq!(stale.effective_status(), None);
+    assert!(!stale.is_trusted_for(&Classifier(SemanticStatus::Uncertain).identity()));
+
+    assert_eq!(
+        fixture
+            .attest(&record.sha256, HumanDecision::Approve)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidValidationEvidence
+    );
+    assert!(
+        fixture.store.verify_integrity().unwrap()[0]
+            .human_attestation
+            .is_none()
+    );
+}
+
+#[test]
+fn malformed_approval_without_validation_is_rejected_by_manifest_and_read() {
+    let fixture = Fixture::new();
+    fixture.ingest(&png(36), None);
+    let record = fixture.classify(SemanticStatus::Verified);
+    let path = fixture.directory.join("store/manifest.json");
+    let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let stored = &mut manifest.assets[0];
+    assert_eq!(stored.identity, record.identity);
+    stored.validation = None;
+    stored.human_attestation = Some(HumanAttestation {
+        identity: stored.identity.clone(),
+        content_sha256: stored.sha256.clone(),
+        decision: HumanDecision::Approve,
+        reason: "поддельное approval без evidence".into(),
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+    assert_eq!(
+        fixture.store.verify_integrity().unwrap_err().code,
+        ErrorCode::ManifestCorrupt
+    );
+    assert_eq!(fixture.read().unwrap_err().code, ErrorCode::ManifestCorrupt);
+}
+
+#[test]
+fn oversized_asset_cannot_be_human_approved() {
+    let fixture = Fixture::new();
+    let bytes = vec![0x5a; MAX_MEDIA_BYTES + 1];
+    let record = fixture.ingest(&bytes, None);
+    fixture.classify(SemanticStatus::Uncertain);
+
+    assert_eq!(
+        fixture
+            .attest(&record.sha256, HumanDecision::Approve)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidTransition
+    );
+    assert!(
+        fixture.store.verify_integrity().unwrap()[0]
+            .human_attestation
+            .is_none()
+    );
+}
+
+#[test]
 fn human_approval_overrides_uncertain_rejected_and_preserves_automated_evidence() {
     for status in [SemanticStatus::Uncertain, SemanticStatus::Rejected] {
         let fixture = Fixture::new();

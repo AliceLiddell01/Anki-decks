@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::{encode_lower_hex, sha256_hex};
+use crate::kanji_validator::MAX_MEDIA_BYTES;
 use crate::model::{
     AssetIdentity, AssetRecord, DetectedFormat, HumanAttestation, HumanDecision, LifecycleState,
     MANIFEST_SCHEMA_VERSION, Manifest, Provenance, SemanticDecision, SemanticStatus,
@@ -471,10 +472,23 @@ impl AssetStore {
                 ));
             }
             before_read(record);
-            let mut bytes = Vec::new();
-            checked_asset_file(&directory, record)?
-                .read_to_end(&mut bytes)
-                .map_err(|e| AssetError::io("чтение проверенных байтов", e))?;
+            let human_approved = record.current_human_decision() == Some(HumanDecision::Approve);
+            if human_approved && record.byte_length > MAX_MEDIA_BYTES as u64 {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "изображение, одобренное человеком, превышает установленный предел размера",
+                ));
+            }
+            let file = checked_asset_file(&directory, record)?;
+            let bytes = if human_approved {
+                read_bounded_asset_bytes(file, MAX_MEDIA_BYTES, "чтение проверенных байтов")?
+            } else {
+                let mut bytes = Vec::new();
+                file.take(record.byte_length.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| AssetError::io("чтение проверенных байтов", error))?;
+                bytes
+            };
             let format = DetectedFormat::from_signature(&bytes);
             if format != record.format
                 || bytes.len() as u64 != record.byte_length
@@ -485,7 +499,7 @@ impl AssetStore {
                     "прочитанные байты не совпадают с проверенной записью",
                 ));
             }
-            if record.current_human_decision() == Some(HumanDecision::Approve) {
+            if human_approved {
                 validate_image_decode(&bytes)?;
             }
             result.push(VerifiedAssetBytes {
@@ -1147,9 +1161,9 @@ impl AssetStore {
         Ok(report)
     }
 
-    /// Применяет явно полученное human decision к текущим exact bytes. Approval
-    /// проверяет весь image decode, а затем использует тот же атомарный lifecycle
-    /// переход, что automated validation. Automated evidence сохраняется.
+    /// Применяет явное решение человека к текущим точным байтам. Подтверждение
+    /// требует полной проверки декодером, затем использует тот же атомарный
+    /// переход жизненного цикла, что автоматическая проверка. Её данные сохраняются.
     pub fn attest(&self, request: HumanAttestationRequest) -> Result<IngestOutcome, AssetError> {
         request
             .identity
@@ -1159,7 +1173,7 @@ impl AssetStore {
         if request.reason.trim().is_empty() {
             return Err(AssetError::new(
                 ErrorCode::InvalidValidationEvidence,
-                "human decision требует явного основания",
+                "решение человека требует явного основания",
             ));
         }
         let lock = self.lock_exclusive()?;
@@ -1193,14 +1207,22 @@ impl AssetStore {
             ));
         }
         if request.decision == HumanDecision::Approve {
-            if previous
-                .validation
-                .as_ref()
-                .is_some_and(|decision| decision.status == SemanticStatus::Corrupt)
-            {
+            let Some(automated_status) = previous.current_validation_status() else {
+                return Err(AssetError::new(
+                    ErrorCode::InvalidValidationEvidence,
+                    "подтверждение человеком требует автоматическую запись ValidationRecord для текущего SHA-256",
+                ));
+            };
+            if automated_status == SemanticStatus::Corrupt {
                 return Err(AssetError::new(
                     ErrorCode::InvalidTransition,
-                    "human approval не может отменить CORRUPT; требуется исправленный candidate",
+                    "подтверждение человеком не может отменить статус CORRUPT; требуется исправленный кандидат",
+                ));
+            }
+            if previous.byte_length > MAX_MEDIA_BYTES as u64 {
+                return Err(AssetError::new(
+                    ErrorCode::InvalidTransition,
+                    "подтверждение человеком превышает установленный предел размера изображения",
                 ));
             }
             let area = if previous.lifecycle == LifecycleState::Verified {
@@ -1208,10 +1230,11 @@ impl AssetStore {
             } else {
                 &self.runtime_handle
             };
-            let mut bytes = Vec::new();
-            checked_asset_file(area, &previous)?
-                .read_to_end(&mut bytes)
-                .map_err(|error| AssetError::io("чтение candidate для human approval", error))?;
+            let bytes = read_bounded_asset_bytes(
+                checked_asset_file(area, &previous)?,
+                MAX_MEDIA_BYTES,
+                "чтение кандидата для подтверждения человеком",
+            )?;
             if sha256_hex(&bytes) != previous.sha256
                 || bytes.len() as u64 != previous.byte_length
                 || DetectedFormat::from_signature(&bytes) != previous.format
@@ -1930,6 +1953,26 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
                     "human attestation не привязана к текущим identity/hash или не содержит основания",
                 ));
             }
+            if attestation.decision == HumanDecision::Approve {
+                if !record.has_current_validation() {
+                    return Err(AssetError::new(
+                        ErrorCode::ManifestCorrupt,
+                        format!(
+                            "подтверждение человеком не содержит автоматическую запись ValidationRecord для текущего SHA-256: {}",
+                            record.identity
+                        ),
+                    ));
+                }
+                if record.byte_length > MAX_MEDIA_BYTES as u64 {
+                    return Err(AssetError::new(
+                        ErrorCode::ManifestCorrupt,
+                        format!(
+                            "изображение, одобренное человеком, превышает установленный предел размера: {}",
+                            record.identity
+                        ),
+                    ));
+                }
+            }
         }
         let expected_lifecycle = match record.effective_status() {
             Some(SemanticStatus::Verified) => LifecycleState::Verified,
@@ -2324,7 +2367,9 @@ pub(crate) fn validate_image_decode(bytes: &[u8]) -> Result<(), AssetError> {
     let failure = |message: String| {
         AssetError::new(
             ErrorCode::InvalidTransition,
-            format!("human approval требует корректного полного image decode: {message}"),
+            format!(
+                "подтверждение человеком требует полной проверки изображения декодером: {message}"
+            ),
         )
     };
     match DetectedFormat::from_signature(bytes) {
@@ -2387,14 +2432,15 @@ fn validate_asset(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
     if record.current_human_decision() == Some(HumanDecision::Approve)
         && record.effective_status() == Some(SemanticStatus::Verified)
     {
-        let mut bytes = Vec::new();
-        checked_asset_file(root, record)?
-            .read_to_end(&mut bytes)
-            .map_err(|error| AssetError::io("чтение human-approved bytes", error))?;
+        let bytes = read_bounded_asset_bytes(
+            checked_asset_file(root, record)?,
+            MAX_MEDIA_BYTES,
+            "чтение байтов, одобренных человеком",
+        )?;
         if sha256_hex(&bytes) != record.sha256 {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "human-approved bytes изменились",
+                "байты, одобренные человеком, изменились",
             ));
         }
         validate_image_decode(&bytes)?;
@@ -2563,6 +2609,24 @@ fn checked_asset_file(root: &File, record: &AssetRecord) -> Result<File, AssetEr
             error
         }
     })
+}
+
+fn read_bounded_asset_bytes(
+    file: File,
+    maximum: usize,
+    operation: &str,
+) -> Result<Vec<u8>, AssetError> {
+    let mut bytes = Vec::new();
+    file.take((maximum as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| AssetError::io(operation, error))?;
+    if bytes.len() > maximum {
+        return Err(AssetError::new(
+            ErrorCode::IntegrityMismatch,
+            format!("{operation}: изображение превышает предел {maximum} байт"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn canonical_asset_path(identity: &AssetIdentity, hash: &str, format: DetectedFormat) -> String {

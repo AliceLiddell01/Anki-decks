@@ -20,7 +20,7 @@ fn batch(characters: &[char]) -> KanjiBatch {
 }
 
 fn bytes(label: &str) -> Vec<u8> {
-    // Здесь тестируются state/hash boundaries. Full GIF decode проверяет owner.
+    // Здесь проверяются границы состояния и хеша. Полное декодирование GIF проверяет владелец.
     let mut bytes = b"GIF89a".to_vec();
     bytes.extend_from_slice(label.as_bytes());
     bytes
@@ -33,7 +33,7 @@ fn record(bytes: &[u8], status: SemanticStatus, distance: f64, margin: f64) -> V
         content_sha256: sha256_hex(bytes),
         evidence: vec![ValidationEvidence {
             kind: "pixel_reference_comparison".into(),
-            summary: "synthetic semantic evidence".into(),
+            summary: "синтетическое семантическое свидетельство".into(),
             details: Some(
                 serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "字"}),
             ),
@@ -235,17 +235,37 @@ fn technically_invalid_candidates_are_not_semantic_samples() {
 
 #[test]
 fn metrics_thresholds_and_unknown_policy_fail_closed() {
+    let (maximum_distance, minimum_margin) =
+        crate::kanji_validator::registered_aggregate_thresholds();
     let mut state = batch(&['漢']);
     acquire(
         &mut state,
         '漢',
-        candidate("border", SemanticStatus::Uncertain, 0.0200001, 0.004),
+        candidate(
+            "border",
+            SemanticStatus::Uncertain,
+            maximum_distance + 0.0000001,
+            minimum_margin,
+        ),
     );
     assert!(!state.items[0].aggregate.accepted);
     state.policy.maximum_expected_distance = 0.03;
     assert!(state.validate().is_err());
     state.policy = AggregatePolicy::current(validator());
     state.policy.version = "unknown".into();
+    assert!(state.validate().is_err());
+}
+
+#[test]
+fn aggregate_policy_uses_registered_validator_thresholds() {
+    let (maximum_distance, minimum_margin) =
+        crate::kanji_validator::registered_aggregate_thresholds();
+    let policy = AggregatePolicy::current(validator());
+    assert_eq!(policy.maximum_expected_distance, maximum_distance);
+    assert_eq!(policy.minimum_margin, minimum_margin);
+
+    let mut state = batch(&['漢']);
+    state.policy.maximum_expected_distance = maximum_distance + 0.001;
     assert!(state.validate().is_err());
 }
 
@@ -280,7 +300,7 @@ fn human_confirm_retains_automated_status_and_requires_exact_candidate() {
     let mut state = batch(&['漢']);
     let candidate = candidate("human", SemanticStatus::Rejected, 0.04, -0.02);
     let hash = candidate.sha256.clone();
-    for _ in 0..5 {
+    for _ in 0..MAX_ACQUISITION_ROUNDS {
         acquire(&mut state, '漢', candidate.clone());
     }
     let mut decision = HumanBatchDecision {
@@ -315,6 +335,97 @@ fn human_confirm_retains_automated_status_and_requires_exact_candidate() {
         .mark_published_ready(&identity('漢'), &hash, BatchTrustSource::Human)
         .unwrap();
     state.validate().unwrap();
+}
+
+#[test]
+fn human_reason_limit_is_shared_and_persisted_state_fails_closed() {
+    let mut state = batch(&['漢']);
+    let selected = candidate("reason-boundary", SemanticStatus::Uncertain, 0.03, 0.001);
+    let bytes = bytes("reason-boundary");
+    acquire(&mut state, '漢', selected.clone());
+    let decision = |reason: String| HumanBatchDecision {
+        identity: identity('漢'),
+        candidate_sha256: selected.sha256.clone(),
+        action: HumanBatchAction::Confirm,
+        reason,
+    };
+
+    let mut accepted = state.clone();
+    accepted
+        .decide(decision("r".repeat(MAX_HUMAN_REASON_BYTES)), &bytes)
+        .unwrap();
+    assert_eq!(
+        accepted.items[0].human_decisions[0].reason.len(),
+        MAX_HUMAN_REASON_BYTES
+    );
+    accepted.validate().unwrap();
+
+    assert!(
+        state
+            .decide(decision("r".repeat(MAX_HUMAN_REASON_BYTES + 1)), &bytes,)
+            .is_err()
+    );
+    state.validate().unwrap();
+
+    accepted.items[0].human_decisions[0].reason.push('r');
+    assert!(accepted.validate().is_err());
+}
+
+#[test]
+fn persisted_acquisition_round_limit_rejects_an_extra_attempt() {
+    let mut state = batch(&['漢']);
+    for _ in 0..MAX_ACQUISITION_ROUNDS {
+        failed(&mut state, '漢');
+    }
+    assert_eq!(
+        state.items[0].attempts.len(),
+        MAX_ACQUISITION_ROUNDS as usize
+    );
+    state.validate().unwrap();
+
+    state.items[0].attempts.push(BatchAttempt {
+        index: MAX_ACQUISITION_ROUNDS + 1,
+        generation: 0,
+        round: MAX_ACQUISITION_ROUNDS + 1,
+        result: BatchAttemptInput::Failed {
+            code: "network".into(),
+            message: "источник недоступен".into(),
+        },
+        duplicate_sha256: false,
+    });
+    assert!(state.validate().is_err());
+}
+
+#[test]
+fn retry_reason_limit_is_enforced_in_domain_and_persisted_state() {
+    let mut state = batch(&['漢']);
+    for _ in 0..MAX_ACQUISITION_ROUNDS {
+        failed(&mut state, '漢');
+    }
+    let maximum_reason = "r".repeat(MAX_HUMAN_REASON_BYTES);
+    state
+        .retry_acquisition(&identity('漢'), maximum_reason)
+        .unwrap();
+    state.validate().unwrap();
+
+    let mut oversized_state = state.clone();
+    oversized_state.items[0]
+        .review_reason
+        .as_mut()
+        .unwrap()
+        .push('r');
+    assert!(oversized_state.validate().is_err());
+
+    let mut rejected = batch(&['漢']);
+    for _ in 0..MAX_ACQUISITION_ROUNDS {
+        failed(&mut rejected, '漢');
+    }
+    assert!(
+        rejected
+            .retry_acquisition(&identity('漢'), "r".repeat(MAX_HUMAN_REASON_BYTES + 1),)
+            .is_err()
+    );
+    rejected.validate().unwrap();
 }
 
 #[test]
@@ -537,17 +648,52 @@ fn review_references_exact_gif_and_escapes_machine_evidence() {
     let mut automated = record(&data, SemanticStatus::Uncertain, 0.03, 0.001);
     automated.evidence[0].summary = "<script>alert('unsafe')</script>".into();
     let candidate = runtime.persist_candidate(&data, automated, true).unwrap();
-    for _ in 0..5 {
+    let other_data = bytes("review-other");
+    let other_candidate = runtime
+        .persist_candidate(
+            &other_data,
+            record(&other_data, SemanticStatus::Uncertain, 0.03, 0.001),
+            true,
+        )
+        .unwrap();
+    for _ in 0..4 {
         acquire(&mut state, '漢', candidate.clone());
     }
+    acquire(&mut state, '漢', other_candidate);
     runtime.save(&state).unwrap();
     let path = runtime.write_review(&state).unwrap();
     let html = fs::read_to_string(path).unwrap();
     assert!(html.contains(&format!("src=\"{}\"", candidate.storage_path)));
     assert!(html.contains(&candidate.sha256));
+    assert!(html.contains("<html lang=\"ru\">"));
+    assert!(html.contains("Пакет:"));
+    assert!(html.contains("Состояние: ожидает решения человека"));
+    assert!(html.contains("Точный SHA-256:"));
+    assert!(html.contains("Причина проверки:"));
+    assert!(html.contains("Среднее, минимум, максимум и количество по агрегату"));
+    assert!(html.contains("Все попытки получения"));
+    assert!(html.contains("Попытка 1 · раунд 1"));
+    assert!(html.contains("Другой кандидат SHA-256:"));
     assert!(!html.contains("<script>"));
     assert!(html.contains("&lt;script&gt;"));
-    assert!(html.contains("independent valid SHA: 1"));
+    assert!(html.contains("разных допустимых SHA-256: 2"));
+    for label in [
+        "Batch:",
+        "policy:",
+        "revision:",
+        "State:",
+        "acquisition attempts:",
+        "independent valid SHA:",
+        "Aggregate mean",
+        "Attempt 1",
+        "round 1",
+        "duplicate SHA:",
+    ] {
+        assert!(
+            !html.contains(label),
+            "в HTML осталась английская метка {label}"
+        );
+    }
     assert_eq!(runtime.load().unwrap().unwrap(), state);
 }
 

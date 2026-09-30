@@ -59,12 +59,12 @@ fn glyph(value: char) -> Vec<u8> {
     crate::kanji_validator::synthetic_reference_png(value)
 }
 fn media(character: &str, bytes: Vec<u8>) -> AcquiredMedia {
-    // Provider публикует Unicode статьи как hex code point, а не как character.
+    // Источник публикует Unicode статьи как шестнадцатеричную кодовую точку, а не как символ.
     let code = character
         .chars()
         .next()
         .map(|ch| format!("{:X}", u32::from(ch)))
-        .expect("synthetic media identity");
+        .expect("символ синтетического материала указан");
     let evidence = crate::yarxi::AcquisitionEvidence {
         provider: "synthetic".into(),
         provider_version: "1".into(),
@@ -101,8 +101,8 @@ fn media_with_codes(character: &str, article_unicode: &str, bytes: Vec<u8>) -> A
 fn provider_article_unicode_is_a_hex_code_point_not_the_character() {
     let fixture = Fixture::new();
     fixture.start("identity", &['漢']);
-    // Provider публикует Unicode статьи как hex code point (U+6F22 -> "6F22").
-    // Сравнение с самим character делало бы любой живой acquisition неуспешным.
+    // Источник публикует Unicode статьи как шестнадцатеричную кодовую точку (U+6F22 -> "6F22").
+    // Сравнение с самим символом приводило бы к ошибке при любом реальном получении.
     let (state, _, issues) = run_batch(&fixture.store, "identity", 1, |characters| {
         assert_eq!(characters, ["漢"]);
         Ok(vec![Ok(media_with_codes("漢", "6F22", glyph('漢')))])
@@ -183,18 +183,87 @@ fn cli_parser_supports_structured_batch_actions_and_rejects_free_text() {
         ])
         .is_err()
     );
-    assert!(
-        Cli::try_parse_from([
-            "kanji-assets",
-            "batch",
-            "run",
-            "--batch-id",
-            "fixture",
-            "--rounds",
-            "6"
-        ])
-        .is_err()
+    let default_run =
+        Cli::try_parse_from(["kanji-assets", "batch", "run", "--batch-id", "fixture"]).unwrap();
+    let Command::Batch { command } = &default_run.command else {
+        panic!("команда пакета должна разбираться как batch");
+    };
+    assert!(matches!(
+        command,
+        BatchCommand::Run {
+            rounds: MAX_ACQUISITION_ROUNDS,
+            ..
+        }
+    ));
+    assert!(prevalidate(command).is_ok());
+
+    let too_many = Cli::try_parse_from([
+        "kanji-assets",
+        "batch",
+        "run",
+        "--batch-id",
+        "fixture",
+        "--rounds",
+        &(MAX_ACQUISITION_ROUNDS + 1).to_string(),
+    ])
+    .unwrap();
+    let Command::Batch { command } = &too_many.command else {
+        panic!("команда пакета должна разбираться как batch");
+    };
+    assert!(prevalidate(command).is_err());
+}
+
+#[test]
+fn human_reason_uses_one_byte_limit_at_cli_boundary() {
+    assert!(validate_reason(&"r".repeat(MAX_HUMAN_REASON_BYTES)).is_ok());
+    assert!(validate_reason(&"r".repeat(MAX_HUMAN_REASON_BYTES + 1)).is_err());
+    assert!(validate_reason(" \n\t ").is_err());
+}
+
+#[test]
+fn domain_round_limit_rejects_overflow_before_acquisition() {
+    let fixture = Fixture::new();
+    fixture.start("round-limit", &['漢']);
+    let mut called = false;
+    let result = run_batch(
+        &fixture.store,
+        "round-limit",
+        MAX_ACQUISITION_ROUNDS + 1,
+        |_| {
+            called = true;
+            Ok(Vec::new())
+        },
     );
+    assert!(result.is_err());
+    assert!(!called);
+}
+
+#[test]
+fn human_cli_output_uses_russian_labels() {
+    let fixture = Fixture::new();
+    let output = execute(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Start {
+            batch_id: Some("localized".into()),
+            characters: vec!["漢".into()],
+        },
+        OutputFormat::Human,
+        false,
+    );
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output
+            .stdout
+            .contains("Операция: создание пакета; результат: создан")
+    );
+    assert!(
+        output
+            .stdout
+            .contains("попыток_получения=0 разных_кандидатов_SHA-256=0")
+    );
+    assert!(!output.stdout.contains("attempts="));
+    assert!(!output.stdout.contains("review:"));
 }
 
 #[test]
@@ -255,7 +324,8 @@ fn acquisition_releases_runtime_lock_and_finishes_all_items_before_retry() {
     fixture.start("breadth", &['元', '漢', '字']);
     let mut requests = Vec::new();
     let (state, _, _) = run_batch(&fixture.store, "breadth", 2, |characters| {
-        // Reopening the same flock during provider invocation proves release.
+        // Повторное открытие той же flock во время вызова источника подтверждает,
+        // что блокировка снята.
         let _probe = BatchRuntime::open(fixture.store.root(), "breadth").unwrap();
         requests.push(characters.to_vec());
         Ok(characters
@@ -309,13 +379,13 @@ fn reuse_trusted_assets_and_publication_resume_do_not_acquire_again() {
     assert!(state.is_resolved());
     fixture.start("reuse", &['元']);
     let (state, changed, _) = run_batch(&fixture.store, "reuse", 5, |_| {
-        panic!("trusted bytes must not be acquired")
+        panic!("для доверенных байтов получение не запускается")
     })
     .unwrap();
     assert!(!changed);
     assert!(state.is_resolved());
     assert_eq!(state.items[0].status, BatchItemStatus::ExistingVerified);
-    // Simulate canonical commit completed before state mark/save.
+    // Имитируем канонический коммит до отметки и сохранения состояния.
     let mut runtime = BatchRuntime::open(fixture.store.root(), "original").unwrap();
     let mut before_mark = runtime.load().unwrap().unwrap();
     before_mark.items[0].published_sha256 = None;
@@ -324,7 +394,7 @@ fn reuse_trusted_assets_and_publication_resume_do_not_acquire_again() {
     runtime.save(&before_mark).unwrap();
     drop(runtime);
     let (state, _, _) = run_batch(&fixture.store, "original", 5, |_| {
-        panic!("publication resume must not acquire")
+        panic!("возобновление публикации не должно запускать получение")
     })
     .unwrap();
     assert!(state.is_resolved());
@@ -343,8 +413,8 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
     .unwrap();
     assert!(state.items[0].is_ready());
     assert_eq!(state.review_queue().len(), 2);
-    // REJECTED candidate утверждает, что ближе другой эталон Unicode, поэтому он
-    // не считается независимым пригодным sample этого identity.
+    // Кандидат REJECTED показывает, что другой эталон Unicode ближе, поэтому он
+    // не считается независимым пригодным образцом этой identity.
     assert!(state.items[1].aggregate.distinct_valid_hashes.is_empty());
     assert_eq!(state.items[1].attempts.len(), 5);
     let confirm_hash = state.items[1].current_sha256.clone().unwrap();
@@ -416,9 +486,72 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
     );
     assert!(state.items[0].is_ready());
     assert!(state.items[1].is_ready());
-    // The new candidate can be individually VERIFIED or awaiting refinement;
-    // the targeted retry itself must not repeat acquisitions of ready neighbors.
+    // Новый кандидат может получить индивидуальный VERIFIED или ждать уточнения;
+    // целевой повтор не должен запускать получение для уже готовых соседей.
     assert_eq!(state.items[2].attempts.len(), 6);
+}
+
+#[test]
+fn confirm_of_exact_asset_without_valid_automated_evidence_does_not_approve_owner() {
+    let fixture = Fixture::new();
+    fixture.start("confirm-without-evidence", &['漢']);
+    let bytes = b"GIF89a bytes that do not encode an image";
+    let hash = sha256_hex(bytes);
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "confirm-without-evidence").unwrap();
+    let mut state = runtime.load().unwrap().unwrap();
+    let candidate = runtime
+        .persist_candidate(
+            bytes,
+            ValidationRecord {
+                status: SemanticStatus::Uncertain,
+                validator: KanjiImageValidator::validator_identity(),
+                content_sha256: hash.clone(),
+                evidence: vec![ValidationEvidence {
+                    kind: "pixel_reference_comparison".into(),
+                    summary: "синтетическое свидетельство для теста границы подтверждения".into(),
+                    details: None,
+                }],
+            },
+            true,
+        )
+        .unwrap();
+    state
+        .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
+        .unwrap();
+    runtime.save(&state).unwrap();
+    drop(runtime);
+
+    assert!(fixture.store.verify_integrity().unwrap().is_empty());
+    let (response, exit_code) = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Decide {
+            batch_id: "confirm-without-evidence".into(),
+            character: "漢".into(),
+            sha256: hash,
+            action: BatchActionArg::Confirm,
+            reason: "проверить, что автоматическое свидетельство обязательно".into(),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(exit_code, 3);
+    assert_eq!(response.outcome, "publication_blocked");
+    assert!(!response.issues.is_empty());
+    assert!(!response.items[0].effective_verified);
+    let owner = fixture
+        .store
+        .verify_integrity()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.identity == identity('漢'))
+        .unwrap();
+    assert_ne!(owner.current_human_decision(), Some(HumanDecision::Approve));
+    assert_eq!(
+        owner.validation.as_ref().unwrap().status,
+        SemanticStatus::Corrupt
+    );
 }
 
 #[test]
@@ -445,9 +578,9 @@ fn exact_source_cas_fails_before_manifest_mutation() {
 fn aggregate_publication_is_exact_versioned_and_decoded() {
     let fixture = Fixture::new();
     fixture.start("aggregate", &['漢']);
-    // Bytes обязаны быть приемлемыми для production validator: aggregate не
-    // повышает REJECTED candidate, поэтому синтетика строится на эталоне 漢, а
-    // независимые метрики задаются записанным evidence.
+    // Байты должны приниматься рабочим валидатором: агрегат не повышает кандидата
+    // REJECTED, поэтому синтетика строится на эталоне 漢, а независимые метрики
+    // задаются сохранёнными свидетельствами.
     let first = glyph('漢');
     let mut image = image::load_from_memory(&first).unwrap().to_rgba8();
     image.put_pixel(0, 0, image::Rgba([254, 255, 255, 255]));
@@ -465,7 +598,7 @@ fn aggregate_publication_is_exact_versioned_and_decoded() {
             content_sha256: sha256_hex(bytes),
             evidence: vec![ValidationEvidence {
                 kind: "pixel_reference_comparison".into(),
-                summary: "synthetic independent metrics".into(),
+                summary: "синтетические независимые метрики".into(),
                 details: Some(
                     serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "元"}),
                 ),
@@ -480,7 +613,7 @@ fn aggregate_publication_is_exact_versioned_and_decoded() {
     assert!(!state.is_resolved());
     drop(runtime);
     let (state, _, issues) = run_batch(&fixture.store, "aggregate", 5, |_| {
-        panic!("aggregate publication must resume exact bytes")
+        panic!("публикация агрегата должна продолжиться с точных байтов")
     })
     .unwrap();
     assert!(issues.is_empty());
@@ -533,9 +666,9 @@ fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
         5,
         "synthetic candidates обязаны быть distinct"
     );
-    // Один REJECTED с привлекательными метриками и четыре UNCERTAIN: старый
-    // фильтр включал REJECTED в средние, поэтому mean проходил порог, а выбранным
-    // становился именно отвергнутый candidate (у него минимальная дистанция).
+    // Один REJECTED с привлекательными метриками и четыре UNCERTAIN: прежний
+    // фильтр включал REJECTED в среднее, поэтому порог проходился, а выбирался
+    // именно отклонённый кандидат с минимальной дистанцией.
     let plan = [
         (SemanticStatus::Rejected, 0.015, -0.015),
         (SemanticStatus::Uncertain, 0.021, 0.009),
@@ -552,7 +685,7 @@ fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
             content_sha256: sha256_hex(bytes),
             evidence: vec![ValidationEvidence {
                 kind: "pixel_reference_comparison".into(),
-                summary: "synthetic independent metrics".into(),
+                summary: "синтетические независимые метрики".into(),
                 details: Some(
                     serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "漠"}),
                 ),
@@ -567,7 +700,7 @@ fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
     runtime.save(&state).unwrap();
     drop(runtime);
     let (state, _, _) = run_batch(&fixture.store, "rejected", 5, |_| {
-        panic!("resume must not acquire")
+        panic!("возобновление не должно запускать получение")
     })
     .unwrap();
     let item = &state.items[0];
@@ -1072,7 +1205,7 @@ fn expected_validator_trust_loss_invalidates_cached_ready() {
                 SemanticStatus::Verified,
                 vec![ValidationEvidence {
                     kind: "synthetic_other_classifier".into(),
-                    summary: "other exact validator identity".into(),
+                    summary: "точная identity другого валидатора".into(),
                     details: None,
                 }],
             ))
@@ -1114,7 +1247,7 @@ fn stale_pinned_validator_blocks_decision_before_mutation() {
                 SemanticStatus::Verified,
                 vec![ValidationEvidence {
                     kind: "synthetic_other_classifier".into(),
-                    summary: "other exact validator identity".into(),
+                    summary: "точная identity другого валидатора".into(),
                     details: None,
                 }],
             ))
@@ -1122,9 +1255,9 @@ fn stale_pinned_validator_blocks_decision_before_mutation() {
     }
     let fixture = Fixture::new();
     let hash = publish_reference(&fixture, "seed");
-    // Batch, созданный до апгрейда production validator'а: pinned identity
-    // отличается от текущей, поэтому ни решение, ни retry не могут публиковать
-    // соседние items текущим validator'ом.
+    // Пакет создан до обновления рабочего валидатора: закреплённая identity
+    // отличается от текущей, поэтому ни решение, ни повторное получение не могут
+    // публиковать соседние элементы текущим валидатором.
     let pinned = OtherValidator.identity();
     {
         let mut runtime = BatchRuntime::open(fixture.store.root(), "pinned").unwrap();

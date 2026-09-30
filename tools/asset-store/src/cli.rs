@@ -84,7 +84,7 @@ pub enum Command {
         #[arg(required = true, num_args = 1..)]
         characters: Vec<String>,
     },
-    /// Resumable acquisition/refinement/human review без Git publication.
+    /// Возобновляемое получение и уточнение ресурсов, проверка человеком без публикации в Git.
     Batch {
         #[command(subcommand)]
         command: BatchCommand,
@@ -714,7 +714,7 @@ fn ensure_characters(
         });
         if is_current {
             let mut summary =
-                summary_for_current(existing.expect("verified record exists").clone());
+                summary_for_current(existing.expect("подтверждённая запись существует").clone());
             summary.item_outcome = Some("already_verified".into());
             summaries.push(Some(summary));
         } else {
@@ -750,7 +750,7 @@ fn ensure_characters(
                     let Some(Ok(media)) = result else {
                         let message = match result {
                             Some(Err(message)) => message.as_str(),
-                            None => "provider outcome count mismatch",
+                            None => "источник вернул неожиданное число результатов",
                             Some(Ok(_)) => unreachable!(),
                         };
                         blockers.push(format!("acquisition_failed:{character}"));
@@ -878,7 +878,7 @@ fn validate_selected_format(selection: SelectionResult, bytes: &[u8]) -> Result<
     };
     if actual != expected {
         return Err(format!(
-            "selected {selection:?} requires {expected:?} magic bytes, received {actual:?}"
+            "выбранный формат {selection:?} требует сигнатуру {expected:?}, получена {actual:?}"
         ));
     }
     Ok(())

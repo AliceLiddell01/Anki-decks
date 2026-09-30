@@ -28,7 +28,7 @@ const REFERENCE_DB: &[u8] = include_bytes!("data/kanjivg-r20250816.maskdb.zlib")
 const YARXI_FONT_REFERENCE_DB: &[u8] = include_bytes!("data/yarxi-noto-serif-jp-r1.maskdb.zlib");
 const KANJIVG_REFERENCE_VERSION: &str = "KanjiVG r20250816 @ bd13ffbcc9d85cb86ae98bbbf001d9069220b901; normalization=center-sampled-mask64-v2; maskdb_sha256=5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff";
 const YARXI_FONT_REFERENCE_VERSION: &str = "Noto Serif JP /fonts/noto-serif-jp.24fc2d26.ttf sha256=e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8; normalization=center-sampled-mask64-v2; maskdb_sha256=ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c";
-const MAX_MEDIA_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_MEDIA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 2048;
 const MAX_GIF_FRAMES: usize = 512;
 const MIN_FOREGROUND_CONTRAST: f32 = 30.0;
@@ -38,6 +38,15 @@ const MIN_FOREGROUND_CONTRAST: f32 = 30.0;
 const VERIFIED_MAX_DISTANCE: f32 = 0.020;
 const VERIFIED_MIN_MARGIN: f32 = 0.004;
 const REJECT_MIN_GAP: f32 = 0.015;
+
+/// Пороги положительного индивидуального решения для агрегирующей policy.
+/// Значения берутся из тех же constants, что использует classifier ниже.
+pub(crate) fn registered_aggregate_thresholds() -> (f64, f64) {
+    (
+        f64::from(VERIFIED_MAX_DISTANCE),
+        f64::from(VERIFIED_MIN_MARGIN),
+    )
+}
 
 type ReferenceMap = BTreeMap<char, ReferenceTemplate>;
 type FontReferenceMap = BTreeMap<char, ReferenceTemplate>;
@@ -957,6 +966,39 @@ mod tests {
         cursor.into_inner()
     }
 
+    fn progressive_top_rows_with_full_bounds(mask: &Mask, rows: usize) -> Mask {
+        let mut left = MASK_SIDE;
+        let mut top = MASK_SIDE;
+        let mut right = 0;
+        let mut bottom = 0;
+        for y in 0..MASK_SIDE {
+            for x in 0..MASK_SIDE {
+                if get_ink(mask, x, y) {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x);
+                    bottom = bottom.max(y);
+                }
+            }
+        }
+
+        let mut partial = [0; MASK_BYTES];
+        for y in 0..MASK_SIDE {
+            for x in 0..MASK_SIDE {
+                if get_ink(mask, x, y)
+                    && (y < rows.min(MASK_SIDE)
+                        || y == top
+                        || y == bottom
+                        || x == left
+                        || x == right)
+                {
+                    set_ink(&mut partial, x, y);
+                }
+            }
+        }
+        partial
+    }
+
     fn semantic_status_for(candidate: &Mask, expected: char) -> SemanticStatus {
         let catalog = test_catalog();
         let expected_template = catalog.get(&expected).expect("эталонный шаблон существует");
@@ -1042,6 +1084,33 @@ mod tests {
             SemanticStatus::Verified
         );
         assert_ne!(semantic_status_for(&early, '元'), SemanticStatus::Verified);
+    }
+
+    #[test]
+    fn yarxi_shaped_gif_full_partial_progression_full_keeps_full_semantic_mask() {
+        let full = reference('魔');
+        let full_evidence = rgba_to_mask(&rgba_for(&full))
+            .expect("полный исходный кадр нормализуется production segmentation");
+        let expected = full_evidence.mask;
+        let frames = vec![
+            full,
+            progressive_top_rows_with_full_bounds(&full, 16),
+            progressive_top_rows_with_full_bounds(&full, 32),
+            progressive_top_rows_with_full_bounds(&full, 48),
+            full,
+        ];
+        let gif = gif_for(frames.clone());
+        let animation =
+            decode_media(&gif).expect("GIF с полным и промежуточными кадрами декодируется");
+
+        assert_eq!(animation.frame_count, frames.len());
+        assert!(animation.representative_frame < animation.frame_count);
+        assert_eq!(animation.mask, expected);
+        assert_eq!(animation.foreground_pixels, full_evidence.foreground_pixels);
+        assert_eq!(
+            semantic_status_for(&animation.mask, '魔'),
+            SemanticStatus::Verified
+        );
     }
 
     #[test]
@@ -1198,8 +1267,12 @@ mod tests {
         );
         assert_eq!(negative_rejected + negative_uncertain, SAMPLE_COUNT);
         assert!(
-            positive_verified > 0,
-            "в калибровочном наборе есть подтверждённые положительные примеры"
+            positive_verified >= SAMPLE_COUNT * 3 / 4,
+            "не менее 75% закреплённых положительных образцов должны получать VERIFIED"
+        );
+        assert_eq!(
+            positive_rejected, 0,
+            "совпадающие закреплённые reference masks не должны получать REJECTED"
         );
         eprintln!(
             "офлайн-калибровка: источник=Noto Serif JP, размер синтетической плитки=142 px; стратифицированная выборка={SAMPLE_COUNT}; положительные случаи: verified={positive_verified}, uncertain={positive_uncertain}, rejected={positive_rejected}, максимальное расстояние до ожидаемого эталона={max_positive_distance:.6}, минимальный отрыв={min_positive_margin:.6}; ближайшие конкурирующие символы: rejected={negative_rejected}, uncertain={negative_uncertain}, максимальный разрыв={max_wrong_identity_gap:.6}"
@@ -1342,16 +1415,20 @@ mod tests {
     #[test]
     fn registered_threshold_boundaries_remain_fail_closed() {
         assert_eq!(
-            classify_distance(0.020, 0.025, 0.005),
+            classify_distance(
+                VERIFIED_MAX_DISTANCE,
+                VERIFIED_MAX_DISTANCE + VERIFIED_MIN_MARGIN,
+                VERIFIED_MIN_MARGIN,
+            ),
             SemanticStatus::Verified
         );
         assert_eq!(
-            classify_distance(0.0201, 0.0251, 0.005),
+            classify_distance(VERIFIED_MAX_DISTANCE + 0.0001, 0.0251, VERIFIED_MIN_MARGIN,),
             SemanticStatus::Uncertain,
             "расстояние выше верхнего положительного порога не принимается"
         );
         assert_eq!(
-            classify_distance(0.015, 0.0189, 0.0039),
+            classify_distance(0.015, 0.0189, VERIFIED_MIN_MARGIN - 0.0001,),
             SemanticStatus::Uncertain,
             "отрыв ниже нижнего положительного порога не принимается"
         );
@@ -1359,5 +1436,12 @@ mod tests {
             classify_distance(0.030, 0.010, -0.020),
             SemanticStatus::Rejected
         );
+    }
+
+    #[test]
+    fn aggregate_threshold_api_uses_registered_classifier_values() {
+        let (max_distance, minimum_margin) = registered_aggregate_thresholds();
+        assert_eq!(max_distance, f64::from(VERIFIED_MAX_DISTANCE));
+        assert_eq!(minimum_margin, f64::from(VERIFIED_MIN_MARGIN));
     }
 }
