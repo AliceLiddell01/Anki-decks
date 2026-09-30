@@ -122,7 +122,7 @@ fn fields_by_ord(value: &Value, note: &Value, uuid: &str) -> Vec<(i64, String)> 
     let models = raw_models(value);
     let model = models
         .get(uuid)
-        .unwrap_or_else(|| panic!("модель {uuid} должна быть в модели экспорта"));
+        .unwrap_or_else(|| panic!("модель должна быть в модели экспорта"));
     let mut by_ord: Vec<(i64, String)> = model
         .iter()
         .map(|(name, ord)| (*ord, name.clone()))
@@ -138,7 +138,7 @@ fn fields_by_ord(value: &Value, note: &Value, uuid: &str) -> Vec<(i64, String)> 
     assert_eq!(
         fields.len(),
         by_ord.len(),
-        "число fields расходится с моделью {uuid}"
+        "число fields расходится с моделью"
     );
     by_ord
 }
@@ -241,7 +241,7 @@ fn every_note_resolves_through_ord() {
             .expect("у заметки есть note_model_uuid");
         let model = index
             .model_by_uuid(uuid)
-            .unwrap_or_else(|| panic!("модель {uuid} не разрешается"));
+            .unwrap_or_else(|| panic!("модель не разрешается"));
         assert_eq!(
             model.flds.len(),
             entry.note.fields.len(),

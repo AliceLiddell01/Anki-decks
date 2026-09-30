@@ -485,7 +485,7 @@ pub fn raw_note_model_fields(raw: &Value, note: &Value) -> Vec<(String, i64)> {
     raw_all_models(raw)
         .into_iter()
         .find(|(model_uuid, _)| model_uuid == uuid)
-        .unwrap_or_else(|| panic!("модель {uuid} не найдена в note_models"))
+        .unwrap_or_else(|| panic!("модель не найдена в note_models"))
         .1
 }
 
@@ -504,9 +504,9 @@ pub fn raw_field_ord(
         .expect("у заметки должен быть note_model_uuid");
     models
         .get(uuid)
-        .unwrap_or_else(|| panic!("модель {uuid} не найдена в note_models"))
+        .unwrap_or_else(|| panic!("модель не найдена в note_models"))
         .get(name)
-        .unwrap_or_else(|| panic!("поле {name} не найдено в модели {uuid}"))
+        .unwrap_or_else(|| panic!("поле {name} не найдено в модели"))
         .to_owned()
 }
 
