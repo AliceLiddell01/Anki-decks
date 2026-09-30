@@ -267,13 +267,24 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             request_file,
             apply,
             emit_resolved,
+            create_config,
+            asset_store,
         } => {
             let raw = read_document(request_file, create_op::MAX_REQUEST_BYTES, "запрос")?;
             let label = request_file.display().to_string();
             let request = create_op::parse_request_bytes(&raw, &label)?;
             // Разрешённый запрос публикуется внутри самой операции и до
             // мутации экспорта: см. `create_op::create`.
-            let result = create_op::create(export_dir, &request, *apply, emit_resolved.as_deref())?;
+            let result = create_op::create_with_options(
+                export_dir,
+                &request,
+                *apply,
+                emit_resolved.as_deref(),
+                &crate::ops::create_media::MediaOptions {
+                    config: create_config.clone(),
+                    asset_store: asset_store.clone(),
+                },
+            )?;
             Ok(Rendered {
                 command: "create",
                 stdout: if cli.json {

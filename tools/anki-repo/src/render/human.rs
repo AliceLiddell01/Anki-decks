@@ -1048,7 +1048,11 @@ pub fn create(result: &CreateResult) -> String {
 
     out.line(format!("Экспорт: {}", result.export_dir.display()));
     out.line(format!("deck.json: {}", result.deck_json.display()));
-    out.line(mode_line(result.applied, result.dry_run));
+    if result.media.mutations > 0 && !result.applied {
+        out.line("Режим: --apply, восстановлены медиафайлы");
+    } else {
+        out.line(mode_line(result.applied, result.dry_run));
+    }
     out.line(format!("Заметок в запросе: {}", result.notes_total));
     out.line(format!("Создано: {}", result.notes_created));
     out.line(format!("Уже было: {}", result.notes_already_applied));
@@ -1057,6 +1061,12 @@ pub fn create(result: &CreateResult) -> String {
         result.source_bytes, result.candidate_bytes, result.byte_delta
     ));
 
+    out.line(format!(
+        "План медиафайлов: ссылок={}, проверенных файлов={}, новых объявлений media_files={}",
+        result.media.references.len(),
+        result.media.assets_total(),
+        result.media.declarations_added.len()
+    ));
     out.blank();
     out.line(format!(
         "Затронутые колоды ({}):",
@@ -1098,6 +1108,10 @@ pub fn create(result: &CreateResult) -> String {
             outcome.model_uuid
         ));
         out.line(format!(
+            "      поля с обработчиком: {}",
+            outcome.processor_fields.join(", ")
+        ));
+        out.line(format!(
             "      свидетельство модели: {}",
             outcome.model_evidence
         ));
@@ -1107,7 +1121,7 @@ pub fn create(result: &CreateResult) -> String {
             outcome.field_names.join(", ")
         ));
         out.line(format!(
-            "      теги: {}; media-ссылок в новых значениях: {}",
+            "      теги: {}; ссылок на медиа в новых значениях: {}",
             if outcome.tags.is_empty() {
                 "—".to_string()
             } else {
@@ -1137,6 +1151,11 @@ pub fn create(result: &CreateResult) -> String {
             "media_references_absent",
             result.checks.media_references_absent,
         ),
+        (
+            "only_notes_and_media_files_appended",
+            result.checks.only_notes_and_media_files_appended,
+        ),
+        ("media_assets_verified", result.checks.media_assets_verified),
         (
             "guids_resolved_without_conflict",
             result.checks.guids_resolved_without_conflict,
