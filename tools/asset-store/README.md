@@ -58,14 +58,23 @@ form, а не reading: только PNG попадает в `assets/png/<surface
 получает `<surface>.pitch.png`. Например, внутренняя запись для `飴` хранится как
 `assets/png/飴.png` и публикуется в Anki под именем `飴.pitch.png`; kanji media
 `飴.png` сохраняет прежнее имя. Reading и положительный JPDB vocabulary ID
-хранятся в domain metadata/evidence. Полного PNG decode недостаточно для
-`VERIFIED`: `PitchAccentImageValidator` проверяет точный match surface и reading
-с формами выбранной JPDB vocabulary entry, фактический detail URL с тем же ID,
-положительное число graph nodes, наблюдаемое состояние dark theme в документе,
-положительные viewport/capture geometry, page scale `1.0`, device scale ровно
-`3.0`, а также соответствие CSS capture rectangle фактическим пикселям PNG.
-Browser provenance обязательна. Evidence старой версии validator не наследует
-доверие новой версии; неполное evidence остаётся `UNCERTAIN`.
+хранятся в domain metadata/evidence. Resolver сравнивает чтение, считая
+хирагану и катакану эквивалентными записями, но требует точное surface и
+связанную с ним пару JPDB; в evidence сохраняется исходная запись чтения JPDB.
+Полного PNG decode недостаточно для `VERIFIED`:
+`PitchAccentImageValidator` проверяет точное соответствие surface и reading как
+связанной пары среди форм выбранной vocabulary entry JPDB, фактический detail URL
+с тем же ID, положительное число узлов графиков и наблюдаемое
+свидетельство тёмного фона. В evidence отдельно хранятся прямоугольники каждого
+graph в системах координат viewport и документа, их объединение в координатах
+документа, итоговая область захвата с отступом и фактический остаточный отступ
+после ограничения границами документа. Validator сверяет эти связи, масштаб
+страницы `1.0`, масштаб устройства `3.0` и фактические размеры PNG в пикселях с
+CSS capture rect, допуская не более 3 output pixels разницы из-за округления
+границ нативного CDP clip. Он также сравнивает наблюдённый сплошной тёмный фон с
+точками на границе PNG; одних class/media flags недостаточно. Provenance браузера
+обязательна. Evidence старой версии validator не наследует доверие новой версии;
+неполное evidence остаётся `UNCERTAIN`.
 
 Manifest schema — `5`. Помимо exact SHA-256, размера, формата, lifecycle,
 provenance и semantic decision, каждая запись хранит `consumer_filename`, а весь
@@ -99,11 +108,11 @@ image/kanji semantics.
 
 Общие Chromium session, executable discovery, runtime provenance, CDP metrics и
 сетевая техническая телеметрия находятся в `browser_runtime.rs`. Yarxi сохраняет
-свои selectors, URLs, TLS policy, фильтры, fallback, dark theme и текущую
-геометрию capture. Общий runtime позволяет задавать отдельный scale factor `3.0`.
-Provider JPDB использует ту же изолированную сессию и не публикует PNG в canonical
-store; полноценный pitch batch lifecycle и интеграция с `anki-repo` остаются
-отдельными возможностями.
+свои selectors, URLs, TLS policy, фильтры, fallback, dark theme и геометрию
+capture. Общий runtime позволяет задавать отдельный scale factor `3.0`. Provider
+JPDB использует изолированную сессию и не публикует PNG в canonical store;
+полноценный pitch batch lifecycle и интеграция с `anki-repo` остаются отдельными
+возможностями.
 
 Whitelist для хранения в Git включает `.owner.json` и `manifest.json` каждого
 домена, а также непосредственные пути `assets/gif/*.gif` и `assets/png/*.png`
@@ -135,33 +144,108 @@ canonical corpus.
 
 ## Получение pitch accent с JPDB
 
-`JpdbPitchProvider` работает с обычными JPDB search и vocabulary detail pages.
-Resolver выбирает только vocabulary entries, сверяет точную surface form или
-подтверждённую alternative form и при наличии запроса — точный reading. Выбор
-всегда подтверждается повторно на detail page. Provider использует фактический
-`href` результата, не строит vocabulary URL по входным строкам и возвращает
-`ambiguous_vocabulary`/`vocabulary_not_found` отдельно от технических ошибок.
+`JpdbPitchProvider` работает с обычными страницами поиска и vocabulary detail
+JPDB. Механизм поиска проверяет связанную пару написания и чтения среди
+наблюдённых форм, включая подтверждённые альтернативные формы. При неоднозначности
+он не выбирает первый или наиболее ранжированный результат: возвращает
+`ambiguous_vocabulary` и кандидатов с vocabulary ID, формами и чтениями, частями
+речи, значениями и фактическим detail URL. Потребитель может передать явный
+`JpdbPitchSelection` через `JpdbPitchRequest`. Provider заново выполняет поиск и
+принимает выбор только при совпадении ID, surface и optional reading
+валидированной ссылки с одним из фактически найденных кандидатов; query и
+fragment ссылки на identity не влияют. Допустимая ссылка использует HTTPS host
+`jpdb.io`, стандартный порт и точный путь из трёх или четырёх непустых сегментов
+`/vocabulary/<positive-id>/<surface>[/<reading>]`; завершающий slash не допускается.
+Произвольному URL или ID provider не доверяет. Без явного выбора неоднозначный
+запрос остаётся неоднозначным. Provider использует фактический `href` результата,
+не строит vocabulary URL по входным строкам, а `vocabulary_not_found` отделяет от
+технических ошибок.
 
 Для подтверждённой detail page отсутствие pitch возвращается как
 `no_pitch_accent_on_source` только если распознана ожидаемая структура страницы и
-секции Pitch accent нет. Неизвестный или пустой graph DOM, сетевой/JS сбой,
-неподтверждённая dark theme и некорректный capture остаются technical failures.
-Несколько graph nodes снимаются одним native CDP rectangle screenshot при DSF
-`3.0`, без преобразования PNG после capture. Каждая acquisition передаёт готовые
-bytes и `PitchAccentDomainMetadata`, пригодные для `PitchAccentImageValidator`.
-Серии запросов обрабатываются последовательно в одной изолированной session;
-ошибка item не отменяет результаты остальных.
+секции Pitch accent нет. Неизвестный или пустой набор graph в DOM, сетевой/JS
+сбой, неподтверждённая отрисованная тёмная тема и некорректный захват остаются
+техническими ошибками. Перед фиксацией отсутствия provider дожидается idle для
+критических source-запросов и подтверждает повторным чтением, что структура страницы
+не изменилась; произвольная временная пауза сама по себе не считается доказательством.
+Сбой выполнения или декодирования ответа `page.evaluate()` сохраняется как
+`browser_evaluation` с активной стадией; противоречивые данные DOM остаются
+`page_contract`, а ожидание готовности, превысившее срок, — `timeout`.
 
-Для ручной live acceptance используйте внешний plan, например:
+Все найденные узлы графиков выбранной vocabulary entry снимаются одним штатным
+снимком области через CDP при DSF `3.0`; PNG после захвата не масштабируется,
+обрезается или перекодируется. Координаты узлов сохраняются и относительно
+viewport, и относительно документа с учётом `scrollX`/`scrollY`. Область захвата
+задаётся в координатах документа и включает отступ 8 CSS px с каждой стороны;
+если край ограничен границей документа, evidence записывает фактический
+остаточный отступ для каждой стороны. В evidence также входят объединение
+прямоугольников графиков, итоговая область захвата, размеры viewport и страницы,
+масштабы, размеры PNG и свидетельство отрисованного фона. Validator проверяет,
+что прямоугольники графиков образуют указанное объединение и находятся внутри
+области захвата с отступом, размеры PNG соответствуют области захвата и DSF с
+допуском до 3 пикселей для округления границ нативного CDP clip, а
+непрозрачные точки на границе PNG совпадают с наблюдённым сплошным тёмным фоном.
+Он не классифицирует рисунок pitch accent. Естественный вертикальный промежуток
+между несколькими графиками сохраняется.
+
+Каждое получение передаёт исходные bytes и `PitchAccentDomainMetadata`, пригодные
+для `PitchAccentImageValidator`. `JpdbPitchProvider::acquire_requests` запускает
+изолированную session для набора запросов; `acquire_requests_in_session` принимает
+session вызывающего кода. В обоих случаях запросы обрабатываются последовательно,
+но для каждого элемента выполняется новый поиск. Обычная ошибка отдельного item
+не останавливает batch. Если CDP telemetry monitor теряет данные и session больше
+нельзя считать надёжной, текущий item получает ошибку на своей стадии, а следующие
+получают явный `session_failure`.
+
+Для ручной приёмки используйте внешний JSON-план. Для каждого элемента обязательно
+задайте `expected_outcome` одним из точных токенов:
+`acquired`, `no_pitch_accent_on_source`, `ambiguous_vocabulary` или
+`vocabulary_not_found`. Опционально разрешены:
+
+- `expected_vocabulary_id` и `min_graph_count` только для `acquired`;
+- `expected_candidate_ids` только для `ambiguous_vocabulary`; значения должны
+  точно совпасть с набором ID фактических candidates без учёта порядка;
+- `selection` только для `acquired`. В нём обязательны `vocabulary_id` и
+  `detail_url`; ID должен совпасть с `expected_vocabulary_id`, а ссылка должна
+  соответствовать описанному выше JPDB route с тем же ID.
+
+До создания отчёта и запуска браузера программа проверяет запрос, identity домена
+и consumer filename, числовые ограничения, повторы запроса и ссылку выбора.
+Краевые пробелы в surface/reading обрезаются для запроса, а исходные значения
+плана сохраняются в отчёте для диагностики. Повтор
+surface/reading допустим для обычного неоднозначного запроса и отдельного явного
+выбора; точный повтор одного query/selection отклоняется. После поиска provider
+повторно сверяет выбор с фактическими кандидатами.
+
+Синтетический пример показывает поля плана; ID и detail URL для `selection` при
+реальном прогоне нужно заменить на согласованные значения из evidence кандидата:
 
 ```json
 {
   "items": [
-    { "surface": "幽霊" },
-    { "surface": "元気", "reading": "げんき" },
-    { "surface": "美味しい", "reading": "おいしい" },
-    { "surface": "クラブ" },
-    { "surface": "これは存在しない JPDB vocabulary" }
+    {
+      "surface": "合成語",
+      "reading": "ごうせいご",
+      "expected_outcome": "acquired",
+      "expected_vocabulary_id": 42,
+      "min_graph_count": 1
+    },
+    { "surface": "別の語", "expected_outcome": "no_pitch_accent_on_source" },
+    {
+      "surface": "重複語",
+      "expected_outcome": "ambiguous_vocabulary",
+      "expected_candidate_ids": [101, 102]
+    },
+    {
+      "surface": "重複語",
+      "expected_outcome": "acquired",
+      "expected_vocabulary_id": 101,
+      "selection": {
+        "vocabulary_id": 101,
+        "detail_url": "https://jpdb.io/vocabulary/101/重複語/ちょうふくご"
+      }
+    },
+    { "surface": "欠落語", "expected_outcome": "vocabulary_not_found" }
   ]
 }
 ```
@@ -173,16 +257,24 @@ cargo run --locked -p asset-store --bin jpdb_pitch_acceptance -- \
   --plan ../jpdb-pitch-plan.json
 ```
 
-Без `--output` JSON/HTML report и полученные PNG помещаются в системный temp
+Без `--output` JSON/HTML-отчёт и полученные PNG помещаются в системный временный
 каталог вне checkout. С `--output <DIR>` укажите новый каталог вне checkout.
-Отчёт сохраняет фактические vocabulary ID/detail URL, forms/readings, dark-theme
-DOM proof, graph count, capture geometry, DSF, PNG dimensions, SHA-256 и статус
-semantic validator. Для ambiguity, not found и no-pitch report не создаёт PNG.
-Для surface из reference-набора отчёт сравнивает observed PNG dimensions с
-историческими пользовательскими размерами и помечает `match`, `source_drift`
-или `not_acquired`; это только диагностическая сверка, не production rule.
-Harness не меняет canonical asset store, пользовательские media или `decks/**`;
-live plan и его отчёт остаются локальными.
+Отчёт сохраняет полный план и для каждого элемента ожидаемый и фактический исход,
+результат их сравнения, смысловые сведения о кандидатах, фактические vocabulary
+ID/detail URL, формы и чтения, свидетельство отрисованной тёмной темы, геометрию
+графиков и захвата, отступы, DSF, размеры PNG, SHA-256 и решение production
+validator.
+`acquired` проходит только при статусе validator `VERIFIED` и выполнении заданных
+ограничений плана. Ожидаемые ambiguity, not-found и отсутствие pitch могут быть
+успешными исходами; неожиданное отсутствие найденной vocabulary entry приводит к
+ошибке прогона. Отсутствующий результат provider и локальная ошибка обработки
+также помечаются как несовпадение. Ошибка отдельного элемента не удаляет уже
+собранные строки: программа записывает итоговые `evidence.json` и `index.html`,
+включая доступные частичные данные. Исходные bytes результата `acquired`
+сохраняются без преобразования; PNG, не прошедший проверку сигнатуры и decode,
+доступен как `.bin` и не показывается как изображение. Harness не меняет
+canonical asset store, пользовательские media или `decks/**`; план и отчёт
+остаются локальными.
 
 ## Получение с Yarxi
 

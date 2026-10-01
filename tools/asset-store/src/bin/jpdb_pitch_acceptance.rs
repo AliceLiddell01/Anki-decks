@@ -4,25 +4,31 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use asset_store::domain::AssetDomainPolicy;
 use asset_store::hashing::sha256_hex;
-use asset_store::jpdb::{JpdbPitchOutcome, JpdbPitchProvider, JpdbPitchQuery};
+use asset_store::jpdb::{
+    JpdbPitchOutcome, JpdbPitchProvider, JpdbPitchQuery, JpdbPitchRequest, JpdbPitchSelection,
+};
 use asset_store::model::{
     AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, Provenance, SemanticStatus,
 };
-use asset_store::pitch_accent::PitchAccentImageValidator;
+use asset_store::pitch_accent::{
+    PitchAccentDomainPolicy, PitchAccentImageValidator, jpdb_readings_equivalent,
+};
 use asset_store::validation::SemanticValidator;
 use clap::Parser;
 use image::GenericImageView;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "jpdb_pitch_acceptance",
-    about = "Получить и проверить browser-rendered pitch-accent PNG с JPDB"
+    about = "Проверить PNG pitch accent, полученные браузером с JPDB, по ожиданиям плана"
 )]
 struct Args {
-    /// JSON-план: {"items":[{"surface":"幽霊","reading":"ゆうれい"}]}.
-    /// Поле reading необязательно; путь может находиться вне checkout.
+    /// JSON-план: каждый элемент задаёт `surface` и обязательный `expected_outcome`.
+    /// План и отчёт могут находиться вне checkout.
     #[arg(long, value_name = "PATH")]
     plan: PathBuf,
 
@@ -31,10 +37,60 @@ struct Args {
     output: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PlanItem {
     surface: String,
     reading: Option<String>,
+    expected_outcome: ExpectedOutcome,
+    expected_vocabulary_id: Option<u64>,
+    min_graph_count: Option<u32>,
+    expected_candidate_ids: Option<Vec<u64>>,
+    selection: Option<JpdbPitchSelection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedOutcome {
+    Acquired,
+    NoPitchAccentOnSource,
+    AmbiguousVocabulary,
+    VocabularyNotFound,
+}
+
+impl ExpectedOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Acquired => "acquired",
+            Self::NoPitchAccentOnSource => "no_pitch_accent_on_source",
+            Self::AmbiguousVocabulary => "ambiguous_vocabulary",
+            Self::VocabularyNotFound => "vocabulary_not_found",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPlan {
+    items: Vec<RawPlanItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPlanItem {
+    surface: String,
+    reading: Option<String>,
+    expected_outcome: ExpectedOutcome,
+    expected_vocabulary_id: Option<u64>,
+    min_graph_count: Option<u32>,
+    expected_candidate_ids: Option<Vec<u64>>,
+    selection: Option<RawSelection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSelection {
+    vocabulary_id: u64,
+    detail_url: String,
 }
 
 #[tokio::main]
@@ -44,229 +100,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let plan_path = args.plan.canonicalize()?;
-    let plan: Value = serde_json::from_slice(&fs::read(&plan_path)?)?;
-    let items = read_plan_items(&plan)?;
+    let plan_json: Value = serde_json::from_slice(&fs::read(&plan_path)?)?;
+    let items = read_plan_items(&plan_json)?;
+
+    // Все детерминированные ошибки плана и пути --output обнаруживаются до создания
+    // отчёта и запуска браузера.
     let report_dir = create_report_dir(args.output.as_deref())?;
+    let requests = items.iter().map(provider_request).collect::<Vec<_>>();
 
-    let queries: Vec<_> = items
-        .iter()
-        .map(|item| JpdbPitchQuery {
-            surface: item.surface.clone(),
-            reading: item.reading.clone(),
-        })
-        .collect();
-    let outcomes = JpdbPitchProvider::acquire_many(&queries).await;
-    let mut rows = Vec::with_capacity(items.len().max(outcomes.len()));
-    let mut all_checks_passed = outcomes.len() == items.len();
-
-    for (index, (item, outcome)) in items.iter().zip(outcomes.iter()).enumerate() {
-        let mut row = json!({
-            "surface": item.surface,
-            "requested_reading": item.reading,
-            "outcome": outcome_name(outcome),
-        });
-
-        match outcome {
-            JpdbPitchOutcome::Acquired { asset } => {
-                let metadata = &asset.metadata;
-                let bytes = &asset.bytes;
-                let sha256 = sha256_hex(bytes);
-                let png_signature_valid = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
-                let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Png);
-                let dimensions = decoded.as_ref().ok().map(GenericImageView::dimensions);
-
-                // Сохраняются только исходные bytes outcome Acquired. Невалидный PNG
-                // остаётся доступен как .bin и не встраивается в HTML под видом картинки.
-                let extension = if png_signature_valid && dimensions.is_some() {
-                    "png"
-                } else {
-                    "bin"
-                };
-                let image_relative_path = format!("images/{:04}.{extension}", index + 1);
-                fs::create_dir_all(report_dir.join("images"))?;
-                fs::write(report_dir.join(&image_relative_path), bytes)?;
-
-                let metadata_matches_plan = metadata.surface == item.surface
-                    && item
-                        .reading
-                        .as_deref()
-                        .is_none_or(|reading| metadata.reading == reading);
-                let provisional = AssetRecord {
-                    identity: AssetIdentity::new("pitch_accent", metadata.surface.clone())?,
-                    // Временная запись передаёт production validator фактические metadata
-                    // provider. Harness не создаёт canonical storage или consumer filename.
-                    storage_path: String::new(),
-                    consumer_filename: String::new(),
-                    sha256: sha256.clone(),
-                    byte_length: bytes.len() as u64,
-                    format: DetectedFormat::from_signature(bytes),
-                    provenance: Provenance {
-                        source_kind: "jpdb_browser_render".into(),
-                        source_name: format!("jpdb-vocabulary-{}.png", metadata.jpdb_vocabulary_id),
-                    },
-                    lifecycle: LifecycleState::Pending,
-                    validation: None,
-                    human_attestation: None,
-                    domain_metadata: Some(serde_json::to_value(metadata)?),
-                };
-                let validation =
-                    PitchAccentImageValidator.validate(&provisional, &mut Cursor::new(bytes));
-
-                match validation {
-                    Ok(decision) => {
-                        let semantic_status = decision.status.as_str();
-                        let verified = semantic_status == SemanticStatus::Verified.as_str()
-                            && metadata_matches_plan
-                            && png_signature_valid
-                            && dimensions.is_some();
-                        all_checks_passed &= verified;
-                        extend_object(
-                            &mut row,
-                            json!({
-                                "jpdb_vocabulary_id": metadata.jpdb_vocabulary_id,
-                                "detail_url": metadata.evidence.source_url,
-                                "canonical_reading": metadata.reading,
-                                "graph_count": metadata.evidence.graph_count,
-                                "graphs": metadata.evidence.render.graphs,
-                                "dark_theme_proof": metadata.evidence.render.dark_theme,
-                                "capture_geometry": {
-                                    "selector": metadata.evidence.render.selector,
-                                    "capture_rect_css_px": metadata.evidence.render.capture_rect,
-                                    "viewport_css_px": [
-                                        metadata.evidence.render.viewport_width,
-                                        metadata.evidence.render.viewport_height
-                                    ],
-                                    "page_scale_factor": metadata.evidence.render.page_scale_factor,
-                                    "device_scale_factor": metadata.evidence.render.device_scale_factor,
-                                    "pixel_dimensions": [
-                                        metadata.evidence.render.pixel_width,
-                                        metadata.evidence.render.pixel_height
-                                    ],
-                                },
-                                "browser": metadata.evidence.browser,
-                                "metadata_matches_plan": metadata_matches_plan,
-                                "sha256": sha256,
-                                "byte_length": bytes.len(),
-                                "png_signature_valid": png_signature_valid,
-                                "dimensions": dimensions,
-                                "semantic_status": semantic_status,
-                                "validation_evidence": decision.evidence,
-                                "image_path": image_relative_path,
-                                "image_mime": if extension == "png" { "image/png" } else { "application/octet-stream" },
-                                "item_status": if verified { "verified_candidate" } else { "candidate_rejected" },
-                            }),
-                        );
-                    }
-                    Err(error) => {
-                        all_checks_passed = false;
-                        extend_object(
-                            &mut row,
-                            json!({
-                                "jpdb_vocabulary_id": metadata.jpdb_vocabulary_id,
-                                "detail_url": metadata.evidence.source_url,
-                                "canonical_reading": metadata.reading,
-                                "graph_count": metadata.evidence.graph_count,
-                                "graphs": metadata.evidence.render.graphs,
-                                "dark_theme_proof": metadata.evidence.render.dark_theme,
-                                "capture_geometry": metadata.evidence.render,
-                                "browser": metadata.evidence.browser,
-                                "metadata_matches_plan": metadata_matches_plan,
-                                "sha256": sha256,
-                                "byte_length": bytes.len(),
-                                "png_signature_valid": png_signature_valid,
-                                "dimensions": dimensions,
-                                "semantic_status": Value::Null,
-                                "validator_failure": { "code": error.code, "message": error.message },
-                                "image_path": image_relative_path,
-                                "image_mime": if extension == "png" { "image/png" } else { "application/octet-stream" },
-                                "item_status": "validator_failed",
-                            }),
-                        );
-                    }
-                }
-            }
-            JpdbPitchOutcome::NoPitchAccentOnSource { evidence } => {
-                extend_object(
-                    &mut row,
-                    json!({
-                        "absence_evidence": evidence,
-                        "item_status": "no_pitch_accent_on_source",
-                        "semantic_status": Value::Null,
-                    }),
-                );
-            }
-            JpdbPitchOutcome::AmbiguousVocabulary {
-                surface,
-                reading,
-                candidates,
-            } => {
-                extend_object(
-                    &mut row,
-                    json!({
-                        "resolved_surface": surface,
-                        "resolved_reading": reading,
-                        "candidates": candidates,
-                        "item_status": "ambiguous_vocabulary",
-                        "semantic_status": Value::Null,
-                    }),
-                );
-            }
-            JpdbPitchOutcome::VocabularyNotFound { surface, reading } => {
-                extend_object(
-                    &mut row,
-                    json!({
-                        "resolved_surface": surface,
-                        "resolved_reading": reading,
-                        "item_status": "vocabulary_not_found",
-                        "semantic_status": Value::Null,
-                    }),
-                );
-            }
-            JpdbPitchOutcome::Failed { error } => {
-                all_checks_passed = false;
-                extend_object(
-                    &mut row,
-                    json!({
-                        "failure": error,
-                        "item_status": "acquisition_failed",
-                        "semantic_status": Value::Null,
-                    }),
-                );
-            }
-        }
-        let observed_dimensions = row["dimensions"]
-            .as_array()
-            .filter(|dimensions| dimensions.len() == 2)
-            .and_then(|dimensions| Some([dimensions[0].as_u64()?, dimensions[1].as_u64()?]));
-        if let Some(visual_reference) =
-            visual_reference(&item.surface, outcome_name(outcome), observed_dimensions)
-        {
-            extend_object(&mut row, json!({ "visual_reference": visual_reference }));
-        }
-        rows.push(row);
-    }
-
-    if outcomes.len() > items.len() {
-        for outcome in outcomes.iter().skip(items.len()) {
-            all_checks_passed = false;
-            rows.push(json!({
-                "outcome": outcome_name(outcome),
-                "item_status": "unmatched_provider_result",
-                "semantic_status": Value::Null,
-            }));
-        }
-    }
-    if outcomes.len() < items.len() {
-        for item in items.iter().skip(outcomes.len()) {
-            rows.push(json!({
-                "surface": item.surface,
-                "requested_reading": item.reading,
-                "outcome": "missing_provider_result",
-                "item_status": "provider_result_missing",
-                "semantic_status": Value::Null,
-            }));
-        }
-    }
+    let outcomes = JpdbPitchProvider::acquire_requests(&requests).await;
+    let (rows, all_checks_passed) = process_outcomes(
+        &items,
+        &outcomes,
+        &report_dir,
+        |index, item, outcome, report_dir| Ok(render_outcome(index, item, outcome, report_dir)),
+    );
 
     let run_status = if all_checks_passed {
         "automatic_checks_passed_waiting_for_user_review"
@@ -281,7 +129,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .count();
     if !all_checks_passed {
         return Err(format!(
-            "Автоматическая проверка не прошла для всего плана; подтверждено PNG: {verified_count}/{}; отчёт: {}",
+            "Проверка плана не пройдена; подтверждено PNG: {verified_count}/{}; отчёт: {}",
             items.len(),
             report_dir.join("index.html").display()
         )
@@ -289,7 +137,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "Автоматические проверки завершены; PNG-кандидатов подтверждено: {verified_count}. Ассеты не опубликованы, проверьте исходы и изображения вручную. Отчёт: {}",
+        "Ожидания плана выполнены; PNG-кандидатов подтверждено: {verified_count}. Ассеты не опубликованы; проверьте исходы и изображения вручную. Отчёт: {}",
         report_dir.join("index.html").display()
     );
     Ok(())
@@ -305,41 +153,507 @@ fn outcome_name(outcome: &JpdbPitchOutcome) -> &'static str {
     }
 }
 
-fn reference_dimensions(surface: &str) -> Option<[u32; 2]> {
-    match surface {
-        "くすぐったい" => Some([321, 84]),
-        "クラブ" => Some([162, 87]),
-        "乙女" => Some([177, 84]),
-        "吹き抜ける" => Some([273, 84]),
-        _ => None,
+fn outcome_matches_expected(expected: ExpectedOutcome, actual: &str) -> bool {
+    expected.as_str() == actual
+}
+
+fn provider_request(item: &PlanItem) -> JpdbPitchRequest {
+    let query = JpdbPitchQuery {
+        surface: item.surface.trim().to_owned(),
+        reading: item
+            .reading
+            .as_deref()
+            .map(|reading| reading.trim().to_owned()),
+    };
+    match item.selection.clone() {
+        Some(selection) => JpdbPitchRequest::with_selection(query, selection),
+        None => JpdbPitchRequest::new(query),
     }
 }
 
-fn visual_reference(
-    surface: &str,
-    outcome: &str,
-    observed_dimensions: Option<[u64; 2]>,
-) -> Option<Value> {
-    let expected_dimensions = reference_dimensions(surface)?;
-    Some(if outcome == "acquired" {
-        let comparison_status = match observed_dimensions {
-            Some(observed) if observed == expected_dimensions.map(u64::from) => "match",
-            Some(_) => "source_drift",
-            None => "unavailable",
+fn process_outcomes<F>(
+    items: &[PlanItem],
+    outcomes: &[JpdbPitchOutcome],
+    report_dir: &Path,
+    mut render: F,
+) -> (Vec<Value>, bool)
+where
+    F: FnMut(usize, &PlanItem, &JpdbPitchOutcome, &Path) -> Result<(Value, bool), String>,
+{
+    let mut rows = Vec::with_capacity(items.len().max(outcomes.len()));
+    let mut all_checks_passed = outcomes.len() == items.len();
+
+    for (index, item) in items.iter().enumerate() {
+        let Some(outcome) = outcomes.get(index) else {
+            all_checks_passed = false;
+            rows.push(missing_result_row(index, item));
+            continue;
         };
-        json!({
-            "expected_native_png_dimensions_px": expected_dimensions,
-            "observed_native_png_dimensions_px": observed_dimensions,
-            "comparison_status": comparison_status,
-        })
-    } else {
-        json!({
-            "expected_native_png_dimensions_px": expected_dimensions,
-            "observed_native_png_dimensions_px": Value::Null,
-            "comparison_status": "not_acquired",
-            "outcome": outcome,
-        })
+
+        let (mut row, acquisition_verified) = match render(index, item, outcome, report_dir) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                all_checks_passed = false;
+                let mut row = base_row(index, item, outcome_name(outcome));
+                let mut issues = expectation_issues(item, outcome, false);
+                issues.push(format!("обработка элемента завершилась ошибкой: {error}"));
+                extend_object(
+                    &mut row,
+                    json!({
+                        "item_status": "item_processing_failed",
+                        "item_processing_error": error,
+                        "expectation_status": "mismatched",
+                        "expectation_issues": issues,
+                    }),
+                );
+                rows.push(row);
+                continue;
+            }
+        };
+
+        let issues = expectation_issues(item, outcome, acquisition_verified);
+        let expectation_matched = issues.is_empty();
+        extend_object(
+            &mut row,
+            json!({
+                "expectation_status": if expectation_matched { "matched" } else { "mismatched" },
+                "expectation_issues": issues,
+            }),
+        );
+
+        if matches!(outcome, JpdbPitchOutcome::Acquired { .. }) {
+            row["item_status"] = Value::String(
+                if expectation_matched {
+                    "verified_candidate"
+                } else {
+                    "candidate_rejected"
+                }
+                .into(),
+            );
+        }
+        if !expectation_matched || row.get("item_processing_error").is_some() {
+            all_checks_passed = false;
+        }
+        rows.push(row);
+    }
+
+    for (offset, outcome) in outcomes.iter().skip(items.len()).enumerate() {
+        all_checks_passed = false;
+        rows.push(json!({
+            "provider_result_index": items.len() + offset,
+            "outcome": outcome_name(outcome),
+            "item_status": "unmatched_provider_result",
+            "expectation_status": "mismatched",
+            "expectation_issues": ["результату провайдера не соответствует элемент плана"],
+            "semantic_status": Value::Null,
+        }));
+    }
+
+    (rows, all_checks_passed)
+}
+
+fn base_row(index: usize, item: &PlanItem, outcome: &str) -> Value {
+    json!({
+        "plan_index": index,
+        "surface": item.surface,
+        "requested_reading": item.reading,
+        "normalized_surface": item.surface.trim(),
+        "normalized_reading": item.reading.as_deref().map(str::trim),
+        "expected_outcome": item.expected_outcome.as_str(),
+        "expected_vocabulary_id": item.expected_vocabulary_id,
+        "min_graph_count": item.min_graph_count,
+        "expected_candidate_ids": item.expected_candidate_ids,
+        "selection": item.selection,
+        "outcome": outcome,
     })
+}
+
+fn missing_result_row(index: usize, item: &PlanItem) -> Value {
+    let mut row = base_row(index, item, "missing_provider_result");
+    extend_object(
+        &mut row,
+        json!({
+            "item_status": "provider_result_missing",
+            "expectation_status": "mismatched",
+            "expectation_issues": ["провайдер не вернул результат для элемента плана"],
+            "semantic_status": Value::Null,
+        }),
+    );
+    row
+}
+
+fn render_outcome(
+    index: usize,
+    item: &PlanItem,
+    outcome: &JpdbPitchOutcome,
+    report_dir: &Path,
+) -> (Value, bool) {
+    let mut row = base_row(index, item, outcome_name(outcome));
+    let mut acquisition_verified = false;
+
+    match outcome {
+        JpdbPitchOutcome::Acquired { asset } => {
+            let metadata = &asset.metadata;
+            let bytes = &asset.bytes;
+            let sha256 = sha256_hex(bytes);
+            let png_signature_valid = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+            let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Png);
+            let dimensions = decoded.as_ref().ok().map(GenericImageView::dimensions);
+
+            // В отчёт записываются только исходные bytes outcome Acquired. Невалидный PNG
+            // остаётся доступен как .bin и не встраивается в HTML под видом картинки.
+            let extension = if png_signature_valid && dimensions.is_some() {
+                "png"
+            } else {
+                "bin"
+            };
+            let image_relative_path = format!("images/{:04}.{extension}", index + 1);
+            let image_write_error = fs::create_dir_all(report_dir.join("images"))
+                .and_then(|()| fs::write(report_dir.join(&image_relative_path), bytes))
+                .err()
+                .map(|error| error.to_string());
+
+            let metadata_matches_plan = metadata.surface == item.surface.trim()
+                && item.reading.as_deref().is_none_or(|reading| {
+                    jpdb_readings_equivalent(&metadata.reading, reading.trim())
+                });
+            let validation = match AssetIdentity::new("pitch_accent", metadata.surface.clone()) {
+                Ok(identity) => match serde_json::to_value(metadata) {
+                    Ok(domain_metadata) => {
+                        let provisional = AssetRecord {
+                            identity,
+                            // Временная запись передаёт production validator фактические
+                            // Метаданные provider-а; приёмочный инструмент не создаёт каноническое хранилище.
+                            storage_path: String::new(),
+                            consumer_filename: String::new(),
+                            sha256: sha256.clone(),
+                            byte_length: bytes.len() as u64,
+                            format: DetectedFormat::from_signature(bytes),
+                            provenance: Provenance {
+                                source_kind: "jpdb_browser_render".into(),
+                                source_name: format!(
+                                    "jpdb-vocabulary-{}.png",
+                                    metadata.jpdb_vocabulary_id
+                                ),
+                            },
+                            lifecycle: LifecycleState::Pending,
+                            validation: None,
+                            human_attestation: None,
+                            domain_metadata: Some(domain_metadata),
+                        };
+                        PitchAccentImageValidator
+                            .validate(&provisional, &mut Cursor::new(bytes))
+                            .map_err(
+                                |error| json!({ "code": error.code, "message": error.message }),
+                            )
+                    }
+                    Err(error) => Err(json!({
+                        "code": "metadata_serialization_failed",
+                        "message": error.to_string(),
+                    })),
+                },
+                Err(error) => Err(json!({
+                    "code": "invalid_asset_identity",
+                    "message": error,
+                })),
+            };
+
+            let (semantic_status, validation_evidence, validator_failure) = match validation {
+                Ok(decision) => (
+                    Some(decision.status.as_str().to_owned()),
+                    serde_json::to_value(decision.evidence).unwrap_or(Value::Null),
+                    Value::Null,
+                ),
+                Err(error) => (None, Value::Null, error),
+            };
+            acquisition_verified = semantic_status.as_deref()
+                == Some(SemanticStatus::Verified.as_str())
+                && metadata_matches_plan
+                && png_signature_valid
+                && dimensions.is_some()
+                && image_write_error.is_none();
+
+            extend_object(
+                &mut row,
+                json!({
+                    "jpdb_vocabulary_id": metadata.jpdb_vocabulary_id,
+                    "detail_url": metadata.evidence.source_url,
+                    "canonical_reading": metadata.reading,
+                    "graph_count": metadata.evidence.graph_count,
+                    "graphs": metadata.evidence.render.graphs,
+                    "dark_theme_proof": metadata.evidence.render.dark_theme,
+                    "capture_geometry": metadata.evidence.render,
+                    "browser": metadata.evidence.browser,
+                    "metadata_matches_plan": metadata_matches_plan,
+                    "sha256": sha256,
+                    "byte_length": bytes.len(),
+                    "png_signature_valid": png_signature_valid,
+                    "dimensions": dimensions,
+                    "semantic_status": semantic_status,
+                    "validation_evidence": validation_evidence,
+                    "validator_failure": validator_failure,
+                    "image_path": if image_write_error.is_none() { Some(image_relative_path) } else { None },
+                    "image_mime": if extension == "png" { "image/png" } else { "application/octet-stream" },
+                    "image_write_error": image_write_error,
+                    "acquisition_validation_verified": acquisition_verified,
+                    "item_status": if acquisition_verified { "verified_candidate" } else { "candidate_rejected" },
+                }),
+            );
+        }
+        JpdbPitchOutcome::NoPitchAccentOnSource { evidence } => {
+            extend_object(
+                &mut row,
+                json!({
+                    "absence_evidence": evidence,
+                    "jpdb_vocabulary_id": evidence.jpdb_vocabulary_id,
+                    "detail_url": evidence.source_url,
+                    "item_status": "no_pitch_accent_on_source",
+                    "semantic_status": Value::Null,
+                }),
+            );
+        }
+        JpdbPitchOutcome::AmbiguousVocabulary {
+            surface,
+            reading,
+            candidates,
+        } => {
+            extend_object(
+                &mut row,
+                json!({
+                    "resolved_surface": surface,
+                    "resolved_reading": reading,
+                    "candidates": candidates,
+                    "candidate_ids": candidates.iter().map(|candidate| candidate.vocabulary_id).collect::<Vec<_>>(),
+                    "item_status": "ambiguous_vocabulary",
+                    "semantic_status": Value::Null,
+                }),
+            );
+        }
+        JpdbPitchOutcome::VocabularyNotFound { surface, reading } => {
+            extend_object(
+                &mut row,
+                json!({
+                    "resolved_surface": surface,
+                    "resolved_reading": reading,
+                    "item_status": "vocabulary_not_found",
+                    "semantic_status": Value::Null,
+                }),
+            );
+        }
+        JpdbPitchOutcome::Failed { error } => {
+            extend_object(
+                &mut row,
+                json!({
+                    "failure": error,
+                    "item_status": "acquisition_failed",
+                    "semantic_status": Value::Null,
+                }),
+            );
+        }
+    }
+
+    (row, acquisition_verified)
+}
+
+fn expectation_issues(
+    item: &PlanItem,
+    outcome: &JpdbPitchOutcome,
+    acquisition_verified: bool,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    if !outcome_matches_expected(item.expected_outcome, outcome_name(outcome)) {
+        issues.push(format!(
+            "ожидался исход `{}`, получен `{}`",
+            item.expected_outcome.as_str(),
+            outcome_name(outcome)
+        ));
+        return issues;
+    }
+
+    match outcome {
+        JpdbPitchOutcome::Acquired { asset } => {
+            let metadata = &asset.metadata;
+            issues.extend(acquired_expectation_issues(
+                item,
+                &metadata.surface,
+                &metadata.reading,
+                metadata.jpdb_vocabulary_id,
+                metadata.evidence.graph_count,
+                acquisition_verified,
+            ));
+        }
+        JpdbPitchOutcome::NoPitchAccentOnSource { evidence } => {
+            let resolved_query_pair = evidence.resolved_forms.iter().any(|form| {
+                form.surface == item.surface.trim()
+                    && !form.reading.trim().is_empty()
+                    && item.reading.as_deref().is_none_or(|reading| {
+                        jpdb_readings_equivalent(&form.reading, reading.trim())
+                    })
+            });
+            if evidence.surface != item.surface.trim()
+                || item.reading.as_deref().is_some_and(|reading| {
+                    !jpdb_readings_equivalent(&evidence.reading, reading.trim())
+                })
+                || !resolved_query_pair
+                || JpdbPitchSelection::new(evidence.jpdb_vocabulary_id, evidence.source_url.clone())
+                    .is_err()
+                || !evidence.base_page_contract_valid
+                || !evidence
+                    .section_inventory
+                    .iter()
+                    .any(|label| label == "Meanings")
+                || evidence
+                    .section_inventory
+                    .iter()
+                    .any(|label| label == "Pitch accent")
+                || evidence.pitch_section_present
+                || evidence.pitch_marker_count != 0
+            {
+                issues.push(
+                    "свидетельства отсутствия pitch accent не подтверждают связанную пару запроса или контракт страницы источника"
+                        .into(),
+                );
+            }
+        }
+        JpdbPitchOutcome::AmbiguousVocabulary {
+            surface,
+            reading,
+            candidates,
+        } => {
+            if surface != item.surface.trim()
+                || item.reading.as_deref().is_some_and(|requested| {
+                    reading
+                        .as_deref()
+                        .is_none_or(|actual| !jpdb_readings_equivalent(actual, requested.trim()))
+                })
+            {
+                issues.push("результат ambiguity не совпадает с запросом".into());
+            }
+            if candidates.is_empty() {
+                issues.push("ambiguity не содержит кандидатов".into());
+            }
+            let mut candidate_ids = BTreeSet::new();
+            for candidate in candidates {
+                if candidate.vocabulary_id == 0 || !candidate_ids.insert(candidate.vocabulary_id) {
+                    issues.push(
+                        "результат `ambiguous_vocabulary` содержит нулевой или повторный ID словарной записи"
+                            .into(),
+                    );
+                }
+                if JpdbPitchSelection::new(candidate.vocabulary_id, candidate.detail_url.clone())
+                    .is_err()
+                {
+                    issues.push(format!(
+                        "URL словарной записи кандидата {} не соответствует его ID JPDB",
+                        candidate.vocabulary_id
+                    ));
+                }
+                let query_pair_is_present = candidate.resolved_forms.iter().any(|form| {
+                    form.surface == item.surface.trim()
+                        && !form.reading.trim().is_empty()
+                        && item.reading.as_deref().is_none_or(|reading| {
+                            jpdb_readings_equivalent(&form.reading, reading.trim())
+                        })
+                });
+                if candidate.resolved_forms.is_empty() || !query_pair_is_present {
+                    issues.push(format!(
+                        "candidate {} не содержит связанную пару написания и чтения запроса",
+                        candidate.vocabulary_id
+                    ));
+                }
+                let has_part_of_speech = candidate
+                    .part_of_speech
+                    .iter()
+                    .any(|value| !value.trim().is_empty());
+                let has_meaning = candidate
+                    .meanings
+                    .iter()
+                    .any(|value| !value.trim().is_empty());
+                if !has_part_of_speech || !has_meaning {
+                    issues.push(format!(
+                        "candidate {} не содержит части речи и значения",
+                        candidate.vocabulary_id
+                    ));
+                }
+            }
+            if let Some(expected_ids) = &item.expected_candidate_ids {
+                let actual_ids = candidates
+                    .iter()
+                    .map(|candidate| candidate.vocabulary_id)
+                    .collect::<BTreeSet<_>>();
+                let expected_ids = expected_ids.iter().copied().collect::<BTreeSet<_>>();
+                let missing_ids = expected_ids
+                    .difference(&actual_ids)
+                    .copied()
+                    .collect::<Vec<_>>();
+                let unexpected_ids = actual_ids
+                    .difference(&expected_ids)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !missing_ids.is_empty() || !unexpected_ids.is_empty() {
+                    issues.push(format!(
+                        "набор ID кандидатов неоднозначного результата не совпадает: отсутствуют {missing_ids:?}, лишние {unexpected_ids:?}"
+                    ));
+                }
+            }
+        }
+        JpdbPitchOutcome::VocabularyNotFound { surface, reading } => {
+            if surface != item.surface.trim()
+                || item.reading.as_deref().is_some_and(|requested| {
+                    reading
+                        .as_deref()
+                        .is_none_or(|actual| !jpdb_readings_equivalent(actual, requested.trim()))
+                })
+            {
+                issues.push("результат not-found не совпадает с запросом".into());
+            }
+        }
+        JpdbPitchOutcome::Failed { .. } => {
+            issues.push("техническая ошибка не является ожидаемым исходом плана".into());
+        }
+    }
+    issues
+}
+
+fn acquired_expectation_issues(
+    item: &PlanItem,
+    actual_surface: &str,
+    actual_reading: &str,
+    actual_vocabulary_id: u64,
+    actual_graph_count: u32,
+    acquisition_verified: bool,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    if actual_surface != item.surface.trim() {
+        issues.push("результат `acquired` содержит другое написание".into());
+    }
+    if item
+        .reading
+        .as_deref()
+        .is_some_and(|reading| !jpdb_readings_equivalent(actual_reading, reading.trim()))
+    {
+        issues.push("результат `acquired` содержит другое чтение".into());
+    }
+    if let Some(expected_id) = item.expected_vocabulary_id
+        && actual_vocabulary_id != expected_id
+    {
+        issues.push(format!(
+            "ожидался ID словарной записи {expected_id}, получен {actual_vocabulary_id}"
+        ));
+    }
+    if let Some(min_graph_count) = item.min_graph_count
+        && actual_graph_count < min_graph_count
+    {
+        issues.push(format!(
+            "ожидалось не менее {min_graph_count} графиков, получено {actual_graph_count}"
+        ));
+    }
+    if !acquisition_verified {
+        issues.push(
+            "acquired не прошёл production-валидатор, проверку PNG или сохранения отчёта".into(),
+        );
+    }
+    issues
 }
 
 fn extend_object(target: &mut Value, extra: Value) {
@@ -353,31 +667,134 @@ fn extend_object(target: &mut Value, extra: Value) {
 }
 
 fn read_plan_items(plan: &Value) -> Result<Vec<PlanItem>, Box<dyn std::error::Error>> {
-    let values = plan["items"]
-        .as_array()
-        .ok_or("plan.items должен быть массивом")?;
-    if values.is_empty() {
+    let raw: RawPlan = serde_json::from_value(plan.clone()).map_err(|error| {
+        format!("неверная структура JSON-плана (проверьте поля и типы): {error}")
+    })?;
+    if raw.items.is_empty() {
         return Err("plan.items не должен быть пустым".into());
     }
 
-    let mut items = Vec::with_capacity(values.len());
-    let mut seen = BTreeSet::new();
-    for (index, value) in values.iter().enumerate() {
-        let surface = value["surface"]
-            .as_str()
-            .ok_or_else(|| format!("plan.items[{index}].surface должен быть строкой"))?;
-        validate_plan_text(surface, "surface", index)?;
-        let reading = optional_string(value, "reading", index)?;
-        if let Some(reading) = reading {
+    let policy = PitchAccentDomainPolicy;
+    let mut items = Vec::with_capacity(raw.items.len());
+    let mut seen_requests = BTreeSet::new();
+    for (index, raw_item) in raw.items.into_iter().enumerate() {
+        validate_plan_text(&raw_item.surface, "surface", index)?;
+        if raw_item.surface.trim().is_empty() {
+            return Err(format!("plan.items[{index}].surface не должен быть пустым").into());
+        }
+        if let Some(reading) = &raw_item.reading {
             validate_plan_text(reading, "reading", index)?;
+            if reading.trim().is_empty() {
+                return Err(format!("plan.items[{index}].reading не должен быть пустым").into());
+            }
         }
-        let key = (surface.to_owned(), reading.map(str::to_owned));
-        if !seen.insert(key) {
-            return Err(format!("повтор surface/reading в плане: {surface}").into());
+
+        let normalized_surface = raw_item.surface.trim();
+        let identity = AssetIdentity::new("pitch_accent", normalized_surface)?;
+        policy.validate_identity(&identity).map_err(|error| {
+            format!(
+                "plan.items[{index}].surface нельзя использовать в имени файла consumer-а: {error}"
+            )
+        })?;
+
+        if raw_item.expected_vocabulary_id == Some(0) {
+            return Err(format!(
+                "plan.items[{index}].expected_vocabulary_id должен быть положительным"
+            )
+            .into());
         }
+        if raw_item.min_graph_count == Some(0) {
+            return Err(
+                format!("plan.items[{index}].min_graph_count должен быть положительным").into(),
+            );
+        }
+        if raw_item
+            .expected_candidate_ids
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(format!(
+                "plan.items[{index}].expected_candidate_ids не должен быть пустым"
+            )
+            .into());
+        }
+        if let Some(candidate_ids) = &raw_item.expected_candidate_ids {
+            let mut unique = BTreeSet::new();
+            if candidate_ids
+                .iter()
+                .any(|candidate_id| *candidate_id == 0 || !unique.insert(*candidate_id))
+            {
+                return Err(format!("plan.items[{index}].expected_candidate_ids должен содержать уникальные положительные ID").into());
+            }
+        }
+
+        if raw_item.expected_vocabulary_id.is_some()
+            && raw_item.expected_outcome != ExpectedOutcome::Acquired
+        {
+            return Err(format!("plan.items[{index}].expected_vocabulary_id допустим только для expected_outcome=acquired").into());
+        }
+        if raw_item.min_graph_count.is_some()
+            && raw_item.expected_outcome != ExpectedOutcome::Acquired
+        {
+            return Err(format!(
+                "plan.items[{index}].min_graph_count допустим только для expected_outcome=acquired"
+            )
+            .into());
+        }
+        if raw_item.expected_candidate_ids.is_some()
+            && raw_item.expected_outcome != ExpectedOutcome::AmbiguousVocabulary
+        {
+            return Err(format!("plan.items[{index}].expected_candidate_ids допустим только для expected_outcome=ambiguous_vocabulary").into());
+        }
+
+        let selection = raw_item
+            .selection
+            .map(|selection| {
+                JpdbPitchSelection::new(selection.vocabulary_id, selection.detail_url).map_err(
+                    |message| {
+                        format!("plan.items[{index}].selection не прошёл проверку: {message}")
+                    },
+                )
+            })
+            .transpose()?;
+        if let Some(selection) = &selection {
+            if raw_item.expected_outcome != ExpectedOutcome::Acquired {
+                return Err(format!(
+                    "plan.items[{index}].selection допустим только при expected_outcome=acquired"
+                )
+                .into());
+            }
+            if raw_item.expected_vocabulary_id != Some(selection.vocabulary_id) {
+                return Err(format!("plan.items[{index}].selection.vocabulary_id должен совпадать с expected_vocabulary_id").into());
+            }
+        }
+
+        let duplicate_key = (
+            normalized_surface.to_owned(),
+            raw_item
+                .reading
+                .as_deref()
+                .map(|reading| reading.trim().to_owned()),
+            selection
+                .as_ref()
+                .map(|selection| (selection.vocabulary_id, selection.detail_url.clone())),
+        );
+        if !seen_requests.insert(duplicate_key) {
+            return Err(format!(
+                "повтор query/selection в плане для surface: {}",
+                raw_item.surface
+            )
+            .into());
+        }
+
         items.push(PlanItem {
-            surface: surface.to_owned(),
-            reading: reading.map(str::to_owned),
+            surface: raw_item.surface,
+            reading: raw_item.reading,
+            expected_outcome: raw_item.expected_outcome,
+            expected_vocabulary_id: raw_item.expected_vocabulary_id,
+            min_graph_count: raw_item.min_graph_count,
+            expected_candidate_ids: raw_item.expected_candidate_ids,
+            selection,
         });
     }
     Ok(items)
@@ -388,27 +805,12 @@ fn validate_plan_text(
     name: &str,
     index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if value.trim().is_empty() {
-        return Err(format!("plan.items[{index}].{name} не должен быть пустым").into());
-    }
     if value.chars().any(char::is_control) {
         return Err(
             format!("plan.items[{index}].{name} не должен содержать управляющие символы").into(),
         );
     }
     Ok(())
-}
-
-fn optional_string<'a>(
-    value: &'a Value,
-    key: &str,
-    index: usize,
-) -> Result<Option<&'a str>, Box<dyn std::error::Error>> {
-    match value.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value)),
-        Some(_) => Err(format!("plan.items[{index}].{key} должен быть строкой").into()),
-    }
 }
 
 fn create_report_dir(output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -479,9 +881,10 @@ fn save_evidence(
     report_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let report = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "run_status": run_status,
         "plan_path": plan_path.display().to_string(),
+        "plan": { "items": items },
         "planned_item_count": items.len(),
         "validator": PitchAccentImageValidator::validator_identity(),
         "items": rows,
@@ -525,7 +928,7 @@ small{{color:#505960}}
 <h1>JPDB — приёмка pitch-accent PNG</h1>
 <div class="summary">
 <p><strong>Статус прогона:</strong> {}</p>
-<p>Элементы плана: {}. Для acquired показываются исходные browser bytes в естественном размере и evidence production validator.</p>
+<p>Элементов плана: {}. Для <code>acquired</code> показаны исходные байты из браузера в естественном размере, свидетельства production-валидатора и сверка с ожиданиями.</p>
 <p><a href="evidence.json">Машиночитаемый отчёт (JSON)</a></p>
 </div>
 "##,
@@ -534,23 +937,25 @@ small{{color:#505960}}
     );
 
     html.push_str("<section class=\"items\">");
-    for item in items {
-        let row = rows.iter().find(|row| {
-            row["surface"].as_str() == Some(item.surface.as_str())
-                && row["requested_reading"].as_str() == item.reading.as_deref()
-        });
-        append_html_item(&mut html, item, row);
+    for (index, item) in items.iter().enumerate() {
+        append_html_item(&mut html, index, item, rows.get(index));
     }
     html.push_str("</section></body></html>\n");
     fs::write(report_dir.join("index.html"), html)?;
     Ok(())
 }
 
-fn append_html_item(html: &mut String, item: &PlanItem, row: Option<&Value>) {
+fn append_html_item(html: &mut String, index: usize, item: &PlanItem, row: Option<&Value>) {
     let row = row.cloned().unwrap_or(Value::Null);
+    let subtitle = item
+        .reading
+        .as_deref()
+        .map(|reading| format!("{} · {}", item.surface, reading))
+        .unwrap_or_else(|| item.surface.clone());
     html.push_str(&format!(
-        "<article><h2>{}</h2><p class=\"status\">{}</p>",
-        escape_html(&item.surface),
+        "<article><h2>№ {} · {}</h2><p class=\"status\">{}</p>",
+        index + 1,
+        escape_html(&subtitle),
         escape_html(
             row["item_status"]
                 .as_str()
@@ -567,51 +972,60 @@ fn append_html_item(html: &mut String, item: &PlanItem, row: Option<&Value>) {
             ));
         } else {
             html.push_str(&format!(
-                "<p>Полученные raw bytes: <a href=\"{}\">скачать</a> (PNG не подтверждён).</p>",
+                "<p>Полученные исходные байты: <a href=\"{}\">скачать</a> (PNG не подтверждён).</p>",
                 escape_html(image_path)
             ));
         }
     }
 
-    let mut fields = vec![
+    let fields = vec![
+        ("Ожидаемый исход", value_text(&row["expected_outcome"])),
+        ("Фактический исход", value_text(&row["outcome"])),
+        (
+            "Сверка с ожиданиями",
+            value_text(&row["expectation_status"]),
+        ),
+        ("Расхождения плана", value_text(&row["expectation_issues"])),
         (
             "Запрошенное чтение",
             item.reading.clone().unwrap_or_else(|| "—".into()),
         ),
-        ("Исход", value_text(&row["outcome"])),
-        ("Статус проверки", value_text(&row["semantic_status"])),
-        ("Vocabulary ID", value_text(&row["jpdb_vocabulary_id"])),
-        ("Detail URL", value_text(&row["detail_url"])),
+        (
+            "ID словарной записи",
+            value_text(&row["jpdb_vocabulary_id"]),
+        ),
+        ("Явный выбор", value_text(&row["selection"])),
+        (
+            "Ожидаемые ID кандидатов",
+            value_text(&row["expected_candidate_ids"]),
+        ),
+        ("Кандидаты", value_text(&row["candidates"])),
+        ("URL словарной записи", value_text(&row["detail_url"])),
         ("Каноническое чтение", value_text(&row["canonical_reading"])),
         ("Число графиков", value_text(&row["graph_count"])),
-        ("CSS capture geometry", value_text(&row["capture_geometry"])),
-        ("Dark-theme proof", value_text(&row["dark_theme_proof"])),
-        ("Pixel dimensions", value_text(&row["dimensions"])),
         (
-            "Visual reference comparison",
-            value_text(&row["visual_reference"]),
+            "Геометрия захвата (CSS px, координаты документа)",
+            value_text(&row["capture_geometry"]),
         ),
+        (
+            "Наблюдаемая тёмная тема",
+            value_text(&row["dark_theme_proof"]),
+        ),
+        ("Размер PNG в пикселях", value_text(&row["dimensions"])),
         ("SHA-256", value_text(&row["sha256"])),
         (
-            "Metadata совпадает с планом",
+            "Метаданные совпадают с планом",
             value_text(&row["metadata_matches_plan"]),
         ),
+        (
+            "Ошибка обработки элемента",
+            value_text(&row["item_processing_error"]),
+        ),
+        (
+            "Ошибка сохранения PNG",
+            value_text(&row["image_write_error"]),
+        ),
     ];
-    if row["absence_evidence"].is_object() {
-        fields.push((
-            "Доказательство отсутствия pitch accent",
-            value_text(&row["absence_evidence"]),
-        ));
-    }
-    if row["candidates"].is_array() {
-        fields.push(("Кандидаты", value_text(&row["candidates"])));
-    }
-    if row["failure"].is_object() {
-        fields.push(("Ошибка provider", value_text(&row["failure"])));
-    }
-    if row["validator_failure"].is_object() {
-        fields.push(("Ошибка validator", value_text(&row["validator_failure"])));
-    }
 
     html.push_str("<dl>");
     for (label, value) in fields {
@@ -622,15 +1036,33 @@ fn append_html_item(html: &mut String, item: &PlanItem, row: Option<&Value>) {
         ));
     }
     html.push_str("</dl>");
+    if row["absence_evidence"].is_object() {
+        html.push_str(&format!(
+            "<details><summary>Доказательство отсутствия pitch accent</summary><pre>{}</pre></details>",
+            escape_html(&value_text(&row["absence_evidence"]))
+        ));
+    }
+    if row["failure"].is_object() {
+        html.push_str(&format!(
+            "<details><summary>Ошибка provider</summary><pre>{}</pre></details>",
+            escape_html(&value_text(&row["failure"]))
+        ));
+    }
+    if row["validator_failure"].is_object() {
+        html.push_str(&format!(
+            "<details><summary>Ошибка validator</summary><pre>{}</pre></details>",
+            escape_html(&value_text(&row["validator_failure"]))
+        ));
+    }
     if row["validation_evidence"].is_array() {
         html.push_str(&format!(
-            "<details><summary>Evidence validator</summary><pre>{}</pre></details>",
+            "<details><summary>Доказательства валидатора</summary><pre>{}</pre></details>",
             escape_html(&value_text(&row["validation_evidence"]))
         ));
     }
     if let Some(browser) = row.get("browser") {
         html.push_str(&format!(
-            "<details><summary>Browser runtime</summary><pre>{}</pre></details>",
+            "<details><summary>Среда выполнения браузера</summary><pre>{}</pre></details>",
             escape_html(&value_text(browser))
         ));
     }
@@ -659,54 +1091,344 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn plan_item(expected_outcome: ExpectedOutcome) -> PlanItem {
+        PlanItem {
+            surface: "合成語".into(),
+            reading: Some("ごうせいご".into()),
+            expected_outcome,
+            expected_vocabulary_id: None,
+            min_graph_count: None,
+            expected_candidate_ids: None,
+            selection: None,
+        }
+    }
+
+    fn ambiguity(item: &PlanItem, candidate_ids: &[u64]) -> JpdbPitchOutcome {
+        JpdbPitchOutcome::AmbiguousVocabulary {
+            surface: item.surface.clone(),
+            reading: item.reading.clone(),
+            candidates: candidate_ids
+                .iter()
+                .map(|vocabulary_id| asset_store::jpdb::JpdbVocabularyCandidate {
+                    vocabulary_id: *vocabulary_id,
+                    surface_forms: vec![item.surface.clone()],
+                    readings: item.reading.iter().cloned().collect(),
+                    resolved_forms: vec![asset_store::pitch_accent::PitchAccentResolvedForm {
+                        surface: item.surface.trim().into(),
+                        reading: item
+                            .reading
+                            .as_deref()
+                            .unwrap_or("ごうせいご")
+                            .trim()
+                            .into(),
+                    }],
+                    part_of_speech: vec!["noun".into()],
+                    meanings: vec!["синтетическое значение".into()],
+                    detail_url: format!(
+                        "https://jpdb.io/vocabulary/{vocabulary_id}/合成語/ごうせいご"
+                    ),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
-    fn plan_accepts_optional_reading_and_distinct_readings() {
-        let items = read_plan_items(&json!({
-            "items": [
-                { "surface": "幽霊" },
-                { "surface": "元気", "reading": "げんき" },
-                { "surface": "生", "reading": "せい" },
-                { "surface": "生", "reading": "なま" }
-            ]
-        }))
+    fn plan_requires_expectation_and_accepts_each_supported_outcome() {
+        for token in [
+            "acquired",
+            "no_pitch_accent_on_source",
+            "ambiguous_vocabulary",
+            "vocabulary_not_found",
+        ] {
+            let plan = json!({"items": [{"surface": "合成語", "expected_outcome": token}]});
+            assert_eq!(read_plan_items(&plan).unwrap().len(), 1);
+        }
+        assert!(read_plan_items(&json!({"items": [{"surface": "合成語"}]})).is_err());
+    }
+
+    #[test]
+    fn query_boundary_trims_input_but_plan_keeps_raw_text_for_diagnostics() {
+        let plan = json!({"items": [{
+            "surface": "  合成語  ",
+            "reading": " ごうせいご ",
+            "expected_outcome": "vocabulary_not_found"
+        }]});
+        let items = read_plan_items(&plan).unwrap();
+        assert_eq!(items[0].surface, "  合成語  ");
+        assert_eq!(items[0].reading.as_deref(), Some(" ごうせいご "));
+        let request = provider_request(&items[0]);
+        assert_eq!(request.query.surface, "合成語");
+        assert_eq!(request.query.reading.as_deref(), Some("ごうせいご"));
+
+        let duplicate_after_normalization = json!({"items": [
+            {"surface": "合成語", "expected_outcome": "ambiguous_vocabulary"},
+            {"surface": " 合成語 ", "expected_outcome": "vocabulary_not_found"}
+        ]});
+        assert!(read_plan_items(&duplicate_after_normalization).is_err());
+    }
+
+    #[test]
+    fn expectation_matrix_accepts_only_the_requested_domain_outcome() {
+        let cases = [
+            ExpectedOutcome::Acquired,
+            ExpectedOutcome::NoPitchAccentOnSource,
+            ExpectedOutcome::AmbiguousVocabulary,
+            ExpectedOutcome::VocabularyNotFound,
+        ];
+        let actual_tokens = [
+            "acquired",
+            "no_pitch_accent_on_source",
+            "ambiguous_vocabulary",
+            "vocabulary_not_found",
+        ];
+        for (expected_index, expected) in cases.into_iter().enumerate() {
+            assert_eq!(expected.as_str(), actual_tokens[expected_index]);
+            for (actual_index, actual) in actual_tokens.iter().enumerate() {
+                assert_eq!(
+                    outcome_matches_expected(expected, actual),
+                    expected_index == actual_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn positive_expectation_rejects_not_found_and_expected_negative_outcomes_can_pass() {
+        let mut positive = plan_item(ExpectedOutcome::Acquired);
+        positive.expected_vocabulary_id = Some(42);
+        let not_found = JpdbPitchOutcome::VocabularyNotFound {
+            surface: positive.surface.clone(),
+            reading: positive.reading.clone(),
+        };
+        assert!(!expectation_issues(&positive, &not_found, false).is_empty());
+
+        let mut ambiguity_plan = plan_item(ExpectedOutcome::AmbiguousVocabulary);
+        ambiguity_plan.expected_candidate_ids = Some(vec![42, 43]);
+        let ambiguity_outcome = ambiguity(&ambiguity_plan, &[43, 42]);
+        assert!(expectation_issues(&ambiguity_plan, &ambiguity_outcome, false).is_empty());
+
+        let not_found_plan = plan_item(ExpectedOutcome::VocabularyNotFound);
+        assert!(expectation_issues(&not_found_plan, &not_found, false).is_empty());
+        let no_pitch_plan = plan_item(ExpectedOutcome::NoPitchAccentOnSource);
+        let no_pitch = JpdbPitchOutcome::NoPitchAccentOnSource {
+            evidence: asset_store::jpdb::JpdbPitchAbsenceEvidence {
+                surface: no_pitch_plan.surface.clone(),
+                reading: no_pitch_plan.reading.clone().unwrap(),
+                jpdb_vocabulary_id: 42,
+                source_url: "https://jpdb.io/vocabulary/42/合成語/ごうせいご".into(),
+                resolved_forms: vec![asset_store::pitch_accent::PitchAccentResolvedForm {
+                    surface: no_pitch_plan.surface.trim().into(),
+                    reading: no_pitch_plan.reading.clone().unwrap().trim().into(),
+                }],
+                section_inventory: vec!["Meanings".into(), "Forms".into()],
+                base_page_contract_valid: true,
+                pitch_section_present: false,
+                pitch_marker_count: 0,
+                browser: asset_store::browser_runtime::BrowserRuntimeProvenance {
+                    product: "Chromium".into(),
+                    protocol_version: "1.3".into(),
+                    revision: "synthetic".into(),
+                    user_agent: "synthetic".into(),
+                    js_version: "synthetic".into(),
+                    executable_source:
+                        asset_store::browser_runtime::BrowserExecutableSource::PathLookup,
+                },
+            },
+        };
+        assert!(expectation_issues(&no_pitch_plan, &no_pitch, false).is_empty());
+        let unexpected_candidate = ambiguity(&ambiguity_plan, &[42, 43, 44]);
+        assert!(!expectation_issues(&ambiguity_plan, &unexpected_candidate, false).is_empty());
+        let mut missing_meaning = ambiguity(&ambiguity_plan, &[42, 43]);
+        if let JpdbPitchOutcome::AmbiguousVocabulary { candidates, .. } = &mut missing_meaning {
+            candidates[0].meanings.clear();
+        }
+        assert!(!expectation_issues(&ambiguity_plan, &missing_meaning, false).is_empty());
+        let missing_candidate = ambiguity(&ambiguity_plan, &[42]);
+        assert!(!expectation_issues(&ambiguity_plan, &missing_candidate, false).is_empty());
+    }
+
+    #[test]
+    fn acquired_requires_verified_status_and_all_declared_constraints() {
+        let mut item = plan_item(ExpectedOutcome::Acquired);
+        item.expected_vocabulary_id = Some(42);
+        item.min_graph_count = Some(2);
+        assert!(acquired_expectation_issues(&item, "合成語", "ごうせいご", 42, 2, true).is_empty());
+        let mut katakana_surface = plan_item(ExpectedOutcome::Acquired);
+        katakana_surface.surface = "ネコ".into();
+        katakana_surface.reading = Some("ねこ".into());
+        assert!(
+            acquired_expectation_issues(&katakana_surface, "ネコ", "ネコ", 1467640, 1, true)
+                .is_empty()
+        );
+        let issues = acquired_expectation_issues(&item, "合成語", "ごうせいご", 43, 1, false);
+        assert_eq!(issues.len(), 3);
+    }
+
+    #[test]
+    fn plan_prevalidates_explicit_selection_identity_and_candidate_constraints() {
+        let valid_selection = json!({
+            "items": [{
+                "surface": "合成語",
+                "reading": "ごうせいご",
+                "expected_outcome": "acquired",
+                "expected_vocabulary_id": 42,
+                "min_graph_count": 2,
+                "selection": {
+                    "vocabulary_id": 42,
+                    "detail_url": "https://jpdb.io/vocabulary/42/合成語/ごうせいご"
+                }
+            }]
+        });
+        assert!(read_plan_items(&valid_selection).is_ok());
+
+        let invalid_selection_id = json!({
+            "items": [{
+                "surface": "合成語",
+                "expected_outcome": "acquired",
+                "expected_vocabulary_id": 42,
+                "selection": {
+                    "vocabulary_id": 43,
+                    "detail_url": "https://jpdb.io/vocabulary/42/合成語/ごうせいご"
+                }
+            }]
+        });
+        assert!(read_plan_items(&invalid_selection_id).is_err());
+
+        let invalid_selection_route = json!({
+            "items": [{
+                "surface": "合成語",
+                "expected_outcome": "acquired",
+                "expected_vocabulary_id": 42,
+                "selection": {
+                    "vocabulary_id": 42,
+                    "detail_url": "https://example.com/vocabulary/42/合成語/ごうせいご"
+                }
+            }]
+        });
+        assert!(read_plan_items(&invalid_selection_route).is_err());
+
+        let invalid_selection_expectation = json!({
+            "items": [{
+                "surface": "合成語",
+                "expected_outcome": "ambiguous_vocabulary",
+                "selection": {
+                    "vocabulary_id": 42,
+                    "detail_url": "https://jpdb.io/vocabulary/42/合成語/ごうせいご"
+                }
+            }]
+        });
+        assert!(read_plan_items(&invalid_selection_expectation).is_err());
+
+        let invalid_candidates = json!({
+            "items": [{
+                "surface": "合成語",
+                "expected_outcome": "ambiguous_vocabulary",
+                "expected_candidate_ids": [0]
+            }]
+        });
+        assert!(read_plan_items(&invalid_candidates).is_err());
+
+        let invalid_consumer_filename = json!({"items": [{
+            "surface": "合/成語",
+            "expected_outcome": "acquired"
+        }]});
+        assert!(read_plan_items(&invalid_consumer_filename).is_err());
+    }
+
+    #[test]
+    fn same_query_can_have_distinct_selection_request_but_exact_request_is_rejected() {
+        let plan = json!({"items": [
+            {"surface": "合成語", "expected_outcome": "ambiguous_vocabulary"},
+            {
+                "surface": "合成語",
+                "expected_outcome": "acquired",
+                "expected_vocabulary_id": 42,
+                "selection": {"vocabulary_id": 42, "detail_url": "https://jpdb.io/vocabulary/42/合成語/ごうせいご"}
+            }
+        ]});
+        assert_eq!(read_plan_items(&plan).unwrap().len(), 2);
+
+        let duplicate = json!({"items": [
+            {"surface": "合成語", "expected_outcome": "ambiguous_vocabulary"},
+            {"surface": "合成語", "expected_outcome": "vocabulary_not_found"}
+        ]});
+        assert!(read_plan_items(&duplicate).is_err());
+    }
+
+    #[test]
+    fn missing_provider_result_is_an_expectation_failure() {
+        let item = plan_item(ExpectedOutcome::Acquired);
+        let row = missing_result_row(0, &item);
+        assert_eq!(row["outcome"], "missing_provider_result");
+        assert_eq!(row["expectation_status"], "mismatched");
+        assert_eq!(row["item_status"], "provider_result_missing");
+    }
+
+    #[test]
+    fn an_item_processing_error_keeps_prior_rows_and_final_report_durable() {
+        let items = [
+            plan_item(ExpectedOutcome::VocabularyNotFound),
+            plan_item(ExpectedOutcome::VocabularyNotFound),
+        ];
+        let outcomes = items
+            .iter()
+            .map(|item| JpdbPitchOutcome::VocabularyNotFound {
+                surface: item.surface.clone(),
+                reading: item.reading.clone(),
+            })
+            .collect::<Vec<_>>();
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        let report_dir = temp_root.join(format!(
+            "jpdb-report-durability-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&report_dir).unwrap();
+
+        let (rows, passed) =
+            process_outcomes(&items, &outcomes, &report_dir, |index, item, outcome, _| {
+                if index == 0 {
+                    return Err("ошибка обработки синтетического элемента".into());
+                }
+                Ok(render_outcome(index, item, outcome, &report_dir))
+            });
+        assert!(!passed);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["item_status"], "item_processing_failed");
+        assert_eq!(rows[1]["expectation_status"], "matched");
+
+        save_evidence(
+            "verification_failed",
+            Path::new("synthetic-plan.json"),
+            &items,
+            &rows,
+            &report_dir,
+        )
         .unwrap();
-        assert_eq!(items.len(), 4);
-        assert_eq!(items[0].reading, None);
-        assert_eq!(items[1].reading.as_deref(), Some("げんき"));
+        let evidence: Value =
+            serde_json::from_slice(&fs::read(report_dir.join("evidence.json")).unwrap()).unwrap();
+        let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
+        assert_eq!(evidence["items"].as_array().unwrap().len(), 2);
+        assert!(html.contains("ошибка обработки синтетического элемента"));
+        fs::remove_dir_all(report_dir).unwrap();
     }
 
     #[test]
-    fn plan_rejects_empty_duplicate_and_invalid_items() {
-        assert!(read_plan_items(&json!({ "items": [] })).is_err());
-        assert!(read_plan_items(&json!({ "items": [{ "surface": " " }] })).is_err());
-        assert!(
-            read_plan_items(&json!({
-                "items": [
-                    { "surface": "元気", "reading": "げんき" },
-                    { "surface": "元気", "reading": "げんき" }
-                ]
-            }))
-            .is_err()
-        );
-        assert!(
-            read_plan_items(&json!({ "items": [{ "surface": "元気", "reading": 7 }] })).is_err()
-        );
-        assert!(read_plan_items(&json!({ "items": [{ "surface": "元\n気" }] })).is_err());
-    }
-
-    #[test]
-    fn cli_requires_plan_and_accepts_output() {
+    fn cli_parser_fixture_uses_a_relative_synthetic_output_path() {
         assert!(Args::try_parse_from(["jpdb_pitch_acceptance"]).is_err());
         let args = Args::try_parse_from([
             "jpdb_pitch_acceptance",
             "--plan",
             "plan.json",
             "--output",
-            "/tmp/report",
+            "report-fixture",
         ])
         .unwrap();
         assert_eq!(args.plan, PathBuf::from("plan.json"));
-        assert_eq!(args.output, Some(PathBuf::from("/tmp/report")));
+        assert_eq!(args.output, Some(PathBuf::from("report-fixture")));
     }
 
     #[test]
@@ -732,53 +1454,39 @@ mod tests {
     }
 
     #[test]
-    fn non_acquired_rows_have_no_fake_image() {
-        let item = PlanItem {
-            surface: "存在しない語".into(),
-            reading: None,
-        };
-        let rows = [json!({
-            "surface": item.surface,
-            "outcome": "vocabulary_not_found",
-            "item_status": "vocabulary_not_found",
-            "semantic_status": null,
-        })];
+    fn non_acquired_rows_have_no_fake_image_and_duplicate_surface_rows_stay_distinct() {
+        let items = [
+            plan_item(ExpectedOutcome::AmbiguousVocabulary),
+            plan_item(ExpectedOutcome::Acquired),
+        ];
+        let rows = [
+            json!({"item_status": "ambiguous_vocabulary", "outcome": "ambiguous_vocabulary"}),
+            json!({"item_status": "candidate_rejected", "outcome": "acquired"}),
+        ];
         let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         let report_dir = temp_root.join(format!(
-            "jpdb-acceptance-html-test-{}-{timestamp}",
-            std::process::id()
+            "jpdb-acceptance-html-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir(&report_dir).unwrap();
-        save_html_report("test", &[item], &rows, &report_dir).unwrap();
+        save_html_report("test", &items, &rows, &report_dir).unwrap();
         let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
-        assert!(html.contains("vocabulary_not_found"));
+        assert!(html.contains("ambiguous_vocabulary"));
+        assert!(html.contains("candidate_rejected"));
         assert!(!html.contains("<img"));
         assert!(!report_dir.join("images").exists());
         fs::remove_dir_all(report_dir).unwrap();
     }
 
     #[test]
-    fn known_reference_dimensions_are_report_only_and_non_acquired_has_no_observed_geometry() {
-        assert_eq!(reference_dimensions("くすぐったい"), Some([321, 84]));
-        assert_eq!(reference_dimensions("クラブ"), Some([162, 87]));
-        assert_eq!(reference_dimensions("乙女"), Some([177, 84]));
-        assert_eq!(reference_dimensions("吹き抜ける"), Some([273, 84]));
-        assert_eq!(reference_dimensions("幽霊"), None);
-
-        let non_acquired = visual_reference("クラブ", "vocabulary_not_found", None).unwrap();
-        assert_eq!(
-            non_acquired["observed_native_png_dimensions_px"],
-            Value::Null
-        );
-        assert_eq!(non_acquired["outcome"], "vocabulary_not_found");
-        assert_eq!(non_acquired["comparison_status"], "not_acquired");
-        let match_result = visual_reference("クラブ", "acquired", Some([162, 87])).unwrap();
-        assert_eq!(match_result["comparison_status"], "match");
-        let drift_result = visual_reference("クラブ", "acquired", Some([163, 87])).unwrap();
-        assert_eq!(drift_result["comparison_status"], "source_drift");
+    fn permanent_harness_has_no_live_reference_word_or_dimension_table() {
+        let source = include_str!("jpdb_pitch_acceptance.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("reference_dimensions"));
+        assert!(!production.contains("visual_reference"));
     }
 }

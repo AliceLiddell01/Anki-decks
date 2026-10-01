@@ -1,9 +1,8 @@
-//! JPDB vocabulary resolver and browser-rendered pitch-accent acquisition.
+//! Разрешение словарных записей JPDB и получение графиков акцентуации из браузерного рендеринга.
 //!
-//! This module deliberately uses JPDB's rendered, English-language pages as
-//! its source of truth. It does not call private APIs or reconstruct pitch
-//! graphs. One provider batch shares a single isolated `BrowserSession` and
-//! processes queries sequentially.
+//! Источником истины служат страницы JPDB, отрисованные на английском языке.
+//! Модуль не вызывает закрытые API и не реконструирует графики акцентуации.
+//! Элементы одного пакета последовательно используют изолированную `BrowserSession`.
 
 use std::time::Duration;
 
@@ -28,9 +27,11 @@ use crate::browser_runtime::{
     is_relevant_resource_type,
 };
 use crate::pitch_accent::{
-    PitchAccentCaptureRect, PitchAccentDarkThemeProof, PitchAccentDomainMetadata,
+    PITCH_ACCENT_CAPTURE_PADDING_CSS_PX, PitchAccentCapturePadding, PitchAccentCaptureRect,
+    PitchAccentCoordinateSpace, PitchAccentDarkThemeProof, PitchAccentDomainMetadata,
     PitchAccentEvidence, PitchAccentGraphEvidence, PitchAccentProvider, PitchAccentRenderEvidence,
-    PitchAccentRenderKind,
+    PitchAccentRenderKind, PitchAccentResolvedForm, capture_pixel_dimensions_match,
+    jpdb_readings_equivalent, parse_jpdb_vocabulary_route,
 };
 
 const JPDB_ORIGIN: &str = "https://jpdb.io";
@@ -45,7 +46,8 @@ const GRAPH_STABILITY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_SEARCH_RESULTS: usize = 128;
 const MAX_GRAPH_COUNT: usize = 32;
 
-/// A surface form and optional exact reading to resolve on JPDB.
+/// Форма написания и необязательное чтение для поиска в JPDB.
+/// Чтения в хирагане и катакане считаются эквивалентными; написание сравнивается точно.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JpdbPitchQuery {
@@ -63,25 +65,82 @@ impl JpdbPitchQuery {
 
     fn validate(&self) -> Result<(), String> {
         if self.surface.trim().is_empty() {
-            return Err("surface must not be empty".into());
+            return Err("Поле surface не должно быть пустым".into());
         }
         if self
             .reading
             .as_deref()
             .is_some_and(|reading| reading.trim().is_empty())
         {
-            return Err("reading must be absent or non-empty".into());
+            return Err("Поле reading должно отсутствовать или содержать текст".into());
         }
         Ok(())
     }
 }
 
-/// Browser acquisition result for one input query.
+/// Запрос на получение с необязательным явным выбором словарной записи.
+///
+/// Выбор не обходит поиск: провайдер заново получает список JPDB-кандидатов и
+/// принимает выбор только при совпадении ID и полного маршрута одного из них.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JpdbPitchRequest {
+    pub query: JpdbPitchQuery,
+    pub selection: Option<JpdbPitchSelection>,
+}
+
+impl JpdbPitchRequest {
+    pub fn new(query: JpdbPitchQuery) -> Self {
+        Self {
+            query,
+            selection: None,
+        }
+    }
+
+    pub fn with_selection(query: JpdbPitchQuery, selection: JpdbPitchSelection) -> Self {
+        Self {
+            query,
+            selection: Some(selection),
+        }
+    }
+}
+
+/// Выбор словарной записи, связанный с проверенным маршрутом JPDB.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JpdbPitchSelection {
+    pub vocabulary_id: u64,
+    pub detail_url: String,
+}
+
+impl JpdbPitchSelection {
+    /// Создаёт явный выбор и сверяет маршрут с ID словарной записи.
+    pub fn new(vocabulary_id: u64, detail_url: impl Into<String>) -> Result<Self, String> {
+        let selection = Self {
+            vocabulary_id,
+            detail_url: detail_url.into(),
+        };
+        selection.validate()?;
+        Ok(selection)
+    }
+
+    fn validate(&self) -> Result<crate::pitch_accent::JpdbVocabularyRoute, String> {
+        let route = parse_jpdb_vocabulary_route(&self.detail_url).map_err(|_| {
+            "Ссылка выбора не является допустимым маршрутом словарной записи JPDB".to_owned()
+        })?;
+        if self.vocabulary_id == 0 || route.vocabulary_id != self.vocabulary_id {
+            return Err("ID выбора не совпадает с ID в маршруте словарной записи JPDB".into());
+        }
+        Ok(route)
+    }
+}
+
+/// Результат получения из браузера для одного запроса.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum JpdbPitchOutcome {
     Acquired {
-        asset: JpdbPitchAcquired,
+        asset: Box<JpdbPitchAcquired>,
     },
     NoPitchAccentOnSource {
         evidence: JpdbPitchAbsenceEvidence,
@@ -100,16 +159,16 @@ pub enum JpdbPitchOutcome {
     },
 }
 
-/// PNG bytes and ready-to-validate pitch-accent metadata.
+/// Байты PNG и метаданные акцентуации, готовые к проверке.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JpdbPitchAcquired {
-    /// The unmodified bytes returned by one native CDP PNG region screenshot.
+    /// Неизменённые байты единственного нативного снимка CDP области PNG.
     pub bytes: Vec<u8>,
     pub metadata: PitchAccentDomainMetadata,
 }
 
-/// Positive identity proof for a vocabulary page that has no pitch section.
+/// Положительное подтверждение идентичности страницы без секции акцентуации.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JpdbPitchAbsenceEvidence {
@@ -117,9 +176,8 @@ pub struct JpdbPitchAbsenceEvidence {
     pub reading: String,
     pub jpdb_vocabulary_id: u64,
     pub source_url: String,
-    pub resolved_surface_forms: Vec<String>,
-    pub resolved_readings: Vec<String>,
-    /// Observed vocabulary section labels required before absence is accepted.
+    pub resolved_forms: Vec<PitchAccentResolvedForm>,
+    /// Наблюдённые названия секций, нужные для подтверждения отсутствия графика.
     pub section_inventory: Vec<String>,
     pub base_page_contract_valid: bool,
     pub pitch_section_present: bool,
@@ -127,36 +185,48 @@ pub struct JpdbPitchAbsenceEvidence {
     pub browser: crate::browser_runtime::BrowserRuntimeProvenance,
 }
 
-/// A search result that survived exact surface and optional reading matching.
+/// Результат поиска, прошедший точную проверку написания и необязательного чтения.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JpdbVocabularyCandidate {
     pub vocabulary_id: u64,
     pub surface_forms: Vec<String>,
     pub readings: Vec<String>,
-    /// The actual detail href exposed by JPDB's search result.
+    /// Связанные пары написания и чтения, реально наблюдённые в JPDB.
+    pub resolved_forms: Vec<PitchAccentResolvedForm>,
+    pub part_of_speech: Vec<String>,
+    pub meanings: Vec<String>,
+    /// Фактическая ссылка на словарную запись из результата поиска JPDB.
     pub detail_url: String,
 }
 
-/// Typed technical or source-contract failure for one item.
+/// Типизированная техническая ошибка или нарушение контракта источника для одного элемента.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum JpdbPitchFailure {
     InvalidQuery {
+        stage: JpdbPitchStage,
         message: String,
     },
     BrowserSetup {
+        stage: JpdbPitchStage,
         message: String,
     },
     BrowserConfiguration {
+        stage: JpdbPitchStage,
         message: String,
     },
     Navigation {
         stage: JpdbPitchStage,
         message: String,
     },
+    BrowserEvaluation {
+        stage: JpdbPitchStage,
+        message: String,
+    },
     Timeout {
         stage: JpdbPitchStage,
+        diagnostic: Option<String>,
     },
     Telemetry {
         stage: JpdbPitchStage,
@@ -167,27 +237,46 @@ pub enum JpdbPitchFailure {
         message: String,
     },
     DetailIdentityMismatch {
+        stage: JpdbPitchStage,
         expected_surface: String,
         expected_reading: Option<String>,
         vocabulary_id: Option<u64>,
         observed_surface_forms: Vec<String>,
         observed_readings: Vec<String>,
     },
+    InvalidSelection {
+        stage: JpdbPitchStage,
+        message: String,
+    },
+    ExplicitSelectionMismatch {
+        stage: JpdbPitchStage,
+        vocabulary_id: u64,
+        detail_url: String,
+        message: String,
+    },
+    SessionFailure {
+        stage: JpdbPitchStage,
+        message: String,
+    },
     DarkThemeUnverified {
+        stage: JpdbPitchStage,
         message: String,
     },
     CaptureContract {
+        stage: JpdbPitchStage,
         message: String,
     },
     Screenshot {
+        stage: JpdbPitchStage,
         message: String,
     },
     InvalidPng {
+        stage: JpdbPitchStage,
         message: String,
     },
 }
 
-/// Stable acquisition stage included in technical failures.
+/// Этап получения, указываемый в технических ошибках.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JpdbPitchStage {
@@ -203,25 +292,36 @@ pub enum JpdbPitchStage {
     PostCaptureVerification,
 }
 
-/// Production provider for JPDB's public vocabulary detail pages.
+/// Провайдер для получения данных с публичных страниц словарных записей JPDB.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JpdbPitchProvider;
 
 impl JpdbPitchProvider {
-    /// Resolves and acquires one query in a fresh isolated Chromium session.
+    /// Разрешает запрос и получает данные в новой изолированной сессии Chromium.
     pub async fn acquire(query: &JpdbPitchQuery) -> JpdbPitchOutcome {
         let mut outcomes = Self::acquire_many(std::slice::from_ref(query)).await;
         outcomes.pop().unwrap_or_else(|| {
             failed(JpdbPitchFailure::BrowserSetup {
-                message: "provider returned no item outcome".into(),
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "Провайдер не вернул результат для элемента".into(),
             })
         })
     }
 
-    /// Resolves queries sequentially while reusing one isolated browser session.
-    /// Domain outcomes and item-level technical failures do not stop later items.
+    /// Последовательно разрешает запросы в одной изолированной сессии браузера.
+    /// Предметный результат или ошибка элемента не останавливает оставшуюся очередь.
     pub async fn acquire_many(queries: &[JpdbPitchQuery]) -> Vec<JpdbPitchOutcome> {
-        if queries.is_empty() {
+        let requests = queries
+            .iter()
+            .cloned()
+            .map(JpdbPitchRequest::new)
+            .collect::<Vec<_>>();
+        Self::acquire_requests(&requests).await
+    }
+
+    /// Последовательно разрешает запросы; явный выбор сверяется с новым поиском.
+    pub async fn acquire_requests(requests: &[JpdbPitchRequest]) -> Vec<JpdbPitchOutcome> {
+        if requests.is_empty() {
             return Vec::new();
         }
 
@@ -232,7 +332,7 @@ impl JpdbPitchProvider {
                     CAPTURE_VIEWPORT_HEIGHT,
                     CAPTURE_DEVICE_SCALE_FACTOR,
                 )
-                .expect("static JPDB capture metrics are valid"),
+                .expect("Заданные метрики захвата JPDB должны быть корректными"),
             ),
             prefers_color_scheme: Some("dark".into()),
             ..BrowserRuntimeConfig::default()
@@ -240,10 +340,11 @@ impl JpdbPitchProvider {
         let session = match BrowserSession::launch(runtime).await {
             Ok(session) => session,
             Err(message) => {
-                return queries
+                return requests
                     .iter()
                     .map(|_| {
                         failed(JpdbPitchFailure::BrowserSetup {
+                            stage: JpdbPitchStage::ConfigureBrowser,
                             message: message.clone(),
                         })
                     })
@@ -253,52 +354,79 @@ impl JpdbPitchProvider {
 
         let setup = configure_page(session.page()).await;
         let outcomes = match setup {
-            Ok(()) => acquire_many_in_session(&session, queries).await,
-            Err(error) => queries.iter().map(|_| failed(error.clone())).collect(),
+            Ok(()) => process_requests_in_session(&session, requests).await,
+            Err(error) => requests.iter().map(|_| failed(error.clone())).collect(),
         };
         session.close().await;
         outcomes
     }
 
-    /// Reuses a caller-owned `BrowserSession`; an already-open matching detail
-    /// page is resolved directly. The provider enforces 3× metrics and dark
-    /// color-scheme emulation on the supplied page before processing items.
+    /// Использует переданную `BrowserSession`, но для каждого элемента запускает новый поиск.
+    /// Провайдер задаёт для страницы масштаб 3× и эмуляцию тёмной цветовой схемы.
     pub async fn acquire_many_in_session(
         session: &BrowserSession,
         queries: &[JpdbPitchQuery],
     ) -> Vec<JpdbPitchOutcome> {
-        if queries.is_empty() {
+        let requests = queries
+            .iter()
+            .cloned()
+            .map(JpdbPitchRequest::new)
+            .collect::<Vec<_>>();
+        Self::acquire_requests_in_session(session, &requests).await
+    }
+
+    /// Обрабатывает запрос и явный выбор каждого элемента в переданной сессии браузера.
+    pub async fn acquire_requests_in_session(
+        session: &BrowserSession,
+        requests: &[JpdbPitchRequest],
+    ) -> Vec<JpdbPitchOutcome> {
+        if requests.is_empty() {
             return Vec::new();
         }
         if let Err(error) = configure_page(session.page()).await {
-            return queries.iter().map(|_| failed(error.clone())).collect();
+            return requests.iter().map(|_| failed(error.clone())).collect();
         }
-        acquire_many_in_session(session, queries).await
+        process_requests_in_session(session, requests).await
     }
 }
 
-async fn acquire_many_in_session(
+async fn process_requests_in_session(
     session: &BrowserSession,
-    queries: &[JpdbPitchQuery],
+    requests: &[JpdbPitchRequest],
 ) -> Vec<JpdbPitchOutcome> {
-    let mut outcomes = Vec::with_capacity(queries.len());
-    for query in queries {
+    let mut outcomes = Vec::with_capacity(requests.len());
+    let mut session_failure: Option<(JpdbPitchStage, String)> = None;
+    for request in requests {
+        if let Some((stage, message)) = &session_failure {
+            outcomes.push(failed(JpdbPitchFailure::SessionFailure {
+                stage: *stage,
+                message: message.clone(),
+            }));
+            continue;
+        }
+        let mut stage = JpdbPitchStage::SearchNavigation;
         let result = timeout(
             ITEM_TIMEOUT,
             acquire_one_in_session(
                 session.page(),
                 session.telemetry(),
                 session.provenance(),
-                query,
+                request,
+                &mut stage,
             ),
         )
         .await;
         outcomes.push(match result {
             Ok(outcome) => outcome,
-            Err(_) => failed(JpdbPitchFailure::Timeout {
-                stage: JpdbPitchStage::DetailReadiness,
-            }),
+            Err(_) => item_timeout(stage),
         });
+        if session.telemetry().monitor_failed() {
+            session_failure = Some((
+                stage,
+                "Монитор телеметрии CDP завершился с ошибкой; последующие элементы изолированы"
+                    .into(),
+            ));
+        }
     }
     outcomes
 }
@@ -307,7 +435,8 @@ async fn configure_page(page: &Page) -> Result<(), JpdbPitchFailure> {
     page.emulate_locale(SetLocaleOverrideParams::builder().locale("en_US").build())
         .await
         .map_err(|error| JpdbPitchFailure::BrowserConfiguration {
-            message: format!("CDP Emulation.setLocaleOverride: {error}"),
+            stage: JpdbPitchStage::ConfigureBrowser,
+            message: format!("ошибка CDP Emulation.setLocaleOverride: {error}"),
         })?;
     page.execute(SetDeviceMetricsOverrideParams::new(
         CAPTURE_VIEWPORT_WIDTH,
@@ -317,7 +446,8 @@ async fn configure_page(page: &Page) -> Result<(), JpdbPitchFailure> {
     ))
     .await
     .map_err(|error| JpdbPitchFailure::BrowserConfiguration {
-        message: format!("CDP Emulation.setDeviceMetricsOverride: {error}"),
+        stage: JpdbPitchStage::ConfigureBrowser,
+        message: format!("ошибка CDP Emulation.setDeviceMetricsOverride: {error}"),
     })?;
     page.execute(
         SetEmulatedMediaParams::builder()
@@ -326,12 +456,14 @@ async fn configure_page(page: &Page) -> Result<(), JpdbPitchFailure> {
     )
     .await
     .map_err(|error| JpdbPitchFailure::BrowserConfiguration {
-        message: format!("CDP Emulation.setEmulatedMedia: {error}"),
+        stage: JpdbPitchStage::ConfigureBrowser,
+        message: format!("ошибка CDP Emulation.setEmulatedMedia: {error}"),
     })?;
     page.execute(ResetPageScaleFactorParams::default())
         .await
         .map_err(|error| JpdbPitchFailure::BrowserConfiguration {
-            message: format!("CDP Emulation.resetPageScaleFactor: {error}"),
+            stage: JpdbPitchStage::ConfigureBrowser,
+            message: format!("ошибка CDP Emulation.resetPageScaleFactor: {error}"),
         })?;
     Ok(())
 }
@@ -340,178 +472,125 @@ async fn acquire_one_in_session(
     page: &Page,
     telemetry: &CdpRuntimeMonitor,
     browser: &crate::browser_runtime::BrowserRuntimeProvenance,
-    query: &JpdbPitchQuery,
+    request: &JpdbPitchRequest,
+    stage: &mut JpdbPitchStage,
 ) -> JpdbPitchOutcome {
+    let query = &request.query;
     if let Err(message) = query.validate() {
-        return failed(JpdbPitchFailure::InvalidQuery { message });
+        return failed(JpdbPitchFailure::InvalidQuery {
+            stage: JpdbPitchStage::SearchResolution,
+            message,
+        });
     }
 
-    let initial_url = match current_url(page).await {
+    let selection_route = match request.selection.as_ref().map(JpdbPitchSelection::validate) {
+        Some(Ok(route)) => Some(route),
+        Some(Err(message)) => {
+            return failed(JpdbPitchFailure::InvalidSelection {
+                stage: JpdbPitchStage::SearchResolution,
+                message,
+            });
+        }
+        None => None,
+    };
+    let search_url = match build_search_url(query.surface.trim()) {
+        Ok(url) => url,
+        Err(message) => {
+            return failed(JpdbPitchFailure::InvalidQuery {
+                stage: JpdbPitchStage::SearchResolution,
+                message,
+            });
+        }
+    };
+    *stage = JpdbPitchStage::SearchNavigation;
+    let search_epoch = telemetry.begin_epoch();
+    if let Err(error) = navigate(page, &search_url, *stage).await {
+        return failed(error);
+    }
+    *stage = JpdbPitchStage::SearchReadiness;
+    if let Err(error) = wait_for_critical_readiness(page, telemetry, search_epoch, *stage).await {
+        return failed(error);
+    }
+    *stage = JpdbPitchStage::SearchResolution;
+    let page_url = match current_url(page, *stage).await {
         Ok(url) => url,
         Err(error) => return failed(error),
     };
-    let mut detail_url = None;
-
-    if let Some(route) = parse_detail_route(&initial_url) {
-        let initial_epoch = telemetry.begin_epoch();
-        if let Err(error) = wait_for_critical_readiness(
-            page,
-            telemetry,
-            initial_epoch,
-            JpdbPitchStage::DetailReadiness,
-        )
-        .await
-        {
-            return failed(error);
-        }
-        match wait_for_detail_snapshot(page, telemetry, initial_epoch).await {
-            Ok(snapshot) if detail_matches_query(&snapshot, query) => {
-                detail_url = Some((route, snapshot));
-            }
-            Ok(_) => {}
-            Err(error) if !initial_url.starts_with("about:") => {
-                // A prior batch item can leave an unrelated vocabulary page
-                // open. It is safe to search for this item instead.
-                if matches!(error, JpdbPitchFailure::Timeout { .. }) {
-                    // Continue below with a fresh search navigation.
-                } else {
-                    return failed(error);
-                }
-            }
-            Err(error) => return failed(error),
-        }
-    }
-
-    if detail_url.is_none() {
-        let search_url = match build_search_url(&query.surface) {
-            Ok(url) => url,
-            Err(message) => {
-                return failed(JpdbPitchFailure::InvalidQuery { message });
-            }
-        };
-        let search_epoch = telemetry.begin_epoch();
-        if let Err(error) = navigate(page, &search_url, JpdbPitchStage::SearchNavigation).await {
-            return failed(error);
-        }
-        if let Err(error) = wait_for_critical_readiness(
-            page,
-            telemetry,
-            search_epoch,
-            JpdbPitchStage::SearchReadiness,
-        )
-        .await
-        {
-            return failed(error);
-        }
-        let page_url = match current_url(page).await {
-            Ok(url) => url,
-            Err(error) => return failed(error),
-        };
-        if let Some(route) = parse_detail_route(&page_url) {
-            let snapshot = match wait_for_detail_snapshot(page, telemetry, search_epoch).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => return failed(error),
-            };
-            if !detail_matches_query(&snapshot, query) {
-                return vocabulary_not_found(query);
-            }
-            detail_url = Some((route, snapshot));
-        } else if is_search_url(&page_url) {
-            let search_results =
-                match wait_for_search_candidates(page, telemetry, search_epoch).await {
-                    Ok(results) => results,
-                    Err(error) => return failed(error),
-                };
-            let matching = match select_candidates(&search_results.candidates, query) {
-                Ok(matching) => matching,
-                Err(error) => return failed(error),
-            };
-            match matching.len() {
-                0 => return vocabulary_not_found(query),
-                1 => {
-                    let candidate = &matching[0];
-                    let Some(route) = parse_detail_route(&candidate.detail_url) else {
-                        return failed(JpdbPitchFailure::PageContract {
-                            stage: JpdbPitchStage::SearchResolution,
-                            message: "matching vocabulary result had an invalid detail href".into(),
-                        });
-                    };
-                    if route.vocabulary_id != candidate.vocabulary_id {
-                        return failed(JpdbPitchFailure::PageContract {
-                            stage: JpdbPitchStage::SearchResolution,
-                            message: "candidate ID does not match the result's actual detail href"
-                                .into(),
-                        });
-                    }
-                    let detail_epoch = telemetry.begin_epoch();
-                    if let Err(error) = navigate(
-                        page,
-                        &candidate.detail_url,
-                        JpdbPitchStage::DetailNavigation,
-                    )
-                    .await
-                    {
-                        return failed(error);
-                    }
-                    if let Err(error) = wait_for_critical_readiness(
-                        page,
-                        telemetry,
-                        detail_epoch,
-                        JpdbPitchStage::DetailReadiness,
-                    )
-                    .await
-                    {
-                        return failed(error);
-                    }
-                    let snapshot =
-                        match wait_for_detail_snapshot(page, telemetry, detail_epoch).await {
-                            Ok(snapshot) => snapshot,
-                            Err(error) => return failed(error),
-                        };
-                    if snapshot.vocabulary_id != route.vocabulary_id
-                        || parse_detail_route(&snapshot.url).as_ref() != Some(&route)
-                        || !detail_matches_query(&snapshot, query)
-                    {
-                        return failed(JpdbPitchFailure::DetailIdentityMismatch {
-                            expected_surface: query.surface.clone(),
-                            expected_reading: query.reading.clone(),
-                            vocabulary_id: Some(route.vocabulary_id),
-                            observed_surface_forms: unique_forms(&snapshot.forms)
-                                .into_iter()
-                                .map(|form| form.surface)
-                                .collect(),
-                            observed_readings: unique_readings(&snapshot.forms),
-                        });
-                    }
-                    detail_url = Some((route, snapshot));
-                }
-                _ => {
-                    return JpdbPitchOutcome::AmbiguousVocabulary {
-                        surface: query.surface.clone(),
-                        reading: query.reading.clone(),
-                        candidates: matching,
-                    };
-                }
-            }
-        } else {
-            return failed(JpdbPitchFailure::PageContract {
-                stage: JpdbPitchStage::SearchResolution,
-                message: format!("JPDB search navigation ended at an unexpected URL: {page_url}"),
-            });
-        }
-    }
-
-    let Some((route, snapshot)) = detail_url else {
+    if !is_search_url(&page_url) {
         return failed(JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::DetailVerification,
-            message: "resolver did not produce a verified vocabulary detail page".into(),
+            stage: JpdbPitchStage::SearchResolution,
+            message: format!("После поиска JPDB открыл неожиданный маршрут: {page_url}"),
+        });
+    }
+    let search_results = match wait_for_search_candidates(page, telemetry, search_epoch).await {
+        Ok(results) => results,
+        Err(error) => return failed(error),
+    };
+    let matching = match select_candidates(&search_results.candidates, query) {
+        Ok(matching) => matching,
+        Err(error) => return failed(error),
+    };
+    let candidate = if let (Some(selection), Some(selection_route)) =
+        (request.selection.as_ref(), selection_route.as_ref())
+    {
+        match select_explicit_candidate(&matching, selection, selection_route) {
+            Ok(candidate) => candidate,
+            Err(error) => return failed(error),
+        }
+    } else {
+        match matching.len() {
+            0 => return vocabulary_not_found(query),
+            1 => matching[0].clone(),
+            _ => {
+                return JpdbPitchOutcome::AmbiguousVocabulary {
+                    surface: query.surface.clone(),
+                    reading: query.reading.clone(),
+                    candidates: matching,
+                };
+            }
+        }
+    };
+    let Some(candidate_route) = parse_detail_route(&candidate.detail_url) else {
+        return failed(JpdbPitchFailure::PageContract {
+            stage: JpdbPitchStage::SearchResolution,
+            message: "Результат JPDB содержит недопустимую ссылку на словарную запись".into(),
         });
     };
-    if !detail_matches_query(&snapshot, query) {
+    if candidate_route.vocabulary_id != candidate.vocabulary_id
+        || !route_matches_resolved_forms(&candidate_route, &candidate.resolved_forms)
+    {
+        return failed(JpdbPitchFailure::PageContract {
+            stage: JpdbPitchStage::SearchResolution,
+            message:
+                "ID или пара написания и чтения в маршруте JPDB не подтверждены формами результата"
+                    .into(),
+        });
+    }
+
+    *stage = JpdbPitchStage::DetailNavigation;
+    let detail_epoch = telemetry.begin_epoch();
+    if let Err(error) = navigate(page, &candidate.detail_url, *stage).await {
+        return failed(error);
+    }
+    *stage = JpdbPitchStage::DetailReadiness;
+    if let Err(error) = wait_for_critical_readiness(page, telemetry, detail_epoch, *stage).await {
+        return failed(error);
+    }
+    *stage = JpdbPitchStage::DetailVerification;
+    let snapshot = match wait_for_detail_snapshot(page, telemetry, detail_epoch).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(error),
+    };
+    if !same_route_identity(&parse_detail_route(&snapshot.url), &candidate_route)
+        || snapshot.vocabulary_id != candidate.vocabulary_id
+        || !route_matches_forms(&candidate_route, &unique_forms(&snapshot.forms))
+        || !detail_matches_query(&snapshot, query)
+    {
         return failed(JpdbPitchFailure::DetailIdentityMismatch {
+            stage: JpdbPitchStage::DetailVerification,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
-            vocabulary_id: Some(route.vocabulary_id),
+            vocabulary_id: Some(candidate.vocabulary_id),
             observed_surface_forms: unique_forms(&snapshot.forms)
                 .into_iter()
                 .map(|form| form.surface)
@@ -520,12 +599,16 @@ async fn acquire_one_in_session(
         });
     }
     match inspect_and_capture(
-        page,
-        telemetry,
-        browser,
-        query,
-        route.vocabulary_id,
+        InspectionContext {
+            page,
+            telemetry,
+            browser,
+            query,
+            vocabulary_id: candidate.vocabulary_id,
+            network_epoch: detail_epoch,
+        },
         snapshot,
+        stage,
     )
     .await
     {
@@ -537,26 +620,34 @@ async fn acquire_one_in_session(
 async fn navigate(page: &Page, url: &str, stage: JpdbPitchStage) -> Result<(), JpdbPitchFailure> {
     timeout(READINESS_TIMEOUT, page.goto(url.to_owned()))
         .await
-        .map_err(|_| JpdbPitchFailure::Timeout { stage })?
+        .map_err(|_| JpdbPitchFailure::Timeout {
+            stage,
+            diagnostic: Some("Истёк лимит перехода к странице JPDB".into()),
+        })?
         .map_err(|error| JpdbPitchFailure::Navigation {
             stage,
-            message: error.to_string(),
+            message: format!("Не удалось перейти на страницу JPDB: {error}"),
         })?;
     Ok(())
 }
 
-async fn current_url(page: &Page) -> Result<String, JpdbPitchFailure> {
+fn browser_evaluation_failure(
+    stage: JpdbPitchStage,
+    action: &str,
+    error: impl std::fmt::Display,
+) -> JpdbPitchFailure {
+    JpdbPitchFailure::BrowserEvaluation {
+        stage,
+        message: format!("Сбой выполнения JavaScript через CDP при {action}: {error}"),
+    }
+}
+
+async fn current_url(page: &Page, stage: JpdbPitchStage) -> Result<String, JpdbPitchFailure> {
     page.evaluate("() => location.href")
         .await
-        .map_err(|error| JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::SearchResolution,
-            message: format!("read current URL: {error}"),
-        })?
+        .map_err(|error| browser_evaluation_failure(stage, "чтении текущего URL", error))?
         .into_value()
-        .map_err(|error| JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::SearchResolution,
-            message: format!("decode current URL: {error}"),
-        })
+        .map_err(|error| browser_evaluation_failure(stage, "декодировании текущего URL", error))
 }
 
 async fn wait_for_critical_readiness(
@@ -567,11 +658,11 @@ async fn wait_for_critical_readiness(
 ) -> Result<(), JpdbPitchFailure> {
     let deadline = Instant::now() + READINESS_TIMEOUT;
     loop {
-        let url = current_url(page).await?;
+        let url = current_url(page, stage).await?;
         if !is_jpdb_url(&url) {
             return Err(JpdbPitchFailure::PageContract {
                 stage,
-                message: format!("navigation left jpdb.io: {url}"),
+                message: format!("переход покинул домен jpdb.io: {url}"),
             });
         }
         let snapshot = telemetry.snapshot(epoch);
@@ -581,20 +672,63 @@ async fn wait_for_critical_readiness(
         let ready_state: String = page
             .evaluate("() => document.readyState")
             .await
-            .map_err(|error| JpdbPitchFailure::PageContract {
-                stage,
-                message: format!("read document readiness: {error}"),
+            .map_err(|error| {
+                browser_evaluation_failure(stage, "чтении готовности документа", error)
             })?
             .into_value()
-            .map_err(|error| JpdbPitchFailure::PageContract {
-                stage,
-                message: format!("decode document readiness: {error}"),
+            .map_err(|error| {
+                browser_evaluation_failure(stage, "декодировании готовности документа", error)
             })?;
         if matches!(ready_state.as_str(), "interactive" | "complete") {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(JpdbPitchFailure::Timeout { stage });
+            return Err(JpdbPitchFailure::Timeout {
+                stage,
+                diagnostic: Some(
+                    "Свойство document.readyState не перешло в состояние interactive или complete"
+                        .into(),
+                ),
+            });
+        }
+        sleep(READINESS_POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_critical_network_idle(
+    telemetry: &CdpRuntimeMonitor,
+    epoch: u64,
+    stage: JpdbPitchStage,
+) -> Result<(), JpdbPitchFailure> {
+    let deadline = Instant::now() + READINESS_TIMEOUT;
+    let mut consecutive_idle_observations = 0;
+    loop {
+        let snapshot = telemetry.snapshot(epoch);
+        if let Some(message) = critical_telemetry_failure(&snapshot) {
+            return Err(JpdbPitchFailure::Telemetry { stage, message });
+        }
+        let has_pending_source_request = snapshot.pending_requests.iter().any(|request| {
+            is_critical_resource(
+                &request.resource_type,
+                Some(&request.url),
+                request.is_top_level,
+            )
+        });
+        if has_pending_source_request {
+            consecutive_idle_observations = 0;
+        } else {
+            consecutive_idle_observations += 1;
+            if consecutive_idle_observations >= 2 {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(JpdbPitchFailure::Timeout {
+                stage,
+                diagnostic: Some(
+                    "JPDB не достиг состояния без незавершённых критических запросов".into(),
+                ),
+            });
         }
         sleep(READINESS_POLL_INTERVAL).await;
     }
@@ -602,11 +736,11 @@ async fn wait_for_critical_readiness(
 
 fn critical_telemetry_failure(snapshot: &RuntimeSnapshot) -> Option<String> {
     if snapshot.monitor_failed {
-        return Some("CDP runtime monitor reported lost or incomplete telemetry".into());
+        return Some("Монитор среды CDP сообщил о потере или неполноте телеметрии".into());
     }
     if snapshot.javascript_exceptions > 0 {
         return Some(format!(
-            "page raised {} JavaScript exception(s)",
+            "Страница вызвала исключений JavaScript: {}",
             snapshot.javascript_exceptions
         ));
     }
@@ -618,12 +752,12 @@ fn critical_telemetry_failure(snapshot: &RuntimeSnapshot) -> Option<String> {
         )
     }) {
         return Some(format!(
-            "critical request failed: {} ({})",
-            outcome.url.as_deref().unwrap_or("unknown URL"),
+            "Критический запрос завершился ошибкой: {} ({})",
+            outcome.url.as_deref().unwrap_or("неизвестный URL"),
             outcome
                 .failure_reason
                 .as_deref()
-                .unwrap_or("unknown network failure")
+                .unwrap_or("неизвестная сетевая ошибка")
         ));
     }
     if let Some(outcome) = snapshot.http_errors.iter().find(|outcome| {
@@ -634,9 +768,9 @@ fn critical_telemetry_failure(snapshot: &RuntimeSnapshot) -> Option<String> {
         )
     }) {
         return Some(format!(
-            "critical request returned HTTP {}: {}",
+            "Критический запрос вернул HTTP {}: {}",
             outcome.status_code.unwrap_or_default(),
-            outcome.url.as_deref().unwrap_or("unknown URL")
+            outcome.url.as_deref().unwrap_or("неизвестный URL")
         ));
     }
     None
@@ -669,11 +803,6 @@ fn is_critical_resource(
         )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DetailRoute {
-    vocabulary_id: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JpdbVocabularyForm {
@@ -701,6 +830,7 @@ struct RawVocabularyCandidate {
     detail_url: Option<String>,
     forms: Vec<JpdbVocabularyForm>,
     part_of_speech: Vec<String>,
+    meanings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -717,6 +847,8 @@ struct RawSearchSnapshot {
 struct ResolvedCandidate {
     public: JpdbVocabularyCandidate,
     forms: Vec<JpdbVocabularyForm>,
+    part_of_speech: Vec<String>,
+    meanings: Vec<String>,
 }
 
 async fn wait_for_detail_snapshot(
@@ -725,6 +857,7 @@ async fn wait_for_detail_snapshot(
     epoch: u64,
 ) -> Result<DetailSnapshot, JpdbPitchFailure> {
     let deadline = Instant::now() + READINESS_TIMEOUT;
+    let mut last_diagnostic = None;
     loop {
         if let Some(message) = critical_telemetry_failure(&telemetry.snapshot(epoch)) {
             return Err(JpdbPitchFailure::Telemetry {
@@ -732,25 +865,28 @@ async fn wait_for_detail_snapshot(
                 message,
             });
         }
-        let url = current_url(page).await?;
+        let url = current_url(page, JpdbPitchStage::DetailReadiness).await?;
         let Some(route) = parse_detail_route(&url) else {
             if Instant::now() >= deadline {
                 return Err(JpdbPitchFailure::Timeout {
                     stage: JpdbPitchStage::DetailReadiness,
+                    diagnostic: last_diagnostic,
                 });
             }
             sleep(READINESS_POLL_INTERVAL).await;
             continue;
         };
-        match read_detail_snapshot(page, route.vocabulary_id).await {
+        match read_detail_snapshot(page, route.vocabulary_id, JpdbPitchStage::DetailReadiness).await
+        {
             Ok(snapshot) => return Ok(snapshot),
-            Err(JpdbPitchFailure::Timeout { .. }) if Instant::now() < deadline => {
+            Err(JpdbPitchFailure::Timeout { diagnostic, .. }) if Instant::now() < deadline => {
+                last_diagnostic = diagnostic;
                 sleep(READINESS_POLL_INTERVAL).await;
             }
-            Err(JpdbPitchFailure::Timeout { .. }) => {
-                return Err(JpdbPitchFailure::PageContract {
+            Err(JpdbPitchFailure::Timeout { diagnostic, .. }) => {
+                return Err(JpdbPitchFailure::Timeout {
                     stage: JpdbPitchStage::DetailReadiness,
-                    message: "JPDB detail DOM did not reach its stable vocabulary contract before the readiness deadline".into(),
+                    diagnostic: diagnostic.or(last_diagnostic),
                 });
             }
             Err(error) => return Err(error),
@@ -761,65 +897,106 @@ async fn wait_for_detail_snapshot(
 async fn read_detail_snapshot(
     page: &Page,
     expected_vocabulary_id: u64,
+    stage: JpdbPitchStage,
 ) -> Result<DetailSnapshot, JpdbPitchFailure> {
     let raw: Value = page
         .evaluate(DETAIL_SNAPSHOT_SCRIPT)
         .await
-        .map_err(|error| JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::DetailVerification,
-            message: format!("read JPDB detail DOM: {error}"),
+        .map_err(|error| {
+            browser_evaluation_failure(
+                stage,
+                "чтении сведений страницы словарной записи JPDB",
+                error,
+            )
         })?
         .into_value()
-        .map_err(|error| JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::DetailVerification,
-            message: format!("decode JPDB detail DOM: {error}"),
+        .map_err(|error| {
+            browser_evaluation_failure(
+                stage,
+                "декодировании сведений страницы словарной записи JPDB",
+                error,
+            )
         })?;
-    if let Some(message) = raw["error"].as_str() {
-        let _ = message;
+    if raw["pending"].as_bool() == Some(true) {
         return Err(JpdbPitchFailure::Timeout {
-            stage: JpdbPitchStage::DetailReadiness,
+            stage,
+            diagnostic: raw["error"].as_str().map(str::to_owned),
+        });
+    }
+    if let Some(message) = raw["error"].as_str() {
+        return Err(JpdbPitchFailure::PageContract {
+            stage,
+            message: message.to_owned(),
         });
     }
     let url = raw["url"].as_str().unwrap_or_default().to_owned();
     let Some(route) = parse_detail_route(&url) else {
         return Err(JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::DetailVerification,
-            message: "detail DOM is not on a jpdb.io vocabulary detail route".into(),
+            stage,
+            message: "страница не соответствует точному маршруту словарной записи JPDB".into(),
         });
     };
     if route.vocabulary_id != expected_vocabulary_id {
         return Err(JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::DetailVerification,
-            message: "detail route changed while its DOM was inspected".into(),
+            stage,
+            message: "Маршрут словарной записи JPDB изменился во время проверки DOM".into(),
         });
     }
     if raw["search_language"].as_str() != Some("english") {
         return Err(JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::DetailVerification,
-            message: "JPDB interface is not in English (`#search-bar-lang` != english)".into(),
+            stage,
+            message: "поле `#search-bar-lang` не содержит точное значение `english`".into(),
         });
     }
-    let forms: Vec<JpdbVocabularyForm> =
+    let mut forms: Vec<JpdbVocabularyForm> =
         serde_json::from_value(raw["forms"].clone()).map_err(|error| {
             JpdbPitchFailure::PageContract {
-                stage: JpdbPitchStage::DetailVerification,
-                message: format!("invalid detail form evidence: {error}"),
+                stage,
+                message: format!("некорректные наблюдённые формы словарной записи: {error}"),
             }
         })?;
+    forms.retain(|form| !form.surface.trim().is_empty() && !form.reading.trim().is_empty());
+    if let Some(reading) = route.reading.as_deref() {
+        let route_form = JpdbVocabularyForm {
+            surface: route.surface.clone(),
+            reading: reading.to_owned(),
+        };
+        if !forms.contains(&route_form) {
+            forms.push(route_form);
+        }
+    }
+    if !route_matches_forms(&route, &forms) {
+        return Err(JpdbPitchFailure::DetailIdentityMismatch {
+            stage,
+            expected_surface: route.surface.clone(),
+            expected_reading: route.reading.clone(),
+            vocabulary_id: Some(route.vocabulary_id),
+            observed_surface_forms: unique_forms(&forms)
+                .into_iter()
+                .map(|form| form.surface)
+                .collect(),
+            observed_readings: unique_readings(&forms),
+        });
+    }
     let part_of_speech: Vec<String> = serde_json::from_value(raw["part_of_speech"].clone())
         .map_err(|error| JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::DetailVerification,
-            message: format!("invalid detail part-of-speech evidence: {error}"),
+            stage,
+            message: format!(
+                "некорректные данные о частях речи страницы словарной записи: {error}"
+            ),
         })?;
     let section_inventory: Vec<String> = serde_json::from_value(raw["section_inventory"].clone())
         .map_err(|error| JpdbPitchFailure::PageContract {
-        stage: JpdbPitchStage::DetailVerification,
-        message: format!("invalid detail section inventory: {error}"),
+        stage,
+        message: format!("некорректный список секций страницы словарной записи: {error}"),
     })?;
     let base_page_contract_valid = raw["base_page_contract_valid"].as_bool().unwrap_or(false);
     if forms.is_empty() || part_of_speech.is_empty() || !base_page_contract_valid {
         return Err(JpdbPitchFailure::Timeout {
-            stage: JpdbPitchStage::DetailReadiness,
+            stage,
+            diagnostic: Some(
+                "DOM страницы словарной записи JPDB пока не содержит проверяемых форм, частей речи и блока значений".into(),
+            ),
         });
     }
     let pitch_section_present = raw["pitch_section_present"].as_bool().unwrap_or(false);
@@ -844,14 +1021,20 @@ async fn read_search_candidates(page: &Page) -> Result<RawSearchSnapshot, JpdbPi
     let raw: Value = page
         .evaluate(SEARCH_CANDIDATES_SCRIPT)
         .await
-        .map_err(|error| JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::SearchResolution,
-            message: format!("read JPDB search results: {error}"),
+        .map_err(|error| {
+            browser_evaluation_failure(
+                JpdbPitchStage::SearchResolution,
+                "чтении результатов поиска JPDB",
+                error,
+            )
         })?
         .into_value()
-        .map_err(|error| JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::SearchResolution,
-            message: format!("decode JPDB search results: {error}"),
+        .map_err(|error| {
+            browser_evaluation_failure(
+                JpdbPitchStage::SearchResolution,
+                "декодировании результатов поиска JPDB",
+                error,
+            )
         })?;
     if let Some(message) = raw["error"].as_str() {
         return Err(JpdbPitchFailure::PageContract {
@@ -862,11 +1045,12 @@ async fn read_search_candidates(page: &Page) -> Result<RawSearchSnapshot, JpdbPi
     let snapshot: RawSearchSnapshot =
         serde_json::from_value(raw).map_err(|error| JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: format!("invalid JPDB search result inventory: {error}"),
+            message: format!("некорректный список результатов поиска JPDB: {error}"),
         })?;
     if !snapshot.ready {
         return Err(JpdbPitchFailure::Timeout {
             stage: JpdbPitchStage::SearchReadiness,
+            diagnostic: Some("JPDB ещё не показал стабильный список результатов".into()),
         });
     }
     validate_search_inventory(&snapshot)?;
@@ -879,6 +1063,7 @@ async fn wait_for_search_candidates(
     epoch: u64,
 ) -> Result<RawSearchSnapshot, JpdbPitchFailure> {
     let deadline = Instant::now() + READINESS_TIMEOUT;
+    let mut last_diagnostic = None;
     loop {
         if let Some(message) = critical_telemetry_failure(&telemetry.snapshot(epoch)) {
             return Err(JpdbPitchFailure::Telemetry {
@@ -888,15 +1073,14 @@ async fn wait_for_search_candidates(
         }
         match read_search_candidates(page).await {
             Ok(snapshot) => return Ok(snapshot),
-            Err(JpdbPitchFailure::Timeout {
-                stage: JpdbPitchStage::SearchReadiness,
-            }) if Instant::now() < deadline => sleep(READINESS_POLL_INTERVAL).await,
-            Err(JpdbPitchFailure::Timeout {
-                stage: JpdbPitchStage::SearchReadiness,
-            }) => {
-                return Err(JpdbPitchFailure::PageContract {
-                    stage: JpdbPitchStage::SearchResolution,
-                    message: "JPDB search did not expose stable results or an explicit no-results marker before the readiness deadline".into(),
+            Err(JpdbPitchFailure::Timeout { diagnostic, .. }) if Instant::now() < deadline => {
+                last_diagnostic = diagnostic;
+                sleep(READINESS_POLL_INTERVAL).await
+            }
+            Err(JpdbPitchFailure::Timeout { diagnostic, .. }) => {
+                return Err(JpdbPitchFailure::Timeout {
+                    stage: JpdbPitchStage::SearchReadiness,
+                    diagnostic: diagnostic.or(last_diagnostic),
                 });
             }
             Err(error) => return Err(error),
@@ -908,38 +1092,39 @@ fn validate_search_inventory(snapshot: &RawSearchSnapshot) -> Result<(), JpdbPit
     if !snapshot.ready {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "JPDB search result inventory was not ready".into(),
+            message: "список результатов JPDB ещё не готов".into(),
         });
     }
     if snapshot.truncated {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "JPDB search result count exceeded the provider's bounded extraction limit"
-                .into(),
+            message: "число результатов JPDB превысило ограничение извлечения провайдера".into(),
         });
     }
     if snapshot.candidates.len() > snapshot.result_count {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "JPDB vocabulary row count exceeds the declared search result count".into(),
+            message: "число строк словаря JPDB превышает объявленное число результатов поиска"
+                .into(),
         });
     }
     if snapshot.no_results_found && snapshot.result_count != 0 {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "JPDB search marked no results while result rows are present".into(),
+            message: "JPDB сообщил об отсутствии результатов, хотя строки словаря присутствуют"
+                .into(),
         });
     }
     if !snapshot.no_results_found && snapshot.result_count == 0 {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "JPDB search DOM is empty without an explicit no-results marker".into(),
+            message: "DOM поиска JPDB пуст, но явного маркера отсутствия результатов нет".into(),
         });
     }
     if snapshot.no_results_found && !snapshot.candidates.is_empty() {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "JPDB no-results marker conflicts with vocabulary candidates".into(),
+            message: "маркер отсутствия результатов JPDB конфликтует со строками словаря".into(),
         });
     }
     Ok(())
@@ -952,36 +1137,28 @@ fn select_candidates(
     if raw_candidates.len() > MAX_SEARCH_RESULTS {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "JPDB returned more candidates than the provider's bounded result limit"
-                .into(),
+            message: "JPDB вернул больше кандидатов, чем допускает ограничение провайдера".into(),
         });
     }
     let mut by_id: Vec<ResolvedCandidate> = Vec::new();
     for raw in raw_candidates {
-        if raw.part_of_speech.is_empty()
-            || raw.forms.is_empty()
-            || raw
-                .forms
-                .iter()
-                .any(|form| form.surface.is_empty() || form.reading.is_empty())
-        {
+        if raw.part_of_speech.is_empty() || raw.forms.is_empty() || raw.meanings.is_empty() {
             return Err(JpdbPitchFailure::PageContract {
                 stage: JpdbPitchStage::SearchResolution,
-                message:
-                    "a recognized vocabulary result is missing forms or part-of-speech evidence"
-                        .into(),
+                message: "результат JPDB не содержит наблюдённые формы, часть речи или значения"
+                    .into(),
             });
         }
         let Some(detail_url) = raw.detail_url.as_deref() else {
             return Err(JpdbPitchFailure::PageContract {
                 stage: JpdbPitchStage::SearchResolution,
-                message: "a recognized vocabulary result has no actual detail href".into(),
+            message: "в распознанной строке словаря нет фактической ссылки `href` на словарную запись".into(),
             });
         };
         let Some(route) = parse_detail_route(detail_url) else {
             return Err(JpdbPitchFailure::PageContract {
                 stage: JpdbPitchStage::SearchResolution,
-                message: "a recognized vocabulary result has an invalid detail href".into(),
+                message: "результат JPDB содержит недопустимую ссылку на словарную запись".into(),
             });
         };
         if raw
@@ -991,35 +1168,90 @@ fn select_candidates(
         {
             continue;
         }
-        if !forms_match_query(&raw.forms, query) {
+        let mut forms = raw
+            .forms
+            .iter()
+            .filter(|form| !form.surface.trim().is_empty() && !form.reading.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(reading) = route.reading.as_deref() {
+            // Конкретная ссылка JPDB подтверждает только пару из сегментов своего пути;
+            // это не даёт права переносить чтение маршрута на остальные написания.
+            let route_form = JpdbVocabularyForm {
+                surface: route.surface.clone(),
+                reading: reading.to_owned(),
+            };
+            if !forms.contains(&route_form) {
+                forms.push(route_form);
+            }
+        }
+        if forms.is_empty() {
+            return Err(JpdbPitchFailure::PageContract {
+                stage: JpdbPitchStage::SearchResolution,
+                message: "результат JPDB не содержит подтверждённой пары написания и чтения".into(),
+            });
+        }
+        if !route_matches_forms(&route, &forms) || !forms_match_query(&forms, query) {
             continue;
         }
+        let forms = sorted_unique_forms(&forms);
+        let part_of_speech = sorted_unique_strings(&raw.part_of_speech);
+        let meanings = sorted_unique_strings(&raw.meanings);
         let public = JpdbVocabularyCandidate {
             vocabulary_id: route.vocabulary_id,
-            surface_forms: unique_forms(&raw.forms)
-                .into_iter()
-                .map(|form| form.surface)
+            surface_forms: forms.iter().map(|form| form.surface.clone()).collect(),
+            readings: forms.iter().map(|form| form.reading.clone()).collect(),
+            resolved_forms: forms
+                .iter()
+                .map(|form| PitchAccentResolvedForm {
+                    surface: form.surface.clone(),
+                    reading: form.reading.clone(),
+                })
                 .collect(),
-            readings: unique_readings(&raw.forms),
+            part_of_speech: part_of_speech.clone(),
+            meanings: meanings.clone(),
             detail_url: detail_url.to_owned(),
         };
         if let Some(existing) = by_id
             .iter_mut()
             .find(|candidate| candidate.public.vocabulary_id == route.vocabulary_id)
         {
-            existing.forms = merge_forms(&existing.forms, &raw.forms);
-            existing.public.surface_forms = unique_forms(&existing.forms)
-                .into_iter()
-                .map(|form| form.surface)
-                .collect();
-            existing.public.readings = unique_readings(&existing.forms);
+            existing.forms = sorted_unique_forms(&merge_forms(&existing.forms, &forms));
+            existing.part_of_speech = sorted_unique_strings(
+                &existing
+                    .part_of_speech
+                    .iter()
+                    .chain(part_of_speech.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            existing.meanings = sorted_unique_strings(
+                &existing
+                    .meanings
+                    .iter()
+                    .chain(meanings.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            if detail_url < existing.public.detail_url.as_str() {
+                existing.public.detail_url = detail_url.to_owned();
+            }
+            populate_public_candidate(existing);
         } else {
             by_id.push(ResolvedCandidate {
                 public,
-                forms: raw.forms.clone(),
+                forms,
+                part_of_speech,
+                meanings,
             });
         }
     }
+    by_id.sort_by(|left, right| {
+        left.public
+            .vocabulary_id
+            .cmp(&right.public.vocabulary_id)
+            .then_with(|| left.public.detail_url.cmp(&right.public.detail_url))
+    });
     Ok(by_id
         .into_iter()
         .map(|candidate| candidate.public)
@@ -1027,35 +1259,133 @@ fn select_candidates(
 }
 
 fn forms_match_query(forms: &[JpdbVocabularyForm], query: &JpdbPitchQuery) -> bool {
-    forms.iter().any(|form| form.surface == query.surface)
-        && query
-            .reading
-            .as_deref()
-            .is_none_or(|reading| forms.iter().any(|form| form.reading == reading))
+    let surface = query.surface.trim();
+    let reading = query.reading.as_deref().map(str::trim);
+    forms.iter().any(|form| {
+        form.surface == surface
+            && reading.is_none_or(|reading| jpdb_readings_equivalent(&form.reading, reading))
+    })
 }
 
 fn resolve_query_reading(forms: &[JpdbVocabularyForm], query: &JpdbPitchQuery) -> Option<String> {
-    if let Some(reading) = query.reading.as_deref() {
-        return forms
-            .iter()
-            .any(|form| form.reading == reading)
-            .then(|| reading.to_owned());
-    }
-
-    forms
+    let readings = forms
         .iter()
-        .find(|form| form.surface == query.surface && !form.reading.is_empty())
-        .or_else(|| forms.iter().find(|form| !form.reading.is_empty()))
+        .find(|form| {
+            form.surface == query.surface.trim()
+                && query
+                    .reading
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(|reading| jpdb_readings_equivalent(&form.reading, reading))
+                && !form.reading.trim().is_empty()
+        })
+        .map(|form| form.reading.clone());
+    if query.reading.is_some() {
+        return readings;
+    }
+    let matching_readings = forms
+        .iter()
+        .filter(|form| form.surface == query.surface.trim() && !form.reading.trim().is_empty())
         .map(|form| form.reading.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    (matching_readings.len() == 1)
+        .then(|| matching_readings.into_iter().next())
+        .flatten()
 }
 
 fn detail_matches_query(detail: &DetailSnapshot, query: &JpdbPitchQuery) -> bool {
-    parse_detail_route(&detail.url).is_some_and(|route| route.vocabulary_id == detail.vocabulary_id)
-        && !detail
-            .part_of_speech
-            .iter()
-            .any(|pos| pos.trim().eq_ignore_ascii_case("name"))
+    parse_detail_route(&detail.url).is_some_and(|route| {
+        route.vocabulary_id == detail.vocabulary_id && route_matches_forms(&route, &detail.forms)
+    }) && !detail
+        .part_of_speech
+        .iter()
+        .any(|pos| pos.trim().eq_ignore_ascii_case("name"))
         && forms_match_query(&detail.forms, query)
+}
+
+fn select_explicit_candidate(
+    candidates: &[JpdbVocabularyCandidate],
+    selection: &JpdbPitchSelection,
+    selection_route: &crate::pitch_accent::JpdbVocabularyRoute,
+) -> Result<JpdbVocabularyCandidate, JpdbPitchFailure> {
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.vocabulary_id == selection.vocabulary_id
+                && same_route_identity(&parse_detail_route(&candidate.detail_url), selection_route)
+        })
+        .cloned()
+        .ok_or_else(|| JpdbPitchFailure::ExplicitSelectionMismatch {
+            stage: JpdbPitchStage::SearchResolution,
+            vocabulary_id: selection.vocabulary_id,
+            detail_url: selection.detail_url.clone(),
+            message: "ID выбора и маршрут JPDB не совпали ни с одним кандидатом нового поиска"
+                .into(),
+        })
+}
+
+fn same_route_identity(
+    left: &Option<crate::pitch_accent::JpdbVocabularyRoute>,
+    right: &crate::pitch_accent::JpdbVocabularyRoute,
+) -> bool {
+    left.as_ref().is_some_and(|left| {
+        left.vocabulary_id == right.vocabulary_id
+            && left.surface == right.surface
+            && left.reading == right.reading
+    })
+}
+
+fn route_matches_forms(
+    route: &crate::pitch_accent::JpdbVocabularyRoute,
+    forms: &[JpdbVocabularyForm],
+) -> bool {
+    forms.iter().any(|form| {
+        form.surface == route.surface
+            && route
+                .reading
+                .as_deref()
+                .is_none_or(|reading| form.reading == reading)
+    })
+}
+
+fn route_matches_resolved_forms(
+    route: &crate::pitch_accent::JpdbVocabularyRoute,
+    forms: &[PitchAccentResolvedForm],
+) -> bool {
+    forms.iter().any(|form| {
+        form.surface == route.surface
+            && route
+                .reading
+                .as_deref()
+                .is_none_or(|reading| form.reading == reading)
+    })
+}
+
+fn populate_public_candidate(candidate: &mut ResolvedCandidate) {
+    candidate.public.surface_forms = sorted_unique_strings(
+        &candidate
+            .forms
+            .iter()
+            .map(|form| form.surface.clone())
+            .collect::<Vec<_>>(),
+    );
+    candidate.public.readings = sorted_unique_strings(
+        &candidate
+            .forms
+            .iter()
+            .map(|form| form.reading.clone())
+            .collect::<Vec<_>>(),
+    );
+    candidate.public.resolved_forms = candidate
+        .forms
+        .iter()
+        .map(|form| PitchAccentResolvedForm {
+            surface: form.surface.clone(),
+            reading: form.reading.clone(),
+        })
+        .collect();
+    candidate.public.part_of_speech = candidate.part_of_speech.clone();
+    candidate.public.meanings = candidate.meanings.clone();
 }
 
 fn merge_forms(
@@ -1095,16 +1425,55 @@ fn unique_readings(forms: &[JpdbVocabularyForm]) -> Vec<String> {
     readings
 }
 
-async fn inspect_and_capture(
-    page: &Page,
-    telemetry: &CdpRuntimeMonitor,
-    browser: &crate::browser_runtime::BrowserRuntimeProvenance,
-    query: &JpdbPitchQuery,
+fn sorted_unique_forms(forms: &[JpdbVocabularyForm]) -> Vec<JpdbVocabularyForm> {
+    let mut forms = unique_forms(forms);
+    forms.sort_by(|left, right| {
+        left.surface
+            .cmp(&right.surface)
+            .then_with(|| left.reading.cmp(&right.reading))
+    });
+    forms
+}
+
+fn sorted_unique_strings(values: &[String]) -> Vec<String> {
+    let mut values = values
+        .iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+struct InspectionContext<'a> {
+    page: &'a Page,
+    telemetry: &'a CdpRuntimeMonitor,
+    browser: &'a crate::browser_runtime::BrowserRuntimeProvenance,
+    query: &'a JpdbPitchQuery,
     vocabulary_id: u64,
+    network_epoch: u64,
+}
+
+async fn inspect_and_capture(
+    context: InspectionContext<'_>,
     mut detail: DetailSnapshot,
+    stage: &mut JpdbPitchStage,
 ) -> Result<JpdbPitchOutcome, JpdbPitchFailure> {
-    if !is_jpdb_url(&detail.url) || detail.vocabulary_id != vocabulary_id {
+    let InspectionContext {
+        page,
+        telemetry,
+        browser,
+        query,
+        vocabulary_id,
+        network_epoch: inspection_epoch,
+    } = context;
+    if !is_jpdb_url(&detail.url)
+        || detail.vocabulary_id != vocabulary_id
+        || !detail_matches_query(&detail, query)
+    {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
+            stage: *stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -1115,21 +1484,10 @@ async fn inspect_and_capture(
             observed_readings: unique_readings(&detail.forms),
         });
     }
-    if !detail_matches_query(&detail, query) {
-        return Err(JpdbPitchFailure::DetailIdentityMismatch {
-            expected_surface: query.surface.clone(),
-            expected_reading: query.reading.clone(),
-            vocabulary_id: Some(vocabulary_id),
-            observed_surface_forms: unique_forms(&detail.forms)
-                .into_iter()
-                .map(|form| form.surface)
-                .collect(),
-            observed_readings: unique_readings(&detail.forms),
-        });
-    }
-    let resolved = unique_forms(&detail.forms);
+    let resolved = sorted_unique_forms(&detail.forms);
     let resolved_reading = resolve_query_reading(&resolved, query).ok_or_else(|| {
         JpdbPitchFailure::DetailIdentityMismatch {
+            stage: *stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -1137,43 +1495,40 @@ async fn inspect_and_capture(
             observed_readings: unique_readings(&resolved),
         }
     })?;
-    let inspection_epoch = telemetry.begin_epoch();
-    wait_for_critical_readiness(
-        page,
-        telemetry,
-        inspection_epoch,
-        JpdbPitchStage::PitchInspection,
-    )
-    .await?;
+    *stage = JpdbPitchStage::PitchInspection;
+    wait_for_critical_readiness(page, telemetry, inspection_epoch, *stage).await?;
     match classify_pitch_state(&detail)? {
         PitchDomState::Absent => {
+            wait_for_critical_network_idle(telemetry, inspection_epoch, *stage).await?;
             let first_absence_snapshot = detail.clone();
-            sleep(GRAPH_STABILITY_INTERVAL).await;
-            detail = read_detail_snapshot(page, vocabulary_id).await?;
+            detail =
+                read_detail_snapshot(page, vocabulary_id, JpdbPitchStage::PitchInspection).await?;
             if detail != first_absence_snapshot {
                 return Err(JpdbPitchFailure::PageContract {
-                    stage: JpdbPitchStage::PitchInspection,
-                    message: "the no-pitch detail section inventory was not stable".into(),
+                    stage: *stage,
+                    message: "список секций страницы без графика акцентуации изменился после ожидания сетевого покоя".into(),
                 });
             }
             if let Some(message) = critical_telemetry_failure(&telemetry.snapshot(inspection_epoch))
             {
                 return Err(JpdbPitchFailure::Telemetry {
-                    stage: JpdbPitchStage::PitchInspection,
+                    stage: *stage,
                     message,
                 });
             }
             return Ok(JpdbPitchOutcome::NoPitchAccentOnSource {
                 evidence: JpdbPitchAbsenceEvidence {
-                    surface: query.surface.clone(),
-                    reading: resolved_reading.clone(),
+                    surface: query.surface.trim().to_owned(),
+                    reading: resolved_reading,
                     jpdb_vocabulary_id: vocabulary_id,
                     source_url: detail.url,
-                    resolved_surface_forms: resolved
+                    resolved_forms: resolved
                         .iter()
-                        .map(|form| form.surface.clone())
+                        .map(|form| PitchAccentResolvedForm {
+                            surface: form.surface.clone(),
+                            reading: form.reading.clone(),
+                        })
                         .collect(),
-                    resolved_readings: unique_readings(&resolved),
                     section_inventory: detail.section_inventory.clone(),
                     base_page_contract_valid: detail.base_page_contract_valid,
                     pitch_section_present: detail.pitch_section_present,
@@ -1185,33 +1540,39 @@ async fn inspect_and_capture(
         PitchDomState::Present { graph_count } if graph_count == detail.graph_count => {}
         PitchDomState::Present { .. } => {
             return Err(JpdbPitchFailure::PageContract {
-                stage: JpdbPitchStage::PitchInspection,
-                message: "recognized pitch graph count changed during classification".into(),
+                stage: *stage,
+                message: "число распознанных графиков акцентуации изменилось при классификации"
+                    .into(),
             });
         }
     }
     if detail.graph_count > MAX_GRAPH_COUNT {
         return Err(JpdbPitchFailure::PageContract {
-            stage: JpdbPitchStage::PitchInspection,
-            message: "JPDB pitch graph count exceeds the provider's bounded capture limit".into(),
+            stage: *stage,
+            message: "число графиков акцентуации превышает ограничение провайдера на снимок".into(),
         });
     }
 
-    activate_dark_mode(page).await?;
-    let first = capture_snapshot(page).await?;
+    *stage = JpdbPitchStage::Capture;
+    activate_dark_mode(page, *stage).await?;
+    let first = capture_snapshot(page, *stage).await?;
     sleep(GRAPH_STABILITY_INTERVAL).await;
-    let second = capture_snapshot(page).await?;
+    let second = capture_snapshot(page, *stage).await?;
     if first != second {
         return Err(JpdbPitchFailure::CaptureContract {
-            message: "pitch graph DOM, geometry, or theme changed before capture".into(),
+            stage: *stage,
+            message:
+                "DOM графиков, их геометрия или фактически отрисованная тема изменились до снимка"
+                    .into(),
         });
     }
-    detail = read_detail_snapshot(page, vocabulary_id).await?;
+    detail = read_detail_snapshot(page, vocabulary_id, JpdbPitchStage::Capture).await?;
     if !detail_matches_query(&detail, query)
         || detail.graph_count != second.graphs.len()
         || detail.pitch_label.as_deref() != Some("Pitch accent")
     {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
+            stage: *stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -1224,55 +1585,71 @@ async fn inspect_and_capture(
     }
 
     let clip = Viewport::builder()
-        .x(second.rect.x)
-        .y(second.rect.y)
-        .width(second.rect.width)
-        .height(second.rect.height)
+        .x(second.capture_rect.x)
+        .y(second.capture_rect.y)
+        .width(second.capture_rect.width)
+        .height(second.capture_rect.height)
         .scale(1.0)
         .build()
-        .map_err(|message| JpdbPitchFailure::CaptureContract { message })?;
+        .map_err(|message| JpdbPitchFailure::CaptureContract {
+            stage: *stage,
+            message,
+        })?;
     let params = CaptureScreenshotParams::builder()
         .format(CaptureScreenshotFormat::Png)
         .clip(clip)
-        .capture_beyond_viewport(false)
+        .capture_beyond_viewport(true)
         .build();
     let bytes = page
         .screenshot(params)
         .await
         .map_err(|error| JpdbPitchFailure::Screenshot {
-            message: error.to_string(),
+            stage: JpdbPitchStage::Capture,
+            message: format!("Не удалось получить снимок страницы средствами браузера: {error}"),
         })?;
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err(JpdbPitchFailure::InvalidPng {
-            message: "native browser capture did not return PNG bytes".into(),
+            stage: JpdbPitchStage::Capture,
+            message: "Нативный снимок браузера вернул данные без сигнатуры PNG".into(),
         });
     }
     let image =
         image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).map_err(|error| {
             JpdbPitchFailure::InvalidPng {
-                message: format!("native browser screenshot is not a decodable PNG: {error}"),
+                stage: JpdbPitchStage::Capture,
+                message: format!("Нативный снимок браузера не декодируется как PNG: {error}"),
             }
         })?;
     let (pixel_width, pixel_height) = image.dimensions();
     if pixel_width == 0 || pixel_height == 0 {
         return Err(JpdbPitchFailure::InvalidPng {
-            message: "native browser screenshot has an empty pixel size".into(),
+            stage: JpdbPitchStage::Capture,
+            message: "Нативный снимок браузера имеет нулевой размер".into(),
         });
     }
-    let post_capture = capture_snapshot(page).await?;
+    *stage = JpdbPitchStage::PostCaptureVerification;
+    let post_capture = capture_snapshot(page, *stage).await?;
     if post_capture != second {
         return Err(JpdbPitchFailure::DarkThemeUnverified {
-            message: "theme, graph DOM, or capture geometry changed during native screenshot"
-                .into(),
+            stage: *stage,
+            message: "Фактически отрисованная тема, DOM графиков или геометрия снимка изменились во время снимка экрана".into(),
         });
     }
-    let post_capture_detail = read_detail_snapshot(page, vocabulary_id).await?;
+    validate_png_background(&image, &second.dark_theme).map_err(|message| {
+        JpdbPitchFailure::DarkThemeUnverified {
+            stage: *stage,
+            message,
+        }
+    })?;
+    let post_capture_detail =
+        read_detail_snapshot(page, vocabulary_id, JpdbPitchStage::PostCaptureVerification).await?;
     if post_capture_detail.url != detail.url
         || post_capture_detail.vocabulary_id != vocabulary_id
         || !detail_matches_query(&post_capture_detail, query)
-        || unique_forms(&post_capture_detail.forms) != resolved
+        || sorted_unique_forms(&post_capture_detail.forms) != resolved
     {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
+            stage: *stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -1289,23 +1666,29 @@ async fn inspect_and_capture(
             message,
         });
     }
-    let expected_width = (second.rect.width * CAPTURE_DEVICE_SCALE_FACTOR).round() as u32;
-    let expected_height = (second.rect.height * CAPTURE_DEVICE_SCALE_FACTOR).round() as u32;
-    let edge_rounding_tolerance = CAPTURE_DEVICE_SCALE_FACTOR.ceil() as u32;
-    if pixel_width.abs_diff(expected_width) > edge_rounding_tolerance
-        || pixel_height.abs_diff(expected_height) > edge_rounding_tolerance
-    {
+    if !capture_pixel_dimensions_match(
+        pixel_width,
+        pixel_height,
+        second.capture_rect.width,
+        second.capture_rect.height,
+        CAPTURE_DEVICE_SCALE_FACTOR,
+    ) {
         return Err(JpdbPitchFailure::CaptureContract {
+            stage: *stage,
             message: format!(
-                "PNG size {pixel_width}x{pixel_height} does not match CSS clip {:.3}x{:.3} at 3x",
-                second.rect.width, second.rect.height
+                "размер PNG {pixel_width}×{pixel_height} не соответствует области захвата документа {:.3}×{:.3} CSS-пикселей при масштабе 3×",
+                second.capture_rect.width, second.capture_rect.height
             ),
         });
     }
 
-    let resolved_surface_forms: Vec<String> =
-        resolved.iter().map(|form| form.surface.clone()).collect();
-    let resolved_readings = unique_readings(&resolved);
+    let resolved_forms: Vec<PitchAccentResolvedForm> = resolved
+        .iter()
+        .map(|form| PitchAccentResolvedForm {
+            surface: form.surface.clone(),
+            reading: form.reading.clone(),
+        })
+        .collect();
     let graphs = second
         .graphs
         .iter()
@@ -1313,50 +1696,63 @@ async fn inspect_and_capture(
         .map(|(index, graph)| PitchAccentGraphEvidence {
             index: index as u32,
             selector: graph.selector.clone(),
+            viewport_rect: graph.viewport_rect,
+            document_rect: graph.document_rect,
         })
         .collect::<Vec<_>>();
     let metadata = PitchAccentDomainMetadata {
-        surface: query.surface.clone(),
+        surface: query.surface.trim().to_owned(),
         reading: resolved_reading,
         jpdb_vocabulary_id: vocabulary_id,
         evidence: PitchAccentEvidence {
             provider: PitchAccentProvider::Jpdb,
             source_url: detail.url,
-            resolved_surface_forms,
-            resolved_readings,
+            resolved_forms,
             graph_count: graphs.len() as u32,
             render: PitchAccentRenderEvidence {
                 kind: PitchAccentRenderKind::BrowserRegionScreenshot,
                 selector: ".subsection-pitch-accent .subsection > div > div > div[style*=\"word-break: keep-all\"]".into(),
                 graphs,
+                coordinate_space: PitchAccentCoordinateSpace::Document,
                 viewport_width: second.viewport_width,
                 viewport_height: second.viewport_height,
+                document_width: second.document_width,
+                document_height: second.document_height,
+                scroll_x: second.scroll_x,
+                scroll_y: second.scroll_y,
                 pixel_width,
                 pixel_height,
                 device_scale_factor: CAPTURE_DEVICE_SCALE_FACTOR,
                 page_scale_factor: second.page_scale_factor,
                 dark_theme: second.dark_theme,
-                capture_rect: second.rect,
+                graph_union_rect: second.graph_union_rect,
+                capture_padding_css_px: PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+                actual_capture_padding_css_px: capture_padding(second.graph_union_rect, second.capture_rect),
+                capture_rect: second.capture_rect,
             },
             browser: browser.clone(),
         },
     };
     Ok(JpdbPitchOutcome::Acquired {
-        asset: JpdbPitchAcquired { bytes, metadata },
+        asset: Box::new(JpdbPitchAcquired { bytes, metadata }),
     })
 }
 
-async fn activate_dark_mode(page: &Page) -> Result<(), JpdbPitchFailure> {
+async fn activate_dark_mode(page: &Page, stage: JpdbPitchStage) -> Result<(), JpdbPitchFailure> {
     page.evaluate("() => { document.documentElement.classList.add('dark-mode'); return true; }")
         .await
-        .map_err(|error| JpdbPitchFailure::DarkThemeUnverified {
-            message: format!("activate html.dark-mode: {error}"),
+        .map_err(|error| {
+            browser_evaluation_failure(stage, "включении класса html.dark-mode", error)
         })?
         .into_value::<bool>()
-        .map_err(|error| JpdbPitchFailure::DarkThemeUnverified {
-            message: format!("decode dark-mode activation result: {error}"),
+        .map_err(|error| {
+            browser_evaluation_failure(
+                stage,
+                "декодировании результата включения тёмной темы",
+                error,
+            )
         })?;
-    let state = capture_snapshot(page).await?;
+    let state = capture_snapshot(page, stage).await?;
     if !state
         .dark_theme
         .document_element_classes
@@ -1364,184 +1760,338 @@ async fn activate_dark_mode(page: &Page) -> Result<(), JpdbPitchFailure> {
         .any(|class| class == "dark-mode")
         || state.dark_theme.prefers_color_scheme != "dark"
         || state.dark_theme.computed_color_scheme.trim().is_empty()
+        || relative_luminance(state.dark_theme.background_rgb) > 0.20
     {
         return Err(JpdbPitchFailure::DarkThemeUnverified {
-            message: format!("JPDB dark-mode proof is incomplete: {:?}", state.dark_theme),
-        });
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct CaptureGraph {
-    selector: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct CaptureSnapshot {
-    graphs: Vec<CaptureGraph>,
-    rect: PitchAccentCaptureRect,
-    viewport_width: u32,
-    viewport_height: u32,
-    page_scale_factor: f64,
-    device_pixel_ratio: f64,
-    dark_theme: PitchAccentDarkThemeProof,
-}
-
-async fn capture_snapshot(page: &Page) -> Result<CaptureSnapshot, JpdbPitchFailure> {
-    let raw: Value = page
-        .evaluate(CAPTURE_SNAPSHOT_SCRIPT)
-        .await
-        .map_err(|error| JpdbPitchFailure::CaptureContract {
-            message: format!("read graph capture geometry: {error}"),
-        })?
-        .into_value()
-        .map_err(|error| JpdbPitchFailure::CaptureContract {
-            message: format!("decode graph capture geometry: {error}"),
-        })?;
-    if let Some(message) = raw["error"].as_str() {
-        return Err(JpdbPitchFailure::CaptureContract {
-            message: message.to_owned(),
-        });
-    }
-    let graphs: Vec<CaptureGraph> = raw["graphs"]
-        .as_array()
-        .ok_or_else(|| JpdbPitchFailure::CaptureContract {
-            message: "capture DOM returned no graph array".into(),
-        })?
-        .iter()
-        .map(|graph| {
-            Ok(CaptureGraph {
-                selector: graph["selector"]
-                    .as_str()
-                    .ok_or_else(|| JpdbPitchFailure::CaptureContract {
-                        message: "graph selector is missing".into(),
-                    })?
-                    .to_owned(),
-                x: finite_number(&graph["x"], "graph x")?,
-                y: finite_number(&graph["y"], "graph y")?,
-                width: finite_number(&graph["width"], "graph width")?,
-                height: finite_number(&graph["height"], "graph height")?,
-            })
-        })
-        .collect::<Result<_, JpdbPitchFailure>>()?;
-    if graphs.is_empty() || graphs.len() > MAX_GRAPH_COUNT {
-        return Err(JpdbPitchFailure::CaptureContract {
-            message: "capture DOM returned an empty or excessive graph set".into(),
-        });
-    }
-    let rect = PitchAccentCaptureRect {
-        x: finite_number(&raw["rect"]["x"], "capture x")?,
-        y: finite_number(&raw["rect"]["y"], "capture y")?,
-        width: finite_number(&raw["rect"]["width"], "capture width")?,
-        height: finite_number(&raw["rect"]["height"], "capture height")?,
-    };
-    let viewport_width = raw["viewport_width"]
-        .as_u64()
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| JpdbPitchFailure::CaptureContract {
-            message: "capture DOM returned an invalid viewport width".into(),
-        })?;
-    let viewport_height = raw["viewport_height"]
-        .as_u64()
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| JpdbPitchFailure::CaptureContract {
-            message: "capture DOM returned an invalid viewport height".into(),
-        })?;
-    let page_scale_factor = finite_number(&raw["page_scale_factor"], "page scale factor")?;
-    let device_pixel_ratio = finite_number(&raw["device_pixel_ratio"], "device pixel ratio")?;
-    let classes: Vec<String> = serde_json::from_value(
-        raw["dark_theme"]["document_element_classes"].clone(),
-    )
-    .map_err(|error| JpdbPitchFailure::DarkThemeUnverified {
-        message: format!("invalid html class evidence: {error}"),
-    })?;
-    let dark_theme = PitchAccentDarkThemeProof {
-        document_element_classes: classes,
-        prefers_color_scheme: raw["dark_theme"]["prefers_color_scheme"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-        computed_color_scheme: raw["dark_theme"]["computed_color_scheme"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-    };
-    validate_capture_geometry(
-        rect,
-        viewport_width,
-        viewport_height,
-        page_scale_factor,
-        device_pixel_ratio,
-    )?;
-    Ok(CaptureSnapshot {
-        graphs,
-        rect,
-        viewport_width,
-        viewport_height,
-        page_scale_factor,
-        device_pixel_ratio,
-        dark_theme,
-    })
-}
-
-fn finite_number(value: &Value, label: &str) -> Result<f64, JpdbPitchFailure> {
-    value
-        .as_f64()
-        .filter(|number| number.is_finite())
-        .ok_or_else(|| JpdbPitchFailure::CaptureContract {
-            message: format!("capture DOM returned invalid {label}"),
-        })
-}
-
-fn validate_capture_geometry(
-    rect: PitchAccentCaptureRect,
-    viewport_width: u32,
-    viewport_height: u32,
-    page_scale_factor: f64,
-    device_pixel_ratio: f64,
-) -> Result<(), JpdbPitchFailure> {
-    if ![rect.x, rect.y, rect.width, rect.height]
-        .into_iter()
-        .all(f64::is_finite)
-        || rect.x < 0.0
-        || rect.y < 0.0
-        || rect.width <= 0.0
-        || rect.height <= 0.0
-        || rect.x + rect.width > f64::from(viewport_width) + 0.5
-        || rect.y + rect.height > f64::from(viewport_height) + 0.5
-    {
-        return Err(JpdbPitchFailure::CaptureContract {
-            message: "graph union rectangle is invalid or outside the browser viewport".into(),
-        });
-    }
-    if (page_scale_factor - 1.0).abs() > f64::EPSILON {
-        return Err(JpdbPitchFailure::CaptureContract {
-            message: format!("page scale factor is {page_scale_factor}, expected 1.0"),
-        });
-    }
-    if (device_pixel_ratio - CAPTURE_DEVICE_SCALE_FACTOR).abs() > 0.001 {
-        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
             message: format!(
-                "window.devicePixelRatio is {device_pixel_ratio}, expected {CAPTURE_DEVICE_SCALE_FACTOR}"
+                "Наблюдённый отрисованный фон не подтверждает тёмную тему: {:?}",
+                state.dark_theme
             ),
         });
     }
     Ok(())
 }
 
+fn validate_png_background(
+    image: &image::DynamicImage,
+    proof: &PitchAccentDarkThemeProof,
+) -> Result<(), String> {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err("PNG не содержит пикселей для проверки наблюдённого фона".into());
+    }
+    let x_mid = width / 2;
+    let y_mid = height / 2;
+    let border_points = [
+        (0, 0),
+        (width - 1, 0),
+        (0, height - 1),
+        (width - 1, height - 1),
+        (x_mid, 0),
+        (x_mid, height - 1),
+        (0, y_mid),
+        (width - 1, y_mid),
+    ];
+    for (x, y) in border_points {
+        let pixel = image.get_pixel(x, y).0;
+        if pixel[3] < 250
+            || pixel[..3]
+                .iter()
+                .zip(proof.background_rgb)
+                .any(|(actual, expected)| actual.abs_diff(expected) > 8)
+        {
+            return Err(format!(
+                "пиксель PNG на границе ({x}, {y}) не совпадает с наблюдённым сплошным фоном {:?}",
+                proof.background_rgb
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureGraph {
+    selector: String,
+    viewport_rect: PitchAccentCaptureRect,
+    document_rect: PitchAccentCaptureRect,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureSnapshot {
+    graphs: Vec<CaptureGraph>,
+    graph_union_rect: PitchAccentCaptureRect,
+    capture_rect: PitchAccentCaptureRect,
+    viewport_width: u32,
+    viewport_height: u32,
+    document_width: u32,
+    document_height: u32,
+    scroll_x: f64,
+    scroll_y: f64,
+    page_scale_factor: f64,
+    device_pixel_ratio: f64,
+    dark_theme: PitchAccentDarkThemeProof,
+}
+
+async fn capture_snapshot(
+    page: &Page,
+    stage: JpdbPitchStage,
+) -> Result<CaptureSnapshot, JpdbPitchFailure> {
+    let raw: Value = page
+        .evaluate(CAPTURE_SNAPSHOT_SCRIPT)
+        .await
+        .map_err(|error| browser_evaluation_failure(stage, "получении геометрии графиков", error))?
+        .into_value()
+        .map_err(|error| {
+            browser_evaluation_failure(stage, "декодировании геометрии графиков", error)
+        })?;
+    if let Some(message) = raw["error"].as_str() {
+        if let Some(diagnostic) = message.strip_prefix("dark-theme: ") {
+            return Err(JpdbPitchFailure::DarkThemeUnverified {
+                stage,
+                message: diagnostic.to_owned(),
+            });
+        }
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: message.to_owned(),
+        });
+    }
+    let dark_theme: PitchAccentDarkThemeProof = serde_json::from_value(raw["dark_theme"].clone())
+        .map_err(|error| {
+        JpdbPitchFailure::DarkThemeUnverified {
+            stage,
+            message: format!(
+                "JPDB не предоставил проверяемые данные об отрисованном фоне: {error}"
+            ),
+        }
+    })?;
+    if dark_theme.background_selector.trim().is_empty()
+        || relative_luminance(dark_theme.background_rgb) > 0.20
+    {
+        return Err(JpdbPitchFailure::DarkThemeUnverified {
+            stage,
+            message: format!(
+                "наблюдённый фон {} {:?} не доказывает тёмную тему",
+                dark_theme.background_selector, dark_theme.background_rgb
+            ),
+        });
+    }
+    let mut normalized_raw = raw;
+    normalized_raw["dark_theme"] = serde_json::to_value(&dark_theme).map_err(|error| {
+        JpdbPitchFailure::DarkThemeUnverified {
+            stage,
+            message: format!("не удалось сохранить подтверждение фактического фона: {error}"),
+        }
+    })?;
+    let snapshot: CaptureSnapshot = serde_json::from_value(normalized_raw).map_err(|error| {
+        JpdbPitchFailure::CaptureContract {
+            stage,
+            message: format!("снимок DOM вернул неполные геометрические данные: {error}"),
+        }
+    })?;
+    validate_capture_geometry(&snapshot, stage)?;
+    Ok(snapshot)
+}
+
+fn validate_capture_geometry(
+    snapshot: &CaptureSnapshot,
+    stage: JpdbPitchStage,
+) -> Result<(), JpdbPitchFailure> {
+    let document_width = f64::from(snapshot.document_width);
+    let document_height = f64::from(snapshot.document_height);
+    if snapshot.viewport_width == 0
+        || snapshot.viewport_height == 0
+        || snapshot.document_width == 0
+        || snapshot.document_height == 0
+        || snapshot.document_width < snapshot.viewport_width
+        || snapshot.document_height < snapshot.viewport_height
+        || !snapshot.scroll_x.is_finite()
+        || !snapshot.scroll_y.is_finite()
+        || snapshot.scroll_x < -0.5
+        || snapshot.scroll_y < -0.5
+        || snapshot.graphs.is_empty()
+        || snapshot.graphs.len() > MAX_GRAPH_COUNT
+    {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message:
+                "размеры документа, области просмотра, прокрутки или число графиков недопустимы"
+                    .into(),
+        });
+    }
+    if (snapshot.page_scale_factor - 1.0).abs() > f64::EPSILON {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: format!(
+                "масштаб страницы равен {}, ожидалось значение 1.0",
+                snapshot.page_scale_factor
+            ),
+        });
+    }
+    if (snapshot.device_pixel_ratio - CAPTURE_DEVICE_SCALE_FACTOR).abs() > 0.001 {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: format!(
+                "window.devicePixelRatio равен {}, ожидалось {}",
+                snapshot.device_pixel_ratio, CAPTURE_DEVICE_SCALE_FACTOR
+            ),
+        });
+    }
+
+    let mut union_left = f64::INFINITY;
+    let mut union_top = f64::INFINITY;
+    let mut union_right = f64::NEG_INFINITY;
+    let mut union_bottom = f64::NEG_INFINITY;
+    for graph in &snapshot.graphs {
+        let viewport = graph.viewport_rect;
+        let document = graph.document_rect;
+        if graph.selector.trim().is_empty()
+            || !valid_rect(viewport, false)
+            || viewport.x < -0.25
+            || viewport.y < -0.25
+            || viewport.x + viewport.width > f64::from(snapshot.viewport_width) + 0.25
+            || viewport.y + viewport.height > f64::from(snapshot.viewport_height) + 0.25
+            || !valid_rect(document, true)
+            || document.x < -0.5
+            || document.y < -0.5
+            || document.x + document.width > document_width + 0.5
+            || document.y + document.height > document_height + 0.5
+            || (document.x - (viewport.x + snapshot.scroll_x)).abs() > 0.5
+            || (document.y - (viewport.y + snapshot.scroll_y)).abs() > 0.5
+            || (document.width - viewport.width).abs() > 0.5
+            || (document.height - viewport.height).abs() > 0.5
+        {
+            return Err(JpdbPitchFailure::CaptureContract {
+                stage,
+            message: "прямоугольники графика не согласованы между областью просмотра и координатами документа".into(),
+            });
+        }
+        union_left = union_left.min(document.x);
+        union_top = union_top.min(document.y);
+        union_right = union_right.max(document.x + document.width);
+        union_bottom = union_bottom.max(document.y + document.height);
+    }
+    let expected_union = PitchAccentCaptureRect {
+        x: union_left,
+        y: union_top,
+        width: union_right - union_left,
+        height: union_bottom - union_top,
+    };
+    if !rect_matches(snapshot.graph_union_rect, expected_union, 0.5) {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: "объединение графиков не совпадает с прямоугольниками графиков в координатах документа".into(),
+        });
+    }
+    let expected_capture = padded_capture_rect(
+        expected_union,
+        PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+        document_width,
+        document_height,
+    );
+    if !valid_rect(snapshot.capture_rect, true)
+        || snapshot.capture_rect.x < -0.5
+        || snapshot.capture_rect.y < -0.5
+        || snapshot.capture_rect.x + snapshot.capture_rect.width > document_width + 0.5
+        || snapshot.capture_rect.y + snapshot.capture_rect.height > document_height + 0.5
+        || !rect_matches(snapshot.capture_rect, expected_capture, 0.5)
+    {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: "область захвата не соответствует отступу 8 CSS px с учётом границ документа"
+                .into(),
+        });
+    }
+    let actual_padding = capture_padding(expected_union, snapshot.capture_rect);
+    if [
+        actual_padding.top,
+        actual_padding.right,
+        actual_padding.bottom,
+        actual_padding.left,
+    ]
+    .into_iter()
+    .any(|padding| padding < -0.5 || padding > PITCH_ACCENT_CAPTURE_PADDING_CSS_PX + 0.5)
+    {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: "прямоугольник снимка не содержит все графики с допустимым отступом".into(),
+        });
+    }
+    Ok(())
+}
+
+fn valid_rect(rect: PitchAccentCaptureRect, require_nonnegative: bool) -> bool {
+    [rect.x, rect.y, rect.width, rect.height]
+        .into_iter()
+        .all(f64::is_finite)
+        && (!require_nonnegative || (rect.x >= 0.0 && rect.y >= 0.0))
+        && rect.width > 0.0
+        && rect.height > 0.0
+}
+
+fn rect_matches(
+    actual: PitchAccentCaptureRect,
+    expected: PitchAccentCaptureRect,
+    tolerance: f64,
+) -> bool {
+    (actual.x - expected.x).abs() <= tolerance
+        && (actual.y - expected.y).abs() <= tolerance
+        && (actual.width - expected.width).abs() <= tolerance
+        && (actual.height - expected.height).abs() <= tolerance
+}
+
+fn padded_capture_rect(
+    union: PitchAccentCaptureRect,
+    padding: f64,
+    document_width: f64,
+    document_height: f64,
+) -> PitchAccentCaptureRect {
+    let left = (union.x - padding).max(0.0);
+    let top = (union.y - padding).max(0.0);
+    let right = (union.x + union.width + padding).min(document_width);
+    let bottom = (union.y + union.height + padding).min(document_height);
+    PitchAccentCaptureRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+fn capture_padding(
+    union: PitchAccentCaptureRect,
+    capture: PitchAccentCaptureRect,
+) -> PitchAccentCapturePadding {
+    PitchAccentCapturePadding {
+        top: union.y - capture.y,
+        right: capture.x + capture.width - (union.x + union.width),
+        bottom: capture.y + capture.height - (union.y + union.height),
+        left: union.x - capture.x,
+    }
+}
+
+fn relative_luminance(rgb: [u8; 3]) -> f64 {
+    let linear = rgb.map(|channel| {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+}
+
 fn build_search_url(surface: &str) -> Result<String, String> {
-    if surface.trim().is_empty() {
-        return Err("surface must not be empty".into());
+    let surface = surface.trim();
+    if surface.is_empty() {
+        return Err("Поле surface не должно быть пустым".into());
     }
     let mut url = Url::parse(&format!("{JPDB_ORIGIN}/search"))
-        .map_err(|error| format!("invalid JPDB search origin: {error}"))?;
+        .map_err(|error| format!("неверный origin поиска JPDB: {error}"))?;
     url.query_pairs_mut().append_pair("q", surface);
     Ok(url.to_string())
 }
@@ -1562,28 +2112,8 @@ fn is_search_url(raw_url: &str) -> bool {
     Url::parse(raw_url).is_ok_and(|url| is_jpdb_url(url.as_str()) && url.path() == "/search")
 }
 
-fn parse_detail_route(raw_url: &str) -> Option<DetailRoute> {
-    let url = Url::parse(raw_url).ok()?;
-    if !is_jpdb_url(url.as_str()) {
-        return None;
-    }
-    let mut segments = url.path_segments()?;
-    if segments.next()? != "vocabulary" {
-        return None;
-    }
-    let vocabulary_id = segments.next()?.parse::<u64>().ok().filter(|id| *id > 0)?;
-    let surface_slug = segments.next()?;
-    if surface_slug.is_empty() || surface_slug.eq_ignore_ascii_case("used-in") {
-        return None;
-    }
-    if segments
-        .next()
-        .is_some_and(|reading| reading.eq_ignore_ascii_case("used-in"))
-        || segments.next().is_some()
-    {
-        return None;
-    }
-    Some(DetailRoute { vocabulary_id })
+fn parse_detail_route(raw_url: &str) -> Option<crate::pitch_accent::JpdbVocabularyRoute> {
+    parse_jpdb_vocabulary_route(raw_url).ok()
 }
 
 fn vocabulary_not_found(query: &JpdbPitchQuery) -> JpdbPitchOutcome {
@@ -1597,17 +2127,36 @@ fn failed(error: JpdbPitchFailure) -> JpdbPitchOutcome {
     JpdbPitchOutcome::Failed { error }
 }
 
+fn item_timeout(stage: JpdbPitchStage) -> JpdbPitchOutcome {
+    failed(JpdbPitchFailure::Timeout {
+        stage,
+        diagnostic: Some("Истёк общий лимит времени для элемента".into()),
+    })
+}
+
 const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
   const lang = document.querySelector('#search-bar-lang');
   const results = document.querySelector('.results');
   if (!lang || !results) return { ready: false, no_results_found: false, result_count: 0, truncated: false, candidates: [] };
-  if (lang.value !== 'english') return { error: 'JPDB interface is not in English (#search-bar-lang != english)' };
+  if (lang.value !== 'english') return { error: 'Интерфейс JPDB должен быть на английском языке' };
+  const compact = value => value.replace(/\s+/gu, '');
+  const isKana = value => /^[\u3040-\u309f\u30a0-\u30ffー゙゚]+$/u.test(value);
+  const parseDetailHref = href => {
+    try {
+      const url = new URL(href, location.href);
+      const pieces = url.pathname.split('/').filter(Boolean);
+      if (url.origin !== 'https://jpdb.io' || pieces.length < 3 || pieces.length > 4 || pieces[0] !== 'vocabulary') return null;
+      if (!/^[1-9][0-9]*$/u.test(pieces[1])) return null;
+      const surface = decodeURIComponent(pieces[2]);
+      const reading = pieces.length === 4 ? decodeURIComponent(pieces[3]) : null;
+      if (!surface.trim() || surface.toLowerCase() === 'used-in' || (reading !== null && (!reading.trim() || reading.toLowerCase() === 'used-in'))) return null;
+      return { href: url.href, id: Number(pieces[1]), surface, reading };
+    } catch (_) { return null; }
+  };
   const rubyForm = root => {
     if (!root) return [];
     let surface = '';
     let reading = '';
-    const compact = value => value.replace(/\s+/gu, '');
-    const isKana = value => /^[\u3040-\u309f\u30a0-\u30ffー゙゚]+$/u.test(value);
     const baseText = node => {
       if (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'RT') return '';
       if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
@@ -1622,10 +2171,7 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
         return;
       }
       if (!(node instanceof Element) || node.matches('.property-text')) return;
-      if (node.tagName === 'RT') {
-        reading += compact(node.textContent || '');
-        return;
-      }
+      if (node.tagName === 'RT') { reading += compact(node.textContent || ''); return; }
       if (node.tagName === 'RUBY') {
         let pendingBase = '';
         for (const child of node.childNodes) {
@@ -1635,9 +2181,7 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
             surface += base;
             reading += annotation || (isKana(base) ? base : '');
             pendingBase = '';
-          } else {
-            pendingBase += baseText(child);
-          }
+          } else pendingBase += baseText(child);
         }
         const trailingBase = compact(pendingBase);
         surface += trailingBase;
@@ -1647,67 +2191,48 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
       for (const child of node.childNodes) visit(child);
     };
     for (const child of root.childNodes) visit(child);
-    if (!surface) {
-      const fallback = compact(root.innerText || root.textContent || '');
-      return fallback ? [{ surface: fallback, reading: isKana(fallback) ? fallback : '' }] : [];
-    }
-    return [{ surface, reading }];
+    if (!surface) surface = compact(root.innerText || root.textContent || '');
+    return surface ? [{ surface, reading }] : [];
   };
-  const detailHref = (root, vocabularyId) => {
-    const valid = anchor => {
-      try {
-        const url = new URL(anchor.href, location.href);
-        const pieces = url.pathname.split('/').filter(Boolean);
-        return url.hostname === 'jpdb.io' && pieces[0] === 'vocabulary' && pieces[1] === String(vocabularyId) && pieces.length >= 3 && pieces.length <= 4 && pieces[2] !== 'used-in' && pieces[3] !== 'used-in';
-      } catch (_) { return false; }
-    };
-    const detailsLinks = [...root.querySelectorAll('a.view-conjugations-link[href]')].filter(valid);
-    if (detailsLinks.length) return detailsLinks[0].href;
-    const spellingLinks = [...root.querySelectorAll('.subsection-other-spellings .alt-spelling a.plain')].filter(valid);
-    return spellingLinks.length ? spellingLinks[0].href : null;
+  const append = (forms, candidate) => {
+    if (!candidate || !candidate.surface.trim() || !candidate.reading.trim()) return;
+    if (!forms.some(form => form.surface === candidate.surface && form.reading === candidate.reading)) forms.push(candidate);
   };
-  const candidates = [];
-  const resultRows = [...results.querySelectorAll('div[id^="result-"]')];
+  const hrefForRow = (row, id) => {
+    const links = [...row.querySelectorAll('a.view-conjugations-link[href], .subsection-other-spellings .alt-spelling a.plain[href]')];
+    return links.map(link => parseDetailHref(link.href)).find(route => route && route.id === id) || null;
+  };
   const vocabularyRows = [...results.querySelectorAll('div.result.vocabulary')];
+  const resultRows = [...results.querySelectorAll('div[id^="result-"]')];
   const resultCount = Math.max(resultRows.length, vocabularyRows.length);
   const noResultsFound = /\bNo results found\./i.test(results.innerText || '');
-  if (noResultsFound && resultCount) return { error: 'JPDB no-results marker conflicts with result rows' };
+  if (noResultsFound && resultCount) return { error: 'JPDB одновременно сообщил об отсутствии результатов и показал строки поиска' };
   if (!noResultsFound && resultCount === 0) return { ready: false, no_results_found: false, result_count: 0, truncated: false, candidates: [] };
+  const candidates = [];
   for (const row of vocabularyRows.slice(0, 128)) {
     const primary = row.querySelector('.subsection-headword .primary-spelling');
-    const primaryForms = rubyForm(primary);
-    const forms = [...primaryForms];
-    for (const alternate of row.querySelectorAll('.subsection-other-spellings .alt-spelling a.plain')) {
-      if (alternate.closest('a[href^="/kanji/"]')) continue;
-      forms.push(...rubyForm(alternate));
+    const links = [...row.querySelectorAll('a.view-conjugations-link[href], .subsection-other-spellings .alt-spelling a.plain[href]')];
+    const route = links.map(link => parseDetailHref(link.href)).find(candidate => candidate !== null);
+    const forms = [];
+    for (const form of rubyForm(primary)) append(forms, form);
+    for (const alternate of row.querySelectorAll('.subsection-other-spellings .alt-spelling a.plain[href]')) {
+      const alternateRoute = parseDetailHref(alternate.href);
+      if (!alternateRoute || (route && alternateRoute.id !== route.id)) continue;
+      const parsed = rubyForm(alternate)[0];
+      if (!parsed || parsed.surface !== alternateRoute.surface) continue;
+      if (parsed.reading && (!alternateRoute.reading || parsed.reading === alternateRoute.reading)) append(forms, parsed);
+      else if (alternateRoute.reading) append(forms, { surface: alternateRoute.surface, reading: alternateRoute.reading });
     }
-    const canonicalReading = primaryForms.find(form => form.reading)?.reading
-      || forms.find(form => form.reading)?.reading
-      || '';
-    for (const form of forms) if (!form.reading) form.reading = canonicalReading || form.surface;
+    const detailRoute = hrefForRow(row, route?.id);
+    if (detailRoute?.reading) append(forms, { surface: detailRoute.surface, reading: detailRoute.reading });
     const partOfSpeech = [...row.querySelectorAll('.subsection-meanings .part-of-speech')]
       .map(node => (node.innerText || node.textContent || '').trim()).filter(Boolean);
-    const anchor = [...row.querySelectorAll('a[href^="/vocabulary/"], a[href^="https://jpdb.io/vocabulary/"]')]
-      .find(valid => {
-        try {
-          const url = new URL(valid.href, location.href);
-          return url.hostname === 'jpdb.io' && url.pathname.split('/').filter(Boolean)[0] === 'vocabulary';
-        } catch (_) { return false; }
-      });
-    let vocabularyId = null;
-    if (anchor) {
-      const parts = new URL(anchor.href, location.href).pathname.split('/').filter(Boolean);
-      vocabularyId = Number(parts[1]);
+    const meanings = [...row.querySelectorAll('.subsection-meanings .description')]
+      .map(node => (node.innerText || node.textContent || '').replace(/\s+/gu, ' ').trim()).filter(Boolean);
+    if (!forms.length || !partOfSpeech.length || !meanings.length || !detailRoute) {
+      return { error: 'Строка JPDB не содержит подтверждённые формы, часть речи, значения и фактическую ссылку на словарную запись' };
     }
-    const href = Number.isSafeInteger(vocabularyId) && vocabularyId > 0 ? detailHref(row, vocabularyId) : null;
-    if (!forms.length || !partOfSpeech.length || !href) {
-      return { error: 'a recognized JPDB vocabulary result is missing form, part-of-speech, or detail-href evidence' };
-    }
-    candidates.push({
-      detail_url: href,
-      forms,
-      part_of_speech: partOfSpeech,
-    });
+    candidates.push({ detail_url: detailRoute.href, forms, part_of_speech: partOfSpeech, meanings });
   }
   return {
     ready: true,
@@ -1717,17 +2242,28 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
     candidates,
   };
 }"#;
-
 const DETAIL_SNAPSHOT_SCRIPT: &str = r#"() => {
   const lang = document.querySelector('#search-bar-lang');
   const meanings = document.querySelector('.subsection-meanings');
   const primary = document.querySelector('.subsection-headword .primary-spelling');
+  const compact = value => value.replace(/\s+/gu, '');
+  const isKana = value => /^[\u3040-\u309f\u30a0-\u30ffー゙゚]+$/u.test(value);
+  const parseDetailHref = href => {
+    try {
+      const url = new URL(href, location.href);
+      const pieces = url.pathname.split('/').filter(Boolean);
+      if (url.origin !== 'https://jpdb.io' || pieces.length < 3 || pieces.length > 4 || pieces[0] !== 'vocabulary') return null;
+      if (!/^[1-9][0-9]*$/u.test(pieces[1])) return null;
+      const surface = decodeURIComponent(pieces[2]);
+      const reading = pieces.length === 4 ? decodeURIComponent(pieces[3]) : null;
+      if (!surface.trim() || surface.toLowerCase() === 'used-in' || (reading !== null && (!reading.trim() || reading.toLowerCase() === 'used-in'))) return null;
+      return { id: Number(pieces[1]), surface, reading };
+    } catch (_) { return null; }
+  };
   const rubyForm = root => {
     if (!root) return [];
     let surface = '';
     let reading = '';
-    const compact = value => value.replace(/\s+/gu, '');
-    const isKana = value => /^[\u3040-\u309f\u30a0-\u30ffー゙゚]+$/u.test(value);
     const baseText = node => {
       if (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'RT') return '';
       if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
@@ -1742,10 +2278,7 @@ const DETAIL_SNAPSHOT_SCRIPT: &str = r#"() => {
         return;
       }
       if (!(node instanceof Element) || node.matches('.property-text')) return;
-      if (node.tagName === 'RT') {
-        reading += compact(node.textContent || '');
-        return;
-      }
+      if (node.tagName === 'RT') { reading += compact(node.textContent || ''); return; }
       if (node.tagName === 'RUBY') {
         let pendingBase = '';
         for (const child of node.childNodes) {
@@ -1755,9 +2288,7 @@ const DETAIL_SNAPSHOT_SCRIPT: &str = r#"() => {
             surface += base;
             reading += annotation || (isKana(base) ? base : '');
             pendingBase = '';
-          } else {
-            pendingBase += baseText(child);
-          }
+          } else pendingBase += baseText(child);
         }
         const trailingBase = compact(pendingBase);
         surface += trailingBase;
@@ -1767,22 +2298,25 @@ const DETAIL_SNAPSHOT_SCRIPT: &str = r#"() => {
       for (const child of node.childNodes) visit(child);
     };
     for (const child of root.childNodes) visit(child);
-    if (!surface) {
-      const fallback = compact(root.innerText || root.textContent || '');
-      return fallback ? [{ surface: fallback, reading: isKana(fallback) ? fallback : '' }] : [];
-    }
-    return [{ surface, reading }];
+    if (!surface) surface = compact(root.innerText || root.textContent || '');
+    return surface ? [{ surface, reading }] : [];
   };
-  if (!lang || !primary || !meanings) return { error: 'JPDB vocabulary detail contract is not ready' };
-  const primaryForms = rubyForm(primary);
-  const forms = [...primaryForms];
-  for (const alternate of document.querySelectorAll('.subsection-other-spellings .alt-spelling a.plain')) {
-    forms.push(...rubyForm(alternate));
+  const route = parseDetailHref(location.href);
+  if (!lang || !primary || !meanings || !route) return { pending: true, error: 'DOM страницы словарной записи JPDB пока не готов к проверке' };
+  const forms = [];
+  const append = form => {
+    if (!form || !form.surface.trim() || !form.reading.trim()) return;
+    if (!forms.some(item => item.surface === form.surface && item.reading === form.reading)) forms.push(form);
+  };
+  for (const form of rubyForm(primary)) append(form);
+  for (const alternate of document.querySelectorAll('.subsection-other-spellings .alt-spelling a.plain[href]')) {
+    const alternateRoute = parseDetailHref(alternate.href);
+    if (!alternateRoute || alternateRoute.id !== route.id) continue;
+    const parsed = rubyForm(alternate)[0];
+    if (!parsed || parsed.surface !== alternateRoute.surface) continue;
+    if (parsed.reading && (!alternateRoute.reading || parsed.reading === alternateRoute.reading)) append(parsed);
+    else if (alternateRoute.reading) append({ surface: alternateRoute.surface, reading: alternateRoute.reading });
   }
-  const canonicalReading = primaryForms.find(form => form.reading)?.reading
-    || forms.find(form => form.reading)?.reading
-    || '';
-  for (const form of forms) if (!form.reading) form.reading = canonicalReading || form.surface;
   const section = document.querySelector('.subsection-pitch-accent');
   const label = section?.querySelector('.subsection-label')?.innerText?.trim() || null;
   const sectionInventory = [...document.querySelectorAll('h6, .subsection-label')]
@@ -1816,47 +2350,104 @@ const DETAIL_SNAPSHOT_SCRIPT: &str = r#"() => {
     graph_count: graphCount,
   };
 }"#;
-
 const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
   const section = document.querySelector('.subsection-pitch-accent');
   const subsection = section?.querySelector('.subsection');
   const column = subsection?.firstElementChild;
   const lang = document.querySelector('#search-bar-lang');
-  if (!section || !column || !lang || lang.value !== 'english') return { error: 'pitch section, graph column, or English UI is unavailable' };
-  section.scrollIntoView({ block: 'center', inline: 'nearest' });
+  if (!section || !column || !lang || lang.value !== 'english') return { error: 'Секция графиков акцентуации, контейнер или английский интерфейс недоступны' };
+  section.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  const scrollX = window.scrollX;
+  const scrollY = window.scrollY;
   const graphs = [];
   [...column.children].forEach((row, rowIndex) => {
-    [...row.children].forEach(node => {
+    [...row.children].forEach((node, nodeIndex) => {
       if (!(node instanceof HTMLElement) || !node.matches('div[style*="word-break: keep-all"]')) return;
       const pitchPieces = [...node.querySelectorAll(':scope > div')].filter(piece => (piece.getAttribute('style') || '').includes('--pitch-'));
       if (!pitchPieces.length) return;
       const rect = node.getBoundingClientRect();
-      const selector = `.subsection-pitch-accent .subsection > div > div:nth-child(${rowIndex + 1}) > div[style*="word-break: keep-all"]`;
-      graphs.push({ selector, x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+      const selector = `.subsection-pitch-accent .subsection > div > div:nth-child(${rowIndex + 1}) > div:nth-child(${nodeIndex + 1})[style*="word-break: keep-all"]`;
+      graphs.push({
+        selector,
+        viewport_rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+        document_rect: { x: rect.left + scrollX, y: rect.top + scrollY, width: rect.width, height: rect.height },
+      });
     });
   });
-  if (!graphs.length) return { error: 'pitch section exists but no expected graph DOM was recognized' };
-  const left = Math.min(...graphs.map(graph => graph.x));
-  const top = Math.min(...graphs.map(graph => graph.y));
-  const right = Math.max(...graphs.map(graph => graph.x + graph.width));
-  const bottom = Math.max(...graphs.map(graph => graph.y + graph.height));
+  if (!graphs.length) return { error: 'В секции графиков акцентуации не распознаны узлы графиков' };
+  const left = Math.min(...graphs.map(graph => graph.document_rect.x));
+  const top = Math.min(...graphs.map(graph => graph.document_rect.y));
+  const right = Math.max(...graphs.map(graph => graph.document_rect.x + graph.document_rect.width));
+  const bottom = Math.max(...graphs.map(graph => graph.document_rect.y + graph.document_rect.height));
+  const graphUnion = { x: left, y: top, width: right - left, height: bottom - top };
+  const documentWidth = Math.max(document.documentElement.scrollWidth, document.documentElement.clientWidth, document.body?.scrollWidth || 0);
+  const documentHeight = Math.max(document.documentElement.scrollHeight, document.documentElement.clientHeight, document.body?.scrollHeight || 0);
+  const padding = 8;
+  const captureRect = {
+    x: Math.max(0, graphUnion.x - padding),
+    y: Math.max(0, graphUnion.y - padding),
+    width: Math.min(documentWidth, graphUnion.x + graphUnion.width + padding) - Math.max(0, graphUnion.x - padding),
+    height: Math.min(documentHeight, graphUnion.y + graphUnion.height + padding) - Math.max(0, graphUnion.y - padding),
+  };
+  const clipViewport = {
+    left: captureRect.x - scrollX,
+    top: captureRect.y - scrollY,
+    right: captureRect.x + captureRect.width - scrollX,
+    bottom: captureRect.y + captureRect.height - scrollY,
+  };
+  const opaqueRgb = value => {
+    const match = value.match(/^rgba?\(([^)]+)\)$/u);
+    if (!match) return null;
+    const channels = match[1].split(/[\s,\/]+/u).filter(Boolean).map(Number);
+    if ((channels.length !== 3 && channels.length !== 4) || channels.some(channel => !Number.isFinite(channel))) return null;
+    const alpha = channels.length === 4 ? channels[3] : 1;
+    if (alpha < 0.999) return null;
+    const rgb = channels.slice(0, 3).map(channel => Math.max(0, Math.min(255, Math.round(channel))));
+    return rgb.length === 3 ? rgb : null;
+  };
+  const selectorFor = node => {
+    if (node === document.documentElement) return 'html';
+    if (node === document.body) return 'body';
+    if (node.id) return `#${CSS.escape(node.id)}`;
+    const classes = [...node.classList].slice(0, 3).map(name => `.${CSS.escape(name)}`).join('');
+    return `${node.tagName.toLowerCase()}${classes}`;
+  };
+  let background = null;
+  for (let node = section; node instanceof HTMLElement; node = node.parentElement) {
+    const rect = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    const rgb = style.backgroundImage === 'none' ? opaqueRgb(style.backgroundColor) : null;
+    const covers = rect.left <= clipViewport.left + 0.5 && rect.top <= clipViewport.top + 0.5
+      && rect.right >= clipViewport.right - 0.5 && rect.bottom >= clipViewport.bottom - 0.5;
+    if (rgb && covers) {
+      background = { selector: selectorFor(node), rgb };
+      break;
+    }
+  }
+  if (!background) return { error: 'dark-theme: Не найден непрозрачный фон предка, покрывающий всю область снимка' };
   const root = document.documentElement;
-  const style = getComputedStyle(root);
+  const rootStyle = getComputedStyle(root);
   return {
     graphs,
-    rect: { x: left, y: top, width: right - left, height: bottom - top },
+    graph_union_rect: graphUnion,
+    capture_rect: captureRect,
     viewport_width: window.innerWidth,
     viewport_height: window.innerHeight,
+    document_width: documentWidth,
+    document_height: documentHeight,
+    scroll_x: scrollX,
+    scroll_y: scrollY,
     page_scale_factor: window.visualViewport?.scale ?? NaN,
     device_pixel_ratio: window.devicePixelRatio,
     dark_theme: {
       document_element_classes: [...root.classList],
       prefers_color_scheme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
-      computed_color_scheme: style.colorScheme,
+      computed_color_scheme: rootStyle.colorScheme,
+      background_selector: background.selector,
+      background_rgb: background.rgb,
     },
   };
 }"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1868,9 +2459,90 @@ mod tests {
         }
     }
 
+    fn raw_candidate(
+        detail_url: &str,
+        forms: Vec<JpdbVocabularyForm>,
+        part_of_speech: &[&str],
+        meanings: &[&str],
+    ) -> RawVocabularyCandidate {
+        RawVocabularyCandidate {
+            detail_url: Some(detail_url.into()),
+            forms,
+            part_of_speech: part_of_speech.iter().map(|value| (*value).into()).collect(),
+            meanings: meanings.iter().map(|value| (*value).into()).collect(),
+        }
+    }
+
+    fn capture_snapshot_for_test() -> CaptureSnapshot {
+        let graphs = vec![
+            CaptureGraph {
+                selector: ".graph-a".into(),
+                viewport_rect: PitchAccentCaptureRect {
+                    x: 100.0,
+                    y: 350.0,
+                    width: 80.0,
+                    height: 40.0,
+                },
+                document_rect: PitchAccentCaptureRect {
+                    x: 100.0,
+                    y: 1450.0,
+                    width: 80.0,
+                    height: 40.0,
+                },
+            },
+            CaptureGraph {
+                selector: ".graph-b".into(),
+                viewport_rect: PitchAccentCaptureRect {
+                    x: 200.0,
+                    y: 500.0,
+                    width: 80.0,
+                    height: 40.0,
+                },
+                document_rect: PitchAccentCaptureRect {
+                    x: 200.0,
+                    y: 1600.0,
+                    width: 80.0,
+                    height: 40.0,
+                },
+            },
+        ];
+        let graph_union_rect = PitchAccentCaptureRect {
+            x: 100.0,
+            y: 1450.0,
+            width: 180.0,
+            height: 190.0,
+        };
+        let capture_rect = padded_capture_rect(
+            graph_union_rect,
+            PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+            1280.0,
+            2400.0,
+        );
+        CaptureSnapshot {
+            graphs,
+            graph_union_rect,
+            capture_rect,
+            viewport_width: 1280,
+            viewport_height: 1200,
+            document_width: 1280,
+            document_height: 2400,
+            scroll_x: 0.0,
+            scroll_y: 1100.0,
+            page_scale_factor: 1.0,
+            device_pixel_ratio: 3.0,
+            dark_theme: PitchAccentDarkThemeProof {
+                document_element_classes: vec!["dark-mode".into()],
+                prefers_color_scheme: "dark".into(),
+                computed_color_scheme: "normal".into(),
+                background_selector: ".subsection-pitch-accent".into(),
+                background_rgb: [24, 36, 48],
+            },
+        }
+    }
+
     #[test]
-    fn search_url_uses_url_api_and_percent_encodes_surface() {
-        let url = Url::parse(&build_search_url("元気 & 元気?").unwrap()).unwrap();
+    fn search_url_trims_only_edges_and_percent_encodes_the_search_text() {
+        let url = Url::parse(&build_search_url("  元気 & 元気?  ").unwrap()).unwrap();
         assert_eq!(url.origin().ascii_serialization(), JPDB_ORIGIN);
         assert_eq!(url.path(), "/search");
         assert_eq!(
@@ -1882,68 +2554,79 @@ mod tests {
     }
 
     #[test]
-    fn detail_route_requires_jpdb_vocabulary_path_and_positive_id() {
-        assert_eq!(
-            parse_detail_route("https://jpdb.io/vocabulary/1540590/幽霊/ゆうれい#a"),
-            Some(DetailRoute {
-                vocabulary_id: 1_540_590
-            })
+    fn jpdb_route_parser_matches_the_validator_route_contract() {
+        for value in [
+            "https://jpdb.io/vocabulary/1540590/%E5%B9%BD%E9%9C%8A/%E3%82%86%E3%81%86%E3%82%8C%E3%81%84#a",
+            "https://jpdb.io/vocabulary/1540590/幽霊",
+            "https://jpdb.io/vocabulary/0/test",
+            "https://jpdb.io/vocabulary/1540590/幽霊/used-in",
+            "http://jpdb.io/vocabulary/1540590/test",
+            "https://example.com/vocabulary/1540590/test",
+            "https://jpdb.io/vocabulary/01540590/幽霊/ゆうれい",
+        ] {
+            assert_eq!(
+                parse_detail_route(value),
+                parse_jpdb_vocabulary_route(value).ok(),
+                "разбор маршрута provider-ом и validator-ом разошёлся для {value}"
+            );
+        }
+        let route = parse_detail_route(
+            "https://jpdb.io/vocabulary/1540590/%E5%B9幽%E9%9C%8A/%E3%82%86%E3%81%86%E3%82%8C%E3%81%84",
         );
-        assert_eq!(
-            parse_detail_route("https://jpdb.io/vocabulary/0/test"),
-            None
-        );
-        assert_eq!(
-            parse_detail_route("https://jpdb.io/vocabulary/1540590/used-in"),
-            None
-        );
-        assert_eq!(
-            parse_detail_route("https://jpdb.io/vocabulary/1540590/幽霊/used-in"),
-            None
-        );
-        assert_eq!(
-            parse_detail_route("http://jpdb.io/vocabulary/1540590/test"),
-            None
-        );
-        assert_eq!(
-            parse_detail_route("https://example.com/vocabulary/1540590/test"),
-            None
-        );
+        assert!(route.is_none());
+        let route = parse_detail_route("https://jpdb.io/vocabulary/1540590/%E5%B9%BD%E9%9C%8A/%E3%82%86%E3%81%86%E3%82%8C%E3%81%84").unwrap();
+        assert_eq!(route.vocabulary_id, 1_540_590);
+        assert_eq!(route.surface, "幽霊");
+        assert_eq!(route.reading.as_deref(), Some("ゆうれい"));
     }
 
     #[test]
-    fn only_exact_surface_and_optional_exact_reading_match_candidates() {
+    fn candidates_match_an_exact_surface_reading_pair_and_keep_their_evidence() {
         let rows = vec![
-            RawVocabularyCandidate {
-                detail_url: Some("https://jpdb.io/vocabulary/10/元気/げんき".into()),
-                forms: vec![form("元気", "げんき"), form("ゲンキ", "げんき")],
-                part_of_speech: vec!["Adjective (な)".into()],
-            },
-            RawVocabularyCandidate {
-                detail_url: Some("https://jpdb.io/vocabulary/11/元気/げんき".into()),
-                forms: vec![form("元気", "げんき")],
-                part_of_speech: vec!["Name".into()],
-            },
-            RawVocabularyCandidate {
-                detail_url: Some("https://jpdb.io/vocabulary/12/元気/もとき".into()),
-                forms: vec![form("元気", "もとき")],
-                part_of_speech: vec!["Noun".into()],
-            },
-            RawVocabularyCandidate {
-                detail_url: Some("https://jpdb.io/vocabulary/13/元気/げんき".into()),
-                forms: vec![form("元気屋", "げんきや")],
-                part_of_speech: vec!["Noun".into()],
-            },
-            RawVocabularyCandidate {
-                detail_url: Some("https://jpdb.io/vocabulary/14/猫/ねこ".into()),
-                forms: vec![form("猫", "ねこ"), form("ネコ", "ねこ")],
-                part_of_speech: vec!["Noun".into()],
-            },
+            raw_candidate(
+                "https://jpdb.io/vocabulary/10/元気/げんき",
+                vec![form("元気", "げんき"), form("ゲンキ", "げんき")],
+                &["Adjective (な)"],
+                &["healthy", "energetic"],
+            ),
+            raw_candidate(
+                "https://jpdb.io/vocabulary/11/元気/げんき",
+                vec![form("元気", "げんき")],
+                &["Name"],
+                &["given name"],
+            ),
+            raw_candidate(
+                "https://jpdb.io/vocabulary/12/元気/もとき",
+                vec![form("元気", "もとき")],
+                &["Noun"],
+                &["origin"],
+            ),
+            raw_candidate(
+                "https://jpdb.io/vocabulary/13/元気屋/げんきや",
+                vec![form("元気屋", "げんきや")],
+                &["Noun"],
+                &["shop"],
+            ),
+            raw_candidate(
+                "https://jpdb.io/vocabulary/14/猫/ねこ",
+                vec![form("猫", "ねこ"), form("ネコ", "ねこ")],
+                &["Noun"],
+                &["cat"],
+            ),
         ];
         let matched =
-            select_candidates(&rows, &JpdbPitchQuery::new("元気", Some("げんき".into()))).unwrap();
+            select_candidates(&rows, &JpdbPitchQuery::new(" 元気 ", Some("げんき".into())))
+                .unwrap();
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].vocabulary_id, 10);
+        assert_eq!(matched[0].resolved_forms.len(), 2);
+        assert_eq!(matched[0].part_of_speech, ["Adjective (な)"]);
+        assert_eq!(matched[0].meanings, ["energetic", "healthy"]);
+        assert_eq!(
+            matched[0].detail_url,
+            "https://jpdb.io/vocabulary/10/元気/げんき"
+        );
+
         let ambiguous = select_candidates(&rows, &JpdbPitchQuery::new("元気", None)).unwrap();
         assert_eq!(ambiguous.len(), 2);
         assert_eq!(ambiguous[0].vocabulary_id, 10);
@@ -1953,19 +2636,136 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let kana_alt =
-            select_candidates(&rows, &JpdbPitchQuery::new("ネコ", Some("ねこ".into()))).unwrap();
-        assert_eq!(kana_alt.len(), 1);
-        assert_eq!(kana_alt[0].vocabulary_id, 14);
+        assert_eq!(
+            select_candidates(&rows, &JpdbPitchQuery::new("ネコ", Some("ねこ".into()))).unwrap()[0]
+                .vocabulary_id,
+            14
+        );
     }
 
     #[test]
-    fn candidate_rows_require_a_real_matching_detail_href() {
-        let rows = vec![RawVocabularyCandidate {
-            detail_url: Some("https://jpdb.io/vocabulary/12/元気/used-in".into()),
-            forms: vec![form("元気", "げんき")],
-            part_of_speech: vec!["Noun".into()],
-        }];
+    fn concrete_detail_href_supports_only_its_own_surface_reading_pair() {
+        let rows = [raw_candidate(
+            "https://jpdb.io/vocabulary/14/猫/ねこ",
+            vec![form("猫", "ねこ")],
+            &["Noun"],
+            &["cat"],
+        )];
+        let route_pair =
+            select_candidates(&rows, &JpdbPitchQuery::new("猫", Some("ねこ".into()))).unwrap();
+        assert_eq!(route_pair.len(), 1);
+        assert!(
+            route_pair[0]
+                .resolved_forms
+                .contains(&PitchAccentResolvedForm {
+                    surface: "猫".into(),
+                    reading: "ねこ".into(),
+                })
+        );
+
+        let unrelated_pair =
+            select_candidates(&rows, &JpdbPitchQuery::new("ネコ", Some("ねこ".into()))).unwrap();
+        assert!(unrelated_pair.is_empty());
+    }
+
+    #[test]
+    fn candidate_order_does_not_change_inventory_or_resolution() {
+        let rows = vec![
+            raw_candidate(
+                "https://jpdb.io/vocabulary/14/猫/ねこ",
+                vec![form("猫", "ねこ"), form("ネコ", "ねこ")],
+                &["Noun"],
+                &["cat", "feline"],
+            ),
+            raw_candidate(
+                "https://jpdb.io/vocabulary/12/元気/もとき",
+                vec![form("元気", "もとき")],
+                &["Noun"],
+                &["vigor"],
+            ),
+            raw_candidate(
+                "https://jpdb.io/vocabulary/10/元気/げんき",
+                vec![form("元気", "げんき")],
+                &["Adjective (な)"],
+                &["healthy"],
+            ),
+        ];
+        let query = JpdbPitchQuery::new("元気", None);
+        let forward = select_candidates(&rows, &query).unwrap();
+        let reverse =
+            select_candidates(&rows.iter().cloned().rev().collect::<Vec<_>>(), &query).unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward
+                .iter()
+                .map(|item| item.vocabulary_id)
+                .collect::<Vec<_>>(),
+            [10, 12]
+        );
+    }
+
+    #[test]
+    fn explicit_selection_requires_candidate_id_and_full_detail_route_match() {
+        let query = JpdbPitchQuery::new("元気", None);
+        let candidates = select_candidates(
+            &[
+                raw_candidate(
+                    "https://jpdb.io/vocabulary/12/元気/もとき",
+                    vec![form("元気", "もとき")],
+                    &["Noun"],
+                    &["origin"],
+                ),
+                raw_candidate(
+                    "https://jpdb.io/vocabulary/10/元気/げんき",
+                    vec![form("元気", "げんき")],
+                    &["Noun"],
+                    &["health"],
+                ),
+            ],
+            &query,
+        )
+        .unwrap();
+        let selection = JpdbPitchSelection::new(
+            12,
+            "https://jpdb.io/vocabulary/12/元気/もとき?from=search#entry",
+        )
+        .unwrap();
+        let route = selection.validate().unwrap();
+        assert_eq!(
+            select_explicit_candidate(&candidates, &selection, &route)
+                .unwrap()
+                .vocabulary_id,
+            12
+        );
+
+        let wrong_route =
+            JpdbPitchSelection::new(12, "https://jpdb.io/vocabulary/12/元気/げんき").unwrap();
+        let wrong_route_parsed = wrong_route.validate().unwrap();
+        assert!(matches!(
+            select_explicit_candidate(&candidates, &wrong_route, &wrong_route_parsed),
+            Err(JpdbPitchFailure::ExplicitSelectionMismatch { .. })
+        ));
+        assert!(
+            JpdbPitchSelection::new(10, "https://example.com/vocabulary/10/元気/げんき",).is_err()
+        );
+        assert!(
+            JpdbPitchSelection {
+                vocabulary_id: 99,
+                detail_url: "https://jpdb.io/vocabulary/12/元気/もとき".into(),
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_rows_require_a_real_detail_href() {
+        let rows = vec![raw_candidate(
+            "https://jpdb.io/vocabulary/12/元気/used-in",
+            vec![form("元気", "げんき")],
+            &["Noun"],
+            &["health"],
+        )];
         assert!(matches!(
             select_candidates(&rows, &JpdbPitchQuery::new("元気", None)),
             Err(JpdbPitchFailure::PageContract { .. })
@@ -1973,7 +2773,55 @@ mod tests {
     }
 
     #[test]
-    fn not_found_requires_explicit_empty_search_evidence() {
+    fn reading_must_belong_to_the_same_surface_form_pair() {
+        let forms = vec![
+            form("ネコ", "ネコ"),
+            form("猫", "ねこ"),
+            form("ねこ", "ねこ"),
+        ];
+        assert!(forms_match_query(
+            &forms,
+            &JpdbPitchQuery::new("ネコ", Some("ねこ".into()))
+        ));
+        assert!(!forms_match_query(
+            &forms,
+            &JpdbPitchQuery::new("ネコ", Some("しょうじょ".into()))
+        ));
+        assert!(forms_match_query(
+            &forms,
+            &JpdbPitchQuery::new(" ネコ ", Some(" ネコ ".into()))
+        ));
+        assert_eq!(
+            resolve_query_reading(&forms, &JpdbPitchQuery::new("ネコ", Some("ねこ".into())))
+                .as_deref(),
+            Some("ネコ"),
+            "сохраняется фактическая запись чтения из связанной формы JPDB"
+        );
+        assert_eq!(
+            resolve_query_reading(&forms, &JpdbPitchQuery::new("ネコ", None)).as_deref(),
+            Some("ネコ")
+        );
+
+        let otome_forms = vec![form("乙女", "おとめ"), form("少女", "しょうじょ")];
+        assert!(forms_match_query(
+            &otome_forms,
+            &JpdbPitchQuery::new("乙女", Some("おとめ".into()))
+        ));
+        assert!(!forms_match_query(
+            &otome_forms,
+            &JpdbPitchQuery::new("乙女", Some("しょうじょ".into()))
+        ));
+        let multiple = vec![form("生", "せい"), form("生", "なま")];
+        assert!(resolve_query_reading(&multiple, &JpdbPitchQuery::new("生", None)).is_none());
+        assert_eq!(
+            resolve_query_reading(&multiple, &JpdbPitchQuery::new("生", Some("なま".into())))
+                .as_deref(),
+            Some("なま")
+        );
+    }
+
+    #[test]
+    fn not_found_requires_a_valid_ready_empty_search_inventory() {
         let explicit_empty = RawSearchSnapshot {
             ready: true,
             no_results_found: true,
@@ -2007,23 +2855,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_and_reading_can_be_confirmed_by_distinct_forms_of_one_entry() {
-        let forms = vec![
-            form("ネコ", "ネコ"),
-            form("猫", "ねこ"),
-            form("ねこ", "ねこ"),
-        ];
-        let query = JpdbPitchQuery::new("ネコ", Some("ねこ".into()));
-
-        assert!(forms_match_query(&forms, &query));
-        assert_eq!(
-            resolve_query_reading(&forms, &query).as_deref(),
-            Some("ねこ")
-        );
-    }
-
-    #[test]
-    fn pitch_absence_requires_a_verified_detail_and_missing_section() {
+    fn no_pitch_requires_a_verified_detail_and_missing_section() {
         let detail = DetailSnapshot {
             url: "https://jpdb.io/vocabulary/1540590/幽霊/ゆうれい".into(),
             vocabulary_id: 1_540_590,
@@ -2040,7 +2872,14 @@ mod tests {
             &detail,
             &JpdbPitchQuery::new("幽霊", None)
         ));
-        assert!(classify_pitch_state(&detail).is_ok_and(|state| state == PitchDomState::Absent));
+        assert_eq!(classify_pitch_state(&detail), Ok(PitchDomState::Absent));
+
+        let mut route_slug_not_in_forms = detail.clone();
+        route_slug_not_in_forms.url = "https://jpdb.io/vocabulary/1540590/幽霊/レイ".into();
+        assert!(!detail_matches_query(
+            &route_slug_not_in_forms,
+            &JpdbPitchQuery::new("幽霊", None)
+        ));
 
         let mut unexpected_empty_section = detail.clone();
         unexpected_empty_section.pitch_section_present = true;
@@ -2075,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn current_page_recognizes_search_and_detail_only_on_jpdb() {
+    fn search_and_detail_routes_are_recognized_only_on_jpdb() {
         assert!(is_search_url("https://jpdb.io/search?q=%E5%B9%BD%E9%9C%8A"));
         assert!(!is_search_url(
             "https://jpdb.io/vocabulary/1540590/幽霊/ゆうれい"
@@ -2085,86 +2924,184 @@ mod tests {
         assert!(
             parse_detail_route("https://jpdb.io/vocabulary/1540590/幽霊/ゆうれい?x=1#a").is_some()
         );
+        assert!(!is_search_url("https://example.com/search?q=幽霊"));
     }
 
     #[test]
-    fn readiness_ignores_unrelated_subdocuments_but_tracks_main_navigation() {
+    fn readiness_tracks_main_navigation_and_relevant_jpdb_resources() {
         use chromiumoxide::cdp::browser_protocol::network::ResourceType;
-
         assert!(is_critical_resource(
             &ResourceType::Document,
             Some("https://analytics.example/frame"),
-            true,
+            true
         ));
         assert!(!is_critical_resource(
             &ResourceType::Document,
             Some("https://analytics.example/frame"),
-            false,
+            false
         ));
         assert!(!is_critical_resource(
             &ResourceType::Script,
             Some("https://analytics.example/widget.js"),
-            false,
+            false
         ));
         assert!(is_critical_resource(
             &ResourceType::Script,
             Some("https://jpdb.io/assets/application.js"),
-            false,
+            false
         ));
         assert!(!is_critical_resource(
             &ResourceType::Image,
             Some("https://jpdb.io/images/background.png"),
-            false,
+            false
         ));
     }
 
     #[test]
-    fn graph_union_must_be_in_viewport_at_one_to_one_page_scale_and_three_x() {
-        assert!(
-            validate_capture_geometry(
-                PitchAccentCaptureRect {
-                    x: 10.0,
-                    y: 20.0,
-                    width: 100.0,
-                    height: 30.0
-                },
-                1280,
-                1200,
-                1.0,
-                3.0,
-            )
-            .is_ok()
+    fn capture_geometry_uses_document_coordinates_padding_and_page_bounds() {
+        let snapshot = capture_snapshot_for_test();
+        assert!(snapshot.scroll_y > 0.0);
+        assert!(validate_capture_geometry(&snapshot, JpdbPitchStage::Capture).is_ok());
+        assert_eq!(
+            snapshot.capture_rect,
+            PitchAccentCaptureRect {
+                x: 92.0,
+                y: 1442.0,
+                width: 196.0,
+                height: 206.0,
+            }
         );
-        assert!(
-            validate_capture_geometry(
-                PitchAccentCaptureRect {
-                    x: 10.0,
-                    y: 20.0,
-                    width: 100.0,
-                    height: 30.0
-                },
-                1280,
-                1200,
-                1.1,
-                3.0,
-            )
-            .is_err()
+
+        let mut wrong_offset = snapshot.clone();
+        wrong_offset.graphs[1].document_rect.y += 5.0;
+        assert!(validate_capture_geometry(&wrong_offset, JpdbPitchStage::Capture).is_err());
+        let mut missing_padding = snapshot.clone();
+        missing_padding.capture_rect.y += 1.0;
+        assert!(validate_capture_geometry(&missing_padding, JpdbPitchStage::Capture).is_err());
+        let mut viewport_mismatch = snapshot;
+        viewport_mismatch.graphs[0].viewport_rect.y += 1.0;
+        assert!(validate_capture_geometry(&viewport_mismatch, JpdbPitchStage::Capture).is_err());
+    }
+
+    #[test]
+    fn graph_selector_indexes_the_node_within_its_row() {
+        assert!(CAPTURE_SNAPSHOT_SCRIPT.contains("nodeIndex + 1"));
+        assert!(CAPTURE_SNAPSHOT_SCRIPT.contains("rowIndex + 1"));
+    }
+
+    #[test]
+    fn capture_padding_clamps_to_document_edges() {
+        let union = PitchAccentCaptureRect {
+            x: 4.0,
+            y: 3.0,
+            width: 20.0,
+            height: 10.0,
+        };
+        let capture = padded_capture_rect(union, 8.0, 1280.0, 1200.0);
+        assert_eq!(
+            capture,
+            PitchAccentCaptureRect {
+                x: 0.0,
+                y: 0.0,
+                width: 32.0,
+                height: 21.0
+            }
         );
-        assert!(
-            validate_capture_geometry(
-                PitchAccentCaptureRect {
-                    x: 10.0,
-                    y: 20.0,
-                    width: 100.0,
-                    height: 30.0
-                },
-                1280,
-                1200,
-                1.0,
-                2.0,
-            )
-            .is_err()
+        assert_eq!(
+            capture_padding(union, capture),
+            PitchAccentCapturePadding {
+                top: 3.0,
+                right: 8.0,
+                bottom: 8.0,
+                left: 4.0
+            }
         );
+    }
+
+    #[test]
+    fn item_timeout_keeps_the_stage_that_was_running() {
+        let outcome = item_timeout(JpdbPitchStage::PostCaptureVerification);
+        assert!(matches!(
+            outcome,
+            JpdbPitchOutcome::Failed {
+                error: JpdbPitchFailure::Timeout {
+                    stage: JpdbPitchStage::PostCaptureVerification,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn browser_evaluation_failures_keep_the_stage_and_use_a_technical_outcome() {
+        let failure = browser_evaluation_failure(
+            JpdbPitchStage::SearchResolution,
+            "чтении результатов поиска",
+            "target closed",
+        );
+        let value = serde_json::to_value(failure).unwrap();
+        assert_eq!(value["code"], "browser_evaluation");
+        assert_eq!(value["stage"], "search_resolution");
+        assert!(value["message"].as_str().unwrap().contains("target closed"));
+        assert_ne!(value["code"], "page_contract");
+    }
+
+    #[tokio::test]
+    #[ignore = "требует установленного Chromium; запустить: cargo test -p asset-store jpdb::tests::browser_capture_preserves_scrolled_two_graph_region -- --ignored"]
+    async fn browser_capture_preserves_scrolled_two_graph_region() {
+        let runtime = BrowserRuntimeConfig {
+            device_metrics: Some(DeviceMetrics::new(1280, 1200, 3.0).unwrap()),
+            prefers_color_scheme: Some("dark".into()),
+            ..BrowserRuntimeConfig::default()
+        };
+        let session = BrowserSession::launch(runtime).await.unwrap();
+        configure_page(session.page()).await.unwrap();
+        session.page().set_content(r#"<!doctype html><html class="dark-mode"><body style="margin:0;background:#182430;color:white"><select id="search-bar-lang"><option value="english" selected>English</option></select><div style="height:1800px"></div><section class="subsection-pitch-accent" style="background:#182430;padding:20px;width:280px"><div class="subsection"><div><div class="graph-row"><div class="graph-a" style="word-break: keep-all;width:100px;height:44px;background:#d02020"><div style="--pitch-test:1"></div></div><div class="graph-b" style="word-break: keep-all;width:100px;height:44px;background:#20b050"><div style="--pitch-test:1"></div></div></div></div></div></section></body></html>"#).await.unwrap();
+
+        let snapshot = capture_snapshot(session.page(), JpdbPitchStage::Capture)
+            .await
+            .unwrap();
+        assert!(snapshot.scroll_y > 0.0);
+        assert_eq!(snapshot.graphs.len(), 2);
+        assert_ne!(snapshot.graphs[0].selector, snapshot.graphs[1].selector);
+        let clip = Viewport::builder()
+            .x(snapshot.capture_rect.x)
+            .y(snapshot.capture_rect.y)
+            .width(snapshot.capture_rect.width)
+            .height(snapshot.capture_rect.height)
+            .scale(1.0)
+            .build()
+            .unwrap();
+        let bytes = session
+            .page()
+            .screenshot(
+                CaptureScreenshotParams::builder()
+                    .format(CaptureScreenshotFormat::Png)
+                    .clip(clip)
+                    .capture_beyond_viewport(true)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
+        let centers = snapshot
+            .graphs
+            .iter()
+            .map(|graph| {
+                let x = ((graph.document_rect.x + graph.document_rect.width / 2.0
+                    - snapshot.capture_rect.x)
+                    * 3.0)
+                    .round() as u32;
+                let y = ((graph.document_rect.y + graph.document_rect.height / 2.0
+                    - snapshot.capture_rect.y)
+                    * 3.0)
+                    .round() as u32;
+                image.get_pixel(x, y).0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(&centers[0][..3], &[208, 32, 32]);
+        assert_eq!(&centers[1][..3], &[32, 176, 80]);
+        session.close().await;
     }
 }
 
@@ -2192,14 +3129,15 @@ fn classify_pitch_state(detail: &DetailSnapshot) -> Result<PitchDomState, JpdbPi
     {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::DetailVerification,
-            message: "detail identity and base vocabulary page contract are not proven".into(),
+            message: "идентичность записи и базовый контракт словарной страницы не подтверждены"
+                .into(),
         });
     }
     if !detail.pitch_section_present {
         if detail.pitch_marker_count != 0 {
             return Err(JpdbPitchFailure::PageContract {
                 stage: JpdbPitchStage::PitchInspection,
-                message: "pitch-related section text exists outside the recognized pitch container"
+                message: "текст о графике акцентуации есть вне распознанного контейнера графиков"
                     .into(),
             });
         }
@@ -2211,7 +3149,8 @@ fn classify_pitch_state(detail: &DetailSnapshot) -> Result<PitchDomState, JpdbPi
     {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::PitchInspection,
-            message: "pitch section exists but its label or graph DOM is missing".into(),
+            message: "секция акцентуации найдена, но её точная метка или DOM графиков отсутствует"
+                .into(),
         });
     }
     Ok(PitchDomState::Present {
