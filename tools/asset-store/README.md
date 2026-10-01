@@ -98,10 +98,19 @@ image/kanji semantics.
 геометрию capture. Общий runtime позволяет задавать отдельный scale factor `3.0`,
 но JPDB acquisition в этот этап не входит.
 
-`.gitignore` разрешает tracked metadata и только `assets/gif/*.gif` и
-`assets/png/*.png` внутри kanji root, а также `assets/png/*.png` внутри
-pitch-accent root. `.runtime/`, `.tmp/`, locks и неизвестные каталоги остаются
-ignored. `kanji-corpus-gate` принимает новый nested layout и отклоняет flat,
+Whitelist для хранения в Git включает `.owner.json` и `manifest.json` каждого
+домена, а также непосредственные пути `assets/gif/*.gif` и `assets/png/*.png`
+внутри kanji root и `assets/png/*.png` внутри pitch-accent root. Каталоги с
+разрешённым расширением и их содержимое исключены из Git; вложенные каталоги,
+другие расширения, `.runtime/`, `.tmp/` и `.lock` тоже исключены. Проверить
+правила можно настоящим `git check-ignore` с помощью отдельного регрессионного
+скрипта:
+
+```bash
+bash tools/asset-store/tests/gitignore_regression.sh
+```
+
+`kanji-corpus-gate` принимает новый nested layout и отклоняет flat,
 hash-suffixed, orphan и незарегистрированные canonical paths. Для других
 publishable domains используется `verify_publishable_corpus_with_policy`; отдельный
 пустой pitch CLI gate не нужен.

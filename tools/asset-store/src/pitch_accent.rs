@@ -2,6 +2,7 @@
 
 use std::io::{Cursor, Read};
 
+use image::ImageDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
@@ -19,6 +20,17 @@ use crate::model::{
 };
 use crate::validation::{SemanticValidator, ValidatorFailure};
 
+/// Максимальный размер сжатого PNG одного браузерного снимка графика акцента.
+/// Лимит оставляет запас для PNG-снимка элемента при масштабе 3×, сохраняя
+/// конечную границу для недоверенного входного потока.
+pub(crate) const PITCH_ACCENT_MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Верхняя граница размеров PNG с запасом для снимка элемента при масштабе 3×.
+const PITCH_ACCENT_MAX_IMAGE_DIMENSION: u32 = 4096;
+
+/// Ограничивает память, нужную для декодирования распакованных пикселей и кадров.
+const PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES: u64 = 48 * 1024 * 1024;
+
 /// Независимая publishable policy для canonical pitch-accent PNG.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PitchAccentDomainPolicy;
@@ -35,7 +47,7 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
         if identity.namespace != "pitch_accent" {
             return Err(AssetError::new(
                 ErrorCode::InvalidIdentity,
-                "pitch-accent domain принимает только namespace `pitch_accent`",
+                "домен pitch-accent принимает только пространство имён `pitch_accent`",
             ));
         }
         let filename = format!("{}.png", identity.key);
@@ -88,7 +100,7 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
     }
 
     fn max_asset_bytes(&self) -> Option<u64> {
-        None
+        Some(PITCH_ACCENT_MAX_ASSET_BYTES)
     }
 
     fn content_addressed_storage(&self) -> bool {
@@ -161,7 +173,7 @@ pub struct PitchAccentImageValidator;
 
 impl PitchAccentImageValidator {
     pub const VALIDATOR_ID: &'static str = "jpdb-pitch-accent-render";
-    pub const VALIDATOR_VERSION: &'static str = "1";
+    pub const VALIDATOR_VERSION: &'static str = "2";
     pub const REQUIRED_DEVICE_SCALE_FACTOR: f64 = 3.0;
 
     /// Устойчивая identity validator для manifest и consumer checks.
@@ -173,7 +185,7 @@ impl PitchAccentImageValidator {
 impl SemanticValidator for PitchAccentImageValidator {
     fn identity(&self) -> ValidatorIdentity {
         ValidatorIdentity::new(Self::VALIDATOR_ID, Self::VALIDATOR_VERSION)
-            .expect("static pitch-accent validator identity is valid")
+            .expect("статический идентификатор валидатора pitch-accent корректен")
     }
 
     fn validate(
@@ -183,8 +195,22 @@ impl SemanticValidator for PitchAccentImageValidator {
     ) -> Result<SemanticDecision, ValidatorFailure> {
         let mut contents = Vec::new();
         bytes
+            .take(PITCH_ACCENT_MAX_ASSET_BYTES + 1)
             .read_to_end(&mut contents)
-            .map_err(|error| ValidatorFailure::new("read_failed", error.to_string()))?;
+            .map_err(|error| {
+                ValidatorFailure::new(
+                    "read_failed",
+                    format!("ошибка чтения входных данных: {error}"),
+                )
+            })?;
+        if contents.len() as u64 > PITCH_ACCENT_MAX_ASSET_BYTES {
+            return Ok(decision(
+                SemanticStatus::Corrupt,
+                "pitch_accent_png_too_large",
+                "размер PNG превышает установленный предел",
+                json!({"max_bytes": PITCH_ACCENT_MAX_ASSET_BYTES}),
+            ));
+        }
 
         if asset.format != DetectedFormat::Png
             || DetectedFormat::from_signature(&contents) != DetectedFormat::Png
@@ -192,7 +218,7 @@ impl SemanticValidator for PitchAccentImageValidator {
             return Ok(decision(
                 SemanticStatus::Corrupt,
                 "pitch_accent_png_required",
-                "pitch-accent canonical asset должен быть PNG",
+                "канонический файл домена pitch-accent должен быть PNG",
                 json!({"format": format!("{:?}", asset.format)}),
             ));
         }
@@ -213,13 +239,13 @@ impl SemanticValidator for PitchAccentImageValidator {
             return Ok(decision(
                 SemanticStatus::Rejected,
                 "pitch_accent_identity_mismatch",
-                "identity не принадлежит pitch-accent domain",
+                "идентификатор не принадлежит домену pitch-accent",
                 json!({"message": error.message}),
             ));
         }
 
         let Some(value) = asset.domain_metadata.clone() else {
-            return Ok(incomplete_evidence("domain_metadata отсутствует"));
+            return Ok(incomplete_evidence("поле domain_metadata отсутствует"));
         };
         let metadata: PitchAccentDomainMetadata = match serde_json::from_value(value) {
             Ok(metadata) => metadata,
@@ -229,13 +255,13 @@ impl SemanticValidator for PitchAccentImageValidator {
             Ok(()) => Ok(decision(
                 SemanticStatus::Verified,
                 "pitch_accent_source_render_verified",
-                "PNG полностью декодирован и согласован со структурным JPDB render evidence",
+                "PNG полностью декодирован, структурные данные рендеринга JPDB согласованы",
                 serde_json::to_value(metadata).unwrap_or_else(|_| json!({})),
             )),
             Err(EvidenceFailure::Contradiction(message)) => Ok(decision(
                 SemanticStatus::Rejected,
                 "pitch_accent_evidence_mismatch",
-                "source/render evidence противоречит identity или JPDB source",
+                "данные источника и рендеринга противоречат идентификатору или источнику JPDB",
                 json!({"message": message}),
             )),
             Err(EvidenceFailure::Incomplete(message)) => Ok(incomplete_evidence(message)),
@@ -256,39 +282,41 @@ fn validate_evidence(
 ) -> Result<(), EvidenceFailure> {
     if metadata.surface != surface {
         return Err(EvidenceFailure::Contradiction(
-            "metadata surface не совпадает с identity key".into(),
+            "surface в метаданных не совпадает с ключом идентификатора".into(),
         ));
     }
     if metadata.jpdb_vocabulary_id == 0 {
         return Err(EvidenceFailure::Incomplete(
-            "JPDB vocabulary ID должен быть положительным".into(),
+            "идентификатор словаря JPDB должен быть положительным".into(),
         ));
     }
     if metadata.reading.trim().is_empty() {
-        return Err(EvidenceFailure::Incomplete("reading отсутствует".into()));
+        return Err(EvidenceFailure::Incomplete(
+            "поле reading не заполнено".into(),
+        ));
     }
 
     let evidence = &metadata.evidence;
     if evidence.provider != PitchAccentProvider::Jpdb {
         return Err(EvidenceFailure::Contradiction(
-            "provider evidence не равен JPDB".into(),
+            "поставщик в подтверждении не соответствует JPDB".into(),
         ));
     }
     if !is_jpdb_source_url(&evidence.source_url, metadata.jpdb_vocabulary_id) {
         return Err(EvidenceFailure::Contradiction(
-            "source URL должен быть абсолютным HTTPS URL домена jpdb.io".into(),
+            "URL источника должен быть абсолютным HTTPS-адресом домена jpdb.io".into(),
         ));
     }
     if evidence.graph_count == 0 {
         return Err(EvidenceFailure::Incomplete(
-            "source evidence не содержит pitch graphs".into(),
+            "подтверждение источника не содержит графиков акцента".into(),
         ));
     }
 
     let render = &evidence.render;
     if render.selector.trim().is_empty() || render.selector.chars().any(char::is_control) {
         return Err(EvidenceFailure::Incomplete(
-            "render selector отсутствует или содержит управляющие символы".into(),
+            "селектор render отсутствует или содержит управляющие символы".into(),
         ));
     }
     if render.viewport_width == 0
@@ -297,17 +325,17 @@ fn validate_evidence(
         || render.pixel_height == 0
     {
         return Err(EvidenceFailure::Incomplete(
-            "viewport и pixel dimensions должны быть положительными".into(),
+            "размеры области просмотра и изображения должны быть положительными".into(),
         ));
     }
     if render.pixel_width != actual_pixel_width || render.pixel_height != actual_pixel_height {
         return Err(EvidenceFailure::Contradiction(
-            "render pixel dimensions не совпадают с декодированным PNG".into(),
+            "размеры снятого изображения не совпадают с декодированным PNG".into(),
         ));
     }
     if render.device_scale_factor != PitchAccentImageValidator::REQUIRED_DEVICE_SCALE_FACTOR {
         return Err(EvidenceFailure::Incomplete(
-            "device scale factor должен быть ровно 3.0".into(),
+            "масштаб устройства должен быть ровно 3.0".into(),
         ));
     }
 
@@ -323,7 +351,7 @@ fn validate_evidence(
     .any(|value| value.trim().is_empty() || value.chars().any(char::is_control))
     {
         return Err(EvidenceFailure::Incomplete(
-            "browser runtime provenance неполон".into(),
+            "сведения о среде выполнения браузера неполны".into(),
         ));
     }
     Ok(())
@@ -367,9 +395,24 @@ fn validate_hash(hash: &str) -> Result<(), AssetError> {
 }
 
 fn decode_png(bytes: &[u8]) -> Result<(u32, u32), String> {
-    let decoder =
-        image::codecs::png::PngDecoder::with_limits(Cursor::new(bytes), image::Limits::default())
-            .map_err(|error| error.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(PITCH_ACCENT_MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(PITCH_ACCENT_MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES);
+    let decoder = image::codecs::png::PngDecoder::with_limits(Cursor::new(bytes), limits)
+        .map_err(|error| error.to_string())?;
+    let (width, height) = decoder.dimensions();
+    let bytes_per_pixel = u64::from(decoder.color_type().bytes_per_pixel());
+    let output_allocation = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| "объём декодируемого PNG выходит за числовой предел".to_owned())?;
+    if output_allocation > PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES {
+        return Err(format!(
+            "декодированное изображение потребует {output_allocation} байт при пределе {} байт",
+            PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES
+        ));
+    }
     image::DynamicImage::from_decoder(decoder)
         .map(|image| (image.width(), image.height()))
         .map_err(|error| error.to_string())
@@ -379,7 +422,7 @@ fn incomplete_evidence(message: impl Into<String>) -> SemanticDecision {
     decision(
         SemanticStatus::Uncertain,
         "pitch_accent_evidence_incomplete",
-        "PNG не подтверждён полным source/render evidence",
+        "PNG не подтверждён полными данными источника и рендеринга",
         json!({"message": message.into()}),
     )
 }
@@ -443,6 +486,24 @@ mod tests {
         output.into_inner()
     }
 
+    fn rgb_png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([24, 36, 48]));
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
+    fn rgba_png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba([24, 36, 48, 128]));
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
     #[test]
     fn pitch_policy_keeps_surface_filename_and_isolates_unsupported_runtime_formats() {
         let policy = PitchAccentDomainPolicy;
@@ -464,6 +525,7 @@ mod tests {
             format!("assets/unsupported/{identity_hash}-{hash}.gif")
         );
         assert_eq!(gif.consumer_filename, "幽霊.gif");
+        assert_eq!(policy.max_asset_bytes(), Some(PITCH_ACCENT_MAX_ASSET_BYTES));
         assert!(!policy.is_publishable_format(DetectedFormat::Gif));
         assert!(!policy.allows_verified_format(DetectedFormat::Gif));
         assert!(policy.allows_verified_format(DetectedFormat::Png));
@@ -550,5 +612,66 @@ mod tests {
         let decision = validate(&asset, b"\x89PNG\r\n\x1a\nnot a complete png").unwrap();
 
         assert_eq!(decision.status, SemanticStatus::Corrupt);
+    }
+
+    #[test]
+    fn oversized_input_is_rejected_after_reading_only_limit_plus_one_byte() {
+        struct CountingReader {
+            remaining: usize,
+            bytes_read: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = output.len().min(self.remaining);
+                output[..count].fill(0);
+                self.remaining -= count;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let asset = record(Some(valid_metadata("幽霊")));
+        let mut reader = CountingReader {
+            remaining: PITCH_ACCENT_MAX_ASSET_BYTES as usize + 128,
+            bytes_read: 0,
+        };
+
+        let decision = PitchAccentImageValidator
+            .validate(&asset, &mut reader)
+            .unwrap();
+
+        assert_eq!(decision.status, SemanticStatus::Corrupt);
+        assert_eq!(decision.evidence[0].kind, "pitch_accent_png_too_large");
+        assert_eq!(reader.bytes_read, PITCH_ACCENT_MAX_ASSET_BYTES as usize + 1);
+    }
+
+    #[test]
+    fn png_dimensions_above_limit_are_corrupt() {
+        let asset = record(Some(valid_metadata("幽霊")));
+        let oversized = rgb_png(PITCH_ACCENT_MAX_IMAGE_DIMENSION + 1, 1);
+
+        let decision = validate(&asset, &oversized).unwrap();
+
+        assert_eq!(decision.status, SemanticStatus::Corrupt);
+        assert_eq!(decision.evidence[0].kind, "pitch_accent_png_decode_failed");
+    }
+
+    #[test]
+    fn png_decode_allocation_above_limit_is_corrupt() {
+        let asset = record(Some(valid_metadata("幽霊")));
+        let oversized = rgba_png(
+            PITCH_ACCENT_MAX_IMAGE_DIMENSION,
+            PITCH_ACCENT_MAX_IMAGE_DIMENSION,
+        );
+
+        let decision = validate(&asset, &oversized).unwrap();
+
+        assert_eq!(decision.status, SemanticStatus::Corrupt);
+        assert_eq!(decision.evidence[0].kind, "pitch_accent_png_decode_failed");
+        let message = decision.evidence[0].details.as_ref().unwrap()["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.contains("декодированное изображение потребует"));
     }
 }

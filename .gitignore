@@ -1,4 +1,4 @@
-# Windows Mark-of-the-Web metadata that may appear as literal files in WSL/Linux
+# Метаданные Windows Mark-of-the-Web, которые могут появляться как файлы в WSL/Linux
 *:Zone.Identifier
 
 # Артефакты сборки корневого Cargo workspace: Rust-проверки запускаются из корня
@@ -19,8 +19,11 @@
 !/.asset-store/kanji/assets/png/
 /.asset-store/kanji/assets/gif/*
 !/.asset-store/kanji/assets/gif/*.gif
+# Gitignore сопоставляет пути: каталоги с разрешённым суффиксом тоже запрещены.
+/.asset-store/kanji/assets/gif/*.gif/
 /.asset-store/kanji/assets/png/*
 !/.asset-store/kanji/assets/png/*.png
+/.asset-store/kanji/assets/png/*.png/
 /.asset-store/kanji/.runtime/
 /.asset-store/kanji/.lock
 /.asset-store/kanji/.tmp/
@@ -32,6 +35,7 @@
 !/.asset-store/pitch-accent/assets/png/
 /.asset-store/pitch-accent/assets/png/*
 !/.asset-store/pitch-accent/assets/png/*.png
+/.asset-store/pitch-accent/assets/png/*.png/
 /.asset-store/pitch-accent/.runtime/
 /.asset-store/pitch-accent/.lock
 /.asset-store/pitch-accent/.tmp/

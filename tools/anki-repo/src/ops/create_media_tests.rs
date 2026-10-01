@@ -1,5 +1,6 @@
-//! Только синтетические exports и изолированные stores. Stub validator задаёт
-//! lifecycle evidence fixture; production pixel algorithm тестируется владельцем.
+//! Только синтетические экспорты и изолированные хранилища. Тестовая заглушка
+//! задаёт данные о проверке жизненного цикла; алгоритм обработки пикселей
+//! тестируется его владельцем.
 use super::*;
 use crate::ops::create::{MAX_REPORTED_NOTES, create_with_options, parse_request_bytes};
 use crate::test_support::{MINIMAL_EXPORT, TempDir};
@@ -32,7 +33,7 @@ impl SemanticValidator for Stub {
             SemanticStatus::Verified,
             vec![ValidationEvidence {
                 kind: "synthetic".into(),
-                summary: "контролируемые fixture bytes".into(),
+                summary: "контролируемые байты тестовой фикстуры".into(),
                 details: None,
             }],
         ))
@@ -117,7 +118,8 @@ impl Fixture {
 }
 const GIF: &[u8] = b"GIF89a-synthetic-one";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-synthetic";
-// Полный GIF размером 1×1: human approval проверяет decode, а не одну сигнатуру.
+// Полный GIF размером 1×1: подтверждение человеком проверяет декодирование,
+// а не только сигнатуру.
 const DECODABLE_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
 fn policy(uuid: &str, field: &str) -> String {
     format!(
@@ -156,8 +158,8 @@ fn verified_asset_fixture(
     }
 }
 
-/// Только внутренние тестовые реализации: production YAML не получает новых
-/// processor types ради теста композиции.
+/// Только внутренние тестовые реализации: ради проверки композиции в YAML
+/// не добавляются новые типы обработчиков.
 struct TestProcessor<'a> {
     name: &'static str,
     filename: &'static str,
@@ -855,16 +857,31 @@ fn unsafe_consumer_filenames_and_format_mismatches_fail_closed() {
     ] {
         let asset = verified_asset_fixture(identity.clone(), "assets/png/幽霊.png", filename, PNG);
         let error = verified_asset_filename(&asset).unwrap_err();
-        assert_eq!(error.code, ErrorCode::Internal, "filename={filename:?}");
+        assert_eq!(error.code, ErrorCode::Internal, "имя файла={filename:?}");
         assert_eq!(
             error.details["reason"], "mutation_internal_invariant",
-            "filename={filename:?}"
+            "имя файла={filename:?}"
         );
     }
 
     let wrong_detected_format =
-        verified_asset_fixture(identity, "assets/png/幽霊.png", "幽霊.png", GIF);
+        verified_asset_fixture(identity.clone(), "assets/png/幽霊.png", "幽霊.png", GIF);
     let error = verified_asset_filename(&wrong_detected_format).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+
+    let mut wrong_recorded_format =
+        verified_asset_fixture(identity.clone(), "assets/png/幽霊.png", "幽霊.gif", PNG);
+    wrong_recorded_format.record.format = DetectedFormat::Gif;
+    let error = verified_asset_filename(&wrong_recorded_format).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+
+    let unknown_format = verified_asset_fixture(
+        identity,
+        "assets/bin/幽霊.bin",
+        "幽霊.bin",
+        b"synthetic unknown bytes",
+    );
+    let error = verified_asset_filename(&unknown_format).unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 }
 

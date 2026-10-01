@@ -1,4 +1,4 @@
-//! CLI adapter предметной kanji boundary поверх общего `asset_store` core.
+//! Адаптер CLI для домена `kanji` поверх общего ядра `asset_store`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -31,10 +31,10 @@ pub use batch_cli::{BatchActionArg, BatchCommand};
 #[command(
     name = "kanji-assets",
     version,
-    about = "Безопасный локальный lifecycle store для kanji assets"
+    about = "Безопасное локальное хранилище ресурсов кандзи с управлением жизненным циклом"
 )]
 pub struct Cli {
-    /// Program-owned runtime root; содержимое по умолчанию исключено из Git.
+    /// Корень локальных ресурсов, которыми владеет программа; по умолчанию содержимое исключено из Git.
     #[arg(long, global = true)]
     pub store: Option<PathBuf>,
     /// Корень checkout, относительно которого запрещено пересечение с `decks/`.
@@ -50,24 +50,24 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// CLI команды.
+/// Команды CLI.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Создаёт пустой store либо проверяет уже существующий.
     Init,
-    /// Явно импортирует ровно один локальный файл как pending candidate.
+    /// Явно импортирует ровно один локальный файл как кандидат в состоянии `pending`.
     Ingest {
-        /// Unicode character или последовательность, например `漢`.
+        /// Символ Unicode или последовательность символов, например `漢`.
         #[arg(long)]
         character: String,
-        /// Один явно названный source file.
+        /// Один явно указанный исходный файл.
         #[arg(long)]
         file: PathBuf,
         /// Разрешает замену только если текущий hash совпадает с этим значением.
         #[arg(long)]
         replace_expected_sha256: Option<String>,
     },
-    /// Проверяет integrity и выводит текущие записи manifest.
+    /// Проверяет целостность и выводит текущие записи manifest.
     List,
     /// Показывает детерминированный набор целей без записи.
     Plan {
@@ -78,25 +78,25 @@ pub enum Command {
         #[arg(long)]
         validator_version: String,
     },
-    /// Получает media через Yarxi и публикует только после semantic VERIFIED.
+    /// Получает изображения через Yarxi и публикует только после семантического решения `VERIFIED`.
     Ensure {
-        /// Один или несколько символов; каждый аргумент должен содержать один Unicode scalar.
+        /// Один или несколько символов; каждый аргумент должен содержать одно скалярное значение Unicode.
         #[arg(required = true, num_args = 1..)]
         characters: Vec<String>,
     },
-    /// Возобновляемое получение и уточнение ресурсов, проверка человеком без публикации в Git.
+    /// Возобновляемое получение и уточнение ресурсов с проверкой человеком без публикации в Git.
     Batch {
         #[command(subcommand)]
         command: BatchCommand,
     },
-    /// Запускает production semantic validator для существующего корпуса.
+    /// Запускает основной семантический валидатор для существующего корпуса.
     Validate {
         #[arg(long, value_enum)]
         mode: ModeArg,
     },
 }
 
-/// Human или machine-readable вывод.
+/// Человекочитаемый или машиночитаемый вывод.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Human,
@@ -119,7 +119,7 @@ impl From<ModeArg> for SelectionMode {
     }
 }
 
-/// Kanji character identity без нормализации или догадки по имени файла.
+/// Идентификатор символа кандзи без нормализации и догадок по имени файла.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KanjiCharacter(String);
 
@@ -211,7 +211,7 @@ struct Response {
     validator_available: Option<bool>,
 }
 
-/// Обработанный CLI-ответ и его process exit code.
+/// Обработанный ответ CLI и код завершения процесса.
 pub struct CliOutput {
     pub stdout: String,
     pub stderr: String,
@@ -363,7 +363,7 @@ fn validate_explicit_source(
         if lexical_source.starts_with(&lexical_root) {
             return Err(AssetError::new(
                 ErrorCode::BoundaryViolation,
-                "kanji CLI не читает source из защищённого дерева decks",
+                "CLI kanji не читает исходные файлы из защищённого дерева decks",
             ));
         }
     }
@@ -384,7 +384,7 @@ fn validate_explicit_source(
         if canonical_root.is_some_and(|root| opened_source.starts_with(root)) {
             return Err(AssetError::new(
                 ErrorCode::BoundaryViolation,
-                "kanji CLI не читает source из защищённого дерева decks",
+                "CLI kanji не читает исходные файлы из защищённого дерева decks",
             ));
         }
     }
@@ -525,7 +525,7 @@ fn execute_with_store(
                 source_file.take().ok_or_else(|| {
                     AssetError::new(
                         ErrorCode::IoFailure,
-                        "CLI потерял проверенный explicit source handle",
+                        "CLI потерял проверенный дескриптор явно указанного источника",
                     )
                 })?,
             )?;
@@ -620,7 +620,7 @@ fn execute_with_store(
         }
         Command::Batch { .. } => Err(AssetError::new(
             ErrorCode::InvalidTransition,
-            "batch требует отдельного CLI adapter",
+            "команда batch должна выполняться через отдельный адаптер CLI",
         )),
         Command::Validate { mode } => {
             let selection_mode: SelectionMode = mode.into();
@@ -1073,7 +1073,7 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> C
         OutputFormat::Human => {
             let mut text = format!("{}: {}", response.operation, response.outcome);
             if let Some(mode) = &response.mode {
-                text.push_str(&format!(" (mode={mode})"));
+                text.push_str(&format!(" (режим={mode})"));
             }
             text.push('\n');
             for asset in &response.assets {
@@ -1084,11 +1084,11 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> C
                     asset.sha256.as_deref().unwrap_or("-"),
                     asset
                         .validation_status
-                        .map_or("no decision", |status| status.as_str())
+                        .map_or("нет решения", |status| status.as_str())
                 ));
             }
             for blocker in &response.blockers {
-                text.push_str(&format!("blocker: {blocker}\n"));
+                text.push_str(&format!("Препятствие: {blocker}\n"));
             }
             CliOutput {
                 stdout: text,
@@ -1134,7 +1134,7 @@ mod tests {
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("synthetic test root is created");
+            fs::create_dir_all(&path).expect("создаётся корень фикстуры теста");
             Self(path)
         }
     }
@@ -1150,24 +1150,24 @@ mod tests {
         let temp = TempDir::new();
         let repository = temp.0.join("repository");
         let decks = repository.join("decks");
-        fs::create_dir_all(&decks).expect("protected tree is created");
+        fs::create_dir_all(&decks).expect("создаётся защищённое дерево");
         let protected_source = decks.join("protected.bin");
-        let protected_bytes = b"must not be read from decks";
-        fs::write(&protected_source, protected_bytes).expect("protected fixture writes");
+        let protected_bytes = "нельзя читать из decks".as_bytes();
+        fs::write(&protected_source, protected_bytes).expect("записывается защищённая фикстура");
 
         let candidate = temp.0.join("candidate.bin");
-        let candidate_bytes = b"opened candidate remains the source";
-        fs::write(&candidate, candidate_bytes).expect("safe fixture writes");
+        let candidate_bytes = "открытый кандидат остаётся источником".as_bytes();
+        fs::write(&candidate, candidate_bytes).expect("записывается безопасная фикстура");
         let protected_roots = BTreeSet::from([decks.clone()]);
         let opened = validate_explicit_source(&candidate, &protected_roots)
-            .expect("source handle passes boundary check");
+            .expect("дескриптор источника проходит проверку границы");
 
-        fs::remove_file(&candidate).expect("original pathname removed");
-        symlink(&protected_source, &candidate).expect("path now points into protected tree");
+        fs::remove_file(&candidate).expect("исходный путь удалён");
+        symlink(&protected_source, &candidate).expect("путь теперь указывает в защищённое дерево");
 
         let store_root = temp.0.join("store");
         let store = AssetStore::open(StoreOptions::new(&store_root).protect_from(&decks))
-            .expect("separate store opens");
+            .expect("отдельный store открывается");
         let outcome = store
             .ingest_from_file(
                 IngestRequest {
@@ -1179,12 +1179,12 @@ mod tests {
                 },
                 opened,
             )
-            .expect("ingest consumes the checked open handle");
+            .expect("ingest использует проверенный открытый дескриптор");
 
         assert_eq!(
             outcome.asset.sha256,
             sha256_hex(candidate_bytes),
-            "the bytes belong to the descriptor checked before pathname replacement"
+            "байты получены из дескриптора, проверенного до подмены пути"
         );
         assert_ne!(outcome.asset.sha256, sha256_hex(protected_bytes));
     }

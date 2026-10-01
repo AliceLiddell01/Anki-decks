@@ -1,13 +1,14 @@
-//! Browser provider для динамических статей Yarxi и изображений слева от них.
+//! Провайдер браузера для динамических статей Yarxi и изображений слева от них.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::time::Duration;
 
 #[cfg(test)]
 use crate::browser_runtime::TrackedRequest;
 use crate::browser_runtime::{
     self, BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor, DeviceMetrics, NetworkOutcome,
-    RuntimeSnapshot,
+    RetryTrigger, RuntimeSnapshot,
 };
 pub use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
 use base64::Engine as _;
@@ -29,6 +30,8 @@ const PROVIDER_VERSION: &str = "7";
 const SITE_URL: &str = "https://www.yarxi.su/";
 const SITE_HOST: &str = "www.yarxi.su";
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const BROWSER_SETUP_TIMEOUT_MESSAGE: &str =
+    "browser_setup_timeout: истёк срок подготовки сеанса браузера";
 const ITEM_TIMEOUT: Duration = Duration::from_secs(90);
 const TLS_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const BATCH_PACING: Duration = Duration::from_millis(900);
@@ -43,7 +46,7 @@ const CAPTURE_LIGHT_GLYPH_MIN_LUMINANCE: f64 = 0.60;
 const YARXI_DARK_THEME_STYLE_ID: &str = "asset-store-yarxi-dark-theme";
 const YARXI_DARK_THEME_STYLE: &str = ":root { color-scheme: dark !important; } #app { color: rgb(var(--w-base-color-rgb)) !important; }";
 
-/// Источник bytes и ограниченный набор evidence при работе браузера.
+/// Источник байтов и ограниченный набор свидетельств при работе браузера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionResult {
@@ -53,7 +56,7 @@ pub enum SelectionResult {
 }
 
 /// Явный выбор источника. `PreferredSource` используется по умолчанию;
-/// `RenderedFontSamplePng` предназначен для отдельной приёмки browser-render.
+/// `RenderedFontSamplePng` предназначен для отдельной приёмки рендеринга в браузере.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcquisitionTarget {
@@ -62,7 +65,7 @@ pub enum AcquisitionTarget {
     RenderedFontSamplePng,
 }
 
-/// Полученный оригинальный бинарный asset.
+/// Полученный исходный бинарный файл.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcquiredMedia {
     pub character: String,
@@ -73,7 +76,7 @@ pub struct AcquiredMedia {
     pub evidence: AcquisitionEvidence,
 }
 
-/// Сохраняемое evidence выбора источника без состояния браузера и сеанса.
+/// Сохраняемые свидетельства выбора источника без состояния браузера и сеанса.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcquisitionEvidence {
@@ -100,7 +103,7 @@ fn one_acquisition_attempt() -> u8 {
     1
 }
 
-/// Принятое по явному флагу TLS-исключение для точного host.
+/// Принятое по явному флагу TLS-исключение для точного имени узла.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsExceptionProvenance {
@@ -115,7 +118,7 @@ struct ApprovedTlsException {
     provenance: TlsExceptionProvenance,
 }
 
-/// Evidence PNG, созданного рендерингом видимого DOM-элемента font-sample Yarxi.
+/// Свидетельства для PNG, созданного рендерингом видимого элемента DOM `font-sample` Yarxi.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenderedFontSampleEvidence {
@@ -164,7 +167,7 @@ pub struct CssRect {
     pub height: f64,
 }
 
-/// Чёткое состояние primary GIF для проверки политики и fake-тестов.
+/// Чёткое состояние основного GIF для проверки политики и имитационных тестов.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrimaryGifState {
     PresentLoaded { url: String },
@@ -291,16 +294,8 @@ impl BrowserEvidenceMonitor {
         }
     }
 
-    fn retryable_failures_only(&self, epoch: u64) -> bool {
-        self.telemetry.retryable_failures_only(epoch)
-    }
-
-    fn retryable_timeout(&self, epoch: u64) -> bool {
-        self.telemetry.retryable_timeout(epoch)
-    }
-
-    fn monitor_failed(&self) -> bool {
-        self.telemetry.monitor_failed()
+    fn retryable_acquisition(&self, epoch: u64, trigger: RetryTrigger) -> bool {
+        self.telemetry.retryable_acquisition(epoch, trigger)
     }
 
     fn network_failure_details(&self, epoch: u64, excluded_primary_gif: Option<&str>) -> String {
@@ -408,7 +403,7 @@ fn classify_primary_state(
         }
     } else {
         PrimaryGifState::Unknown {
-            reason: "область информации или media ещё не завершила загрузку и не стабилизировалась"
+            reason: "область информации или медиа ещё не завершила загрузку и не стабилизировалась"
                 .into(),
         }
     }
@@ -446,7 +441,7 @@ enum MediaSourceChoice {
     },
 }
 
-/// Выбирает исходные image bytes или PNG, отрендеренный из точного видимого font-sample.
+/// Выбирает байты исходного изображения или PNG, отрендеренный из точного видимого `font-sample`.
 /// URL Kakijun справа никогда не используется как источник.
 #[cfg(test)]
 fn choose_media_source(
@@ -515,7 +510,7 @@ fn choose_media_source_for_target(
             })
         }
         PrimaryGifState::Unknown { reason } => Err(format!(
-            "gif_unknown: нельзя разрешить image/font-sample fallback: {reason}"
+            "gif_unknown: нельзя выбрать запасное изображение или образец шрифта: {reason}"
         )),
     }
 }
@@ -549,8 +544,8 @@ fn choose_font_sample(
         })
 }
 
-/// Выполняет изолированный browser batch. TLS interstitial можно
-/// пропустить только с явным флагом и только для точного host Yarxi.
+/// Выполняет изолированный пакет браузера. Страницу-предупреждение TLS можно
+/// пропустить только с явным флагом и только для точного имени узла Yarxi.
 pub fn acquire_many(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -562,9 +557,9 @@ pub fn acquire_many(
     )
 }
 
-/// Получает media с явно выбранной политикой источника. Инструменты приёмки
-/// могут запросить PNG из font-sample; обычные вызовы используют [`acquire_many`]
-/// с предпочтением primary GIF.
+/// Получает медиа с явно выбранной политикой источника. Инструменты приёмки
+/// могут запросить PNG из `font-sample`; обычные вызовы используют [`acquire_many`]
+/// с предпочтением основного GIF.
 pub fn acquire_many_with_target(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -573,7 +568,7 @@ pub fn acquire_many_with_target(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|error| format!("среда browser runtime: {error}"))?;
+        .map_err(|error| format!("среда браузера: {error}"))?;
     runtime
         .block_on(async move { acquire_many_async(characters, allow_insecure_tls, target).await })
 }
@@ -604,11 +599,12 @@ async fn acquire_many_async(
         prefers_color_scheme: Some("dark".into()),
         ..BrowserRuntimeConfig::default()
     };
-    let session = BrowserSession::launch(runtime_config).await?;
+    let session =
+        run_setup_before_deadline(session_deadline, BrowserSession::launch(runtime_config)).await?;
     let evidence_monitor = BrowserEvidenceMonitor::new(session.telemetry().clone());
     let browser_runtime = session.provenance().clone();
 
-    let setup_result = timeout_at(session_deadline, async {
+    let setup_result = run_setup_before_deadline(session_deadline, async {
         let page = session.page();
         let tls_exception = match page.goto(SITE_URL).await {
             Err(error) => {
@@ -668,9 +664,7 @@ async fn acquire_many_async(
         }
         Ok::<_, String>(tls_exception)
     })
-    .await
-    .map_err(|_| "browser_setup_timeout: истёк срок подготовки сеанса браузера".to_owned())
-    .and_then(|result| result);
+    .await;
 
     let tls_exception = match setup_result {
         Ok(setup) => setup,
@@ -741,7 +735,7 @@ fn append_batch_stopped_outcomes<T>(
         BatchStopReason::SessionDeadline => {
             "browser_session_deadline: общий срок пакета истёк".to_owned()
         }
-        BatchStopReason::ItemTimeout => "browser_batch_stopped_after_item_timeout: обработка предыдущего символа отменена по timeout; сеанс браузера остановлен, чтобы поздний ответ не изменил страницу".to_owned(),
+        BatchStopReason::ItemTimeout => "browser_batch_stopped_after_item_timeout: обработка предыдущего символа отменена по таймауту; сеанс браузера остановлен, чтобы поздний ответ не изменил страницу".to_owned(),
         BatchStopReason::RetryRecoveryFailed(detail) => format!(
             "browser_batch_stopped_after_retry_recovery_failure: не удалось безопасно восстановить страницу: {detail}"
         ),
@@ -862,12 +856,16 @@ fn is_retryable_acquisition_error(
     evidence_monitor: &BrowserEvidenceMonitor,
     epoch: u64,
 ) -> bool {
-    !evidence_monitor.monitor_failed()
-        && ((error.starts_with("browser_item_timeout:")
-            && evidence_monitor.retryable_timeout(epoch))
-            || error.starts_with("browser_readiness_timeout:")
-            || (error.starts_with("browser_network_runtime_failure:")
-                && evidence_monitor.retryable_failures_only(epoch)))
+    let trigger = if error.starts_with("browser_item_timeout:") {
+        RetryTrigger::ItemTimeout
+    } else if error.starts_with("browser_readiness_timeout:") {
+        RetryTrigger::ReadinessTimeout
+    } else if error.starts_with("browser_network_runtime_failure:") {
+        RetryTrigger::RuntimeFailure
+    } else {
+        return false;
+    };
+    evidence_monitor.retryable_acquisition(epoch, trigger)
 }
 
 fn should_retry_acquisition(
@@ -1221,7 +1219,7 @@ async fn acquire_one(
         }
     };
     if bytes.is_empty() {
-        return Err("media_empty: browser вернул пустые bytes".into());
+        return Err("media_empty: браузер вернул пустые байты".into());
     }
     let evidence = AcquisitionEvidence {
         provider: PROVIDER_ID.to_owned(),
@@ -1523,7 +1521,7 @@ async fn wait_for_media_snapshot(
                 ));
             }
             return Err(format!(
-                "gif_unknown: область media не достигла завершённого и стабильного состояния; {reason}"
+                "gif_unknown: область медиа не достигла завершённого и стабильного состояния; {reason}"
             ));
         }
         sleep(Duration::from_millis(200)).await;
@@ -1557,7 +1555,7 @@ async fn resource_bytes(page: &Page, resource_url: &str) -> Result<Vec<u8>, Stri
         || url.host_str().is_none()
         || url.host_str().is_some_and(is_kakijun_host)
     {
-        return Err("source_url_rejected: ожидается HTTPS resource, не связанный с Kakijun".into());
+        return Err("source_url_rejected: ожидается HTTPS-ресурс, не связанный с Kakijun".into());
     }
     let tree = page
         .execute(GetResourceTreeParams::default())
@@ -1569,7 +1567,7 @@ async fn resource_bytes(page: &Page, resource_url: &str) -> Result<Vec<u8>, Stri
         .await
         .map_err(|error| format!("CDP Page.getResourceContent: {error}"))?;
     if !content.result.base64_encoded {
-        return Err("media_response_not_binary: browser не сохранил исходные bytes".into());
+        return Err("media_response_not_binary: браузер не сохранил исходные байты".into());
     }
     base64::engine::general_purpose::STANDARD
         .decode(content.result.content)
@@ -2012,9 +2010,9 @@ async fn wait_until(
         let ready: bool = page
             .evaluate(expression())
             .await
-            .map_err(|error| format!("проверка готовности browser: {error}"))?
+            .map_err(|error| format!("проверка готовности браузера: {error}"))?
             .into_value()
-            .map_err(|error| format!("ответ проверки готовности browser: {error}"))?;
+            .map_err(|error| format!("ответ проверки готовности браузера: {error}"))?;
         if ready {
             return Ok(());
         }
@@ -2025,6 +2023,15 @@ async fn wait_until(
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+async fn run_setup_before_deadline<T>(
+    deadline: Instant,
+    setup: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    timeout_at(deadline, setup)
+        .await
+        .unwrap_or_else(|_| Err(BROWSER_SETUP_TIMEOUT_MESSAGE.into()))
 }
 
 #[cfg(test)]
@@ -2192,6 +2199,78 @@ mod tests {
             epoch,
             2,
         ));
+    }
+
+    #[test]
+    fn acquisition_retry_preserves_trigger_specific_evidence_rules() {
+        let epoch = 1;
+        let monitor = BrowserEvidenceMonitor::new(CdpRuntimeMonitor::from_snapshot_for_test(
+            RuntimeSnapshot {
+                http_errors: vec![test_outcome(
+                    ResourceType::Fetch,
+                    Some("https://example.test/permanent"),
+                    None,
+                    "permanent",
+                    epoch,
+                    Some(404),
+                )],
+                ..RuntimeSnapshot::default()
+            },
+        ));
+
+        assert!(!is_retryable_acquisition_error(
+            "browser_item_timeout: ограниченный срок истёк",
+            &monitor,
+            epoch,
+        ));
+        assert!(is_retryable_acquisition_error(
+            "browser_readiness_timeout: не готова страница",
+            &monitor,
+            epoch,
+        ));
+        assert!(!is_retryable_acquisition_error(
+            "browser_network_runtime_failure: постоянная HTTP-ошибка",
+            &monitor,
+            epoch,
+        ));
+        assert!(!is_retryable_acquisition_error(
+            "browser_network_runtime_failure: нет сетевой ошибки",
+            &monitor,
+            epoch + 1,
+        ));
+        assert!(!is_retryable_acquisition_error(
+            "неповторяемая ошибка",
+            &monitor,
+            epoch,
+        ));
+
+        let clean_monitor = BrowserEvidenceMonitor::new(CdpRuntimeMonitor::from_snapshot_for_test(
+            RuntimeSnapshot::default(),
+        ));
+        assert!(is_retryable_acquisition_error(
+            "browser_item_timeout: ограниченный срок истёк",
+            &clean_monitor,
+            epoch,
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_rejects_work_after_expiry() {
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let result =
+            run_setup_before_deadline(deadline, std::future::pending::<Result<(), String>>()).await;
+
+        assert_eq!(result, Err(BROWSER_SETUP_TIMEOUT_MESSAGE.into()));
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_accepts_work_completed_before_expiry() {
+        let result = run_setup_before_deadline(Instant::now() + Duration::from_secs(1), async {
+            Ok::<_, String>("готово")
+        })
+        .await;
+
+        assert_eq!(result, Ok("готово"));
     }
 
     #[test]

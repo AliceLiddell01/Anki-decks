@@ -9,6 +9,7 @@ use crate::batch::{
     BatchTrustSource, HumanBatchAction, HumanBatchDecision, KanjiBatch, MAX_ACQUISITION_ROUNDS,
     MAX_HUMAN_REASON_BYTES,
 };
+use crate::domain::{AssetDomainPolicy, KanjiDomainPolicy};
 use crate::model::{HumanDecision, Provenance, SemanticDecision, ValidationRecord};
 use crate::store::{HumanAttestationRequest, validate_image_decode};
 use crate::validation::ValidatorFailure;
@@ -746,7 +747,7 @@ fn validated_candidate(
         return Ok(failure("media_format_mismatch", &message));
     }
     let sha256 = sha256_hex(&media.bytes);
-    let record = candidate_asset_record(identity, &media.bytes, Some(&media.evidence));
+    let record = candidate_asset_record(identity, &media.bytes, Some(&media.evidence))?;
     let validator = KanjiImageValidator::new();
     let decision = validator
         .validate(&record, &mut Cursor::new(media.bytes.as_slice()))
@@ -1277,14 +1278,17 @@ fn candidate_asset_record(
     identity: &AssetIdentity,
     bytes: &[u8],
     acquisition: Option<&crate::yarxi::AcquisitionEvidence>,
-) -> AssetRecord {
-    AssetRecord {
+) -> Result<AssetRecord, AssetError> {
+    let sha256 = sha256_hex(bytes);
+    let format = DetectedFormat::from_signature(bytes);
+    let location = KanjiDomainPolicy.canonical_location(identity, &sha256, format)?;
+    Ok(AssetRecord {
         identity: identity.clone(),
-        storage_path: "candidate".into(),
-        consumer_filename: format!("{}.gif", identity.key),
-        sha256: sha256_hex(bytes),
+        storage_path: location.storage_path,
+        consumer_filename: location.consumer_filename,
+        sha256,
         byte_length: bytes.len() as u64,
-        format: DetectedFormat::from_signature(bytes),
+        format,
         provenance: Provenance {
             source_kind: acquisition
                 .map_or("kanji_batch_runtime", |evidence| evidence.provider.as_str())
@@ -1295,7 +1299,7 @@ fn candidate_asset_record(
         validation: None,
         human_attestation: None,
         domain_metadata: Some(KanjiCharacter(identity.key.clone()).metadata()),
-    }
+    })
 }
 
 struct AggregateValidator {
@@ -1596,7 +1600,10 @@ mod snapshot_cost_tests {
             execute_command_with_snapshots(&store, summary.clone(), &start, false, &mut reader)
                 .unwrap();
         assert_eq!(response.counts.effective_verified, 1000);
-        assert_eq!(reader.captures, 1, "start uses one full snapshot");
+        assert_eq!(
+            reader.captures, 1,
+            "при запуске используется один полный снимок"
+        );
         for command in [
             start,
             BatchCommand::Status {
@@ -1618,7 +1625,7 @@ mod snapshot_cost_tests {
             assert_eq!(response.counts.effective_verified, 1000);
             assert_eq!(
                 reader.captures, 1,
-                "idempotent start/status/review uses one full snapshot"
+                "повторный запуск, просмотр состояния и проверка используют один полный снимок"
             );
         }
         reader.captures = 0;
@@ -1638,7 +1645,7 @@ mod snapshot_cost_tests {
         assert!(issues.is_empty());
         assert_eq!(
             reader.captures, 2,
-            "ready run uses initial and final snapshots"
+            "для готового запуска используются начальный и итоговый снимки"
         );
         // Для границы получения также делается один снимок на раунд,
         // независимо от числа результатов элементов, сохранённых в раунде.
@@ -1666,7 +1673,7 @@ mod snapshot_cost_tests {
             |characters| {
                 Ok(characters
                     .iter()
-                    .map(|_| Err("synthetic failure".into()))
+                    .map(|_| Err("синтетическая ошибка".into()))
                     .collect())
             },
             &mut reader,
@@ -1676,7 +1683,7 @@ mod snapshot_cost_tests {
         assert!(state.items.iter().all(|item| item.attempts.len() == 1));
         assert_eq!(
             reader.captures, 3,
-            "initial + one frontier boundary + final"
+            "начальный снимок + один снимок границы обработки + итоговый снимок"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1746,7 +1753,7 @@ mod candidate_cost_tests {
         let (state, _, _) = run_batch(&store, "candidate-cost", 1, |characters| {
             Ok(characters
                 .iter()
-                .map(|_| Err("synthetic failure".into()))
+                .map(|_| Err("синтетическая ошибка".into()))
                 .collect())
         })
         .unwrap();

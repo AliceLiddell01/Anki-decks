@@ -586,6 +586,52 @@ fn state_and_exact_bytes_resume_after_process_restart() {
 }
 
 #[test]
+fn load_rejects_candidate_format_mismatch_before_materialization() {
+    let temporary = Temporary::new();
+    let state = batch(&['漢']);
+    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    let data = bytes("format-mismatch");
+    let candidate = runtime
+        .persist_candidate(
+            &data,
+            record(&data, SemanticStatus::Uncertain, 0.03, 0.001),
+            true,
+        )
+        .unwrap();
+    let original_path = temporary
+        .root
+        .join(".runtime/batches")
+        .join(&state.batch_id)
+        .join(&candidate.storage_path);
+    let mut inconsistent = state;
+    let mut wrong_format = candidate;
+    wrong_format.format = DetectedFormat::Png;
+    wrong_format.storage_path = candidate_path(&wrong_format.sha256, wrong_format.format).unwrap();
+    let mismatched_path = temporary
+        .root
+        .join(".runtime/batches")
+        .join(&inconsistent.batch_id)
+        .join(&wrong_format.storage_path);
+    fs::copy(original_path, &mismatched_path).unwrap();
+    acquire(&mut inconsistent, '漢', wrong_format);
+    inconsistent.validate().unwrap();
+    fs::write(
+        temporary
+            .root
+            .join(".runtime/batches")
+            .join(&inconsistent.batch_id)
+            .join("state.json"),
+        serde_json::to_vec_pretty(&inconsistent).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        runtime.load().unwrap_err().code,
+        ErrorCode::IntegrityMismatch
+    );
+}
+
+#[test]
 fn runtime_rejects_path_traversal_symlinks_and_changed_bytes() {
     let temporary = Temporary::new();
     assert!(BatchRuntime::open(&temporary.root, "../escape").is_err());

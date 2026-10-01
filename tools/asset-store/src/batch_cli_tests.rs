@@ -348,7 +348,7 @@ fn acquisition_releases_runtime_lock_and_finishes_all_items_before_retry() {
                 if value == "元" {
                     Ok(media(value, glyph('元')))
                 } else {
-                    Err("synthetic network failure".into())
+                    Err("синтетическая ошибка сети".into())
                 }
             })
             .collect())
@@ -439,7 +439,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
             identity: identity('漢'),
             candidate_sha256: confirm_hash.clone(),
             action: HumanBatchAction::Confirm,
-            reason: "synthetic explicit human confirmation".into(),
+            reason: "синтетическое явное подтверждение человека".into(),
         },
     )
     .unwrap();
@@ -467,7 +467,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
             identity: identity('字'),
             candidate_sha256: reject_hash.clone(),
             action: HumanBatchAction::Reject,
-            reason: "synthetic broken artifact".into(),
+            reason: "синтетический повреждённый артефакт".into(),
         },
     )
     .unwrap();
@@ -678,7 +678,7 @@ fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
     assert_eq!(
         hashes.len(),
         5,
-        "synthetic candidates обязаны быть distinct"
+        "синтетические кандидаты должны различаться"
     );
     // Один REJECTED с привлекательными метриками и четыре UNCERTAIN: прежний
     // фильтр включал REJECTED в среднее, поэтому порог проходился, а выбирался
@@ -740,7 +740,7 @@ fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
             .unwrap()
             .iter()
             .all(|record| record.sha256 != rejected_hash),
-        "REJECTED bytes не должны попасть в canonical corpus"
+        "отклонённые байты не должны попасть в канонический корпус"
     );
 }
 
@@ -798,7 +798,7 @@ fn explicit_reacquire_preserves_current_canonical_trust() {
             identity: identity('元'),
             candidate_sha256: hash.clone(),
             action: HumanBatchAction::Reacquire,
-            reason: "explicit new acquisition".into(),
+            reason: "явное новое получение".into(),
         },
     )
     .unwrap();
@@ -879,7 +879,7 @@ fn persisted_rejection_before_owner_commit_resumes_before_acquisition() {
                 identity: identity('漢'),
                 candidate_sha256: hash.clone(),
                 action: HumanBatchAction::Reject,
-                reason: "durable user intent before interrupted owner commit".into(),
+                reason: "сохранённое намерение пользователя до прерванной записи владельца".into(),
             },
             &bytes,
         )
@@ -896,7 +896,7 @@ fn persisted_rejection_before_owner_commit_resumes_before_acquisition() {
             .unwrap();
         assert_eq!(owner.sha256, hash);
         assert_eq!(owner.current_human_decision(), Some(HumanDecision::Reject));
-        Err("synthetic retry unavailable".into())
+        Err("синтетический повтор недоступен".into())
     })
     .unwrap();
 }
@@ -946,7 +946,7 @@ fn confirm_published_auto_and_existing_candidates_records_owner_approval() {
                 identity: identity('元'),
                 candidate_sha256: hash.clone(),
                 action: HumanBatchAction::Confirm,
-                reason: "explicit confirmation of already published exact bytes".into(),
+                reason: "явное подтверждение уже опубликованных точных байтов".into(),
             },
         )
         .unwrap();
@@ -1077,7 +1077,7 @@ fn stale_reject_never_materializes_or_demotes_newer_owner_sha() {
             identity: identity('元'),
             candidate_sha256: old_hash.clone(),
             action: HumanBatchAction::Reject,
-            reason: "rejection refers only to old reviewed bytes".into(),
+            reason: "отказ относится только к прежним проверенным байтам".into(),
         },
     )
     .unwrap();
@@ -1100,7 +1100,7 @@ fn stale_reject_never_materializes_or_demotes_newer_owner_sha() {
     assert_eq!(after[0].record, before[0].record);
     assert_eq!(after[0].bytes, new_bytes);
     let (state, _, _) = run_batch(&fixture.store, "old-batch", 1, |_| {
-        Err("synthetic acquisition unavailable".into())
+        Err("синтетическое получение недоступно".into())
     })
     .unwrap();
     assert!(!state.is_resolved());
@@ -1130,7 +1130,7 @@ fn owner_rejection_in_another_batch_invalidates_cached_status_review_and_run() {
                 identity: identity('元'),
                 candidate_sha256: hash.clone(),
                 action: HumanBatchAction::Reject,
-                reason: "explicit owner rejection from another batch".into(),
+                reason: "явный отказ владельца в другом пакете".into(),
             },
         )
         .unwrap();
@@ -1281,7 +1281,7 @@ fn run_observes_external_owner_reject_before_restoring_cached_auto_ready() {
             identity: identity('元'),
             expected_sha256: hash.clone(),
             decision: HumanDecision::Reject,
-            reason: "owner rejection before any status/review reconciliation".into(),
+            reason: "отказ владельца до сверки состояния и проверки".into(),
         })
         .unwrap();
     assert!(fixture.load("direct-run").is_resolved());
@@ -1391,7 +1391,7 @@ fn stale_pinned_validator_blocks_decision_before_mutation() {
             identity: identity('元'),
             candidate_sha256: hash,
             action: HumanBatchAction::Confirm,
-            reason: "decision under stale pinned validator".into(),
+            reason: "решение с устаревшим закреплённым валидатором".into(),
         },
     )
     .unwrap_err();
@@ -1407,7 +1407,7 @@ fn stale_pinned_validator_blocks_decision_before_mutation() {
             batch_id: "pinned".into(),
             character: "元".into(),
             sha256: None,
-            reason: "retry under stale pinned validator".into(),
+            reason: "повтор с устаревшим закреплённым валидатором".into(),
         },
         false,
     )
@@ -1427,7 +1427,7 @@ fn repeated_exact_confirm_passes_owner_attestation_after_external_reject() {
         identity: identity('元'),
         candidate_sha256: hash.clone(),
         action: HumanBatchAction::Confirm,
-        reason: "explicit current exact confirmation".into(),
+        reason: "явное подтверждение точных текущих байтов".into(),
     };
     decide_exact(&fixture.store, "repeat-confirm", decision.clone()).unwrap();
     fixture
@@ -1436,7 +1436,7 @@ fn repeated_exact_confirm_passes_owner_attestation_after_external_reject() {
             identity: identity('元'),
             expected_sha256: hash,
             decision: HumanDecision::Reject,
-            reason: "intervening independent owner rejection".into(),
+            reason: "параллельный независимый отказ владельца".into(),
         })
         .unwrap();
     let (state, issues) = decide_exact(&fixture.store, "repeat-confirm", decision).unwrap();

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 
+pub(crate) use crate::batch_runtime::{validate_batch_id, validate_hash};
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
 use crate::kanji_domain::parse_kanji_character;
@@ -20,9 +21,9 @@ use crate::model::{
     ValidationRecord, ValidatorIdentity,
 };
 
-#[path = "batch_runtime.rs"]
-mod runtime;
-pub use runtime::{
+#[cfg(test)]
+pub(crate) use crate::batch_runtime::REFERENCED_BLOB_READS as CANDIDATE_FILE_READS;
+pub use crate::batch_runtime::{
     MAX_RUNTIME_BLOB_BYTES, MAX_RUNTIME_STATE_BYTES, RuntimeBatchState, RuntimeBlobRef,
     SafeBatchRuntime,
 };
@@ -31,7 +32,7 @@ pub const BATCH_SCHEMA_VERSION: u32 = 1;
 pub const AGGREGATE_POLICY_VERSION: &str = "kanji-distinct-mean-v2";
 pub const MAX_ACQUISITION_ROUNDS: u32 = 5;
 pub(crate) const MAX_HUMAN_REASON_BYTES: usize = 4096;
-const MAX_STATE_BYTES: u64 = MAX_RUNTIME_STATE_BYTES;
+const MAX_REVIEW_HTML_BYTES: u64 = MAX_RUNTIME_STATE_BYTES;
 const MAX_CANDIDATE_BYTES: u64 = crate::kanji_validator::MAX_MEDIA_BYTES as u64;
 #[cfg(test)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -301,7 +302,7 @@ impl KanjiBatch {
             });
         }
         if items.is_empty() {
-            return Err(invalid("пакет должен содержать хотя бы один identity"));
+            return Err(invalid("пакет должен содержать хотя бы один идентификатор"));
         }
         Ok(Self {
             schema_version: BATCH_SCHEMA_VERSION,
@@ -440,7 +441,7 @@ impl KanjiBatch {
                 || decision.reason.len() > MAX_HUMAN_REASON_BYTES
             {
                 return Err(invalid(
-                    "отказ владельца не является семантическим Reject для точной identity и SHA-256",
+                    "отказ владельца не является семантическим Reject для точного идентификатора и SHA-256",
                 ));
             }
         }
@@ -508,7 +509,7 @@ impl KanjiBatch {
     ) -> Result<(), AssetError> {
         if !self.next_round().contains(identity) {
             return Err(invalid(
-                "identity отсутствует в текущей границе обхода по уровням",
+                "идентификатор отсутствует в текущей границе обхода по уровням",
             ));
         }
         validate_attempt_input(&result, &self.policy)?;
@@ -605,7 +606,7 @@ impl KanjiBatch {
             .items
             .iter()
             .find(|item| &item.identity == identity)
-            .ok_or_else(|| invalid("identity отсутствует в пакете"))?;
+            .ok_or_else(|| invalid("идентификатор отсутствует в пакете"))?;
         if item.status != BatchItemStatus::AutoVerified || !item.aggregate.accepted {
             return Ok(None);
         }
@@ -645,7 +646,7 @@ impl KanjiBatch {
         self.items
             .iter_mut()
             .find(|item| &item.identity == identity)
-            .ok_or_else(|| invalid("identity отсутствует в пакете"))
+            .ok_or_else(|| invalid("идентификатор отсутствует в пакете"))
     }
 
     /// Отказывает при подмене вычисленных свидетельств, неизвестной политике,
@@ -683,7 +684,7 @@ impl KanjiBatch {
                 )?;
             }
             if !identities.insert(&item.identity) {
-                return Err(invalid("повторяющаяся запрошенная identity"));
+                return Err(invalid("повторяющийся запрошенный идентификатор"));
             }
             let mut hashes = BTreeSet::new();
             let mut generations = std::collections::BTreeMap::<u32, u32>::new();
@@ -721,7 +722,9 @@ impl KanjiBatch {
                     || decision.reason.trim().is_empty()
                     || decision.reason.len() > MAX_HUMAN_REASON_BYTES
                 {
-                    return Err(invalid("недопустимы identity или причина решения человека"));
+                    return Err(invalid(
+                        "недопустимы идентификатор или причина решения человека",
+                    ));
                 }
                 validate_hash(&decision.candidate_sha256)?;
             }
@@ -841,6 +844,44 @@ impl RuntimeBatchState for KanjiBatch {
     fn maximum_blob_bytes(&self) -> u64 {
         MAX_CANDIDATE_BYTES
     }
+
+    fn blob_validation_context(&self, blob: &RuntimeBlobRef) -> Option<&str> {
+        find_candidate_for_blob(self, blob)
+            .map(|candidate| kanji_candidate_extension(candidate.format).unwrap_or("unsupported"))
+    }
+
+    fn validate_blob_bytes(&self, blob: &RuntimeBlobRef, bytes: &[u8]) -> Result<(), AssetError> {
+        let candidate = find_candidate_for_blob(self, blob)
+            .ok_or_else(|| invalid("ссылка на blob не связана с кандидатом пакета"))?;
+        if DetectedFormat::from_signature(bytes) != candidate.format {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "байты кандидата не соответствуют объявленному формату",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn find_candidate_for_blob<'a>(
+    batch: &'a KanjiBatch,
+    blob: &RuntimeBlobRef,
+) -> Option<&'a BatchCandidate> {
+    batch.items.iter().find_map(|item| {
+        item.existing_candidate
+            .iter()
+            .chain(
+                item.attempts
+                    .iter()
+                    .filter_map(|attempt| match &attempt.result {
+                        BatchAttemptInput::Candidate { candidate } => Some(candidate),
+                        BatchAttemptInput::Failed { .. } => None,
+                    }),
+            )
+            .find(|candidate| {
+                candidate.sha256 == blob.sha256 && candidate.storage_path == blob.storage_path
+            })
+    })
 }
 
 fn check_publication_source(item: &BatchItem, source: BatchTrustSource) -> Result<(), AssetError> {
@@ -1078,57 +1119,24 @@ fn validate_identity(identity: &AssetIdentity) -> Result<(), AssetError> {
     Ok(())
 }
 
-pub(crate) fn validate_batch_id(batch_id: &str) -> Result<(), AssetError> {
-    if batch_id.is_empty()
-        || batch_id.len() > 128
-        || !batch_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
-    {
-        return Err(invalid(
-            "batch_id должен содержать не более 128 символов из a-z, A-Z, 0-9, дефиса и подчёркивания",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_hash(hash: &str) -> Result<(), AssetError> {
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(invalid(
-            "SHA-256 должен содержать 64 строчных шестнадцатеричных символа",
-        ));
-    }
-    Ok(())
-}
-
 fn candidate_path(hash: &str, format: DetectedFormat) -> Result<String, AssetError> {
     validate_hash(hash)?;
-    let extension = match format {
-        DetectedFormat::Gif => "gif",
-        DetectedFormat::Png => "png",
-        _ => {
-            return Err(invalid(
-                "кандидат пакета кандзи должен иметь формат GIF или PNG",
-            ));
-        }
-    };
+    let extension = kanji_candidate_extension(format)
+        .ok_or_else(|| invalid("кандидат пакета кандзи должен иметь формат GIF или PNG"))?;
     Ok(format!("candidates/{hash}.{extension}"))
+}
+
+fn kanji_candidate_extension(format: DetectedFormat) -> Option<&'static str> {
+    match format {
+        DetectedFormat::Gif | DetectedFormat::Png => {
+            Some(crate::domain::extension_for_format(format))
+        }
+        _ => None,
+    }
 }
 
 fn invalid(message: impl Into<String>) -> AssetError {
     AssetError::new(ErrorCode::InvalidTransition, message)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Наблюдаемость регрессионного теста: сколько раз файл кандидата был фактически
-    /// прочитан. Счётчик локален для потока, поэтому параллельные тесты не влияют друг на друга.
-    pub(crate) static CANDIDATE_FILE_READS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
 }
 
 /// Kanji-адаптер над домен-независимым безопасным runtime.
@@ -1164,7 +1172,7 @@ impl BatchRuntime {
         state.validate()?;
         if state.batch_id != self.batch_id() {
             return Err(invalid(
-                "identity пакета проверки не совпадает с каталогом runtime-данных",
+                "идентификатор пакета проверки не совпадает с каталогом runtime-данных",
             ));
         }
         let mut html = String::from(
@@ -1264,17 +1272,17 @@ impl BatchRuntime {
             html.push_str("</article>");
         }
         html.push_str("</html>");
-        if html.len() as u64 > MAX_STATE_BYTES {
+        if html.len() as u64 > MAX_REVIEW_HTML_BYTES {
             return Err(invalid(
                 "HTML-страница проверки превышает ограничение runtime-данных; разделите пакет",
             ));
         }
         self.runtime
-            .write_artifact("review.html", html.as_bytes(), MAX_STATE_BYTES)
+            .write_artifact("review.html", html.as_bytes(), MAX_REVIEW_HTML_BYTES)
     }
 
     /// Байты сохраняются до записи состояния: прерывание оставит безопасный
-    /// orphan, который не становится доверенным и не мешает возобновить прежнее состояние.
+    /// осиротевший файл, который не становится доверенным и не мешает возобновить прежнее состояние.
     pub fn persist_candidate(
         &self,
         bytes: &[u8],
@@ -1293,18 +1301,15 @@ impl BatchRuntime {
         }
         let format = DetectedFormat::from_signature(bytes);
         let storage_path = candidate_path(&hash, format)?;
-        let extension = match format {
-            DetectedFormat::Gif => "gif",
-            DetectedFormat::Png => "png",
-            _ => unreachable!("candidate_path принимает только GIF и PNG"),
-        };
+        let extension =
+            kanji_candidate_extension(format).expect("candidate_path принимает только GIF и PNG");
         let blob = self
             .runtime
             .persist_blob_with_limit(bytes, extension, MAX_CANDIDATE_BYTES)?;
         if blob.sha256 != hash || blob.storage_path != storage_path {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "runtime blob не совпал с идентичностью Kanji-кандидата",
+                "blob runtime не совпал с идентификатором кандидата кандзи",
             ));
         }
         Ok(BatchCandidate {
@@ -1383,7 +1388,3 @@ fn review_format(format: DetectedFormat) -> &'static str {
 #[cfg(test)]
 #[path = "batch_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "batch_runtime_tests.rs"]
-mod runtime_tests;

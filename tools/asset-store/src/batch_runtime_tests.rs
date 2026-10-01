@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::batch::{RuntimeBatchState, RuntimeBlobRef, SafeBatchRuntime};
+use crate::batch_runtime::{RuntimeBatchState, RuntimeBlobRef, SafeBatchRuntime};
 use crate::error::{AssetError, ErrorCode};
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -52,7 +52,7 @@ impl RuntimeBatchState for PlainTextBatch {
         if self.schema_version != 1 || self.description.trim().is_empty() {
             return Err(AssetError::new(
                 ErrorCode::InvalidTransition,
-                "invalid plain-text fixture state",
+                "состояние тестовой текстовой партии недопустимо",
             ));
         }
         Ok(())
@@ -66,7 +66,7 @@ impl RuntimeBatchState for PlainTextBatch {
 #[test]
 fn generic_runtime_resumes_non_image_state_and_exact_blob_bytes() {
     let temporary = TemporaryDirectory::new();
-    let bytes = b"plain text fixture bytes, not an image";
+    let bytes = "обычный текст, не изображение".as_bytes();
     let state = {
         let mut runtime = SafeBatchRuntime::open(&temporary.0, "plain-text").unwrap();
         assert!(runtime.load::<PlainTextBatch>().unwrap().is_none());
@@ -75,7 +75,7 @@ fn generic_runtime_resumes_non_image_state_and_exact_blob_bytes() {
             schema_version: 1,
             batch_id: "plain-text".into(),
             revision: 1,
-            description: "domain-owned state with no image semantics".into(),
+            description: "состояние предметной партии без семантики изображений".into(),
             blob: Some(blob),
         };
         runtime.save(&state).unwrap();

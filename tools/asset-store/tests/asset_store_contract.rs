@@ -150,6 +150,54 @@ impl FixedValidator {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DuplicateConsumerPolicy;
+
+impl asset_store::AssetDomainPolicy for DuplicateConsumerPolicy {
+    fn domain_id(&self) -> &'static str {
+        "duplicate-test"
+    }
+
+    fn validate_identity(&self, identity: &AssetIdentity) -> Result<(), asset_store::AssetError> {
+        identity
+            .validate()
+            .map_err(|message| asset_store::AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        if identity.namespace != self.domain_id() {
+            return Err(asset_store::AssetError::new(
+                ErrorCode::InvalidIdentity,
+                "identity принадлежит другому тестовому домену",
+            ));
+        }
+        Ok(())
+    }
+
+    fn canonical_location(
+        &self,
+        identity: &AssetIdentity,
+        _sha256: &str,
+        format: DetectedFormat,
+    ) -> Result<asset_store::CanonicalAssetLocation, asset_store::AssetError> {
+        self.validate_identity(identity)?;
+        let extension = asset_store::domain::extension_for_format(format);
+        Ok(asset_store::CanonicalAssetLocation {
+            storage_path: format!("assets/{}.{}", identity.key, extension),
+            consumer_filename: format!("shared.{extension}"),
+        })
+    }
+
+    fn is_publishable_format(&self, format: DetectedFormat) -> bool {
+        format == DetectedFormat::Gif
+    }
+
+    fn max_asset_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    fn content_addressed_storage(&self) -> bool {
+        false
+    }
+}
+
 impl SemanticValidator for FixedValidator {
     fn identity(&self) -> ValidatorIdentity {
         self.identity.clone()
@@ -970,6 +1018,42 @@ fn pitch_accent_policy_never_verifies_non_png_even_with_a_permissive_validator()
     assert_eq!(records[0].lifecycle, LifecycleState::Pending);
 }
 
+#[test]
+fn wrong_domain_schema_v5_open_does_not_create_runtime_or_poison_owner() {
+    let temp = TempDir::new("wrong-domain-v5-open");
+    let root = temp.path().join("pitch-accent");
+    let store =
+        AssetStore::open_with_policy(StoreOptions::new(&root), PitchAccentDomainPolicy).unwrap();
+    drop(store);
+
+    let manifest_path = root.join("manifest.json");
+    let owner_path = root.join(".owner.json");
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let owner_before = fs::read(&owner_path).unwrap();
+    fs::remove_dir_all(root.join(".runtime")).unwrap();
+    fs::remove_file(root.join(".lock")).unwrap();
+    assert_eq!(fs::read_dir(root.join(".tmp")).unwrap().count(), 0);
+
+    let error = match AssetStore::open_with_policy(
+        StoreOptions::new(&root),
+        asset_store::KanjiDomainPolicy,
+    ) {
+        Ok(_) => panic!("несовместимая policy не должна открыть pitch-accent store"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::ManifestCorrupt);
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(&owner_path).unwrap(), owner_before);
+    assert!(!root.join(".runtime").exists());
+    assert!(!root.join(".lock").exists());
+    assert_eq!(fs::read_dir(root.join(".tmp")).unwrap().count(), 0);
+
+    let reopened =
+        AssetStore::open_existing_with_policy(StoreOptions::new(&root), PitchAccentDomainPolicy)
+            .unwrap();
+    assert!(reopened.verify_integrity().unwrap().is_empty());
+}
+
 fn synthetic_png() -> Vec<u8> {
     let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([24, 36, 48, 255]));
     let mut output = Cursor::new(Vec::new());
@@ -1044,6 +1128,20 @@ fn flat_kanji_schema_v3_v4_migrate_without_reacquisition_or_trust_loss() {
         fs::remove_file(root.join(".lock")).unwrap();
         fs::remove_dir_all(root.join(".runtime")).unwrap();
 
+        let owner_path = root.join(".owner.json");
+        let owner_before = fs::read(&owner_path).unwrap();
+        let error =
+            match AssetStore::open_with_policy(StoreOptions::new(&root), PitchAccentDomainPolicy) {
+                Ok(_) => panic!("новый domain не должен присваивать себе legacy Kanji store"),
+                Err(error) => error,
+            };
+        assert_eq!(error.code, ErrorCode::UnsupportedSchemaVersion);
+        assert_eq!(fs::read(&manifest_path).unwrap(), legacy_bytes);
+        assert_eq!(fs::read(&owner_path).unwrap(), owner_before);
+        assert!(!root.join(".runtime").exists());
+        assert!(!root.join(".lock").exists());
+        assert_eq!(fs::read_dir(root.join(".tmp")).unwrap().count(), 0);
+
         let read_only = AssetStore::read_verified_with_policy(
             &root,
             std::slice::from_ref(&identity),
@@ -1081,7 +1179,150 @@ fn flat_kanji_schema_v3_v4_migrate_without_reacquisition_or_trust_loss() {
 }
 
 #[test]
-fn duplicate_consumer_filename_and_cross_domain_identity_are_rejected() {
+fn empty_legacy_schema_v4_is_kanji_only_and_migrates_once() {
+    let temp = TempDir::new("empty-legacy-v4");
+    let root = temp.path().join("store");
+    let store = open_kanji_store(&root);
+    drop(store);
+
+    let manifest_path = root.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["schema_version"] = serde_json::json!(4);
+    manifest.as_object_mut().unwrap().remove("domain_id");
+    manifest["assets"] = serde_json::json!([]);
+    let legacy_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    fs::write(&manifest_path, &legacy_bytes).unwrap();
+    fs::remove_dir_all(root.join(".runtime")).unwrap();
+    fs::remove_file(root.join(".lock")).unwrap();
+    let owner_before = fs::read(root.join(".owner.json")).unwrap();
+
+    let error =
+        match AssetStore::open_with_policy(StoreOptions::new(&root), PitchAccentDomainPolicy) {
+            Ok(_) => panic!("пустой legacy manifest остаётся Kanji compatibility path"),
+            Err(error) => error,
+        };
+    assert_eq!(error.code, ErrorCode::UnsupportedSchemaVersion);
+    assert_eq!(fs::read(&manifest_path).unwrap(), legacy_bytes);
+    assert_eq!(fs::read(root.join(".owner.json")).unwrap(), owner_before);
+    assert!(!root.join(".runtime").exists());
+    assert!(!root.join(".lock").exists());
+
+    let migrated = AssetStore::open_kanji_existing(StoreOptions::new(&root)).unwrap();
+    assert!(migrated.layout_migrated_on_open());
+    let migrated_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(migrated_manifest["schema_version"], serde_json::json!(5));
+    assert_eq!(migrated_manifest["domain_id"], "kanji");
+    drop(migrated);
+
+    let reopened = AssetStore::open_kanji_existing(StoreOptions::new(&root)).unwrap();
+    assert!(!reopened.layout_migrated_on_open());
+    assert!(reopened.verify_integrity().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_runtime_overlay_v4_migrates_and_recovers_interrupted_target() {
+    let temp = TempDir::new("legacy-runtime-v4");
+    let root = temp.path().join("store");
+    let identity = AssetIdentity::new("kanji", "裏").unwrap();
+    let store = open_kanji_store(&root);
+    let candidate = ingest(
+        &store,
+        identity.clone(),
+        temp.write("candidate.gif", b"GIF89a runtime migration candidate"),
+    )
+    .asset;
+    store
+        .validate(
+            SelectionMode::Full,
+            &FixedValidator::new(SemanticStatus::Uncertain),
+        )
+        .unwrap();
+    let quarantined = store
+        .verify_integrity()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.identity == identity)
+        .unwrap();
+    assert_eq!(quarantined.lifecycle, LifecycleState::Quarantined);
+    assert!(quarantined.validation.is_some());
+    assert_eq!(quarantined.sha256, candidate.sha256);
+    drop(store);
+
+    let runtime = root.join(".runtime");
+    let old_path = runtime.join("assets/裏.gif");
+    let new_path = runtime.join("assets/gif/裏.gif");
+    fs::rename(runtime.join(&quarantined.storage_path), &old_path).unwrap();
+    fs::remove_dir(runtime.join("assets/gif")).unwrap();
+
+    let runtime_manifest_path = runtime.join("manifest.json");
+    let mut runtime_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&runtime_manifest_path).unwrap()).unwrap();
+    runtime_manifest["schema_version"] = serde_json::json!(4);
+    runtime_manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("domain_id");
+    runtime_manifest["assets"][0]["storage_path"] = serde_json::json!("assets/裏.gif");
+    runtime_manifest["assets"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("consumer_filename");
+    fs::write(
+        &runtime_manifest_path,
+        serde_json::to_vec_pretty(&runtime_manifest).unwrap(),
+    )
+    .unwrap();
+
+    // Имитируем прерывание после подготовки вложенной жёсткой ссылки, но до
+    // сохранения manifest. Восстановление должно удалить целевой файл, после
+    // чего миграция безопасно завершит перенос из прежнего плоского пути.
+    fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+    fs::hard_link(&old_path, &new_path).unwrap();
+    let marker = serde_json::json!({
+        "schema_version": 1,
+        "store_id": runtime_manifest["store_id"],
+        "domain_id": "kanji",
+        "source_schema_version": 4,
+        "entries": [{
+            "identity": identity,
+            "sha256": quarantined.sha256,
+            "format": "gif",
+            "old_path": "assets/裏.gif",
+            "new_path": "assets/gif/裏.gif",
+            "consumer_filename": "裏.gif"
+        }]
+    });
+    fs::write(
+        runtime.join(".tmp/layout-migration.json"),
+        serde_json::to_vec_pretty(&marker).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(root.join(".lock")).unwrap();
+
+    let migrated = AssetStore::open_kanji_existing(StoreOptions::new(&root)).unwrap();
+    assert!(migrated.layout_migrated_on_open());
+    let records = migrated.verify_integrity().unwrap();
+    assert_eq!(records.as_slice(), std::slice::from_ref(&quarantined));
+    assert_eq!(records[0].lifecycle, LifecycleState::Quarantined);
+    assert_eq!(records[0].validation, quarantined.validation);
+    assert!(!old_path.exists());
+    assert!(new_path.is_file());
+    assert_eq!(
+        fs::read(&new_path).unwrap(),
+        b"GIF89a runtime migration candidate"
+    );
+    assert!(!runtime.join(".tmp/layout-migration.json").exists());
+    drop(migrated);
+
+    let reopened = AssetStore::open_kanji_existing(StoreOptions::new(&root)).unwrap();
+    assert!(!reopened.layout_migrated_on_open());
+    assert_eq!(reopened.verify_integrity().unwrap(), records);
+}
+
+#[test]
+fn cross_domain_identity_is_rejected() {
     let temp = TempDir::new("duplicate-consumer-filename");
     let root = temp.path().join("store");
     let store = open_kanji_store(&root);
@@ -1114,19 +1355,33 @@ fn duplicate_consumer_filename_and_cross_domain_identity_are_rejected() {
         .unwrap_err();
     assert_eq!(cross_domain.code, ErrorCode::InvalidIdentity);
     drop(store);
-    assert!(AssetStore::open_existing(StoreOptions::new(&root)).is_err());
+    assert!(AssetStore::open_kanji_existing(StoreOptions::new(&root)).is_ok());
+}
 
-    let store = open_kanji_store(&root);
-    let manifest_path = root.join("manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    let filename = manifest["assets"][0]["consumer_filename"].clone();
-    manifest["assets"][1]["consumer_filename"] = filename;
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
+#[test]
+fn duplicate_consumer_filename_reaches_manifest_dedup_guard() {
+    let temp = TempDir::new("duplicate-consumer-filename");
+    let root = temp.path().join("store");
+    let store =
+        AssetStore::open_with_policy(StoreOptions::new(&root), DuplicateConsumerPolicy).unwrap();
+    for key in ["first", "second"] {
+        store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: AssetIdentity::new("duplicate-test", key).unwrap(),
+                    bytes: [b"GIF89a".as_slice(), key.as_bytes()].concat(),
+                    provenance: Provenance {
+                        source_kind: "fixture".into(),
+                        source_name: format!("{key}.gif"),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                &FixedValidator::new(SemanticStatus::Verified),
+            )
+            .unwrap();
+    }
+
     assert_eq!(
         store.verify_integrity().unwrap_err().code,
         ErrorCode::ManifestCorrupt

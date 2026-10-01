@@ -19,10 +19,6 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
 
-#[cfg(test)]
-use super::CANDIDATE_FILE_READS;
-use super::{validate_batch_id, validate_hash};
-
 /// Максимальный размер сохранённого состояния одного пакета.
 pub const MAX_RUNTIME_STATE_BYTES: u64 = 64 * 1024 * 1024;
 /// Общий предел одного blob; конкретный домен может применять более строгий предел.
@@ -45,12 +41,24 @@ pub trait RuntimeBatchState: Serialize + DeserializeOwned {
     fn maximum_blob_bytes(&self) -> u64 {
         MAX_RUNTIME_BLOB_BYTES
     }
+
+    /// Непрозрачный ключ контекста проверки содержимого для конкретной ссылки.
+    /// Он входит в кэш runtime и должен меняться, если меняется ожидаемое
+    /// предметное свойство байтов. `None` означает, что дополнительной проверки нет.
+    fn blob_validation_context(&self, _blob: &RuntimeBlobRef) -> Option<&str> {
+        None
+    }
+
+    /// Проверяет предметные свойства байтов после проверки пути, размера и SHA-256.
+    fn validate_blob_bytes(&self, _blob: &RuntimeBlobRef, _bytes: &[u8]) -> Result<(), AssetError> {
+        Ok(())
+    }
 }
 
-/// Ссылка на content-addressed blob внутри каталога пакета.
+/// Ссылка на blob, путь к которому вычисляется по SHA-256, внутри каталога пакета.
 ///
 /// `storage_path` сохраняет существующую форму `candidates/<sha256>.<ext>`;
-/// расширение ограничено безопасным filename token и не влияет на проверку SHA.
+/// расширение ограничено безопасным токеном имени файла и не влияет на проверку SHA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeBlobRef {
@@ -67,7 +75,7 @@ pub struct SafeBatchRuntime {
     batch_id: String,
     loaded_revision: Option<u64>,
     directory_path: PathBuf,
-    verified_blob_keys: BTreeSet<String>,
+    verified_blob_keys: BTreeSet<(String, String, u64, Option<String>)>,
 }
 
 impl SafeBatchRuntime {
@@ -120,10 +128,10 @@ impl SafeBatchRuntime {
         state.validate()?;
         if state.batch_id() != self.batch_id {
             return Err(invalid(
-                "identity пакета не совпадает с каталогом runtime-данных",
+                "идентификатор пакета не совпадает с каталогом runtime-данных",
             ));
         }
-        self.verify_referenced_blobs(&state)?;
+        self.verify_referenced_blobs(&state, true)?;
         self.loaded_revision = Some(state.revision());
         Ok(Some(state))
     }
@@ -135,7 +143,7 @@ impl SafeBatchRuntime {
         state.validate()?;
         if state.batch_id() != self.batch_id {
             return Err(invalid(
-                "identity пакета не совпадает с каталогом runtime-данных",
+                "идентификатор пакета не совпадает с каталогом runtime-данных",
             ));
         }
         if let Some(revision) = self.loaded_revision {
@@ -153,7 +161,7 @@ impl SafeBatchRuntime {
                 Err(error) => return Err(error),
             }
         }
-        self.verify_referenced_blobs(state)?;
+        self.verify_referenced_blobs(state, false)?;
         let bytes = serde_json::to_vec_pretty(state).map_err(|error| invalid(error.to_string()))?;
         if bytes.len() as u64 > MAX_RUNTIME_STATE_BYTES {
             return Err(invalid(
@@ -170,7 +178,7 @@ impl SafeBatchRuntime {
         Ok(())
     }
 
-    /// Сохраняет content-addressed blob. Повторная запись того же SHA допускается
+    /// Сохраняет blob по пути, вычисленному из SHA-256. Повторная запись того же SHA допускается
     /// только при совпадении байтов. Runtime сохраняет прежний layout candidates/.
     pub fn persist_blob(
         &self,
@@ -194,7 +202,7 @@ impl SafeBatchRuntime {
         let storage_path = format!("candidates/{sha256}.{extension}");
         let name = storage_path
             .strip_prefix("candidates/")
-            .expect("runtime path создаётся с фиксированным префиксом");
+            .expect("путь runtime создаётся с фиксированным префиксом");
         match read_file(&self.blobs, name, maximum) {
             Ok(existing) if existing == bytes => {}
             Ok(_) => {
@@ -214,7 +222,7 @@ impl SafeBatchRuntime {
         })
     }
 
-    /// Возвращает байты только после проверки path, regular-file, размера и SHA.
+    /// Возвращает байты только после проверки пути, обычного файла, размера и SHA.
     pub fn read_blob(&self, blob: &RuntimeBlobRef) -> Result<Vec<u8>, AssetError> {
         self.read_blob_with_limit(blob, MAX_RUNTIME_BLOB_BYTES)
     }
@@ -229,7 +237,7 @@ impl SafeBatchRuntime {
         }
         let name = validate_blob_ref(blob)?;
         #[cfg(test)]
-        CANDIDATE_FILE_READS.with(|reads| reads.set(reads.get() + 1));
+        REFERENCED_BLOB_READS.with(|reads| reads.set(reads.get() + 1));
         let bytes = read_file(&self.blobs, name, maximum)?;
         if sha256_hex(&bytes) != blob.sha256 {
             return Err(AssetError::new(
@@ -259,15 +267,25 @@ impl SafeBatchRuntime {
     fn verify_referenced_blobs<S: RuntimeBatchState>(
         &mut self,
         state: &S,
+        force_recheck: bool,
     ) -> Result<(), AssetError> {
+        let mut checked_in_this_pass = BTreeSet::new();
         for blob in state.referenced_blobs() {
             let key = validate_blob_ref(&blob)?.to_owned();
             let maximum = state.maximum_blob_bytes();
-            let cache_key = format!("{}|{}|{}", key, blob.sha256, maximum);
-            if self.verified_blob_keys.contains(&cache_key) {
+            let cache_key = (
+                key,
+                blob.sha256.clone(),
+                maximum,
+                state.blob_validation_context(&blob).map(str::to_owned),
+            );
+            if !checked_in_this_pass.insert(cache_key.clone())
+                || (!force_recheck && self.verified_blob_keys.contains(&cache_key))
+            {
                 continue;
             }
-            self.read_blob_with_limit(&blob, maximum)?;
+            let bytes = self.read_blob_with_limit(&blob, maximum)?;
+            state.validate_blob_bytes(&blob, &bytes)?;
             self.verified_blob_keys.insert(cache_key);
         }
         Ok(())
@@ -296,7 +314,7 @@ fn validate_extension(extension: &str) -> Result<(), AssetError> {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
     {
         return Err(invalid(
-            "расширение blob должно быть безопасным filename token",
+            "расширение blob должно быть безопасным токеном имени файла",
         ));
     }
     Ok(())
@@ -436,10 +454,44 @@ fn invalid(message: impl Into<String>) -> AssetError {
     AssetError::new(ErrorCode::InvalidTransition, message)
 }
 
+pub(crate) fn validate_batch_id(batch_id: &str) -> Result<(), AssetError> {
+    if batch_id.is_empty()
+        || batch_id.len() > 128
+        || !batch_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    {
+        return Err(invalid(
+            "batch_id должен содержать не более 128 символов из a-z, A-Z, 0-9, дефиса и подчёркивания",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_hash(hash: &str) -> Result<(), AssetError> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "SHA-256 должен содержать 64 строчных шестнадцатеричных символа",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Счётчик чтения blob-файлов для проверок ограниченного числа обращений к диску.
+    pub(crate) static REFERENCED_BLOB_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 fn path_error() -> AssetError {
     AssetError::new(
         ErrorCode::PathTraversal,
-        "ссылка runtime blob должна совпадать с content-addressed path",
+        "ссылка на blob runtime должна совпадать с путём, вычисленным по SHA-256",
     )
 }
 

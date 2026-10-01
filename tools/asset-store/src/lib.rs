@@ -8,6 +8,7 @@
 compile_error!("asset-store currently supports Linux only");
 
 pub mod batch;
+pub mod batch_runtime;
 pub mod browser_runtime;
 pub mod cli;
 pub mod domain;
@@ -22,6 +23,10 @@ pub mod selection;
 pub mod store;
 pub mod validation;
 pub mod yarxi;
+
+#[cfg(test)]
+#[path = "batch_runtime_tests.rs"]
+mod batch_runtime_tests;
 
 pub use browser_runtime::{
     BrowserExecutableSelection, BrowserExecutableSource, BrowserRuntimeConfig,

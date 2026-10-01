@@ -325,7 +325,7 @@ impl Routing {
                 .as_ref()
                 .and_then(|p| p.note_models.iter().find(|m| m.crowdanki_uuid == uuid))
                 .and_then(|m| m.fields.get(field))
-                .expect("enabled field has a configured processor chain")
+                .expect("для включённого поля настроена цепочка обработчиков")
                 .processors;
             let processors = chain
                 .iter()
@@ -605,33 +605,17 @@ impl MediaPlan {
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 fn verified_asset_filename(asset: &VerifiedAssetBytes) -> Result<&str, DomainError> {
     let filename = asset.record.consumer_filename.as_str();
-    let extension = consumer_extension(asset.record.format).ok_or_else(|| {
-        crate::ops::source::internal("проверенное хранилище вернуло неподдерживаемый формат media")
-    })?;
     let detected_format = DetectedFormat::from_signature(&asset.bytes);
-    if asset_store::domain::validate_safe_consumer_filename(filename, asset.record.format).is_err()
+    if asset.record.format == DetectedFormat::Unknown
+        || asset_store::domain::validate_safe_consumer_filename(filename, asset.record.format)
+            .is_err()
         || detected_format != asset.record.format
-        || filename
-            .rsplit_once('.')
-            .is_none_or(|(stem, actual)| stem.is_empty() || actual != extension)
     {
         return Err(crate::ops::source::internal(
-            "проверенное хранилище вернуло небезопасное или несогласованное consumer filename",
+            "проверенное хранилище вернуло небезопасное или несогласованное имя файла для потребителя",
         ));
     }
     Ok(filename)
-}
-
-fn consumer_extension(format: DetectedFormat) -> Option<&'static str> {
-    match format {
-        DetectedFormat::Png => Some("png"),
-        DetectedFormat::Jpeg => Some("jpg"),
-        DetectedFormat::Gif => Some("gif"),
-        DetectedFormat::Webp => Some("webp"),
-        DetectedFormat::Bmp => Some("bmp"),
-        DetectedFormat::Tiff => Some("tiff"),
-        DetectedFormat::Unknown => None,
-    }
 }
 
 fn io_failure(e: impl std::fmt::Display) -> DomainError {

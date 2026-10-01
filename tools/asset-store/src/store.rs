@@ -385,6 +385,14 @@ impl AssetStore {
                 "store root не содержит инициализированный asset store",
             ));
         }
+        // Для существующего хранилища сначала проверяем совместимость
+        // канонического manifest с запрошенной политикой. До этой проверки
+        // нельзя создавать lock-файл, `.runtime` или восстанавливать
+        // транзакции: открытие чужого хранилища не должно менять его состояние.
+        if state == RootState::Owned {
+            let manifest = load_manifest(&root_handle)?;
+            ensure_store_domain(&manifest, policy.as_ref())?;
+        }
         let lock = match state {
             RootState::NewlyCreated | RootState::ExistingEmpty => create_lock_file(&root_handle)?,
             RootState::Owned => open_lock_file(&root_handle, true)?,
@@ -406,7 +414,7 @@ impl AssetStore {
         let runtime_handle = open_or_initialize_runtime(
             &root_handle,
             &canonical_manifest.store_id,
-            policy.domain_id(),
+            policy.as_ref(),
         )?;
         recover_publications(&root_handle, policy.as_ref())?;
         recover_publications(&runtime_handle, policy.as_ref())?;
@@ -485,12 +493,13 @@ impl AssetStore {
         self.initialized_on_open
     }
 
-    /// True, если mutating open завершил versioned schema/storage migration.
+    /// Истина, если открытие с изменением состояния завершило перенос схемы
+    /// или расположения ресурсов.
     pub const fn layout_migrated_on_open(&self) -> bool {
         self.layout_migrated_on_open
     }
 
-    /// True when opening created the store or performed a legacy layout migration.
+    /// Истина, если открытие создало хранилище или перенесло ресурсы из старой схемы.
     pub const fn did_mutate_on_open(&self) -> bool {
         self.initialized_on_open || self.layout_migrated_on_open
     }
@@ -524,9 +533,9 @@ impl AssetStore {
         Self::read_verified_with_policy(root, identities, expected_validator, &KanjiDomainPolicy)
     }
 
-    /// Read-only variant for an explicit domain. It never performs manifest or
-    /// filesystem migration; legacy v3/v4 stores are interpreted through the
-    /// policy's read-only legacy layout mapping.
+    /// Вариант только для чтения с явно указанным доменом. Он не изменяет
+    /// manifest и файловую систему; хранилища v3/v4 читаются по правилам
+    /// расположения старой схемы, заданным политикой домена.
     pub fn read_verified_with_policy(
         root: impl AsRef<Path>,
         identities: &[AssetIdentity],
@@ -1742,8 +1751,8 @@ fn initialize_or_load(root: &File, state: RootState, domain_id: &str) -> Result<
             Ok(true)
         }
         RootState::Owned => {
-            // Missing internal directories may be repaired only after both
-            // independent ownership files have been validated.
+            // Внутренние каталоги можно восстановить только после проверки
+            // канонического manifest для запрошенного домена.
             ensure_dir_entry(root, ASSETS_DIR)?;
             ensure_dir_entry(root, TEMP_DIR)?;
             Ok(false)
@@ -1754,7 +1763,7 @@ fn initialize_or_load(root: &File, state: RootState, domain_id: &str) -> Result<
 fn open_or_initialize_runtime(
     root: &File,
     store_id: &str,
-    domain_id: &str,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<File, AssetError> {
     let runtime = ensure_dir_entry(root, RUNTIME_DIR)?;
     let names = inspect_area_top_level(&runtime, ErrorCode::StoreNotOwned, true)?;
@@ -1764,7 +1773,7 @@ fn open_or_initialize_runtime(
         write_owner_marker(&runtime, store_id)?;
         save_manifest(
             &runtime,
-            &Manifest::empty_for_domain(store_id.to_owned(), domain_id),
+            &Manifest::empty_for_domain(store_id.to_owned(), policy.domain_id()),
             true,
         )?;
     } else {
@@ -1783,6 +1792,7 @@ fn open_or_initialize_runtime(
         }
         let manifest = load_runtime_manifest(&runtime, store_id)?;
         check_schema(&manifest)?;
+        ensure_store_domain(&manifest, policy)?;
         ensure_dir_entry(&runtime, ASSETS_DIR)?;
         ensure_dir_entry(&runtime, TEMP_DIR)?;
     }
@@ -1794,6 +1804,20 @@ fn ensure_store_domain(
     manifest: &Manifest,
     policy: &dyn AssetDomainPolicy,
 ) -> Result<(), AssetError> {
+    if manifest.schema_version < MANIFEST_SCHEMA_VERSION && !policy.supports_legacy_schema() {
+        return Err(AssetError::with_details(
+            ErrorCode::UnsupportedSchemaVersion,
+            format!(
+                "domain {} не может открывать legacy schema {}",
+                policy.domain_id(),
+                manifest.schema_version
+            ),
+            serde_json::json!({
+                "store_schema_version": manifest.schema_version,
+                "requested_domain": policy.domain_id(),
+            }),
+        ));
+    }
     if manifest.schema_version >= MANIFEST_SCHEMA_VERSION
         && manifest.domain_id != policy.domain_id()
     {
@@ -1872,7 +1896,7 @@ fn migrate_layout(
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 format!(
-                    "legacy storage_path не совпадает с layout policy для {}",
+                    "storage_path старой схемы не совпадает с расположением, заданным политикой для {}",
                     record.identity
                 ),
             ));
@@ -1882,7 +1906,7 @@ fn migrate_layout(
         {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
-                "migration выявила повторяющийся canonical path или consumer filename",
+                "миграция обнаружила повторяющийся канонический путь или consumer filename",
             ));
         }
         entries.push(LayoutMigrationEntry {
@@ -1916,7 +1940,7 @@ fn migrate_layout(
         if hash_file(old)?.0 != entry.sha256 {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "legacy asset изменился до storage-layout migration",
+                "ресурс прежней схемы изменился до переноса в новое расположение",
             ));
         }
         let (new_parent, new_name) = open_storage_parent(root, &entry.new_path, true)?;
@@ -1925,7 +1949,7 @@ fn migrate_layout(
                 if hash_file(existing)?.0 != entry.sha256 {
                     return Err(AssetError::new(
                         ErrorCode::IdentityConflict,
-                        "целевой canonical path уже занят другими bytes при migration",
+                        "целевой канонический путь уже занят другими байтами при миграции",
                     ));
                 }
             }
@@ -1948,13 +1972,13 @@ fn migrate_layout(
                         if hash_file(existing)?.0 != entry.sha256 {
                             return Err(AssetError::new(
                                 ErrorCode::IdentityConflict,
-                                "целевой canonical path изменился во время migration",
+                                "целевой канонический путь изменился во время миграции",
                             ));
                         }
                     }
                     Err(link_error) => {
                         return Err(AssetError::io(
-                            "не удалось подготовить nested asset path для migration",
+                            "не удалось подготовить вложенный путь ресурса для миграции",
                             std::io::Error::from(link_error),
                         ));
                     }
@@ -1975,7 +1999,7 @@ fn migrate_layout(
     migrated.revision = migrated.revision.checked_add(1).ok_or_else(|| {
         AssetError::new(
             ErrorCode::ManifestCorrupt,
-            "manifest revision переполнен при migration",
+            "счётчик revision в manifest переполнен при миграции",
         )
     })?;
     save_manifest(root, &migrated, false)?;
@@ -1999,7 +2023,7 @@ fn recover_layout_migration(root: &File, policy: &dyn AssetDomainPolicy) -> Resu
         serde_json::from_reader(marker).map_err(|error| {
             AssetError::new(
                 ErrorCode::ManifestCorrupt,
-                format!("layout migration marker повреждён: {error}"),
+                format!("маркер переноса расположения повреждён: {error}"),
             )
         })?;
     if transaction.schema_version != 1
@@ -2009,14 +2033,14 @@ fn recover_layout_migration(root: &File, policy: &dyn AssetDomainPolicy) -> Resu
     {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
-            "layout migration marker содержит неизвестную schema/domain",
+            "маркер переноса расположения содержит неизвестную schema/domain",
         ));
     }
     let manifest = load_owned_manifest(root)?;
     if manifest.store_id != transaction.store_id {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
-            "layout migration marker указывает на другой store_id",
+            "маркер переноса расположения указывает на другой store_id",
         ));
     }
     let committed = manifest.schema_version >= MANIFEST_SCHEMA_VERSION
@@ -2026,7 +2050,7 @@ fn recover_layout_migration(root: &File, policy: &dyn AssetDomainPolicy) -> Resu
     if !committed && !rolling_back {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
-            "layout migration marker не согласован с текущим manifest",
+            "маркер переноса расположения не согласован с текущим manifest",
         ));
     }
     let mut seen_new_paths = BTreeSet::new();
@@ -2050,7 +2074,7 @@ fn recover_layout_migration(root: &File, policy: &dyn AssetDomainPolicy) -> Resu
         {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
-                "migration marker содержит path/name, не вычисляемые из domain policy",
+                "маркер миграции содержит путь или имя, не вычисляемые из domain policy",
             ));
         }
         crate::domain::validate_safe_consumer_filename(&entry.consumer_filename, entry.format)?;
@@ -2063,13 +2087,18 @@ fn recover_layout_migration(root: &File, policy: &dyn AssetDomainPolicy) -> Resu
                         "после manifest commit отсутствует migrated asset bytes",
                     ));
                 }
-                remove_storage_path_if_hash(root, &entry.old_path, &entry.sha256, "legacy asset")?;
+                remove_storage_path_if_hash(
+                    root,
+                    &entry.old_path,
+                    &entry.sha256,
+                    "ресурс прежней схемы",
+                )?;
             } else {
                 remove_storage_path_if_hash(
                     root,
                     &entry.new_path,
                     &entry.sha256,
-                    "migration target",
+                    "целевой ресурс миграции",
                 )?;
                 prune_empty_storage_directories(root, &entry.new_path)?;
             }
@@ -2080,7 +2109,7 @@ fn recover_layout_migration(root: &File, policy: &dyn AssetDomainPolicy) -> Resu
     sync_directory(&temporary)
 }
 
-/// Classifies root without creating files or directories.
+/// Определяет состояние корня, не создавая файлы и каталоги.
 fn preflight_root_ownership(root: &File, root_created: bool) -> Result<RootState, AssetError> {
     let names = inspect_top_level(root, ErrorCode::StoreNotOwned)?;
     if names.is_empty() {
@@ -3220,7 +3249,9 @@ fn scan_asset_directory(
         let file = open_regular_at(directory, &name, ErrorCode::MissingAssetFile)?;
         let (actual_hash, _, format) = hash_file(file)?;
         if registered_paths.contains(&path) {
-            if extension_for_format(format) != component.rsplit('.').next().unwrap_or("") {
+            if crate::domain::extension_for_format(format)
+                != component.rsplit('.').next().unwrap_or("")
+            {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
                     format!("asset {path} не соответствует формату в manifest"),
@@ -3247,15 +3278,10 @@ fn scan_asset_directory(
                 format!("неизвестный файл в canonical asset store: {path}"),
             ));
         };
-        if policy.is_reserved_orphan_filename(&component) {
-            return Err(AssetError::new(
-                ErrorCode::UnexpectedPath,
-                format!("имя orphan asset запрещено domain policy: {path}"),
-            ));
-        }
         validate_hash(hash)?;
         if actual_hash != hash
-            || extension_for_format(format) != component.rsplit('.').next().unwrap_or("")
+            || crate::domain::extension_for_format(format)
+                != component.rsplit('.').next().unwrap_or("")
         {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
@@ -3480,26 +3506,8 @@ fn read_bounded_asset_bytes(
     Ok(bytes)
 }
 
-fn extension_for_format(format: DetectedFormat) -> &'static str {
-    match format {
-        DetectedFormat::Png => "png",
-        DetectedFormat::Jpeg => "jpg",
-        DetectedFormat::Gif => "gif",
-        DetectedFormat::Webp => "webp",
-        DetectedFormat::Bmp => "bmp",
-        DetectedFormat::Tiff => "tiff",
-        DetectedFormat::Unknown => "bin",
-    }
-}
-
 fn embedded_content_hash(filename: &str) -> Option<&str> {
-    let (stem, extension) = filename.rsplit_once('.')?;
-    if !matches!(
-        extension,
-        "png" | "jpg" | "gif" | "webp" | "bmp" | "tiff" | "bin"
-    ) {
-        return None;
-    }
+    let (stem, _) = filename.rsplit_once('.')?;
     let (_, hash) = stem.rsplit_once('-')?;
     (hash.len() == 64).then_some(hash)
 }

@@ -1,4 +1,4 @@
-//! Domain policy для canonical asset location и consumer-facing имён.
+//! Политики доменов для канонического расположения ресурсов и имён для потребителей.
 
 use std::path::{Component, Path};
 
@@ -7,29 +7,33 @@ use crate::hashing::sha256_hex;
 use crate::kanji_domain::parse_kanji_character;
 use crate::model::{AssetIdentity, AssetRecord, DetectedFormat};
 
-const KANJI_MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
+/// Пространства имён, принадлежащие предметным доменам публикации.
+///
+/// Этот статический список используется общей политикой, чтобы она не могла
+/// принять идентификатор, закреплённый за одной из предметных политик.
+const PUBLISHABLE_DOMAIN_NAMESPACES: &[&str] = &["kanji", "pitch_accent"];
 
-/// Внутреннее расположение asset и имя, которое получает конечный consumer.
+/// Внутреннее расположение ресурса и имя, которое получает конечный потребитель.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalAssetLocation {
     pub storage_path: String,
     pub consumer_filename: String,
 }
 
-/// Правила одного независимого asset domain.
+/// Правила одного независимого домена ресурсов.
 ///
-/// Реализации отвечают за identity, допустимый формат и детерминированный
-/// canonical layout. `legacy_location` используется только для чтения и
-/// миграции старых manifest; новые записи всегда строятся через
+/// Реализации отвечают за identity, допустимый формат и детерминированное
+/// каноническое расположение. `legacy_location` используется только для чтения
+/// и миграции старых манифестов; новые записи всегда строятся через
 /// `canonical_location`.
 pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
-    /// Стабильный идентификатор domain, сохраняемый вместе со store.
+    /// Стабильный идентификатор домена, сохраняемый вместе с хранилищем.
     fn domain_id(&self) -> &'static str;
 
-    /// Проверяет принадлежность identity этому domain.
+    /// Проверяет принадлежность идентификатора этому домену.
     fn validate_identity(&self, identity: &AssetIdentity) -> Result<(), AssetError>;
 
-    /// Возвращает canonical путь внутри store и плоское имя для consumer.
+    /// Возвращает канонический путь внутри хранилища и плоское имя для потребителя.
     fn canonical_location(
         &self,
         identity: &AssetIdentity,
@@ -37,7 +41,7 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
         format: DetectedFormat,
     ) -> Result<CanonicalAssetLocation, AssetError>;
 
-    /// Возвращает расположение, использовавшееся прежней схемой, если domain
+    /// Возвращает расположение, использовавшееся прежней схемой, если домен
     /// существовал в ней.
     fn legacy_location(
         &self,
@@ -48,38 +52,37 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
         None
     }
 
-    /// Можно ли хранить этот фактический формат в canonical corpus domain.
+    /// Поддерживает ли политика чтение legacy-схем 3/4, исторически созданных
+    /// до фиксации `domain_id`. По умолчанию такие схемы политике не принадлежат.
+    fn supports_legacy_schema(&self) -> bool {
+        false
+    }
+
+    /// Можно ли хранить этот фактический формат в каноническом корпусе домена.
     fn is_publishable_format(&self, format: DetectedFormat) -> bool;
 
-    /// Может ли semantic validator поместить такой формат в verified lifecycle.
-    /// Generic domain по умолчанию принимает любой фактически определённый
-    /// формат, предметные domains сужают этот набор.
+    /// Может ли семантический валидатор поместить такой формат в состояние
+    /// `verified`. Общий домен по умолчанию принимает любой определённый формат;
+    /// предметные домены сужают этот набор.
     fn allows_verified_format(&self, _format: DetectedFormat) -> bool {
         true
     }
 
-    /// Domain-specific предел размера asset, если он установлен.
+    /// Доменный предел размера ресурса, если он установлен.
     fn max_asset_bytes(&self) -> Option<u64>;
 
-    /// Использует ли domain hash-suffixed immutable object storage вместо
-    /// стабильного имени с compare-and-swap публикацией.
+    /// Использует ли домен неизменяемые объекты с хешем в имени вместо
+    /// стабильного имени с публикацией по принципу compare-and-swap.
     fn content_addressed_storage(&self) -> bool;
 
-    /// Дополнительные имена orphan-файлов, запрещённые предметной областью.
-    /// Generic core вызывает правило только для незарегистрированных
-    /// content-addressed объектов в canonical area.
-    fn is_reserved_orphan_filename(&self, _filename: &str) -> bool {
-        false
-    }
-
-    /// Проверяет полную canonical location записи перед публикацией.
+    /// Проверяет полное каноническое расположение записи перед публикацией.
     fn validate_publishable_record(&self, record: &AssetRecord) -> Result<(), AssetError> {
         self.validate_identity(&record.identity)?;
         if !self.is_publishable_format(record.format) {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 format!(
-                    "формат {:?} не разрешён для domain {}",
+                    "формат {:?} не разрешён для домена {}",
                     record.format,
                     self.domain_id()
                 ),
@@ -94,7 +97,7 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 format!(
-                    "canonical location записи {} не совпадает с policy domain {}",
+                    "каноническое расположение записи {} не совпадает с политикой домена {}",
                     record.identity,
                     self.domain_id()
                 ),
@@ -104,10 +107,11 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
     }
 }
 
-/// Политика для namespace без предметного publishable domain.
+/// Политика для пространства имён без собственного домена публикации.
 ///
-/// Для совместимости сохраняет прежний hash-suffixed layout. Зарезервированные
-/// publishable namespaces должны открываться своей предметной policy.
+/// Для совместимости сохраняет прежнее размещение с hash в имени файла.
+/// Зарезервированные пространства имён должны обслуживаться своей предметной
+/// политикой.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GenericDomainPolicy;
 
@@ -120,11 +124,11 @@ impl AssetDomainPolicy for GenericDomainPolicy {
         identity
             .validate()
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
-        if matches!(identity.namespace.as_str(), "kanji" | "pitch_accent") {
+        if PUBLISHABLE_DOMAIN_NAMESPACES.contains(&identity.namespace.as_str()) {
             return Err(AssetError::new(
                 ErrorCode::InvalidIdentity,
                 format!(
-                    "namespace {} должен использовать собственный asset domain",
+                    "пространство имён {} должно использовать собственный домен ресурсов",
                     identity.namespace
                 ),
             ));
@@ -174,7 +178,7 @@ impl AssetDomainPolicy for GenericDomainPolicy {
     }
 }
 
-/// Политика canonical corpus для изображений кандзи.
+/// Политика канонического корпуса изображений кандзи.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KanjiDomainPolicy;
 
@@ -190,7 +194,7 @@ impl AssetDomainPolicy for KanjiDomainPolicy {
         if identity.namespace != "kanji" {
             return Err(AssetError::new(
                 ErrorCode::InvalidIdentity,
-                "kanji domain принимает только namespace `kanji`",
+                "домен кандзи принимает только пространство имён `kanji`",
             ));
         }
         parse_kanji_character(&identity.key)
@@ -230,6 +234,10 @@ impl AssetDomainPolicy for KanjiDomainPolicy {
         })
     }
 
+    fn supports_legacy_schema(&self) -> bool {
+        true
+    }
+
     fn is_publishable_format(&self, format: DetectedFormat) -> bool {
         matches!(format, DetectedFormat::Gif | DetectedFormat::Png)
     }
@@ -239,30 +247,16 @@ impl AssetDomainPolicy for KanjiDomainPolicy {
     }
 
     fn max_asset_bytes(&self) -> Option<u64> {
-        Some(KANJI_MAX_ASSET_BYTES)
+        Some(crate::kanji_validator::MAX_MEDIA_BYTES as u64)
     }
 
     fn content_addressed_storage(&self) -> bool {
         false
     }
-
-    fn is_reserved_orphan_filename(&self, filename: &str) -> bool {
-        is_legacy_hash_suffixed_kanji_filename(filename)
-    }
 }
 
-fn is_legacy_hash_suffixed_kanji_filename(filename: &str) -> bool {
-    let Some((stem, _)) = filename.rsplit_once('.') else {
-        return false;
-    };
-    let Some((prefix, hash)) = stem.rsplit_once('-') else {
-        return false;
-    };
-    hash.len() == 64 && prefix.chars().count() == 1
-}
-
-/// Проверяет, что consumer filename является безопасным одноуровневым именем
-/// и его расширение соответствует фактическому формату bytes.
+/// Проверяет, что имя для потребителя является безопасным одноуровневым именем
+/// и его расширение соответствует фактическому формату байтов.
 pub fn validate_safe_consumer_filename(
     filename: &str,
     format: DetectedFormat,
@@ -270,7 +264,7 @@ pub fn validate_safe_consumer_filename(
     let invalid = || {
         AssetError::new(
             ErrorCode::PathTraversal,
-            "consumer filename должен быть безопасным одноуровневым именем",
+            "имя для потребителя должно быть безопасным одноуровневым именем",
         )
     };
     if filename.is_empty()
@@ -305,12 +299,12 @@ pub fn validate_safe_consumer_filename(
     Ok(())
 }
 
-/// Проверяет лексически безопасный store-relative путь внутри `assets/`.
+/// Проверяет лексически безопасный относительный путь внутри `assets/`.
 pub fn validate_safe_storage_path(storage_path: &str) -> Result<(), AssetError> {
     let invalid = || {
         AssetError::new(
             ErrorCode::PathTraversal,
-            "storage_path должен оставаться внутри каталога assets",
+            "storage_path должен оставаться внутри каталога `assets`",
         )
     };
     if storage_path.is_empty()
@@ -336,7 +330,12 @@ pub fn validate_safe_storage_path(storage_path: &str) -> Result<(), AssetError> 
     Ok(())
 }
 
-pub(crate) fn extension_for_format(format: DetectedFormat) -> &'static str {
+/// Возвращает каноническое расширение для обнаруженного формата.
+///
+/// Это единый контракт asset-store для имён внутри хранилища и плоских имён,
+/// которые получает потребитель. Для `Unknown` используется `bin`; потребители,
+/// которым нужны только известные media-форматы, должны отдельно отклонить его.
+pub fn extension_for_format(format: DetectedFormat) -> &'static str {
     match format {
         DetectedFormat::Png => "png",
         DetectedFormat::Jpeg => "jpg",
@@ -434,7 +433,7 @@ mod tests {
     #[test]
     fn reserved_namespaces_and_unsafe_consumer_names_fail_closed() {
         let generic = GenericDomainPolicy;
-        for namespace in ["kanji", "pitch_accent"] {
+        for &namespace in PUBLISHABLE_DOMAIN_NAMESPACES {
             let identity = AssetIdentity::new(namespace, "漢").unwrap();
             assert!(generic.validate_identity(&identity).is_err());
         }
@@ -452,5 +451,27 @@ mod tests {
                 "имя {filename:?} должно быть отклонено"
             );
         }
+    }
+
+    #[test]
+    fn legacy_schema_ownership_and_kanji_size_limit_are_explicit() {
+        assert!(KanjiDomainPolicy.supports_legacy_schema());
+        assert!(!GenericDomainPolicy.supports_legacy_schema());
+        assert_eq!(
+            KanjiDomainPolicy.max_asset_bytes(),
+            Some(crate::kanji_validator::MAX_MEDIA_BYTES as u64)
+        );
+        assert_eq!(GenericDomainPolicy.max_asset_bytes(), None);
+    }
+
+    #[test]
+    fn format_extension_mapping_is_the_canonical_table() {
+        assert_eq!(extension_for_format(DetectedFormat::Png), "png");
+        assert_eq!(extension_for_format(DetectedFormat::Jpeg), "jpg");
+        assert_eq!(extension_for_format(DetectedFormat::Gif), "gif");
+        assert_eq!(extension_for_format(DetectedFormat::Webp), "webp");
+        assert_eq!(extension_for_format(DetectedFormat::Bmp), "bmp");
+        assert_eq!(extension_for_format(DetectedFormat::Tiff), "tiff");
+        assert_eq!(extension_for_format(DetectedFormat::Unknown), "bin");
     }
 }

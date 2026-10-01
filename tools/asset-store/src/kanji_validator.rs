@@ -28,6 +28,8 @@ const REFERENCE_DB: &[u8] = include_bytes!("data/kanjivg-r20250816.maskdb.zlib")
 const YARXI_FONT_REFERENCE_DB: &[u8] = include_bytes!("data/yarxi-noto-serif-jp-r1.maskdb.zlib");
 const KANJIVG_REFERENCE_VERSION: &str = "KanjiVG r20250816 @ bd13ffbcc9d85cb86ae98bbbf001d9069220b901; normalization=center-sampled-mask64-v2; maskdb_sha256=5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff";
 const YARXI_FONT_REFERENCE_VERSION: &str = "Noto Serif JP /fonts/noto-serif-jp.24fc2d26.ttf sha256=e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8; normalization=center-sampled-mask64-v2; maskdb_sha256=ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c";
+/// Единственный предел размера входного изображения Kanji; доменная политика
+/// использует это же значение при проверке ресурсов и манифеста.
 pub(crate) const MAX_MEDIA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 2048;
 const MAX_GIF_FRAMES: usize = 512;
@@ -39,8 +41,8 @@ const VERIFIED_MAX_DISTANCE: f32 = 0.020;
 const VERIFIED_MIN_MARGIN: f32 = 0.004;
 const REJECT_MIN_GAP: f32 = 0.015;
 
-/// Пороги положительного индивидуального решения для агрегирующей policy.
-/// Значения берутся из тех же constants, что использует classifier ниже.
+/// Пороги положительного индивидуального решения для агрегирующей политики.
+/// Значения берутся из тех же констант, что использует классификатор ниже.
 pub(crate) fn registered_aggregate_thresholds() -> (f64, f64) {
     (
         f64::from(VERIFIED_MAX_DISTANCE),
@@ -101,7 +103,7 @@ struct NormalizedMask {
     excluded_border_components: usize,
 }
 
-/// Валидатор изображений кандзи в формате PNG/GIF для рабочего кода.
+/// Валидатор изображений кандзи в формате PNG/GIF.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KanjiImageValidator;
 
@@ -157,7 +159,7 @@ impl SemanticValidator for KanjiImageValidator {
             return Ok(decision(
                 SemanticStatus::Corrupt,
                 "format_mismatch",
-                "формат в manifest не совпадает с сигнатурой изображения",
+                "формат в манифесте не совпадает с сигнатурой изображения",
                 json!({
                     "manifest_format": asset.format,
                     "actual_format": raster.format,
@@ -170,7 +172,7 @@ impl SemanticValidator for KanjiImageValidator {
                 return Ok(decision(
                     SemanticStatus::Uncertain,
                     "identity_outside_han_domain",
-                    "для identity валидатору нужен один поддерживаемый символ Han/CJK",
+                    "валидатору нужен один поддерживаемый символ Han/CJK в идентификаторе",
                     json!({ "identity": asset.identity.key }),
                 ));
             }

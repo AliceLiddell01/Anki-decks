@@ -3,6 +3,8 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use asset_store::hashing::sha256_hex;
+
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct TempDir(std::path::PathBuf);
@@ -13,7 +15,8 @@ impl TempDir {
         let path =
             std::env::temp_dir().join(format!("kanji-assets-cli-{}-{counter}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(path.join("repository/decks")).expect("synthetic repository root");
+        fs::create_dir_all(path.join("repository/decks"))
+            .expect("создаётся корень тестового репозитория");
         Self(path)
     }
 
@@ -40,11 +43,11 @@ fn cli(temp: &TempDir, args: &[&str]) -> Output {
         .arg("json")
         .args(args)
         .output()
-        .expect("kanji-assets process запускается")
+        .expect("процесс kanji-assets запускается")
 }
 
 fn json(output: &Output) -> serde_json::Value {
-    serde_json::from_slice(&output.stdout).expect("stdout содержит JSON contract")
+    serde_json::from_slice(&output.stdout).expect("stdout содержит JSON-контракт")
 }
 
 #[test]
@@ -68,7 +71,7 @@ fn cli_reports_store_unicode_selection_idempotency_and_conflicts_as_json() {
     assert_eq!(json(&init_repeat)["changed"], false);
 
     let source = temp.path().join("claim.png");
-    fs::write(&source, b"not an image").expect("synthetic bytes");
+    fs::write(&source, b"not an image").expect("записываются синтетические байты");
     let source_text = source.to_str().unwrap();
     let first = cli(
         &temp,
@@ -188,7 +191,7 @@ fn list_and_plan_reject_a_missing_store_without_creating_it() {
 fn list_does_not_initialize_an_existing_empty_directory() {
     let temp = TempDir::new();
     let store = temp.path().join("owned-store");
-    fs::create_dir(&store).expect("empty store path exists");
+    fs::create_dir(&store).expect("создаётся пустой каталог store");
 
     let output = cli(&temp, &["list"]);
 
@@ -224,7 +227,11 @@ fn cli_rejects_explicit_source_under_decks_before_creating_the_store() {
         .path()
         .join("repository/decks/japanese/media/candidate.png");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
-    fs::write(&source, b"synthetic user media").unwrap();
+    fs::write(
+        &source,
+        "синтетический пользовательский media-файл".as_bytes(),
+    )
+    .unwrap();
     let source_text = source.to_str().unwrap();
 
     let output = cli(
@@ -252,7 +259,11 @@ fn cli_rejects_decks_source_reached_through_a_symlink_alias() {
     let actual_decks = temp.path().join("private-decks");
     let source = actual_decks.join("media/candidate.png");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
-    fs::write(&source, b"synthetic user media").unwrap();
+    fs::write(
+        &source,
+        "синтетический пользовательский media-файл".as_bytes(),
+    )
+    .unwrap();
     symlink(&actual_decks, &decks).unwrap();
     let aliased_source = decks.join("media/candidate.png");
     let source_text = aliased_source.to_str().unwrap();
@@ -367,6 +378,61 @@ fn cli_reports_unsupported_manifest_schema_with_a_stable_json_code() {
 }
 
 #[test]
+fn cli_json_reports_layout_migration_only_on_the_migrating_open() {
+    let temp = TempDir::new();
+    let init = cli(&temp, &["init"]);
+    assert!(init.status.success());
+    assert_eq!(json(&init)["store"]["layout_migrated_on_open"], false);
+
+    let store = temp.path().join("owned-store");
+    let manifest_path = store.join("manifest.json");
+    let legacy_path = store.join("assets/漢.png");
+    let bytes = b"\x89PNG\r\n\x1a\nlegacy migration fixture";
+    fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    fs::write(&legacy_path, bytes).unwrap();
+
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["schema_version"] = serde_json::json!(4);
+    manifest.as_object_mut().unwrap().remove("domain_id");
+    manifest["assets"] = serde_json::json!([{
+        "identity": { "namespace": "kanji", "key": "漢" },
+        "storage_path": "assets/漢.png",
+        "sha256": sha256_hex(bytes),
+        "byte_length": bytes.len(),
+        "format": "png",
+        "provenance": { "source_kind": "fixture", "source_name": "migration.png" },
+        "lifecycle": "pending"
+    }]);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let first_open = cli(&temp, &["list"]);
+    assert!(
+        first_open.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_open.stderr)
+    );
+    let first_json = json(&first_open);
+    assert_eq!(first_json["store"]["layout_migrated_on_open"], true);
+    let migrated_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(migrated_manifest["schema_version"], 5);
+    assert!(migrated_manifest["assets"].as_array().unwrap().is_empty());
+    assert!(!legacy_path.exists());
+
+    let second_open = cli(&temp, &["list"]);
+    assert!(second_open.status.success());
+    assert_eq!(
+        json(&second_open)["store"]["layout_migrated_on_open"],
+        false
+    );
+}
+
+#[test]
 fn cli_argument_usage_error_writes_stderr_without_json_stdout() {
     let temp = TempDir::new();
     let output = Command::new(env!("CARGO_BIN_EXE_kanji-assets"))
@@ -382,7 +448,7 @@ fn cli_argument_usage_error_writes_stderr_without_json_stdout() {
     assert!(!output.stderr.is_empty());
     assert!(
         !temp.path().join(".asset-store/kanji").exists(),
-        "parse error does not execute a store operation"
+        "ошибка разбора аргументов не запускает операцию с store"
     );
 }
 

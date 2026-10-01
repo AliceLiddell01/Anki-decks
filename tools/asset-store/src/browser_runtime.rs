@@ -1,4 +1,4 @@
-//! Повторно используемый Chromium runtime и техническая телеметрия CDP.
+//! Повторно используемая среда Chromium и техническая телеметрия CDP.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ const MAX_NETWORK_OUTCOMES: usize = 256;
 const MAX_NETWORK_DIAGNOSTIC_ITEMS: usize = 3;
 const MAX_NETWORK_DIAGNOSTIC_PATH_CHARS: usize = 160;
 
-/// Способ выбора browser executable без сохранения абсолютного пути.
+/// Способ выбора исполняемого файла браузера без сохранения абсолютного пути.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserExecutableSource {
@@ -38,7 +38,7 @@ pub enum BrowserExecutableSource {
     ChromiumoxideDefault,
 }
 
-/// Версия browser runtime; абсолютные пути, профиль и cookies не записываются.
+/// Версия среды браузера; абсолютные пути, профиль и cookie-файлы не записываются.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserRuntimeProvenance {
@@ -50,7 +50,7 @@ pub struct BrowserRuntimeProvenance {
     pub executable_source: BrowserExecutableSource,
 }
 
-/// Размер viewport и device scale для CDP `Emulation.setDeviceMetricsOverride`.
+/// Размер области просмотра и масштаб устройства для CDP `Emulation.setDeviceMetricsOverride`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeviceMetrics {
     pub width: i64,
@@ -74,12 +74,12 @@ impl DeviceMetrics {
     pub fn validate(self) -> Result<(), String> {
         if self.width <= 0 || self.height <= 0 {
             return Err(
-                "browser_device_metrics_invalid: viewport dimensions must be positive".into(),
+                "browser_device_metrics_invalid: размеры области просмотра должны быть положительными".into(),
             );
         }
         if !self.device_scale_factor.is_finite() || self.device_scale_factor <= 0.0 {
             return Err(
-                "browser_device_metrics_invalid: device scale must be finite and positive".into(),
+                "browser_device_metrics_invalid: масштаб устройства должен быть конечным и положительным".into(),
             );
         }
         Ok(())
@@ -95,8 +95,8 @@ impl DeviceMetrics {
     }
 }
 
-/// Настройки изолированного Chromium-сеанса. Site navigation и DOM policy
-/// остаются ответственностью вызывающего provider.
+/// Настройки изолированного сеанса Chromium. Переходы по сайтам и правила работы с DOM
+/// остаются ответственностью вызывающего провайдера.
 #[derive(Debug, Clone)]
 pub struct BrowserRuntimeConfig {
     pub device_metrics: Option<DeviceMetrics>,
@@ -122,31 +122,29 @@ impl BrowserRuntimeConfig {
             metrics.validate()?;
         }
         if self.launch_timeout.is_zero() || self.request_timeout.is_zero() {
-            return Err("browser_runtime_timeout_invalid: timeouts must be positive".into());
+            return Err(
+                "browser_runtime_timeout_invalid: значения таймаутов должны быть положительными"
+                    .into(),
+            );
         }
         if self
             .prefers_color_scheme
             .as_deref()
             .is_some_and(|scheme| scheme.trim().is_empty())
         {
-            return Err("browser_media_preference_invalid: color scheme must not be empty".into());
+            return Err(
+                "browser_media_preference_invalid: цветовая схема не должна быть пустой".into(),
+            );
         }
         Ok(())
     }
 }
 
-/// Найденный Chromium executable и безопасная для provenance категория выбора.
+/// Найденный исполняемый файл Chromium и безопасная для записи категория его происхождения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserExecutableSelection {
     path: PathBuf,
     pub source: BrowserExecutableSource,
-}
-
-impl BrowserExecutableSelection {
-    /// Путь нужен только для запуска процесса и не входит в provenance.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 /// Изолированный Chromium-процесс, его начальная страница и CDP-монитор.
@@ -176,10 +174,10 @@ impl BrowserSession {
         }
         let browser_config = browser_config
             .build()
-            .map_err(|error| format!("настройка browser: {error}"))?;
+            .map_err(|error| format!("настройка браузера: {error}"))?;
         let (mut browser, mut handler) = Browser::launch(browser_config)
             .await
-            .map_err(|error| format!("запуск browser: {error}"))?;
+            .map_err(|error| format!("запуск браузера: {error}"))?;
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
                 if event.is_err() {
@@ -204,7 +202,7 @@ impl BrowserSession {
             let page = browser
                 .new_page("about:blank")
                 .await
-                .map_err(|error| format!("создание browser page: {error}"))?;
+                .map_err(|error| format!("создание страницы браузера: {error}"))?;
             page.execute(EnableParams::default())
                 .await
                 .map_err(|error| format!("CDP Page.enable: {error}"))?;
@@ -289,7 +287,7 @@ pub struct NetworkOutcome {
     pub is_top_level: bool,
 }
 
-/// Неинтерпретированная provider-ом CDP телеметрия одного acquisition epoch.
+/// Неинтерпретированная провайдером телеметрия CDP одного этапа получения.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeSnapshot {
     pub pending_requests: Vec<TrackedRequest>,
@@ -299,25 +297,11 @@ pub struct RuntimeSnapshot {
     pub monitor_failed: bool,
 }
 
-impl RuntimeSnapshot {
-    pub fn is_clean(&self) -> bool {
-        !self.monitor_failed
-            && self.pending_requests.is_empty()
-            && self.network_failures.is_empty()
-            && self.http_errors.is_empty()
-            && self.javascript_exceptions == 0
-    }
-
-    pub fn failure_summary(&self) -> String {
-        format!(
-            "monitor_failed={}, ожидают={}, сетевых ошибок={}, HTTP-ошибок={}, JS-исключений={}",
-            self.monitor_failed,
-            self.pending_requests.len(),
-            self.network_failures.len(),
-            self.http_errors.len(),
-            self.javascript_exceptions
-        )
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryTrigger {
+    ReadinessTimeout,
+    ItemTimeout,
+    RuntimeFailure,
 }
 
 #[derive(Debug, Default)]
@@ -470,8 +454,8 @@ impl RuntimeState {
     }
 }
 
-/// Слушает Network и Runtime CDP events; состояние ограничено по размеру и
-/// при потере события всегда сообщает monitor failure.
+/// Слушает события Network и Runtime CDP; состояние ограничено по размеру, а
+/// при потере события всегда сообщает об ошибке мониторинга.
 #[derive(Debug, Clone)]
 pub struct CdpRuntimeMonitor {
     state: Arc<Mutex<RuntimeState>>,
@@ -612,81 +596,56 @@ impl CdpRuntimeMonitor {
         lock_state(&self.state).monitor_failed
     }
 
-    pub fn retryable_failures_only(&self, epoch: u64) -> bool {
+    pub(crate) fn retryable_acquisition(&self, epoch: u64, trigger: RetryTrigger) -> bool {
         let state = lock_state(&self.state);
-        let snapshot = state.snapshot(epoch);
-        let epoch_network_failures: Vec<_> = state
-            .network_failures
-            .iter()
-            .filter(|failure| failure.epoch == epoch)
-            .collect();
-        let epoch_http_errors: Vec<_> = state
-            .http_errors
-            .iter()
-            .filter(|failure| failure.epoch == epoch)
-            .collect();
-        let bootstrap_failure = state
-            .network_failures
-            .iter()
-            .any(|failure| failure.epoch == 0)
-            || state.http_errors.iter().any(|failure| failure.epoch == 0)
-            || state.javascript_exceptions.get(&0).copied().unwrap_or(0) > 0;
-        !snapshot.monitor_failed
-            && !bootstrap_failure
-            && state
-                .javascript_exceptions
-                .get(&epoch)
-                .copied()
-                .unwrap_or(0)
-                == 0
-            && (!epoch_network_failures.is_empty() || !epoch_http_errors.is_empty())
-            && epoch_network_failures.iter().all(|failure| {
-                failure
-                    .failure_reason
-                    .as_deref()
-                    .is_some_and(is_retryable_network_error)
-            })
-            && epoch_http_errors
-                .iter()
-                .all(|failure| failure.status_code.is_some_and(is_retryable_http_status))
-    }
+        if state.monitor_failed {
+            return false;
+        }
+        if trigger == RetryTrigger::ReadinessTimeout {
+            return true;
+        }
 
-    pub fn retryable_timeout(&self, epoch: u64) -> bool {
-        let state = lock_state(&self.state);
-        let snapshot = state.snapshot(epoch);
         let bootstrap_failure = state
             .network_failures
             .iter()
             .any(|failure| failure.epoch == 0)
             || state.http_errors.iter().any(|failure| failure.epoch == 0)
             || state.javascript_exceptions.get(&0).copied().unwrap_or(0) > 0;
-        let epoch_network_failures: Vec<_> = state
+        let has_epoch_network_failure = state
+            .network_failures
+            .iter()
+            .any(|failure| failure.epoch == epoch);
+        let has_epoch_http_error = state
+            .http_errors
+            .iter()
+            .any(|failure| failure.epoch == epoch);
+        let epoch_network_failures_are_retryable = state
             .network_failures
             .iter()
             .filter(|failure| failure.epoch == epoch)
-            .collect();
-        let epoch_http_errors: Vec<_> = state
+            .all(|failure| {
+                failure
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(is_retryable_network_error)
+            });
+        let epoch_http_errors_are_retryable = state
             .http_errors
             .iter()
             .filter(|failure| failure.epoch == epoch)
-            .collect();
-        !snapshot.monitor_failed
-            && !bootstrap_failure
+            .all(|failure| failure.status_code.is_some_and(is_retryable_http_status));
+        let has_epoch_failure = has_epoch_network_failure || has_epoch_http_error;
+
+        !bootstrap_failure
             && state
                 .javascript_exceptions
                 .get(&epoch)
                 .copied()
                 .unwrap_or(0)
                 == 0
-            && epoch_network_failures.iter().all(|failure| {
-                failure
-                    .failure_reason
-                    .as_deref()
-                    .is_some_and(is_retryable_network_error)
-            })
-            && epoch_http_errors
-                .iter()
-                .all(|failure| failure.status_code.is_some_and(is_retryable_http_status))
+            && epoch_network_failures_are_retryable
+            && epoch_http_errors_are_retryable
+            && (trigger == RetryTrigger::ItemTimeout || has_epoch_failure)
     }
 
     /// Удаляет только запись с совпадающими CDP request id, URL и причиной.
@@ -880,7 +839,7 @@ fn sanitized_network_location(raw_url: &str) -> String {
         return "<URL не удалось разобрать>".into();
     };
     if !matches!(url.scheme(), "http" | "https") || !url.origin().is_tuple() {
-        return format!("<{} resource>", url.scheme());
+        return format!("<{} ресурс>", url.scheme());
     }
     let raw_path = if url.path().is_empty() {
         "/"
@@ -1008,7 +967,6 @@ mod tests {
         assert_eq!(snapshot.network_failures.len(), 1);
         assert_eq!(snapshot.http_errors[0].status_code, Some(503));
         assert_eq!(snapshot.javascript_exceptions, 1);
-        assert!(!snapshot.is_clean());
         assert!(state.snapshot(epoch + 1).pending_requests.is_empty());
         assert_eq!(state.snapshot(epoch + 1).javascript_exceptions, 0);
     }
@@ -1039,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_classification_rejects_bootstrap_js_and_permanent_failures() {
+    fn retry_classification_rejects_javascript_and_permanent_failures() {
         assert!(is_retryable_network_error("net::ERR_TIMED_OUT"));
         assert!(is_retryable_network_error("net::ERR_ABORTED"));
         assert!(!is_retryable_network_error("net::ERR_CERT_DATE_INVALID"));
@@ -1062,13 +1020,15 @@ mod tests {
             state: Arc::new(Mutex::new(state)),
             tasks: Arc::new(Vec::new()),
         };
-        assert!(monitor.retryable_failures_only(epoch));
-        assert!(monitor.retryable_timeout(epoch));
+        assert!(monitor.retryable_acquisition(epoch, RetryTrigger::RuntimeFailure));
+        assert!(monitor.retryable_acquisition(epoch, RetryTrigger::ItemTimeout));
+        assert!(monitor.retryable_acquisition(epoch, RetryTrigger::ReadinessTimeout));
 
         let mut state = lock_state(&monitor.state);
         state.record_javascript_exception();
         drop(state);
-        assert!(!monitor.retryable_timeout(epoch));
+        assert!(!monitor.retryable_acquisition(epoch, RetryTrigger::ItemTimeout));
+        assert!(monitor.retryable_acquisition(epoch, RetryTrigger::ReadinessTimeout));
 
         lock_state(&monitor.state).http_errors.push(outcome(
             ResourceType::Fetch,
@@ -1078,7 +1038,52 @@ mod tests {
             epoch,
             Some(404),
         ));
-        assert!(!monitor.retryable_failures_only(epoch));
+        assert!(!monitor.retryable_acquisition(epoch, RetryTrigger::RuntimeFailure));
+        assert!(!monitor.retryable_acquisition(epoch, RetryTrigger::ItemTimeout));
+    }
+
+    #[test]
+    fn retry_classification_rejects_bootstrap_failure_except_readiness_timeout() {
+        let mut state = RuntimeState::default();
+        let epoch = state.begin_epoch();
+        state.network_failures.push(outcome(
+            ResourceType::Fetch,
+            Some("https://example.test/bootstrap"),
+            Some("net::ERR_CONNECTION_RESET"),
+            "bootstrap",
+            0,
+            None,
+        ));
+        let monitor = CdpRuntimeMonitor {
+            state: Arc::new(Mutex::new(state)),
+            tasks: Arc::new(Vec::new()),
+        };
+
+        assert!(!monitor.retryable_acquisition(epoch, RetryTrigger::ItemTimeout));
+        assert!(!monitor.retryable_acquisition(epoch, RetryTrigger::RuntimeFailure));
+        assert!(monitor.retryable_acquisition(epoch, RetryTrigger::ReadinessTimeout));
+    }
+
+    #[test]
+    fn retry_classification_preserves_timeout_without_failures_and_rejects_failed_monitor() {
+        let mut state = RuntimeState::default();
+        let epoch = state.begin_epoch();
+        let monitor = CdpRuntimeMonitor {
+            state: Arc::new(Mutex::new(state)),
+            tasks: Arc::new(Vec::new()),
+        };
+        assert!(monitor.retryable_acquisition(epoch, RetryTrigger::ItemTimeout));
+        assert!(!monitor.retryable_acquisition(epoch, RetryTrigger::RuntimeFailure));
+        assert!(monitor.retryable_acquisition(epoch, RetryTrigger::ReadinessTimeout));
+
+        lock_state(&monitor.state).monitor_failed = true;
+        for trigger in [
+            RetryTrigger::ItemTimeout,
+            RetryTrigger::RuntimeFailure,
+            RetryTrigger::ReadinessTimeout,
+        ] {
+            assert!(!monitor.retryable_acquisition(epoch, trigger));
+        }
     }
 
     #[test]
