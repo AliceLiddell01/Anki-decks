@@ -730,6 +730,34 @@ fn publishable_gate_accepts_empty_manifest_without_assets_directory() {
 }
 
 #[test]
+fn empty_unregistered_directories_are_ignored_only_outside_publishable_gate() {
+    let temp = TempDir::new("empty-unregistered-directories");
+    let root = temp.path().join("store");
+    let store = open_kanji_store(&root);
+    let runtime_empty = root.join(".runtime/assets/unregistered-empty");
+    fs::create_dir(&runtime_empty).unwrap();
+
+    assert!(store.verify_integrity().unwrap().is_empty());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
+
+    let canonical_empty = root.join("assets/unregistered-empty");
+    fs::create_dir(&canonical_empty).unwrap();
+    assert!(store.verify_integrity().unwrap().is_empty());
+    assert_eq!(
+        AssetStore::verify_publishable_corpus(&root, &publishable_validator())
+            .unwrap_err()
+            .code,
+        ErrorCode::UnexpectedPath
+    );
+
+    fs::write(runtime_empty.join("unexpected.bin"), b"unregistered bytes").unwrap();
+    assert_eq!(
+        store.verify_integrity().unwrap_err().code,
+        ErrorCode::UnexpectedPath
+    );
+}
+
+#[test]
 fn publishable_gate_rejects_stale_validator_identity() {
     let temp = TempDir::new("publishable-stale-validator");
     let root = temp.path().join("store");
@@ -1323,7 +1351,7 @@ fn legacy_runtime_overlay_v4_migrates_and_recovers_interrupted_target() {
 
 #[test]
 fn cross_domain_identity_is_rejected() {
-    let temp = TempDir::new("duplicate-consumer-filename");
+    let temp = TempDir::new("cross-domain-identity");
     let root = temp.path().join("store");
     let store = open_kanji_store(&root);
     for (character, name) in [('日', "first.gif"), ('月', "second.gif")] {

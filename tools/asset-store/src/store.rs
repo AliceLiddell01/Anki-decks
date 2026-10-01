@@ -3228,6 +3228,13 @@ fn scan_asset_directory(
                 .iter()
                 .any(|registered| registered.starts_with(&format!("{path}/")))
             {
+                if !reject_orphans {
+                    let child = open_directory_at(directory, &name)
+                        .map_err(|error| directory_entry_error(&path, error))?;
+                    if is_directory_empty(&child, &path)? {
+                        continue;
+                    }
+                }
                 return Err(AssetError::new(
                     ErrorCode::UnexpectedPath,
                     format!("неожиданный каталог внутри canonical assets: {path}"),
@@ -3291,6 +3298,23 @@ fn scan_asset_directory(
         observed_paths.insert(path);
     }
     Ok(())
+}
+
+fn is_directory_empty(directory: &File, path: &str) -> Result<bool, AssetError> {
+    let mut entries = fs::read_dir(fd_path(directory)).map_err(|error| {
+        AssetError::io(
+            format!("не удалось прочитать каталог assets: {path}"),
+            error,
+        )
+    })?;
+    match entries.next() {
+        None => Ok(true),
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(AssetError::io(
+            format!("не удалось прочитать каталог assets: {path}"),
+            error,
+        )),
+    }
 }
 
 fn validate_relative_path(actual: &str, expected: &str) -> Result<(), AssetError> {

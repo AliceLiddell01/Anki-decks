@@ -96,7 +96,7 @@ image/kanji semantics.
 сетевая техническая телеметрия находятся в `browser_runtime.rs`. Yarxi сохраняет
 свои selectors, URLs, TLS policy, фильтры, fallback, dark theme и текущую
 геометрию capture. Общий runtime позволяет задавать отдельный scale factor `3.0`,
-но JPDB acquisition в этот этап не входит.
+а команда получения изображений из JPDB в `asset-store` отсутствует.
 
 Whitelist для хранения в Git включает `.owner.json` и `manifest.json` каждого
 домена, а также непосредственные пути `assets/gif/*.gif` и `assets/png/*.png`
