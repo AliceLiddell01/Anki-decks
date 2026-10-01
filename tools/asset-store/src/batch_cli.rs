@@ -1043,14 +1043,22 @@ fn decide_exact(
                 "существующий канонический кандидат изменился после проверки",
             ));
         }
-        // Этот путь достижим только при внешнем повреждении манифеста: все
-        // операции записи (`ingest`, `ingest_verified`, `validate_exact`)
-        // сохраняют автоматические свидетельства для записи Verified, а схема v3
-        // не допускает подтверждение человека.
-        let automated = record
-            .validation
-            .clone()
-            .ok_or_else(|| invalid("для существующего канонического кандидата отсутствуют автоматические свидетельства"))?;
+        // Одобрение человеком сохраняет доверие между версиями валидатора. Перед
+        // записью этих байтов в пакет обновляем автоматическое свидетельство.
+        let validation_is_current = record.validation.as_ref().is_some_and(|validation| {
+            validation.is_valid_for_sha(&record.sha256)
+                && validation.validator == state.policy.validator
+        });
+        if !validation_is_current {
+            validate_exact_snapshot(store, &identity, &record.sha256, &mut snapshot)?;
+        }
+        let automated = snapshot
+            .current(&identity)
+            .filter(|current| current.sha256 == decision.candidate_sha256)
+            .and_then(|current| current.validation.clone())
+            .ok_or_else(|| {
+                invalid("для существующего канонического кандидата отсутствуют актуальные автоматические свидетельства")
+            })?;
         runtime.persist_candidate(&verified[0].bytes, automated, true)?
     } else {
         current_candidate(item)?.clone()

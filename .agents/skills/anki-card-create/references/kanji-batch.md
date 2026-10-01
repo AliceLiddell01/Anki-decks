@@ -9,7 +9,7 @@ contract принадлежат `tools/asset-store/README.md`; здесь дан
 
 ## Запуск и возобновление
 
-Batch state и точные candidate bytes владеет `kanji-assets` под
+Состоянием пакета и точными байтами кандидатов владеет `kanji-assets` под
 `.asset-store/kanji/.runtime/batches/<batch-id>/`. Сохраняй batch ID из JSON
 ответа вне чата, например в локальном workflow state вне `decks/**` и Git.
 Повторный запуск с тем же ID возобновляет тот же requested identity set и

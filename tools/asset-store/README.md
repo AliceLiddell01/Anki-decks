@@ -10,9 +10,10 @@ content hash, integrity и lifecycle. Предметный CLI `kanji-assets` д
 
 ## Где лежат данные
 
-Корень по умолчанию — `.asset-store/kanji` в корне workspace. Если он уже
-существует, `list`, `plan`, `validate` и batch-resume работают с ним.
-`ensure` и `batch start` создают store при первом вызове.
+Корень по умолчанию — `.asset-store/kanji` в корне workspace. Команды `list`,
+`plan`, `validate`, `batch run`, `batch status`, `batch review`, `batch decide` и
+`batch retry` открывают уже существующий store и завершаются ошибкой, если его
+нет. `ensure` и `batch start` создают store при первом вызове.
 
 В store разделены публикуемое состояние и локальные записи проверки:
 

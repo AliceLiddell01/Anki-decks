@@ -959,6 +959,75 @@ fn confirm_published_auto_and_existing_candidates_records_owner_approval() {
 }
 
 #[test]
+fn reject_existing_asset_with_approval_from_an_older_validator() {
+    struct PriorValidator;
+    impl SemanticValidator for PriorValidator {
+        fn identity(&self) -> ValidatorIdentity {
+            ValidatorIdentity::new("prior-kanji-validator", "1").unwrap()
+        }
+        fn validate(
+            &self,
+            _: &AssetRecord,
+            _: &mut dyn Read,
+        ) -> Result<SemanticDecision, ValidatorFailure> {
+            Ok(SemanticDecision::new(
+                SemanticStatus::Verified,
+                vec![ValidationEvidence {
+                    kind: "prior_validator".into(),
+                    summary: "проверка предыдущей версии валидатора".into(),
+                    details: None,
+                }],
+            ))
+        }
+    }
+
+    let fixture = Fixture::new();
+    let hash = publish_reference(&fixture, "prior-validator-source");
+    fixture
+        .store
+        .validate_exact(&identity('元'), &hash, &PriorValidator)
+        .unwrap();
+    fixture
+        .store
+        .attest(HumanAttestationRequest {
+            identity: identity('元'),
+            expected_sha256: hash.clone(),
+            decision: HumanDecision::Approve,
+            reason: "явное подтверждение точных байтов".into(),
+        })
+        .unwrap();
+
+    fixture.start("prior-validator-reject", &['元']);
+    assert_eq!(
+        fixture.load("prior-validator-reject").items[0].status,
+        BatchItemStatus::ExistingVerified
+    );
+    let decision = HumanBatchDecision {
+        identity: identity('元'),
+        candidate_sha256: hash,
+        action: HumanBatchAction::Reject,
+        reason: "явный отказ после повторной проверки".into(),
+    };
+    let (state, issues) =
+        decide_exact(&fixture.store, "prior-validator-reject", decision.clone()).unwrap();
+
+    assert!(issues.is_empty());
+    assert_eq!(state.items[0].status, BatchItemStatus::Reacquire);
+    assert_eq!(state.items[0].human_decisions.last(), Some(&decision));
+    let owner_record = fixture
+        .store
+        .verify_integrity()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.identity == identity('元'))
+        .unwrap();
+    assert_eq!(
+        owner_record.current_human_decision(),
+        Some(HumanDecision::Reject)
+    );
+}
+
+#[test]
 fn stale_reject_never_materializes_or_demotes_newer_owner_sha() {
     let fixture = Fixture::new();
     let old_hash = publish_reference(&fixture, "old-batch");
