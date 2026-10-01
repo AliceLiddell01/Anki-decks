@@ -5,18 +5,12 @@
 //! семантическое решение или решение человека, затем фиксирует результат здесь.
 //! Runtime-данные хранятся только под `.runtime/batches/`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use rustix::fs::{
-    AtFlags, FlockOperation, Mode, OFlags, flock, mkdirat, open, openat, renameat, unlinkat,
-};
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
@@ -26,12 +20,20 @@ use crate::model::{
     ValidationRecord, ValidatorIdentity,
 };
 
+#[path = "batch_runtime.rs"]
+mod runtime;
+pub use runtime::{
+    MAX_RUNTIME_BLOB_BYTES, MAX_RUNTIME_STATE_BYTES, RuntimeBatchState, RuntimeBlobRef,
+    SafeBatchRuntime,
+};
+
 pub const BATCH_SCHEMA_VERSION: u32 = 1;
 pub const AGGREGATE_POLICY_VERSION: &str = "kanji-distinct-mean-v2";
 pub const MAX_ACQUISITION_ROUNDS: u32 = 5;
 pub(crate) const MAX_HUMAN_REASON_BYTES: usize = 4096;
-const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_STATE_BYTES: u64 = MAX_RUNTIME_STATE_BYTES;
 const MAX_CANDIDATE_BYTES: u64 = crate::kanji_validator::MAX_MEDIA_BYTES as u64;
+#[cfg(test)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Пороги совпадают с текущими порогами f32 валидатора кандзи; версия правил закреплена в состоянии.
@@ -802,6 +804,45 @@ impl KanjiBatch {
     }
 }
 
+impl RuntimeBatchState for KanjiBatch {
+    fn batch_id(&self) -> &str {
+        &self.batch_id
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn validate(&self) -> Result<(), AssetError> {
+        KanjiBatch::validate(self)
+    }
+
+    fn referenced_blobs(&self) -> Vec<RuntimeBlobRef> {
+        let mut blobs = Vec::new();
+        for item in &self.items {
+            if let Some(candidate) = &item.existing_candidate {
+                blobs.push(RuntimeBlobRef {
+                    sha256: candidate.sha256.clone(),
+                    storage_path: candidate.storage_path.clone(),
+                });
+            }
+            for attempt in &item.attempts {
+                if let BatchAttemptInput::Candidate { candidate } = &attempt.result {
+                    blobs.push(RuntimeBlobRef {
+                        sha256: candidate.sha256.clone(),
+                        storage_path: candidate.storage_path.clone(),
+                    });
+                }
+            }
+        }
+        blobs
+    }
+
+    fn maximum_blob_bytes(&self) -> u64 {
+        MAX_CANDIDATE_BYTES
+    }
+}
+
 fn check_publication_source(item: &BatchItem, source: BatchTrustSource) -> Result<(), AssetError> {
     let allowed = match source {
         BatchTrustSource::Existing => item.status == BatchItemStatus::ExistingVerified,
@@ -1090,148 +1131,29 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// Сохранение runtime-данных относительно файлового дескриптора. Блокировка
-/// освобождается при завершении процесса, в том числе при аварии. Она удерживается
-/// во время загрузки, изменения и сохранения, чтобы процессы не теряли обновления.
+/// Kanji-адаптер над домен-независимым безопасным runtime.
 #[derive(Debug)]
 pub struct BatchRuntime {
-    directory: File,
-    candidates: File,
-    batch_id: String,
-    loaded_revision: Option<u64>,
-    directory_path: PathBuf,
-    /// Файлы кандидатов адресуются по содержимому и неизменяемы, а исключительная
-    /// блокировка удерживается всё время жизни объекта. Поэтому каждая проверяемая
-    /// комбинация (путь, SHA-256, формат) читается не более одного раза: иначе
-    /// сохранение каждого элемента заново обходило бы весь набор.
-    verified_candidate_keys: BTreeSet<String>,
+    runtime: SafeBatchRuntime,
 }
 
 impl BatchRuntime {
-    /// Корень хранилища должен быть заранее открыт и проверен владельцем `AssetStore`.
-    /// Здесь корень и вложенные каталоги открываются с NOFOLLOW; runtime не попадает в assets/.
     pub fn open(store_root: &Path, batch_id: &str) -> Result<Self, AssetError> {
-        validate_batch_id(batch_id)?;
-        let root = File::from(
-            open(
-                store_root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(boundary_io)?,
-        );
-        let runtime = ensure_directory(&root, ".runtime")?;
-        let batches = ensure_directory(&runtime, "batches")?;
-        let directory = ensure_directory(&batches, batch_id)?;
-        flock(&directory, FlockOperation::LockExclusive).map_err(boundary_io)?;
-        let candidates = ensure_directory(&directory, "candidates")?;
         Ok(Self {
-            directory,
-            candidates,
-            batch_id: batch_id.into(),
-            loaded_revision: None,
-            directory_path: store_root.join(".runtime").join("batches").join(batch_id),
-            verified_candidate_keys: BTreeSet::new(),
+            runtime: SafeBatchRuntime::open(store_root, batch_id)?,
         })
     }
 
     pub fn batch_id(&self) -> &str {
-        &self.batch_id
+        self.runtime.batch_id()
     }
 
     pub fn load(&mut self) -> Result<Option<KanjiBatch>, AssetError> {
-        let bytes = match read_file(&self.directory, "state.json", MAX_STATE_BYTES) {
-            Ok(bytes) => bytes,
-            Err(error) if error.code == ErrorCode::MissingAssetFile => {
-                self.loaded_revision = None;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        let state: KanjiBatch = serde_json::from_slice(&bytes).map_err(|error| {
-            AssetError::new(
-                ErrorCode::ManifestCorrupt,
-                format!("JSON пакета повреждён: {error}"),
-            )
-        })?;
-        state.validate()?;
-        if state.batch_id != self.batch_id {
-            return Err(invalid(
-                "identity пакета не совпадает с каталогом runtime-данных",
-            ));
-        }
-        // Каждый сохранённый кандидат остаётся доступным для проверки, включая
-        // отклонённые и повреждённые данные.
-        self.verify_referenced_candidates(&state)?;
-        self.loaded_revision = Some(state.revision);
-        Ok(Some(state))
-    }
-
-    /// Проверяет каждую указанную ссылку на кандидата не более одного раза за объект.
-    fn verify_referenced_candidates(&mut self, state: &KanjiBatch) -> Result<(), AssetError> {
-        for item in &state.items {
-            if let Some(candidate) = &item.existing_candidate {
-                self.verify_candidate_once(candidate)?;
-            }
-            for attempt in &item.attempts {
-                if let BatchAttemptInput::Candidate { candidate } = &attempt.result {
-                    self.verify_candidate_once(candidate)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn verify_candidate_once(&mut self, candidate: &BatchCandidate) -> Result<(), AssetError> {
-        // Ключ охватывает все проверки `read_candidate`, поэтому две ссылки с
-        // одинаковым ключом дают одинаковый результат и повторное чтение избыточно.
-        let key = format!(
-            "{}|{}|{:?}",
-            candidate.storage_path, candidate.sha256, candidate.format
-        );
-        if self.verified_candidate_keys.contains(&key) {
-            return Ok(());
-        }
-        self.read_candidate(candidate)?;
-        self.verified_candidate_keys.insert(key);
-        Ok(())
+        self.runtime.load()
     }
 
     pub fn save(&mut self, state: &KanjiBatch) -> Result<(), AssetError> {
-        state.validate()?;
-        if state.batch_id != self.batch_id {
-            return Err(invalid(
-                "identity пакета не совпадает с каталогом runtime-данных",
-            ));
-        }
-        if let Some(revision) = self.loaded_revision {
-            if state.revision < revision {
-                return Err(invalid("номер изменения состояния пакета нельзя уменьшить"));
-            }
-        } else {
-            match read_file(&self.directory, "state.json", MAX_STATE_BYTES) {
-                Ok(_) => {
-                    return Err(invalid(
-                        "существующий пакет нужно загрузить перед сохранением",
-                    ));
-                }
-                Err(error) if error.code == ErrorCode::MissingAssetFile => {}
-                Err(error) => return Err(error),
-            }
-        }
-        // `save` всегда следует за `load` того же объекта, а загрузка уже проверила
-        // каждую указанную ссылку на кандидата. Здесь достаточно дешёвой
-        // инкрементальной проверки без повторного обхода набора для каждого элемента.
-        self.verify_referenced_candidates(state)?;
-        let bytes = serde_json::to_vec_pretty(state).map_err(|error| invalid(error.to_string()))?;
-        if bytes.len() as u64 > MAX_STATE_BYTES {
-            return Err(invalid(
-                "состояние пакета превышает ограничение размера runtime-данных",
-            ));
-        }
-        atomic_write(&self.directory, "state.json", &bytes)?;
-        self.loaded_revision = Some(state.revision);
-        Ok(())
+        self.runtime.save(state)
     }
 
     /// Локальная страница проверки с экранированным содержимым. Каждый отдельный
@@ -1240,7 +1162,7 @@ impl BatchRuntime {
     /// Страница проверки не меняет машиночитаемый источник истины.
     pub fn write_review(&self, state: &KanjiBatch) -> Result<PathBuf, AssetError> {
         state.validate()?;
-        if state.batch_id != self.batch_id {
+        if state.batch_id != self.batch_id() {
             return Err(invalid(
                 "identity пакета проверки не совпадает с каталогом runtime-данных",
             ));
@@ -1347,8 +1269,8 @@ impl BatchRuntime {
                 "HTML-страница проверки превышает ограничение runtime-данных; разделите пакет",
             ));
         }
-        atomic_write(&self.directory, "review.html", html.as_bytes())?;
-        Ok(self.directory_path.join("review.html"))
+        self.runtime
+            .write_artifact("review.html", html.as_bytes(), MAX_STATE_BYTES)
     }
 
     /// Байты сохраняются до записи состояния: прерывание оставит безопасный
@@ -1371,21 +1293,19 @@ impl BatchRuntime {
         }
         let format = DetectedFormat::from_signature(bytes);
         let storage_path = candidate_path(&hash, format)?;
-        let name = storage_path
-            .strip_prefix("candidates/")
-            .expect("путь кандидата вычислен из SHA-256");
-        match read_file(&self.candidates, name, MAX_CANDIDATE_BYTES) {
-            Ok(existing) if existing == bytes => {}
-            Ok(_) => {
-                return Err(AssetError::new(
-                    ErrorCode::IntegrityMismatch,
-                    "по существующему пути кандидата сохранены другие байты",
-                ));
-            }
-            Err(error) if error.code == ErrorCode::MissingAssetFile => {
-                atomic_write(&self.candidates, name, bytes)?
-            }
-            Err(error) => return Err(error),
+        let extension = match format {
+            DetectedFormat::Gif => "gif",
+            DetectedFormat::Png => "png",
+            _ => unreachable!("candidate_path принимает только GIF и PNG"),
+        };
+        let blob = self
+            .runtime
+            .persist_blob_with_limit(bytes, extension, MAX_CANDIDATE_BYTES)?;
+        if blob.sha256 != hash || blob.storage_path != storage_path {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "runtime blob не совпал с идентичностью Kanji-кандидата",
+            ));
         }
         Ok(BatchCandidate {
             sha256: hash,
@@ -1408,14 +1328,16 @@ impl BatchRuntime {
                 "ссылка кандидата не совпадает с относительным путём, вычисленным из SHA-256",
             ));
         }
-        let name = expected
-            .strip_prefix("candidates/")
-            .expect("путь кандидата вычислен из SHA-256");
-        #[cfg(test)]
-        CANDIDATE_FILE_READS.with(|reads| reads.set(reads.get() + 1));
-        let bytes = read_file(&self.candidates, name, MAX_CANDIDATE_BYTES)?;
+        let bytes = self.runtime.read_blob_with_limit(
+            &RuntimeBlobRef {
+                sha256: candidate.sha256.clone(),
+                storage_path: expected,
+            },
+            MAX_CANDIDATE_BYTES,
+        )?;
         if sha256_hex(&bytes) != candidate.sha256
             || DetectedFormat::from_signature(&bytes) != candidate.format
+            || bytes.len() as u64 > MAX_CANDIDATE_BYTES
         {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
@@ -1424,115 +1346,6 @@ impl BatchRuntime {
         }
         Ok(bytes)
     }
-}
-
-fn ensure_directory(parent: &File, name: &str) -> Result<File, AssetError> {
-    match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
-        Ok(()) => {}
-        Err(error) if error == rustix::io::Errno::EXIST => {}
-        Err(error) => return Err(boundary_io(error)),
-    }
-    Ok(File::from(
-        openat(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(boundary_io)?,
-    ))
-}
-
-fn open_regular_runtime_file(
-    parent: &File,
-    name: &str,
-    maximum: u64,
-) -> Result<Option<File>, AssetError> {
-    let descriptor = openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(|error| {
-        if error == rustix::io::Errno::NOENT {
-            AssetError::new(
-                ErrorCode::MissingAssetFile,
-                "файл runtime-данных отсутствует",
-            )
-        } else {
-            boundary_io(error)
-        }
-    });
-    let descriptor = match descriptor {
-        Ok(descriptor) => descriptor,
-        Err(error) if error.code == ErrorCode::MissingAssetFile => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let file = File::from(descriptor);
-    let metadata = file
-        .metadata()
-        .map_err(|error| AssetError::io("метаданные runtime-файла", error))?;
-    if !metadata.is_file() || metadata.len() > maximum {
-        return Err(AssetError::new(
-            ErrorCode::BoundaryViolation,
-            "запись runtime должна быть ограниченным обычным файлом",
-        ));
-    }
-    Ok(Some(file))
-}
-
-fn read_file(parent: &File, name: &str, maximum: u64) -> Result<Vec<u8>, AssetError> {
-    let file = open_regular_runtime_file(parent, name, maximum)?.ok_or_else(|| {
-        AssetError::new(
-            ErrorCode::MissingAssetFile,
-            "файл runtime-данных отсутствует",
-        )
-    })?;
-    let mut bytes = Vec::new();
-    file.take(maximum + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| AssetError::io("чтение runtime-файла", error))?;
-    if bytes.len() as u64 > maximum {
-        return Err(AssetError::new(
-            ErrorCode::BoundaryViolation,
-            "размер записи runtime превысил ограничение",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn atomic_write(parent: &File, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
-    // Проверяем тип назначения без чтения старых данных перед атомарной заменой.
-    let _existing = open_regular_runtime_file(parent, name, MAX_STATE_BYTES)?;
-    let temporary = format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
-    let descriptor = openat(
-        parent,
-        temporary.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(0o600),
-    )
-    .map_err(boundary_io)?;
-    let result = (|| {
-        let mut file = File::from(descriptor);
-        file.write_all(bytes)
-            .map_err(|error| AssetError::io("запись runtime-файла", error))?;
-        file.sync_all()
-            .map_err(|error| AssetError::io("синхронизация runtime-файла", error))?;
-        renameat(parent, temporary.as_str(), parent, name).map_err(boundary_io)?;
-        parent
-            .sync_all()
-            .map_err(|error| AssetError::io("синхронизация каталога runtime", error))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = unlinkat(parent, temporary.as_str(), AtFlags::empty());
-    }
-    result
 }
 
 fn html_escape(value: &str) -> String {
@@ -1567,20 +1380,10 @@ fn review_format(format: DetectedFormat) -> &'static str {
     }
 }
 
-fn boundary_io(error: rustix::io::Errno) -> AssetError {
-    if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
-        AssetError::new(
-            ErrorCode::BoundaryViolation,
-            "путь runtime содержит символическую ссылку или ведёт не к каталогу либо обычному файлу",
-        )
-    } else {
-        AssetError::io(
-            "файловая система runtime пакета",
-            std::io::Error::from(error),
-        )
-    }
-}
-
 #[cfg(test)]
 #[path = "batch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "batch_runtime_tests.rs"]
+mod runtime_tests;

@@ -157,6 +157,7 @@ impl KanjiCharacter {
 struct StoreSummary {
     path: String,
     store_id: Option<String>,
+    layout_migrated_on_open: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,6 +275,7 @@ pub fn execute(cli: Cli) -> CliOutput {
                 StoreSummary {
                     path: store_path.display().to_string(),
                     store_id: None,
+                    layout_migrated_on_open: false,
                 },
                 cli.output,
                 false,
@@ -298,15 +300,16 @@ pub fn execute(cli: Cli) -> CliOutput {
             }
     );
     let open_result = if open_existing {
-        AssetStore::open_existing(options)
+        AssetStore::open_kanji_existing(options)
     } else {
-        AssetStore::open(options)
+        AssetStore::open_kanji(options)
     };
     match open_result {
         Ok(store) => {
             let store_summary = StoreSummary {
                 path: store.root().display().to_string(),
                 store_id: Some(store.store_id().to_owned()),
+                layout_migrated_on_open: store.layout_migrated_on_open(),
             };
             if let Command::Batch { command } = &cli.command {
                 return batch_cli::execute(
@@ -331,7 +334,7 @@ pub fn execute(cli: Cli) -> CliOutput {
                     error,
                     store_summary,
                     cli.output,
-                    store.initialized_on_open(),
+                    store.did_mutate_on_open(),
                 ),
             }
         }
@@ -342,6 +345,7 @@ pub fn execute(cli: Cli) -> CliOutput {
             StoreSummary {
                 path: store_path.display().to_string(),
                 store_id: None,
+                layout_migrated_on_open: false,
             },
             cli.output,
             false,
@@ -485,7 +489,7 @@ fn execute_with_store(
 ) -> Result<(Response, u8), AssetError> {
     match command {
         Command::Init => {
-            let changed = store.initialized_on_open();
+            let changed = store.did_mutate_on_open();
             Ok((
                 response(
                     "init",
@@ -557,7 +561,7 @@ fn execute_with_store(
                     "already_present".into()
                 }),
             };
-            let changed = outcome.changed || store.initialized_on_open();
+            let changed = outcome.changed || store.did_mutate_on_open();
             Ok((
                 response(
                     "ingest",
@@ -583,7 +587,7 @@ fn execute_with_store(
                     store_summary,
                     None,
                     summaries,
-                    store.initialized_on_open(),
+                    store.did_mutate_on_open(),
                     "ok",
                 ),
                 0,
@@ -604,7 +608,7 @@ fn execute_with_store(
                 store_summary,
                 Some(selection_mode.as_str().to_owned()),
                 summaries,
-                store.initialized_on_open(),
+                store.did_mutate_on_open(),
                 "planned",
             );
             response.validator_available =
@@ -669,7 +673,7 @@ fn execute_with_store(
                 store_summary,
                 Some(selection_mode.as_str().to_owned()),
                 summaries,
-                report.changed > 0 || store.initialized_on_open(),
+                report.changed > 0 || store.did_mutate_on_open(),
                 if blockers.is_empty() {
                     "validated"
                 } else {
@@ -850,7 +854,7 @@ fn ensure_characters(
             asset.effective_status == Some(SemanticStatus::Verified)
                 && asset.to_state == Some(LifecycleState::Verified)
         });
-    let changed = assets.iter().any(|asset| asset.changed) || store.initialized_on_open();
+    let changed = assets.iter().any(|asset| asset.changed) || store.did_mutate_on_open();
     let mut response = response(
         "ensure",
         store_summary,

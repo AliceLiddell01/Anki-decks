@@ -1319,7 +1319,8 @@ mod tests {
 
         AssetRecord {
             identity: AssetIdentity::new("kanji", character.to_string()).unwrap(),
-            storage_path: format!("assets/{character}.png"),
+            storage_path: format!("assets/png/{character}.png"),
+            consumer_filename: format!("{character}.png"),
             sha256: "synthetic-test-hash".into(),
             byte_length: byte_length as u64,
             format: DetectedFormat::Png,

@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Версия формата persistent manifest.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
 
 /// Логическая identity asset; имя файла в identity не участвует.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -250,6 +250,10 @@ pub struct AssetRecord {
     pub identity: AssetIdentity,
     /// Relative path сохраняется явно и при чтении сверяется с lifecycle/hash.
     pub storage_path: String,
+    /// Плоское имя, которое consumer материализует в собственной media-директории.
+    /// Оно независимо от вложенного `storage_path` и проверяется по формату bytes.
+    #[serde(default)]
+    pub consumer_filename: String,
     pub sha256: String,
     pub byte_length: u64,
     pub format: DetectedFormat,
@@ -330,6 +334,10 @@ fn is_sha256(value: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
+    /// Policy/domain, закреплённые за этим физическим store root.
+    /// Отсутствует только в legacy schema 3/4 и заполняется при mutating open.
+    #[serde(default)]
+    pub domain_id: String,
     pub store_id: String,
     pub revision: u64,
     pub assets: Vec<AssetRecord>,
@@ -338,8 +346,14 @@ pub struct Manifest {
 impl Manifest {
     /// Пустое состояние нового store.
     pub fn empty(store_id: String) -> Self {
+        Self::empty_for_domain(store_id, "generic")
+    }
+
+    /// Пустое состояние нового store, привязанное к конкретной domain policy.
+    pub fn empty_for_domain(store_id: String, domain_id: impl Into<String>) -> Self {
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
+            domain_id: domain_id.into(),
             store_id,
             revision: 0,
             assets: Vec::new(),

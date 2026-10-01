@@ -1,6 +1,7 @@
 use super::*;
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::sync::atomic::Ordering;
 
 fn validator() -> ValidatorIdentity {
     ValidatorIdentity::new("kanjivg-pixel-chamfer", "synthetic-v1").unwrap()

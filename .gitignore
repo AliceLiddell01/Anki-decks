@@ -5,20 +5,36 @@
 # репозитория, поэтому build output принадлежит корневому `target/`.
 /target
 
-# В Git попадает только verified-only представление kanji corpus. Candidate и
-# quarantine manifests/bytes лежат в локальном runtime overlay.
+# В Git попадает только verified-only canonical corpus поддерживаемых domains.
+# Candidate и quarantine manifests/bytes лежат в локальном runtime overlay.
 /.asset-store/*
 !/.asset-store/kanji/
+!/.asset-store/pitch-accent/
 /.asset-store/kanji/*
 !/.asset-store/kanji/.owner.json
 !/.asset-store/kanji/manifest.json
 !/.asset-store/kanji/assets/
 /.asset-store/kanji/assets/*
-!/.asset-store/kanji/assets/*.gif
-!/.asset-store/kanji/assets/*.png
+!/.asset-store/kanji/assets/gif/
+!/.asset-store/kanji/assets/png/
+/.asset-store/kanji/assets/gif/*
+!/.asset-store/kanji/assets/gif/*.gif
+/.asset-store/kanji/assets/png/*
+!/.asset-store/kanji/assets/png/*.png
 /.asset-store/kanji/.runtime/
 /.asset-store/kanji/.lock
 /.asset-store/kanji/.tmp/
+/.asset-store/pitch-accent/*
+!/.asset-store/pitch-accent/.owner.json
+!/.asset-store/pitch-accent/manifest.json
+!/.asset-store/pitch-accent/assets/
+/.asset-store/pitch-accent/assets/*
+!/.asset-store/pitch-accent/assets/png/
+/.asset-store/pitch-accent/assets/png/*
+!/.asset-store/pitch-accent/assets/png/*.png
+/.asset-store/pitch-accent/.runtime/
+/.asset-store/pitch-accent/.lock
+/.asset-store/pitch-accent/.tmp/
 
 # Каталог статического отчёта `anki-repo visual-report`: это результат единичного
 # прогона (сотни файлов превью и копий media), а не данные репозитория. Каталог

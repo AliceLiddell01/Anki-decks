@@ -136,7 +136,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let provisional = AssetRecord {
             identity: AssetIdentity::new("kanji", item.character.clone())?,
-            storage_path: format!("assets/{codepoint}.png"),
+            storage_path: format!("assets/png/{}.png", item.character),
+            consumer_filename: format!("{}.png", item.character),
             sha256: sha256.clone(),
             byte_length: media.bytes.len() as u64,
             format: DetectedFormat::from_signature(&media.bytes),

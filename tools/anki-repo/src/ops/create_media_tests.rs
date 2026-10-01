@@ -4,11 +4,13 @@ use super::*;
 use crate::ops::create::{MAX_REPORTED_NOTES, create_with_options, parse_request_bytes};
 use crate::test_support::{MINIMAL_EXPORT, TempDir};
 use asset_store::{
-    AssetRecord, HumanAttestationRequest, HumanDecision, IngestRequest, Provenance, SelectionMode,
-    SemanticDecision, SemanticStatus, SemanticValidator, StoreOptions, ValidationEvidence,
-    ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
+    AssetRecord, DetectedFormat, HumanAttestationRequest, HumanDecision, IngestRequest,
+    LifecycleState, Provenance, SelectionMode, SemanticDecision, SemanticStatus, SemanticValidator,
+    StoreOptions, ValidationEvidence, ValidatorFailure, ValidatorIdentity, VerifiedAssetBytes,
+    VerifiedIngestRequest,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs;
 
 struct Fixture {
@@ -64,7 +66,8 @@ impl Fixture {
     }
     fn asset(&self, character: &str, bytes: &[u8], previous: Option<String>) -> String {
         let store =
-            AssetStore::open(StoreOptions::new(self.options.asset_store.clone().unwrap())).unwrap();
+            AssetStore::open_kanji(StoreOptions::new(self.options.asset_store.clone().unwrap()))
+                .unwrap();
         let result = store
             .ingest_verified(
                 VerifiedIngestRequest {
@@ -123,6 +126,34 @@ fn policy(uuid: &str, field: &str) -> String {
 }
 fn reason(error: &DomainError, expected: &str) {
     assert_eq!(error.details["reason"], expected, "{error:?}");
+}
+
+fn verified_asset_fixture(
+    identity: AssetIdentity,
+    storage_path: &str,
+    consumer_filename: &str,
+    bytes: &[u8],
+) -> VerifiedAssetBytes {
+    let format = DetectedFormat::from_signature(bytes);
+    VerifiedAssetBytes {
+        record: AssetRecord {
+            identity,
+            storage_path: storage_path.into(),
+            consumer_filename: consumer_filename.into(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            byte_length: bytes.len() as u64,
+            format,
+            provenance: Provenance {
+                source_kind: "fixture".into(),
+                source_name: "verified-media.bin".into(),
+            },
+            lifecycle: LifecycleState::Verified,
+            validation: None,
+            human_attestation: None,
+            domain_metadata: None,
+        },
+        bytes: bytes.to_vec(),
+    }
 }
 
 /// Только внутренние тестовые реализации: production YAML не получает новых
@@ -295,7 +326,7 @@ fn create_reads_human_approved_exact_bytes_through_asset_owner_api() {
     for status in [SemanticStatus::Uncertain, SemanticStatus::Rejected] {
         let f = Fixture::new();
         let root = f.options.asset_store.as_ref().unwrap();
-        let store = AssetStore::open(StoreOptions::new(root.clone())).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(root.clone())).unwrap();
         let source = f.temp.path().join("candidate.gif");
         fs::write(&source, DECODABLE_GIF).unwrap();
         let identity = AssetIdentity::new("kanji", "一").unwrap();
@@ -325,10 +356,11 @@ fn create_reads_human_approved_exact_bytes_through_asset_owner_api() {
             approved.asset.effective_status(),
             Some(SemanticStatus::Verified)
         );
-        let verified = AssetStore::read_verified(
+        let verified = AssetStore::read_verified_with_policy(
             root,
             &[identity],
             &KanjiImageValidator::validator_identity(),
+            &asset_store::KanjiDomainPolicy,
         )
         .unwrap();
         assert_eq!(verified[0].bytes, DECODABLE_GIF);
@@ -545,7 +577,7 @@ fn missing_integrity_nonverified_and_filename_mismatch_write_nothing() {
         .asset_store
         .as_ref()
         .unwrap()
-        .join("assets/一.png");
+        .join("assets/png/一.png");
     fs::remove_file(&path).unwrap();
     fs::write(&path, b"corrupt").unwrap();
     reason(
@@ -562,7 +594,7 @@ fn pending_and_quarantine_are_never_used_as_canonical() {
     let source = f.temp.path().join("pending.gif");
     fs::write(&source, GIF).unwrap();
     let store =
-        AssetStore::open(StoreOptions::new(f.options.asset_store.clone().unwrap())).unwrap();
+        AssetStore::open_kanji(StoreOptions::new(f.options.asset_store.clone().unwrap())).unwrap();
     store
         .ingest(IngestRequest {
             identity: AssetIdentity::new("kanji", "一").unwrap(),
@@ -632,7 +664,7 @@ fn pinned_missing_asset_and_filename_drift_are_stale_before_destination_checks()
             .asset_store
             .as_ref()
             .unwrap()
-            .join("assets/一.gif"),
+            .join("assets/gif/一.gif"),
     )
     .unwrap();
     reason(
@@ -717,7 +749,7 @@ fn destination_conflict_and_symlinks_never_overwrite() {
             .asset_store
             .as_ref()
             .unwrap()
-            .join("assets/一.gif"),
+            .join("assets/gif/一.gif"),
         &destination,
     )
     .unwrap();
@@ -754,11 +786,86 @@ fn media_evidence_caps_references_and_reports_truncation() {
 }
 
 #[test]
-fn invalid_verified_asset_path_is_reported_as_internal_error() {
-    let error = verified_asset_filename("outside/assets/file.gif").unwrap_err();
+fn nested_storage_paths_keep_the_explicit_consumer_filename_flat_in_media() {
+    let cases = [
+        (
+            AssetIdentity::new("kanji", "漢").unwrap(),
+            "assets/gif/漢.gif",
+            "漢.gif",
+            GIF,
+        ),
+        (
+            AssetIdentity::new("kanji", "饅").unwrap(),
+            "assets/png/饅.png",
+            "饅.png",
+            PNG,
+        ),
+        (
+            AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+            "assets/png/幽霊.png",
+            "幽霊.png",
+            PNG,
+        ),
+    ];
 
+    for (identity, storage_path, consumer_filename, bytes) in cases {
+        let f = Fixture::new();
+        let asset =
+            verified_asset_fixture(identity.clone(), storage_path, consumer_filename, bytes);
+        assert_eq!(verified_asset_filename(&asset).unwrap(), consumer_filename);
+
+        let mut plan = MediaPlan {
+            items: vec![Item {
+                pin: Pin {
+                    identity,
+                    filename: consumer_filename.into(),
+                    sha256: asset.record.sha256.clone(),
+                },
+                action: "copy".into(),
+                asset,
+            }],
+            ..MediaPlan::default()
+        };
+        let guard = crate::write::ExportLock::acquire(&f.export).unwrap();
+        plan.materialize(&guard).unwrap();
+
+        assert_eq!(
+            fs::read(f.export.join("media").join(consumer_filename)).unwrap(),
+            bytes
+        );
+        assert!(!f.export.join("media/gif").exists());
+        assert!(!f.export.join("media/png").exists());
+    }
+}
+
+#[test]
+fn unsafe_consumer_filenames_and_format_mismatches_fail_closed() {
+    let identity = AssetIdentity::new("pitch_accent", "幽霊").unwrap();
+    for filename in [
+        "",
+        ".",
+        "..",
+        "../幽霊.png",
+        "nested/幽霊.png",
+        r"nested\幽霊.png",
+        "幽\u{0}霊.png",
+        "幽\n霊.png",
+        ".png",
+        "幽霊.gif",
+    ] {
+        let asset = verified_asset_fixture(identity.clone(), "assets/png/幽霊.png", filename, PNG);
+        let error = verified_asset_filename(&asset).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal, "filename={filename:?}");
+        assert_eq!(
+            error.details["reason"], "mutation_internal_invariant",
+            "filename={filename:?}"
+        );
+    }
+
+    let wrong_detected_format =
+        verified_asset_fixture(identity, "assets/png/幽霊.png", "幽霊.png", GIF);
+    let error = verified_asset_filename(&wrong_detected_format).unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
-    assert_eq!(error.details["reason"], "mutation_internal_invariant");
 }
 
 #[test]
@@ -1096,7 +1203,7 @@ fn canonical_lifecycle_decision_validator_and_hash_must_all_match() {
                 manifest["assets"][0]["validation"]["validator"]["version"] = json!("old")
             }
             "format" => manifest["assets"][0]["format"] = json!("png"),
-            "missing_file" => fs::remove_file(store.join("assets/一.gif")).unwrap(),
+            "missing_file" => fs::remove_file(store.join("assets/gif/一.gif")).unwrap(),
             _ => unreachable!(),
         }
         fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();

@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,9 +16,9 @@ use rustix::fs::{
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
+use crate::domain::{AssetDomainPolicy, GenericDomainPolicy, KanjiDomainPolicy};
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::{encode_lower_hex, sha256_hex};
-use crate::kanji_validator::MAX_MEDIA_BYTES;
 use crate::model::{
     AssetIdentity, AssetRecord, DetectedFormat, HumanAttestation, HumanDecision, LifecycleState,
     MANIFEST_SCHEMA_VERSION, Manifest, Provenance, SemanticDecision, SemanticStatus,
@@ -38,7 +39,9 @@ const BATCHES_DIR: &str = "batches";
 const REMOVAL_MARKER: &str = "removal.json";
 const REMOVAL_BACKUP: &str = "removal.backup";
 const TRANSITION_MARKER: &str = "transition.json";
+const LAYOUT_MIGRATION_MARKER: &str = "layout-migration.json";
 const OWNER_SCHEMA_VERSION: u32 = 1;
+const MAX_HUMAN_APPROVED_BYTES: u64 = 8 * 1024 * 1024;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -88,7 +91,9 @@ pub struct AssetStore {
     /// Локальное хранилище записей `Pending` и `Quarantined`; оно целиком исключено из Git.
     runtime_handle: File,
     store_id: String,
+    policy: Arc<dyn AssetDomainPolicy>,
     initialized_on_open: bool,
+    layout_migrated_on_open: bool,
     #[cfg(test)]
     fail_next_manifest_write: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -223,6 +228,27 @@ struct TransitionTransaction {
     sha256: String,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayoutMigrationTransaction {
+    schema_version: u32,
+    store_id: String,
+    domain_id: String,
+    source_schema_version: u32,
+    entries: Vec<LayoutMigrationEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayoutMigrationEntry {
+    identity: AssetIdentity,
+    sha256: String,
+    format: DetectedFormat,
+    old_path: String,
+    new_path: String,
+    consumer_filename: String,
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TransitionTarget {
@@ -259,18 +285,45 @@ impl StoreLock {
 impl AssetStore {
     /// Открывает существующий или создаёт новый store после проверки boundary.
     pub fn open(options: StoreOptions) -> Result<Self, AssetError> {
-        Self::open_with_creation(options, true)
+        Self::open_with_policy(options, GenericDomainPolicy)
     }
 
     /// Открывает существующее принадлежащее asset-store хранилище без создания нового корня.
     /// При открытии инициализирует отсутствующий `.runtime` и переносит туда
     /// прежние записи `Pending` и `Quarantined`, чтобы восстановить границу жизненного цикла.
     pub fn open_existing(options: StoreOptions) -> Result<Self, AssetError> {
-        Self::open_with_creation(options, false)
+        Self::open_existing_with_policy(options, GenericDomainPolicy)
+    }
+
+    /// Открывает store с явной domain/layout policy.
+    pub fn open_with_policy<P: AssetDomainPolicy + 'static>(
+        options: StoreOptions,
+        policy: P,
+    ) -> Result<Self, AssetError> {
+        Self::open_with_creation(options, Arc::new(policy), true)
+    }
+
+    /// Открывает существующий store с явной domain/layout policy.
+    pub fn open_existing_with_policy<P: AssetDomainPolicy + 'static>(
+        options: StoreOptions,
+        policy: P,
+    ) -> Result<Self, AssetError> {
+        Self::open_with_creation(options, Arc::new(policy), false)
+    }
+
+    /// Открывает или создаёт kanji store с закреплённой kanji policy.
+    pub fn open_kanji(options: StoreOptions) -> Result<Self, AssetError> {
+        Self::open_with_policy(options, KanjiDomainPolicy)
+    }
+
+    /// Открывает существующий kanji store без его создания.
+    pub fn open_kanji_existing(options: StoreOptions) -> Result<Self, AssetError> {
+        Self::open_existing_with_policy(options, KanjiDomainPolicy)
     }
 
     fn open_with_creation(
         options: StoreOptions,
+        policy: Arc<dyn AssetDomainPolicy>,
         create_if_missing: bool,
     ) -> Result<Self, AssetError> {
         let requested_root = resolve_store_root(&options.root)?;
@@ -343,31 +396,62 @@ impl AssetStore {
             )
         })?;
         let initialized_on_open = if create_if_missing {
-            initialize_or_load(&root_handle, state)?
+            initialize_or_load(&root_handle, state, policy.domain_id())?
         } else {
             ensure_dir_entry(&root_handle, TEMP_DIR)?;
             false
         };
 
         let canonical_manifest = load_manifest(&root_handle)?;
-        let runtime_handle =
-            open_or_initialize_runtime(&root_handle, &canonical_manifest.store_id)?;
-        recover_publications(&root_handle)?;
-        recover_publications(&runtime_handle)?;
-        let manifest = load_manifest(&root_handle)?;
-        let runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
-        reconcile_runtime_boundary(&root_handle, &runtime_handle, &manifest, &runtime_manifest)?;
-        let manifest = load_manifest(&root_handle)?;
-        let runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
-        validate_verified_manifest(&root_handle, &manifest)?;
-        validate_runtime_manifest(&runtime_handle, &runtime_manifest, &manifest.store_id)?;
+        let runtime_handle = open_or_initialize_runtime(
+            &root_handle,
+            &canonical_manifest.store_id,
+            policy.domain_id(),
+        )?;
+        recover_publications(&root_handle, policy.as_ref())?;
+        recover_publications(&runtime_handle, policy.as_ref())?;
+        recover_layout_migration(&root_handle, policy.as_ref())?;
+        recover_layout_migration(&runtime_handle, policy.as_ref())?;
+        let mut manifest = load_manifest(&root_handle)?;
+        let mut runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
+        ensure_store_domain(&manifest, policy.as_ref())?;
+        ensure_store_domain(&runtime_manifest, policy.as_ref())?;
+        let mut layout_migrated_on_open = false;
+        if manifest.schema_version < MANIFEST_SCHEMA_VERSION {
+            migrate_layout(&root_handle, &mut manifest, policy.as_ref())?;
+            layout_migrated_on_open = true;
+        }
+        if runtime_manifest.schema_version < MANIFEST_SCHEMA_VERSION {
+            migrate_layout(&runtime_handle, &mut runtime_manifest, policy.as_ref())?;
+            layout_migrated_on_open = true;
+        }
+        manifest = load_manifest(&root_handle)?;
+        runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
+        reconcile_runtime_boundary(
+            &root_handle,
+            &runtime_handle,
+            &manifest,
+            &runtime_manifest,
+            policy.as_ref(),
+        )?;
+        manifest = load_manifest(&root_handle)?;
+        runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
+        validate_verified_manifest(&root_handle, &manifest, policy.as_ref())?;
+        validate_runtime_manifest(
+            &runtime_handle,
+            &runtime_manifest,
+            &manifest.store_id,
+            policy.as_ref(),
+        )?;
 
         let store = Self {
             root: canonical_root,
             root_handle,
             runtime_handle,
             store_id: manifest.store_id,
+            policy,
             initialized_on_open,
+            layout_migrated_on_open,
             #[cfg(test)]
             fail_next_manifest_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -401,13 +485,28 @@ impl AssetStore {
         self.initialized_on_open
     }
 
+    /// True, если mutating open завершил versioned schema/storage migration.
+    pub const fn layout_migrated_on_open(&self) -> bool {
+        self.layout_migrated_on_open
+    }
+
+    /// True when opening created the store or performed a legacy layout migration.
+    pub const fn did_mutate_on_open(&self) -> bool {
+        self.initialized_on_open || self.layout_migrated_on_open
+    }
+
     /// Проверяет manifest и каждый файл, на который он ссылается.
     pub fn verify_integrity(&self) -> Result<Vec<AssetRecord>, AssetError> {
         let lock = self.lock_shared()?;
         let manifest = load_manifest(&self.root_handle)?;
-        validate_verified_manifest(&self.root_handle, &manifest)?;
+        validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
         let runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         let mut assets = manifest.assets;
         assets.extend(runtime_manifest.assets);
         assets.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -415,24 +514,39 @@ impl AssetStore {
         Ok(assets)
     }
 
-    /// Читает только проверенные записи канонического хранилища, не создавая
-    /// хранилище, не восстанавливая его и не обращаясь к `.runtime`.
-    /// Проверяются именно возвращаемые байты, а не путь для последующего чтения.
-    /// Общая блокировка каталога согласована с ingest/validate; дескрипторы,
-    /// открытые с `NOFOLLOW`, не дают выйти за границы хранилища даже при
-    /// внешней подмене пути.
+    /// Совместимый read-only consumer для kanji store. Для других domains
+    /// вызывайте `read_verified_with_policy` с их явной policy.
     pub fn read_verified(
         root: impl AsRef<Path>,
         identities: &[AssetIdentity],
         expected_validator: &ValidatorIdentity,
     ) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
-        Self::read_verified_snapshot(root.as_ref(), identities, expected_validator, |_| {})
+        Self::read_verified_with_policy(root, identities, expected_validator, &KanjiDomainPolicy)
+    }
+
+    /// Read-only variant for an explicit domain. It never performs manifest or
+    /// filesystem migration; legacy v3/v4 stores are interpreted through the
+    /// policy's read-only legacy layout mapping.
+    pub fn read_verified_with_policy(
+        root: impl AsRef<Path>,
+        identities: &[AssetIdentity],
+        expected_validator: &ValidatorIdentity,
+        policy: &dyn AssetDomainPolicy,
+    ) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
+        Self::read_verified_snapshot(
+            root.as_ref(),
+            identities,
+            expected_validator,
+            policy,
+            |_| {},
+        )
     }
 
     fn read_verified_snapshot(
         root: &Path,
         identities: &[AssetIdentity],
         expected_validator: &ValidatorIdentity,
+        policy: &dyn AssetDomainPolicy,
         mut before_read: impl FnMut(&AssetRecord),
     ) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
         validate_validator_identity(expected_validator)?;
@@ -448,12 +562,15 @@ impl AssetStore {
                 "store_id отличается от owner",
             ));
         }
-        validate_verified_manifest(&directory, &manifest)?;
+        ensure_store_domain(&manifest, policy)?;
+        if manifest.schema_version < MANIFEST_SCHEMA_VERSION {
+            validate_legacy_verified_manifest(&directory, &manifest, policy)?;
+        } else {
+            validate_verified_manifest(&directory, &manifest, policy)?;
+        }
         let mut result = Vec::new();
         for identity in identities {
-            identity
-                .validate()
-                .map_err(|e| AssetError::new(ErrorCode::InvalidIdentity, e))?;
+            policy.validate_identity(identity)?;
             let record = manifest
                 .assets
                 .iter()
@@ -471,17 +588,35 @@ impl AssetStore {
                     "изображение проверено другой версией валидатора",
                 ));
             }
-            before_read(record);
+            let mut record = record.clone();
+            if record.consumer_filename.is_empty() {
+                record.consumer_filename = policy
+                    .legacy_location(&record.identity, &record.sha256, record.format)
+                    .ok_or_else(|| {
+                        AssetError::new(
+                            ErrorCode::UnsupportedSchemaVersion,
+                            "legacy manifest не имеет consumer filename для этой domain policy",
+                        )
+                    })?
+                    .consumer_filename;
+            }
+            validate_record_consumer_filename(&record)?;
+            before_read(&record);
             let human_approved = record.current_human_decision() == Some(HumanDecision::Approve);
-            if human_approved && record.byte_length > MAX_MEDIA_BYTES as u64 {
+            let maximum = policy.max_asset_bytes().unwrap_or(MAX_HUMAN_APPROVED_BYTES);
+            if human_approved && record.byte_length > maximum {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
                     "изображение, одобренное человеком, превышает установленный предел размера",
                 ));
             }
-            let file = checked_asset_file(&directory, record)?;
+            let file = if manifest.schema_version < MANIFEST_SCHEMA_VERSION {
+                checked_legacy_asset_file(&directory, &record, policy)?
+            } else {
+                checked_asset_file(&directory, &record, policy)?
+            };
             let bytes = if human_approved {
-                read_bounded_asset_bytes(file, MAX_MEDIA_BYTES, "чтение проверенных байтов")?
+                read_bounded_asset_bytes(file, maximum as usize, "чтение проверенных байтов")?
             } else {
                 let mut bytes = Vec::new();
                 file.take(record.byte_length.saturating_add(1))
@@ -502,10 +637,7 @@ impl AssetStore {
             if human_approved {
                 validate_image_decode(&bytes)?;
             }
-            result.push(VerifiedAssetBytes {
-                record: record.clone(),
-                bytes,
-            });
+            result.push(VerifiedAssetBytes { record, bytes });
         }
         Ok(result)
     }
@@ -514,6 +646,15 @@ impl AssetStore {
     /// восстановления или изменения файлов. Отсутствующий корпус допустим.
     pub fn verify_publishable_corpus(
         root: impl AsRef<Path>,
+        expected_validator: &ValidatorIdentity,
+    ) -> Result<(), AssetError> {
+        Self::verify_publishable_corpus_with_policy(root, &KanjiDomainPolicy, expected_validator)
+    }
+
+    /// Verifies a publishable domain corpus without creating or changing files.
+    pub fn verify_publishable_corpus_with_policy(
+        root: impl AsRef<Path>,
+        policy: &dyn AssetDomainPolicy,
         expected_validator: &ValidatorIdentity,
     ) -> Result<(), AssetError> {
         validate_validator_identity(expected_validator)?;
@@ -551,13 +692,14 @@ impl AssetStore {
                     "значение `store_id` в публикуемом манифесте не совпадает с маркером владельца",
                 ));
             }
-            validate_publishable_manifest(&root_handle, &manifest, expected_validator)?;
+            ensure_store_domain(&manifest, policy)?;
+            validate_publishable_manifest(&root_handle, &manifest, expected_validator, policy)?;
             ensure_directory_empty(&root_handle, TEMP_DIR)?;
             if names.contains(RUNTIME_DIR) {
                 let runtime = open_directory_at(&root_handle, RUNTIME_DIR)
                     .map_err(|error| directory_entry_error(RUNTIME_DIR, error))?;
                 let runtime_manifest = load_runtime_manifest(&runtime, &manifest.store_id)?;
-                validate_runtime_manifest(&runtime, &runtime_manifest, &manifest.store_id)?;
+                validate_runtime_manifest(&runtime, &runtime_manifest, &manifest.store_id, policy)?;
                 let published: BTreeSet<_> = manifest
                     .assets
                     .iter()
@@ -590,10 +732,7 @@ impl AssetStore {
     /// Явно импортирует один файл, вычисляя SHA-256 по скопированным bytes.
     /// Повтор той же identity/hash — no-op; другой hash требует ожидаемый hash.
     pub fn ingest(&self, request: IngestRequest) -> Result<IngestOutcome, AssetError> {
-        request
-            .identity
-            .validate()
-            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        self.policy.validate_identity(&request.identity)?;
         let source = open_source_file(&request.source_path)?;
         self.ingest_from_file(request, source)
     }
@@ -606,25 +745,22 @@ impl AssetStore {
         request: VerifiedIngestRequest,
         validator: &V,
     ) -> Result<VerifiedIngestOutcome, AssetError> {
-        request
-            .identity
-            .validate()
-            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        self.policy.validate_identity(&request.identity)?;
         if request.provenance.source_kind.trim().is_empty()
             || request.provenance.source_name.trim().is_empty()
             || request.provenance.source_name.contains(['/', '\\'])
         {
             return Err(AssetError::new(
                 ErrorCode::InvalidIdentity,
-                "Yarxi provenance должен содержать тип и имя источника без path",
+                "provenance должен содержать тип и имя источника без path",
             ));
         }
         let validator_id = validator.identity();
         validate_validator_identity(&validator_id)?;
         let staged = stage_bytes(&self.root_handle, &request.bytes)?;
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle)?;
-        recover_publications(&self.runtime_handle)?;
+        recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         reconcile_runtime_boundary(
@@ -632,11 +768,17 @@ impl AssetStore {
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
+            self.policy.as_ref(),
         )?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        validate_verified_manifest(&self.root_handle, &manifest)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         let existing = manifest
             .assets
             .iter()
@@ -694,10 +836,14 @@ impl AssetStore {
             ));
         }
 
-        let storage_path = canonical_asset_path(&request.identity, &staged.sha256, staged.format);
+        self.policy.validate_identity(&request.identity)?;
+        let location =
+            self.policy
+                .canonical_location(&request.identity, &staged.sha256, staged.format)?;
         let mut record = AssetRecord {
             identity: request.identity,
-            storage_path,
+            storage_path: location.storage_path,
+            consumer_filename: location.consumer_filename,
             sha256: staged.sha256.clone(),
             byte_length: staged.byte_length,
             format: staged.format,
@@ -736,6 +882,16 @@ impl AssetStore {
             lock.unlock()?;
             return Ok(outcome);
         }
+        if !self.policy.allows_verified_format(staged.format) {
+            return Err(AssetError::new(
+                ErrorCode::InvalidTransition,
+                format!(
+                    "формат {:?} не может получить verified lifecycle в domain {}",
+                    staged.format,
+                    self.policy.domain_id()
+                ),
+            ));
+        }
         record.lifecycle = LifecycleState::Verified;
         record.validation = Some(ValidationRecord {
             status: SemanticStatus::Verified,
@@ -767,6 +923,7 @@ impl AssetStore {
             previous_canonical.as_ref(),
             &record,
             &mut manifest,
+            self.policy.as_ref(),
             |root, manifest| {
                 #[cfg(test)]
                 {
@@ -791,7 +948,12 @@ impl AssetStore {
                     "тестовый сбой после canonical commit",
                 ));
             }
-            remove_record_from_area(&self.runtime_handle, &mut runtime_manifest, &candidate)?;
+            remove_record_from_area(
+                &self.runtime_handle,
+                &mut runtime_manifest,
+                &candidate,
+                self.policy.as_ref(),
+            )?;
             clear_transition(&self.root_handle)?;
         }
         let sha256 = staged.sha256.clone();
@@ -814,10 +976,7 @@ impl AssetStore {
         request: IngestRequest,
         source: File,
     ) -> Result<IngestOutcome, AssetError> {
-        request
-            .identity
-            .validate()
-            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        self.policy.validate_identity(&request.identity)?;
         if let Some(expected) = &request.expected_source_sha256 {
             validate_hash(expected)?;
         }
@@ -833,8 +992,8 @@ impl AssetStore {
             ));
         }
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle)?;
-        recover_publications(&self.runtime_handle)?;
+        recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         reconcile_runtime_boundary(
@@ -842,11 +1001,17 @@ impl AssetStore {
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
+            self.policy.as_ref(),
         )?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        validate_verified_manifest(&self.root_handle, &manifest)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         let source_name = request
             .source_path
             .file_name()
@@ -903,10 +1068,13 @@ impl AssetStore {
             ));
         }
 
-        let storage_path = canonical_asset_path(&request.identity, &staged.sha256, staged.format);
+        let location =
+            self.policy
+                .canonical_location(&request.identity, &staged.sha256, staged.format)?;
         let record = AssetRecord {
             identity: request.identity,
-            storage_path,
+            storage_path: location.storage_path,
+            consumer_filename: location.consumer_filename,
             sha256: staged.sha256.clone(),
             byte_length: staged.byte_length,
             format: staged.format,
@@ -938,6 +1106,7 @@ impl AssetStore {
             existing_runtime.as_ref(),
             &record,
             &mut runtime_manifest,
+            self.policy.as_ref(),
             |root, manifest| {
                 #[cfg(test)]
                 {
@@ -955,11 +1124,21 @@ impl AssetStore {
             },
         )?;
         if let Some(canonical) = previous_canonical {
-            remove_record_from_area(&self.root_handle, &mut manifest, &canonical)?;
+            remove_record_from_area(
+                &self.root_handle,
+                &mut manifest,
+                &canonical,
+                self.policy.as_ref(),
+            )?;
             clear_transition(&self.root_handle)?;
         }
-        validate_verified_manifest(&self.root_handle, &manifest)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         drop(staged);
         lock.unlock()?;
         Ok(IngestOutcome {
@@ -978,9 +1157,14 @@ impl AssetStore {
         validate_validator_identity(validator)?;
         let lock = self.lock_shared()?;
         let manifest = load_manifest(&self.root_handle)?;
-        validate_verified_manifest(&self.root_handle, &manifest)?;
+        validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
         let runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         let mut records = manifest.assets;
         records.extend(runtime_manifest.assets);
         let assets = select_assets(&records, mode, validator)
@@ -1030,8 +1214,8 @@ impl AssetStore {
         let validator_id = validator.identity();
         validate_validator_identity(&validator_id)?;
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle)?;
-        recover_publications(&self.runtime_handle)?;
+        recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         reconcile_runtime_boundary(
@@ -1039,11 +1223,17 @@ impl AssetStore {
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
+            self.policy.as_ref(),
         )?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        validate_verified_manifest(&self.root_handle, &manifest)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         let mut records = manifest.assets.clone();
         records.extend(runtime_manifest.assets.clone());
         let selected: Vec<_> = select_assets(&records, mode, &validator_id)
@@ -1082,7 +1272,7 @@ impl AssetStore {
             } else {
                 &self.runtime_handle
             };
-            let mut file = checked_asset_file(area, &record)?;
+            let mut file = checked_asset_file(area, &record, self.policy.as_ref())?;
             let original_state = record.lifecycle;
             match validator.validate(&record, &mut file) {
                 Ok(decision) => {
@@ -1155,8 +1345,17 @@ impl AssetStore {
             .iter()
             .filter(|attempt| attempt.changed)
             .count();
-        validate_verified_manifest(&self.root_handle, &load_manifest(&self.root_handle)?)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_verified_manifest(
+            &self.root_handle,
+            &load_manifest(&self.root_handle)?,
+            self.policy.as_ref(),
+        )?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         lock.unlock()?;
         Ok(report)
     }
@@ -1165,10 +1364,7 @@ impl AssetStore {
     /// требует полной проверки декодером, затем использует тот же атомарный
     /// переход жизненного цикла, что автоматическая проверка. Её данные сохраняются.
     pub fn attest(&self, request: HumanAttestationRequest) -> Result<IngestOutcome, AssetError> {
-        request
-            .identity
-            .validate()
-            .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
+        self.policy.validate_identity(&request.identity)?;
         validate_hash(&request.expected_sha256)?;
         if request.reason.trim().is_empty() {
             return Err(AssetError::new(
@@ -1177,8 +1373,8 @@ impl AssetStore {
             ));
         }
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle)?;
-        recover_publications(&self.runtime_handle)?;
+        recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
         reconcile_runtime_boundary(
@@ -1186,11 +1382,17 @@ impl AssetStore {
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
+            self.policy.as_ref(),
         )?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
-        validate_verified_manifest(&self.root_handle, &manifest)?;
-        validate_runtime_manifest(&self.runtime_handle, &runtime_manifest, &self.store_id)?;
+        validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
+        validate_runtime_manifest(
+            &self.runtime_handle,
+            &runtime_manifest,
+            &self.store_id,
+            self.policy.as_ref(),
+        )?;
         let previous = manifest
             .assets
             .iter()
@@ -1219,7 +1421,11 @@ impl AssetStore {
                     "подтверждение человеком не может отменить статус CORRUPT; требуется исправленный кандидат",
                 ));
             }
-            if previous.byte_length > MAX_MEDIA_BYTES as u64 {
+            let maximum = self
+                .policy
+                .max_asset_bytes()
+                .unwrap_or(MAX_HUMAN_APPROVED_BYTES);
+            if previous.byte_length > maximum {
                 return Err(AssetError::new(
                     ErrorCode::InvalidTransition,
                     "подтверждение человеком превышает установленный предел размера изображения",
@@ -1231,8 +1437,8 @@ impl AssetStore {
                 &self.runtime_handle
             };
             let bytes = read_bounded_asset_bytes(
-                checked_asset_file(area, &previous)?,
-                MAX_MEDIA_BYTES,
+                checked_asset_file(area, &previous, self.policy.as_ref())?,
+                maximum as usize,
                 "чтение кандидата для подтверждения человеком",
             )?;
             if sha256_hex(&bytes) != previous.sha256
@@ -1258,6 +1464,18 @@ impl AssetStore {
         } else {
             LifecycleState::Quarantined
         };
+        if record.lifecycle == LifecycleState::Verified
+            && !self.policy.allows_verified_format(record.format)
+        {
+            return Err(AssetError::new(
+                ErrorCode::InvalidTransition,
+                format!(
+                    "формат {:?} не может получить verified lifecycle в domain {}",
+                    record.format,
+                    self.policy.domain_id()
+                ),
+            ));
+        }
         let changed = record != previous;
         if changed {
             self.commit_lifecycle_change(&previous, &record, &mut manifest, &mut runtime_manifest)?;
@@ -1277,6 +1495,18 @@ impl AssetStore {
         manifest: &mut Manifest,
         runtime_manifest: &mut Manifest,
     ) -> Result<(), AssetError> {
+        if new_record.lifecycle == LifecycleState::Verified
+            && !self.policy.allows_verified_format(new_record.format)
+        {
+            return Err(AssetError::new(
+                ErrorCode::InvalidTransition,
+                format!(
+                    "формат {:?} не может получить verified lifecycle в domain {}",
+                    new_record.format,
+                    self.policy.domain_id()
+                ),
+            ));
+        }
         manifest.schema_version = MANIFEST_SCHEMA_VERSION;
         runtime_manifest.schema_version = MANIFEST_SCHEMA_VERSION;
         match (old_record.lifecycle, new_record.lifecycle) {
@@ -1292,7 +1522,8 @@ impl AssetStore {
                 )?;
             }
             (LifecycleState::Verified, LifecycleState::Quarantined) => {
-                let source = checked_asset_file(&self.root_handle, old_record)?;
+                let source =
+                    checked_asset_file(&self.root_handle, old_record, self.policy.as_ref())?;
                 let staged = stage_source(&self.runtime_handle, source)?;
                 begin_transition(
                     &self.root_handle,
@@ -1311,13 +1542,20 @@ impl AssetStore {
                     previous_runtime.as_ref(),
                     new_record,
                     runtime_manifest,
+                    self.policy.as_ref(),
                     |root, manifest| save_manifest(root, manifest, false),
                 )?;
-                remove_record_from_area(&self.root_handle, manifest, old_record)?;
+                remove_record_from_area(
+                    &self.root_handle,
+                    manifest,
+                    old_record,
+                    self.policy.as_ref(),
+                )?;
                 clear_transition(&self.root_handle)?;
             }
             (LifecycleState::Pending | LifecycleState::Quarantined, LifecycleState::Verified) => {
-                let source = checked_asset_file(&self.runtime_handle, old_record)?;
+                let source =
+                    checked_asset_file(&self.runtime_handle, old_record, self.policy.as_ref())?;
                 let staged = stage_source(&self.root_handle, source)?;
                 begin_transition(
                     &self.root_handle,
@@ -1336,6 +1574,7 @@ impl AssetStore {
                     previous.as_ref(),
                     new_record,
                     manifest,
+                    self.policy.as_ref(),
                     |root, manifest| {
                         #[cfg(test)]
                         {
@@ -1359,7 +1598,12 @@ impl AssetStore {
                         "тестовый сбой после canonical commit",
                     ));
                 }
-                remove_record_from_area(&self.runtime_handle, runtime_manifest, old_record)?;
+                remove_record_from_area(
+                    &self.runtime_handle,
+                    runtime_manifest,
+                    old_record,
+                    self.policy.as_ref(),
+                )?;
                 clear_transition(&self.root_handle)?;
             }
             (
@@ -1484,7 +1728,7 @@ enum RootState {
     Owned,
 }
 
-fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError> {
+fn initialize_or_load(root: &File, state: RootState, domain_id: &str) -> Result<bool, AssetError> {
     match state {
         RootState::NewlyCreated | RootState::ExistingEmpty => {
             // Empty root is the only unowned state safe to initialize. Both
@@ -1492,7 +1736,7 @@ fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError>
             let _assets = ensure_dir_entry(root, ASSETS_DIR)?;
             let _temporary = ensure_dir_entry(root, TEMP_DIR)?;
             let store_id = new_store_id();
-            let manifest = Manifest::empty(store_id.clone());
+            let manifest = Manifest::empty_for_domain(store_id.clone(), domain_id);
             write_owner_marker(root, &store_id)?;
             save_manifest(root, &manifest, true)?;
             Ok(true)
@@ -1507,14 +1751,22 @@ fn initialize_or_load(root: &File, state: RootState) -> Result<bool, AssetError>
     }
 }
 
-fn open_or_initialize_runtime(root: &File, store_id: &str) -> Result<File, AssetError> {
+fn open_or_initialize_runtime(
+    root: &File,
+    store_id: &str,
+    domain_id: &str,
+) -> Result<File, AssetError> {
     let runtime = ensure_dir_entry(root, RUNTIME_DIR)?;
     let names = inspect_area_top_level(&runtime, ErrorCode::StoreNotOwned, true)?;
     if names.is_empty() {
         ensure_dir_entry(&runtime, ASSETS_DIR)?;
         ensure_dir_entry(&runtime, TEMP_DIR)?;
         write_owner_marker(&runtime, store_id)?;
-        save_manifest(&runtime, &Manifest::empty(store_id.to_owned()), true)?;
+        save_manifest(
+            &runtime,
+            &Manifest::empty_for_domain(store_id.to_owned(), domain_id),
+            true,
+        )?;
     } else {
         if !names.contains(OWNER_FILE) || !names.contains(MANIFEST_FILE) {
             return Err(AssetError::new(
@@ -1536,6 +1788,296 @@ fn open_or_initialize_runtime(root: &File, store_id: &str) -> Result<File, Asset
     }
     inspect_area_top_level(&runtime, ErrorCode::UnexpectedPath, true)?;
     Ok(runtime)
+}
+
+fn ensure_store_domain(
+    manifest: &Manifest,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
+    if manifest.schema_version >= MANIFEST_SCHEMA_VERSION
+        && manifest.domain_id != policy.domain_id()
+    {
+        return Err(AssetError::with_details(
+            ErrorCode::ManifestCorrupt,
+            format!(
+                "store domain `{}` нельзя открыть с policy `{}`",
+                manifest.domain_id,
+                policy.domain_id()
+            ),
+            serde_json::json!({
+                "store_domain": manifest.domain_id,
+                "requested_domain": policy.domain_id(),
+            }),
+        ));
+    }
+    if !manifest.domain_id.is_empty() && manifest.domain_id != policy.domain_id() {
+        return Err(AssetError::with_details(
+            ErrorCode::ManifestCorrupt,
+            "legacy store уже связан с другим domain",
+            serde_json::json!({
+                "store_domain": manifest.domain_id,
+                "requested_domain": policy.domain_id(),
+            }),
+        ));
+    }
+    for record in &manifest.assets {
+        policy.validate_identity(&record.identity)?;
+    }
+    Ok(())
+}
+
+/// Переводит legacy flat records под mutating exclusive open. Старые bytes
+/// сначала hard-link-ятся в новый layout и проверяются по SHA, затем одним
+/// atomic manifest replace фиксируются schema/path/name. После commit старые
+/// links удаляются. Marker завершает либо откатывает interrupted переход.
+fn migrate_layout(
+    root: &File,
+    manifest: &mut Manifest,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
+    if manifest.schema_version >= MANIFEST_SCHEMA_VERSION {
+        ensure_store_domain(manifest, policy)?;
+        return Ok(());
+    }
+    if !matches!(manifest.schema_version, 3 | 4) {
+        return Err(AssetError::new(
+            ErrorCode::UnsupportedSchemaVersion,
+            "для миграции поддерживаются только manifest schema 3 и 4",
+        ));
+    }
+    ensure_store_domain(manifest, policy)?;
+    validate_manifest(root, manifest, policy)?;
+
+    let mut entries = Vec::with_capacity(manifest.assets.len());
+    let mut target_paths = BTreeSet::new();
+    let mut consumer_names = BTreeSet::new();
+    for record in &manifest.assets {
+        let legacy = policy
+            .legacy_location(&record.identity, &record.sha256, record.format)
+            .ok_or_else(|| {
+                AssetError::new(
+                    ErrorCode::UnsupportedSchemaVersion,
+                    format!(
+                        "domain {} не имеет legacy layout для {}",
+                        policy.domain_id(),
+                        record.identity
+                    ),
+                )
+            })?;
+        let next = policy.canonical_location(&record.identity, &record.sha256, record.format)?;
+        crate::domain::validate_safe_storage_path(&legacy.storage_path)?;
+        crate::domain::validate_safe_storage_path(&next.storage_path)?;
+        crate::domain::validate_safe_consumer_filename(&next.consumer_filename, record.format)?;
+        if record.storage_path != legacy.storage_path {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!(
+                    "legacy storage_path не совпадает с layout policy для {}",
+                    record.identity
+                ),
+            ));
+        }
+        if !target_paths.insert(next.storage_path.clone())
+            || !consumer_names.insert(next.consumer_filename.clone())
+        {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "migration выявила повторяющийся canonical path или consumer filename",
+            ));
+        }
+        entries.push(LayoutMigrationEntry {
+            identity: record.identity.clone(),
+            sha256: record.sha256.clone(),
+            format: record.format,
+            old_path: legacy.storage_path,
+            new_path: next.storage_path,
+            consumer_filename: next.consumer_filename,
+        });
+    }
+
+    let transaction = LayoutMigrationTransaction {
+        schema_version: 1,
+        store_id: manifest.store_id.clone(),
+        domain_id: policy.domain_id().to_owned(),
+        source_schema_version: manifest.schema_version,
+        entries,
+    };
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
+    let bytes = serde_json::to_vec_pretty(&transaction)
+        .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
+    write_transaction_marker(&temporary, LAYOUT_MIGRATION_MARKER, &bytes)?;
+
+    for entry in &transaction.entries {
+        if entry.old_path == entry.new_path {
+            continue;
+        }
+        let old = open_storage_file(root, &entry.old_path, false)?;
+        if hash_file(old)?.0 != entry.sha256 {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "legacy asset изменился до storage-layout migration",
+            ));
+        }
+        let (new_parent, new_name) = open_storage_parent(root, &entry.new_path, true)?;
+        match open_regular_at(&new_parent, &new_name, ErrorCode::MissingAssetFile) {
+            Ok(existing) => {
+                if hash_file(existing)?.0 != entry.sha256 {
+                    return Err(AssetError::new(
+                        ErrorCode::IdentityConflict,
+                        "целевой canonical path уже занят другими bytes при migration",
+                    ));
+                }
+            }
+            Err(error) if error.code == ErrorCode::MissingAssetFile => {
+                let (old_parent, old_name) = open_storage_parent(root, &entry.old_path, false)?;
+                match linkat(
+                    &old_parent,
+                    &old_name,
+                    &new_parent,
+                    &new_name,
+                    AtFlags::empty(),
+                ) {
+                    Ok(()) => {}
+                    Err(link_error)
+                        if std::io::Error::from(link_error).kind()
+                            == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        let existing =
+                            open_regular_at(&new_parent, &new_name, ErrorCode::MissingAssetFile)?;
+                        if hash_file(existing)?.0 != entry.sha256 {
+                            return Err(AssetError::new(
+                                ErrorCode::IdentityConflict,
+                                "целевой canonical path изменился во время migration",
+                            ));
+                        }
+                    }
+                    Err(link_error) => {
+                        return Err(AssetError::io(
+                            "не удалось подготовить nested asset path для migration",
+                            std::io::Error::from(link_error),
+                        ));
+                    }
+                }
+                sync_directory(&new_parent)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut migrated = manifest.clone();
+    for (record, entry) in migrated.assets.iter_mut().zip(&transaction.entries) {
+        record.storage_path = entry.new_path.clone();
+        record.consumer_filename = entry.consumer_filename.clone();
+    }
+    migrated.domain_id = policy.domain_id().to_owned();
+    migrated.schema_version = MANIFEST_SCHEMA_VERSION;
+    migrated.revision = migrated.revision.checked_add(1).ok_or_else(|| {
+        AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "manifest revision переполнен при migration",
+        )
+    })?;
+    save_manifest(root, &migrated, false)?;
+    *manifest = migrated;
+    recover_layout_migration(root, policy)
+}
+
+fn recover_layout_migration(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), AssetError> {
+    let temporary = open_directory_at(root, TEMP_DIR)
+        .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
+    let marker = match open_regular_at(
+        &temporary,
+        LAYOUT_MIGRATION_MARKER,
+        ErrorCode::MissingAssetFile,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.code == ErrorCode::MissingAssetFile => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let transaction: LayoutMigrationTransaction =
+        serde_json::from_reader(marker).map_err(|error| {
+            AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!("layout migration marker повреждён: {error}"),
+            )
+        })?;
+    if transaction.schema_version != 1
+        || !matches!(transaction.source_schema_version, 3 | 4)
+        || transaction.domain_id != policy.domain_id()
+        || transaction.store_id.is_empty()
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "layout migration marker содержит неизвестную schema/domain",
+        ));
+    }
+    let manifest = load_owned_manifest(root)?;
+    if manifest.store_id != transaction.store_id {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "layout migration marker указывает на другой store_id",
+        ));
+    }
+    let committed = manifest.schema_version >= MANIFEST_SCHEMA_VERSION
+        && manifest.domain_id == transaction.domain_id;
+    let rolling_back = manifest.schema_version == transaction.source_schema_version
+        && (manifest.domain_id.is_empty() || manifest.domain_id == transaction.domain_id);
+    if !committed && !rolling_back {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "layout migration marker не согласован с текущим manifest",
+        ));
+    }
+    let mut seen_new_paths = BTreeSet::new();
+    for entry in &transaction.entries {
+        entry
+            .identity
+            .validate()
+            .map_err(|message| AssetError::new(ErrorCode::ManifestCorrupt, message))?;
+        policy.validate_identity(&entry.identity)?;
+        validate_hash(&entry.sha256)?;
+        let legacy = policy
+            .legacy_location(&entry.identity, &entry.sha256, entry.format)
+            .ok_or_else(|| {
+                AssetError::new(ErrorCode::ManifestCorrupt, "legacy path policy отсутствует")
+            })?;
+        let expected = policy.canonical_location(&entry.identity, &entry.sha256, entry.format)?;
+        if entry.old_path != legacy.storage_path
+            || entry.new_path != expected.storage_path
+            || entry.consumer_filename != expected.consumer_filename
+            || !seen_new_paths.insert(entry.new_path.clone())
+        {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "migration marker содержит path/name, не вычисляемые из domain policy",
+            ));
+        }
+        crate::domain::validate_safe_consumer_filename(&entry.consumer_filename, entry.format)?;
+        if entry.old_path != entry.new_path {
+            if committed {
+                let new_file = open_storage_file(root, &entry.new_path, false)?;
+                if hash_file(new_file)?.0 != entry.sha256 {
+                    return Err(AssetError::new(
+                        ErrorCode::IntegrityMismatch,
+                        "после manifest commit отсутствует migrated asset bytes",
+                    ));
+                }
+                remove_storage_path_if_hash(root, &entry.old_path, &entry.sha256, "legacy asset")?;
+            } else {
+                remove_storage_path_if_hash(
+                    root,
+                    &entry.new_path,
+                    &entry.sha256,
+                    "migration target",
+                )?;
+                prune_empty_storage_directories(root, &entry.new_path)?;
+            }
+        }
+    }
+    sync_directory(&temporary)?;
+    unlink_if_exists(&temporary, &OsString::from(LAYOUT_MIGRATION_MARKER))?;
+    sync_directory(&temporary)
 }
 
 /// Classifies root without creating files or directories.
@@ -1842,7 +2384,7 @@ fn read_manifest_file(root: &File) -> Result<Manifest, AssetError> {
                 "manifest schema_version отсутствует или не является целым числом",
             )
         })?;
-    if schema_version != 3 && schema_version != u64::from(MANIFEST_SCHEMA_VERSION) {
+    if !matches!(schema_version, 3 | 4) && schema_version != u64::from(MANIFEST_SCHEMA_VERSION) {
         return Err(AssetError::new(
             ErrorCode::UnsupportedSchemaVersion,
             format!(
@@ -1885,7 +2427,9 @@ fn read_owner_marker(root: &File) -> Result<OwnerMarker, AssetError> {
 }
 
 fn check_schema(manifest: &Manifest) -> Result<(), AssetError> {
-    if manifest.schema_version != 3 && manifest.schema_version != MANIFEST_SCHEMA_VERSION {
+    if !matches!(manifest.schema_version, 3 | 4)
+        && manifest.schema_version != MANIFEST_SCHEMA_VERSION
+    {
         return Err(AssetError::new(
             ErrorCode::UnsupportedSchemaVersion,
             format!(
@@ -1908,7 +2452,11 @@ fn check_schema(manifest: &Manifest) -> Result<(), AssetError> {
     Ok(())
 }
 
-fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
+fn validate_manifest(
+    root: &File,
+    manifest: &Manifest,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
     check_schema(manifest)?;
     if manifest.store_id.is_empty() || manifest.revision > i64::MAX as u64 {
         return Err(AssetError::new(
@@ -1917,12 +2465,28 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
         ));
     }
     let mut previous_identity: Option<&AssetIdentity> = None;
+    if manifest.schema_version >= MANIFEST_SCHEMA_VERSION
+        && manifest.domain_id != policy.domain_id()
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "manifest domain_id не совпадает с активной policy",
+        ));
+    }
     let mut registered_paths = BTreeSet::new();
+    let mut consumer_names = BTreeSet::new();
     for record in &manifest.assets {
-        record
-            .identity
-            .validate()
-            .map_err(|message| AssetError::new(ErrorCode::ManifestCorrupt, message))?;
+        policy
+            .validate_identity(&record.identity)
+            .map_err(|error| {
+                AssetError::new(
+                    ErrorCode::ManifestCorrupt,
+                    format!(
+                        "identity {} не принадлежит domain policy: {}",
+                        record.identity, error.message
+                    ),
+                )
+            })?;
         if previous_identity.is_some_and(|previous| previous >= &record.identity) {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
@@ -1937,8 +2501,44 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
                 "пустой файл должен иметь format unknown",
             ));
         }
-        let expected_path = canonical_asset_path(&record.identity, &record.sha256, record.format);
-        validate_relative_path(&record.storage_path, &expected_path)?;
+        let expected_location = if manifest.schema_version < MANIFEST_SCHEMA_VERSION {
+            policy.legacy_location(&record.identity, &record.sha256, record.format)
+        } else {
+            Some(policy.canonical_location(&record.identity, &record.sha256, record.format)?)
+        }
+        .ok_or_else(|| {
+            AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                format!(
+                    "domain {} не имеет layout для {}",
+                    policy.domain_id(),
+                    record.identity
+                ),
+            )
+        })?;
+        validate_relative_path(&record.storage_path, &expected_location.storage_path)?;
+        crate::domain::validate_safe_storage_path(&record.storage_path)?;
+        if manifest.schema_version >= MANIFEST_SCHEMA_VERSION {
+            crate::domain::validate_safe_consumer_filename(
+                &record.consumer_filename,
+                record.format,
+            )?;
+            if record.consumer_filename != expected_location.consumer_filename {
+                return Err(AssetError::new(
+                    ErrorCode::ManifestCorrupt,
+                    format!(
+                        "consumer_filename не совпадает с domain policy для {}",
+                        record.identity
+                    ),
+                ));
+            }
+        }
+        if !consumer_names.insert(expected_location.consumer_filename.clone()) {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "manifest содержит повторяющиеся consumer_filename",
+            ));
+        }
         if let Some(validation) = &record.validation {
             validate_validation_record(record, validation)?;
         }
@@ -1963,7 +2563,8 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
                         ),
                     ));
                 }
-                if record.byte_length > MAX_MEDIA_BYTES as u64 {
+                if record.byte_length > policy.max_asset_bytes().unwrap_or(MAX_HUMAN_APPROVED_BYTES)
+                {
                     return Err(AssetError::new(
                         ErrorCode::ManifestCorrupt,
                         format!(
@@ -2000,15 +2601,45 @@ fn validate_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError>
                 "provenance source_name не должен содержать path",
             ));
         }
-        validate_asset(root, record)?;
-        registered_paths.insert(record.storage_path.clone());
+        validate_asset(
+            root,
+            record,
+            policy,
+            manifest.schema_version < MANIFEST_SCHEMA_VERSION,
+        )?;
+        if !registered_paths.insert(record.storage_path.clone()) {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!(
+                    "manifest содержит повторяющийся storage_path: {}",
+                    record.storage_path
+                ),
+            ));
+        }
     }
-    validate_asset_directory(root, &registered_paths)?;
+    validate_asset_directory(root, &registered_paths, policy)?;
     Ok(())
 }
 
-fn validate_verified_manifest(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
-    validate_manifest(root, manifest)?;
+fn validate_verified_manifest(
+    root: &File,
+    manifest: &Manifest,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
+    validate_manifest(root, manifest, policy)?;
+    if manifest
+        .assets
+        .iter()
+        .any(|asset| !policy.allows_verified_format(asset.format))
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            format!(
+                "canonical manifest содержит формат, запрещённый для verified lifecycle в domain {}",
+                policy.domain_id()
+            ),
+        ));
+    }
     if manifest.assets.iter().any(|asset| {
         asset.lifecycle != LifecycleState::Verified
             || asset.effective_status() != Some(SemanticStatus::Verified)
@@ -2025,6 +2656,7 @@ fn validate_runtime_manifest(
     root: &File,
     manifest: &Manifest,
     store_id: &str,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<(), AssetError> {
     if manifest.store_id != store_id {
         return Err(AssetError::new(
@@ -2032,7 +2664,7 @@ fn validate_runtime_manifest(
             "значение `store_id` в локальном манифесте не совпадает со значением в каноническом манифесте",
         ));
     }
-    validate_manifest(root, manifest)?;
+    validate_manifest(root, manifest, policy)?;
     if manifest
         .assets
         .iter()
@@ -2050,8 +2682,9 @@ fn validate_publishable_manifest(
     root: &File,
     manifest: &Manifest,
     expected_validator: &ValidatorIdentity,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<(), AssetError> {
-    validate_verified_manifest(root, manifest)?;
+    validate_verified_manifest(root, manifest, policy)?;
     for asset in &manifest.assets {
         if !asset.is_trusted_for(expected_validator) {
             return Err(AssetError::new(
@@ -2062,18 +2695,34 @@ fn validate_publishable_manifest(
                 ),
             ));
         }
-        if asset.identity.namespace != "kanji" || kanji_character(&asset.identity).is_none() {
+        policy.validate_publishable_record(asset)?;
+        if !policy.is_publishable_format(asset.format) {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 format!(
-                    "публикуемый корпус кандзи содержит чужую идентичность {}",
-                    asset.identity
+                    "публикуемый корпус domain {} содержит неподдерживаемый формат для {}",
+                    policy.domain_id(),
+                    asset.identity,
                 ),
             ));
         }
     }
-    validate_asset_directory_exact(root, manifest)?;
+    validate_asset_directory_exact(root, manifest, policy)?;
     Ok(())
+}
+
+fn validate_legacy_verified_manifest(
+    root: &File,
+    manifest: &Manifest,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
+    if manifest.schema_version >= MANIFEST_SCHEMA_VERSION {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "legacy validator вызван для актуальной schema",
+        ));
+    }
+    validate_verified_manifest(root, manifest, policy)
 }
 
 fn reconcile_runtime_boundary(
@@ -2081,6 +2730,7 @@ fn reconcile_runtime_boundary(
     runtime: &File,
     canonical_manifest: &Manifest,
     runtime_manifest: &Manifest,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<(), AssetError> {
     let mut canonical = canonical_manifest.clone();
     let mut local = runtime_manifest.clone();
@@ -2103,7 +2753,7 @@ fn reconcile_runtime_boundary(
         {
             continue;
         }
-        let source = checked_asset_file(root, &candidate)?;
+        let source = checked_asset_file(root, &candidate, policy)?;
         let staged = stage_source(runtime, source)?;
         commit_asset_record(
             runtime,
@@ -2111,6 +2761,7 @@ fn reconcile_runtime_boundary(
             None,
             &candidate,
             &mut local,
+            policy,
             |root, manifest| save_manifest(root, manifest, false),
         )?;
     }
@@ -2156,9 +2807,9 @@ fn reconcile_runtime_boundary(
                         "runtime asset исчез при восстановлении перехода",
                     )
                 })?;
-            remove_record_from_area(runtime, &mut local, &previous_runtime)?;
+            remove_record_from_area(runtime, &mut local, &previous_runtime, policy)?;
         } else {
-            remove_record_from_area(root, &mut canonical, &previous)?;
+            remove_record_from_area(root, &mut canonical, &previous, policy)?;
         }
     }
 
@@ -2183,8 +2834,8 @@ fn reconcile_runtime_boundary(
 
     cleanup_matching_orphans(root, &canonical, &local)?;
     cleanup_matching_orphans(runtime, &local, &canonical)?;
-    validate_verified_manifest(root, &canonical)?;
-    validate_runtime_manifest(runtime, &local, &canonical.store_id)?;
+    validate_verified_manifest(root, &canonical, policy)?;
+    validate_runtime_manifest(runtime, &local, &canonical.store_id, policy)?;
     Ok(())
 }
 
@@ -2198,29 +2849,18 @@ fn cleanup_matching_orphans(
         .iter()
         .map(|asset| asset.storage_path.as_str())
         .collect();
-    let assets = open_directory_at(area, ASSETS_DIR)
-        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
-    for entry in fs::read_dir(fd_path(&assets))
-        .map_err(|error| AssetError::io("не удалось прочитать каталог `assets`", error))?
-    {
-        let entry = entry.map_err(|error| {
-            AssetError::io("не удалось прочитать запись в каталоге `assets`", error)
-        })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let path = format!("{ASSETS_DIR}/{name}");
-        if registered.contains(path.as_str()) {
+    for record in &other.assets {
+        if registered.contains(record.storage_path.as_str()) {
             continue;
         }
-        if let Some(record) = other.assets.iter().find(|asset| asset.storage_path == path) {
-            remove_if_hash(
-                &assets,
-                &name,
-                &record.sha256,
-                "запись о незавершённом переносе актива",
-            )?;
-        }
+        remove_storage_path_if_hash(
+            area,
+            &record.storage_path,
+            &record.sha256,
+            "запись о незавершённом переносе актива",
+        )?;
     }
-    sync_directory(&assets)
+    Ok(())
 }
 
 fn replace_manifest_record(
@@ -2265,6 +2905,7 @@ fn remove_record_from_area(
     root: &File,
     manifest: &mut Manifest,
     record: &AssetRecord,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<(), AssetError> {
     let Some(index) = manifest
         .assets
@@ -2282,18 +2923,32 @@ fn remove_record_from_area(
             ),
         ));
     }
-    let assets = open_directory_at(root, ASSETS_DIR)
-        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
-    let name = asset_name(&record.storage_path)?;
-    if !file_matches_hash(&assets, name, &record.sha256)? {
+    let (asset_parent, name) = open_storage_parent(root, &record.storage_path, false)?;
+    let location = policy.canonical_location(&record.identity, &record.sha256, record.format)?;
+    if record.storage_path != location.storage_path
+        || record.consumer_filename != location.consumer_filename
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "удаляемая запись не соответствует canonical domain location",
+        ));
+    }
+    if !file_matches_hash(&asset_parent, &name, &record.sha256)? {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
             "байты удаляемой записи не совпадают с manifest",
         ));
     }
-    linkat(&assets, name, &temporary, REMOVAL_BACKUP, AtFlags::empty()).map_err(|error| {
+    linkat(
+        &asset_parent,
+        name.as_str(),
+        &temporary,
+        REMOVAL_BACKUP,
+        AtFlags::empty(),
+    )
+    .map_err(|error| {
         AssetError::io(
             "не удалось сохранить bytes перед удалением записи",
             std::io::Error::from(error),
@@ -2323,13 +2978,14 @@ fn remove_record_from_area(
         ));
     }
     remove_if_hash(
-        &assets,
-        name,
+        &asset_parent,
+        name.as_str(),
         &record.sha256,
         "байты удаляемой записи жизненного цикла",
     )?;
-    sync_directory(&assets)?;
-    recover_removal(root)
+    sync_directory(&asset_parent)?;
+    prune_empty_storage_directories(root, &record.storage_path)?;
+    recover_removal(root, policy)
 }
 
 fn validate_validation_record(
@@ -2420,8 +3076,17 @@ pub(crate) fn validate_image_decode(bytes: &[u8]) -> Result<(), AssetError> {
     Ok(())
 }
 
-fn validate_asset(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
-    let file = checked_asset_file(root, record)?;
+fn validate_asset(
+    root: &File,
+    record: &AssetRecord,
+    policy: &dyn AssetDomainPolicy,
+    legacy: bool,
+) -> Result<(), AssetError> {
+    let file = if legacy {
+        checked_legacy_asset_file(root, record, policy)?
+    } else {
+        checked_asset_file(root, record, policy)?
+    };
     let (sha256, byte_length, format) = hash_file(file)?;
     if sha256 != record.sha256 || byte_length != record.byte_length || format != record.format {
         return Err(AssetError::new(
@@ -2437,23 +3102,29 @@ fn validate_asset(root: &File, record: &AssetRecord) -> Result<(), AssetError> {
 fn validate_asset_directory(
     root: &File,
     registered_paths: &BTreeSet<String>,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<(), AssetError> {
-    validate_asset_directory_impl(root, registered_paths, false)
+    validate_asset_directory_impl(root, registered_paths, false, policy)
 }
 
-fn validate_asset_directory_exact(root: &File, manifest: &Manifest) -> Result<(), AssetError> {
+fn validate_asset_directory_exact(
+    root: &File,
+    manifest: &Manifest,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
     let registered_paths = manifest
         .assets
         .iter()
         .map(|asset| asset.storage_path.clone())
         .collect();
-    validate_asset_directory_impl(root, &registered_paths, true)
+    validate_asset_directory_impl(root, &registered_paths, true, policy)
 }
 
 fn validate_asset_directory_impl(
     root: &File,
     registered_paths: &BTreeSet<String>,
     reject_orphans: bool,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<(), AssetError> {
     let assets = match open_directory_at(root, ASSETS_DIR) {
         Ok(assets) => assets,
@@ -2476,54 +3147,14 @@ fn validate_asset_directory_impl(
         }
     };
     let mut observed_paths = BTreeSet::new();
-    for entry in fs::read_dir(fd_path(&assets))
-        .map_err(|error| AssetError::io("не удалось прочитать canonical asset store", error))?
-    {
-        let entry =
-            entry.map_err(|error| AssetError::io("не удалось прочитать asset entry", error))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let file = open_regular_at(&assets, entry.file_name(), ErrorCode::MissingAssetFile)?;
-        let (actual_hash, _, format) = hash_file(file)?;
-        let storage_path = format!("{ASSETS_DIR}/{name}");
-        if registered_paths.contains(&storage_path) {
-            if extension_for_format(format) != name.rsplit('.').next().unwrap_or("") {
-                return Err(AssetError::new(
-                    ErrorCode::IntegrityMismatch,
-                    format!("asset {name} не соответствует формату в manifest"),
-                ));
-            }
-        } else {
-            if reject_orphans {
-                return Err(AssetError::new(
-                    ErrorCode::UnexpectedPath,
-                    format!("незарегистрированный файл в публикуемом корпусе: {name}"),
-                ));
-            }
-            let Some(hash) = embedded_content_hash(&name) else {
-                return Err(AssetError::new(
-                    ErrorCode::UnexpectedPath,
-                    format!("неизвестный файл в canonical asset store: {name}"),
-                ));
-            };
-            if is_hash_suffixed_kanji_filename(&name) {
-                return Err(AssetError::new(
-                    ErrorCode::UnexpectedPath,
-                    format!("устаревшее hash-suffixed имя kanji asset: {name}"),
-                ));
-            }
-            validate_hash(hash)?;
-            if actual_hash != hash
-                || extension_for_format(format) != name.rsplit('.').next().unwrap_or("")
-            {
-                return Err(AssetError::new(
-                    ErrorCode::IntegrityMismatch,
-                    format!("asset {name} не соответствует SHA-256/формату в имени"),
-                ));
-            }
-        }
-        observed_paths.insert(storage_path);
-    }
+    scan_asset_directory(
+        &assets,
+        ASSETS_DIR,
+        registered_paths,
+        &mut observed_paths,
+        reject_orphans,
+        policy,
+    )?;
     if !registered_paths.is_subset(&observed_paths) {
         return Err(AssetError::new(
             ErrorCode::MissingAssetFile,
@@ -2536,9 +3167,103 @@ fn validate_asset_directory_impl(
             "в публикуемом корпусе есть незарегистрированные байты",
         ));
     }
-    // Generic immutable objects can leave a verified-by-hash orphan after a
-    // crash. Stable kanji paths use a transaction marker and are recovered
-    // before manifest validation.
+    Ok(())
+}
+
+fn scan_asset_directory(
+    directory: &File,
+    relative_path: &str,
+    registered_paths: &BTreeSet<String>,
+    observed_paths: &mut BTreeSet<String>,
+    reject_orphans: bool,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
+    for entry in fs::read_dir(fd_path(directory))
+        .map_err(|error| AssetError::io("не удалось прочитать canonical asset directory", error))?
+    {
+        let entry =
+            entry.map_err(|error| AssetError::io("не удалось прочитать asset entry", error))?;
+        let name = entry.file_name();
+        let component = name.to_string_lossy();
+        let path = format!("{relative_path}/{component}");
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| AssetError::io("не удалось проверить asset entry", error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(AssetError::new(
+                ErrorCode::BoundaryViolation,
+                format!("symlink запрещён внутри canonical assets: {path}"),
+            ));
+        }
+        if metadata.is_dir() {
+            if !registered_paths
+                .iter()
+                .any(|registered| registered.starts_with(&format!("{path}/")))
+            {
+                return Err(AssetError::new(
+                    ErrorCode::UnexpectedPath,
+                    format!("неожиданный каталог внутри canonical assets: {path}"),
+                ));
+            }
+            let child = open_directory_at(directory, &name)
+                .map_err(|error| directory_entry_error(&path, error))?;
+            scan_asset_directory(
+                &child,
+                &path,
+                registered_paths,
+                observed_paths,
+                reject_orphans,
+                policy,
+            )?;
+            continue;
+        }
+
+        let file = open_regular_at(directory, &name, ErrorCode::MissingAssetFile)?;
+        let (actual_hash, _, format) = hash_file(file)?;
+        if registered_paths.contains(&path) {
+            if extension_for_format(format) != component.rsplit('.').next().unwrap_or("") {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("asset {path} не соответствует формату в manifest"),
+                ));
+            }
+            observed_paths.insert(path);
+            continue;
+        }
+        if reject_orphans || !policy.content_addressed_storage() {
+            return Err(AssetError::new(
+                ErrorCode::UnexpectedPath,
+                format!("незарегистрированный файл в canonical asset store: {path}"),
+            ));
+        }
+        if path.matches('/').count() != 1 {
+            return Err(AssetError::new(
+                ErrorCode::UnexpectedPath,
+                format!("hash-addressed orphan должен быть непосредственно в assets/: {path}"),
+            ));
+        }
+        let Some(hash) = embedded_content_hash(&component) else {
+            return Err(AssetError::new(
+                ErrorCode::UnexpectedPath,
+                format!("неизвестный файл в canonical asset store: {path}"),
+            ));
+        };
+        if policy.is_reserved_orphan_filename(&component) {
+            return Err(AssetError::new(
+                ErrorCode::UnexpectedPath,
+                format!("имя orphan asset запрещено domain policy: {path}"),
+            ));
+        }
+        validate_hash(hash)?;
+        if actual_hash != hash
+            || extension_for_format(format) != component.rsplit('.').next().unwrap_or("")
+        {
+            return Err(AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                format!("asset {path} не соответствует SHA-256/формату в имени"),
+            ));
+        }
+        observed_paths.insert(path);
+    }
     Ok(())
 }
 
@@ -2564,24 +3289,129 @@ fn validate_relative_path(actual: &str, expected: &str) -> Result<(), AssetError
     Ok(())
 }
 
-fn checked_asset_file(root: &File, record: &AssetRecord) -> Result<File, AssetError> {
-    let expected = canonical_asset_path(&record.identity, &record.sha256, record.format);
-    validate_relative_path(&record.storage_path, &expected)?;
-    let assets = open_directory_at(root, ASSETS_DIR).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            AssetError::new(
-                ErrorCode::ManifestCorrupt,
-                "каталог assets отсутствует в program-owned store",
-            )
-        } else {
-            AssetError::io("не удалось открыть canonical asset store", error)
-        }
+/// Открывает parent canonical storage path через последовательные dirfd и
+/// `NOFOLLOW`; промежуточная symlink никогда не передаётся в `openat` вместе
+/// с последующим path компонентом.
+fn open_storage_parent(
+    root: &File,
+    storage_path: &str,
+    create_parents: bool,
+) -> Result<(File, String), AssetError> {
+    crate::domain::validate_safe_storage_path(storage_path)?;
+    let relative = storage_path.strip_prefix("assets/").ok_or_else(|| {
+        AssetError::new(ErrorCode::PathTraversal, "storage_path вне каталога assets")
     })?;
-    let name = record
-        .storage_path
-        .strip_prefix("assets/")
-        .ok_or_else(|| AssetError::new(ErrorCode::ManifestCorrupt, "storage_path вне assets/"))?;
-    open_regular_at(&assets, name, ErrorCode::MissingAssetFile).map_err(|error| {
+    let components: Vec<_> = relative.split('/').collect();
+    let (leaf, directories) = components
+        .split_last()
+        .ok_or_else(|| AssetError::new(ErrorCode::PathTraversal, "storage_path пуст"))?;
+    let mut directory = open_directory_at(root, ASSETS_DIR)
+        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
+    for component in directories {
+        directory = if create_parents {
+            ensure_dir_entry(&directory, component)?
+        } else {
+            match open_directory_at(&directory, *component) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(AssetError::new(
+                        ErrorCode::MissingAssetFile,
+                        "промежуточный каталог canonical asset отсутствует",
+                    ));
+                }
+                Err(error) => return Err(directory_entry_error(component, error)),
+            }
+        };
+    }
+    Ok((directory, (*leaf).to_owned()))
+}
+
+fn open_storage_file(
+    root: &File,
+    storage_path: &str,
+    create_parents: bool,
+) -> Result<File, AssetError> {
+    let (parent, leaf) = open_storage_parent(root, storage_path, create_parents)?;
+    open_regular_at(&parent, &leaf, ErrorCode::MissingAssetFile)
+}
+
+fn remove_storage_path_if_hash(
+    root: &File,
+    storage_path: &str,
+    expected_hash: &str,
+    description: &str,
+) -> Result<(), AssetError> {
+    let (parent, leaf) = match open_storage_parent(root, storage_path, false) {
+        Ok(value) => value,
+        Err(error) if error.code == ErrorCode::MissingAssetFile => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match open_regular_at(&parent, &leaf, ErrorCode::MissingAssetFile) {
+        Ok(file) => {
+            if hash_file(file)?.0 != expected_hash {
+                return Err(AssetError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("{description} bytes не совпадают с ожидаемым SHA-256"),
+                ));
+            }
+            unlinkat(&parent, leaf.as_str(), AtFlags::empty()).map_err(|error| {
+                AssetError::io(
+                    format!("не удалось удалить {description}"),
+                    std::io::Error::from(error),
+                )
+            })?;
+            sync_directory(&parent)?;
+        }
+        Err(error) if error.code == ErrorCode::MissingAssetFile => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    prune_empty_storage_directories(root, storage_path)
+}
+
+fn prune_empty_storage_directories(root: &File, storage_path: &str) -> Result<(), AssetError> {
+    crate::domain::validate_safe_storage_path(storage_path)?;
+    let relative = storage_path.strip_prefix("assets/").ok_or_else(|| {
+        AssetError::new(ErrorCode::PathTraversal, "storage_path вне каталога assets")
+    })?;
+    let components: Vec<_> = relative.split('/').collect();
+    if components.len() < 2 {
+        return Ok(());
+    }
+    for depth in (1..components.len()).rev() {
+        let directory_path = format!("assets/{}", components[..depth].join("/"));
+        let (parent, leaf) = open_storage_parent(root, &directory_path, false)?;
+        match unlinkat(&parent, leaf.as_str(), AtFlags::REMOVEDIR) {
+            Ok(()) => sync_directory(&parent)?,
+            Err(error)
+                if std::io::Error::from(error).kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) if std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AssetError::io(
+                    "не удалось удалить пустой каталог canonical assets",
+                    std::io::Error::from(error),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_asset_file(
+    root: &File,
+    record: &AssetRecord,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<File, AssetError> {
+    policy.validate_identity(&record.identity)?;
+    let expected = policy.canonical_location(&record.identity, &record.sha256, record.format)?;
+    validate_relative_path(&record.storage_path, &expected.storage_path)?;
+    validate_record_consumer_filename(record)?;
+    if record.consumer_filename != expected.consumer_filename {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "consumer_filename не совпадает с canonical domain location",
+        ));
+    }
+    open_storage_file(root, &record.storage_path, false).map_err(|error| {
         if error.code == ErrorCode::MissingAssetFile {
             AssetError::with_details(
                 error.code,
@@ -2595,6 +3425,41 @@ fn checked_asset_file(root: &File, record: &AssetRecord) -> Result<File, AssetEr
             error
         }
     })
+}
+
+fn checked_legacy_asset_file(
+    root: &File,
+    record: &AssetRecord,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<File, AssetError> {
+    policy.validate_identity(&record.identity)?;
+    let expected = policy
+        .legacy_location(&record.identity, &record.sha256, record.format)
+        .ok_or_else(|| {
+            AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                "domain policy не поддерживает legacy layout",
+            )
+        })?;
+    validate_relative_path(&record.storage_path, &expected.storage_path)?;
+    open_storage_file(root, &record.storage_path, false).map_err(|error| {
+        if error.code == ErrorCode::MissingAssetFile {
+            AssetError::with_details(
+                error.code,
+                error.message,
+                serde_json::json!({
+                    "identity": record.identity,
+                    "storage_path": record.storage_path,
+                }),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn validate_record_consumer_filename(record: &AssetRecord) -> Result<(), AssetError> {
+    crate::domain::validate_safe_consumer_filename(&record.consumer_filename, record.format)
 }
 
 fn read_bounded_asset_bytes(
@@ -2613,30 +3478,6 @@ fn read_bounded_asset_bytes(
         ));
     }
     Ok(bytes)
-}
-
-fn canonical_asset_path(identity: &AssetIdentity, hash: &str, format: DetectedFormat) -> String {
-    if let Some(character) = kanji_character(identity) {
-        return format!("{ASSETS_DIR}/{character}.{}", extension_for_format(format));
-    }
-    let prefix = {
-        let key_hash = sha256_hex(identity.key.as_bytes());
-        format!("{}-{}", identity.namespace, &key_hash[..16])
-    };
-    format!(
-        "{ASSETS_DIR}/{prefix}-{hash}.{}",
-        extension_for_format(format)
-    )
-}
-
-fn kanji_character(identity: &AssetIdentity) -> Option<char> {
-    if identity.namespace != "kanji" {
-        return None;
-    }
-    let mut chars = identity.key.chars();
-    let character = chars.next()?;
-    (chars.next().is_none() && crate::kanji_domain::is_supported_han(character))
-        .then_some(character)
 }
 
 fn extension_for_format(format: DetectedFormat) -> &'static str {
@@ -2661,16 +3502,6 @@ fn embedded_content_hash(filename: &str) -> Option<&str> {
     }
     let (_, hash) = stem.rsplit_once('-')?;
     (hash.len() == 64).then_some(hash)
-}
-
-fn is_hash_suffixed_kanji_filename(filename: &str) -> bool {
-    let Some((stem, _)) = filename.rsplit_once('.') else {
-        return false;
-    };
-    let Some((prefix, hash)) = stem.rsplit_once('-') else {
-        return false;
-    };
-    hash.len() == 64 && prefix.chars().count() == 1
 }
 
 fn validate_hash(hash: &str) -> Result<(), AssetError> {
@@ -2756,34 +3587,30 @@ fn publish_object(
     root: &File,
     storage_path: &str,
 ) -> Result<(), AssetError> {
-    let assets = open_directory_at(root, ASSETS_DIR)
-        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
-    let name = storage_path.strip_prefix("assets/").ok_or_else(|| {
-        AssetError::new(ErrorCode::ManifestCorrupt, "publication path вне assets/")
-    })?;
-    match open_regular_at(&assets, name, ErrorCode::MissingAssetFile) {
+    let (parent, name) = open_storage_parent(root, storage_path, true)?;
+    match open_regular_at(&parent, &name, ErrorCode::MissingAssetFile) {
         Ok(existing) => {
             verify_staged_file(staged, existing)?;
-            sync_directory(&assets)
+            sync_directory(&parent)
         }
         Err(error) if error.code == ErrorCode::MissingAssetFile => {
             match linkat(
                 &staged.artifact.directory,
                 &staged.artifact.name,
-                &assets,
-                name,
+                &parent,
+                name.as_str(),
                 AtFlags::empty(),
             ) {
                 Ok(()) => {
-                    let asset = open_regular_at(&assets, name, ErrorCode::MissingAssetFile)?;
+                    let asset = open_regular_at(&parent, &name, ErrorCode::MissingAssetFile)?;
                     verify_staged_file(staged, asset)?;
-                    sync_directory(&assets)
+                    sync_directory(&parent)
                 }
                 Err(link_error)
                     if std::io::Error::from(link_error).kind()
                         == std::io::ErrorKind::AlreadyExists =>
                 {
-                    let existing = open_regular_at(&assets, name, ErrorCode::MissingAssetFile)?;
+                    let existing = open_regular_at(&parent, &name, ErrorCode::MissingAssetFile)?;
                     verify_staged_file(staged, existing)
                 }
                 Err(link_error) => Err(AssetError::io(
@@ -2990,24 +3817,25 @@ fn commit_asset_record<F>(
     previous: Option<&AssetRecord>,
     record: &AssetRecord,
     manifest: &mut Manifest,
+    policy: &dyn AssetDomainPolicy,
     save: F,
 ) -> Result<(), AssetError>
 where
     F: FnOnce(&File, &Manifest) -> Result<(), AssetError>,
 {
-    recover_publications(root)?;
+    recover_publications(root, policy)?;
     let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
         AssetError::new(
             ErrorCode::ManifestCorrupt,
             "поле `revision` в манифесте переполнено",
         )
     })?;
-    let needs_stable_publication = kanji_character(&record.identity).is_some()
+    let needs_stable_publication = !policy.content_addressed_storage()
         && previous.is_none_or(|asset| {
             asset.sha256 != record.sha256 || asset.storage_path != record.storage_path
         });
     let publication = if needs_stable_publication {
-        Some(prepare_publication(root, staged, previous, record)?)
+        Some(prepare_publication(root, staged, previous, record, policy)?)
     } else {
         None
     };
@@ -3018,7 +3846,7 @@ where
         } else {
             publish_object(staged, root, &record.storage_path)?;
         }
-        validate_asset(root, record)?;
+        validate_asset(root, record, policy, false)?;
         if let Some(slot) = manifest
             .assets
             .iter_mut()
@@ -3035,12 +3863,12 @@ where
 
     if let Err(error) = result {
         if let Some(publication) = &publication {
-            recover_publication(root, &publication.marker_name)?;
+            recover_publication(root, &publication.marker_name, policy)?;
         }
         return Err(error);
     }
     if let Some(publication) = publication {
-        recover_publication(root, &publication.marker_name)?;
+        recover_publication(root, &publication.marker_name, policy)?;
     }
     Ok(())
 }
@@ -3050,36 +3878,46 @@ fn prepare_publication(
     staged: &StagedObject,
     previous: Option<&AssetRecord>,
     next: &AssetRecord,
+    policy: &dyn AssetDomainPolicy,
 ) -> Result<PendingPublication, AssetError> {
-    if kanji_character(&next.identity).is_none() {
+    if policy.content_addressed_storage() {
         return Err(AssetError::new(
             ErrorCode::InvalidIdentity,
-            "публикация с постоянным именем допустима только для идентичности `kanji` из одного символа",
+            "stable publication запрещена для content-addressed domain",
         ));
     }
-    let assets = open_directory_at(root, ASSETS_DIR)
-        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
+    policy.validate_identity(&next.identity)?;
+    let expected = policy.canonical_location(&next.identity, &next.sha256, next.format)?;
+    if expected.storage_path != next.storage_path
+        || expected.consumer_filename != next.consumer_filename
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "stable publication record не соответствует domain policy",
+        ));
+    }
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
-    let next_name = asset_name(&next.storage_path)?;
+    let (next_parent, next_name) = open_storage_parent(root, &next.storage_path, true)?;
     let previous_object = previous.map(|asset| PublicationObject {
         storage_path: asset.storage_path.clone(),
         sha256: asset.sha256.clone(),
         format: asset.format,
     });
     if let Some(previous) = previous {
-        let previous_name = asset_name(&previous.storage_path)?;
-        if !file_matches_hash(&assets, previous_name, &previous.sha256)? {
+        let (previous_parent, previous_name) =
+            open_storage_parent(root, &previous.storage_path, false)?;
+        if !file_matches_hash(&previous_parent, &previous_name, &previous.sha256)? {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "предыдущий kanji asset изменился до compare-and-swap публикации",
+                "предыдущий asset изменился до compare-and-swap публикации",
             ));
         }
         if previous.storage_path != next.storage_path {
-            ensure_asset_path_absent(&assets, next_name, &next.storage_path)?;
+            ensure_asset_path_absent(&next_parent, &next_name, &next.storage_path)?;
         }
     } else {
-        ensure_asset_path_absent(&assets, next_name, &next.storage_path)?;
+        ensure_asset_path_absent(&next_parent, &next_name, &next.storage_path)?;
     }
 
     for _ in 0..128 {
@@ -3110,25 +3948,26 @@ fn prepare_publication(
             transaction,
         };
         if let (Some(previous), Some(backup_name)) = (previous, backup_name) {
-            let previous_name = asset_name(&previous.storage_path)?;
+            let (previous_parent, previous_name) =
+                open_storage_parent(root, &previous.storage_path, false)?;
             if let Err(error) = linkat(
-                &assets,
-                previous_name,
+                &previous_parent,
+                previous_name.as_str(),
                 &temporary,
                 backup_name.as_str(),
                 AtFlags::empty(),
             ) {
-                recover_publication(root, &pending.marker_name)?;
+                recover_publication(root, &pending.marker_name, policy)?;
                 return Err(AssetError::io(
-                    "не удалось сохранить предыдущий kanji asset для CAS",
+                    "не удалось сохранить предыдущий asset для CAS",
                     std::io::Error::from(error),
                 ));
             }
-            if !file_matches_hash(&temporary, &backup_name, &previous.sha256)? {
-                recover_publication(root, &pending.marker_name)?;
+            if !file_matches_hash(&temporary, backup_name.as_str(), &previous.sha256)? {
+                recover_publication(root, &pending.marker_name, policy)?;
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
-                    "backup предыдущего kanji asset не прошёл SHA-256 проверку",
+                    "backup предыдущего asset не прошёл SHA-256 проверку",
                 ));
             }
             sync_directory(&temporary)?;
@@ -3185,9 +4024,8 @@ fn apply_publication(
     staged: &StagedObject,
     publication: &PendingPublication,
 ) -> Result<(), AssetError> {
-    let assets = open_directory_at(root, ASSETS_DIR)
-        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
-    let next_name = asset_name(&publication.transaction.next.storage_path)?;
+    let (asset_parent, next_name) =
+        open_storage_parent(root, &publication.transaction.next.storage_path, true)?;
     let staged_file = open_regular_at(
         &staged.artifact.directory,
         &staged.artifact.name,
@@ -3197,20 +4035,20 @@ fn apply_publication(
     renameat(
         &staged.artifact.directory,
         &staged.artifact.name,
-        &assets,
-        next_name,
+        &asset_parent,
+        next_name.as_str(),
     )
     .map_err(|error| {
         AssetError::io(
-            "не удалось атомарно опубликовать stable kanji asset",
+            "не удалось атомарно опубликовать stable asset",
             std::io::Error::from(error),
         )
     })?;
     sync_directory(&staged.artifact.directory)?;
-    sync_directory(&assets)?;
-    let published = open_regular_at(&assets, next_name, ErrorCode::MissingAssetFile)?;
+    sync_directory(&asset_parent)?;
+    let published = open_regular_at(&asset_parent, &next_name, ErrorCode::MissingAssetFile)?;
     verify_staged_file(staged, published)?;
-    sync_directory(&assets)
+    sync_directory(&asset_parent)
 }
 
 fn verify_staged_contents(staged: &StagedObject, file: File) -> Result<(), AssetError> {
@@ -3218,13 +4056,13 @@ fn verify_staged_contents(staged: &StagedObject, file: File) -> Result<(), Asset
     if hash != staged.sha256 || length != staged.byte_length || format != staged.format {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "staged kanji asset не совпадает с вычисленным SHA-256",
+            "staged asset не совпадает с вычисленным SHA-256",
         ));
     }
     Ok(())
 }
 
-fn recover_publications(root: &File) -> Result<(), AssetError> {
+fn recover_publications(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), AssetError> {
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
     let mut markers = Vec::new();
@@ -3241,9 +4079,9 @@ fn recover_publications(root: &File) -> Result<(), AssetError> {
     }
     markers.sort();
     for marker in markers {
-        recover_publication(root, &marker)?;
+        recover_publication(root, &marker, policy)?;
     }
-    recover_removal(root)
+    recover_removal(root, policy)
 }
 
 fn write_transaction_marker(directory: &File, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
@@ -3307,7 +4145,7 @@ fn clear_transition(root: &File) -> Result<(), AssetError> {
     sync_directory(&temporary)
 }
 
-fn recover_removal(root: &File) -> Result<(), AssetError> {
+fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), AssetError> {
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
     let marker_file = match open_regular_at(&temporary, REMOVAL_MARKER, ErrorCode::MissingAssetFile)
@@ -3321,23 +4159,46 @@ fn recover_removal(root: &File) -> Result<(), AssetError> {
     };
     let transaction: RemovalTransaction = serde_json::from_reader(marker_file)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
-    if transaction.schema_version != 1 || transaction.record.identity.validate().is_err() {
+    if transaction.schema_version != 1 {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
             "removal marker повреждён",
         ));
     }
     validate_hash(&transaction.record.sha256)?;
-    let expected_path = canonical_asset_path(
-        &transaction.record.identity,
-        &transaction.record.sha256,
-        transaction.record.format,
-    );
-    validate_relative_path(&transaction.record.storage_path, &expected_path)?;
-    let assets = open_directory_at(root, ASSETS_DIR)
-        .map_err(|error| directory_entry_error(ASSETS_DIR, error))?;
-    let name = asset_name(&transaction.record.storage_path)?;
+    policy.validate_identity(&transaction.record.identity)?;
     let manifest = load_owned_manifest(root)?;
+    ensure_store_domain(&manifest, policy)?;
+    let expected = if manifest.schema_version < MANIFEST_SCHEMA_VERSION {
+        policy.legacy_location(
+            &transaction.record.identity,
+            &transaction.record.sha256,
+            transaction.record.format,
+        )
+    } else {
+        Some(policy.canonical_location(
+            &transaction.record.identity,
+            &transaction.record.sha256,
+            transaction.record.format,
+        )?)
+    }
+    .ok_or_else(|| {
+        AssetError::new(
+            ErrorCode::UnsupportedSchemaVersion,
+            "legacy location отсутствует",
+        )
+    })?;
+    validate_relative_path(&transaction.record.storage_path, &expected.storage_path)?;
+    if transaction.record.consumer_filename != expected.consumer_filename
+        && !(manifest.schema_version < MANIFEST_SCHEMA_VERSION
+            && transaction.record.consumer_filename.is_empty())
+    {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "removal marker consumer_filename не совпадает с domain policy",
+        ));
+    }
+    let (asset_parent, name) = open_storage_parent(root, &transaction.record.storage_path, true)?;
     match manifest
         .assets
         .iter()
@@ -3347,7 +4208,7 @@ fn recover_removal(root: &File) -> Result<(), AssetError> {
             if current.sha256 == transaction.record.sha256
                 && current.storage_path == transaction.record.storage_path =>
         {
-            match open_regular_at(&assets, name, ErrorCode::MissingAssetFile) {
+            match open_regular_at(&asset_parent, &name, ErrorCode::MissingAssetFile) {
                 Ok(file) => {
                     if hash_file(file)?.0 != current.sha256 {
                         return Err(AssetError::new(
@@ -3363,20 +4224,32 @@ fn recover_removal(root: &File) -> Result<(), AssetError> {
                             "backup удаляемого asset отсутствует",
                         ));
                     }
-                    renameat(&temporary, REMOVAL_BACKUP, &assets, name).map_err(|error| {
+                    let (restore_parent, restore_name) =
+                        open_storage_parent(root, &transaction.record.storage_path, true)?;
+                    renameat(
+                        &temporary,
+                        REMOVAL_BACKUP,
+                        &restore_parent,
+                        restore_name.as_str(),
+                    )
+                    .map_err(|error| {
                         AssetError::io(
                             "не удалось восстановить удаляемый asset",
                             std::io::Error::from(error),
                         )
                     })?;
-                    sync_directory(&assets)?;
+                    sync_directory(&restore_parent)?;
                 }
                 Err(error) => return Err(error),
             }
         }
         None => {
-            remove_if_hash(&assets, name, &transaction.record.sha256, "удаляемый asset")?;
-            sync_directory(&assets)?;
+            remove_storage_path_if_hash(
+                root,
+                &transaction.record.storage_path,
+                &transaction.record.sha256,
+                "удаляемый asset",
+            )?;
         }
         Some(_) => {
             return Err(AssetError::new(
@@ -3392,18 +4265,29 @@ fn recover_removal(root: &File) -> Result<(), AssetError> {
         "removal backup",
     )?;
     unlink_if_exists(&temporary, &OsString::from(REMOVAL_MARKER))?;
-    sync_directory(&temporary)
+    sync_directory(&temporary)?;
+    prune_empty_storage_directories(root, &transaction.record.storage_path)
 }
 
-fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetError> {
+fn recover_publication(
+    root: &File,
+    marker_name: &OsString,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<(), AssetError> {
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
     validate_publication_names(marker_name, None, None)?;
     let marker_file = open_regular_at(&temporary, marker_name, ErrorCode::MissingAssetFile)?;
     let transaction: PublicationTransaction = serde_json::from_reader(marker_file)
         .map_err(|error| AssetError::new(ErrorCode::ManifestCorrupt, error.to_string()))?;
-    validate_publication_transaction(marker_name, &transaction)?;
     let manifest = load_owned_manifest(root)?;
+    ensure_store_domain(&manifest, policy)?;
+    validate_publication_transaction(
+        marker_name,
+        &transaction,
+        policy,
+        manifest.schema_version < MANIFEST_SCHEMA_VERSION,
+    )?;
     let current = manifest
         .assets
         .iter()
@@ -3419,35 +4303,33 @@ fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetE
         (None, None) => true,
         _ => false,
     };
-    let assets = open_directory_at(root, ASSETS_DIR)
-        .map_err(|error| AssetError::io("не удалось открыть canonical asset store", error))?;
-
     if committed {
-        if !file_matches_hash(
-            &assets,
-            asset_name(&transaction.next.storage_path)?,
+        if !storage_file_matches_hash(
+            root,
+            &transaction.next.storage_path,
             &transaction.next.sha256,
         )? {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "manifest commit ссылается на не опубликованный kanji asset",
+                "manifest commit ссылается на не опубликованный asset",
             ));
         }
         if let Some(previous) = &transaction.previous
             && previous.storage_path != transaction.next.storage_path
         {
-            remove_if_hash(
-                &assets,
-                asset_name(&previous.storage_path)?,
+            remove_storage_path_if_hash(
+                root,
+                &previous.storage_path,
                 &previous.sha256,
-                "предыдущий kanji asset",
+                "предыдущий asset",
             )?;
         }
     } else if previous_state {
         if let Some(previous) = &transaction.previous {
-            let previous_name = asset_name(&previous.storage_path)?;
+            let (previous_parent, previous_name) =
+                open_storage_parent(root, &previous.storage_path, true)?;
             if previous.storage_path == transaction.next.storage_path
-                && !file_matches_hash(&assets, previous_name, &previous.sha256)?
+                && !file_matches_hash(&previous_parent, &previous_name, &previous.sha256)?
             {
                 let backup_name = transaction.backup_name.as_deref().ok_or_else(|| {
                     AssetError::new(
@@ -3458,27 +4340,33 @@ fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetE
                 if !file_matches_hash(&temporary, backup_name, &previous.sha256)? {
                     return Err(AssetError::new(
                         ErrorCode::IntegrityMismatch,
-                        "не удалось восстановить предыдущие kanji bytes после сбоя публикации",
+                        "не удалось восстановить предыдущие asset bytes после сбоя публикации",
                     ));
                 }
-                renameat(&temporary, backup_name, &assets, previous_name).map_err(|error| {
+                renameat(
+                    &temporary,
+                    backup_name,
+                    &previous_parent,
+                    previous_name.as_str(),
+                )
+                .map_err(|error| {
                     AssetError::io(
-                        "не удалось откатить атомарную замену kanji asset",
+                        "не удалось откатить атомарную замену asset",
                         std::io::Error::from(error),
                     )
                 })?;
                 sync_directory(&temporary)?;
-                sync_directory(&assets)?;
-                if !file_matches_hash(&assets, previous_name, &previous.sha256)? {
+                sync_directory(&previous_parent)?;
+                if !file_matches_hash(&previous_parent, &previous_name, &previous.sha256)? {
                     return Err(AssetError::new(
                         ErrorCode::IntegrityMismatch,
-                        "восстановленный kanji asset не совпадает с прежним SHA-256",
+                        "восстановленный asset не совпадает с прежним SHA-256",
                     ));
                 }
-            } else if !file_matches_hash(&assets, previous_name, &previous.sha256)? {
+            } else if !file_matches_hash(&previous_parent, &previous_name, &previous.sha256)? {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
-                    "предыдущий kanji asset отсутствует после незавершённой публикации",
+                    "предыдущий asset отсутствует после незавершённой публикации",
                 ));
             }
         }
@@ -3487,11 +4375,11 @@ fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetE
             .as_ref()
             .is_none_or(|previous| previous.storage_path != transaction.next.storage_path)
         {
-            remove_if_hash(
-                &assets,
-                asset_name(&transaction.next.storage_path)?,
+            remove_storage_path_if_hash(
+                root,
+                &transaction.next.storage_path,
                 &transaction.next.sha256,
-                "неподтверждённый kanji asset",
+                "неподтверждённый asset",
             )?;
         }
     } else {
@@ -3514,31 +4402,47 @@ fn recover_publication(root: &File, marker_name: &OsString) -> Result<(), AssetE
         )?;
     }
     unlink_if_exists(&temporary, marker_name)?;
-    sync_directory(&assets)?;
+    if let Some(previous) = &transaction.previous {
+        prune_empty_storage_directories(root, &previous.storage_path)?;
+    }
+    prune_empty_storage_directories(root, &transaction.next.storage_path)?;
     sync_directory(&temporary)
 }
 
 fn validate_publication_transaction(
     marker_name: &OsString,
     transaction: &PublicationTransaction,
+    policy: &dyn AssetDomainPolicy,
+    legacy: bool,
 ) -> Result<(), AssetError> {
-    if transaction.schema_version != 1
-        || transaction.identity.validate().is_err()
-        || kanji_character(&transaction.identity).is_none()
-    {
+    if transaction.schema_version != 1 {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
-            "publication marker содержит неподдерживаемую kanji identity/schema",
+            "publication marker содержит неизвестную schema",
         ));
     }
+    policy.validate_identity(&transaction.identity)?;
     validate_hash(&transaction.next.sha256)?;
-    if transaction.next.storage_path
-        != canonical_asset_path(
+    let expected_next = if legacy {
+        policy.legacy_location(
             &transaction.identity,
             &transaction.next.sha256,
             transaction.next.format,
         )
-    {
+    } else {
+        Some(policy.canonical_location(
+            &transaction.identity,
+            &transaction.next.sha256,
+            transaction.next.format,
+        )?)
+    }
+    .ok_or_else(|| {
+        AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "publication legacy location отсутствует",
+        )
+    })?;
+    if transaction.next.storage_path != expected_next.storage_path {
         return Err(AssetError::new(
             ErrorCode::ManifestCorrupt,
             "publication marker содержит неверный новый storage_path",
@@ -3546,9 +4450,22 @@ fn validate_publication_transaction(
     }
     if let Some(previous) = &transaction.previous {
         validate_hash(&previous.sha256)?;
-        if previous.storage_path
-            != canonical_asset_path(&transaction.identity, &previous.sha256, previous.format)
-        {
+        let expected_previous = if legacy {
+            policy.legacy_location(&transaction.identity, &previous.sha256, previous.format)
+        } else {
+            Some(policy.canonical_location(
+                &transaction.identity,
+                &previous.sha256,
+                previous.format,
+            )?)
+        }
+        .ok_or_else(|| {
+            AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "publication legacy location отсутствует",
+            )
+        })?;
+        if previous.storage_path != expected_previous.storage_path {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 "publication marker содержит неверный предыдущий storage_path",
@@ -3638,12 +4555,6 @@ fn is_temp_artifact_name(name: &str) -> bool {
     })
 }
 
-fn asset_name(storage_path: &str) -> Result<&str, AssetError> {
-    storage_path
-        .strip_prefix("assets/")
-        .ok_or_else(|| AssetError::new(ErrorCode::ManifestCorrupt, "storage_path вне assets/"))
-}
-
 fn ensure_asset_path_absent(
     directory: &File,
     name: &str,
@@ -3652,7 +4563,7 @@ fn ensure_asset_path_absent(
     match open_regular_at(directory, name, ErrorCode::MissingAssetFile) {
         Ok(_) => Err(AssetError::new(
             ErrorCode::UnexpectedPath,
-            format!("путь нового kanji asset уже занят: {storage_path}"),
+            format!("путь нового asset уже занят: {storage_path}"),
         )),
         Err(error) if error.code == ErrorCode::MissingAssetFile => Ok(()),
         Err(error) => Err(error),
@@ -3669,6 +4580,19 @@ fn file_matches_hash(
         Err(error) if error.code == ErrorCode::MissingAssetFile => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn storage_file_matches_hash(
+    root: &File,
+    storage_path: &str,
+    expected_hash: &str,
+) -> Result<bool, AssetError> {
+    let (parent, leaf) = match open_storage_parent(root, storage_path, false) {
+        Ok(value) => value,
+        Err(error) if error.code == ErrorCode::MissingAssetFile => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    file_matches_hash(&parent, &leaf, expected_hash)
 }
 
 fn remove_if_hash(
@@ -4065,7 +4989,7 @@ mod tests {
     fn verified_snapshot_is_read_only_and_rechecks_the_returned_bytes() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
         let identity = AssetIdentity::new("kanji", "一").unwrap();
         store
             .ingest_verified(
@@ -4086,10 +5010,11 @@ mod tests {
         fs::remove_dir_all(root.join(RUNTIME_DIR)).unwrap();
         fs::remove_file(root.join(LOCK_FILE)).unwrap();
         let before = fs::read(root.join(MANIFEST_FILE)).unwrap();
-        let read = AssetStore::read_verified(
+        let read = AssetStore::read_verified_with_policy(
             &root,
             std::slice::from_ref(&identity),
             &VerifiedValidator.identity(),
+            &KanjiDomainPolicy,
         )
         .unwrap();
         assert_eq!(read[0].bytes, b"GIF89a-synthetic");
@@ -4100,6 +5025,7 @@ mod tests {
             &root,
             std::slice::from_ref(&identity),
             &VerifiedValidator.identity(),
+            &KanjiDomainPolicy,
             |record| {
                 let path = root.join(&record.storage_path);
                 fs::remove_file(&path).unwrap();
@@ -4114,7 +5040,7 @@ mod tests {
     fn verified_snapshot_rejects_symlink_replacement_after_validation() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
         let identity = AssetIdentity::new("kanji", "二").unwrap();
         store
             .ingest_verified(
@@ -4137,6 +5063,7 @@ mod tests {
             &root,
             &[identity],
             &VerifiedValidator.identity(),
+            &KanjiDomainPolicy,
             |record| {
                 let path = root.join(&record.storage_path);
                 fs::remove_file(&path).unwrap();
@@ -4145,6 +5072,100 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::BoundaryViolation);
+    }
+
+    #[test]
+    fn layout_migration_recovery_rolls_back_or_finishes_by_manifest_commit() {
+        let temp = TempDir::new();
+        let root = temp.0.join("store");
+        let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
+        let identity = AssetIdentity::new("kanji", "元").unwrap();
+        let record = store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity,
+                    bytes: b"GIF89a migration fixture".to_vec(),
+                    provenance: Provenance {
+                        source_kind: "fixture".into(),
+                        source_name: "migration.gif".into(),
+                    },
+                    domain_metadata: None,
+                    replace_expected_sha256: None,
+                },
+                &VerifiedValidator,
+            )
+            .unwrap()
+            .asset
+            .unwrap();
+        drop(store);
+
+        let old_path = root.join("assets/元.gif");
+        let new_path = root.join("assets/gif/元.gif");
+        fs::rename(&new_path, &old_path).unwrap();
+        fs::remove_dir(root.join("assets/gif")).unwrap();
+        let manifest_path = root.join(MANIFEST_FILE);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        legacy["schema_version"] = 4.into();
+        legacy.as_object_mut().unwrap().remove("domain_id");
+        legacy["assets"][0]["storage_path"] = "assets/元.gif".into();
+        legacy["assets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("consumer_filename");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let transaction = LayoutMigrationTransaction {
+            schema_version: 1,
+            store_id: legacy["store_id"].as_str().unwrap().to_owned(),
+            domain_id: "kanji".into(),
+            source_schema_version: 4,
+            entries: vec![LayoutMigrationEntry {
+                identity: record.identity.clone(),
+                sha256: record.sha256.clone(),
+                format: record.format,
+                old_path: "assets/元.gif".into(),
+                new_path: "assets/gif/元.gif".into(),
+                consumer_filename: "元.gif".into(),
+            }],
+        };
+        let root_handle = File::open(&root).unwrap();
+        let write_marker = || {
+            let temporary = open_directory_at(&root_handle, TEMP_DIR).unwrap();
+            let bytes = serde_json::to_vec(&transaction).unwrap();
+            write_transaction_marker(&temporary, LAYOUT_MIGRATION_MARKER, &bytes).unwrap();
+        };
+
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::hard_link(&old_path, &new_path).unwrap();
+        write_marker();
+        recover_layout_migration(&root_handle, &KanjiDomainPolicy).unwrap();
+        assert!(old_path.exists());
+        assert!(!new_path.exists());
+        assert!(!root.join(TEMP_DIR).join(LAYOUT_MIGRATION_MARKER).exists());
+
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::hard_link(&old_path, &new_path).unwrap();
+        let mut committed: Manifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        committed.schema_version = MANIFEST_SCHEMA_VERSION;
+        committed.domain_id = "kanji".into();
+        committed.revision += 1;
+        committed.assets[0].storage_path = "assets/gif/元.gif".into();
+        committed.assets[0].consumer_filename = "元.gif".into();
+        save_manifest(&root_handle, &committed, false).unwrap();
+        write_marker();
+        recover_layout_migration(&root_handle, &KanjiDomainPolicy).unwrap();
+
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+        assert_eq!(fs::read(&new_path).unwrap(), b"GIF89a migration fixture");
+        assert!(!root.join(TEMP_DIR).join(LAYOUT_MIGRATION_MARKER).exists());
+        let reopened = AssetStore::open_kanji_existing(StoreOptions::new(&root)).unwrap();
+        assert_eq!(
+            reopened.verify_integrity().unwrap()[0].sha256,
+            record.sha256
+        );
     }
 
     #[test]
@@ -4192,7 +5213,7 @@ mod tests {
     fn removal_recovers_after_manifest_commit_before_byte_deletion() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
         let record = store
             .ingest_verified(
                 VerifiedIngestRequest {
@@ -4214,9 +5235,14 @@ mod tests {
         let mut manifest = load_manifest(&store.root_handle).unwrap();
         FAIL_AFTER_REMOVAL_MANIFEST.with(|hook| hook.set(true));
         assert_eq!(
-            remove_record_from_area(&store.root_handle, &mut manifest, &record)
-                .unwrap_err()
-                .code,
+            remove_record_from_area(
+                &store.root_handle,
+                &mut manifest,
+                &record,
+                store.policy.as_ref(),
+            )
+            .unwrap_err()
+            .code,
             ErrorCode::IoFailure
         );
         assert!(root.join(&record.storage_path).exists());
@@ -4224,7 +5250,7 @@ mod tests {
         lock.unlock().unwrap();
         drop(store);
 
-        let reopened = AssetStore::open_existing(StoreOptions::new(&root)).unwrap();
+        let reopened = AssetStore::open_kanji_existing(StoreOptions::new(&root)).unwrap();
         assert!(reopened.verify_integrity().unwrap().is_empty());
         assert!(!root.join(&record.storage_path).exists());
         assert!(!root.join(TEMP_DIR).join(REMOVAL_MARKER).exists());
@@ -4236,7 +5262,7 @@ mod tests {
         for through_validation in [false, true] {
             let temp = TempDir::new();
             let root = temp.0.join("store");
-            let store = AssetStore::open(StoreOptions::new(&root)).unwrap();
+            let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
             let source = temp.0.join("candidate.gif");
             let bytes = b"GIF89a pending to verified fixture";
             fs::write(&source, bytes).unwrap();
@@ -4276,7 +5302,7 @@ mod tests {
             assert!(root.join(TEMP_DIR).join(TRANSITION_MARKER).exists());
             drop(store);
 
-            let reopened = AssetStore::open_existing(StoreOptions::new(&root)).unwrap();
+            let reopened = AssetStore::open_kanji_existing(StoreOptions::new(&root)).unwrap();
             let records = reopened.verify_integrity().unwrap();
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].lifecycle, LifecycleState::Verified);
@@ -4288,7 +5314,7 @@ mod tests {
     fn failed_kanji_cas_manifest_write_restores_previous_stable_bytes() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open(StoreOptions::new(&root)).expect("empty store opens");
+        let store = AssetStore::open_kanji(StoreOptions::new(&root)).expect("empty store opens");
         let validator = VerifiedValidator;
         let first_bytes = b"GIF89a previous fixture".to_vec();
         let first = store
@@ -4307,7 +5333,7 @@ mod tests {
             )
             .expect("first verified bytes publish");
         let previous = first.asset.expect("first asset exists");
-        assert_eq!(previous.storage_path, "assets/元.gif");
+        assert_eq!(previous.storage_path, "assets/gif/元.gif");
 
         store.fail_next_manifest_write();
         let error = store
@@ -4327,7 +5353,7 @@ mod tests {
             .expect_err("injected manifest failure aborts CAS publication");
         assert_eq!(error.code, ErrorCode::IoFailure);
         assert_eq!(
-            fs::read(root.join("assets/元.gif")).expect("old stable path restored"),
+            fs::read(root.join("assets/gif/元.gif")).expect("old stable path restored"),
             first_bytes
         );
         assert_eq!(
@@ -4338,7 +5364,8 @@ mod tests {
             "rollback removes transaction marker, backup and staged candidate"
         );
 
-        let reopened = AssetStore::open(StoreOptions::new(&root)).expect("store remains readable");
+        let reopened =
+            AssetStore::open_kanji(StoreOptions::new(&root)).expect("store remains readable");
         let records = reopened
             .verify_integrity()
             .expect("old manifest still matches bytes");
@@ -4351,7 +5378,7 @@ mod tests {
     fn reopening_after_interrupted_kanji_cas_restores_previous_verified_bytes() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open(StoreOptions::new(&root)).expect("empty store opens");
+        let store = AssetStore::open_kanji(StoreOptions::new(&root)).expect("empty store opens");
         let previous_bytes = b"GIF89a durable previous fixture".to_vec();
         let first = store
             .ingest_verified(
@@ -4377,12 +5404,23 @@ mod tests {
         next.sha256 = staged.sha256.clone();
         next.byte_length = staged.byte_length;
         next.format = staged.format;
-        next.storage_path = canonical_asset_path(&next.identity, &next.sha256, next.format);
+        let location = store
+            .policy
+            .canonical_location(&next.identity, &next.sha256, next.format)
+            .unwrap();
+        next.storage_path = location.storage_path;
+        next.consumer_filename = location.consumer_filename;
         next.lifecycle = LifecycleState::Pending;
         next.validation = None;
 
-        let publication = prepare_publication(&store.root_handle, &staged, Some(&previous), &next)
-            .expect("same-path CAS transaction is durable before publication");
+        let publication = prepare_publication(
+            &store.root_handle,
+            &staged,
+            Some(&previous),
+            &next,
+            store.policy.as_ref(),
+        )
+        .expect("same-path CAS transaction is durable before publication");
         let marker_name = publication.marker_name.clone();
         let backup_name = publication
             .transaction
@@ -4392,7 +5430,7 @@ mod tests {
         apply_publication(&store.root_handle, &staged, &publication)
             .expect("new bytes atomically replace the stable path");
         assert_eq!(
-            fs::read(root.join("assets/元.gif")).expect("replacement is published"),
+            fs::read(root.join("assets/gif/元.gif")).expect("replacement is published"),
             replacement_bytes
         );
         assert!(root.join(TEMP_DIR).join(&marker_name).exists());
@@ -4402,7 +5440,7 @@ mod tests {
         lock.unlock().expect("test releases CAS lock");
         drop(store);
 
-        let reopened = AssetStore::open(StoreOptions::new(&root))
+        let reopened = AssetStore::open_kanji(StoreOptions::new(&root))
             .expect("open recovers interrupted in-place CAS before validation");
         let records = reopened
             .verify_integrity()
@@ -4411,7 +5449,7 @@ mod tests {
         assert_eq!(records[0].sha256, previous.sha256);
         assert_eq!(records[0].lifecycle, LifecycleState::Verified);
         assert_eq!(
-            fs::read(root.join("assets/元.gif")).expect("previous stable bytes restored"),
+            fs::read(root.join("assets/gif/元.gif")).expect("previous stable bytes restored"),
             previous_bytes
         );
         assert_eq!(

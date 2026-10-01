@@ -8,23 +8,39 @@
 compile_error!("asset-store currently supports Linux only");
 
 pub mod batch;
+pub mod browser_runtime;
 pub mod cli;
+pub mod domain;
 pub mod error;
 pub mod hashing;
 pub mod kanji_domain;
 pub mod kanji_mask;
 pub mod kanji_validator;
 pub mod model;
+pub mod pitch_accent;
 pub mod selection;
 pub mod store;
 pub mod validation;
 pub mod yarxi;
 
+pub use browser_runtime::{
+    BrowserExecutableSelection, BrowserExecutableSource, BrowserRuntimeConfig,
+    BrowserRuntimeProvenance, BrowserSession, CdpRuntimeMonitor, DeviceMetrics, NetworkOutcome,
+    RuntimeSnapshot, TrackedRequest,
+};
+pub use domain::{
+    AssetDomainPolicy, CanonicalAssetLocation, GenericDomainPolicy, KanjiDomainPolicy,
+};
 pub use error::{AssetError, ErrorCode};
 pub use model::{
     AssetIdentity, AssetRecord, DetectedFormat, HumanAttestation, HumanDecision, LifecycleState,
     Manifest, Provenance, SemanticDecision, SemanticStatus, ValidationEvidence, ValidationRecord,
     ValidatorIdentity,
+};
+pub use pitch_accent::{
+    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
+    PitchAccentImageValidator, PitchAccentProvider, PitchAccentRenderEvidence,
+    PitchAccentRenderKind,
 };
 pub use selection::{SelectionMode, select_assets};
 pub use store::{

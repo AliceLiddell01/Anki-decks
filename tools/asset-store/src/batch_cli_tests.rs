@@ -4,6 +4,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+fn read_kanji_verified(
+    root: impl AsRef<std::path::Path>,
+    identities: &[crate::model::AssetIdentity],
+    validator: &crate::model::ValidatorIdentity,
+) -> Result<Vec<crate::store::VerifiedAssetBytes>, crate::error::AssetError> {
+    AssetStore::read_verified_with_policy(
+        root,
+        identities,
+        validator,
+        &crate::domain::KanjiDomainPolicy,
+    )
+}
+
 struct Fixture {
     directory: PathBuf,
     store: AssetStore,
@@ -16,7 +29,7 @@ impl Fixture {
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&directory).unwrap();
-        let store = AssetStore::open(StoreOptions::new(directory.join("corpus"))).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
         Self { directory, store }
     }
     fn start(&self, id: &str, characters: &[char]) {
@@ -43,6 +56,7 @@ impl Fixture {
         StoreSummary {
             path: self.store.root().display().to_string(),
             store_id: Some(self.store.store_id().into()),
+            layout_migrated_on_open: self.store.layout_migrated_on_open(),
         }
     }
 }
@@ -350,7 +364,7 @@ fn acquisition_releases_runtime_lock_and_finishes_all_items_before_retry() {
         state.items[0].attempts[0].result.clone(),
         fixture.load("breadth").items[0].attempts[0].result
     );
-    let record = AssetStore::read_verified(
+    let record = read_kanji_verified(
         fixture.store.root(),
         &[identity('元')],
         &KanjiImageValidator::validator_identity(),
@@ -431,7 +445,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
     .unwrap();
     assert!(issues.is_empty());
     assert!(state.items[1].is_ready());
-    let human = AssetStore::read_verified(
+    let human = read_kanji_verified(
         fixture.store.root(),
         &[identity('漢')],
         &KanjiImageValidator::validator_identity(),
@@ -460,7 +474,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
     assert!(issues.is_empty());
     assert_eq!(state.next_round(), [identity('字')]);
     assert!(
-        AssetStore::read_verified(
+        read_kanji_verified(
             fixture.store.root(),
             &[identity('字')],
             &KanjiImageValidator::validator_identity()
@@ -622,7 +636,7 @@ fn aggregate_publication_is_exact_versioned_and_decoded() {
         state.items[0].publication_source,
         Some(BatchTrustSource::Aggregate)
     );
-    let read = AssetStore::read_verified(
+    let read = read_kanji_verified(
         fixture.store.root(),
         &[identity('漢')],
         &KanjiImageValidator::validator_identity(),
@@ -790,7 +804,7 @@ fn explicit_reacquire_preserves_current_canonical_trust() {
     .unwrap();
     assert!(issues.is_empty());
     assert_eq!(state.next_round(), [identity('元')]);
-    let owner = AssetStore::read_verified(
+    let owner = read_kanji_verified(
         fixture.store.root(),
         &[identity('元')],
         &KanjiImageValidator::validator_identity(),
@@ -943,7 +957,7 @@ fn confirm_published_auto_and_existing_candidates_records_owner_approval() {
             state.items[0].publication_source,
             Some(BatchTrustSource::Human)
         );
-        let owner = AssetStore::read_verified(
+        let owner = read_kanji_verified(
             fixture.store.root(),
             &[identity('元')],
             &KanjiImageValidator::validator_identity(),
@@ -1050,7 +1064,7 @@ fn stale_reject_never_materializes_or_demotes_newer_owner_sha() {
         .unwrap();
     assert_eq!(new.status, SemanticStatus::Verified);
     assert_ne!(new.sha256, old_hash);
-    let before = AssetStore::read_verified(
+    let before = read_kanji_verified(
         fixture.store.root(),
         &[identity('元')],
         &KanjiImageValidator::validator_identity(),
@@ -1077,7 +1091,7 @@ fn stale_reject_never_materializes_or_demotes_newer_owner_sha() {
             .candidate_sha256,
         old_hash
     );
-    let after = AssetStore::read_verified(
+    let after = read_kanji_verified(
         fixture.store.root(),
         &[identity('元')],
         &KanjiImageValidator::validator_identity(),
@@ -1090,7 +1104,7 @@ fn stale_reject_never_materializes_or_demotes_newer_owner_sha() {
     })
     .unwrap();
     assert!(!state.is_resolved());
-    let after_resume = AssetStore::read_verified(
+    let after_resume = read_kanji_verified(
         fixture.store.root(),
         &[identity('元')],
         &KanjiImageValidator::validator_identity(),
@@ -1152,7 +1166,7 @@ fn owner_rejection_in_another_batch_invalidates_cached_status_review_and_run() {
         assert!(!state.is_resolved());
         assert!(state.items[0].aggregate.distinct_valid_hashes.is_empty());
         assert!(
-            AssetStore::read_verified(
+            read_kanji_verified(
                 fixture.store.root(),
                 &[identity('元')],
                 &KanjiImageValidator::validator_identity()
@@ -1166,7 +1180,7 @@ fn owner_rejection_in_another_batch_invalidates_cached_status_review_and_run() {
         .unwrap();
         assert!(state.is_resolved());
         assert_ne!(state.items[0].current_sha256.as_ref().unwrap(), &hash);
-        let owner = AssetStore::read_verified(
+        let owner = read_kanji_verified(
             fixture.store.root(),
             &[identity('元')],
             &KanjiImageValidator::validator_identity(),
@@ -1284,7 +1298,7 @@ fn run_observes_external_owner_reject_before_restoring_cached_auto_ready() {
     );
     assert!(state.items[0].aggregate.distinct_valid_hashes.is_empty());
     assert!(
-        AssetStore::read_verified(
+        read_kanji_verified(
             fixture.store.root(),
             &[identity('元')],
             &KanjiImageValidator::validator_identity()
@@ -1428,7 +1442,7 @@ fn repeated_exact_confirm_passes_owner_attestation_after_external_reject() {
     let (state, issues) = decide_exact(&fixture.store, "repeat-confirm", decision).unwrap();
     assert!(issues.is_empty());
     assert!(state.is_resolved());
-    let owner = AssetStore::read_verified(
+    let owner = read_kanji_verified(
         fixture.store.root(),
         &[identity('元')],
         &KanjiImageValidator::validator_identity(),

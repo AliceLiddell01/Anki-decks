@@ -259,7 +259,7 @@ pub(super) fn execute(
             error,
             summary,
             output,
-            store.initialized_on_open(),
+            store.did_mutate_on_open(),
         ),
     }
 }
@@ -1032,10 +1032,11 @@ fn decide_exact(
         // Для повторно использованного канонического элемента нет runtime-попытки.
         // Закрепляем байты владельца и добавляем локальные свидетельства, чтобы
         // явный отказ всё ещё можно было проверить.
-        let verified = AssetStore::read_verified(
+        let verified = AssetStore::read_verified_with_policy(
             store.root(),
             std::slice::from_ref(&identity),
             &state.policy.validator,
+            &crate::domain::KanjiDomainPolicy,
         )?;
         let record = &verified[0].record;
         if record.sha256 != decision.candidate_sha256 {
@@ -1280,6 +1281,7 @@ fn candidate_asset_record(
     AssetRecord {
         identity: identity.clone(),
         storage_path: "candidate".into(),
+        consumer_filename: format!("{}.gif", identity.key),
         sha256: sha256_hex(bytes),
         byte_length: bytes.len() as u64,
         format: DetectedFormat::from_signature(bytes),
@@ -1540,10 +1542,11 @@ mod snapshot_cost_tests {
     fn thousand_ready_identities_use_bounded_full_owner_snapshots() {
         let directory = std::env::temp_dir().join(generated_batch_id().unwrap());
         std::fs::create_dir_all(&directory).unwrap();
-        let store = AssetStore::open(StoreOptions::new(directory.join("corpus"))).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
         let summary = StoreSummary {
             path: store.root().display().to_string(),
             store_id: Some(store.store_id().into()),
+            layout_migrated_on_open: store.layout_migrated_on_open(),
         };
         let characters: Vec<_> = (0x4e00..0x4e00 + 1000)
             .map(|code| char::from_u32(code).unwrap().to_string())
@@ -1552,10 +1555,12 @@ mod snapshot_cost_tests {
             .iter()
             .map(|character| {
                 let identity = parse_character(character).unwrap().identity();
+                let consumer_filename = format!("{}.png", identity.key);
                 let sha256 = sha256_hex(character.as_bytes());
                 AssetRecord {
                     identity,
-                    storage_path: format!("assets/{sha256}.png"),
+                    storage_path: format!("assets/png/{consumer_filename}"),
+                    consumer_filename,
                     sha256: sha256.clone(),
                     byte_length: 1,
                     format: DetectedFormat::Png,
@@ -1691,10 +1696,11 @@ mod candidate_cost_tests {
         const ITEMS: u32 = 200;
         let directory = std::env::temp_dir().join(generated_batch_id().unwrap());
         std::fs::create_dir_all(&directory).unwrap();
-        let store = AssetStore::open(StoreOptions::new(directory.join("corpus"))).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
         let summary = StoreSummary {
             path: store.root().display().to_string(),
             store_id: Some(store.store_id().into()),
+            layout_migrated_on_open: store.layout_migrated_on_open(),
         };
         let characters: Vec<_> = (0x4e00..0x4e00 + ITEMS)
             .map(|code| char::from_u32(code).unwrap().to_string())
