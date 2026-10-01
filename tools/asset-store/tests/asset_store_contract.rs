@@ -1387,33 +1387,38 @@ fn cross_domain_identity_is_rejected() {
 }
 
 #[test]
-fn duplicate_consumer_filename_reaches_manifest_dedup_guard() {
+fn duplicate_consumer_filename_is_rejected_before_manifest_commit() {
     let temp = TempDir::new("duplicate-consumer-filename");
     let root = temp.path().join("store");
     let store =
         AssetStore::open_with_policy(StoreOptions::new(&root), DuplicateConsumerPolicy).unwrap();
     for key in ["first", "second"] {
-        store
-            .ingest_verified(
-                VerifiedIngestRequest {
-                    identity: AssetIdentity::new("duplicate-test", key).unwrap(),
-                    bytes: [b"GIF89a".as_slice(), key.as_bytes()].concat(),
-                    provenance: Provenance {
-                        source_kind: "fixture".into(),
-                        source_name: format!("{key}.gif"),
-                    },
-                    domain_metadata: None,
-                    replace_expected_sha256: None,
+        let result = store.ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("duplicate-test", key).unwrap(),
+                bytes: [b"GIF89a".as_slice(), key.as_bytes()].concat(),
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: format!("{key}.gif"),
                 },
-                &FixedValidator::new(SemanticStatus::Verified),
-            )
-            .unwrap();
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            },
+            &FixedValidator::new(SemanticStatus::Verified),
+        );
+        if key == "first" {
+            result.expect("первая consumer filename должна публиковаться");
+        } else {
+            let error = result.expect_err("повторный consumer filename отклоняется до commit");
+            assert_eq!(error.code, ErrorCode::ManifestCorrupt);
+            assert!(error.message.contains("повторяющиеся consumer_filename"));
+        }
     }
 
-    assert_eq!(
-        store.verify_integrity().unwrap_err().code,
-        ErrorCode::ManifestCorrupt
-    );
+    let assets = store.verify_integrity().unwrap();
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].identity.key, "first");
+    assert!(!root.join("assets/second.gif").exists());
 }
 
 #[test]

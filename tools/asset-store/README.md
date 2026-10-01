@@ -57,10 +57,11 @@ Kanji GIF и PNG физически разделены по `assets/gif/` и `as
 form, а не reading: только PNG может попасть в `assets/png/<surface>.png` и
 consumer получает `<surface>.png`. Reading и положительный JPDB vocabulary ID
 хранятся в domain metadata/evidence. Полного PNG decode недостаточно для
-`VERIFIED`: `PitchAccentImageValidator` требует согласованные surface, reading,
-JPDB source URL с тем же vocabulary ID, число graphs, render dimensions,
-viewport, selector, browser provenance и device scale `3.0`. Без evidence
-результат остаётся `UNCERTAIN`.
+`VERIFIED`: `PitchAccentImageValidator` требует совпадения surface и JPDB source
+URL с тем же vocabulary ID, заполненные reading и число graphs, положительные
+viewport и render dimensions (последние должны совпадать с размерами PNG),
+непустой selector, заполненную browser provenance и device scale ровно `3.0`.
+Без evidence результат остаётся `UNCERTAIN`.
 
 Manifest schema — `5`. Помимо exact SHA-256, размера, формата, lifecycle,
 provenance и semantic decision, каждая запись хранит `consumer_filename`, а весь

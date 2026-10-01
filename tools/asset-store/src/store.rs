@@ -3855,6 +3855,7 @@ fn commit_asset_record<F>(
 where
     F: FnOnce(&File, &Manifest) -> Result<(), AssetError>,
 {
+    ensure_unique_consumer_filename(manifest, record)?;
     recover_publications(root, policy)?;
     let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
         AssetError::new(
@@ -3901,6 +3902,21 @@ where
     }
     if let Some(publication) = publication {
         recover_publication(root, &publication.marker_name, policy)?;
+    }
+    Ok(())
+}
+
+fn ensure_unique_consumer_filename(
+    manifest: &Manifest,
+    record: &AssetRecord,
+) -> Result<(), AssetError> {
+    if manifest.assets.iter().any(|asset| {
+        asset.identity != record.identity && asset.consumer_filename == record.consumer_filename
+    }) {
+        return Err(AssetError::new(
+            ErrorCode::ManifestCorrupt,
+            "manifest содержит повторяющиеся consumer_filename",
+        ));
     }
     Ok(())
 }

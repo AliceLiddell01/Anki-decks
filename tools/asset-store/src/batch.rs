@@ -846,14 +846,20 @@ impl RuntimeBatchState for KanjiBatch {
     }
 
     fn blob_validation_context(&self, blob: &RuntimeBlobRef) -> Option<&str> {
-        find_candidate_for_blob(self, blob)
-            .map(|candidate| kanji_candidate_extension(candidate.format).unwrap_or("unsupported"))
+        Some(kanji_candidate_extension_from_path(blob))
     }
 
     fn validate_blob_bytes(&self, blob: &RuntimeBlobRef, bytes: &[u8]) -> Result<(), AssetError> {
-        let candidate = find_candidate_for_blob(self, blob)
-            .ok_or_else(|| invalid("ссылка на blob не связана с кандидатом пакета"))?;
-        if DetectedFormat::from_signature(bytes) != candidate.format {
+        let expected_format = match kanji_candidate_extension_from_path(blob) {
+            "gif" => DetectedFormat::Gif,
+            "png" => DetectedFormat::Png,
+            _ => {
+                return Err(invalid(
+                    "кандидат пакета кандзи должен иметь формат GIF или PNG",
+                ));
+            }
+        };
+        if DetectedFormat::from_signature(bytes) != expected_format {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
                 "байты кандидата не соответствуют объявленному формату",
@@ -863,25 +869,16 @@ impl RuntimeBatchState for KanjiBatch {
     }
 }
 
-fn find_candidate_for_blob<'a>(
-    batch: &'a KanjiBatch,
-    blob: &RuntimeBlobRef,
-) -> Option<&'a BatchCandidate> {
-    batch.items.iter().find_map(|item| {
-        item.existing_candidate
-            .iter()
-            .chain(
-                item.attempts
-                    .iter()
-                    .filter_map(|attempt| match &attempt.result {
-                        BatchAttemptInput::Candidate { candidate } => Some(candidate),
-                        BatchAttemptInput::Failed { .. } => None,
-                    }),
-            )
-            .find(|candidate| {
-                candidate.sha256 == blob.sha256 && candidate.storage_path == blob.storage_path
-            })
-    })
+fn kanji_candidate_extension_from_path(blob: &RuntimeBlobRef) -> &'static str {
+    match blob
+        .storage_path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+    {
+        Some("gif") => "gif",
+        Some("png") => "png",
+        _ => "unsupported",
+    }
 }
 
 fn check_publication_source(item: &BatchItem, source: BatchTrustSource) -> Result<(), AssetError> {
