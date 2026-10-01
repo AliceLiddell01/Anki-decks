@@ -1,24 +1,24 @@
-//! Versioned state и доменные типы, общие для всех asset consumers.
+//! Версионируемое состояние и доменные типы для всех потребителей ресурсов.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Версия формата persistent manifest.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
+/// Версия формата постоянного манифеста.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
 
-/// Логическая identity asset; имя файла в identity не участвует.
+/// Логический идентификатор ресурса; имя файла в нём не участвует.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetIdentity {
-    /// Тип или namespace asset, например `kanji`.
+    /// Тип или пространство имён ресурса, например `kanji`.
     pub namespace: String,
     /// Стабильный ключ, заданный вызывающей предметной областью.
     pub key: String,
 }
 
 impl AssetIdentity {
-    /// Создаёт и проверяет логическую identity.
+    /// Создаёт и проверяет логический идентификатор.
     pub fn new(namespace: impl Into<String>, key: impl Into<String>) -> Result<Self, String> {
         let identity = Self {
             namespace: namespace.into(),
@@ -28,7 +28,7 @@ impl AssetIdentity {
         Ok(identity)
     }
 
-    /// Проверяет безопасные ограничения формата identity.
+    /// Проверяет безопасные ограничения формата идентификатора.
     pub fn validate(&self) -> Result<(), String> {
         let namespace_ok = !self.namespace.is_empty()
             && self.namespace.len() <= 64
@@ -37,12 +37,12 @@ impl AssetIdentity {
             });
         if !namespace_ok {
             return Err(
-                "namespace должен содержать до 64 символов a-z, 0-9, '.', '_' или '-'".into(),
+                "поле namespace должно содержать до 64 символов a-z, 0-9, '.', '_' или '-'".into(),
             );
         }
         if self.key.is_empty() || self.key.len() > 512 || self.key.chars().any(char::is_control) {
             return Err(
-                "key должен быть непустым, не длиннее 512 байт и без управляющих символов".into(),
+                "поле key должно быть непустым, не длиннее 512 байт и не содержать управляющих символов".into(),
             );
         }
         Ok(())
@@ -55,7 +55,7 @@ impl fmt::Display for AssetIdentity {
     }
 }
 
-/// Установленный по magic bytes формат, не зависящий от расширения исходника.
+/// Формат, определённый по сигнатуре байтов независимо от расширения исходника.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectedFormat {
@@ -89,7 +89,7 @@ impl DetectedFormat {
     }
 }
 
-/// Физическое положение файла в пределах store.
+/// Физическое положение файла в хранилище.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
@@ -115,7 +115,7 @@ impl fmt::Display for LifecycleState {
     }
 }
 
-/// Результат semantic decision внешнего domain validator'а.
+/// Результат семантического решения внешнего доменного валидатора.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticStatus {
@@ -137,7 +137,7 @@ impl SemanticStatus {
     }
 }
 
-/// Идентичность и версия semantic validator'а.
+/// Идентификатор и версия семантического валидатора.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidatorIdentity {
@@ -146,7 +146,7 @@ pub struct ValidatorIdentity {
 }
 
 impl ValidatorIdentity {
-    /// Создаёт и проверяет явную пару id/version.
+    /// Создаёт и проверяет явную пару «идентификатор/версия».
     pub fn new(id: impl Into<String>, version: impl Into<String>) -> Result<Self, String> {
         let identity = Self {
             id: id.into(),
@@ -159,13 +159,16 @@ impl ValidatorIdentity {
             || identity.id.chars().any(char::is_control)
             || identity.version.chars().any(char::is_control)
         {
-            return Err("validator id/version должны быть непустыми строками до 128 байт".into());
+            return Err(
+                "идентификатор и версия валидатора должны быть непустыми строками до 128 байт"
+                    .into(),
+            );
         }
         Ok(identity)
     }
 }
 
-/// Одно проверяемое свидетельство domain validator'а.
+/// Одно проверяемое свидетельство доменного валидатора.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationEvidence {
@@ -175,7 +178,7 @@ pub struct ValidationEvidence {
     pub details: Option<serde_json::Value>,
 }
 
-/// Не сохранённый ещё ответ validator'а; его принимает только lifecycle API.
+/// Ещё не сохранённый ответ валидатора; его принимает только API жизненного цикла.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticDecision {
     pub status: SemanticStatus,
@@ -183,23 +186,23 @@ pub struct SemanticDecision {
 }
 
 impl SemanticDecision {
-    /// Создаёт решение с явным status и evidence.
+    /// Создаёт решение с явным статусом и свидетельствами.
     pub fn new(status: SemanticStatus, evidence: Vec<ValidationEvidence>) -> Self {
         Self { status, evidence }
     }
 }
 
-/// Provenance источника bytes.
+/// Происхождение исходных байтов.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
     /// Стабильный тип источника; поддерживается `local_import`.
     pub source_kind: String,
-    /// Имя явно переданного файла; абсолютный host path не сохраняется.
+    /// Имя явно переданного файла; абсолютный путь исходной системы не сохраняется.
     pub source_name: String,
 }
 
-/// Semantic decision, привязанный к hash и версии конкретного validator'а.
+/// Семантическое решение, привязанное к хешу и версии конкретного валидатора.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationRecord {
@@ -224,7 +227,7 @@ impl ValidationRecord {
     }
 }
 
-/// Явное semantic решение человека для конкретных bytes.
+/// Явное семантическое решение человека для конкретных байтов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanDecision {
@@ -232,7 +235,8 @@ pub enum HumanDecision {
     Reject,
 }
 
-/// Независимое от automated evidence свидетельство; не обходит integrity/decode.
+/// Независимое от автоматической проверки свидетельство; не обходит контроль
+/// целостности и декодирование.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanAttestation {
@@ -243,13 +247,17 @@ pub struct HumanAttestation {
     pub reason: String,
 }
 
-/// Одна актуальная версия логического asset.
+/// Одна актуальная версия логического ресурса.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetRecord {
     pub identity: AssetIdentity,
-    /// Relative path сохраняется явно и при чтении сверяется с lifecycle/hash.
+    /// Относительный путь сохраняется явно и при чтении сверяется с состоянием и хешем.
     pub storage_path: String,
+    /// Плоское имя, которое потребитель размещает в своём каталоге медиафайлов.
+    /// Оно независимо от вложенного `storage_path` и сверяется с форматом байтов.
+    #[serde(default)]
+    pub consumer_filename: String,
     pub sha256: String,
     pub byte_length: u64,
     pub format: DetectedFormat,
@@ -259,14 +267,14 @@ pub struct AssetRecord {
     pub validation: Option<ValidationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_attestation: Option<HumanAttestation>,
-    /// Kanji consumer хранит здесь character и Unicode code points; generic core
-    /// сохраняет extension metadata без интерпретации.
+    /// Потребитель Kanji хранит здесь символ и его кодовые точки Unicode; общий
+    /// код сохраняет дополнительные сведения о расширении без интерпретации.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_metadata: Option<serde_json::Value>,
 }
 
 impl AssetRecord {
-    /// Human decision учитывается только для точного identity+hash.
+    /// Решение человека учитывается только для точных identity и хеша.
     pub fn current_human_decision(&self) -> Option<HumanDecision> {
         self.human_attestation
             .as_ref()
@@ -278,7 +286,8 @@ impl AssetRecord {
             .map(|attestation| attestation.decision)
     }
 
-    /// Automated decision, только если его hash и evidence корректны для текущих bytes.
+    /// Автоматическое решение учитывается, только если его хеш и свидетельства
+    /// корректны для текущих байтов.
     pub(crate) fn current_validation_status(&self) -> Option<SemanticStatus> {
         self.validation
             .as_ref()
@@ -286,13 +295,13 @@ impl AssetRecord {
             .map(|decision| decision.status)
     }
 
-    /// Есть ли пригодное automated evidence для текущего hash.
+    /// Есть ли пригодные свидетельства автоматической проверки для текущего хеша.
     pub(crate) fn has_current_validation(&self) -> bool {
         self.current_validation_status().is_some()
     }
 
-    /// Semantic trust после применения human override. Вызывающий обязан сначала
-    /// проверить physical integrity; этот метод не читает и не декодирует bytes.
+    /// Семантический статус после решения человека. Вызывающий обязан сначала
+    /// проверить физическую целостность; этот метод не читает и не декодирует байты.
     pub fn effective_status(&self) -> Option<SemanticStatus> {
         let automated = self.current_validation_status();
         if automated == Some(SemanticStatus::Corrupt) {
@@ -308,7 +317,7 @@ impl AssetRecord {
         }
     }
 
-    /// Актуальность semantic trust для consumer, ожидающего validator version.
+    /// Актуальность семантического статуса для потребителя, ожидающего версию валидатора.
     pub fn is_trusted_for(&self, validator: &ValidatorIdentity) -> bool {
         self.effective_status() == Some(SemanticStatus::Verified)
             && (self.current_human_decision() == Some(HumanDecision::Approve)
@@ -325,21 +334,26 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Канонический persistent manifest.
+/// Канонический постоянный манифест.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
+    /// Политика и домен, закреплённые за этим корнем хранилища.
+    /// Отсутствует только в старых схемах 3/4 и заполняется при открытии с изменениями.
+    #[serde(default)]
+    pub domain_id: String,
     pub store_id: String,
     pub revision: u64,
     pub assets: Vec<AssetRecord>,
 }
 
 impl Manifest {
-    /// Пустое состояние нового store.
-    pub fn empty(store_id: String) -> Self {
+    /// Пустое состояние нового хранилища, привязанное к политике конкретного домена.
+    pub fn empty_for_domain(store_id: String, domain_id: impl Into<String>) -> Self {
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
+            domain_id: domain_id.into(),
             store_id,
             revision: 0,
             assets: Vec::new(),

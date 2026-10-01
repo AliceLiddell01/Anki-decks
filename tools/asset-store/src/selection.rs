@@ -60,6 +60,7 @@ mod tests {
         AssetRecord {
             identity: AssetIdentity::new("generic", key).expect("identity valid"),
             storage_path: format!("pending/{hash}.blob"),
+            consumer_filename: format!("{hash}.bin"),
             sha256: hash.to_owned(),
             byte_length: 1,
             format: DetectedFormat::Unknown,

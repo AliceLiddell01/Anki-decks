@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use asset_store::kanji_validator::KanjiImageValidator;
 use asset_store::store::VerifiedAssetBytes;
-use asset_store::{AssetIdentity, AssetStore};
+use asset_store::{AssetIdentity, AssetStore, DetectedFormat};
 use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, openat, unlinkat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -325,7 +325,7 @@ impl Routing {
                 .as_ref()
                 .and_then(|p| p.note_models.iter().find(|m| m.crowdanki_uuid == uuid))
                 .and_then(|m| m.fields.get(field))
-                .expect("enabled field has a configured processor chain")
+                .expect("для включённого поля настроена цепочка обработчиков")
                 .processors;
             let processors = chain
                 .iter()
@@ -389,10 +389,11 @@ impl Routing {
                 json!({}),
             ));
         }
-        let assets = AssetStore::read_verified(
+        let assets = AssetStore::read_verified_with_policy(
             root,
             &identities,
             &KanjiImageValidator::validator_identity(),
+            &asset_store::KanjiDomainPolicy,
         )
         .map_err(|e| {
             let missing_pinned_identity = e
@@ -428,7 +429,7 @@ impl Routing {
         })?;
         let mut plan = MediaPlan::default();
         for asset in assets {
-            let filename = verified_asset_filename(&asset.record.storage_path)?.to_owned();
+            let filename = verified_asset_filename(&asset)?.to_owned();
             let pin = Pin {
                 identity: asset.record.identity.clone(),
                 filename: filename.clone(),
@@ -602,13 +603,19 @@ impl MediaPlan {
     }
 }
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-fn verified_asset_filename(storage_path: &str) -> Result<&str, DomainError> {
-    storage_path
-        .strip_prefix("assets/")
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            crate::ops::source::internal("проверенное хранилище вернуло путь вне assets/")
-        })
+fn verified_asset_filename(asset: &VerifiedAssetBytes) -> Result<&str, DomainError> {
+    let filename = asset.record.consumer_filename.as_str();
+    let detected_format = DetectedFormat::from_signature(&asset.bytes);
+    if asset.record.format == DetectedFormat::Unknown
+        || asset_store::domain::validate_safe_consumer_filename(filename, asset.record.format)
+            .is_err()
+        || detected_format != asset.record.format
+    {
+        return Err(crate::ops::source::internal(
+            "проверенное хранилище вернуло небезопасное или несогласованное имя файла для потребителя",
+        ));
+    }
+    Ok(filename)
 }
 
 fn io_failure(e: impl std::fmt::Display) -> DomainError {

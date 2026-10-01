@@ -1,5 +1,6 @@
 //! Регрессии exact-hash human trust и совместимости с прежним корпусом.
 use super::*;
+use crate::kanji_validator::MAX_MEDIA_BYTES;
 use crate::model::ValidationEvidence;
 
 struct Fixture {
@@ -16,7 +17,7 @@ impl Fixture {
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&directory).unwrap();
-        let store = AssetStore::open(StoreOptions::new(directory.join("store"))).unwrap();
+        let store = AssetStore::open_kanji(StoreOptions::new(directory.join("store"))).unwrap();
         Self {
             directory,
             store,
@@ -56,10 +57,11 @@ impl Fixture {
     }
 
     fn read(&self) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
-        AssetStore::read_verified(
+        AssetStore::read_verified_with_policy(
             self.directory.join("store"),
             std::slice::from_ref(&self.identity),
             &Classifier(SemanticStatus::Verified).identity(),
+            &crate::domain::KanjiDomainPolicy,
         )
     }
 }
@@ -227,15 +229,17 @@ fn human_approval_overrides_uncertain_rejected_and_preserves_automated_evidence(
         assert_eq!(fixture.classify(status).lifecycle, LifecycleState::Verified);
         let other_validator = ValidatorIdentity::new("new-validator", "2").unwrap();
         assert!(
-            AssetStore::read_verified(
+            AssetStore::read_verified_with_policy(
                 fixture.directory.join("store"),
                 std::slice::from_ref(&fixture.identity),
-                &other_validator
+                &other_validator,
+                &crate::domain::KanjiDomainPolicy,
             )
             .is_ok()
         );
         drop(
-            AssetStore::open_existing(StoreOptions::new(fixture.directory.join("store"))).unwrap(),
+            AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+                .unwrap(),
         );
     }
 }
@@ -370,12 +374,33 @@ fn schema_v3_read_retains_trust_and_first_decision_migrates_without_evidence_los
     let path = fixture.directory.join("store/manifest.json");
     let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     legacy["schema_version"] = 3.into();
+    legacy.as_object_mut().unwrap().remove("domain_id");
+    let record_json = legacy["assets"][0].as_object_mut().unwrap();
+    record_json.remove("consumer_filename");
+    record_json.insert(
+        "storage_path".into(),
+        serde_json::Value::String("assets/日.png".into()),
+    );
+    let old_path = fixture.directory.join("store/assets/png/日.png");
+    let legacy_path = fixture.directory.join("store/assets/日.png");
+    fs::rename(&old_path, &legacy_path).unwrap();
+    fs::remove_dir(fixture.directory.join("store/assets/png")).unwrap();
     let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
     fs::write(&path, &legacy_bytes).unwrap();
     assert!(fixture.read().is_ok());
     assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
-    let approved = fixture
-        .attest(&record.sha256, HumanDecision::Approve)
+    let migrated =
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+            .unwrap();
+    assert!(migrated.layout_migrated_on_open());
+    assert!(!legacy_path.exists());
+    let approved = migrated
+        .attest(HumanAttestationRequest {
+            identity: fixture.identity.clone(),
+            expected_sha256: record.sha256.clone(),
+            decision: HumanDecision::Approve,
+            reason: "явное пользовательское решение по изображению".into(),
+        })
         .unwrap();
     assert_eq!(approved.asset.validation, record.validation);
     let current: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -398,7 +423,8 @@ fn approval_recovery_keeps_exact_bytes_and_both_decisions() {
         ErrorCode::IoFailure
     );
     let reopened =
-        AssetStore::open_existing(StoreOptions::new(fixture.directory.join("store"))).unwrap();
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+            .unwrap();
     let result = reopened.verify_integrity().unwrap();
     assert_eq!(result[0].validation, classified.validation);
     assert_eq!(
@@ -415,7 +441,8 @@ fn runtime_batch_extension_survives_open_and_asset_lifecycle_recovery() {
     fs::create_dir(&batches).unwrap();
     fs::write(batches.join("owned-by-domain.json"), b"domain payload").unwrap();
     let reopened =
-        AssetStore::open_existing(StoreOptions::new(fixture.directory.join("store"))).unwrap();
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+            .unwrap();
     assert!(reopened.verify_integrity().unwrap().is_empty());
     // Ingest создаёт publication transaction внутри runtime; затем approval
     // выполняет runtime removal recovery. Оба используют area-generic loaders.
@@ -442,7 +469,7 @@ fn runtime_batch_extension_rejects_symlink_and_non_directory() {
             fs::write(&batches, b"not a directory").unwrap();
         }
         assert_eq!(
-            AssetStore::open_existing(StoreOptions::new(fixture.directory.join("store")))
+            AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
                 .unwrap_err()
                 .code,
             ErrorCode::BoundaryViolation,
@@ -463,7 +490,7 @@ fn batch_extension_is_not_allowed_in_canonical_store() {
         ErrorCode::UnexpectedPath
     );
     assert_eq!(
-        AssetStore::open_existing(StoreOptions::new(fixture.directory.join("store")))
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
             .unwrap_err()
             .code,
         ErrorCode::StoreNotOwned,

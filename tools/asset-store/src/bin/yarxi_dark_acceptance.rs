@@ -28,12 +28,12 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     plan: PathBuf,
 
-    /// Новый каталог HTML/evidence отчёта. Родитель должен существовать;
+    /// Новый каталог HTML-отчёта со свидетельствами. Родитель должен существовать;
     /// каталог должен быть вне checkout и ещё не существовать.
     #[arg(long, value_name = "DIR")]
     output: Option<PathBuf>,
 
-    /// Разрешить точечную обработку TLS interstitial для www.yarxi.su.
+    /// Разрешить обработку промежуточной страницы TLS-предупреждения только для www.yarxi.su.
     #[arg(long)]
     allow_insecure_tls: bool,
 }
@@ -136,7 +136,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let provisional = AssetRecord {
             identity: AssetIdentity::new("kanji", item.character.clone())?,
-            storage_path: format!("assets/{codepoint}.png"),
+            // Валидатор использует только identity и фактический формат; запись не сохраняется,
+            // поэтому здесь нет утверждения о storage path или имени для consumer.
+            storage_path: String::new(),
+            consumer_filename: String::new(),
             sha256: sha256.clone(),
             byte_length: media.bytes.len() as u64,
             format: DetectedFormat::from_signature(&media.bytes),

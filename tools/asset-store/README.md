@@ -10,143 +10,122 @@ content hash, integrity и lifecycle. Предметный CLI `kanji-assets` д
 
 ## Где лежат данные
 
-Корень по умолчанию — `.asset-store/kanji` в корне workspace. Команды `list`,
-`plan`, `validate`, `batch run`, `batch status`, `batch review`, `batch decide` и
-`batch retry` открывают уже существующий store и завершаются ошибкой, если его
-нет. `ensure` и `batch start` создают store при первом вызове.
-
-В store разделены публикуемое состояние и локальные записи проверки:
+Kanji CLI по умолчанию использует `.asset-store/kanji`. Следующий самостоятельный
+домен имеет отдельный root `.asset-store/pitch-accent`; два publishable corpus не
+делят manifest или каталог `assets/`.
 
 ```text
-.asset-store/kanji/
-├── .owner.json             # tracked marker владельца
-├── manifest.json           # tracked: только assets с effective VERIFIED trust
-├── assets/                 # tracked: bytes effective VERIFIED изображений
-├── .runtime/               # ignored: локальные кандидаты, карантин и batch state
-│   ├── .owner.json         # тот же store_id
-│   ├── manifest.json       # Pending и Quarantined
-│   ├── assets/             # bytes локальных кандидатов и карантина
-│   ├── batches/<batch-id>/  # ignored state.json, review.html и candidates/
-│   └── .tmp/               # ignored staging runtime-состояния
-├── .lock                    # ignored lock
-└── .tmp/                    # ignored staging и транзакционные файлы
+.asset-store/
+├── kanji/
+│   ├── .owner.json                 # tracked owner marker
+│   ├── manifest.json               # tracked; только effective VERIFIED
+│   ├── assets/
+│   │   ├── gif/漢.gif
+│   │   └── png/饅.png
+│   ├── .runtime/                   # ignored candidates, quarantine, batches
+│   ├── .tmp/                       # ignored staging и transaction markers
+│   └── .lock                       # ignored
+└── pitch-accent/
+    ├── .owner.json
+    ├── manifest.json
+    ├── assets/png/幽霊.png
+    ├── .runtime/
+    ├── .tmp/
+    └── .lock
 ```
 
-`.runtime/manifest.json` использует тот же `store_id`, что и публикуемый
-manifest. `verify_integrity` проверяет оба состояния и возвращает их записи.
-Read-only publishability gate подтверждает canonical corpus и проверяет, что
-локальный runtime store, если он есть, структурно исправен и не пересекается с
-опубликованными identity. Runtime assets при этом не становятся публикуемыми.
-Отсутствующий `.asset-store/kanji` не считается ошибкой: репозиторий может пока
-не содержать corpus. При открытии legacy store с каноническим manifest
-`schema_version: 3` automated decisions остаются действующими, а отсутствующее
-поле `human_attestation` читается как `null`. Старые `Pending` и `Quarantined` записи переносятся из
-корневого manifest в `.runtime/` под exclusive lock. Store с `schema_version: 1`
-и каталогом `objects/` нужно создать заново: он не мигрируется.
-Если в `.runtime/` уже есть запись с той же identity, при восстановлении она
-сохраняется, а старая canonical запись и bytes удаляются.
+Внутренний `storage_path` и имя для конечного consumer — разные значения manifest.
+Например, `assets/gif/漢.gif` имеет `consumer_filename: "漢.gif"` и попадает в
+`media/漢.gif`. `anki-repo` использует явное consumer-имя и не извлекает его из
+структуры asset-store.
 
-Например, изображение `漢` в GIF-формате хранится в `assets/漢.gif`, а в PNG —
-в `assets/漢.png`. Расширение выводится из magic bytes. SHA-256 остаётся в
-manifest и проверяется вместе с размером, форматом, identity и semantic
-decision; hash не входит в имя kanji asset. Для других namespace общего core
-сохраняется hash-suffixed layout.
+`.runtime/manifest.json` использует тот же `store_id`, что и canonical manifest.
+`verify_integrity` проверяет обе области. Pending и Quarantined bytes остаются в
+runtime, verified-only gate проверяет canonical corpus и отсутствие пересечений
+identity с runtime. Отсутствующий corpus допустим.
 
-`.gitignore` разрешает публиковать только `.owner.json`, `manifest.json` и
-изображения `.gif`/`.png` в `assets/`; `.runtime/`, включая `batches/`, lock и незавершённая
-публикация остаются локальными. Read-only gate отклоняет non-VERIFIED записи,
-orphan-файлы и незарегистрированные bytes в tracked corpus. Другие каталоги и
-файлы store не усыновляются. Root с `..`, symlink-компонентом, неожиданными
-файлами или пересечением с `decks/` отвергается.
+## Domain policy и manifest
 
-Каждый канонический image связан в manifest с:
+`AssetDomainPolicy` задаёт допустимую identity, canonical storage path,
+consumer filename, publishable formats и ограничения размера. `GenericDomainPolicy`
+сохраняет hash-addressed layout для непубликуемых generic assets. Предметные
+policy не принимают identity другого namespace: `KanjiDomainPolicy` владеет
+`kanji`, `PitchAccentDomainPolicy` — `pitch_accent`.
 
-- identity `{namespace: "kanji", key: "<символ>"}`;
-- фактическим SHA-256, размером и форматом;
-- provenance Yarxi и domain metadata с символом, Unicode, номером статьи,
-  выбранным source URL и результатом выбора GIF/PNG;
-- automated semantic status, validator id/version, content hash решения и pixel
-  evidence;
-- optional human decision `approve`/`reject`, основание, та же identity и exact
-  content SHA-256. Human decision является semantic решением, а не подписью.
+Kanji GIF и PNG физически разделены по `assets/gif/` и `assets/png/`, при этом
+имя файла — точный символ и расширение. Pitch accent использует ключ surface
+form, а не reading: только PNG может попасть в `assets/png/<surface>.png` и
+consumer получает `<surface>.png`. Reading и положительный JPDB vocabulary ID
+хранятся в domain metadata/evidence. Полного PNG decode недостаточно для
+`VERIFIED`: `PitchAccentImageValidator` требует совпадения surface и JPDB source
+URL с тем же vocabulary ID, заполненные reading и число graphs, положительные
+viewport и render dimensions (последние должны совпадать с размерами PNG),
+непустой selector, заполненную browser provenance и device scale ровно `3.0`.
+Без evidence результат остаётся `UNCERTAIN`.
 
-Acquisition evidence содержит фактические сведения browser runtime, важные для
-воспроизведения rendered PNG: product, protocol version, revision, user agent,
-JavaScript version и источник выбора исполняемого файла (`CHROME_BIN`,
-`CHROMIUM_BIN`, `PATH`, Playwright cache или default `chromiumoxide`). Абсолютный
-путь, профиль браузера и cookies не сохраняются.
+Manifest schema — `5`. Помимо exact SHA-256, размера, формата, lifecycle,
+provenance и semantic decision, каждая запись хранит `consumer_filename`, а весь
+store — `domain_id`. Автоматический `ValidationRecord` и optional
+`HumanAttestation` остаются привязаны к exact identity и SHA. `CORRUPT` нельзя
+подтвердить человеком; новый hash не наследует trust. Замена существующей
+identity требует compare-and-swap по ожидаемому старому hash.
 
-Manifest schema сейчас `4`; schema `3` читается обратно-совместимо, а запись
-обновляет manifest до текущей версии. `human_attestation` не переписывает
-автоматическое решение и действует только для совпадающих identity и content
-hash. `Approve` может изменить технически корректное решение `UNCERTAIN` или
-`REJECTED` на effective `VERIFIED`, только если есть корректный автоматический
-`ValidationRecord` для тех же bytes; `CORRUPT` подтвердить нельзя. `Reject` снимает
-доверие даже с ранее автоматически подтверждённых текущих bytes. Другой SHA-256 не
-наследует решение. Замена bytes для существующей identity требует
-compare-and-swap по ожидаемому старому hash. Kanji-файл публикуется атомарным
-rename из staging; transaction marker и backup в `.tmp/` позволяют при открытии
-store восстановить завершённый manifest commit либо откатить незавершённую
-замену. Чтение остаётся fail-closed: текущий SHA-256 сверяется с manifest до
-использования bytes. У generic hash-suffixed объекта авария до manifest commit
-может оставить проверяемый orphan-файл; он не считается asset без manifest
-записи.
+Schema v3/v4 и прежний плоский Kanji layout читаются. Изменяющий open выполняет
+версионную миграцию под exclusive lock: сохраняет старые bytes через hard link,
+сверяет SHA-256, атомарно обновляет manifest, затем удаляет старые flat links.
+Transaction marker в `.tmp/` позволяет завершить или откатить прерванный переход.
+`ValidationRecord`, `HumanAttestation` и SHA неизменившихся bytes сохраняются;
+повторное получение не требуется. После commit старого и нового canonical пути
+одновременно не остаётся. CLI JSON сообщает `store.layout_migrated_on_open`.
 
-Generic `AssetStore::ingest` сохраняет `Pending` candidate в `.runtime/`; такой
-файл не попадает в tracked corpus. `AssetStore::ingest_verified` держит bytes во
-временном staging и публикует их в canonical `assets/` только после ответа
-`VERIFIED`. `REJECTED`, `UNCERTAIN`, `CORRUPT` и технический сбой не публикуют
-байты в канонический корпус при автоматической публикации. Отдельный
-`attest(Approve)` может перевести технически корректный точный pending/quarantined
-candidate в effective `VERIFIED` только при наличии автоматического
-`ValidationRecord` для того же SHA-256 со статусом, отличным от `CORRUPT`.
-Подтверждение повторно проверяет хеш, размер, формат и полностью декодирует все
-кадры GIF либо PNG; изображения, одобренные человеком, ограничены общим пределом
-8 МиБ. Решение человека не создаёт автоматическое evidence. `attest(Reject)`
-переносит asset из канонического корпуса в локальную runtime quarantine. При
-повторной проверке уже опубликованного asset, который больше не получает
-`VERIFIED`, его байты и запись сначала сохраняются в runtime quarantine, затем
-запись и байты атомарно убираются из tracked corpus.
+`AssetStore::read_verified` остаётся read-only compatibility API с
+`KanjiDomainPolicy`. Consumers других доменов используют
+`read_verified_with_policy`; этот API также читает поддерживаемые legacy v3/v4
+файлы через legacy mapping и возвращает явный `consumer_filename`, но не пишет
+manifest, не создаёт runtime/lock-файлы, не мигрирует layout и не запускает
+recovery. Миграция выполняется только через изменяющий open. Проверяются exact
+bytes, checksum, размер, формат, validator identity и human decision.
 
-Публикуемость можно проверить из корня workspace отдельной read-only командой:
+Общий batch runtime владеет безопасной файловой механикой
+`.runtime/batches/<batch-id>`: `NOFOLLOW`, lock, revision/CAS, atomic state,
+ограниченные reads и content-addressed blobs. Он не знает `KanjiBatch`,
+`KanjiMetrics`, Yarxi evidence или HTML review; эти правила остаются в Kanji
+adapter. Тестовый plain-text state проверяет повторное открытие и чтение blob без
+image/kanji semantics.
+
+Общие Chromium session, executable discovery, runtime provenance, CDP metrics и
+сетевая техническая телеметрия находятся в `browser_runtime.rs`. Yarxi сохраняет
+свои selectors, URLs, TLS policy, фильтры, fallback, dark theme и текущую
+геометрию capture. Общий runtime позволяет задавать отдельный scale factor `3.0`,
+а команда получения изображений из JPDB в `asset-store` отсутствует.
+
+Whitelist для хранения в Git включает `.owner.json` и `manifest.json` каждого
+домена, а также непосредственные пути `assets/gif/*.gif` и `assets/png/*.png`
+внутри kanji root и `assets/png/*.png` внутри pitch-accent root. Каталоги с
+разрешённым расширением и их содержимое исключены из Git; вложенные каталоги,
+другие расширения, `.runtime/`, `.tmp/` и `.lock` тоже исключены. Проверить
+правила можно настоящим `git check-ignore` с помощью отдельного регрессионного
+скрипта:
+
+```bash
+bash tools/asset-store/tests/gitignore_regression.sh
+```
+
+`kanji-corpus-gate` принимает новый nested layout и отклоняет flat,
+hash-suffixed, orphan и незарегистрированные canonical paths. Для других
+publishable domains используется `verify_publishable_corpus_with_policy`; отдельный
+пустой pitch CLI gate не нужен.
+
+Проверить Kanji corpus из корня workspace можно read-only командой:
 
 ```bash
 cargo run --quiet --locked -p asset-store --bin kanji-corpus-gate
 ```
 
-Gate возвращает ненулевой код, если в canonical manifest есть состояние кроме
-`VERIFIED` или решение другого валидатора, если в canonical `assets/` обнаружены
-orphan или незарегистрированные bytes, либо если `.runtime/` не проходит
-структурную проверку или пересекается с публикуемой identity. Проверка ничего не
-меняет и не считает runtime bytes частью
+Gate возвращает ненулевой код при записи кроме effective `VERIFIED`, старом
+layout, неверной domain policy, stale validator, orphan bytes или повреждённом
+runtime состоянии. Проверка ничего не меняет и не считает runtime bytes частью
 canonical corpus.
-
-## Чтение проверенных данных
-
-`AssetStore::read_verified(root, identities, expected_validator)` только читает
-канонические изображения с effective verified trust. Метод не открывает хранилище для изменений, не создаёт
-`.runtime`, блокировочные и временные файлы, не переносит данные между форматами
-и не восстанавливает хранилище. Отсутствие хранилища или идентичности приводит к
-явному отказу. `.runtime` не читается и не служит источником байтов.
-
-API удерживает общую блокировку каталога, согласованную с изменяющими API,
-проверяет маркер владельца и `store_id`, манифест, состояние и статус жизненного
-цикла. При автоматическом доверии сверяются контрольная сумма решения и
-ожидаемая версия валидатора. `Approve` учитывается только при наличии корректного
-`ValidationRecord` для того же точного SHA-256: он может переопределить
-`UNCERTAIN` или `REJECTED`, но не `CORRUPT`; версия автоматического валидатора
-для такого решения не важна. Отсутствующие, устаревшие или некорректные данные
-проверки не проходят проверку manifest. `Reject` запрещает чтение. Затем проверяются
-границы хранилища и целостность. `VerifiedAssetBytes` содержит запись и те же байты, для которых
-после чтения через дескриптор без перехода по символическим ссылкам проверены
-SHA-256, размер и формат. Раздельных шагов проверки пути и последующего чтения
-файла нет. Подмена байтов или символической ссылки внешним процессом после
-проверки манифеста приводит к отказу. Вызывающий код использует эти проверенные
-байты и может закрепить идентичность, имя файла и SHA-256 для следующей операции.
-
-API не получает изображения и не запускает валидатор заново: он проверяет
-сохранённое актуальное решение. Незавершённую транзакцию хранилища должен
-восстановить изменяющий API владельца до успешного чтения данных.
 
 ## Получение с Yarxi
 
@@ -263,11 +242,13 @@ Chrome interstitial «Перейти на сайт» для исходного U
 композитные кадры с учётом GIF disposal; validator проверяет все кадры и берёт
 кадр с наибольшей площадью foreground.
 
-Общий предел размера медиа — `MAX_MEDIA_BYTES` (8 МиБ); batch runtime использует
-тот же предел для байтов кандидатов. При подтверждении человеком читается не
-более предела плюс один байт, чтобы обнаружить превышение без неограниченного
-выделения памяти, затем проверяется целостность и полностью декодируется
-изображение.
+`KanjiImageValidator` и Kanji batch adapter ограничивают изображения 8 МиБ.
+Общий batch runtime задаёт верхний предел 64 МиБ для state и blob, а предметный
+adapter может установить меньший предел. Human approval использует лимит
+текущей domain policy, а при его отсутствии — 8 МиБ. При подтверждении человеком
+читается не более выбранного предела плюс один байт, чтобы обнаружить превышение
+без неограниченного выделения памяти, затем проверяется целостность и полностью
+декодируется изображение.
 
 Основной reference catalog построен из KanjiVG release `r20250816`, commit
 `bd13ffbcc9d85cb86ae98bbbf001d9069220b901`. Исходные Unicode-addressed SVG

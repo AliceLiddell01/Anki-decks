@@ -1,27 +1,24 @@
-//! Browser provider для динамических статей Yarxi и изображений слева от них.
+//! Провайдер браузера для динамических статей Yarxi и изображений слева от них.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::future::Future;
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::browser_runtime::TrackedRequest;
+use crate::browser_runtime::{
+    self, BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor, DeviceMetrics, NetworkOutcome,
+    RetryTrigger, RuntimeSnapshot,
+};
+pub use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
 use base64::Engine as _;
 use chromiumoxide::{
-    Browser, BrowserConfig, Page,
+    Page,
+    cdp::browser_protocol::network::ResourceType,
     cdp::browser_protocol::page::{
-        CaptureScreenshotFormat, EnableParams, GetFrameTreeParams, GetResourceContentParams,
-        GetResourceTreeParams,
+        CaptureScreenshotFormat, GetResourceContentParams, GetResourceTreeParams,
     },
-    cdp::browser_protocol::{
-        emulation::{MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams},
-        network::{
-            EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
-            EventRequestWillBeSent, EventResponseReceived, ResourceType,
-        },
-    },
-    cdp::js_protocol::runtime::{EnableParams as RuntimeEnableParams, EventExceptionThrown},
 };
-use futures::StreamExt;
 use image::{GenericImageView, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,6 +30,8 @@ const PROVIDER_VERSION: &str = "7";
 const SITE_URL: &str = "https://www.yarxi.su/";
 const SITE_HOST: &str = "www.yarxi.su";
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const BROWSER_SETUP_TIMEOUT_MESSAGE: &str =
+    "browser_setup_timeout: истёк срок подготовки сеанса браузера";
 const ITEM_TIMEOUT: Duration = Duration::from_secs(90);
 const TLS_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const BATCH_PACING: Duration = Duration::from_millis(900);
@@ -46,12 +45,8 @@ const CAPTURE_MAX_EDGE_PX: u32 = 220;
 const CAPTURE_LIGHT_GLYPH_MIN_LUMINANCE: f64 = 0.60;
 const YARXI_DARK_THEME_STYLE_ID: &str = "asset-store-yarxi-dark-theme";
 const YARXI_DARK_THEME_STYLE: &str = ":root { color-scheme: dark !important; } #app { color: rgb(var(--w-base-color-rgb)) !important; }";
-const MAX_TRACKED_REQUESTS: usize = 256;
-const MAX_NETWORK_OUTCOMES: usize = 256;
-const MAX_NETWORK_DIAGNOSTIC_ITEMS: usize = 3;
-const MAX_NETWORK_DIAGNOSTIC_PATH_CHARS: usize = 160;
 
-/// Источник bytes и ограниченный набор evidence при работе браузера.
+/// Источник байтов и ограниченный набор свидетельств при работе браузера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionResult {
@@ -61,7 +56,7 @@ pub enum SelectionResult {
 }
 
 /// Явный выбор источника. `PreferredSource` используется по умолчанию;
-/// `RenderedFontSamplePng` предназначен для отдельной приёмки browser-render.
+/// `RenderedFontSamplePng` предназначен для отдельной приёмки рендеринга в браузере.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcquisitionTarget {
@@ -70,7 +65,7 @@ pub enum AcquisitionTarget {
     RenderedFontSamplePng,
 }
 
-/// Полученный оригинальный бинарный asset.
+/// Полученный исходный бинарный файл.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcquiredMedia {
     pub character: String,
@@ -81,7 +76,7 @@ pub struct AcquiredMedia {
     pub evidence: AcquisitionEvidence,
 }
 
-/// Сохраняемое evidence выбора источника без состояния браузера и сеанса.
+/// Сохраняемые свидетельства выбора источника без состояния браузера и сеанса.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcquisitionEvidence {
@@ -108,30 +103,7 @@ fn one_acquisition_attempt() -> u8 {
     1
 }
 
-/// Версия browser runtime, влияющая на raster; локальные пути не сохраняются.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserRuntimeProvenance {
-    pub product: String,
-    pub protocol_version: String,
-    pub revision: String,
-    pub user_agent: String,
-    pub js_version: String,
-    pub executable_source: BrowserExecutableSource,
-}
-
-/// Способ выбора browser executable без сохранения абсолютного пути.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BrowserExecutableSource {
-    ChromeBinEnvironment,
-    ChromiumBinEnvironment,
-    PathLookup,
-    PlaywrightCache,
-    ChromiumoxideDefault,
-}
-
-/// Принятое по явному флагу TLS-исключение для точного host.
+/// Принятое по явному флагу TLS-исключение для точного имени узла.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsExceptionProvenance {
@@ -146,7 +118,7 @@ struct ApprovedTlsException {
     provenance: TlsExceptionProvenance,
 }
 
-/// Evidence PNG, созданного рендерингом видимого DOM-элемента font-sample Yarxi.
+/// Свидетельства для PNG, созданного рендерингом видимого элемента DOM `font-sample` Yarxi.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenderedFontSampleEvidence {
@@ -195,7 +167,7 @@ pub struct CssRect {
     pub height: f64,
 }
 
-/// Чёткое состояние primary GIF для проверки политики и fake-тестов.
+/// Чёткое состояние основного GIF для проверки политики и имитационных тестов.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrimaryGifState {
     PresentLoaded { url: String },
@@ -211,37 +183,6 @@ struct ImageElementState {
     height: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NetworkRequestState {
-    resource_type: ResourceType,
-    url: String,
-    epoch: u64,
-    is_top_level: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NetworkOutcome {
-    resource_type: ResourceType,
-    url: Option<String>,
-    failure_reason: Option<String>,
-    request_id: String,
-    epoch: u64,
-    status_code: Option<u16>,
-    is_top_level: bool,
-}
-
-#[derive(Debug, Default)]
-struct BrowserRuntimeEvidence {
-    relevant_requests: HashMap<String, NetworkRequestState>,
-    network_failures: Vec<NetworkOutcome>,
-    http_errors: Vec<NetworkOutcome>,
-    javascript_exceptions: HashMap<u64, u32>,
-    monitor_failed: bool,
-    main_frame_id: String,
-    active_epoch: u64,
-    next_epoch: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RuntimeReadiness {
     pending_relevant_requests: usize,
@@ -249,174 +190,6 @@ struct RuntimeReadiness {
     http_errors: u32,
     javascript_exceptions: u32,
     monitor_failed: bool,
-}
-
-impl BrowserRuntimeEvidence {
-    fn begin_acquisition(&mut self) -> u64 {
-        self.next_epoch = self.next_epoch.saturating_add(1).max(1);
-        self.active_epoch = self.next_epoch;
-        self.active_epoch
-    }
-
-    fn readiness(&self, epoch: u64, excluded_primary_gif: Option<&str>) -> RuntimeReadiness {
-        RuntimeReadiness {
-            pending_relevant_requests: self
-                .relevant_requests
-                .values()
-                .filter(|request| request_in_scope(request.epoch, epoch))
-                .filter(|request| {
-                    request.resource_type != ResourceType::Image
-                        || Some(request.url.as_str()) != excluded_primary_gif
-                })
-                .count(),
-            network_failures: self
-                .network_failures
-                .iter()
-                .filter(|failure| request_in_scope(failure.epoch, epoch))
-                .filter(|failure| !is_excluded_primary_gif(failure, excluded_primary_gif))
-                .count() as u32,
-            http_errors: self
-                .http_errors
-                .iter()
-                .filter(|failure| request_in_scope(failure.epoch, epoch))
-                .filter(|failure| !is_excluded_primary_gif(failure, excluded_primary_gif))
-                .count() as u32,
-            javascript_exceptions: self.javascript_exceptions_for(epoch),
-            monitor_failed: self.monitor_failed,
-        }
-    }
-
-    fn font_sample_readiness(
-        &self,
-        epoch: u64,
-        selected_image_urls: &HashSet<String>,
-    ) -> RuntimeReadiness {
-        RuntimeReadiness {
-            pending_relevant_requests: self
-                .relevant_requests
-                .values()
-                .filter(|request| request_in_scope(request.epoch, epoch))
-                .filter(|request| {
-                    is_relevant_font_sample_resource(
-                        &request.resource_type,
-                        Some(&request.url),
-                        selected_image_urls,
-                    )
-                })
-                .count(),
-            network_failures: self
-                .network_failures
-                .iter()
-                .filter(|failure| request_in_scope(failure.epoch, epoch))
-                .filter(|failure| {
-                    is_relevant_font_sample_resource(
-                        &failure.resource_type,
-                        failure.url.as_deref(),
-                        selected_image_urls,
-                    )
-                })
-                .count() as u32,
-            http_errors: self
-                .http_errors
-                .iter()
-                .filter(|failure| request_in_scope(failure.epoch, epoch))
-                .filter(|failure| {
-                    is_relevant_font_sample_resource(
-                        &failure.resource_type,
-                        failure.url.as_deref(),
-                        selected_image_urls,
-                    )
-                })
-                .count() as u32,
-            javascript_exceptions: self.javascript_exceptions_for(epoch),
-            monitor_failed: self.monitor_failed,
-        }
-    }
-
-    fn javascript_exceptions_for(&self, epoch: u64) -> u32 {
-        self.javascript_exceptions
-            .get(&0)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(self.javascript_exceptions.get(&epoch).copied().unwrap_or(0))
-    }
-
-    fn record_javascript_exception(&mut self) {
-        let current = self
-            .javascript_exceptions
-            .entry(self.active_epoch)
-            .or_default();
-        *current = current.saturating_add(1);
-        if self.javascript_exceptions.len() > MAX_NETWORK_OUTCOMES {
-            self.monitor_failed = true;
-        }
-    }
-
-    fn retryable_failures_only(&self, epoch: u64) -> bool {
-        self.retryable_failure_state(epoch, true)
-    }
-
-    fn retryable_timeout(&self, epoch: u64) -> bool {
-        self.retryable_failure_state(epoch, false)
-    }
-
-    fn retryable_failure_state(&self, epoch: u64, require_failure: bool) -> bool {
-        let network_failures: Vec<_> = self
-            .network_failures
-            .iter()
-            .filter(|failure| failure.epoch == epoch)
-            .collect();
-        let http_errors: Vec<_> = self
-            .http_errors
-            .iter()
-            .filter(|failure| failure.epoch == epoch)
-            .collect();
-        let bootstrap_failure = self
-            .network_failures
-            .iter()
-            .any(|failure| failure.epoch == 0)
-            || self.http_errors.iter().any(|failure| failure.epoch == 0)
-            || self.javascript_exceptions.get(&0).copied().unwrap_or(0) > 0;
-        !self.monitor_failed
-            && !bootstrap_failure
-            && self.javascript_exceptions.get(&epoch).copied().unwrap_or(0) == 0
-            && (!require_failure || !network_failures.is_empty() || !http_errors.is_empty())
-            && network_failures.iter().all(|failure| {
-                failure
-                    .failure_reason
-                    .as_deref()
-                    .is_some_and(is_retryable_network_error)
-            })
-            && http_errors
-                .iter()
-                .all(|failure| failure.status_code.is_some_and(is_retryable_http_status))
-    }
-}
-
-fn request_in_scope(request_epoch: u64, requested_epoch: u64) -> bool {
-    request_epoch == 0 || request_epoch == requested_epoch
-}
-
-fn is_retryable_http_status(status: u16) -> bool {
-    status == 429 || (500..=599).contains(&status)
-}
-
-fn is_retryable_network_error(reason: &str) -> bool {
-    matches!(
-        reason.trim().to_ascii_uppercase().as_str(),
-        "NET::ERR_TIMED_OUT"
-            | "ERR_TIMED_OUT"
-            | "NET::ERR_CONNECTION_RESET"
-            | "ERR_CONNECTION_RESET"
-            | "NET::ERR_CONNECTION_CLOSED"
-            | "ERR_CONNECTION_CLOSED"
-            | "NET::ERR_CONNECTION_REFUSED"
-            | "ERR_CONNECTION_REFUSED"
-            | "NET::ERR_NETWORK_CHANGED"
-            | "ERR_NETWORK_CHANGED"
-            | "NET::ERR_ABORTED"
-            | "ERR_ABORTED"
-    )
 }
 
 fn is_expected_yarxi_tls_url(raw_url: &str) -> bool {
@@ -440,70 +213,27 @@ fn is_relevant_font_sample_resource(
         || url.is_none_or(|url| url.is_empty() || selected_image_urls.contains(url))
 }
 
-fn is_excluded_primary_gif(outcome: &NetworkOutcome, excluded_primary_gif: Option<&str>) -> bool {
-    outcome.resource_type == ResourceType::Image
-        && outcome
-            .url
-            .as_deref()
-            .is_some_and(|url| Some(url) == excluded_primary_gif)
-}
-
-fn sanitized_network_location(raw_url: &str) -> String {
-    let Ok(url) = Url::parse(raw_url) else {
-        return "<URL не удалось разобрать>".into();
-    };
-    if !matches!(url.scheme(), "http" | "https") || !url.origin().is_tuple() {
-        return format!("<{} resource>", url.scheme());
-    }
-    let raw_path = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
-    let mut path = raw_path
-        .chars()
-        .take(MAX_NETWORK_DIAGNOSTIC_PATH_CHARS)
-        .collect::<String>();
-    if raw_path.chars().count() > MAX_NETWORK_DIAGNOSTIC_PATH_CHARS {
-        path.push('…');
-    }
-    format!("{}{path}", url.origin().ascii_serialization())
-}
-
-fn sanitized_network_failure_reason(raw_reason: &str) -> String {
-    let upper = raw_reason.trim().to_ascii_uppercase();
-    let Some(suffix) = upper.strip_prefix("NET::ERR_") else {
-        return "не классифицированная сетевая ошибка".into();
-    };
-    if suffix.is_empty()
-        || !suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return "не классифицированная сетевая ошибка".into();
-    }
-    format!("net::ERR_{suffix}")
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BrowserEvidenceMonitor {
-    state: Arc<Mutex<BrowserRuntimeEvidence>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    telemetry: CdpRuntimeMonitor,
 }
 
 impl BrowserEvidenceMonitor {
+    fn new(telemetry: CdpRuntimeMonitor) -> Self {
+        Self { telemetry }
+    }
+
     fn begin_acquisition(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .begin_acquisition()
+        self.telemetry.begin_epoch()
     }
 
     fn readiness(&self, epoch: u64, excluded_primary_gif: Option<&str>) -> RuntimeReadiness {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .readiness(epoch, excluded_primary_gif)
+        let snapshot = self.telemetry.snapshot(epoch);
+        readiness_for_snapshot(&snapshot, |resource_type, url| {
+            excluded_primary_gif.is_some_and(|excluded| {
+                resource_type == &ResourceType::Image && url == Some(excluded)
+            })
+        })
     }
 
     fn font_sample_readiness(
@@ -511,22 +241,20 @@ impl BrowserEvidenceMonitor {
         epoch: u64,
         selected_image_urls: &HashSet<String>,
     ) -> RuntimeReadiness {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .font_sample_readiness(epoch, selected_image_urls)
+        let snapshot = self.telemetry.snapshot(epoch);
+        readiness_for_snapshot(&snapshot, |resource_type, url| {
+            !is_relevant_font_sample_resource(resource_type, url, selected_image_urls)
+        })
     }
 
     fn tls_navigation_failure(&self) -> Option<NetworkOutcome> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.telemetry
+            .snapshot(0)
             .network_failures
-            .iter()
+            .into_iter()
             .rev()
             .find(|failure| {
-                failure.epoch == 0
-                    && failure.resource_type == ResourceType::Document
+                failure.resource_type == ResourceType::Document
                     && failure.is_top_level
                     && failure
                         .url
@@ -536,7 +264,6 @@ impl BrowserEvidenceMonitor {
                         reason.eq_ignore_ascii_case("net::ERR_CERT_AUTHORITY_INVALID")
                     })
             })
-            .cloned()
     }
 
     fn clear_explicitly_approved_tls_interstitial_failure(
@@ -544,81 +271,47 @@ impl BrowserEvidenceMonitor {
         request_id: &str,
         blocked_url: &str,
     ) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .network_failures
-            .retain(|failure| {
-                !(failure.epoch == 0
-                    && failure.resource_type == ResourceType::Document
-                    && failure.is_top_level
-                    && failure.request_id == request_id
-                    && failure.url.as_deref() == Some(blocked_url)
-                    && failure.failure_reason.as_deref().is_some_and(|reason| {
-                        reason.eq_ignore_ascii_case("net::ERR_CERT_AUTHORITY_INVALID")
-                    }))
-            });
+        let exact_failure_is_approved =
+            self.telemetry
+                .snapshot(0)
+                .network_failures
+                .iter()
+                .any(|failure| {
+                    failure.resource_type == ResourceType::Document
+                        && failure.is_top_level
+                        && failure.request_id == request_id
+                        && failure.url.as_deref() == Some(blocked_url)
+                        && failure.failure_reason.as_deref().is_some_and(|reason| {
+                            reason.eq_ignore_ascii_case("net::ERR_CERT_AUTHORITY_INVALID")
+                        })
+                });
+        if exact_failure_is_approved {
+            self.telemetry.clear_exact_network_failure(
+                request_id,
+                blocked_url,
+                "net::ERR_CERT_AUTHORITY_INVALID",
+            );
+        }
     }
 
-    fn retryable_failures_only(&self, epoch: u64) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retryable_failures_only(epoch)
-    }
-
-    fn retryable_timeout(&self, epoch: u64) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retryable_timeout(epoch)
-    }
-
-    fn monitor_failed(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .monitor_failed
+    fn retryable_acquisition(&self, epoch: u64, trigger: RetryTrigger) -> bool {
+        self.telemetry.retryable_acquisition(epoch, trigger)
     }
 
     fn network_failure_details(&self, epoch: u64, excluded_primary_gif: Option<&str>) -> String {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let failures: Vec<_> = state
+        let failures: Vec<_> = self
+            .telemetry
+            .snapshot(epoch)
             .network_failures
-            .iter()
-            .filter(|failure| request_in_scope(failure.epoch, epoch))
-            .filter(|failure| !is_excluded_primary_gif(failure, excluded_primary_gif))
-            .collect();
-        if failures.is_empty() {
-            return "нет".into();
-        }
-        let mut details = failures
-            .iter()
-            .take(MAX_NETWORK_DIAGNOSTIC_ITEMS)
-            .map(|failure| {
-                let location = failure
-                    .url
-                    .as_deref()
-                    .map(sanitized_network_location)
-                    .unwrap_or_else(|| "<URL недоступен>".into());
-                let reason = failure
-                    .failure_reason
-                    .as_deref()
-                    .map(sanitized_network_failure_reason)
-                    .unwrap_or_else(|| "не классифицированная сетевая ошибка".into());
-                format!("{:?} {location} {reason}", failure.resource_type)
+            .into_iter()
+            .filter(|failure| {
+                !excluded_primary_gif.is_some_and(|excluded| {
+                    failure.resource_type == ResourceType::Image
+                        && failure.url.as_deref() == Some(excluded)
+                })
             })
-            .collect::<Vec<_>>();
-        if failures.len() > MAX_NETWORK_DIAGNOSTIC_ITEMS {
-            details.push(format!(
-                "ещё сетевых ошибок: {}",
-                failures.len() - MAX_NETWORK_DIAGNOSTIC_ITEMS
-            ));
-        }
-        details.join("; ")
+            .collect();
+        browser_runtime::format_network_failure_details(&failures)
     }
 
     fn font_sample_network_failure_details(
@@ -626,14 +319,11 @@ impl BrowserEvidenceMonitor {
         epoch: u64,
         selected_image_urls: &HashSet<String>,
     ) -> String {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let failures: Vec<_> = state
+        let failures: Vec<_> = self
+            .telemetry
+            .snapshot(epoch)
             .network_failures
-            .iter()
-            .filter(|failure| request_in_scope(failure.epoch, epoch))
+            .into_iter()
             .filter(|failure| {
                 is_relevant_font_sample_resource(
                     &failure.resource_type,
@@ -642,45 +332,36 @@ impl BrowserEvidenceMonitor {
                 )
             })
             .collect();
-        if failures.is_empty() {
-            return "нет".into();
-        }
-        let mut details = failures
-            .iter()
-            .take(MAX_NETWORK_DIAGNOSTIC_ITEMS)
-            .map(|failure| {
-                let location = failure
-                    .url
-                    .as_deref()
-                    .map(sanitized_network_location)
-                    .unwrap_or_else(|| "<URL недоступен>".into());
-                let reason = failure
-                    .failure_reason
-                    .as_deref()
-                    .map(sanitized_network_failure_reason)
-                    .unwrap_or_else(|| "не классифицированная сетевая ошибка".into());
-                format!("{:?} {location} {reason}", failure.resource_type)
-            })
-            .collect::<Vec<_>>();
-        if failures.len() > MAX_NETWORK_DIAGNOSTIC_ITEMS {
-            details.push(format!(
-                "ещё сетевых ошибок: {}",
-                failures.len() - MAX_NETWORK_DIAGNOSTIC_ITEMS
-            ));
-        }
-        details.join("; ")
+        browser_runtime::format_network_failure_details(&failures)
     }
 
     fn abort(&self) {
-        for task in &self.tasks {
-            task.abort();
-        }
+        self.telemetry.abort();
     }
 }
 
-impl Drop for BrowserEvidenceMonitor {
-    fn drop(&mut self) {
-        self.abort();
+fn readiness_for_snapshot(
+    snapshot: &RuntimeSnapshot,
+    mut excluded: impl FnMut(&ResourceType, Option<&str>) -> bool,
+) -> RuntimeReadiness {
+    RuntimeReadiness {
+        pending_relevant_requests: snapshot
+            .pending_requests
+            .iter()
+            .filter(|request| !excluded(&request.resource_type, Some(&request.url)))
+            .count(),
+        network_failures: snapshot
+            .network_failures
+            .iter()
+            .filter(|failure| !excluded(&failure.resource_type, failure.url.as_deref()))
+            .count() as u32,
+        http_errors: snapshot
+            .http_errors
+            .iter()
+            .filter(|failure| !excluded(&failure.resource_type, failure.url.as_deref()))
+            .count() as u32,
+        javascript_exceptions: snapshot.javascript_exceptions,
+        monitor_failed: snapshot.monitor_failed,
     }
 }
 
@@ -722,7 +403,7 @@ fn classify_primary_state(
         }
     } else {
         PrimaryGifState::Unknown {
-            reason: "область информации или media ещё не завершила загрузку и не стабилизировалась"
+            reason: "область информации или медиа ещё не завершила загрузку и не стабилизировалась"
                 .into(),
         }
     }
@@ -760,7 +441,7 @@ enum MediaSourceChoice {
     },
 }
 
-/// Выбирает исходные image bytes или PNG, отрендеренный из точного видимого font-sample.
+/// Выбирает байты исходного изображения или PNG, отрендеренный из точного видимого `font-sample`.
 /// URL Kakijun справа никогда не используется как источник.
 #[cfg(test)]
 fn choose_media_source(
@@ -829,7 +510,7 @@ fn choose_media_source_for_target(
             })
         }
         PrimaryGifState::Unknown { reason } => Err(format!(
-            "gif_unknown: нельзя разрешить image/font-sample fallback: {reason}"
+            "gif_unknown: нельзя выбрать запасное изображение или образец шрифта: {reason}"
         )),
     }
 }
@@ -863,8 +544,8 @@ fn choose_font_sample(
         })
 }
 
-/// Выполняет изолированный browser batch. TLS interstitial можно
-/// пропустить только с явным флагом и только для точного host Yarxi.
+/// Выполняет изолированный пакет браузера. Страницу-предупреждение TLS можно
+/// пропустить только с явным флагом и только для точного имени узла Yarxi.
 pub fn acquire_many(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -876,9 +557,9 @@ pub fn acquire_many(
     )
 }
 
-/// Получает media с явно выбранной политикой источника. Инструменты приёмки
-/// могут запросить PNG из font-sample; обычные вызовы используют [`acquire_many`]
-/// с предпочтением primary GIF.
+/// Получает медиа с явно выбранной политикой источника. Инструменты приёмки
+/// могут запросить PNG из `font-sample`; обычные вызовы используют [`acquire_many`]
+/// с предпочтением основного GIF.
 pub fn acquire_many_with_target(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -887,7 +568,7 @@ pub fn acquire_many_with_target(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|error| format!("среда browser runtime: {error}"))?;
+        .map_err(|error| format!("среда браузера: {error}"))?;
     runtime
         .block_on(async move { acquire_many_async(characters, allow_insecure_tls, target).await })
 }
@@ -906,74 +587,30 @@ async fn acquire_many_async(
     }
 
     let session_deadline = Instant::now() + OPERATION_TIMEOUT;
-    let executable = find_browser_executable();
-    let executable_source = executable
-        .as_ref()
-        .map(|selection| selection.source)
-        .unwrap_or(BrowserExecutableSource::ChromiumoxideDefault);
-    let mut config = BrowserConfig::builder()
-        .incognito()
-        .respect_https_errors()
-        .launch_timeout(Duration::from_secs(30))
-        .request_timeout(Duration::from_secs(30));
-    if let Some(executable) = executable {
-        config = config.chrome_executable(executable.path);
-    }
-    let config = config
-        .build()
-        .map_err(|error| format!("настройка browser: {error}"))?;
-    let (mut browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|error| format!("запуск browser: {error}"))?;
-    let handler_task = tokio::spawn(async move {
-        while let Some(event) = handler.next().await {
-            if event.is_err() {
-                break;
-            }
-        }
-    });
+    let runtime_config = BrowserRuntimeConfig {
+        device_metrics: Some(
+            DeviceMetrics::new(
+                CAPTURE_VIEWPORT_WIDTH,
+                CAPTURE_VIEWPORT_HEIGHT,
+                CAPTURE_DEVICE_SCALE_FACTOR,
+            )
+            .map_err(|error| format!("настройка viewport Yarxi: {error}"))?,
+        ),
+        prefers_color_scheme: Some("dark".into()),
+        ..BrowserRuntimeConfig::default()
+    };
+    let session =
+        run_setup_before_deadline(session_deadline, BrowserSession::launch(runtime_config)).await?;
+    let evidence_monitor = BrowserEvidenceMonitor::new(session.telemetry().clone());
+    let browser_runtime = session.provenance().clone();
 
-    let setup_result = timeout_at(session_deadline, async {
-        let version = browser
-            .version()
-            .await
-            .map_err(|error| format!("CDP Browser.getVersion: {error}"))?;
-        let browser_runtime = BrowserRuntimeProvenance {
-            product: version.product,
-            protocol_version: version.protocol_version,
-            revision: version.revision,
-            user_agent: version.user_agent,
-            js_version: version.js_version,
-            executable_source,
-        };
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(|error| format!("создание browser page: {error}"))?;
-        page.execute(EnableParams::default())
-            .await
-            .map_err(|error| format!("CDP Page.enable: {error}"))?;
-        page.execute(SetDeviceMetricsOverrideParams::new(
-            CAPTURE_VIEWPORT_WIDTH,
-            CAPTURE_VIEWPORT_HEIGHT,
-            CAPTURE_DEVICE_SCALE_FACTOR,
-            false,
-        ))
-        .await
-        .map_err(|error| format!("CDP Emulation.setDeviceMetricsOverride: {error}"))?;
-        page.execute(
-            SetEmulatedMediaParams::builder()
-                .feature(MediaFeature::new("prefers-color-scheme", "dark"))
-                .build(),
-        )
-        .await
-        .map_err(|error| format!("CDP Emulation.setEmulatedMedia: {error}"))?;
-        let evidence_monitor = start_browser_evidence_monitor(&page).await?;
+    let setup_result = run_setup_before_deadline(session_deadline, async {
+        let page = session.page();
         let tls_exception = match page.goto(SITE_URL).await {
             Err(error) => {
                 Some(
                     async_error_or_tls_interstitial(
-                        &page,
+                        page,
                         &evidence_monitor,
                         allow_insecure_tls,
                         error,
@@ -991,7 +628,7 @@ async fn acquire_many_async(
                 if !tls_probe["code"].as_str().unwrap_or_default().is_empty() {
                     Some(
                         async_error_or_tls_interstitial(
-                            &page,
+                            page,
                             &evidence_monitor,
                             allow_insecure_tls,
                             tls_probe["code"].as_str().unwrap_or_default(),
@@ -1012,7 +649,7 @@ async fn acquire_many_async(
         if !site_host {
             return Err("provider_host_mismatch: загрузка ушла с www.yarxi.su".into());
         }
-        wait_until(&page, Duration::from_secs(20), || {
+        wait_until(page, Duration::from_secs(20), || {
             "Boolean([...document.querySelectorAll('.kanji-search-form input[placeholder=\"Чтение\"]')].find(node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden'))"
         })
         .await?;
@@ -1023,19 +660,16 @@ async fn acquire_many_async(
             );
         }
         if target == AcquisitionTarget::RenderedFontSamplePng {
-            apply_dark_theme(&page).await?;
+            apply_dark_theme(page).await?;
         }
-        Ok::<_, String>((page, evidence_monitor, tls_exception, browser_runtime))
+        Ok::<_, String>(tls_exception)
     })
-    .await
-    .map_err(|_| "browser_setup_timeout: истёк срок подготовки сеанса браузера".to_owned())
-    .and_then(|result| result);
+    .await;
 
-    let (page, evidence_monitor, tls_exception, browser_runtime) = match setup_result {
+    let tls_exception = match setup_result {
         Ok(setup) => setup,
         Err(error) => {
-            let _ = timeout_at(Instant::now() + Duration::from_secs(2), browser.close()).await;
-            handler_task.abort();
+            session.close().await;
             return Err(error);
         }
     };
@@ -1055,7 +689,7 @@ async fn acquire_many_async(
             break;
         }
         let (outcome, stop_reason) = acquire_one_with_retries(
-            &page,
+            session.page(),
             character,
             target,
             &evidence_monitor,
@@ -1077,8 +711,7 @@ async fn acquire_many_async(
         }
     }
     evidence_monitor.abort();
-    let _ = timeout_at(Instant::now() + Duration::from_secs(2), browser.close()).await;
-    handler_task.abort();
+    session.close().await;
     Ok(outcomes)
 }
 
@@ -1102,7 +735,7 @@ fn append_batch_stopped_outcomes<T>(
         BatchStopReason::SessionDeadline => {
             "browser_session_deadline: общий срок пакета истёк".to_owned()
         }
-        BatchStopReason::ItemTimeout => "browser_batch_stopped_after_item_timeout: обработка предыдущего символа отменена по timeout; сеанс браузера остановлен, чтобы поздний ответ не изменил страницу".to_owned(),
+        BatchStopReason::ItemTimeout => "browser_batch_stopped_after_item_timeout: обработка предыдущего символа отменена по таймауту; сеанс браузера остановлен, чтобы поздний ответ не изменил страницу".to_owned(),
         BatchStopReason::RetryRecoveryFailed(detail) => format!(
             "browser_batch_stopped_after_retry_recovery_failure: не удалось безопасно восстановить страницу: {detail}"
         ),
@@ -1223,12 +856,16 @@ fn is_retryable_acquisition_error(
     evidence_monitor: &BrowserEvidenceMonitor,
     epoch: u64,
 ) -> bool {
-    !evidence_monitor.monitor_failed()
-        && ((error.starts_with("browser_item_timeout:")
-            && evidence_monitor.retryable_timeout(epoch))
-            || error.starts_with("browser_readiness_timeout:")
-            || (error.starts_with("browser_network_runtime_failure:")
-                && evidence_monitor.retryable_failures_only(epoch)))
+    let trigger = if error.starts_with("browser_item_timeout:") {
+        RetryTrigger::ItemTimeout
+    } else if error.starts_with("browser_readiness_timeout:") {
+        RetryTrigger::ReadinessTimeout
+    } else if error.starts_with("browser_network_runtime_failure:") {
+        RetryTrigger::RuntimeFailure
+    } else {
+        return false;
+    };
+    evidence_monitor.retryable_acquisition(epoch, trigger)
 }
 
 fn should_retry_acquisition(
@@ -1296,277 +933,6 @@ async fn recover_page_for_retry(
         }
         sleep(Duration::from_millis(50)).await;
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BrowserExecutableSelection {
-    path: PathBuf,
-    source: BrowserExecutableSource,
-}
-
-fn find_browser_executable() -> Option<BrowserExecutableSelection> {
-    for (variable, source) in [
-        ("CHROME_BIN", BrowserExecutableSource::ChromeBinEnvironment),
-        (
-            "CHROMIUM_BIN",
-            BrowserExecutableSource::ChromiumBinEnvironment,
-        ),
-    ] {
-        if let Some(path) = std::env::var_os(variable).map(PathBuf::from)
-            && is_executable_file(&path)
-        {
-            return Some(BrowserExecutableSelection { path, source });
-        }
-    }
-    if let Some(path_entries) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&path_entries) {
-            for name in ["chromium", "chromium-browser", "google-chrome", "chrome"] {
-                let path = directory.join(name);
-                if is_executable_file(&path) {
-                    return Some(BrowserExecutableSelection {
-                        path,
-                        source: BrowserExecutableSource::PathLookup,
-                    });
-                }
-            }
-        }
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let cache = home.join(".cache/ms-playwright");
-    let mut candidates = Vec::new();
-    let entries = std::fs::read_dir(cache).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("chromium-") {
-            continue;
-        }
-        candidates.push(entry.path().join("chrome-linux64/chrome"));
-        candidates.push(entry.path().join("chrome-linux/chrome"));
-    }
-    candidates.sort();
-    candidates
-        .into_iter()
-        .find(|path| is_executable_file(path))
-        .map(|path| BrowserExecutableSelection {
-            path,
-            source: BrowserExecutableSource::PlaywrightCache,
-        })
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-async fn start_browser_evidence_monitor(page: &Page) -> Result<BrowserEvidenceMonitor, String> {
-    let main_frame_id = page
-        .execute(GetFrameTreeParams::default())
-        .await
-        .map_err(|error| format!("CDP Page.getFrameTree: {error}"))?
-        .frame_tree
-        .frame
-        .id
-        .as_ref()
-        .to_owned();
-    let request_events = page
-        .event_listener::<EventRequestWillBeSent>()
-        .await
-        .map_err(|error| format!("обработчик CDP Network.requestWillBeSent: {error}"))?;
-    let finished_events = page
-        .event_listener::<EventLoadingFinished>()
-        .await
-        .map_err(|error| format!("обработчик CDP Network.loadingFinished: {error}"))?;
-    let failed_events = page
-        .event_listener::<EventLoadingFailed>()
-        .await
-        .map_err(|error| format!("обработчик CDP Network.loadingFailed: {error}"))?;
-    let response_events = page
-        .event_listener::<EventResponseReceived>()
-        .await
-        .map_err(|error| format!("обработчик CDP Network.responseReceived: {error}"))?;
-    let exception_events = page
-        .event_listener::<EventExceptionThrown>()
-        .await
-        .map_err(|error| format!("обработчик CDP Runtime.exceptionThrown: {error}"))?;
-
-    page.execute(NetworkEnableParams::default())
-        .await
-        .map_err(|error| format!("CDP Network.enable: {error}"))?;
-    page.execute(RuntimeEnableParams::default())
-        .await
-        .map_err(|error| format!("CDP Runtime.enable: {error}"))?;
-
-    let state = Arc::new(Mutex::new(BrowserRuntimeEvidence {
-        main_frame_id,
-        ..BrowserRuntimeEvidence::default()
-    }));
-    let mut tasks = Vec::with_capacity(5);
-
-    {
-        let state = Arc::clone(&state);
-        tasks.push(tokio::spawn(async move {
-            let mut events = request_events;
-            while let Some(event) = events.next().await {
-                let Some(resource_type) = event.r#type.as_ref() else {
-                    mark_monitor_failed(&state);
-                    continue;
-                };
-                if is_relevant_resource_type(resource_type) {
-                    let id = event.request_id.as_ref().to_owned();
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !state.relevant_requests.contains_key(&id)
-                        && state.relevant_requests.len() >= MAX_TRACKED_REQUESTS
-                    {
-                        state.monitor_failed = true;
-                        continue;
-                    }
-                    let epoch = state
-                        .relevant_requests
-                        .get(&id)
-                        .map_or(state.active_epoch, |request| request.epoch);
-                    let is_top_level = event
-                        .frame_id
-                        .as_ref()
-                        .is_some_and(|frame_id| frame_id.as_ref() == state.main_frame_id);
-                    state.relevant_requests.insert(
-                        id.clone(),
-                        NetworkRequestState {
-                            resource_type: resource_type.clone(),
-                            url: event.request.url.clone(),
-                            epoch,
-                            is_top_level,
-                        },
-                    );
-                }
-            }
-            mark_monitor_failed(&state);
-        }));
-    }
-    {
-        let state = Arc::clone(&state);
-        tasks.push(tokio::spawn(async move {
-            let mut events = finished_events;
-            while let Some(event) = events.next().await {
-                let id = event.request_id.as_ref();
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.relevant_requests.remove(id);
-            }
-            mark_monitor_failed(&state);
-        }));
-    }
-    {
-        let state = Arc::clone(&state);
-        tasks.push(tokio::spawn(async move {
-            let mut events = failed_events;
-            while let Some(event) = events.next().await {
-                let id = event.request_id.as_ref();
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let tracked = state.relevant_requests.remove(id);
-                if tracked.is_some() || is_relevant_resource_type(&event.r#type) {
-                    if state.network_failures.len() >= MAX_NETWORK_OUTCOMES {
-                        state.monitor_failed = true;
-                    } else {
-                        let epoch = tracked
-                            .as_ref()
-                            .map_or(state.active_epoch, |request| request.epoch);
-                        let is_top_level =
-                            tracked.as_ref().is_some_and(|request| request.is_top_level);
-                        state.network_failures.push(NetworkOutcome {
-                            resource_type: tracked
-                                .as_ref()
-                                .map(|request| request.resource_type.clone())
-                                .unwrap_or_else(|| event.r#type.clone()),
-                            url: tracked.as_ref().map(|request| request.url.clone()),
-                            failure_reason: Some(event.error_text.clone()),
-                            request_id: id.to_owned(),
-                            epoch,
-                            status_code: None,
-                            is_top_level,
-                        });
-                    }
-                }
-            }
-            mark_monitor_failed(&state);
-        }));
-    }
-    {
-        let state = Arc::clone(&state);
-        tasks.push(tokio::spawn(async move {
-            let mut events = response_events;
-            while let Some(event) = events.next().await {
-                if is_relevant_resource_type(&event.r#type) && event.response.status >= 400 {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.http_errors.len() >= MAX_NETWORK_OUTCOMES {
-                        state.monitor_failed = true;
-                    } else {
-                        let request_id = event.request_id.as_ref().to_owned();
-                        let epoch = state
-                            .relevant_requests
-                            .get(&request_id)
-                            .map_or(state.active_epoch, |request| request.epoch);
-                        let is_top_level = state
-                            .relevant_requests
-                            .get(&request_id)
-                            .is_some_and(|request| request.is_top_level);
-                        state.http_errors.push(NetworkOutcome {
-                            resource_type: event.r#type.clone(),
-                            url: Some(event.response.url.clone()),
-                            failure_reason: None,
-                            request_id,
-                            epoch,
-                            status_code: Some(event.response.status as u16),
-                            is_top_level,
-                        });
-                    }
-                }
-            }
-            mark_monitor_failed(&state);
-        }));
-    }
-    {
-        let state = Arc::clone(&state);
-        tasks.push(tokio::spawn(async move {
-            let mut events = exception_events;
-            while events.next().await.is_some() {
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.record_javascript_exception();
-            }
-            mark_monitor_failed(&state);
-        }));
-    }
-
-    Ok(BrowserEvidenceMonitor { state, tasks })
-}
-
-fn mark_monitor_failed(state: &Mutex<BrowserRuntimeEvidence>) {
-    state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .monitor_failed = true;
-}
-
-fn is_relevant_resource_type(resource_type: &ResourceType) -> bool {
-    matches!(
-        resource_type,
-        ResourceType::Document
-            | ResourceType::Stylesheet
-            | ResourceType::Image
-            | ResourceType::Font
-            | ResourceType::Script
-            | ResourceType::Xhr
-            | ResourceType::Fetch
-    )
 }
 
 async fn apply_dark_theme(page: &Page) -> Result<(), String> {
@@ -1853,7 +1219,7 @@ async fn acquire_one(
         }
     };
     if bytes.is_empty() {
-        return Err("media_empty: browser вернул пустые bytes".into());
+        return Err("media_empty: браузер вернул пустые байты".into());
     }
     let evidence = AcquisitionEvidence {
         provider: PROVIDER_ID.to_owned(),
@@ -2155,7 +1521,7 @@ async fn wait_for_media_snapshot(
                 ));
             }
             return Err(format!(
-                "gif_unknown: область media не достигла завершённого и стабильного состояния; {reason}"
+                "gif_unknown: область медиа не достигла завершённого и стабильного состояния; {reason}"
             ));
         }
         sleep(Duration::from_millis(200)).await;
@@ -2189,7 +1555,7 @@ async fn resource_bytes(page: &Page, resource_url: &str) -> Result<Vec<u8>, Stri
         || url.host_str().is_none()
         || url.host_str().is_some_and(is_kakijun_host)
     {
-        return Err("source_url_rejected: ожидается HTTPS resource, не связанный с Kakijun".into());
+        return Err("source_url_rejected: ожидается HTTPS-ресурс, не связанный с Kakijun".into());
     }
     let tree = page
         .execute(GetResourceTreeParams::default())
@@ -2201,7 +1567,7 @@ async fn resource_bytes(page: &Page, resource_url: &str) -> Result<Vec<u8>, Stri
         .await
         .map_err(|error| format!("CDP Page.getResourceContent: {error}"))?;
     if !content.result.base64_encoded {
-        return Err("media_response_not_binary: browser не сохранил исходные bytes".into());
+        return Err("media_response_not_binary: браузер не сохранил исходные байты".into());
     }
     base64::engine::general_purpose::STANDARD
         .decode(content.result.content)
@@ -2644,9 +2010,9 @@ async fn wait_until(
         let ready: bool = page
             .evaluate(expression())
             .await
-            .map_err(|error| format!("проверка готовности browser: {error}"))?
+            .map_err(|error| format!("проверка готовности браузера: {error}"))?
             .into_value()
-            .map_err(|error| format!("ответ проверки готовности browser: {error}"))?;
+            .map_err(|error| format!("ответ проверки готовности браузера: {error}"))?;
         if ready {
             return Ok(());
         }
@@ -2657,6 +2023,15 @@ async fn wait_until(
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+async fn run_setup_before_deadline<T>(
+    deadline: Instant,
+    setup: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    timeout_at(deadline, setup)
+        .await
+        .unwrap_or_else(|_| Err(BROWSER_SETUP_TIMEOUT_MESSAGE.into()))
 }
 
 #[cfg(test)]
@@ -2771,64 +2146,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn item_runtime_evidence_isolated_by_request_epoch_and_fatal_state_is_global() {
-        let mut state = BrowserRuntimeEvidence::default();
-        let item_a = state.begin_acquisition();
-        state.network_failures.push(test_outcome(
-            ResourceType::Fetch,
-            Some("https://example.test/item-a"),
-            Some("net::ERR_CONNECTION_RESET"),
-            "request-a",
-            item_a,
-            None,
-        ));
-        state.http_errors.push(test_outcome(
-            ResourceType::Xhr,
-            Some("https://example.test/item-a.json"),
-            None,
-            "http-a",
-            item_a,
-            Some(503),
-        ));
-        state.record_javascript_exception();
-
-        let item_b = state.begin_acquisition();
-        assert_eq!(state.readiness(item_a, None).network_failures, 1);
-        assert_eq!(state.readiness(item_a, None).http_errors, 1);
-        assert_eq!(state.readiness(item_a, None).javascript_exceptions, 1);
-        assert_eq!(state.readiness(item_b, None), clean_runtime());
-
-        state.monitor_failed = true;
-        assert!(state.readiness(item_b, None).monitor_failed);
+    fn tracked_request(
+        request_id: &str,
+        resource_type: ResourceType,
+        url: &str,
+        epoch: u64,
+    ) -> TrackedRequest {
+        TrackedRequest {
+            request_id: request_id.to_owned(),
+            resource_type,
+            url: url.to_owned(),
+            epoch,
+            is_top_level: false,
+        }
     }
 
     #[test]
-    fn retry_policy_accepts_only_bounded_transient_network_and_http_classes() {
-        assert!(is_retryable_network_error("net::ERR_TIMED_OUT"));
-        assert!(is_retryable_network_error("net::ERR_ABORTED"));
-        assert!(!is_retryable_network_error("net::ERR_CERT_DATE_INVALID"));
-        assert!(!is_retryable_network_error("details: ERR_CONNECTION_RESET"));
-        assert!(is_retryable_http_status(429));
-        assert!(is_retryable_http_status(503));
-        assert!(!is_retryable_http_status(404));
-
-        let mut state = BrowserRuntimeEvidence::default();
-        let epoch = state.begin_acquisition();
-        state.network_failures.push(test_outcome(
-            ResourceType::Fetch,
-            Some("https://example.test/retry"),
-            Some("net::ERR_CONNECTION_RESET"),
-            "retryable",
-            epoch,
-            None,
-        ));
-        assert!(state.retryable_failures_only(epoch));
-        let monitor = BrowserEvidenceMonitor {
-            state: Arc::new(Mutex::new(state)),
-            tasks: Vec::new(),
-        };
-        assert!(monitor.retryable_timeout(epoch));
+    fn acquisition_retry_requires_transient_runtime_evidence_and_stops_at_attempt_limit() {
+        let epoch = 1;
+        let telemetry = CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot {
+            network_failures: vec![test_outcome(
+                ResourceType::Fetch,
+                Some("https://example.test/retry"),
+                Some("net::ERR_CONNECTION_RESET"),
+                "retryable",
+                epoch,
+                None,
+            )],
+            ..RuntimeSnapshot::default()
+        });
+        let monitor = BrowserEvidenceMonitor::new(telemetry);
         assert!(is_retryable_acquisition_error(
             "browser_item_timeout: ограниченный срок истёк",
             &monitor,
@@ -2846,37 +2193,84 @@ mod tests {
             epoch,
             2,
         ));
-        monitor
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_javascript_exception();
-        assert!(!monitor.retryable_timeout(epoch));
+        assert!(!should_retry_acquisition(
+            "browser_item_timeout: ограниченный срок истёк",
+            &monitor,
+            epoch,
+            2,
+        ));
+    }
+
+    #[test]
+    fn acquisition_retry_preserves_trigger_specific_evidence_rules() {
+        let epoch = 1;
+        let monitor = BrowserEvidenceMonitor::new(CdpRuntimeMonitor::from_snapshot_for_test(
+            RuntimeSnapshot {
+                http_errors: vec![test_outcome(
+                    ResourceType::Fetch,
+                    Some("https://example.test/permanent"),
+                    None,
+                    "permanent",
+                    epoch,
+                    Some(404),
+                )],
+                ..RuntimeSnapshot::default()
+            },
+        ));
+
         assert!(!is_retryable_acquisition_error(
             "browser_item_timeout: ограниченный срок истёк",
             &monitor,
             epoch,
         ));
-        monitor
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .http_errors
-            .push(test_outcome(
-                ResourceType::Fetch,
-                Some("https://example.test/not-retryable"),
-                None,
-                "permanent",
-                epoch,
-                Some(404),
-            ));
-        assert!(
-            !monitor
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retryable_failures_only(epoch)
-        );
+        assert!(is_retryable_acquisition_error(
+            "browser_readiness_timeout: не готова страница",
+            &monitor,
+            epoch,
+        ));
+        assert!(!is_retryable_acquisition_error(
+            "browser_network_runtime_failure: постоянная HTTP-ошибка",
+            &monitor,
+            epoch,
+        ));
+        assert!(!is_retryable_acquisition_error(
+            "browser_network_runtime_failure: нет сетевой ошибки",
+            &monitor,
+            epoch + 1,
+        ));
+        assert!(!is_retryable_acquisition_error(
+            "неповторяемая ошибка",
+            &monitor,
+            epoch,
+        ));
+
+        let clean_monitor = BrowserEvidenceMonitor::new(CdpRuntimeMonitor::from_snapshot_for_test(
+            RuntimeSnapshot::default(),
+        ));
+        assert!(is_retryable_acquisition_error(
+            "browser_item_timeout: ограниченный срок истёк",
+            &clean_monitor,
+            epoch,
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_rejects_work_after_expiry() {
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let result =
+            run_setup_before_deadline(deadline, std::future::pending::<Result<(), String>>()).await;
+
+        assert_eq!(result, Err(BROWSER_SETUP_TIMEOUT_MESSAGE.into()));
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_accepts_work_completed_before_expiry() {
+        let result = run_setup_before_deadline(Instant::now() + Duration::from_secs(1), async {
+            Ok::<_, String>("готово")
+        })
+        .await;
+
+        assert_eq!(result, Ok("готово"));
     }
 
     #[test]
@@ -3120,52 +2514,51 @@ mod tests {
 
     #[test]
     fn explicit_png_target_can_ignore_primary_gif_only_by_exact_image_url() {
-        let mut browser = BrowserRuntimeEvidence::default();
-        browser.relevant_requests.insert(
-            "gif".into(),
-            NetworkRequestState {
-                resource_type: ResourceType::Image,
-                url: "https://example.test/primary.gif".into(),
-                epoch: 0,
-                is_top_level: false,
-            },
-        );
-        browser.relevant_requests.insert(
-            "script".into(),
-            NetworkRequestState {
-                resource_type: ResourceType::Script,
-                url: "https://example.test/article.js".into(),
-                epoch: 0,
-                is_top_level: false,
-            },
-        );
-        browser.network_failures.push(test_outcome(
-            ResourceType::Image,
-            Some("https://example.test/primary.gif"),
-            Some("net::ERR_FAILED"),
-            "gif",
-            0,
-            None,
-        ));
-        browser.http_errors.push(test_outcome(
-            ResourceType::Image,
-            Some("https://example.test/primary.gif"),
-            None,
-            "gif",
-            0,
-            Some(404),
-        ));
-        assert_eq!(browser.readiness(1, None).pending_relevant_requests, 2);
-        let explicit = browser.readiness(1, Some("https://example.test/primary.gif"));
+        let snapshot = RuntimeSnapshot {
+            pending_requests: vec![
+                tracked_request(
+                    "gif",
+                    ResourceType::Image,
+                    "https://example.test/primary.gif",
+                    0,
+                ),
+                tracked_request(
+                    "script",
+                    ResourceType::Script,
+                    "https://example.test/article.js",
+                    0,
+                ),
+            ],
+            network_failures: vec![test_outcome(
+                ResourceType::Image,
+                Some("https://example.test/primary.gif"),
+                Some("net::ERR_FAILED"),
+                "gif",
+                0,
+                None,
+            )],
+            http_errors: vec![test_outcome(
+                ResourceType::Image,
+                Some("https://example.test/primary.gif"),
+                None,
+                "gif",
+                0,
+                Some(404),
+            )],
+            ..RuntimeSnapshot::default()
+        };
+        let all = readiness_for_snapshot(&snapshot, |_, _| false);
+        assert_eq!(all.pending_relevant_requests, 2);
+        let explicit = readiness_for_snapshot(&snapshot, |resource_type, url| {
+            resource_type == &ResourceType::Image && url == Some("https://example.test/primary.gif")
+        });
         assert_eq!(explicit.pending_relevant_requests, 1);
         assert_eq!(explicit.network_failures, 0);
         assert_eq!(explicit.http_errors, 0);
-        assert_eq!(
-            browser
-                .readiness(1, Some("https://example.test/other.gif"))
-                .network_failures,
-            1
-        );
+        let other_primary = readiness_for_snapshot(&snapshot, |resource_type, url| {
+            resource_type == &ResourceType::Image && url == Some("https://example.test/other.gif")
+        });
+        assert_eq!(other_primary.network_failures, 1);
     }
 
     #[test]
@@ -3173,36 +2566,17 @@ mod tests {
         let selected_url = "https://example.test/sample.png";
         let sibling_url = "https://yosida.example/stroke-order.gif";
         let selected_images = HashSet::from([selected_url.to_owned()]);
-        let browser = BrowserRuntimeEvidence {
-            relevant_requests: HashMap::from([
-                (
-                    "selected-image".into(),
-                    NetworkRequestState {
-                        resource_type: ResourceType::Image,
-                        url: selected_url.into(),
-                        epoch: 1,
-                        is_top_level: false,
-                    },
+        let snapshot = RuntimeSnapshot {
+            pending_requests: vec![
+                tracked_request("selected-image", ResourceType::Image, selected_url, 1),
+                tracked_request("sibling-image", ResourceType::Image, sibling_url, 1),
+                tracked_request(
+                    "script",
+                    ResourceType::Script,
+                    "https://example.test/article.js",
+                    1,
                 ),
-                (
-                    "sibling-image".into(),
-                    NetworkRequestState {
-                        resource_type: ResourceType::Image,
-                        url: sibling_url.into(),
-                        epoch: 1,
-                        is_top_level: false,
-                    },
-                ),
-                (
-                    "script".into(),
-                    NetworkRequestState {
-                        resource_type: ResourceType::Script,
-                        url: "https://example.test/article.js".into(),
-                        epoch: 1,
-                        is_top_level: false,
-                    },
-                ),
-            ]),
+            ],
             network_failures: vec![
                 test_outcome(
                     ResourceType::Image,
@@ -3229,10 +2603,12 @@ mod tests {
                     None,
                 ),
             ],
-            ..BrowserRuntimeEvidence::default()
+            ..RuntimeSnapshot::default()
         };
 
-        let readiness = browser.font_sample_readiness(1, &selected_images);
+        let readiness = readiness_for_snapshot(&snapshot, |resource_type, url| {
+            !is_relevant_font_sample_resource(resource_type, url, &selected_images)
+        });
         assert_eq!(readiness.pending_relevant_requests, 2);
         assert_eq!(readiness.network_failures, 2);
         assert_eq!(readiness.http_errors, 0);
@@ -3258,7 +2634,7 @@ mod tests {
             None,
         );
         attacker_failure.is_top_level = true;
-        let browser = BrowserRuntimeEvidence {
+        let telemetry = CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot {
             network_failures: vec![
                 approved_failure,
                 attacker_failure,
@@ -3279,12 +2655,9 @@ mod tests {
                     None,
                 ),
             ],
-            ..BrowserRuntimeEvidence::default()
-        };
-        let monitor = BrowserEvidenceMonitor {
-            state: Arc::new(Mutex::new(browser)),
-            tasks: Vec::new(),
-        };
+            ..RuntimeSnapshot::default()
+        });
+        let monitor = BrowserEvidenceMonitor::new(telemetry);
         assert_eq!(
             monitor
                 .tls_navigation_failure()
@@ -3292,25 +2665,21 @@ mod tests {
             Some("approved-request".into())
         );
         monitor.clear_explicitly_approved_tls_interstitial_failure("approved-request", SITE_URL);
-        let state = monitor
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(state.network_failures.len(), 3);
+        let failures = monitor.telemetry.snapshot(0).network_failures;
+        assert_eq!(failures.len(), 3);
         assert!(
-            state
-                .network_failures
+            failures
                 .iter()
                 .any(|failure| { failure.url.as_deref() == Some("https://attacker.example/") })
         );
-        assert!(state.network_failures.iter().any(|failure| {
+        assert!(failures.iter().any(|failure| {
             failure.failure_reason.as_deref() == Some("net::ERR_CERT_DATE_INVALID")
         }));
     }
 
     #[test]
     fn network_failure_diagnostics_strip_query_fragment_and_credentials() {
-        let browser = BrowserRuntimeEvidence {
+        let telemetry = CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot {
             network_failures: vec![
                 test_outcome(
                     ResourceType::Script,
@@ -3329,12 +2698,9 @@ mod tests {
                     None,
                 ),
             ],
-            ..BrowserRuntimeEvidence::default()
-        };
-        let monitor = BrowserEvidenceMonitor {
-            state: Arc::new(Mutex::new(browser)),
-            tasks: Vec::new(),
-        };
+            ..RuntimeSnapshot::default()
+        });
+        let monitor = BrowserEvidenceMonitor::new(telemetry);
         let details = monitor.network_failure_details(1, None);
         assert!(
             details.contains("Script https://example.test/assets/app.js net::ERR_CONNECTION_RESET")
@@ -3371,18 +2737,14 @@ mod tests {
                 is_top_level: false,
             })
             .collect();
-        let monitor = BrowserEvidenceMonitor {
-            state: Arc::new(Mutex::new(BrowserRuntimeEvidence {
+        let monitor = BrowserEvidenceMonitor::new(CdpRuntimeMonitor::from_snapshot_for_test(
+            RuntimeSnapshot {
                 network_failures: failures,
-                ..BrowserRuntimeEvidence::default()
-            })),
-            tasks: Vec::new(),
-        };
+                ..RuntimeSnapshot::default()
+            },
+        ));
         let details = monitor.network_failure_details(1, None);
-        assert_eq!(
-            details.matches("Fetch ").count(),
-            MAX_NETWORK_DIAGNOSTIC_ITEMS
-        );
+        assert_eq!(details.matches("Fetch ").count(), 3);
         assert!(details.contains("ещё сетевых ошибок: 2"));
         assert!(details.contains("не классифицированная сетевая ошибка"));
         assert!(!details.contains("secret"));
