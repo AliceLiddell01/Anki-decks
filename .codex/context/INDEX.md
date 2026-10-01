@@ -19,12 +19,13 @@
 | `03-VERIFICATION.md` | минимальные проверки JSON и структурных инвариантов после изменения, проверки CI и локальное воспроизведение набора |
 | `tools/anki-repo/README.md` | контракт toolkit `anki-repo`: команды, вывод, exit codes, правила QA, границы записи `edit`/`create`/`retire` и границы статического отчёта `visual-report` |
 | `tools/asset-store/README.md` | единственный публичный контракт program-owned asset store и kanji CLI: filesystem boundary, manifest/lifecycle, `new`/`full`, JSON outcomes и ограничения реализации |
+| `.agents/skills/anki-card-create/` | агентский workflow создания новых карточек и batch карточек в существующей CrowdAnki-колоде: model evidence, configured processors, kanji dependencies, частичный прогресс, human review и отдельная asset-only публикация |
 | `.agents/skills/anki-git-workflow/` | обычная процедура Git/GitHub: branch, staging, commit, push, проверка удалённого состояния, PR, merge |
 | `.agents/skills/anki-coderabbit-review/` | явно запрошенный CodeRabbit review cycle текущего checkout |
 
-Вопросы вне этого каталога — Git/GitHub lifecycle и CodeRabbit review — принадлежат
-repository skills из `.agents/skills/`: маршрутизируй к ним, а не заводи здесь
-второго владельца их процедуры.
+Вопросы вне этого каталога — создание новых карточек, Git/GitHub lifecycle и
+CodeRabbit review — принадлежат repository skills из `.agents/skills/`:
+маршрутизируй к ним, а не заводи здесь второго владельца их процедуры.
 
 ## Инструменты
 

@@ -7,6 +7,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("asset-store currently supports Linux only");
 
+pub mod batch;
 pub mod cli;
 pub mod error;
 pub mod hashing;
@@ -21,12 +22,13 @@ pub mod yarxi;
 
 pub use error::{AssetError, ErrorCode};
 pub use model::{
-    AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, Manifest, Provenance,
-    SemanticDecision, SemanticStatus, ValidationEvidence, ValidationRecord, ValidatorIdentity,
+    AssetIdentity, AssetRecord, DetectedFormat, HumanAttestation, HumanDecision, LifecycleState,
+    Manifest, Provenance, SemanticDecision, SemanticStatus, ValidationEvidence, ValidationRecord,
+    ValidatorIdentity,
 };
 pub use selection::{SelectionMode, select_assets};
 pub use store::{
-    AssetStore, IngestOutcome, IngestRequest, StoreOptions, VerifiedAssetBytes,
-    VerifiedIngestOutcome, VerifiedIngestRequest,
+    AssetStore, HumanAttestationRequest, IngestOutcome, IngestRequest, StoreOptions,
+    VerifiedAssetBytes, VerifiedIngestOutcome, VerifiedIngestRequest,
 };
 pub use validation::{SemanticValidator, ValidationReport, ValidatorFailure};

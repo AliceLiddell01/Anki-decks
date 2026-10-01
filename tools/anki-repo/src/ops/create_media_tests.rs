@@ -4,8 +4,9 @@ use super::*;
 use crate::ops::create::{MAX_REPORTED_NOTES, create_with_options, parse_request_bytes};
 use crate::test_support::{MINIMAL_EXPORT, TempDir};
 use asset_store::{
-    AssetRecord, Provenance, SemanticDecision, SemanticStatus, SemanticValidator, StoreOptions,
-    ValidationEvidence, ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
+    AssetRecord, HumanAttestationRequest, HumanDecision, IngestRequest, Provenance, SelectionMode,
+    SemanticDecision, SemanticStatus, SemanticValidator, StoreOptions, ValidationEvidence,
+    ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
 };
 use serde_json::json;
 use std::fs;
@@ -113,6 +114,8 @@ impl Fixture {
 }
 const GIF: &[u8] = b"GIF89a-synthetic-one";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-synthetic";
+// Полный GIF размером 1×1: human approval проверяет decode, а не одну сигнатуру.
+const DECODABLE_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
 fn policy(uuid: &str, field: &str) -> String {
     format!(
         "schema_version: 1\nnote_models:\n  - crowdanki_uuid: '{uuid}'\n    fields:\n      {field}:\n        processors:\n          - type: kanji_assets\n"
@@ -120,6 +123,231 @@ fn policy(uuid: &str, field: &str) -> String {
 }
 fn reason(error: &DomainError, expected: &str) {
     assert_eq!(error.details["reason"], expected, "{error:?}");
+}
+
+/// Только внутренние тестовые реализации: production YAML не получает новых
+/// processor types ради теста композиции.
+struct TestProcessor<'a> {
+    name: &'static str,
+    filename: &'static str,
+    identity: &'static str,
+    calls: &'a std::cell::RefCell<Vec<&'static str>>,
+}
+impl MediaProcessor for TestProcessor<'_> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn claim(&self, reference: &media::MediaReference) -> Option<AssetIdentity> {
+        self.calls.borrow_mut().push(self.name);
+        (reference.value == self.filename)
+            .then(|| AssetIdentity::new("kanji", self.identity).unwrap())
+    }
+}
+
+#[test]
+fn processor_list_schema_accepts_multiple_definitions_and_duplicate_validation_is_explicit() {
+    let yaml = policy("model-1", "Заголовок").replace(
+        "          - type: kanji_assets",
+        "          - type: kanji_assets\n          - type: kanji_assets",
+    );
+    // Размер списка не является ограничением структуры YAML. Повтор одного
+    // конкретного типа отвергает отдельная предметная проверка до исполнения.
+    let parsed: Policy = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        parsed.note_models[0].fields["Заголовок"].processors.len(),
+        2
+    );
+    let error = Routing::parse(yaml.as_bytes()).unwrap_err();
+    reason(&error, "config_invalid");
+    assert_eq!(
+        error.details["evidence"]["duplicate_processor"],
+        "kanji_assets"
+    );
+
+    let f = Fixture::new();
+    fs::write(f.options.config.as_ref().unwrap(), yaml).unwrap();
+    let before = f.bytes();
+    reason(
+        &f.run(&["<img src=一.gif>"], true).unwrap_err(),
+        "config_invalid",
+    );
+    assert_eq!(before, f.bytes());
+    assert!(!f.export.join("media").exists());
+    assert!(!f.options.asset_store.as_ref().unwrap().exists());
+}
+
+#[test]
+fn configured_empty_processor_chain_is_invalid_even_for_media_free_fields() {
+    let f = Fixture::new();
+    fs::write(
+        f.options.config.as_ref().unwrap(),
+        policy("model-1", "Заголовок").replace(
+            "processors:\n          - type: kanji_assets",
+            "processors: []",
+        ),
+    )
+    .unwrap();
+    reason(&f.run(&["слово"], true).unwrap_err(), "config_invalid");
+    assert!(!f.export.join("media").exists());
+}
+
+#[test]
+fn processor_engine_composes_two_owners_in_configured_order() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let first = TestProcessor {
+        name: "first",
+        filename: "一.gif",
+        identity: "一",
+        calls: &calls,
+    };
+    let second = TestProcessor {
+        name: "second",
+        filename: "二.png",
+        identity: "二",
+        calls: &calls,
+    };
+    let value = "<img src=二.png><img src=一.gif>";
+    let refs = collect_processor_chain(&[&first, &second], 7, "model", "field", value).unwrap();
+    assert_eq!(*calls.borrow(), vec!["first", "first", "second", "second"]);
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0].filename, "二.png");
+    assert_eq!(refs[0].identity, AssetIdentity::new("kanji", "二").unwrap());
+    assert_eq!(refs[1].filename, "一.gif");
+    assert_eq!(refs[1].identity, AssetIdentity::new("kanji", "一").unwrap());
+    assert_eq!(refs[1].note_index, 7);
+    assert_eq!(refs[1].model_uuid, "model");
+    assert_eq!(refs[1].field, "field");
+    calls.borrow_mut().clear();
+    let reversed = collect_processor_chain(&[&second, &first], 7, "model", "field", value).unwrap();
+    assert_eq!(*calls.borrow(), vec!["second", "second", "first", "first"]);
+    assert_eq!(
+        serde_json::to_value(refs).unwrap(),
+        serde_json::to_value(reversed).unwrap()
+    );
+}
+
+#[test]
+fn processor_engine_rejects_conflicting_claims_and_unclaimed_media() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let first = TestProcessor {
+        name: "first",
+        filename: "一.gif",
+        identity: "一",
+        calls: &calls,
+    };
+    let conflict = TestProcessor {
+        name: "conflict",
+        filename: "一.gif",
+        identity: "二",
+        calls: &calls,
+    };
+    let error = collect_processor_chain(
+        &[&first, &conflict],
+        0,
+        "model",
+        "field",
+        "<img src=一.gif>",
+    )
+    .unwrap_err();
+    reason(&error, "media_reference_conflict");
+    assert_eq!(
+        error.details["evidence"]["processors"],
+        json!(["first", "conflict"])
+    );
+    for value in [
+        "<img src=一.gif><img src=三.gif>",
+        "<img src=一.gif>[sound:一.gif]",
+        "<img src=一.gif><style>x{background:url(一.gif)}</style>",
+    ] {
+        reason(
+            &collect_processor_chain(&[&first], 0, "model", "field", value).unwrap_err(),
+            "media_reference_unclaimed",
+        );
+    }
+    reason(
+        &collect_processor_chain(&[], 0, "model", "field", "<img src=一.gif>").unwrap_err(),
+        "media_reference_unclaimed",
+    );
+}
+
+#[test]
+fn create_reads_human_approved_exact_bytes_through_asset_owner_api() {
+    struct NonVerified(SemanticStatus);
+    impl SemanticValidator for NonVerified {
+        fn identity(&self) -> ValidatorIdentity {
+            KanjiImageValidator::validator_identity()
+        }
+        fn validate(
+            &self,
+            _: &AssetRecord,
+            _: &mut dyn Read,
+        ) -> Result<SemanticDecision, ValidatorFailure> {
+            Ok(SemanticDecision::new(
+                self.0,
+                vec![ValidationEvidence {
+                    kind: "synthetic".into(),
+                    summary: "синтетическое спорное semantic решение".into(),
+                    details: None,
+                }],
+            ))
+        }
+    }
+    for status in [SemanticStatus::Uncertain, SemanticStatus::Rejected] {
+        let f = Fixture::new();
+        let root = f.options.asset_store.as_ref().unwrap();
+        let store = AssetStore::open(StoreOptions::new(root.clone())).unwrap();
+        let source = f.temp.path().join("candidate.gif");
+        fs::write(&source, DECODABLE_GIF).unwrap();
+        let identity = AssetIdentity::new("kanji", "一").unwrap();
+        let pending = store
+            .ingest(IngestRequest {
+                identity: identity.clone(),
+                source_path: source,
+                expected_source_sha256: None,
+                domain_metadata: None,
+                replace_expected_sha256: None,
+            })
+            .unwrap();
+        store
+            .validate(SelectionMode::New, &NonVerified(status))
+            .unwrap();
+        assert!(f.run(&["<img src=一.gif>"], false).is_err());
+        let approved = store
+            .attest(HumanAttestationRequest {
+                identity: identity.clone(),
+                expected_sha256: pending.asset.sha256.clone(),
+                decision: HumanDecision::Approve,
+                reason: "пользователь подтвердил точный candidate в review".into(),
+            })
+            .unwrap();
+        assert_eq!(approved.asset.validation.as_ref().unwrap().status, status);
+        assert_eq!(
+            approved.asset.effective_status(),
+            Some(SemanticStatus::Verified)
+        );
+        let verified = AssetStore::read_verified(
+            root,
+            &[identity],
+            &KanjiImageValidator::validator_identity(),
+        )
+        .unwrap();
+        assert_eq!(verified[0].bytes, DECODABLE_GIF);
+        let before = f.bytes();
+        let dry = f.run(&["<img src=一.gif>"], false).unwrap();
+        assert_eq!(dry.media.pins()[0].sha256, pending.asset.sha256);
+        assert_eq!(dry.media.evidence()["mutations_planned"], 1);
+        assert_eq!(before, f.bytes());
+        assert!(!f.export.join("media").exists());
+        let applied = f.run(&["<img src=一.gif>"], true).unwrap();
+        assert_eq!(applied.notes_created, 1);
+        assert_eq!(
+            fs::read(f.export.join("media/一.gif")).unwrap(),
+            DECODABLE_GIF
+        );
+        let repeated = f.run(&["<img src=一.gif>"], true).unwrap();
+        assert_eq!(repeated.notes_already_applied, 1);
+        assert_eq!(repeated.media.mutations, 0);
+    }
 }
 
 #[test]
@@ -339,6 +567,7 @@ fn pending_and_quarantine_are_never_used_as_canonical() {
         .ingest(IngestRequest {
             identity: AssetIdentity::new("kanji", "一").unwrap(),
             source_path: source,
+            expected_source_sha256: None,
             domain_metadata: None,
             replace_expected_sha256: None,
         })

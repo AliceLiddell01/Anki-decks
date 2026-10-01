@@ -63,6 +63,7 @@ fn ingest(
         .ingest(IngestRequest {
             identity: id,
             source_path,
+            expected_source_sha256: None,
             domain_metadata: None,
             replace_expected_sha256: None,
         })
@@ -211,6 +212,7 @@ fn empty_store_reopens_and_explicit_ingest_is_idempotent_with_hash_conflicts() {
         .ingest(IngestRequest {
             identity: identity("item-a"),
             source_path: different.clone(),
+            expected_source_sha256: None,
             domain_metadata: None,
             replace_expected_sha256: None,
         })
@@ -236,6 +238,7 @@ fn empty_store_reopens_and_explicit_ingest_is_idempotent_with_hash_conflicts() {
         .ingest(IngestRequest {
             identity: identity("item-a"),
             source_path: different,
+            expected_source_sha256: None,
             domain_metadata: None,
             replace_expected_sha256: Some(current.sha256.clone()),
         })
@@ -461,6 +464,7 @@ fn pending_replacement_removes_previous_bytes_from_publishable_tree() {
         .ingest(IngestRequest {
             identity: verified.identity.clone(),
             source_path: temp.write("replacement.gif", b"GIF89a unvalidated new bytes"),
+            expected_source_sha256: None,
             domain_metadata: None,
             replace_expected_sha256: Some(verified.sha256.clone()),
         })
