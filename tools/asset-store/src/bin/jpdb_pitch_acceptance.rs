@@ -32,7 +32,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     plan: PathBuf,
 
-    /// Новый каталог HTML-отчёта. Каталог должен быть вне checkout и ещё не существовать.
+    /// Новый каталог HTML-отчёта вне checkout; родительский каталог должен существовать.
     #[arg(long, value_name = "DIR")]
     output: Option<PathBuf>,
 }
@@ -1449,7 +1449,16 @@ mod tests {
         assert_eq!(report_dir, output);
         assert!(!report_dir.starts_with(&checkout));
         assert!(create_report_dir(Some(&output)).is_err());
-        assert!(create_report_dir(Some(&checkout.join(".codex/local/report"))).is_err());
+        let checkout_output = checkout.join(format!(
+            ".jpdb-acceptance-report-{}-{timestamp}",
+            std::process::id()
+        ));
+        assert!(!checkout_output.exists());
+        let error = create_report_dir(Some(&checkout_output))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("отчёт должен находиться вне checkout"));
+        assert!(!checkout_output.exists());
         fs::remove_dir_all(parent).unwrap();
     }
 
