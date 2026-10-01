@@ -28,7 +28,7 @@ Kanji CLI по умолчанию использует `.asset-store/kanji`. С�
 └── pitch-accent/
     ├── .owner.json
     ├── manifest.json
-    ├── assets/png/幽霊.png
+    ├── assets/png/幽霊.png             # consumer_filename:幽霊.pitch.png
     ├── .runtime/
     ├── .tmp/
     └── .lock
@@ -54,14 +54,18 @@ policy не принимают identity другого namespace: `KanjiDomainPo
 
 Kanji GIF и PNG физически разделены по `assets/gif/` и `assets/png/`, при этом
 имя файла — точный символ и расширение. Pitch accent использует ключ surface
-form, а не reading: только PNG может попасть в `assets/png/<surface>.png` и
-consumer получает `<surface>.png`. Reading и положительный JPDB vocabulary ID
+form, а не reading: только PNG попадает в `assets/png/<surface>.png`, а consumer
+получает `<surface>.pitch.png`. Например, внутренняя запись для `飴` хранится как
+`assets/png/飴.png` и публикуется в Anki под именем `飴.pitch.png`; kanji media
+`飴.png` сохраняет прежнее имя. Reading и положительный JPDB vocabulary ID
 хранятся в domain metadata/evidence. Полного PNG decode недостаточно для
-`VERIFIED`: `PitchAccentImageValidator` требует совпадения surface и JPDB source
-URL с тем же vocabulary ID, заполненные reading и число graphs, положительные
-viewport и render dimensions (последние должны совпадать с размерами PNG),
-непустой selector, заполненную browser provenance и device scale ровно `3.0`.
-Без evidence результат остаётся `UNCERTAIN`.
+`VERIFIED`: `PitchAccentImageValidator` проверяет точный match surface и reading
+с формами выбранной JPDB vocabulary entry, фактический detail URL с тем же ID,
+положительное число graph nodes, наблюдаемое состояние dark theme в документе,
+положительные viewport/capture geometry, page scale `1.0`, device scale ровно
+`3.0`, а также соответствие CSS capture rectangle фактическим пикселям PNG.
+Browser provenance обязательна. Evidence старой версии validator не наследует
+доверие новой версии; неполное evidence остаётся `UNCERTAIN`.
 
 Manifest schema — `5`. Помимо exact SHA-256, размера, формата, lifecycle,
 provenance и semantic decision, каждая запись хранит `consumer_filename`, а весь
@@ -96,8 +100,10 @@ image/kanji semantics.
 Общие Chromium session, executable discovery, runtime provenance, CDP metrics и
 сетевая техническая телеметрия находятся в `browser_runtime.rs`. Yarxi сохраняет
 свои selectors, URLs, TLS policy, фильтры, fallback, dark theme и текущую
-геометрию capture. Общий runtime позволяет задавать отдельный scale factor `3.0`,
-а команда получения изображений из JPDB в `asset-store` отсутствует.
+геометрию capture. Общий runtime позволяет задавать отдельный scale factor `3.0`.
+Provider JPDB использует ту же изолированную сессию и не публикует PNG в canonical
+store; полноценный pitch batch lifecycle и интеграция с `anki-repo` остаются
+отдельными возможностями.
 
 Whitelist для хранения в Git включает `.owner.json` и `manifest.json` каждого
 домена, а также непосредственные пути `assets/gif/*.gif` и `assets/png/*.png`
@@ -126,6 +132,57 @@ Gate возвращает ненулевой код при записи кром
 layout, неверной domain policy, stale validator, orphan bytes или повреждённом
 runtime состоянии. Проверка ничего не меняет и не считает runtime bytes частью
 canonical corpus.
+
+## Получение pitch accent с JPDB
+
+`JpdbPitchProvider` работает с обычными JPDB search и vocabulary detail pages.
+Resolver выбирает только vocabulary entries, сверяет точную surface form или
+подтверждённую alternative form и при наличии запроса — точный reading. Выбор
+всегда подтверждается повторно на detail page. Provider использует фактический
+`href` результата, не строит vocabulary URL по входным строкам и возвращает
+`ambiguous_vocabulary`/`vocabulary_not_found` отдельно от технических ошибок.
+
+Для подтверждённой detail page отсутствие pitch возвращается как
+`no_pitch_accent_on_source` только если распознана ожидаемая структура страницы и
+секции Pitch accent нет. Неизвестный или пустой graph DOM, сетевой/JS сбой,
+неподтверждённая dark theme и некорректный capture остаются technical failures.
+Несколько graph nodes снимаются одним native CDP rectangle screenshot при DSF
+`3.0`, без преобразования PNG после capture. Каждая acquisition передаёт готовые
+bytes и `PitchAccentDomainMetadata`, пригодные для `PitchAccentImageValidator`.
+Серии запросов обрабатываются последовательно в одной изолированной session;
+ошибка item не отменяет результаты остальных.
+
+Для ручной live acceptance используйте внешний plan, например:
+
+```json
+{
+  "items": [
+    { "surface": "幽霊" },
+    { "surface": "元気", "reading": "げんき" },
+    { "surface": "美味しい", "reading": "おいしい" },
+    { "surface": "クラブ" },
+    { "surface": "これは存在しない JPDB vocabulary" }
+  ]
+}
+```
+
+Запуск из корня workspace:
+
+```bash
+cargo run --locked -p asset-store --bin jpdb_pitch_acceptance -- \
+  --plan ../jpdb-pitch-plan.json
+```
+
+Без `--output` JSON/HTML report и полученные PNG помещаются в системный temp
+каталог вне checkout. С `--output <DIR>` укажите новый каталог вне checkout.
+Отчёт сохраняет фактические vocabulary ID/detail URL, forms/readings, dark-theme
+DOM proof, graph count, capture geometry, DSF, PNG dimensions, SHA-256 и статус
+semantic validator. Для ambiguity, not found и no-pitch report не создаёт PNG.
+Для surface из reference-набора отчёт сравнивает observed PNG dimensions с
+историческими пользовательскими размерами и помечает `match`, `source_drift`
+или `not_acquired`; это только диагностическая сверка, не production rule.
+Harness не меняет canonical asset store, пользовательские media или `decks/**`;
+live plan и его отчёт остаются локальными.
 
 ## Получение с Yarxi
 

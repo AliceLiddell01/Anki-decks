@@ -50,7 +50,7 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
                 "домен pitch-accent принимает только пространство имён `pitch_accent`",
             ));
         }
-        let filename = format!("{}.png", identity.key);
+        let filename = format!("{}.pitch.png", identity.key);
         validate_safe_consumer_filename(&filename, DetectedFormat::Png)?;
         Ok(())
     }
@@ -73,7 +73,11 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
                 format!("{identity_hash}-{sha256}.{extension}"),
             )
         };
-        let consumer_filename = format!("{}.{extension}", identity.key);
+        let consumer_filename = if format == DetectedFormat::Png {
+            format!("{}.pitch.png", identity.key)
+        } else {
+            format!("{}.{extension}", identity.key)
+        };
         validate_safe_consumer_filename(&consumer_filename, format)?;
         Ok(CanonicalAssetLocation {
             storage_path: format!("assets/{category}/{storage_filename}"),
@@ -128,6 +132,10 @@ pub struct PitchAccentDomainMetadata {
 pub struct PitchAccentEvidence {
     pub provider: PitchAccentProvider,
     pub source_url: String,
+    /// Формы surface, наблюдённые на разрешённой JPDB vocabulary entry.
+    pub resolved_surface_forms: Vec<String>,
+    /// Формы reading, наблюдённые на разрешённой JPDB vocabulary entry.
+    pub resolved_readings: Vec<String>,
     /// Число отдельных pitch graphs, подтверждённых на source странице.
     pub graph_count: u32,
     pub render: PitchAccentRenderEvidence,
@@ -148,6 +156,40 @@ pub enum PitchAccentRenderKind {
     ElementScreenshot,
     SvgElementScreenshot,
     CanvasElementScreenshot,
+    BrowserRegionScreenshot,
+}
+
+/// Один graph, обнаруженный в detail page и включённый в browser capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentGraphEvidence {
+    /// Нулевой индекс в порядке графиков на странице.
+    pub index: u32,
+    /// CSS selector конкретного graph node.
+    pub selector: String,
+}
+
+/// Состояние document и browser media, непосредственно наблюдённое до capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentDarkThemeProof {
+    /// Токены `classList` элемента `document.documentElement`.
+    pub document_element_classes: Vec<String>,
+    /// Наблюдаемый результат `matchMedia('(prefers-color-scheme: dark)').matches`.
+    pub prefers_color_scheme: String,
+    /// Наблюдаемое `getComputedStyle(document.documentElement).colorScheme`.
+    pub computed_color_scheme: String,
+}
+
+/// CSS rectangle, переданный browser capture как native page clip.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentCaptureRect {
+    /// Координаты относительно viewport в CSS pixels.
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// Фактические параметры rendered элемента.
@@ -155,12 +197,19 @@ pub enum PitchAccentRenderKind {
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentRenderEvidence {
     pub kind: PitchAccentRenderKind,
+    /// Selector общего region, который был захвачен одним browser screenshot.
     pub selector: String,
+    /// Наблюдённые graph nodes, попавшие в screenshot, в DOM-порядке.
+    pub graphs: Vec<PitchAccentGraphEvidence>,
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub pixel_width: u32,
     pub pixel_height: u32,
     pub device_scale_factor: f64,
+    /// `visualViewport.scale`; значение должно быть ровно 1.0.
+    pub page_scale_factor: f64,
+    pub dark_theme: PitchAccentDarkThemeProof,
+    pub capture_rect: PitchAccentCaptureRect,
 }
 
 /// Production semantic validator pitch-accent PNG.
@@ -173,7 +222,7 @@ pub struct PitchAccentImageValidator;
 
 impl PitchAccentImageValidator {
     pub const VALIDATOR_ID: &'static str = "jpdb-pitch-accent-render";
-    pub const VALIDATOR_VERSION: &'static str = "2";
+    pub const VALIDATOR_VERSION: &'static str = "3";
     pub const REQUIRED_DEVICE_SCALE_FACTOR: f64 = 3.0;
 
     /// Устойчивая identity validator для manifest и consumer checks.
@@ -307,6 +356,12 @@ fn validate_evidence(
             "URL источника должен быть абсолютным HTTPS-адресом домена jpdb.io".into(),
         ));
     }
+    validate_observed_forms(
+        &evidence.resolved_surface_forms,
+        &metadata.surface,
+        "surface",
+    )?;
+    validate_observed_forms(&evidence.resolved_readings, &metadata.reading, "reading")?;
     if evidence.graph_count == 0 {
         return Err(EvidenceFailure::Incomplete(
             "подтверждение источника не содержит графиков акцента".into(),
@@ -314,9 +369,25 @@ fn validate_evidence(
     }
 
     let render = &evidence.render;
+    if render.kind != PitchAccentRenderKind::BrowserRegionScreenshot {
+        return Err(EvidenceFailure::Incomplete(
+            "pitch graphs должны быть сняты одним native browser region screenshot".into(),
+        ));
+    }
     if render.selector.trim().is_empty() || render.selector.chars().any(char::is_control) {
         return Err(EvidenceFailure::Incomplete(
             "селектор render отсутствует или содержит управляющие символы".into(),
+        ));
+    }
+    if render.graphs.len() != evidence.graph_count as usize
+        || render.graphs.iter().enumerate().any(|(index, graph)| {
+            graph.index != index as u32
+                || graph.selector.trim().is_empty()
+                || graph.selector.chars().any(char::is_control)
+        })
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "список graph selectors не соответствует graph_count и DOM-порядку".into(),
         ));
     }
     if render.viewport_width == 0
@@ -338,6 +409,13 @@ fn validate_evidence(
             "масштаб устройства должен быть ровно 3.0".into(),
         ));
     }
+    if render.page_scale_factor != 1.0 {
+        return Err(EvidenceFailure::Incomplete(
+            "масштаб страницы должен быть ровно 1.0".into(),
+        ));
+    }
+    validate_capture_geometry(render)?;
+    validate_dark_theme(&render.dark_theme)?;
 
     let browser = &evidence.browser;
     if [
@@ -357,27 +435,115 @@ fn validate_evidence(
     Ok(())
 }
 
+fn validate_observed_forms(
+    forms: &[String],
+    expected: &str,
+    label: &str,
+) -> Result<(), EvidenceFailure> {
+    if forms.is_empty()
+        || forms
+            .iter()
+            .any(|form| form.trim().is_empty() || form.chars().any(char::is_control))
+    {
+        return Err(EvidenceFailure::Incomplete(format!(
+            "список разрешённых JPDB {label}-форм пуст или некорректен"
+        )));
+    }
+    if !forms.iter().any(|form| form == expected) {
+        return Err(EvidenceFailure::Contradiction(format!(
+            "metadata {label} отсутствует среди разрешённых JPDB {label}-форм"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dark_theme(proof: &PitchAccentDarkThemeProof) -> Result<(), EvidenceFailure> {
+    if proof
+        .document_element_classes
+        .iter()
+        .any(|class| class.trim().is_empty() || class.chars().any(char::is_control))
+        || proof.prefers_color_scheme.chars().any(char::is_control)
+        || proof.computed_color_scheme.trim().is_empty()
+        || proof.computed_color_scheme.chars().any(char::is_control)
+    {
+        return Err(EvidenceFailure::Incomplete(
+            "наблюдаемое состояние тёмной темы неполно или некорректно".into(),
+        ));
+    }
+    if !proof
+        .document_element_classes
+        .iter()
+        .any(|class| class == "dark-mode")
+        || proof.prefers_color_scheme != "dark"
+    {
+        return Err(EvidenceFailure::Incomplete(
+            "document или browser media не подтверждают активную тёмную тему".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capture_geometry(render: &PitchAccentRenderEvidence) -> Result<(), EvidenceFailure> {
+    let rect = render.capture_rect;
+    if ![rect.x, rect.y, rect.width, rect.height]
+        .iter()
+        .all(|value| value.is_finite())
+        || rect.x < 0.0
+        || rect.y < 0.0
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+    {
+        return Err(EvidenceFailure::Incomplete(
+            "CSS capture rectangle должен содержать конечные положительные размеры и координаты"
+                .into(),
+        ));
+    }
+    // Capture выполняется по viewport-relative DOM geometry. Допуск в один CSS pixel
+    // оставляет место для дробных DOMRect и округления границы браузером.
+    if rect.x + rect.width > f64::from(render.viewport_width) + 1.0
+        || rect.y + rect.height > f64::from(render.viewport_height) + 1.0
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "capture rectangle выходит за пределы viewport".into(),
+        ));
+    }
+    let expected_width = rect.width * render.device_scale_factor;
+    let expected_height = rect.height * render.device_scale_factor;
+    let edge_rounding_tolerance = render.device_scale_factor;
+    if !expected_width.is_finite()
+        || !expected_height.is_finite()
+        || (f64::from(render.pixel_width) - expected_width).abs() > edge_rounding_tolerance
+        || (f64::from(render.pixel_height) - expected_height).abs() > edge_rounding_tolerance
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "PNG dimensions не соответствуют CSS capture rectangle и device scale factor".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn is_jpdb_source_url(value: &str, vocabulary_id: u64) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
-    let has_vocabulary_id = url.path_segments().is_some_and(|segments| {
+    let has_vocabulary_route = url.path_segments().is_some_and(|segments| {
         let segments: Vec<_> = segments.collect();
-        segments
-            .windows(2)
-            .any(|pair| pair[0] == "vocabulary" && pair[1] == vocabulary_id.to_string())
+        (3..=4).contains(&segments.len())
+            && segments[0] == "vocabulary"
+            && segments[1] == vocabulary_id.to_string()
+            && !segments[2].is_empty()
+            && !segments[2].eq_ignore_ascii_case("used-in")
+            && segments.get(3).is_none_or(|reading| {
+                !reading.is_empty() && !reading.eq_ignore_ascii_case("used-in")
+            })
     });
     url.scheme() == "https"
         && url.username().is_empty()
         && url.password().is_none()
-        && has_vocabulary_id
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("jpdb.io")
-                || host
-                    .to_ascii_lowercase()
-                    .strip_suffix(".jpdb.io")
-                    .is_some_and(|prefix| !prefix.is_empty())
-        })
+        && has_vocabulary_route
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("jpdb.io"))
 }
 
 fn validate_hash(hash: &str) -> Result<(), AssetError> {
@@ -454,16 +620,34 @@ mod tests {
             jpdb_vocabulary_id: 123,
             evidence: PitchAccentEvidence {
                 provider: PitchAccentProvider::Jpdb,
-                source_url: "https://jpdb.io/vocabulary/123".into(),
+                source_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい#a".into(),
+                resolved_surface_forms: vec![surface.to_owned()],
+                resolved_readings: vec!["ゆうれい".into()],
                 graph_count: 1,
                 render: PitchAccentRenderEvidence {
-                    kind: PitchAccentRenderKind::ElementScreenshot,
+                    kind: PitchAccentRenderKind::BrowserRegionScreenshot,
                     selector: ".pitch-accent-graph".into(),
+                    graphs: vec![PitchAccentGraphEvidence {
+                        index: 0,
+                        selector: ".pitch-accent-graph".into(),
+                    }],
                     viewport_width: 1280,
                     viewport_height: 900,
                     pixel_width: 2,
                     pixel_height: 2,
                     device_scale_factor: 3.0,
+                    page_scale_factor: 1.0,
+                    dark_theme: PitchAccentDarkThemeProof {
+                        document_element_classes: vec!["dark-mode".into()],
+                        prefers_color_scheme: "dark".into(),
+                        computed_color_scheme: "dark".into(),
+                    },
+                    capture_rect: PitchAccentCaptureRect {
+                        x: 20.0,
+                        y: 30.0,
+                        width: 2.0 / 3.0,
+                        height: 2.0 / 3.0,
+                    },
                 },
                 browser: BrowserRuntimeProvenance {
                     product: "Chrome/140".into(),
@@ -507,24 +691,34 @@ mod tests {
     #[test]
     fn pitch_policy_keeps_surface_filename_and_isolates_unsupported_runtime_formats() {
         let policy = PitchAccentDomainPolicy;
-        let identity = crate::model::AssetIdentity::new("pitch_accent", "幽霊").unwrap();
+        let identity = crate::model::AssetIdentity::new("pitch_accent", "飴").unwrap();
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         let png = policy
             .canonical_location(&identity, hash, DetectedFormat::Png)
             .unwrap();
-        assert_eq!(png.storage_path, "assets/png/幽霊.png");
-        assert_eq!(png.consumer_filename, "幽霊.png");
+        assert_eq!(png.storage_path, "assets/png/飴.png");
+        assert_eq!(png.consumer_filename, "飴.pitch.png");
+
+        let kanji = crate::domain::KanjiDomainPolicy
+            .canonical_location(
+                &crate::model::AssetIdentity::new("kanji", "飴").unwrap(),
+                hash,
+                DetectedFormat::Png,
+            )
+            .unwrap();
+        assert_eq!(kanji.storage_path, "assets/png/飴.png");
+        assert_eq!(kanji.consumer_filename, "飴.png");
 
         let gif = policy
             .canonical_location(&identity, hash, DetectedFormat::Gif)
             .unwrap();
-        let identity_hash = sha256_hex("幽霊".as_bytes());
+        let identity_hash = sha256_hex("飴".as_bytes());
         assert_eq!(
             gif.storage_path,
             format!("assets/unsupported/{identity_hash}-{hash}.gif")
         );
-        assert_eq!(gif.consumer_filename, "幽霊.gif");
+        assert_eq!(gif.consumer_filename, "飴.gif");
         assert_eq!(policy.max_asset_bytes(), Some(PITCH_ACCENT_MAX_ASSET_BYTES));
         assert!(!policy.is_publishable_format(DetectedFormat::Gif));
         assert!(!policy.allows_verified_format(DetectedFormat::Gif));
@@ -540,7 +734,7 @@ mod tests {
         AssetRecord {
             identity: crate::model::AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
             storage_path: "assets/png/幽霊.png".into(),
-            consumer_filename: "幽霊.png".into(),
+            consumer_filename: "幽霊.pitch.png".into(),
             sha256: "0".repeat(64),
             byte_length: 0,
             format: DetectedFormat::Png,
@@ -565,6 +759,7 @@ mod tests {
         let asset = record(Some(metadata));
         let decision = validate(&asset, &valid_png()).unwrap();
 
+        assert_eq!(PitchAccentImageValidator::validator_identity().version, "3");
         assert_eq!(decision.status, SemanticStatus::Verified);
         assert_eq!(
             decision.evidence[0].kind,
@@ -603,6 +798,121 @@ mod tests {
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
             SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.resolved_surface_forms = vec!["元気".into()];
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.resolved_readings = vec!["げんき".into()];
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn source_url_must_be_the_exact_jpdb_vocabulary_detail_route() {
+        for source_url in [
+            "https://subdomain.jpdb.io/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/prefix/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/vocabulary/124/幽霊/ゆうれい",
+            "https://jpdb.io/vocabulary/123/幽霊/used-in",
+            "http://jpdb.io/vocabulary/123/幽霊/ゆうれい",
+        ] {
+            let mut metadata = valid_metadata("幽霊");
+            metadata.evidence.source_url = source_url.into();
+            let asset = record(Some(metadata));
+            assert_eq!(
+                validate(&asset, &valid_png()).unwrap().status,
+                SemanticStatus::Rejected,
+                "source URL must fail closed: {source_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn dark_theme_graph_set_and_native_capture_geometry_are_required() {
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.kind = PitchAccentRenderKind::ElementScreenshot;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata
+            .evidence
+            .render
+            .dark_theme
+            .document_element_classes
+            .clear();
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.dark_theme.prefers_color_scheme = "light".into();
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.page_scale_factor = 1.25;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.capture_rect.width = 2.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.graph_count = 2;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn validator_v3_does_not_trust_legacy_render_metadata() {
+        let mut legacy = serde_json::to_value(valid_metadata("幽霊")).unwrap();
+        let evidence = legacy["evidence"].as_object_mut().unwrap();
+        evidence.remove("resolved_surface_forms");
+        evidence.remove("resolved_readings");
+        let render = evidence["render"].as_object_mut().unwrap();
+        render.remove("graphs");
+        render.remove("page_scale_factor");
+        render.remove("dark_theme");
+        render.remove("capture_rect");
+
+        let mut asset = record(None);
+        asset.domain_metadata = Some(legacy);
+        let decision = validate(&asset, &valid_png()).unwrap();
+
+        assert_eq!(decision.status, SemanticStatus::Uncertain);
+        assert_eq!(
+            decision.evidence[0].kind,
+            "pitch_accent_evidence_incomplete"
         );
     }
 
