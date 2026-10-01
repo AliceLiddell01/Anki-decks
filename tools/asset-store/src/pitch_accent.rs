@@ -33,6 +33,9 @@ pub(crate) const PITCH_ACCENT_CAPTURE_PADDING_CSS_PX: f64 = 8.0;
 /// При DSF 3.0 он ограничивает расхождение одним CSS-пикселем.
 pub(crate) const PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE: f64 = 3.0;
 
+/// Геометрический допуск для согласования DOM, capture clip и сохранённого evidence.
+pub(crate) const PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX: f64 = 0.25;
+
 /// Сравнивает reading JPDB, считая хирагану и катакану эквивалентной записью.
 /// Остальные символы сравниваются буквально; surface form не нормализуется.
 pub fn jpdb_readings_equivalent(left: &str, right: &str) -> bool {
@@ -407,9 +410,17 @@ impl SemanticValidator for PitchAccentImageValidator {
     }
 }
 
-enum EvidenceFailure {
+pub(crate) enum EvidenceFailure {
     Incomplete(String),
     Contradiction(String),
+}
+
+impl EvidenceFailure {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Incomplete(message) | Self::Contradiction(message) => message,
+        }
+    }
 }
 
 fn validate_evidence(
@@ -597,7 +608,9 @@ fn validate_dark_theme(proof: &PitchAccentDarkThemeProof) -> Result<(), Evidence
     Ok(())
 }
 
-fn validate_capture_geometry(render: &PitchAccentRenderEvidence) -> Result<(), EvidenceFailure> {
+pub(crate) fn validate_capture_geometry(
+    render: &PitchAccentRenderEvidence,
+) -> Result<(), EvidenceFailure> {
     if render.coordinate_space != PitchAccentCoordinateSpace::Document {
         return Err(EvidenceFailure::Incomplete(
             "снимок браузера должен явно использовать координаты документа".into(),
@@ -625,7 +638,7 @@ fn validate_capture_geometry(render: &PitchAccentRenderEvidence) -> Result<(), E
         ));
     }
 
-    const GEOMETRY_TOLERANCE: f64 = 0.25;
+    let geometry_tolerance = PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX;
     let mut left = f64::INFINITY;
     let mut top = f64::INFINITY;
     let mut right = f64::NEG_INFINITY;
@@ -633,27 +646,29 @@ fn validate_capture_geometry(render: &PitchAccentRenderEvidence) -> Result<(), E
     for graph in &render.graphs {
         validate_positive_rect(graph.viewport_rect, "график в viewport")?;
         validate_positive_rect(graph.document_rect, "график в координатах документа")?;
-        if graph.viewport_rect.x < -GEOMETRY_TOLERANCE
-            || graph.viewport_rect.y < -GEOMETRY_TOLERANCE
+        if graph.viewport_rect.x < -geometry_tolerance
+            || graph.viewport_rect.y < -geometry_tolerance
             || graph.viewport_rect.x + graph.viewport_rect.width
-                > f64::from(render.viewport_width) + GEOMETRY_TOLERANCE
+                > f64::from(render.viewport_width) + geometry_tolerance
             || graph.viewport_rect.y + graph.viewport_rect.height
-                > f64::from(render.viewport_height) + GEOMETRY_TOLERANCE
+                > f64::from(render.viewport_height) + geometry_tolerance
         {
             return Err(EvidenceFailure::Contradiction(
                 "прямоугольник графика выходит за границы viewport".into(),
             ));
         }
         if (graph.document_rect.x - (graph.viewport_rect.x + render.scroll_x)).abs()
-            > GEOMETRY_TOLERANCE
+            > geometry_tolerance
             || (graph.document_rect.y - (graph.viewport_rect.y + render.scroll_y)).abs()
-                > GEOMETRY_TOLERANCE
-            || graph.document_rect.x < -GEOMETRY_TOLERANCE
-            || graph.document_rect.y < -GEOMETRY_TOLERANCE
+                > geometry_tolerance
+            || (graph.document_rect.width - graph.viewport_rect.width).abs() > geometry_tolerance
+            || (graph.document_rect.height - graph.viewport_rect.height).abs() > geometry_tolerance
+            || graph.document_rect.x < -geometry_tolerance
+            || graph.document_rect.y < -geometry_tolerance
             || graph.document_rect.x + graph.document_rect.width
-                > f64::from(render.document_width) + GEOMETRY_TOLERANCE
+                > f64::from(render.document_width) + geometry_tolerance
             || graph.document_rect.y + graph.document_rect.height
-                > f64::from(render.document_height) + GEOMETRY_TOLERANCE
+                > f64::from(render.document_height) + geometry_tolerance
         {
             return Err(EvidenceFailure::Contradiction(
                 "прямоугольник графика в документе не соответствует viewport и прокрутке".into(),
@@ -672,7 +687,7 @@ fn validate_capture_geometry(render: &PitchAccentRenderEvidence) -> Result<(), E
         height: bottom - top,
     };
     validate_positive_rect(render.graph_union_rect, "объединение графиков")?;
-    if !rects_match(render.graph_union_rect, expected_union, GEOMETRY_TOLERANCE) {
+    if !rects_match(render.graph_union_rect, expected_union, geometry_tolerance) {
         return Err(EvidenceFailure::Contradiction(
             "объединение не соответствует прямоугольникам графиков в координатах документа".into(),
         ));
@@ -701,7 +716,7 @@ fn validate_capture_geometry(render: &PitchAccentRenderEvidence) -> Result<(), E
             .min(f64::from(render.document_height))
             - (expected_union.y - padding).max(0.0),
     };
-    if !rects_match(rect, expected_capture, GEOMETRY_TOLERANCE) {
+    if !rects_match(rect, expected_capture, geometry_tolerance) {
         return Err(EvidenceFailure::Contradiction(
             "область захвата не соответствует объединению графиков с отступом 8 CSS px и границами страницы"
                 .into(),
@@ -720,11 +735,11 @@ fn validate_capture_geometry(render: &PitchAccentRenderEvidence) -> Result<(), E
         actual_padding.left,
     ]
     .iter()
-    .any(|value| *value < -GEOMETRY_TOLERANCE || *value > padding + GEOMETRY_TOLERANCE)
+    .any(|value| *value < -geometry_tolerance || *value > padding + geometry_tolerance)
         || !padding_matches(
             render.actual_capture_padding_css_px,
             actual_padding,
-            GEOMETRY_TOLERANCE,
+            geometry_tolerance,
         )
     {
         return Err(EvidenceFailure::Contradiction(
@@ -787,7 +802,7 @@ fn padding_matches(
         && (actual.left - expected.left).abs() <= tolerance
 }
 
-fn validate_capture_background(
+pub(crate) fn validate_capture_background(
     proof: &PitchAccentDarkThemeProof,
     image: &image::DynamicImage,
 ) -> Result<(), EvidenceFailure> {
@@ -825,7 +840,7 @@ fn validate_capture_background(
     Ok(())
 }
 
-fn relative_luminance(rgb: [u8; 3]) -> f64 {
+pub(crate) fn relative_luminance(rgb: [u8; 3]) -> f64 {
     let linear = rgb.map(|channel| {
         let value = f64::from(channel) / 255.0;
         if value <= 0.04045 {
@@ -1441,6 +1456,15 @@ mod tests {
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
             SemanticStatus::Rejected
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.graphs[0].document_rect.width += 1.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected,
+            "ширина графика в координатах документа должна совпадать с viewport"
         );
     }
 

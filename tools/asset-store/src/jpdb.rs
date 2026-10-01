@@ -27,11 +27,14 @@ use crate::browser_runtime::{
     is_relevant_resource_type,
 };
 use crate::pitch_accent::{
-    PITCH_ACCENT_CAPTURE_PADDING_CSS_PX, PitchAccentCapturePadding, PitchAccentCaptureRect,
-    PitchAccentCoordinateSpace, PitchAccentDarkThemeProof, PitchAccentDomainMetadata,
-    PitchAccentEvidence, PitchAccentGraphEvidence, PitchAccentProvider, PitchAccentRenderEvidence,
-    PitchAccentRenderKind, PitchAccentResolvedForm, capture_pixel_dimensions_match,
-    jpdb_readings_equivalent, parse_jpdb_vocabulary_route,
+    PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX, PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+    PitchAccentCapturePadding, PitchAccentCaptureRect, PitchAccentCoordinateSpace,
+    PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentEvidence,
+    PitchAccentGraphEvidence, PitchAccentProvider, PitchAccentRenderEvidence,
+    PitchAccentRenderKind, PitchAccentResolvedForm, jpdb_readings_equivalent,
+    parse_jpdb_vocabulary_route, relative_luminance as pitch_accent_relative_luminance,
+    validate_capture_background as validate_evidence_capture_background,
+    validate_capture_geometry as validate_evidence_capture_geometry,
 };
 
 const JPDB_ORIGIN: &str = "https://jpdb.io";
@@ -1635,12 +1638,6 @@ async fn inspect_and_capture(
             message: "Фактически отрисованная тема, DOM графиков или геометрия снимка изменились во время снимка экрана".into(),
         });
     }
-    validate_png_background(&image, &second.dark_theme).map_err(|message| {
-        JpdbPitchFailure::DarkThemeUnverified {
-            stage: *stage,
-            message,
-        }
-    })?;
     let post_capture_detail =
         read_detail_snapshot(page, vocabulary_id, JpdbPitchStage::PostCaptureVerification).await?;
     if post_capture_detail.url != detail.url
@@ -1666,22 +1663,6 @@ async fn inspect_and_capture(
             message,
         });
     }
-    if !capture_pixel_dimensions_match(
-        pixel_width,
-        pixel_height,
-        second.capture_rect.width,
-        second.capture_rect.height,
-        CAPTURE_DEVICE_SCALE_FACTOR,
-    ) {
-        return Err(JpdbPitchFailure::CaptureContract {
-            stage: *stage,
-            message: format!(
-                "размер PNG {pixel_width}×{pixel_height} не соответствует области захвата документа {:.3}×{:.3} CSS-пикселей при масштабе 3×",
-                second.capture_rect.width, second.capture_rect.height
-            ),
-        });
-    }
-
     let resolved_forms: Vec<PitchAccentResolvedForm> = resolved
         .iter()
         .map(|form| PitchAccentResolvedForm {
@@ -1733,6 +1714,18 @@ async fn inspect_and_capture(
             browser: browser.clone(),
         },
     };
+    validate_evidence_capture_geometry(&metadata.evidence.render).map_err(|failure| {
+        JpdbPitchFailure::CaptureContract {
+            stage: *stage,
+            message: failure.into_message(),
+        }
+    })?;
+    validate_evidence_capture_background(&metadata.evidence.render.dark_theme, &image).map_err(
+        |failure| JpdbPitchFailure::DarkThemeUnverified {
+            stage: *stage,
+            message: failure.into_message(),
+        },
+    )?;
     Ok(JpdbPitchOutcome::Acquired {
         asset: Box::new(JpdbPitchAcquired { bytes, metadata }),
     })
@@ -1760,7 +1753,7 @@ async fn activate_dark_mode(page: &Page, stage: JpdbPitchStage) -> Result<(), Jp
         .any(|class| class == "dark-mode")
         || state.dark_theme.prefers_color_scheme != "dark"
         || state.dark_theme.computed_color_scheme.trim().is_empty()
-        || relative_luminance(state.dark_theme.background_rgb) > 0.20
+        || pitch_accent_relative_luminance(state.dark_theme.background_rgb) > 0.20
     {
         return Err(JpdbPitchFailure::DarkThemeUnverified {
             stage,
@@ -1769,43 +1762,6 @@ async fn activate_dark_mode(page: &Page, stage: JpdbPitchStage) -> Result<(), Jp
                 state.dark_theme
             ),
         });
-    }
-    Ok(())
-}
-
-fn validate_png_background(
-    image: &image::DynamicImage,
-    proof: &PitchAccentDarkThemeProof,
-) -> Result<(), String> {
-    let (width, height) = image.dimensions();
-    if width == 0 || height == 0 {
-        return Err("PNG не содержит пикселей для проверки наблюдённого фона".into());
-    }
-    let x_mid = width / 2;
-    let y_mid = height / 2;
-    let border_points = [
-        (0, 0),
-        (width - 1, 0),
-        (0, height - 1),
-        (width - 1, height - 1),
-        (x_mid, 0),
-        (x_mid, height - 1),
-        (0, y_mid),
-        (width - 1, y_mid),
-    ];
-    for (x, y) in border_points {
-        let pixel = image.get_pixel(x, y).0;
-        if pixel[3] < 250
-            || pixel[..3]
-                .iter()
-                .zip(proof.background_rgb)
-                .any(|(actual, expected)| actual.abs_diff(expected) > 8)
-        {
-            return Err(format!(
-                "пиксель PNG на границе ({x}, {y}) не совпадает с наблюдённым сплошным фоном {:?}",
-                proof.background_rgb
-            ));
-        }
     }
     Ok(())
 }
@@ -1869,7 +1825,7 @@ async fn capture_snapshot(
         }
     })?;
     if dark_theme.background_selector.trim().is_empty()
-        || relative_luminance(dark_theme.background_rgb) > 0.20
+        || pitch_accent_relative_luminance(dark_theme.background_rgb) > 0.20
     {
         return Err(JpdbPitchFailure::DarkThemeUnverified {
             stage,
@@ -1910,8 +1866,8 @@ fn validate_capture_geometry(
         || snapshot.document_height < snapshot.viewport_height
         || !snapshot.scroll_x.is_finite()
         || !snapshot.scroll_y.is_finite()
-        || snapshot.scroll_x < -0.5
-        || snapshot.scroll_y < -0.5
+        || snapshot.scroll_x < 0.0
+        || snapshot.scroll_y < 0.0
         || snapshot.graphs.is_empty()
         || snapshot.graphs.len() > MAX_GRAPH_COUNT
     {
@@ -1950,19 +1906,27 @@ fn validate_capture_geometry(
         let document = graph.document_rect;
         if graph.selector.trim().is_empty()
             || !valid_rect(viewport, false)
-            || viewport.x < -0.25
-            || viewport.y < -0.25
-            || viewport.x + viewport.width > f64::from(snapshot.viewport_width) + 0.25
-            || viewport.y + viewport.height > f64::from(snapshot.viewport_height) + 0.25
+            || viewport.x < -PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || viewport.y < -PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || viewport.x + viewport.width
+                > f64::from(snapshot.viewport_width)
+                    + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || viewport.y + viewport.height
+                > f64::from(snapshot.viewport_height)
+                    + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
             || !valid_rect(document, true)
-            || document.x < -0.5
-            || document.y < -0.5
-            || document.x + document.width > document_width + 0.5
-            || document.y + document.height > document_height + 0.5
-            || (document.x - (viewport.x + snapshot.scroll_x)).abs() > 0.5
-            || (document.y - (viewport.y + snapshot.scroll_y)).abs() > 0.5
-            || (document.width - viewport.width).abs() > 0.5
-            || (document.height - viewport.height).abs() > 0.5
+            || document.x + document.width
+                > document_width + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || document.y + document.height
+                > document_height + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || (document.x - (viewport.x + snapshot.scroll_x)).abs()
+                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || (document.y - (viewport.y + snapshot.scroll_y)).abs()
+                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || (document.width - viewport.width).abs()
+                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || (document.height - viewport.height).abs()
+                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
         {
             return Err(JpdbPitchFailure::CaptureContract {
                 stage,
@@ -1980,7 +1944,11 @@ fn validate_capture_geometry(
         width: union_right - union_left,
         height: union_bottom - union_top,
     };
-    if !rect_matches(snapshot.graph_union_rect, expected_union, 0.5) {
+    if !rect_matches(
+        snapshot.graph_union_rect,
+        expected_union,
+        PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX,
+    ) {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
             message: "объединение графиков не совпадает с прямоугольниками графиков в координатах документа".into(),
@@ -1993,11 +1961,13 @@ fn validate_capture_geometry(
         document_height,
     );
     if !valid_rect(snapshot.capture_rect, true)
-        || snapshot.capture_rect.x < -0.5
-        || snapshot.capture_rect.y < -0.5
-        || snapshot.capture_rect.x + snapshot.capture_rect.width > document_width + 0.5
-        || snapshot.capture_rect.y + snapshot.capture_rect.height > document_height + 0.5
-        || !rect_matches(snapshot.capture_rect, expected_capture, 0.5)
+        || snapshot.capture_rect.x + snapshot.capture_rect.width > document_width
+        || snapshot.capture_rect.y + snapshot.capture_rect.height > document_height
+        || !rect_matches(
+            snapshot.capture_rect,
+            expected_capture,
+            PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX,
+        )
     {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
@@ -2013,8 +1983,12 @@ fn validate_capture_geometry(
         actual_padding.left,
     ]
     .into_iter()
-    .any(|padding| padding < -0.5 || padding > PITCH_ACCENT_CAPTURE_PADDING_CSS_PX + 0.5)
-    {
+    .any(|padding| {
+        padding < -PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || padding
+                > PITCH_ACCENT_CAPTURE_PADDING_CSS_PX
+                    + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+    }) {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
             message: "прямоугольник снимка не содержит все графики с допустимым отступом".into(),
@@ -2071,18 +2045,6 @@ fn capture_padding(
         bottom: capture.y + capture.height - (union.y + union.height),
         left: union.x - capture.x,
     }
-}
-
-fn relative_luminance(rgb: [u8; 3]) -> f64 {
-    let linear = rgb.map(|channel| {
-        let value = f64::from(channel) / 255.0;
-        if value <= 0.04045 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    });
-    0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
 }
 
 fn build_search_url(surface: &str) -> Result<String, String> {
