@@ -651,7 +651,7 @@ impl PitchAccentBatch {
                 "нельзя отклонить кандидата при незавершённом намерении публикации",
             ));
         }
-        if !item.candidate(candidate_sha256).is_some() {
+        if item.candidate(candidate_sha256).is_none() {
             return Err(invalid("точный SHA кандидата отсутствует в истории пакета"));
         }
         if item
