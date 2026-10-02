@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asset_store::{
     AssetIdentity, AssetStore, BrowserExecutableSource, BrowserRuntimeProvenance, DetectedFormat,
-    ErrorCode, IngestRequest, LifecycleState, PitchAccentCapturePadding, PitchAccentCaptureRect,
-    PitchAccentCoordinateSpace, PitchAccentDarkThemeProof, PitchAccentDomainMetadata,
-    PitchAccentDomainPolicy, PitchAccentEvidence, PitchAccentGraphEvidence,
-    PitchAccentImageValidator, PitchAccentProvider, PitchAccentRenderEvidence,
-    PitchAccentRenderKind, PitchAccentResolvedForm, Provenance, SelectionMode, SemanticDecision,
-    SemanticStatus, SemanticValidator, StoreOptions, ValidationEvidence, ValidatorFailure,
-    ValidatorIdentity, VerifiedIngestRequest,
+    ErrorCode, IngestRequest, LifecycleState, PitchAccentCaptureRect, PitchAccentCoordinateSpace,
+    PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
+    PitchAccentEvidence, PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
+    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm, Provenance,
+    SelectionMode, SemanticDecision, SemanticStatus, SemanticValidator, StoreOptions,
+    ValidationEvidence, ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
 };
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -956,8 +955,8 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
                 document_height: 1800,
                 scroll_x: 0.0,
                 scroll_y: 100.0,
-                pixel_width: 108,
-                pixel_height: 78,
+                pixel_width: 60,
+                pixel_height: 30,
                 device_scale_factor: 3.0,
                 page_scale_factor: 1.0,
                 dark_theme: PitchAccentDarkThemeProof {
@@ -973,18 +972,11 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
                     width: 20.0,
                     height: 10.0,
                 },
-                capture_padding_css_px: 8.0,
-                actual_capture_padding_css_px: PitchAccentCapturePadding {
-                    top: 8.0,
-                    right: 8.0,
-                    bottom: 8.0,
-                    left: 8.0,
-                },
                 capture_rect: PitchAccentCaptureRect {
-                    x: 92.0,
-                    y: 192.0,
-                    width: 36.0,
-                    height: 26.0,
+                    x: 100.0,
+                    y: 200.0,
+                    width: 20.0,
+                    height: 10.0,
                 },
             },
             browser: BrowserRuntimeProvenance {
@@ -1137,7 +1129,10 @@ fn wrong_domain_schema_v5_open_does_not_create_runtime_or_poison_owner() {
 }
 
 fn pitch_accent_contract_png() -> Vec<u8> {
-    let image = image::RgbaImage::from_pixel(108, 78, image::Rgba([24, 36, 48, 255]));
+    let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
+    for x in 10..50 {
+        image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
+    }
     let mut output = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image)
         .write_to(&mut output, image::ImageFormat::Png)

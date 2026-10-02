@@ -20,6 +20,9 @@ pub mod kanji_mask;
 pub mod kanji_validator;
 pub mod model;
 pub mod pitch_accent;
+pub mod pitch_batch;
+pub mod pitch_cli;
+pub mod pitch_review;
 pub mod selection;
 pub mod store;
 pub mod validation;
@@ -28,6 +31,10 @@ pub mod yarxi;
 #[cfg(test)]
 #[path = "batch_runtime_tests.rs"]
 mod batch_runtime_tests;
+
+#[cfg(test)]
+#[path = "pitch_batch_tests.rs"]
+mod pitch_batch_tests;
 
 pub use browser_runtime::{
     BrowserExecutableSelection, BrowserExecutableSource, BrowserRuntimeConfig,
@@ -44,9 +51,9 @@ pub use model::{
     ValidatorIdentity,
 };
 pub use pitch_accent::{
-    PitchAccentCapturePadding, PitchAccentCaptureRect, PitchAccentCoordinateSpace,
-    PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
-    PitchAccentEvidence, PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
+    PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
+    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
+    PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
     PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
 };
 pub use selection::{SelectionMode, select_assets};

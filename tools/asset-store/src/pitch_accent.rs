@@ -1,4 +1,4 @@
-//! Предметная policy и fail-closed semantic validator для pitch-accent PNG.
+//! Предметные правила и семантическая проверка pitch-accent PNG с отказом при неполных данных.
 
 use std::io::{Cursor, Read};
 
@@ -25,9 +25,6 @@ use crate::validation::{SemanticValidator, ValidatorFailure};
 /// Лимит оставляет запас для PNG-снимка элемента при масштабе 3×, сохраняя
 /// конечную границу для недоверенного входного потока.
 pub(crate) const PITCH_ACCENT_MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Требуемый отступ между объединением графиков и границей browser capture.
-pub(crate) const PITCH_ACCENT_CAPTURE_PADDING_CSS_PX: f64 = 8.0;
 
 /// Допуск размеров PNG из-за округления границ нативного CDP capture clip.
 /// При DSF 3.0 он ограничивает расхождение одним CSS-пикселем.
@@ -70,11 +67,15 @@ pub(crate) fn capture_pixel_dimensions_match(
             <= PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE
 }
 
-/// Верхняя граница размеров PNG с запасом для снимка элемента при масштабе 3×.
-const PITCH_ACCENT_MAX_IMAGE_DIMENSION: u32 = 4096;
+/// Верхняя граница ширины и высоты PNG pitch-accent.
+pub const PITCH_ACCENT_MAX_IMAGE_DIMENSION: u32 = 4096;
 
-/// Ограничивает память, нужную для декодирования распакованных пикселей и кадров.
-const PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES: u64 = 48 * 1024 * 1024;
+/// Предельный объём памяти для декодирования PNG pitch-accent.
+pub const PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES: u64 = 48 * 1024 * 1024;
+
+const PITCH_ACCENT_BACKGROUND_RGB_TOLERANCE: u8 = 8;
+const PITCH_ACCENT_GRAPH_PIXEL_MIN_RGB_DIFFERENCE: u8 = 16;
+const PITCH_ACCENT_MIN_CONTRASTING_GRAPH_PIXELS: usize = 8;
 
 /// Независимая политика публикации канонического PNG pitch-accent.
 #[derive(Debug, Clone, Copy, Default)]
@@ -224,7 +225,7 @@ pub struct PitchAccentGraphEvidence {
     pub document_rect: PitchAccentCaptureRect,
 }
 
-/// Состояние документа и browser media, непосредственно наблюдённое перед захватом.
+/// Состояние документа и цветовая схема браузера, наблюдённые перед снимком.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentDarkThemeProof {
@@ -236,7 +237,7 @@ pub struct PitchAccentDarkThemeProof {
     pub computed_color_scheme: String,
     /// CSS-селектор реально наблюдённого сплошного фона области pitch accent или её предка.
     pub background_selector: String,
-    /// RGB непрозрачного вычисленного фона, совпадающего с фоном по краям снимка.
+    /// RGB вычисленного фона; один пиксель должен совпасть с допуском ±8 на каждый канал.
     pub background_rgb: [u8; 3],
 }
 
@@ -250,16 +251,6 @@ pub struct PitchAccentCaptureRect {
     pub y: f64,
     pub width: f64,
     pub height: f64,
-}
-
-/// Остаточные отступы между объединением графиков и областью снимка после ограничения страницей.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PitchAccentCapturePadding {
-    pub top: f64,
-    pub right: f64,
-    pub bottom: f64,
-    pub left: f64,
 }
 
 /// Координатная система снимка, зафиксированная в свидетельствах.
@@ -296,10 +287,6 @@ pub struct PitchAccentRenderEvidence {
     pub dark_theme: PitchAccentDarkThemeProof,
     /// Объединение фактических прямоугольников узлов графиков в координатах документа.
     pub graph_union_rect: PitchAccentCaptureRect,
-    /// Запрошенный отступ с каждой стороны до ограничения границами документа.
-    pub capture_padding_css_px: f64,
-    /// Фактический отступ с каждой стороны после ограничения границами документа.
-    pub actual_capture_padding_css_px: PitchAccentCapturePadding,
     /// Итоговая область в координатах документа, переданная браузеру для снимка.
     pub capture_rect: PitchAccentCaptureRect,
 }
@@ -314,10 +301,10 @@ pub struct PitchAccentImageValidator;
 
 impl PitchAccentImageValidator {
     pub const VALIDATOR_ID: &'static str = "jpdb-pitch-accent-render";
-    pub const VALIDATOR_VERSION: &'static str = "4";
+    pub const VALIDATOR_VERSION: &'static str = "5";
     pub const REQUIRED_DEVICE_SCALE_FACTOR: f64 = 3.0;
 
-    /// Устойчивый идентификатор validator-а для manifest и проверок consumer-а.
+    /// Устойчивый идентификатор валидатора для manifest и проверок потребителя.
     pub fn validator_identity() -> ValidatorIdentity {
         Self.identity()
     }
@@ -627,11 +614,6 @@ pub(crate) fn validate_capture_geometry(
             "значения прокрутки документа должны быть конечными и неотрицательными".into(),
         ));
     }
-    if (render.capture_padding_css_px - PITCH_ACCENT_CAPTURE_PADDING_CSS_PX).abs() > 0.001 {
-        return Err(EvidenceFailure::Contradiction(
-            "отступ захвата не совпадает с требуемыми 8 CSS-пикселями".into(),
-        ));
-    }
     if render.graphs.is_empty() {
         return Err(EvidenceFailure::Incomplete(
             "свидетельства захвата не содержат прямоугольников графиков".into(),
@@ -644,7 +626,7 @@ pub(crate) fn validate_capture_geometry(
     let mut right = f64::NEG_INFINITY;
     let mut bottom = f64::NEG_INFINITY;
     for graph in &render.graphs {
-        validate_positive_rect(graph.viewport_rect, "график в viewport")?;
+        validate_positive_rect(graph.viewport_rect, "график в области просмотра")?;
         validate_positive_rect(graph.document_rect, "график в координатах документа")?;
         if graph.viewport_rect.x < -geometry_tolerance
             || graph.viewport_rect.y < -geometry_tolerance
@@ -694,57 +676,20 @@ pub(crate) fn validate_capture_geometry(
     }
 
     let rect = render.capture_rect;
-    validate_positive_rect(rect, "capture")?;
+    validate_positive_rect(rect, "снимок")?;
     if rect.x < 0.0
         || rect.y < 0.0
         || rect.x + rect.width > f64::from(render.document_width)
         || rect.y + rect.height > f64::from(render.document_height)
     {
         return Err(EvidenceFailure::Contradiction(
-            "область захвата выходит за пределы страницы документа".into(),
+            "область снимка выходит за пределы страницы документа".into(),
         ));
     }
 
-    let padding = render.capture_padding_css_px;
-    let expected_capture = PitchAccentCaptureRect {
-        x: (expected_union.x - padding).max(0.0),
-        y: (expected_union.y - padding).max(0.0),
-        width: (expected_union.x + expected_union.width + padding)
-            .min(f64::from(render.document_width))
-            - (expected_union.x - padding).max(0.0),
-        height: (expected_union.y + expected_union.height + padding)
-            .min(f64::from(render.document_height))
-            - (expected_union.y - padding).max(0.0),
-    };
-    if !rects_match(rect, expected_capture, geometry_tolerance) {
+    if !rects_match(rect, expected_union, geometry_tolerance) {
         return Err(EvidenceFailure::Contradiction(
-            "область захвата не соответствует объединению графиков с отступом 8 CSS px и границами страницы"
-                .into(),
-        ));
-    }
-    let actual_padding = PitchAccentCapturePadding {
-        top: expected_union.y - rect.y,
-        right: rect.x + rect.width - (expected_union.x + expected_union.width),
-        bottom: rect.y + rect.height - (expected_union.y + expected_union.height),
-        left: expected_union.x - rect.x,
-    };
-    if [
-        actual_padding.top,
-        actual_padding.right,
-        actual_padding.bottom,
-        actual_padding.left,
-    ]
-    .iter()
-    .any(|value| *value < -geometry_tolerance || *value > padding + geometry_tolerance)
-        || !padding_matches(
-            render.actual_capture_padding_css_px,
-            actual_padding,
-            geometry_tolerance,
-        )
-    {
-        return Err(EvidenceFailure::Contradiction(
-            "указанные фактические отступы не совпадают с расстояниями вокруг объединения графиков"
-                .into(),
+            "область снимка должна точно совпадать с объединением прямоугольников графиков".into(),
         ));
     }
 
@@ -756,7 +701,7 @@ pub(crate) fn validate_capture_geometry(
         render.device_scale_factor,
     ) {
         return Err(EvidenceFailure::Contradiction(
-            "размеры PNG не соответствуют области захвата в CSS-пикселях и масштабу устройства"
+            "размеры PNG не соответствуют области снимка в CSS-пикселях и масштабу устройства"
                 .into(),
         ));
     }
@@ -774,7 +719,7 @@ fn validate_positive_rect(
         || rect.height <= 0.0
     {
         return Err(EvidenceFailure::Incomplete(format!(
-            "{label} rectangle должен содержать конечные положительные размеры"
+            "{label}: прямоугольник должен иметь конечные положительные размеры"
         )));
     }
     Ok(())
@@ -791,17 +736,6 @@ fn rects_match(
         && (actual.height - expected.height).abs() <= tolerance
 }
 
-fn padding_matches(
-    actual: PitchAccentCapturePadding,
-    expected: PitchAccentCapturePadding,
-    tolerance: f64,
-) -> bool {
-    (actual.top - expected.top).abs() <= tolerance
-        && (actual.right - expected.right).abs() <= tolerance
-        && (actual.bottom - expected.bottom).abs() <= tolerance
-        && (actual.left - expected.left).abs() <= tolerance
-}
-
 pub(crate) fn validate_capture_background(
     proof: &PitchAccentDarkThemeProof,
     image: &image::DynamicImage,
@@ -812,30 +746,43 @@ pub(crate) fn validate_capture_background(
             "в PNG нет пикселей для проверки сплошного фона".into(),
         ));
     }
-    let x_mid = width / 2;
-    let y_mid = height / 2;
-    let points = [
-        (0, 0),
-        (width - 1, 0),
-        (0, height - 1),
-        (width - 1, height - 1),
-        (x_mid, 0),
-        (x_mid, height - 1),
-        (0, y_mid),
-        (width - 1, y_mid),
-    ];
-    for (x, y) in points {
-        let pixel = image.get_pixel(x, y).0;
-        if pixel[3] < 250
-            || pixel[..3]
+    let mut matching_background_pixels = 0usize;
+    let mut contrasting_graph_pixels = 0usize;
+    // Проверяется сам снимок: искусственная рамка вокруг графика не требуется.
+    // В области графика JPDB могут присутствовать и тёмный фон, и линии графика.
+    for pixel in image.pixels().map(|(_, _, pixel)| pixel.0) {
+        if pixel[3] != 255 {
+            return Err(EvidenceFailure::Contradiction(
+                "в области графиков найден пиксель, который не является полностью непрозрачным"
+                    .into(),
+            ));
+        }
+        let matches_background =
+            pixel[..3]
                 .iter()
                 .zip(proof.background_rgb)
-                .any(|(actual, expected)| actual.abs_diff(expected) > 8)
-        {
-            return Err(EvidenceFailure::Contradiction(format!(
-                "пиксель PNG на границе ({x}, {y}) не совпадает с наблюдённым RGB сплошного фона"
-            )));
+                .all(|(actual, expected)| {
+                    actual.abs_diff(expected) <= PITCH_ACCENT_BACKGROUND_RGB_TOLERANCE
+                });
+        if matches_background {
+            matching_background_pixels += 1;
         }
+        if pixel[..3]
+            .iter()
+            .zip(proof.background_rgb)
+            .any(|(actual, expected)| {
+                actual.abs_diff(expected) > PITCH_ACCENT_GRAPH_PIXEL_MIN_RGB_DIFFERENCE
+            })
+        {
+            contrasting_graph_pixels += 1;
+        }
+    }
+    if matching_background_pixels == 0
+        || contrasting_graph_pixels < PITCH_ACCENT_MIN_CONTRASTING_GRAPH_PIXELS
+    {
+        return Err(EvidenceFailure::Contradiction(format!(
+            "PNG должен содержать наблюдённый фон и не менее {PITCH_ACCENT_MIN_CONTRASTING_GRAPH_PIXELS} контрастных пикселей графика"
+        )));
     }
     Ok(())
 }
@@ -1062,8 +1009,8 @@ mod tests {
                     document_height: 1800,
                     scroll_x: 0.0,
                     scroll_y: 100.0,
-                    pixel_width: 108,
-                    pixel_height: 78,
+                    pixel_width: 60,
+                    pixel_height: 30,
                     device_scale_factor: 3.0,
                     page_scale_factor: 1.0,
                     dark_theme: PitchAccentDarkThemeProof {
@@ -1079,18 +1026,11 @@ mod tests {
                         width: 20.0,
                         height: 10.0,
                     },
-                    capture_padding_css_px: PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
-                    actual_capture_padding_css_px: PitchAccentCapturePadding {
-                        top: 8.0,
-                        right: 8.0,
-                        bottom: 8.0,
-                        left: 8.0,
-                    },
                     capture_rect: PitchAccentCaptureRect {
-                        x: 92.0,
-                        y: 192.0,
-                        width: 36.0,
-                        height: 26.0,
+                        x: 100.0,
+                        y: 200.0,
+                        width: 20.0,
+                        height: 10.0,
                     },
                 },
                 browser: BrowserRuntimeProvenance {
@@ -1106,7 +1046,10 @@ mod tests {
     }
 
     fn valid_png() -> Vec<u8> {
-        let image = image::RgbaImage::from_pixel(108, 78, image::Rgba([24, 36, 48, 255]));
+        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
+        for x in 10..50 {
+            image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
+        }
         let mut output = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut output, image::ImageFormat::Png)
@@ -1115,7 +1058,12 @@ mod tests {
     }
 
     fn rgb_png(width: u32, height: u32) -> Vec<u8> {
-        let image = image::RgbImage::from_pixel(width, height, image::Rgb([24, 36, 48]));
+        let mut image = image::RgbImage::from_pixel(width, height, image::Rgb([24, 36, 48]));
+        if width > 0 && height > 0 {
+            for x in (width / 4)..((width * 3 / 4).max(1)) {
+                image.put_pixel(x, height / 2, image::Rgb([235, 235, 235]));
+            }
+        }
         let mut output = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(image)
             .write_to(&mut output, image::ImageFormat::Png)
@@ -1212,7 +1160,7 @@ mod tests {
         let asset = record(Some(metadata));
         let decision = validate(&asset, &valid_png()).unwrap();
 
-        assert_eq!(PitchAccentImageValidator::validator_identity().version, "4");
+        assert_eq!(PitchAccentImageValidator::validator_identity().version, "5");
         assert_eq!(decision.status, SemanticStatus::Verified);
         assert_eq!(
             decision.evidence[0].kind,
@@ -1415,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn validator_v4_does_not_trust_legacy_render_metadata() {
+    fn validator_requires_current_render_metadata_for_verified_status() {
         let mut legacy = serde_json::to_value(valid_metadata("幽霊")).unwrap();
         let evidence = legacy["evidence"].as_object_mut().unwrap();
         evidence.remove("resolved_forms");
@@ -1442,7 +1390,7 @@ mod tests {
         metadata.evidence.render.scroll_y = 120.0;
         metadata.evidence.render.graphs[0].document_rect.y = 220.0;
         metadata.evidence.render.graph_union_rect.y = 220.0;
-        metadata.evidence.render.capture_rect.y = 212.0;
+        metadata.evidence.render.capture_rect.y = 220.0;
         let asset = record(Some(metadata));
 
         assert_eq!(
@@ -1469,33 +1417,23 @@ mod tests {
     }
 
     #[test]
-    fn graph_union_capture_padding_and_document_page_bounds_are_verified() {
+    fn capture_must_equal_the_graph_union_and_document_page_bounds_are_verified() {
         let mut metadata = valid_metadata("幽霊");
         metadata.evidence.render.graphs[0].viewport_rect.y = 2.0;
         metadata.evidence.render.graphs[0].document_rect.y = 2.0;
         metadata.evidence.render.scroll_y = 0.0;
         metadata.evidence.render.graph_union_rect.y = 2.0;
-        metadata.evidence.render.capture_rect.y = 0.0;
-        metadata.evidence.render.capture_rect.height = 20.0;
-        metadata.evidence.render.pixel_height = 60;
-        metadata.evidence.render.actual_capture_padding_css_px.top = 2.0;
+        metadata.evidence.render.capture_rect.y = 2.0;
+        metadata.evidence.render.capture_rect.height = 10.0;
         let asset = record(Some(metadata));
         assert_eq!(
-            validate(&asset, &rgb_png(108, 60)).unwrap().status,
+            validate(&asset, &rgb_png(60, 30)).unwrap().status,
             SemanticStatus::Verified,
-            "отступ ограничивается верхней границей документа и фиксируется"
+            "capture повторяет график, касающийся верхней границы страницы"
         );
 
         let mut metadata = valid_metadata("幽霊");
         metadata.evidence.render.graph_union_rect.width += 1.0;
-        let asset = record(Some(metadata));
-        assert_eq!(
-            validate(&asset, &valid_png()).unwrap().status,
-            SemanticStatus::Rejected
-        );
-
-        let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.actual_capture_padding_css_px.left = 7.0;
         let asset = record(Some(metadata));
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
@@ -1512,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_capture_background_pixels_must_match_observed_solid_rgb() {
+    fn dark_capture_must_contain_observed_background_and_graph_pixels() {
         let asset = record(Some(valid_metadata("幽霊")));
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
@@ -1523,16 +1461,78 @@ mod tests {
         metadata.evidence.render.dark_theme.background_rgb = [255, 255, 255];
         let asset = record(Some(metadata));
         assert_eq!(
-            validate(&asset, &white_png(108, 78)).unwrap().status,
+            validate(&asset, &white_png(60, 30)).unwrap().status,
             SemanticStatus::Rejected,
-            "флаги тёмной темы не могут подтвердить светлый сплошной фон"
+            "флаги тёмной темы не могут подтвердить светлый вычисленный фон"
         );
 
         let asset = record(Some(valid_metadata("幽霊")));
         assert_eq!(
-            validate(&asset, &white_png(108, 78)).unwrap().status,
+            validate(&asset, &white_png(60, 30)).unwrap().status,
             SemanticStatus::Rejected,
-            "пиксели по краям снимка должны совпадать с наблюдённым тёмным RGB"
+            "содержимое снимка должно включать наблюдённый тёмный фон и пиксели графика"
+        );
+
+        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
+        image.put_pixel(30, 15, image::Rgba([235, 235, 235, 255]));
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        let asset = record(Some(valid_metadata("幽霊")));
+        assert_eq!(
+            validate(&asset, &output.into_inner()).unwrap().status,
+            SemanticStatus::Rejected,
+            "один случайный контрастный пиксель не подтверждает содержимое графика"
+        );
+    }
+
+    #[test]
+    fn transparent_tail_after_background_and_graph_pixels_is_rejected() {
+        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
+        for x in 1..=8 {
+            image.put_pixel(x, 0, image::Rgba([235, 235, 235, 255]));
+        }
+        image.put_pixel(59, 29, image::Rgba([24, 36, 48, 0]));
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+
+        let asset = record(Some(valid_metadata("幽霊")));
+        assert_eq!(
+            validate(&asset, &output.into_inner()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn alpha_254_is_not_fully_opaque() {
+        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 254]));
+        for x in 10..50 {
+            image.put_pixel(x, 15, image::Rgba([235, 235, 235, 254]));
+        }
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+
+        let asset = record(Some(valid_metadata("幽霊")));
+        assert_eq!(
+            validate(&asset, &output.into_inner()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn one_background_pixel_and_eight_contrasting_pixels_satisfy_capture_evidence() {
+        let proof = valid_metadata("幽霊").evidence.render.dark_theme;
+        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([100, 100, 100, 255]));
+        image.put_pixel(0, 0, image::Rgba([24, 36, 48, 255]));
+
+        assert!(
+            validate_capture_background(&proof, &image::DynamicImage::ImageRgba8(image)).is_ok(),
+            "исходный контракт требует один совпавший пиксель фона и не менее восьми контрастных"
         );
     }
 

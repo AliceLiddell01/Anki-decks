@@ -24,6 +24,7 @@ use crate::model::{
     MANIFEST_SCHEMA_VERSION, Manifest, Provenance, SemanticDecision, SemanticStatus,
     ValidationRecord, ValidatorIdentity,
 };
+use crate::pitch_accent::PitchAccentDomainPolicy;
 use crate::selection::{SelectionMode, select_assets};
 use crate::validation::{SemanticValidator, ValidationAttempt, ValidationReport, ValidatorFailure};
 
@@ -591,10 +592,10 @@ impl AssetStore {
                         serde_json::json!({"identity": identity}),
                     )
                 })?;
-            if !record.is_trusted_for(expected_validator) {
+            if !is_trusted_for_policy(record, expected_validator, policy) {
                 return Err(AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
-                    "изображение проверено другой версией валидатора",
+                    "ресурс не имеет доверенного решения `verified` от ожидаемой версии валидатора",
                 ));
             }
             let mut record = record.clone();
@@ -660,7 +661,8 @@ impl AssetStore {
         Self::verify_publishable_corpus_with_policy(root, &KanjiDomainPolicy, expected_validator)
     }
 
-    /// Verifies a publishable domain corpus without creating or changing files.
+    /// Проверяет публикуемый корпус выбранного домена без создания и изменения файлов.
+    /// Отсутствующий корпус допустим.
     pub fn verify_publishable_corpus_with_policy(
         root: impl AsRef<Path>,
         policy: &dyn AssetDomainPolicy,
@@ -677,11 +679,12 @@ impl AssetStore {
         // блокировку flock каталога. Эта проверка только для чтения берёт
         // совместную блокировку того же inode; `.lock` игнорируется Git и может
         // отсутствовать в чистой копии репозитория.
-        let directory_lock = open_directory_at(&root_handle, ".")
-            .map_err(|error| AssetError::io("не удалось открыть каталог корпуса кандзи", error))?;
+        let directory_lock = open_directory_at(&root_handle, ".").map_err(|error| {
+            AssetError::io("не удалось открыть каталог публикуемого корпуса", error)
+        })?;
         flock(&directory_lock, FlockOperation::LockShared).map_err(|error| {
             AssetError::io(
-                "не удалось заблокировать каталог корпуса кандзи для проверки",
+                "не удалось заблокировать каталог публикуемого корпуса для проверки",
                 std::io::Error::from(error),
             )
         })?;
@@ -729,7 +732,7 @@ impl AssetStore {
         })();
         let unlock = flock(&directory_lock, FlockOperation::Unlock).map_err(|error| {
             AssetError::io(
-                "не удалось снять блокировку каталога корпуса кандзи",
+                "не удалось снять блокировку каталога публикуемого корпуса",
                 std::io::Error::from(error),
             )
         });
@@ -808,7 +811,14 @@ impl AssetStore {
                     "эти bytes явно отклонены человеком; требуется новое решение или другой hash",
                 ));
             }
-            if current.sha256 == staged.sha256 && current.is_trusted_for(&validator_id) {
+            let pitch_same_sha_refresh = current.sha256 == staged.sha256
+                && is_pitch_domain(self.policy.as_ref())
+                && (current.domain_metadata != request.domain_metadata
+                    || current.provenance != request.provenance);
+            if current.sha256 == staged.sha256
+                && !pitch_same_sha_refresh
+                && is_trusted_for_policy(current, &validator_id, self.policy.as_ref())
+            {
                 let outcome = VerifiedIngestOutcome {
                     asset: Some(current.clone()),
                     status: SemanticStatus::Verified,
@@ -825,16 +835,24 @@ impl AssetStore {
                 lock.unlock()?;
                 return Ok(outcome);
             }
-            if current.sha256 != staged.sha256
+            if (current.sha256 != staged.sha256 || pitch_same_sha_refresh)
                 && request.replace_expected_sha256.as_deref() != Some(current.sha256.as_str())
             {
                 return Err(AssetError::with_details(
                     ErrorCode::IdentityConflict,
-                    format!("identity {} уже привязана к другому hash", current.identity),
+                    if pitch_same_sha_refresh && current.sha256 == staged.sha256 {
+                        format!(
+                            "метаданные или сведения об источнике ресурса {} изменились; требуется точный ожидаемый SHA для обновления",
+                            current.identity
+                        )
+                    } else {
+                        format!("identity {} уже привязана к другому hash", current.identity)
+                    },
                     serde_json::json!({
                         "identity": current.identity,
                         "existing_sha256": current.sha256,
                         "candidate_sha256": staged.sha256,
+                        "same_sha_metadata_refresh": pitch_same_sha_refresh,
                     }),
                 ));
             }
@@ -1176,7 +1194,7 @@ impl AssetStore {
         )?;
         let mut records = manifest.assets;
         records.extend(runtime_manifest.assets);
-        let assets = select_assets(&records, mode, validator)
+        let assets = select_assets_for_policy(&records, mode, validator, self.policy.as_ref())
             .into_iter()
             .cloned()
             .collect();
@@ -1245,10 +1263,11 @@ impl AssetStore {
         )?;
         let mut records = manifest.assets.clone();
         records.extend(runtime_manifest.assets.clone());
-        let selected: Vec<_> = select_assets(&records, mode, &validator_id)
-            .into_iter()
-            .cloned()
-            .collect();
+        let selected: Vec<_> =
+            select_assets_for_policy(&records, mode, &validator_id, self.policy.as_ref())
+                .into_iter()
+                .cloned()
+                .collect();
         let selected = if let Some((identity, expected_sha256)) = exact {
             let record = selected
                 .into_iter()
@@ -2715,11 +2734,11 @@ fn validate_publishable_manifest(
 ) -> Result<(), AssetError> {
     validate_verified_manifest(root, manifest, policy)?;
     for asset in &manifest.assets {
-        if !asset.is_trusted_for(expected_validator) {
+        if !is_trusted_for_policy(asset, expected_validator, policy) {
             return Err(AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 format!(
-                    "asset {} проверен другой версией валидатора",
+                    "ресурс {} не имеет доверенного решения `verified` от ожидаемой версии валидатора",
                     asset.identity
                 ),
             ));
@@ -2738,6 +2757,45 @@ fn validate_publishable_manifest(
     }
     validate_asset_directory_exact(root, manifest, policy)?;
     Ok(())
+}
+
+fn is_trusted_for_policy(
+    asset: &AssetRecord,
+    expected_validator: &ValidatorIdentity,
+    policy: &dyn AssetDomainPolicy,
+) -> bool {
+    if is_pitch_domain(policy) {
+        asset.is_trusted_for_automated_validation(expected_validator)
+    } else {
+        asset.is_trusted_for(expected_validator)
+    }
+}
+
+fn select_assets_for_policy<'a>(
+    assets: &'a [AssetRecord],
+    mode: SelectionMode,
+    validator: &ValidatorIdentity,
+    policy: &dyn AssetDomainPolicy,
+) -> Vec<&'a AssetRecord> {
+    if !is_pitch_domain(policy) {
+        return select_assets(assets, mode, validator);
+    }
+
+    let mut selected: Vec<_> = assets
+        .iter()
+        .filter(|asset| match mode {
+            SelectionMode::Full => true,
+            SelectionMode::New => !asset.validation.as_ref().is_some_and(|decision| {
+                decision.is_valid_for_sha(&asset.sha256) && decision.validator == *validator
+            }),
+        })
+        .collect();
+    selected.sort_by(|left, right| left.identity.cmp(&right.identity));
+    selected
+}
+
+fn is_pitch_domain(policy: &dyn AssetDomainPolicy) -> bool {
+    policy.domain_id() == PitchAccentDomainPolicy.domain_id()
 }
 
 fn validate_legacy_verified_manifest(
