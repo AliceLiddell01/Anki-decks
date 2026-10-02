@@ -14,6 +14,7 @@ pub mod cli;
 pub mod domain;
 pub mod error;
 pub mod hashing;
+pub mod jpdb;
 pub mod kanji_domain;
 pub mod kanji_mask;
 pub mod kanji_validator;
@@ -43,9 +44,10 @@ pub use model::{
     ValidatorIdentity,
 };
 pub use pitch_accent::{
-    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
-    PitchAccentImageValidator, PitchAccentProvider, PitchAccentRenderEvidence,
-    PitchAccentRenderKind,
+    PitchAccentCapturePadding, PitchAccentCaptureRect, PitchAccentCoordinateSpace,
+    PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
+    PitchAccentEvidence, PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
+    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
 };
 pub use selection::{SelectionMode, select_assets};
 pub use store::{

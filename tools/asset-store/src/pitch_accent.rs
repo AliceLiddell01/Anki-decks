@@ -2,6 +2,7 @@
 
 use std::io::{Cursor, Read};
 
+use image::GenericImageView;
 use image::ImageDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,13 +26,57 @@ use crate::validation::{SemanticValidator, ValidatorFailure};
 /// конечную границу для недоверенного входного потока.
 pub(crate) const PITCH_ACCENT_MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Требуемый отступ между объединением графиков и границей browser capture.
+pub(crate) const PITCH_ACCENT_CAPTURE_PADDING_CSS_PX: f64 = 8.0;
+
+/// Допуск размеров PNG из-за округления границ нативного CDP capture clip.
+/// При DSF 3.0 он ограничивает расхождение одним CSS-пикселем.
+pub(crate) const PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE: f64 = 3.0;
+
+/// Геометрический допуск для согласования DOM, capture clip и сохранённого evidence.
+pub(crate) const PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX: f64 = 0.25;
+
+/// Сравнивает reading JPDB, считая хирагану и катакану эквивалентной записью.
+/// Остальные символы сравниваются буквально; surface form не нормализуется.
+pub fn jpdb_readings_equivalent(left: &str, right: &str) -> bool {
+    fn hiragana_equivalent(character: char) -> char {
+        let code_point = u32::from(character);
+        if matches!(code_point, 0x30A1..=0x30F6 | 0x30FD..=0x30FE) {
+            char::from_u32(code_point - 0x60).unwrap_or(character)
+        } else {
+            character
+        }
+    }
+
+    left.chars()
+        .map(hiragana_equivalent)
+        .eq(right.chars().map(hiragana_equivalent))
+}
+
+pub(crate) fn capture_pixel_dimensions_match(
+    pixel_width: u32,
+    pixel_height: u32,
+    clip_width_css_px: f64,
+    clip_height_css_px: f64,
+    device_scale_factor: f64,
+) -> bool {
+    let expected_width = clip_width_css_px * device_scale_factor;
+    let expected_height = clip_height_css_px * device_scale_factor;
+    expected_width.is_finite()
+        && expected_height.is_finite()
+        && (f64::from(pixel_width) - expected_width).abs()
+            <= PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE
+        && (f64::from(pixel_height) - expected_height).abs()
+            <= PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE
+}
+
 /// Верхняя граница размеров PNG с запасом для снимка элемента при масштабе 3×.
 const PITCH_ACCENT_MAX_IMAGE_DIMENSION: u32 = 4096;
 
 /// Ограничивает память, нужную для декодирования распакованных пикселей и кадров.
 const PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES: u64 = 48 * 1024 * 1024;
 
-/// Независимая publishable policy для canonical pitch-accent PNG.
+/// Независимая политика публикации канонического PNG pitch-accent.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PitchAccentDomainPolicy;
 
@@ -50,7 +95,7 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
                 "домен pitch-accent принимает только пространство имён `pitch_accent`",
             ));
         }
-        let filename = format!("{}.png", identity.key);
+        let filename = format!("{}.pitch.png", identity.key);
         validate_safe_consumer_filename(&filename, DetectedFormat::Png)?;
         Ok(())
     }
@@ -73,7 +118,11 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
                 format!("{identity_hash}-{sha256}.{extension}"),
             )
         };
-        let consumer_filename = format!("{}.{extension}", identity.key);
+        let consumer_filename = if format == DetectedFormat::Png {
+            format!("{}.pitch.png", identity.key)
+        } else {
+            format!("{}.{extension}", identity.key)
+        };
         validate_safe_consumer_filename(&consumer_filename, format)?;
         Ok(CanonicalAssetLocation {
             storage_path: format!("assets/{category}/{storage_filename}"),
@@ -87,7 +136,7 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
         _sha256: &str,
         _format: DetectedFormat,
     ) -> Option<CanonicalAssetLocation> {
-        // Pitch accent не существовал в schema 3/4.
+        // Домен `pitch_accent` отсутствовал в schema 3/4.
         None
     }
 
@@ -108,75 +157,167 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
     }
 }
 
-/// JPDB vocabulary metadata, не участвующая в имени canonical файла.
+/// Метаданные словарной записи JPDB, не участвующие в имени канонического файла.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentDomainMetadata {
-    /// Точная surface form; она должна совпасть с `AssetIdentity.key`.
+    /// Точное значение `surface`; оно должно совпадать с `AssetIdentity.key`.
     pub surface: String,
-    /// Reading для карточки и provenance, но не для filename.
+    /// Значение `reading` для карточки и сведений об источнике; оно не входит в имя файла.
     pub reading: String,
     /// Положительный JPDB vocabulary ID.
     pub jpdb_vocabulary_id: u64,
-    /// Структурные сведения о source, capture и browser runtime.
+    /// Структурные сведения об источнике, захвате и среде браузера.
     pub evidence: PitchAccentEvidence,
 }
 
-/// Минимальное структурное evidence, достаточное для автоматической проверки.
+/// Одна реально наблюдённая JPDB пара написания и чтения.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentResolvedForm {
+    pub surface: String,
+    pub reading: String,
+}
+
+/// Минимальные структурные свидетельства, достаточные для автоматической проверки.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentEvidence {
     pub provider: PitchAccentProvider,
     pub source_url: String,
-    /// Число отдельных pitch graphs, подтверждённых на source странице.
+    /// Связанные пары написания и чтения, наблюдённые в словарной записи JPDB.
+    pub resolved_forms: Vec<PitchAccentResolvedForm>,
+    /// Число отдельных графиков, обнаруженных на странице источника.
     pub graph_count: u32,
     pub render: PitchAccentRenderEvidence,
     pub browser: BrowserRuntimeProvenance,
 }
 
-/// Источник, для которого предназначен этот domain.
+/// Источник получения изображения для этого домена.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PitchAccentProvider {
     Jpdb,
 }
 
-/// Вид получения canonical PNG.
+/// Способ получения канонического PNG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PitchAccentRenderKind {
     ElementScreenshot,
     SvgElementScreenshot,
     CanvasElementScreenshot,
+    BrowserRegionScreenshot,
 }
 
-/// Фактические параметры rendered элемента.
+/// Один узел графика на странице словарной записи, попавший в снимок браузера.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentGraphEvidence {
+    /// Нулевой индекс в порядке графиков страницы.
+    pub index: u32,
+    /// CSS-селектор конкретного узла графика.
+    pub selector: String,
+    /// Прямоугольник узла графика относительно viewport.
+    pub viewport_rect: PitchAccentCaptureRect,
+    /// Прямоугольник узла графика относительно начала документа.
+    pub document_rect: PitchAccentCaptureRect,
+}
+
+/// Состояние документа и browser media, непосредственно наблюдённое перед захватом.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentDarkThemeProof {
+    /// Токены `classList` элемента `document.documentElement`.
+    pub document_element_classes: Vec<String>,
+    /// Наблюдаемый результат `matchMedia('(prefers-color-scheme: dark)').matches`.
+    pub prefers_color_scheme: String,
+    /// Наблюдаемое `getComputedStyle(document.documentElement).colorScheme`.
+    pub computed_color_scheme: String,
+    /// CSS-селектор реально наблюдённого сплошного фона области pitch accent или её предка.
+    pub background_selector: String,
+    /// RGB непрозрачного вычисленного фона, совпадающего с фоном по краям снимка.
+    pub background_rgb: [u8; 3],
+}
+
+/// Прямоугольник в CSS-пикселях; систему координат задаёт поле, в котором он хранится.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentCaptureRect {
+    /// Координата X в CSS-пикселях.
+    pub x: f64,
+    /// Координата Y в CSS-пикселях.
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Остаточные отступы между объединением графиков и областью снимка после ограничения страницей.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentCapturePadding {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+}
+
+/// Координатная система снимка, зафиксированная в свидетельствах.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PitchAccentCoordinateSpace {
+    /// Координаты относительно начала документа, а не текущей области просмотра.
+    Document,
+}
+
+/// Фактические параметры отрисованной области.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentRenderEvidence {
     pub kind: PitchAccentRenderKind,
+    /// Селектор общей области, снятой одним снимком браузера.
     pub selector: String,
+    /// Наблюдённые узлы графиков, попавшие в снимок, в порядке DOM.
+    pub graphs: Vec<PitchAccentGraphEvidence>,
+    /// Система координат объединения графиков и итоговой области снимка.
+    pub coordinate_space: PitchAccentCoordinateSpace,
     pub viewport_width: u32,
     pub viewport_height: u32,
+    pub document_width: u32,
+    pub document_height: u32,
+    /// Наблюдённые `window.scrollX` и `window.scrollY` в CSS-пикселях.
+    pub scroll_x: f64,
+    pub scroll_y: f64,
     pub pixel_width: u32,
     pub pixel_height: u32,
     pub device_scale_factor: f64,
+    /// `visualViewport.scale`; значение должно быть ровно 1.0.
+    pub page_scale_factor: f64,
+    pub dark_theme: PitchAccentDarkThemeProof,
+    /// Объединение фактических прямоугольников узлов графиков в координатах документа.
+    pub graph_union_rect: PitchAccentCaptureRect,
+    /// Запрошенный отступ с каждой стороны до ограничения границами документа.
+    pub capture_padding_css_px: f64,
+    /// Фактический отступ с каждой стороны после ограничения границами документа.
+    pub actual_capture_padding_css_px: PitchAccentCapturePadding,
+    /// Итоговая область в координатах документа, переданная браузеру для снимка.
+    pub capture_rect: PitchAccentCaptureRect,
 }
 
-/// Production semantic validator pitch-accent PNG.
+/// Семантический валидатор PNG pitch-accent.
 ///
 /// PNG декодируется полностью, а `VERIFIED` возвращается только при наличии
-/// структурного JPDB source/render evidence. Одной сигнатуры или успешного
-/// декодирования изображения недостаточно.
+/// структурных свидетельств об источнике JPDB и отрисовке. Одной сигнатуры или
+/// успешного декодирования изображения недостаточно.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PitchAccentImageValidator;
 
 impl PitchAccentImageValidator {
     pub const VALIDATOR_ID: &'static str = "jpdb-pitch-accent-render";
-    pub const VALIDATOR_VERSION: &'static str = "2";
+    pub const VALIDATOR_VERSION: &'static str = "4";
     pub const REQUIRED_DEVICE_SCALE_FACTOR: f64 = 3.0;
 
-    /// Устойчивая identity validator для manifest и consumer checks.
+    /// Устойчивый идентификатор validator-а для manifest и проверок consumer-а.
     pub fn validator_identity() -> ValidatorIdentity {
         Self.identity()
     }
@@ -222,8 +363,8 @@ impl SemanticValidator for PitchAccentImageValidator {
                 json!({"format": format!("{:?}", asset.format)}),
             ));
         }
-        let (pixel_width, pixel_height) = match decode_png(&contents) {
-            Ok(dimensions) => dimensions,
+        let decoded_png = match decode_png(&contents) {
+            Ok(image) => image,
             Err(error) => {
                 return Ok(decision(
                     SemanticStatus::Corrupt,
@@ -251,7 +392,7 @@ impl SemanticValidator for PitchAccentImageValidator {
             Ok(metadata) => metadata,
             Err(error) => return Ok(incomplete_evidence(error.to_string())),
         };
-        match validate_evidence(&asset.identity.key, &metadata, pixel_width, pixel_height) {
+        match validate_evidence(&asset.identity.key, &metadata, &decoded_png) {
             Ok(()) => Ok(decision(
                 SemanticStatus::Verified,
                 "pitch_accent_source_render_verified",
@@ -269,16 +410,23 @@ impl SemanticValidator for PitchAccentImageValidator {
     }
 }
 
-enum EvidenceFailure {
+pub(crate) enum EvidenceFailure {
     Incomplete(String),
     Contradiction(String),
+}
+
+impl EvidenceFailure {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Incomplete(message) | Self::Contradiction(message) => message,
+        }
+    }
 }
 
 fn validate_evidence(
     surface: &str,
     metadata: &PitchAccentDomainMetadata,
-    actual_pixel_width: u32,
-    actual_pixel_height: u32,
+    image: &image::DynamicImage,
 ) -> Result<(), EvidenceFailure> {
     if metadata.surface != surface {
         return Err(EvidenceFailure::Contradiction(
@@ -302,9 +450,36 @@ fn validate_evidence(
             "поставщик в подтверждении не соответствует JPDB".into(),
         ));
     }
-    if !is_jpdb_source_url(&evidence.source_url, metadata.jpdb_vocabulary_id) {
+    let route = parse_jpdb_vocabulary_route(&evidence.source_url).map_err(|_| {
+        EvidenceFailure::Contradiction(
+            "URL источника должен вести на точный HTTPS-маршрут словарной записи `jpdb.io`".into(),
+        )
+    })?;
+    if route.vocabulary_id != metadata.jpdb_vocabulary_id {
         return Err(EvidenceFailure::Contradiction(
-            "URL источника должен быть абсолютным HTTPS-адресом домена jpdb.io".into(),
+            "ID маршрута JPDB не совпадает с ID словарной записи в метаданных".into(),
+        ));
+    }
+    validate_resolved_forms(&evidence.resolved_forms)?;
+    if !evidence
+        .resolved_forms
+        .iter()
+        .any(|form| form.surface == metadata.surface && form.reading == metadata.reading)
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "пара значений `surface` и `reading` в метаданных отсутствует среди разрешённых форм JPDB"
+                .into(),
+        ));
+    }
+    if !evidence.resolved_forms.iter().any(|form| {
+        form.surface == route.surface
+            && route
+                .reading
+                .as_ref()
+                .is_none_or(|reading| form.reading == *reading)
+    }) {
+        return Err(EvidenceFailure::Contradiction(
+            "пара написания и чтения из маршрута JPDB отсутствует среди разрешённых форм".into(),
         ));
     }
     if evidence.graph_count == 0 {
@@ -314,13 +489,32 @@ fn validate_evidence(
     }
 
     let render = &evidence.render;
+    if render.kind != PitchAccentRenderKind::BrowserRegionScreenshot {
+        return Err(EvidenceFailure::Incomplete(
+            "все графики pitch accent должны входить в один нативный снимок области браузера"
+                .into(),
+        ));
+    }
     if render.selector.trim().is_empty() || render.selector.chars().any(char::is_control) {
         return Err(EvidenceFailure::Incomplete(
             "селектор render отсутствует или содержит управляющие символы".into(),
         ));
     }
+    if render.graphs.len() != evidence.graph_count as usize
+        || render.graphs.iter().enumerate().any(|(index, graph)| {
+            graph.index != index as u32
+                || graph.selector.trim().is_empty()
+                || graph.selector.chars().any(char::is_control)
+        })
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "список CSS-селекторов графиков не соответствует `graph_count` и порядку DOM".into(),
+        ));
+    }
     if render.viewport_width == 0
         || render.viewport_height == 0
+        || render.document_width == 0
+        || render.document_height == 0
         || render.pixel_width == 0
         || render.pixel_height == 0
     {
@@ -328,9 +522,9 @@ fn validate_evidence(
             "размеры области просмотра и изображения должны быть положительными".into(),
         ));
     }
-    if render.pixel_width != actual_pixel_width || render.pixel_height != actual_pixel_height {
+    if render.pixel_width != image.width() || render.pixel_height != image.height() {
         return Err(EvidenceFailure::Contradiction(
-            "размеры снятого изображения не совпадают с декодированным PNG".into(),
+            "размеры снимка не совпадают с размерами декодированного PNG".into(),
         ));
     }
     if render.device_scale_factor != PitchAccentImageValidator::REQUIRED_DEVICE_SCALE_FACTOR {
@@ -338,6 +532,14 @@ fn validate_evidence(
             "масштаб устройства должен быть ровно 3.0".into(),
         ));
     }
+    if render.page_scale_factor != 1.0 {
+        return Err(EvidenceFailure::Incomplete(
+            "масштаб страницы должен быть ровно 1.0".into(),
+        ));
+    }
+    validate_capture_geometry(render)?;
+    validate_dark_theme(&render.dark_theme)?;
+    validate_capture_background(&render.dark_theme, image)?;
 
     let browser = &evidence.browser;
     if [
@@ -357,27 +559,403 @@ fn validate_evidence(
     Ok(())
 }
 
-fn is_jpdb_source_url(value: &str, vocabulary_id: u64) -> bool {
-    let Ok(url) = Url::parse(value) else {
-        return false;
-    };
-    let has_vocabulary_id = url.path_segments().is_some_and(|segments| {
-        let segments: Vec<_> = segments.collect();
-        segments
-            .windows(2)
-            .any(|pair| pair[0] == "vocabulary" && pair[1] == vocabulary_id.to_string())
-    });
-    url.scheme() == "https"
-        && url.username().is_empty()
-        && url.password().is_none()
-        && has_vocabulary_id
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("jpdb.io")
-                || host
-                    .to_ascii_lowercase()
-                    .strip_suffix(".jpdb.io")
-                    .is_some_and(|prefix| !prefix.is_empty())
+fn validate_resolved_forms(forms: &[PitchAccentResolvedForm]) -> Result<(), EvidenceFailure> {
+    if forms.is_empty()
+        || forms.iter().any(|form| {
+            form.surface.trim().is_empty()
+                || form.reading.trim().is_empty()
+                || form.surface.chars().any(char::is_control)
+                || form.reading.chars().any(char::is_control)
         })
+    {
+        return Err(EvidenceFailure::Incomplete(
+            "список разрешённых пар написания и чтения JPDB пуст или некорректен".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dark_theme(proof: &PitchAccentDarkThemeProof) -> Result<(), EvidenceFailure> {
+    if proof
+        .document_element_classes
+        .iter()
+        .any(|class| class.trim().is_empty() || class.chars().any(char::is_control))
+        || proof.prefers_color_scheme.chars().any(char::is_control)
+        || proof.computed_color_scheme.trim().is_empty()
+        || proof.computed_color_scheme.chars().any(char::is_control)
+        || proof.background_selector.trim().is_empty()
+        || proof.background_selector.chars().any(char::is_control)
+    {
+        return Err(EvidenceFailure::Incomplete(
+            "наблюдаемое состояние тёмной темы неполно или некорректно".into(),
+        ));
+    }
+    if !proof
+        .document_element_classes
+        .iter()
+        .any(|class| class == "dark-mode")
+        || proof.prefers_color_scheme != "dark"
+    {
+        return Err(EvidenceFailure::Incomplete(
+            "документ или параметр темы браузера не подтверждают активную тёмную тему".into(),
+        ));
+    }
+    if relative_luminance(proof.background_rgb) > 0.20 {
+        return Err(EvidenceFailure::Contradiction(
+            "наблюдённый сплошной фон RGB недостаточно тёмный для снимка JPDB".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_capture_geometry(
+    render: &PitchAccentRenderEvidence,
+) -> Result<(), EvidenceFailure> {
+    if render.coordinate_space != PitchAccentCoordinateSpace::Document {
+        return Err(EvidenceFailure::Incomplete(
+            "снимок браузера должен явно использовать координаты документа".into(),
+        ));
+    }
+    if !render.scroll_x.is_finite()
+        || !render.scroll_y.is_finite()
+        || render.scroll_x < 0.0
+        || render.scroll_y < 0.0
+        || render.scroll_x > f64::from(render.document_width)
+        || render.scroll_y > f64::from(render.document_height)
+    {
+        return Err(EvidenceFailure::Incomplete(
+            "значения прокрутки документа должны быть конечными и неотрицательными".into(),
+        ));
+    }
+    if (render.capture_padding_css_px - PITCH_ACCENT_CAPTURE_PADDING_CSS_PX).abs() > 0.001 {
+        return Err(EvidenceFailure::Contradiction(
+            "отступ захвата не совпадает с требуемыми 8 CSS-пикселями".into(),
+        ));
+    }
+    if render.graphs.is_empty() {
+        return Err(EvidenceFailure::Incomplete(
+            "свидетельства захвата не содержат прямоугольников графиков".into(),
+        ));
+    }
+
+    let geometry_tolerance = PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX;
+    let mut left = f64::INFINITY;
+    let mut top = f64::INFINITY;
+    let mut right = f64::NEG_INFINITY;
+    let mut bottom = f64::NEG_INFINITY;
+    for graph in &render.graphs {
+        validate_positive_rect(graph.viewport_rect, "график в viewport")?;
+        validate_positive_rect(graph.document_rect, "график в координатах документа")?;
+        if graph.viewport_rect.x < -geometry_tolerance
+            || graph.viewport_rect.y < -geometry_tolerance
+            || graph.viewport_rect.x + graph.viewport_rect.width
+                > f64::from(render.viewport_width) + geometry_tolerance
+            || graph.viewport_rect.y + graph.viewport_rect.height
+                > f64::from(render.viewport_height) + geometry_tolerance
+        {
+            return Err(EvidenceFailure::Contradiction(
+                "прямоугольник графика выходит за границы viewport".into(),
+            ));
+        }
+        if (graph.document_rect.x - (graph.viewport_rect.x + render.scroll_x)).abs()
+            > geometry_tolerance
+            || (graph.document_rect.y - (graph.viewport_rect.y + render.scroll_y)).abs()
+                > geometry_tolerance
+            || (graph.document_rect.width - graph.viewport_rect.width).abs() > geometry_tolerance
+            || (graph.document_rect.height - graph.viewport_rect.height).abs() > geometry_tolerance
+            || graph.document_rect.x < -geometry_tolerance
+            || graph.document_rect.y < -geometry_tolerance
+            || graph.document_rect.x + graph.document_rect.width
+                > f64::from(render.document_width) + geometry_tolerance
+            || graph.document_rect.y + graph.document_rect.height
+                > f64::from(render.document_height) + geometry_tolerance
+        {
+            return Err(EvidenceFailure::Contradiction(
+                "прямоугольник графика в документе не соответствует viewport и прокрутке".into(),
+            ));
+        }
+        left = left.min(graph.document_rect.x);
+        top = top.min(graph.document_rect.y);
+        right = right.max(graph.document_rect.x + graph.document_rect.width);
+        bottom = bottom.max(graph.document_rect.y + graph.document_rect.height);
+    }
+
+    let expected_union = PitchAccentCaptureRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    };
+    validate_positive_rect(render.graph_union_rect, "объединение графиков")?;
+    if !rects_match(render.graph_union_rect, expected_union, geometry_tolerance) {
+        return Err(EvidenceFailure::Contradiction(
+            "объединение не соответствует прямоугольникам графиков в координатах документа".into(),
+        ));
+    }
+
+    let rect = render.capture_rect;
+    validate_positive_rect(rect, "capture")?;
+    if rect.x < 0.0
+        || rect.y < 0.0
+        || rect.x + rect.width > f64::from(render.document_width)
+        || rect.y + rect.height > f64::from(render.document_height)
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "область захвата выходит за пределы страницы документа".into(),
+        ));
+    }
+
+    let padding = render.capture_padding_css_px;
+    let expected_capture = PitchAccentCaptureRect {
+        x: (expected_union.x - padding).max(0.0),
+        y: (expected_union.y - padding).max(0.0),
+        width: (expected_union.x + expected_union.width + padding)
+            .min(f64::from(render.document_width))
+            - (expected_union.x - padding).max(0.0),
+        height: (expected_union.y + expected_union.height + padding)
+            .min(f64::from(render.document_height))
+            - (expected_union.y - padding).max(0.0),
+    };
+    if !rects_match(rect, expected_capture, geometry_tolerance) {
+        return Err(EvidenceFailure::Contradiction(
+            "область захвата не соответствует объединению графиков с отступом 8 CSS px и границами страницы"
+                .into(),
+        ));
+    }
+    let actual_padding = PitchAccentCapturePadding {
+        top: expected_union.y - rect.y,
+        right: rect.x + rect.width - (expected_union.x + expected_union.width),
+        bottom: rect.y + rect.height - (expected_union.y + expected_union.height),
+        left: expected_union.x - rect.x,
+    };
+    if [
+        actual_padding.top,
+        actual_padding.right,
+        actual_padding.bottom,
+        actual_padding.left,
+    ]
+    .iter()
+    .any(|value| *value < -geometry_tolerance || *value > padding + geometry_tolerance)
+        || !padding_matches(
+            render.actual_capture_padding_css_px,
+            actual_padding,
+            geometry_tolerance,
+        )
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "указанные фактические отступы не совпадают с расстояниями вокруг объединения графиков"
+                .into(),
+        ));
+    }
+
+    if !capture_pixel_dimensions_match(
+        render.pixel_width,
+        render.pixel_height,
+        rect.width,
+        rect.height,
+        render.device_scale_factor,
+    ) {
+        return Err(EvidenceFailure::Contradiction(
+            "размеры PNG не соответствуют области захвата в CSS-пикселях и масштабу устройства"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_positive_rect(
+    rect: PitchAccentCaptureRect,
+    label: &str,
+) -> Result<(), EvidenceFailure> {
+    if ![rect.x, rect.y, rect.width, rect.height]
+        .iter()
+        .all(|value| value.is_finite())
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+    {
+        return Err(EvidenceFailure::Incomplete(format!(
+            "{label} rectangle должен содержать конечные положительные размеры"
+        )));
+    }
+    Ok(())
+}
+
+fn rects_match(
+    actual: PitchAccentCaptureRect,
+    expected: PitchAccentCaptureRect,
+    tolerance: f64,
+) -> bool {
+    (actual.x - expected.x).abs() <= tolerance
+        && (actual.y - expected.y).abs() <= tolerance
+        && (actual.width - expected.width).abs() <= tolerance
+        && (actual.height - expected.height).abs() <= tolerance
+}
+
+fn padding_matches(
+    actual: PitchAccentCapturePadding,
+    expected: PitchAccentCapturePadding,
+    tolerance: f64,
+) -> bool {
+    (actual.top - expected.top).abs() <= tolerance
+        && (actual.right - expected.right).abs() <= tolerance
+        && (actual.bottom - expected.bottom).abs() <= tolerance
+        && (actual.left - expected.left).abs() <= tolerance
+}
+
+pub(crate) fn validate_capture_background(
+    proof: &PitchAccentDarkThemeProof,
+    image: &image::DynamicImage,
+) -> Result<(), EvidenceFailure> {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err(EvidenceFailure::Incomplete(
+            "в PNG нет пикселей для проверки сплошного фона".into(),
+        ));
+    }
+    let x_mid = width / 2;
+    let y_mid = height / 2;
+    let points = [
+        (0, 0),
+        (width - 1, 0),
+        (0, height - 1),
+        (width - 1, height - 1),
+        (x_mid, 0),
+        (x_mid, height - 1),
+        (0, y_mid),
+        (width - 1, y_mid),
+    ];
+    for (x, y) in points {
+        let pixel = image.get_pixel(x, y).0;
+        if pixel[3] < 250
+            || pixel[..3]
+                .iter()
+                .zip(proof.background_rgb)
+                .any(|(actual, expected)| actual.abs_diff(expected) > 8)
+        {
+            return Err(EvidenceFailure::Contradiction(format!(
+                "пиксель PNG на границе ({x}, {y}) не совпадает с наблюдённым RGB сплошного фона"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn relative_luminance(rgb: [u8; 3]) -> f64 {
+    let linear = rgb.map(|channel| {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+}
+
+/// Разобранный и проверенный маршрут словарной записи `jpdb.io`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JpdbVocabularyRoute {
+    pub(crate) vocabulary_id: u64,
+    pub(crate) surface: String,
+    pub(crate) reading: Option<String>,
+}
+
+/// Ошибка разбора точного маршрута словарной записи JPDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JpdbVocabularyRouteError {
+    Url,
+    Origin,
+    Path,
+    VocabularyId,
+    Encoding,
+}
+
+/// Разбирает только точный путь словарной записи JPDB, игнорируя query и fragment.
+pub(crate) fn parse_jpdb_vocabulary_route(
+    value: &str,
+) -> Result<JpdbVocabularyRoute, JpdbVocabularyRouteError> {
+    let url = Url::parse(value).map_err(|_| JpdbVocabularyRouteError::Url)?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url
+            .host_str()
+            .is_none_or(|host| !host.eq_ignore_ascii_case("jpdb.io"))
+        || url.port_or_known_default() != Some(443)
+    {
+        return Err(JpdbVocabularyRouteError::Origin);
+    }
+    let encoded_segments: Vec<_> = url
+        .path_segments()
+        .ok_or(JpdbVocabularyRouteError::Path)?
+        .collect();
+    if !(encoded_segments.len() == 3 || encoded_segments.len() == 4)
+        || encoded_segments.iter().any(|segment| segment.is_empty())
+        || encoded_segments[0] != "vocabulary"
+    {
+        return Err(JpdbVocabularyRouteError::Path);
+    }
+    if encoded_segments[1]
+        .bytes()
+        .any(|byte| !byte.is_ascii_digit())
+    {
+        return Err(JpdbVocabularyRouteError::VocabularyId);
+    }
+    let vocabulary_id = encoded_segments[1]
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0 && id.to_string() == encoded_segments[1])
+        .ok_or(JpdbVocabularyRouteError::VocabularyId)?;
+    let surface = decode_path_segment(encoded_segments[2])?;
+    let reading = encoded_segments
+        .get(3)
+        .map(|segment| decode_path_segment(segment))
+        .transpose()?;
+    if surface.trim().is_empty()
+        || reading
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        || surface.eq_ignore_ascii_case("used-in")
+        || reading
+            .as_ref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("used-in"))
+    {
+        return Err(JpdbVocabularyRouteError::Path);
+    }
+    Ok(JpdbVocabularyRoute {
+        vocabulary_id,
+        surface,
+        reading,
+    })
+}
+
+fn decode_path_segment(segment: &str) -> Result<String, JpdbVocabularyRouteError> {
+    let input = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            if index + 2 >= input.len() {
+                return Err(JpdbVocabularyRouteError::Encoding);
+            }
+            let high = (input[index + 1] as char)
+                .to_digit(16)
+                .ok_or(JpdbVocabularyRouteError::Encoding)?;
+            let low = (input[index + 2] as char)
+                .to_digit(16)
+                .ok_or(JpdbVocabularyRouteError::Encoding)?;
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        } else {
+            decoded.push(input[index]);
+            index += 1;
+        }
+    }
+    let value = String::from_utf8(decoded).map_err(|_| JpdbVocabularyRouteError::Encoding)?;
+    if value.chars().any(char::is_control) {
+        return Err(JpdbVocabularyRouteError::Encoding);
+    }
+    Ok(value)
 }
 
 fn validate_hash(hash: &str) -> Result<(), AssetError> {
@@ -394,7 +972,7 @@ fn validate_hash(hash: &str) -> Result<(), AssetError> {
     Ok(())
 }
 
-fn decode_png(bytes: &[u8]) -> Result<(u32, u32), String> {
+fn decode_png(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(PITCH_ACCENT_MAX_IMAGE_DIMENSION);
     limits.max_image_height = Some(PITCH_ACCENT_MAX_IMAGE_DIMENSION);
@@ -413,9 +991,7 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32), String> {
             PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES
         ));
     }
-    image::DynamicImage::from_decoder(decoder)
-        .map(|image| (image.width(), image.height()))
-        .map_err(|error| error.to_string())
+    image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())
 }
 
 fn incomplete_evidence(message: impl Into<String>) -> SemanticDecision {
@@ -454,16 +1030,68 @@ mod tests {
             jpdb_vocabulary_id: 123,
             evidence: PitchAccentEvidence {
                 provider: PitchAccentProvider::Jpdb,
-                source_url: "https://jpdb.io/vocabulary/123".into(),
+                source_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい#a".into(),
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: "幽霊".into(),
+                    reading: "ゆうれい".into(),
+                }],
                 graph_count: 1,
                 render: PitchAccentRenderEvidence {
-                    kind: PitchAccentRenderKind::ElementScreenshot,
+                    kind: PitchAccentRenderKind::BrowserRegionScreenshot,
                     selector: ".pitch-accent-graph".into(),
+                    graphs: vec![PitchAccentGraphEvidence {
+                        index: 0,
+                        selector: ".pitch-accent-graph".into(),
+                        viewport_rect: PitchAccentCaptureRect {
+                            x: 100.0,
+                            y: 100.0,
+                            width: 20.0,
+                            height: 10.0,
+                        },
+                        document_rect: PitchAccentCaptureRect {
+                            x: 100.0,
+                            y: 200.0,
+                            width: 20.0,
+                            height: 10.0,
+                        },
+                    }],
+                    coordinate_space: PitchAccentCoordinateSpace::Document,
                     viewport_width: 1280,
                     viewport_height: 900,
-                    pixel_width: 2,
-                    pixel_height: 2,
+                    document_width: 1280,
+                    document_height: 1800,
+                    scroll_x: 0.0,
+                    scroll_y: 100.0,
+                    pixel_width: 108,
+                    pixel_height: 78,
                     device_scale_factor: 3.0,
+                    page_scale_factor: 1.0,
+                    dark_theme: PitchAccentDarkThemeProof {
+                        document_element_classes: vec!["dark-mode".into()],
+                        prefers_color_scheme: "dark".into(),
+                        computed_color_scheme: "dark".into(),
+                        background_selector: ".subsection-pitch-accent".into(),
+                        background_rgb: [24, 36, 48],
+                    },
+                    graph_union_rect: PitchAccentCaptureRect {
+                        x: 100.0,
+                        y: 200.0,
+                        width: 20.0,
+                        height: 10.0,
+                    },
+                    capture_padding_css_px: PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+                    actual_capture_padding_css_px: PitchAccentCapturePadding {
+                        top: 8.0,
+                        right: 8.0,
+                        bottom: 8.0,
+                        left: 8.0,
+                    },
+                    capture_rect: PitchAccentCaptureRect {
+                        x: 92.0,
+                        y: 192.0,
+                        width: 36.0,
+                        height: 26.0,
+                    },
                 },
                 browser: BrowserRuntimeProvenance {
                     product: "Chrome/140".into(),
@@ -478,7 +1106,7 @@ mod tests {
     }
 
     fn valid_png() -> Vec<u8> {
-        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([24, 36, 48, 255]));
+        let image = image::RgbaImage::from_pixel(108, 78, image::Rgba([24, 36, 48, 255]));
         let mut output = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut output, image::ImageFormat::Png)
@@ -504,27 +1132,46 @@ mod tests {
         output.into_inner()
     }
 
+    fn white_png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([255, 255, 255]));
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
     #[test]
     fn pitch_policy_keeps_surface_filename_and_isolates_unsupported_runtime_formats() {
         let policy = PitchAccentDomainPolicy;
-        let identity = crate::model::AssetIdentity::new("pitch_accent", "幽霊").unwrap();
+        let identity = crate::model::AssetIdentity::new("pitch_accent", "飴").unwrap();
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         let png = policy
             .canonical_location(&identity, hash, DetectedFormat::Png)
             .unwrap();
-        assert_eq!(png.storage_path, "assets/png/幽霊.png");
-        assert_eq!(png.consumer_filename, "幽霊.png");
+        assert_eq!(png.storage_path, "assets/png/飴.png");
+        assert_eq!(png.consumer_filename, "飴.pitch.png");
+
+        let kanji = crate::domain::KanjiDomainPolicy
+            .canonical_location(
+                &crate::model::AssetIdentity::new("kanji", "飴").unwrap(),
+                hash,
+                DetectedFormat::Png,
+            )
+            .unwrap();
+        assert_eq!(kanji.storage_path, "assets/png/飴.png");
+        assert_eq!(kanji.consumer_filename, "飴.png");
 
         let gif = policy
             .canonical_location(&identity, hash, DetectedFormat::Gif)
             .unwrap();
-        let identity_hash = sha256_hex("幽霊".as_bytes());
+        let identity_hash = sha256_hex("飴".as_bytes());
         assert_eq!(
             gif.storage_path,
             format!("assets/unsupported/{identity_hash}-{hash}.gif")
         );
-        assert_eq!(gif.consumer_filename, "幽霊.gif");
+        assert_eq!(gif.consumer_filename, "飴.gif");
         assert_eq!(policy.max_asset_bytes(), Some(PITCH_ACCENT_MAX_ASSET_BYTES));
         assert!(!policy.is_publishable_format(DetectedFormat::Gif));
         assert!(!policy.allows_verified_format(DetectedFormat::Gif));
@@ -540,7 +1187,7 @@ mod tests {
         AssetRecord {
             identity: crate::model::AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
             storage_path: "assets/png/幽霊.png".into(),
-            consumer_filename: "幽霊.png".into(),
+            consumer_filename: "幽霊.pitch.png".into(),
             sha256: "0".repeat(64),
             byte_length: 0,
             format: DetectedFormat::Png,
@@ -565,6 +1212,7 @@ mod tests {
         let asset = record(Some(metadata));
         let decision = validate(&asset, &valid_png()).unwrap();
 
+        assert_eq!(PitchAccentImageValidator::validator_identity().version, "4");
         assert_eq!(decision.status, SemanticStatus::Verified);
         assert_eq!(
             decision.evidence[0].kind,
@@ -603,6 +1251,288 @@ mod tests {
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
             SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.resolved_forms = vec![PitchAccentResolvedForm {
+            surface: "幽霊".into(),
+            reading: "げんき".into(),
+        }];
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn source_url_and_typed_route_parser_share_the_exact_jpdb_contract() {
+        for source_url in [
+            "https://jpdb.io:443/vocabulary/123/幽霊/ゆうれい?tab=1#pitch",
+            "https://jpdb.io/vocabulary/123/幽霊?tab=1#pitch",
+        ] {
+            assert!(parse_jpdb_vocabulary_route(source_url).is_ok());
+            let mut metadata = valid_metadata("幽霊");
+            metadata.evidence.source_url = source_url.into();
+            let asset = record(Some(metadata));
+            assert_eq!(
+                validate(&asset, &valid_png()).unwrap().status,
+                SemanticStatus::Verified,
+                "валидатор должен принимать маршрут, допустимый общим разборщиком: {source_url}"
+            );
+        }
+
+        for source_url in [
+            "https://subdomain.jpdb.io/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/prefix/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/vocabulary/123/幽霊/used-in",
+            "http://jpdb.io/vocabulary/123/幽霊/ゆうれい",
+            "https://user:pass@jpdb.io/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io:444/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/vocabulary/123/幽霊/ゆうれい/",
+            "https://jpdb.io/vocabulary/123//ゆうれい",
+            "https://jpdb.io/vocabulary/123/幽霊/ゆうれい/extra",
+            "https://jpdb.io.evil.example/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/vocabulary/0123/幽霊/ゆうれい",
+        ] {
+            assert!(
+                parse_jpdb_vocabulary_route(source_url).is_err(),
+                "разборщик должен отвергать маршрут: {source_url}"
+            );
+            let mut metadata = valid_metadata("幽霊");
+            metadata.evidence.source_url = source_url.into();
+            let asset = record(Some(metadata));
+            assert_eq!(
+                validate(&asset, &valid_png()).unwrap().status,
+                SemanticStatus::Rejected,
+                "валидатор должен отвергать неверный URL источника: {source_url}"
+            );
+        }
+
+        let mismatched_id = "https://jpdb.io/vocabulary/124/幽霊/ゆうれい";
+        assert!(parse_jpdb_vocabulary_route(mismatched_id).is_ok());
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.source_url = mismatched_id.into();
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected,
+            "структурно допустимый маршрут с неверным ID в метаданных отвергается"
+        );
+    }
+
+    #[test]
+    fn metadata_surface_and_reading_must_be_an_observed_pair() {
+        let mut metadata = valid_metadata("幽霊");
+        metadata.reading = "げんき".into();
+        metadata
+            .evidence
+            .resolved_forms
+            .push(PitchAccentResolvedForm {
+                surface: "元気".into(),
+                reading: "げんき".into(),
+            });
+        let asset = record(Some(metadata));
+
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn dark_theme_graph_set_and_native_capture_geometry_are_required() {
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.kind = PitchAccentRenderKind::ElementScreenshot;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata
+            .evidence
+            .render
+            .dark_theme
+            .document_element_classes
+            .clear();
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.dark_theme.prefers_color_scheme = "light".into();
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.page_scale_factor = 1.25;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.capture_rect.width = 2.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.graph_count = 2;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn native_capture_clip_rounding_allows_at_most_three_output_pixels() {
+        assert!(capture_pixel_dimensions_match(111, 81, 36.0, 26.0, 3.0));
+        assert!(capture_pixel_dimensions_match(
+            318, 279, 106.047, 93.781, 3.0
+        ));
+        assert!(!capture_pixel_dimensions_match(112, 78, 36.0, 26.0, 3.0));
+        assert!(!capture_pixel_dimensions_match(108, 82, 36.0, 26.0, 3.0));
+    }
+
+    #[test]
+    fn jpdb_reading_comparison_only_equates_hiragana_and_katakana() {
+        assert!(jpdb_readings_equivalent("ネコ", "ねこ"));
+        assert!(jpdb_readings_equivalent("スーパー", "すーぱー"));
+        assert!(!jpdb_readings_equivalent("ネコ", "しょうじょ"));
+        assert!(!jpdb_readings_equivalent("NEKO", "ねこ"));
+    }
+
+    #[test]
+    fn validator_v4_does_not_trust_legacy_render_metadata() {
+        let mut legacy = serde_json::to_value(valid_metadata("幽霊")).unwrap();
+        let evidence = legacy["evidence"].as_object_mut().unwrap();
+        evidence.remove("resolved_forms");
+        let render = evidence["render"].as_object_mut().unwrap();
+        render.remove("graphs");
+        render.remove("page_scale_factor");
+        render.remove("dark_theme");
+        render.remove("capture_rect");
+
+        let mut asset = record(None);
+        asset.domain_metadata = Some(legacy);
+        let decision = validate(&asset, &valid_png()).unwrap();
+
+        assert_eq!(decision.status, SemanticStatus::Uncertain);
+        assert_eq!(
+            decision.evidence[0].kind,
+            "pitch_accent_evidence_incomplete"
+        );
+    }
+
+    #[test]
+    fn page_coordinate_geometry_offsets_graphs_by_document_scroll() {
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.scroll_y = 120.0;
+        metadata.evidence.render.graphs[0].document_rect.y = 220.0;
+        metadata.evidence.render.graph_union_rect.y = 220.0;
+        metadata.evidence.render.capture_rect.y = 212.0;
+        let asset = record(Some(metadata));
+
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Verified
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.graphs[0].document_rect.y += 1.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.graphs[0].document_rect.width += 1.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected,
+            "ширина графика в координатах документа должна совпадать с viewport"
+        );
+    }
+
+    #[test]
+    fn graph_union_capture_padding_and_document_page_bounds_are_verified() {
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.graphs[0].viewport_rect.y = 2.0;
+        metadata.evidence.render.graphs[0].document_rect.y = 2.0;
+        metadata.evidence.render.scroll_y = 0.0;
+        metadata.evidence.render.graph_union_rect.y = 2.0;
+        metadata.evidence.render.capture_rect.y = 0.0;
+        metadata.evidence.render.capture_rect.height = 20.0;
+        metadata.evidence.render.pixel_height = 60;
+        metadata.evidence.render.actual_capture_padding_css_px.top = 2.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &rgb_png(108, 60)).unwrap().status,
+            SemanticStatus::Verified,
+            "отступ ограничивается верхней границей документа и фиксируется"
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.graph_union_rect.width += 1.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.actual_capture_padding_css_px.left = 7.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.capture_rect.x = -1.0;
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn dark_capture_background_pixels_must_match_observed_solid_rgb() {
+        let asset = record(Some(valid_metadata("幽霊")));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Verified
+        );
+
+        let mut metadata = valid_metadata("幽霊");
+        metadata.evidence.render.dark_theme.background_rgb = [255, 255, 255];
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &white_png(108, 78)).unwrap().status,
+            SemanticStatus::Rejected,
+            "флаги тёмной темы не могут подтвердить светлый сплошной фон"
+        );
+
+        let asset = record(Some(valid_metadata("幽霊")));
+        assert_eq!(
+            validate(&asset, &white_png(108, 78)).unwrap().status,
+            SemanticStatus::Rejected,
+            "пиксели по краям снимка должны совпадать с наблюдённым тёмным RGB"
         );
     }
 

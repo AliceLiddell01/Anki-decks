@@ -805,7 +805,7 @@ fn nested_storage_paths_keep_the_explicit_consumer_filename_flat_in_media() {
         (
             AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
             "assets/png/幽霊.png",
-            "幽霊.png",
+            "幽霊.pitch.png",
             PNG,
         ),
     ];
@@ -864,8 +864,12 @@ fn unsafe_consumer_filenames_and_format_mismatches_fail_closed() {
         );
     }
 
-    let wrong_detected_format =
-        verified_asset_fixture(identity.clone(), "assets/png/幽霊.png", "幽霊.png", GIF);
+    let wrong_detected_format = verified_asset_fixture(
+        identity.clone(),
+        "assets/png/幽霊.png",
+        "幽霊.pitch.png",
+        GIF,
+    );
     let error = verified_asset_filename(&wrong_detected_format).unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 

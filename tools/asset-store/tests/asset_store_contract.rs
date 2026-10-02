@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asset_store::{
     AssetIdentity, AssetStore, BrowserExecutableSource, BrowserRuntimeProvenance, DetectedFormat,
-    ErrorCode, IngestRequest, LifecycleState, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
-    PitchAccentEvidence, PitchAccentImageValidator, PitchAccentProvider, PitchAccentRenderEvidence,
-    PitchAccentRenderKind, Provenance, SelectionMode, SemanticDecision, SemanticStatus,
-    SemanticValidator, StoreOptions, ValidationEvidence, ValidatorFailure, ValidatorIdentity,
-    VerifiedIngestRequest,
+    ErrorCode, IngestRequest, LifecycleState, PitchAccentCapturePadding, PitchAccentCaptureRect,
+    PitchAccentCoordinateSpace, PitchAccentDarkThemeProof, PitchAccentDomainMetadata,
+    PitchAccentDomainPolicy, PitchAccentEvidence, PitchAccentGraphEvidence,
+    PitchAccentImageValidator, PitchAccentProvider, PitchAccentRenderEvidence,
+    PitchAccentRenderKind, PitchAccentResolvedForm, Provenance, SelectionMode, SemanticDecision,
+    SemanticStatus, SemanticValidator, StoreOptions, ValidationEvidence, ValidatorFailure,
+    ValidatorIdentity, VerifiedIngestRequest,
 };
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -915,23 +917,75 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
     let policy = PitchAccentDomainPolicy;
     let store = AssetStore::open_with_policy(StoreOptions::new(&root), policy).unwrap();
     let identity = AssetIdentity::new("pitch_accent", "幽霊").unwrap();
-    let bytes = synthetic_png();
+    let bytes = pitch_accent_contract_png();
     let metadata = PitchAccentDomainMetadata {
         surface: "幽霊".into(),
         reading: "ゆうれい".into(),
         jpdb_vocabulary_id: 123,
         evidence: PitchAccentEvidence {
             provider: PitchAccentProvider::Jpdb,
-            source_url: "https://jpdb.io/vocabulary/123".into(),
+            source_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい#a".into(),
+            resolved_forms: vec![PitchAccentResolvedForm {
+                surface: "幽霊".into(),
+                reading: "ゆうれい".into(),
+            }],
             graph_count: 1,
             render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::ElementScreenshot,
+                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
                 selector: ".pitch-accent-graph".into(),
+                graphs: vec![PitchAccentGraphEvidence {
+                    index: 0,
+                    selector: ".pitch-accent-graph".into(),
+                    viewport_rect: PitchAccentCaptureRect {
+                        x: 100.0,
+                        y: 100.0,
+                        width: 20.0,
+                        height: 10.0,
+                    },
+                    document_rect: PitchAccentCaptureRect {
+                        x: 100.0,
+                        y: 200.0,
+                        width: 20.0,
+                        height: 10.0,
+                    },
+                }],
+                coordinate_space: PitchAccentCoordinateSpace::Document,
                 viewport_width: 1280,
                 viewport_height: 900,
-                pixel_width: 2,
-                pixel_height: 2,
+                document_width: 1280,
+                document_height: 1800,
+                scroll_x: 0.0,
+                scroll_y: 100.0,
+                pixel_width: 108,
+                pixel_height: 78,
                 device_scale_factor: 3.0,
+                page_scale_factor: 1.0,
+                dark_theme: PitchAccentDarkThemeProof {
+                    document_element_classes: vec!["dark-mode".into()],
+                    prefers_color_scheme: "dark".into(),
+                    computed_color_scheme: "dark".into(),
+                    background_selector: ".subsection-pitch-accent".into(),
+                    background_rgb: [24, 36, 48],
+                },
+                graph_union_rect: PitchAccentCaptureRect {
+                    x: 100.0,
+                    y: 200.0,
+                    width: 20.0,
+                    height: 10.0,
+                },
+                capture_padding_css_px: 8.0,
+                actual_capture_padding_css_px: PitchAccentCapturePadding {
+                    top: 8.0,
+                    right: 8.0,
+                    bottom: 8.0,
+                    left: 8.0,
+                },
+                capture_rect: PitchAccentCaptureRect {
+                    x: 92.0,
+                    y: 192.0,
+                    width: 36.0,
+                    height: 26.0,
+                },
             },
             browser: BrowserRuntimeProvenance {
                 product: "Chrome/140".into(),
@@ -950,7 +1004,7 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
                 bytes: bytes.clone(),
                 provenance: Provenance {
                     source_kind: "jpdb-browser".into(),
-                    source_name: "幽霊.png".into(),
+                    source_name: "幽霊.pitch.png".into(),
                 },
                 domain_metadata: Some(serde_json::to_value(metadata).unwrap()),
                 replace_expected_sha256: None,
@@ -961,7 +1015,7 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
     let record = outcome.asset.expect("полное JPDB evidence публикует PNG");
     assert_eq!(record.identity, identity);
     assert_eq!(record.storage_path, "assets/png/幽霊.png");
-    assert_eq!(record.consumer_filename, "幽霊.png");
+    assert_eq!(record.consumer_filename, "幽霊.pitch.png");
     assert!(root.join("assets/png/幽霊.png").is_file());
     assert_eq!(store.verify_integrity().unwrap()[0].sha256, record.sha256);
 
@@ -988,8 +1042,8 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
     AssetStore::verify_publishable_corpus_with_policy(&root, &policy, &validator).unwrap();
     let read =
         AssetStore::read_verified_with_policy(&root, &[identity], &validator, &policy).unwrap();
-    assert_eq!(read[0].record.consumer_filename, "幽霊.png");
-    assert_eq!(read[0].bytes, synthetic_png());
+    assert_eq!(read[0].record.consumer_filename, "幽霊.pitch.png");
+    assert_eq!(read[0].bytes, pitch_accent_contract_png());
     assert!(AssetStore::open_kanji_existing(StoreOptions::new(&root)).is_err());
     assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_err());
 }
@@ -1082,8 +1136,8 @@ fn wrong_domain_schema_v5_open_does_not_create_runtime_or_poison_owner() {
     assert!(reopened.verify_integrity().unwrap().is_empty());
 }
 
-fn synthetic_png() -> Vec<u8> {
-    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([24, 36, 48, 255]));
+fn pitch_accent_contract_png() -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(108, 78, image::Rgba([24, 36, 48, 255]));
     let mut output = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image)
         .write_to(&mut output, image::ImageFormat::Png)
