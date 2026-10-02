@@ -1,12 +1,12 @@
-//! Human renderer: компактный текст на русском языке.
+//! Человекочитаемый вывод: компактный текст на русском языке.
 //!
-//! Renderer не выполняет доменную работу: он только печатает уже готовый
-//! domain result — включая адресуемость заметок и состав групп, которые команды
-//! уже вычислили. Значения полей в human-режиме приводятся к одной строке и
+//! Модуль вывода не выполняет доменную работу: он только печатает уже готовый
+//! доменный результат — включая адресуемость заметок и состав групп, которые команды
+//! уже вычислили. Значения полей в человекочитаемом режиме приводятся к одной строке и
 //! ограничиваются по длине.
 //!
 //! Сообщение об усечении обязано называть реальную причину и реальный способ
-//! получить остаток. `--json` сериализует ровно тот же vector, поэтому
+//! получить остаток. `--json` сериализует ровно тот же вектор, поэтому
 //! «полный список доступен в --json» запрещено: это обещание, которого команда
 //! не выполняет.
 
@@ -25,7 +25,7 @@ use crate::ops::stats::StatsResult;
 use crate::ops::validate::{Severity, ValidateResult};
 use crate::ops::visual_report::{NoteChangeKind, VisualReportResult};
 
-/// Предел длины значения поля в human-режиме.
+/// Предел длины значения поля в человекочитаемом режиме.
 pub const VALUE_LIMIT: usize = 300;
 
 #[derive(Default)]
@@ -907,7 +907,7 @@ fn describe_related(positions: &[usize], guids: &[String]) -> String {
         .join(", ")
 }
 
-/// Печатает участников группы batch'а в форме `note_index (guid)`.
+/// Печатает участников группы набора в форме `note_index (guid)`.
 fn describe_related_notes(related: &[crate::ops::review::RelatedNote]) -> String {
     if related.is_empty() {
         return "—".to_string();
@@ -945,7 +945,7 @@ fn describe_selection(result: &ReviewResult) -> String {
     parts.join("; ")
 }
 
-/// Human-readable представление `models`.
+/// Человекочитаемое представление `models`.
 pub fn models(result: &ModelsResult) -> String {
     let mut out = Out::default();
 
@@ -1043,7 +1043,7 @@ pub fn models(result: &ModelsResult) -> String {
     out.finish()
 }
 
-/// Human-readable представление `create`.
+/// Человекочитаемое представление `create`.
 pub fn create(result: &CreateResult) -> String {
     let mut out = Out::default();
 
@@ -1174,7 +1174,7 @@ pub fn create(result: &CreateResult) -> String {
     out.finish()
 }
 
-/// Human-readable представление `retire`.
+/// Человекочитаемое представление `retire`.
 pub fn retire(result: &RetireResult) -> String {
     let mut out = Out::default();
 
@@ -1256,7 +1256,7 @@ pub fn retire(result: &RetireResult) -> String {
     out.finish()
 }
 
-/// Human-readable представление `visual-report`.
+/// Человекочитаемое представление `visual-report`.
 pub fn visual_report(result: &VisualReportResult) -> String {
     let mut out = Out::default();
 
@@ -1447,7 +1447,7 @@ fn push_validation(out: &mut Out, validation: &crate::ops::source::ValidationDel
     }
 }
 
-/// Имя вида модели для human-readable вывода.
+/// Имя вида модели для человекочитаемого вывода.
 fn model_kind_name(kind: crate::template::ModelKind) -> &'static str {
     match kind {
         crate::template::ModelKind::Standard => "standard",
@@ -1455,7 +1455,7 @@ fn model_kind_name(kind: crate::template::ModelKind) -> &'static str {
     }
 }
 
-/// Human-readable представление `migrate-media`.
+/// Человекочитаемое представление `migrate-media`.
 pub fn migrate_media(result: &MigrationResult) -> String {
     let mut out = Out::default();
 
@@ -1502,16 +1502,23 @@ pub fn migrate_media(result: &MigrationResult) -> String {
     match &result.legacy_media {
         Some(digest) => {
             out.line(format!(
-                "Освободившееся имя занято файлом: media/{} — {} байт, sha256 {}",
+                "Прежний файл до миграции: media/{} — {} байт, sha256 {}",
                 digest.filename, digest.byte_length, digest.sha256
             ));
         }
         None => {
             out.line(format!(
-                "Освободившееся имя media/{} физически не занято",
+                "Прежний файл до миграции: media/{} физически отсутствовал",
                 result.legacy_filename
             ));
         }
+    }
+    if result.legacy_released {
+        out.line("После применения legacy-имя освобождено");
+    } else if result.legacy_media_exists_after {
+        out.line("После завершения команды legacy-файл существует");
+    } else {
+        out.line("После завершения команды legacy-файл отсутствует");
     }
     if !result.changed {
         out.line("Мигрировать нечего: повторный прогон ничего не меняет");

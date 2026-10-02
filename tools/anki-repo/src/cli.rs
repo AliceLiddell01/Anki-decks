@@ -1,7 +1,7 @@
 //! CLI-контракт `anki-repo`.
 //!
-//! Здесь только описание аргументов. Никакой доменной логики: разбор
-//! превращается в domain-запросы в [`crate::run`].
+//! Здесь только описание аргументов. Предметной логики нет: разбор
+//! превращается в запросы для [`crate::run`].
 
 use std::path::PathBuf;
 
@@ -11,13 +11,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub const DEFAULT_LIMIT: u64 = 20;
 /// Жёсткий максимум результата `find`.
 pub const MAX_LIMIT: u64 = 500;
-/// Предел distribution output `stats` по умолчанию.
+/// Предел числа элементов распределения `stats` по умолчанию.
 pub const DEFAULT_TOP: u64 = 20;
-/// Жёсткий максимум distribution output `stats`.
+/// Максимально допустимое число элементов распределения `stats`.
 pub const MAX_TOP: u64 = 500;
-/// Предел findings на один код для `qa` по умолчанию.
+/// Предел результатов на один код для `qa` по умолчанию.
 pub const DEFAULT_QA_MAX_PER_CODE: u64 = 20;
-/// Жёсткий максимум findings на один код для `qa`.
+/// Жёсткий максимум результатов на один код для `qa`.
 pub const MAX_QA_MAX_PER_CODE: u64 = 200;
 /// Предел страницы `review` по умолчанию.
 pub const DEFAULT_REVIEW_LIMIT: u64 = 25;
@@ -48,27 +48,32 @@ pub enum MatchArg {
     Exact,
 }
 
-/// Toolkit для CrowdAnki-экспортов репозитория Anki-decks.
+/// Инструменты для CrowdAnki-экспортов репозитория Anki-decks.
 #[derive(Debug, Parser)]
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ, QA-review, создание и вывод из обращения заметок CrowdAnki: inspect, find, stats, validate, qa, review, review-check, models, create, retire, visual-report",
-    long_about = "Анализ, QA-review и правка одного CrowdAnki-экспорта.\n\
+    about = "Анализ, проверка и ограниченные изменения CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, visual-report",
+    long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models и\n\
                   visual-report только читают.\n\
                   edit меняет значения существующих полей существующих заметок.\n\
-                  create добавляет заметки в существующие колоды существующих моделей.\n\
+                  create добавляет заметки в существующие колоды и модели.\n\
                   retire помечает заметки тегом вместо физического удаления.\n\
-                  Все три мутирующие команды пишут только по явному --apply, только\n\
-                  для канонического deck.json и только после проверок предусловий.\n\
-                  Имена полей берутся из фактической модели экспорта: models показывает\n\
-                  схему полей и свидетельства по значениям.\n\
-                  Toolkit не вызывает LLM API и не ходит в сеть.",
+                  migrate-media переводит только доказанные ссылки с legacy-имени домена.\n\
+                  Все изменяющие команды по умолчанию выполняют dry-run; запись возможна\n\
+                  только с явным --apply и после проверок предусловий.\n\
+                  edit и retire меняют только канонический deck.json. create меняет\n\
+                  deck.json и размещает только проверенные файлы, разрешённые явными\n\
+                  правилами домена. migrate-media меняет deck.json, размещает проверенный\n\
+                  канонический файл и удаляет legacy-файл только после доказательства\n\
+                  пары identity—имя и проверки всех потребителей.\n\
+                  Схему полей показывает models. Инструменты не вызывают LLM API и\n\
+                  не ходят в сеть.",
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Вывести стабильный machine-readable JSON вместо human-readable текста.
+    /// Вывести стабильный машиночитаемый JSON вместо текста для человека.
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -106,7 +111,7 @@ pub enum Command {
     Inspect {
         /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
-        /// Добавить UUID, deck paths, шаблоны и bounded sample диагностики.
+        /// Добавить UUID, пути подколод, шаблоны и ограниченную выборку диагностики.
         #[arg(long)]
         verbose: bool,
     },
@@ -160,7 +165,7 @@ pub enum Command {
         #[arg(long)]
         group_by: Option<String>,
 
-        /// Предел размера distribution output (только вместе с --group-by).
+        /// Предел размера распределения (только вместе с --group-by).
         #[arg(
             long,
             requires = "group_by",
@@ -175,7 +180,7 @@ pub enum Command {
         export_dir: PathBuf,
     },
 
-    /// Детерминированные QA-findings по содержимому карточек.
+    /// Детерминированные результаты QA по содержимому карточек.
     Qa {
         /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
@@ -184,7 +189,7 @@ pub enum Command {
         #[arg(long = "code", value_name = "CODE")]
         codes: Vec<String>,
 
-        /// Предел числа findings на один код; остальные только считаются.
+        /// Предел числа результатов на один код; остальные только считаются.
         #[arg(
             long,
             default_value_t = DEFAULT_QA_MAX_PER_CODE,
@@ -193,7 +198,7 @@ pub enum Command {
         max_per_code: u64,
     },
 
-    /// Компактный bounded batch карточек для внешнего review.
+    /// Компактный ограниченный пакет карточек для внешней проверки.
     #[command(group(
         clap::ArgGroup::new("criteria")
             .required(true)
@@ -292,7 +297,11 @@ pub enum Command {
         sample_limit: u64,
     },
 
-    /// Создание заметок в существующих колодах существующих моделей.
+    /// Создание заметок в существующих колодах и моделях.
+    ///
+    /// Ссылки на media по умолчанию запрещены. Явные правила для точной модели,
+    /// поля и домена могут разрешить только проверенные файлы; с `--apply`
+    /// файлы размещаются в `media/`, а их имена добавляются в `media_files`.
     Create {
         /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
         export_dir: PathBuf,
@@ -301,7 +310,7 @@ pub enum Command {
         #[arg(long = "request", value_name = "PATH")]
         request_file: PathBuf,
 
-        /// Записать заметки в deck.json. Без флага выполняется только dry-run.
+        /// Записать заметки и разрешённые объявления `media_files`, разместить проверенные файлы. Без флага — только dry-run.
         #[arg(long)]
         apply: bool,
 
@@ -309,7 +318,7 @@ pub enum Command {
         #[arg(long = "emit-resolved", value_name = "PATH")]
         emit_resolved: Option<PathBuf>,
 
-        /// Правила создания; по умолчанию .anki-repo/create.yaml из репозитория экспорта.
+        /// Правила создания заметок; по умолчанию .anki-repo/create.yaml из репозитория экспорта.
         #[arg(long)]
         create_config: Option<PathBuf>,
 
@@ -418,14 +427,12 @@ pub enum Command {
         apply: bool,
     },
 
-    /// Контролируемая миграция legacy consumer filename на каноническое имя домена.
+    /// Контролируемая миграция доказанных ссылок с legacy-имени домена.
     ///
-    /// Существует ровно для одного случая: прежний конвейер называл pitch-картинку
-    /// `<surface>.png`, и для односложного слова с kanji-fallback это имя совпадает
-    /// с каноническим именем изображения символа. Команда доказывает семантику
-    /// каждой ссылки, переводит их на каноническое имя домена и освобождает
-    /// legacy-имя. Ни одна ссылка с иной семантикой не переписывается: команда
-    /// останавливается и показывает свидетельства.
+    /// Политика домена должна доказать точную пару `AssetIdentity` и имени файла.
+    /// Команда проверяет всех потребителей в полях заметок, `qfmt`, `afmt` и CSS;
+    /// неподтверждённый потребитель блокирует миграцию целиком. По умолчанию
+    /// выполняется dry-run; запись возможна только с явным `--apply`.
     #[command(name = "migrate-media")]
     MigrateMedia {
         /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
@@ -443,11 +450,11 @@ pub enum Command {
         #[arg(long = "from", value_name = "FILENAME")]
         from: String,
 
-        /// Записать изменения в deck.json и освободить legacy-имя. Без флага — dry-run.
+        /// Записать проверенный deck.json и канонический файл, затем удалить legacy-файл. Без флага — только dry-run.
         #[arg(long)]
         apply: bool,
 
-        /// Правила создания; по умолчанию .anki-repo/create.yaml из репозитория экспорта.
+        /// Правила привязки доменных обработчиков; по умолчанию .anki-repo/create.yaml из репозитория экспорта.
         #[arg(long)]
         create_config: Option<PathBuf>,
 

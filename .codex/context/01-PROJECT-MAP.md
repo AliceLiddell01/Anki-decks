@@ -27,7 +27,7 @@ decks/
     └── words/
 tools/
 ├── anki-repo/               # toolkit анализа и точечной правки CrowdAnki-экспорта
-└── asset-store/             # общий asset core и CLI kanji-assets
+└── asset-store/             # общая библиотека ресурсов и CLI kanji-assets
 ```
 
 ## Владельцы
@@ -40,10 +40,12 @@ tools/
   `.agents/skills/anki-git-workflow/`, явно запрошенный CodeRabbit review cycle —
   `.agents/skills/anki-coderabbit-review/`.
 - `tools/anki-repo/` — Rust package `anki-repo` для анализа экспорта и строго
-  ограниченной записи в него (`edit`, `create`, `retire`) вместе со статическим
-  отчётом `visual-report`; его контракт описан в `tools/anki-repo/README.md`. Это участник корневого workspace, а не отдельный
+  ограниченной записи в него (`edit`, `create`, `retire`, `migrate-media`), а
+  также статического отчёта `visual-report`; контракт описан в
+  `tools/anki-repo/README.md`. Это участник корневого workspace, а не отдельный
   workspace: `cargo` запускается из корня репозитория.
-- `tools/asset-store/` — Rust package общего program-owned asset lifecycle core и
+- `tools/asset-store/` — Rust package общей библиотеки жизненного цикла ресурсов,
+  которыми управляет программа, и
   бинарника `kanji-assets`; его единственный публичный контракт —
   `tools/asset-store/README.md`. Пакет входит в корневой workspace и наследует
   его `edition` и MSRV. Он не зависит от Anki/Yarxi и не читает `decks/**/media/`.
@@ -94,5 +96,9 @@ repository gate: CI рекурсивно находит `deck.json` под `deck
 `flds[].ord` → `fields`, по умолчанию работает как dry-run, требует `--expect` и
 проверяет байтовый diff до записи. Новая заметка добавляется командой `create` (перед
 ней смотри фактическую схему полей через `models`), а вывод заметки из обращения —
-командой `retire` одним тегом: физического удаления в toolkit'е нет. Команды и
-контракт вывода описаны в `tools/anki-repo/README.md`.
+командой `retire` одним тегом: физического удаления заметок в toolkit'е нет.
+Единственное ограниченное исключение для существующей заметки — `migrate-media`,
+которая меняет доказанные media-ссылки после проверки пары identity—имя и всех
+потребителей. Ручная правка `deck.json` и файлов `media/` в обход команды
+запрещена. Создание колод и моделей toolkit не выполняет. Полный контракт
+команд и вывода описан в `tools/anki-repo/README.md`.

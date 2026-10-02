@@ -1,4 +1,4 @@
-//! Регрессии того, что общий core применяет семантику доверия, объявленную
+//! Регрессии того, что общий слой применяет семантику доверия, объявленную
 //! политикой домена, а не распознаёт домен по имени.
 //!
 //! Синтетические домены ниже намеренно не называются ни `kanji`, ни
@@ -276,7 +276,7 @@ fn declared_semantics_decide_trust_not_the_domain_name() {
 }
 
 /// `SelectionMode::New` следует объявленной семантике и для домена, которого
-/// общий core не знает по имени.
+/// общий слой не знает по имени.
 #[test]
 fn new_selection_follows_declared_semantics_for_an_unknown_domain() {
     let strict = Fixture::new("select-automated-only", AUTOMATED_ONLY);
@@ -304,7 +304,7 @@ fn new_selection_follows_declared_semantics_for_an_unknown_domain() {
 }
 
 /// Домен, объявивший метаданные частью семантики ресурса, получает CAS на
-/// повторную публикацию тех же bytes, даже если core не знает его имени.
+/// повторную публикацию тех же байтов, даже если общий слой не знает его имени.
 #[test]
 fn declared_metadata_cas_applies_without_recognising_the_domain() {
     let strict = Fixture::new("cas-automated-only", AUTOMATED_ONLY);
@@ -329,4 +329,40 @@ fn declared_metadata_cas_applies_without_recognising_the_domain() {
         unchanged.provenance.source_name, "candidate-a",
         "неизменённые байты сохраняют прежние сведения об источнике"
     );
+}
+
+#[test]
+fn domain_policy_owns_exact_legacy_consumer_filename_binding() {
+    use asset_store::{GenericDomainPolicy, KanjiDomainPolicy, PitchAccentDomainPolicy};
+    let pitch = AssetIdentity::new("pitch_accent", "飴").unwrap();
+    let kanji = AssetIdentity::new("kanji", "飴").unwrap();
+    let generic = AssetIdentity::new("fixture", "飴").unwrap();
+    assert!(PitchAccentDomainPolicy.proves_legacy_consumer_filename(&pitch, "飴.png"));
+    assert!(KanjiDomainPolicy.proves_legacy_consumer_filename(&kanji, "飴.png"));
+    assert!(KanjiDomainPolicy.proves_legacy_consumer_filename(&kanji, "飴.gif"));
+    for filename in [
+        "幽霊.png",
+        "飴.pitch.png",
+        "飴.PNG",
+        "media/飴.png",
+        "飴.jpg",
+        "飴.png ",
+    ] {
+        assert!(
+            !PitchAccentDomainPolicy.proves_legacy_consumer_filename(&pitch, filename),
+            "{filename}"
+        );
+        assert!(
+            !KanjiDomainPolicy.proves_legacy_consumer_filename(&kanji, filename),
+            "{filename}"
+        );
+    }
+    assert!(!PitchAccentDomainPolicy.proves_legacy_consumer_filename(&pitch, "飴.gif"));
+    assert!(!PitchAccentDomainPolicy.proves_legacy_consumer_filename(&kanji, "飴.png"));
+    assert!(!KanjiDomainPolicy.proves_legacy_consumer_filename(&pitch, "飴.png"));
+    assert!(!GenericDomainPolicy.proves_legacy_consumer_filename(&generic, "飴.png"));
+    assert!(!AUTOMATED_ONLY.proves_legacy_consumer_filename(
+        &AssetIdentity::new("fixture_auto", "飴").unwrap(),
+        "飴.png"
+    ));
 }

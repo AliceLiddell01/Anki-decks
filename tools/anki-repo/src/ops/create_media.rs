@@ -1,4 +1,5 @@
-//! Правила явного разрешения и локальный план размещения медиафайлов для create.
+//! Правила явного разрешения и локальный план размещения медиафайлов для `create`
+//! и `migrate-media`.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -107,7 +108,7 @@ impl ProcessorType {
         }
     }
 
-    /// Политика домена: canonical location, допустимый формат и trust semantics.
+    /// Политика домена: каноническое расположение, допустимый формат и уровень доверия.
     pub(crate) fn domain_policy(self) -> &'static dyn AssetDomainPolicy {
         match self {
             Self::KanjiAssets => &KanjiDomainPolicy,
@@ -181,7 +182,8 @@ impl MediaProcessor for ProcessorType {
 }
 
 /// Цепочка исполняется в порядке YAML. План публикуется только после проверки
-/// единственного владельца каждой ссылки и полного fail-closed media-гейта.
+/// единственного владельца каждой ссылки и полной проверки media, запрещающей
+/// запись при любой неопределённости.
 fn collect_processor_chain(
     processors: &[&dyn MediaProcessor],
     note_index: usize,
@@ -252,7 +254,7 @@ pub struct Routing {
     config: Option<PathBuf>,
     /// Разрешённые корни хранилищ по пространству имён доменов.
     ///
-    /// Domain ownership остаётся явным: один обработчик читает ровно своё
+    /// Владение доменом остаётся явным: один обработчик читает только своё
     /// хранилище и не получает неявного доступа к чужим.
     stores: BTreeMap<&'static str, PathBuf>,
 }
@@ -409,7 +411,7 @@ impl Routing {
     }
     /// Владеет ли это поле обработчиком указанного домена.
     ///
-    /// Нужно миграции legacy consumer filename: ссылку на старое имя вправе
+    /// Это нужно миграции старого имени файла в ссылках: ссылку вправе
     /// переписать только то поле, которому принадлежит каноническое имя домена.
     /// Включение обработчика на поле — часть конфигурации, а не догадка по имени
     /// поля, поэтому ответ берётся из разобранной policy.
@@ -608,8 +610,8 @@ impl Routing {
 }
 
 /// Отказывает, если два домена претендуют на одно плоское имя media с разными
-/// bytes. Совпадение имени при одинаковом SHA безвредно: потребитель видит одни
-/// и те же данные.
+/// байтами. Совпадение имени при одинаковом SHA безвредно: потребитель видит
+/// одни и те же данные.
 fn check_filename_ownership(items: &[Item]) -> Result<(), DomainError> {
     let mut owners = BTreeMap::<&str, (&AssetIdentity, &str)>::new();
     for item in items {
@@ -814,8 +816,9 @@ impl MediaPlan {
 }
 /// План размещения ровно одного проверенного файла.
 ///
-/// Миграция legacy consumer filename переиспользует тот же fail-closed placement,
-/// что и `create`: второй реализации записи файла в `media/` в toolkit'е нет.
+/// Миграция старого имени файла в ссылках использует ту же безопасную проверку
+/// размещения, что и `create`: второй реализации записи файла в `media/` в
+/// toolkit'е нет.
 impl MediaPlan {
     pub(crate) fn for_asset(asset: VerifiedAssetBytes, export: &Path) -> Result<Self, DomainError> {
         let filename = verified_asset_filename(&asset)?.to_owned();
@@ -873,13 +876,16 @@ pub(crate) fn media_file_digest(
 ///
 /// Отсутствие файла — не ошибка: миграция обязана сходиться и после обрыва между
 /// публикацией `deck.json` и удалением освободившегося имени.
-pub(crate) fn remove_media_file(guard: &ExportLock, name: &str) -> Result<(), DomainError> {
+pub(crate) fn remove_media_file(guard: &ExportLock, name: &str) -> Result<bool, DomainError> {
     let Some(media) = open_media(&guard.directory, false)? else {
-        return Ok(());
+        return Ok(false);
     };
     match unlinkat(&media, name, AtFlags::empty()) {
-        Ok(()) => media.sync_all().map_err(io_failure),
-        Err(rustix::io::Errno::NOENT) => Ok(()),
+        Ok(()) => {
+            media.sync_all().map_err(io_failure)?;
+            Ok(true)
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(false),
         Err(e) => Err(io_failure(e)),
     }
 }

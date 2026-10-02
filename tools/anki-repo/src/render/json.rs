@@ -1,6 +1,6 @@
-//! JSON renderer: стабильный machine-readable контракт schema_version 1.
+//! JSON-вывод: стабильный машиночитаемый контракт `schema_version: 1`.
 //!
-//! Human и JSON renderers получают один и тот же domain result. Имена
+//! Человекочитаемый и JSON-вывод получают один и тот же доменный результат. Имена
 //! JSON-ключей и кодов стабильны и не зависят от Rust-имён типов.
 
 use serde::Serialize;
@@ -23,7 +23,7 @@ use crate::ops::validate::{SeverityCounts, ValidateResult};
 use crate::ops::visual_report::{PreviewFileFact, ReportSide, VisualReportResult};
 use crate::template::ModelKind;
 
-/// Версия machine-readable контракта.
+/// Версия машиночитаемого контракта.
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize)]
@@ -49,8 +49,8 @@ struct ErrorBody<'a> {
 
 /// Поля заметки как JSON-объект в порядке `ord` модели.
 ///
-/// Порядок ключей задаётся самим domain result'ом, а не сортировкой имён.
-/// При дублирующихся именах полей (malformed модель) ключ получает суффикс
+/// Порядок ключей задаётся самим доменным результатом, а не сортировкой имён.
+/// При дублирующихся именах полей (некорректная модель) ключ получает суффикс
 /// `#N`, чтобы JSON оставался однозначным.
 struct OrderedFields<'a>(&'a [NamedField]);
 
@@ -1728,6 +1728,9 @@ struct MigrateMediaDto<'a> {
     legacy_filename: &'a str,
     legacy_declared: bool,
     legacy_media: Option<&'a LegacyMediaDigest>,
+    legacy_media_exists_after: bool,
+    legacy_declared_after: bool,
+    legacy_released: bool,
     references_total: usize,
     references_truncated: bool,
     references: &'a [MigratedReference],
@@ -1753,6 +1756,9 @@ impl<'a> From<&'a MigrationResult> for MigrateMediaDto<'a> {
             legacy_filename: &result.legacy_filename,
             legacy_declared: result.legacy_declared,
             legacy_media: result.legacy_media.as_ref(),
+            legacy_media_exists_after: result.legacy_media_exists_after,
+            legacy_declared_after: result.legacy_declared_after,
+            legacy_released: result.legacy_released,
             references_total: result.references_total,
             references_truncated: result.references_truncated,
             references: &result.references,

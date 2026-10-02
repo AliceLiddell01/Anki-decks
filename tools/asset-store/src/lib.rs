@@ -1,8 +1,9 @@
-//! Общий lifecycle core для program-owned assets.
+//! Общее ядро жизненного цикла ресурсов, принадлежащих программе.
 //!
-//! Core ничего не знает о CrowdAnki, Yarxi или конкретном типе медиа. В нём
-//! хранятся явные identities, hashes, provenance и semantic decisions. Предметный
-//! CLI `kanji-assets` использует этот API, не дублируя владение store.
+//! Общий слой ничего не знает о CrowdAnki, Yarxi или конкретном типе медиа. В нём
+//! хранятся явные идентичности, хеши, сведения о происхождении и семантические
+//! решения. Предметный CLI `kanji-assets` использует этот API, не дублируя
+//! владение хранилищем.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("asset-store currently supports Linux only");

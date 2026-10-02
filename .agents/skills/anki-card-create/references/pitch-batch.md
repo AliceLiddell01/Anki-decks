@@ -1,33 +1,57 @@
-# Pitch-accent batch и ручная проверка
+# Пакет pitch-accent и ручная проверка
 
-Эта инструкция применяется, когда фактическая `.anki-repo/create.yaml`
-назначает `pitch_accent` полю создаваемой заметки. Публичные команды и их JSON
-contract принадлежат `tools/asset-store/README.md`; здесь дан порядок
-оркестрации. При расхождении проверь `pitch-assets --help` и owner README.
-Не заменяй отсутствующий API ad hoc скриптом, который меняет manifest или
-самостоятельно рисует/сравнивает графики.
+Применяется, когда фактическая `.anki-repo/create.yaml` назначает `pitch_accent`
+полю создаваемой заметки. Публичные команды и JSON принадлежат
+`tools/asset-store/README.md`; здесь задана оркестрация. При расхождении проверь
+`pitch-assets --help` и README владельца. Не заменяй отсутствующий API скриптом,
+который меняет манифест или самостоятельно рисует/сравнивает графики.
 
-## Зависимости
+## Зависимости и исходный снимок
 
-Identity pitch-ресурса — точный `surface` слова, поэтому canonical имя файла
-остаётся surface-based независимо от чтения. Извлекай surfaces только из полей,
-которым policy назначила `pitch_accent`, и дедуплицируй их между notes. Чтение
-(`reading`) повышает точность resolver'а и передаётся отдельно; оно не входит ни
-в identity, ни в имя файла.
+Идентичность — точная `surface` слова; чтение `reading` уточняет поиск и не входит
+в идентичность или имя файла. Получай оба значения из явно сохранённого
+семантического входа новой заметки по сопоставлению в [SKILL.md](../SKILL.md).
+Поле, назначенное `pitch_accent`, — потребитель результата, оно может быть
+пустым при планировании и получении. Не извлекай слово из него. Пример
+пустого выходного поля — [semantic-input.md](semantic-input.md).
+Дедуплицируй одинаковые запросы; несовместимые чтения одной `surface` нельзя
+молча объединять.
 
-Хранилище по умолчанию — `.asset-store/pitch-accent` в корне checkout; `create`
-читает его офлайн и никогда не ходит в сеть. Acquisition выполняет только
-`pitch-assets`.
+Хранилище — `.asset-store/pitch-accent` в корне checkout; `create` читает его
+офлайн. Получение выполняет только `pitch-assets`.
+Перед `batch start` сохрани push remote, default branch и точный SHA base,
+проверь каноническую область через `pitch-corpus-gate` и Git на отсутствие
+отличий от base. Сохрани полный исходный JSON:
+
+```bash
+cargo run --locked --bin pitch-assets -- --output json corpus list
+cargo run --locked --bin pitch-assets -- --output json corpus check
+```
+
+`corpus list` возвращает `operation = corpus_list`, `outcome = listed`,
+`records[]` с записями `AssetRecord`, а не кандзи `assets[]`. Сохрани
+`identity`, `sha256`, `storage_path`, `consumer_filename`, `lifecycle`,
+`validation` и сведения домена для сравнения байтов и доверия. Для пригодной
+записи `lifecycle = verified`, `validation.status = verified`,
+`validation.content_sha256 = sha256`; актуальность валидатора и свидетельств
+подтверждает `corpus check`/`pitch-corpus-gate`. Не вычисляй доверие только из
+хеша или осмотра PNG, не разбирай манифест самостоятельно.
+
+При отсутствии каталога **и** канонического корпуса в сохранённой base пустой
+снимок допустим только по точному отказу `corpus list`: код завершения `4`,
+`outcome = failed`, `error.code = store_missing`. Условие кандзи
+`outcome = blocked` сюда не переносится. Другая ошибка закрывает публикацию.
+Снимок и SHA base неизменны при возобновлении; без доказанной исходной точки пакет
+можно продолжать, а публикация остаётся `LOCAL_READY_TO_PUBLISH`.
 
 ## Запуск и возобновление
 
 Состоянием пакета владеет `pitch-assets` под
-`.asset-store/pitch-accent/.runtime/batches/<batch-id>/`. Сохраняй batch ID в
-локальном workflow state вне `decks/**` и Git. Повторный запуск с тем же ID
-возобновляет тот же requested set; тот же ID с другим планом отвергается
-(`identity_conflict`).
+`.asset-store/pitch-accent/.runtime/batches/<batch-id>/`. ID и исходный план
+сохраняй вне `decks/**` и Git. Тот же ID возобновляет тот же исходный план;
+другой план отвергается (`identity_conflict`).
 
-План — обычный JSON, а не второй источник identity:
+План готовится из семантического входа, без зависимости от выходного поля:
 
 ```json
 {
@@ -40,135 +64,133 @@ Identity pitch-ресурса — точный `surface` слова, поэто�
 ```
 
 ```bash
-# Создать пакет из плана; при отсутствии --batch-id владелец выдаст ID.
+# Создать пакет; без --batch-id владелец выдаст ID.
 cargo run --locked --bin pitch-assets -- --output json batch start \
   --batch-id <id> --plan <plan.json>
 
-# Пройти текущий frontier.
+# Получить ресурсы текущего набора.
 cargo run --locked --bin pitch-assets -- --output json batch run --batch-id <id>
 
-# Продолжить прерванный прогон тем же код-путём.
+# Продолжить прерванный прогон тем же путём.
 cargo run --locked --bin pitch-assets -- --output json batch resume --batch-id <id>
 
-# Прочитать persistent machine state без сети и браузера.
+# Перечитать состояние без сети и браузера, сверив его с владельцем корпуса.
 cargo run --locked --bin pitch-assets -- --output json batch status --batch-id <id>
 ```
 
-`batch status` не ходит в сеть и не запускает браузер — это единственный
-безопасный способ перечитать состояние перед действием.
+`batch status` может сохранить обновлённое состояние при сверке с корпусом;
+его `changed` не обязательно `false`. Это офлайн путь перечитать пакет перед
+действием. Ответ содержит `batch_id`, `batch`, `items`, `blockers`, `artifact`;
+для элемента проверяй `surface`, `reading`, `status`,
+`current_candidate_sha256`, `canonical_sha256` и `last_outcome`.
+В pitch нет полей кандзи `counts.effective_verified`,
+`items[].effective_verified` или `published_sha256`.
 
-**Сессия браузера одна на хост.** Acquisition kanji и pitch используют общий
-runner-каталог браузера, поэтому одновременный запуск `kanji-assets batch run`
-и `pitch-assets batch run` роняет вторую сессию на `browser_setup`
-(`SingletonLock: File exists`). Выполняй браузерные acquisition последовательно,
-а не параллельно; конфликт — это retryable техническая ошибка, а не отказ
-источника.
+**Сессия браузера одна на хост.** Кандзи и pitch-accent делят каталог браузера.
+Одновременные `batch run` могут завершить вторую сессию `browser_setup`
+(`SingletonLock: File exists`). Запускай получение последовательно;
+это технический отказ с возможностью повтора, а не отсутствие слова/ударения.
 
-## Исходы и что с ними делать
+## Исходы и действия
 
-Разрешённые (`is_resolved`, exit `0`): `no_pitch_accent_on_source`,
-`published`, `existing_verified`.
+Разрешённые статусы: `no_pitch_accent_on_source`, `published`,
+`existing_verified`. Код завершения `0` от `batch status` означает успешное чтение,
+а не разрешение каждого элемента; проверяй `items[].status` и `blockers`.
 
-| Статус | Что делать |
+| Статус | Действие |
 |---|---|
 | `pending` | `batch run` или `batch resume` |
 | `acquired_verified`, `publication_pending` | следующий `run`/`resume` завершит публикацию |
-| `existing_verified`, `published` | готово |
-| `no_pitch_accent_on_source` | готово: у слова действительно нет pitch на источнике |
-| `ambiguous_vocabulary` | `batch select` с явным выбором, затем `run` |
-| `vocabulary_not_found` | **не** доказательство отсутствия pitch: замени слово |
-| отказ `create` по занятому имени файла | legacy-конфликт имён, а не отсутствующая зависимость: см. «Canonical имя и legacy-конфликт» ниже |
-| `technical_failure` | `batch retry`, только если исход retryable |
+| `existing_verified`, `published` | ресурс готов; сверь канонический SHA |
+| `no_pitch_accent_on_source` | зависимость разрешена без медиа |
+| `ambiguous_vocabulary` | явный `batch select`, затем `run` |
+| `vocabulary_not_found` | зависимость не разрешена; уточни слово/чтение у пользователя |
+| `technical_failure` | `batch retry`, только если отказ допускает повтор |
 | `candidate_rejected` | `batch reacquire`, затем `run` |
-| `conflict` | сначала `batch status`, затем `batch reacquire` с `--reason` |
+| `conflict` | перечитай `batch status`, затем явный `batch reacquire` с `--reason` |
 
-`no_pitch_accent_on_source` — полноценная разрешённая зависимость: пустая запись
-и placeholder media не создаются, а поле карточки остаётся пустым. Это не ошибка
-и не повод менять слово.
+`no_pitch_accent_on_source` не создаёт пустую запись или изображение-заглушку;
+поле остаётся пустым. `vocabulary_not_found` не доказывает отсутствие pitch:
+не подставляй пустое поле и не заменяй запрошенное слово без основания.
+Отказ `create` по занятому имени — отдельный конфликт прежнего имени.
 
-`vocabulary_not_found` не означает отсутствие pitch. Не подставляй пустое поле по
-этому исходу: замени test word или передай решение пользователю.
-
-`ambiguous_vocabulary` никогда не разрешай автоматическим выбором первого
-candidate. Передавай `reading`, если он объективно известен; если после свежего
-search выбор всё ещё неоднозначен, запроси решение человека. Механизм выбора —
-только owner API, который сверяет `vocabulary_id` и `detail_url` со свежим
-списком кандидатов:
+При неоднозначности передавай объективно известное `reading`. Не выбирай
+первого кандидата автоматически; если свежий поиск неоднозначен, нужен выбор
+человека. Перед точечным решением создай отчёт:
 
 ```bash
+cargo run --locked --bin pitch-assets -- --output json batch review --batch-id <id>
+
 cargo run --locked --bin pitch-assets -- --output json batch select \
   --batch-id <id> --surface 重複語 --vocabulary-id <id> \
   --detail-url 'https://jpdb.io/vocabulary/<id>/重複語/ちょうふくご'
 ```
 
-Перед точечными командами создай review artifact и передай его пользователю:
-
-```bash
-cargo run --locked --bin pitch-assets -- --output json batch review --batch-id <id>
-```
-
-Ответ содержит `artifact` — локальный HTML в ignored runtime. `batch retry`
-допустим только для retryable технической ошибки; при неретраибельном исходе
-владелец вернёт `invalid_transition`. `batch reject` требует точный текущий
-`--sha256` из истории кандидатов пакета.
+`artifact` — локальный HTML в игнорируемом служебном каталоге. Владелец сверяет ID и
+`detail_url` со свежим списком кандидатов. `batch retry` при отказе без
+возможности повтора возвращает `invalid_transition`; `batch reject` требует
+точный текущий `--sha256` из истории кандидатов пакета.
 
 ## Доверие
 
-Pitch-домен считает ресурс пригодным для карточки только при current automated
-`VERIFIED` от ожидаемого валидатора для exact SHA. Подтверждение человека не
-заменяет и не переписывает это решение, поэтому «этот график выглядит верно» не
-делает неverified кандидат пригодным: нужен новый acquisition generation
-(`batch reacquire`) с текущим валидатором. Это отличается от `kanji_assets`, где
-явное решение человека по exact bytes даёт effective trust.
+Pitch принимает только текущее автоматическое `VERIFIED` ожидаемого валидатора
+для точного SHA. Одобрение человека не заменяет это решение: нужен новый
+`batch reacquire` с текущим валидатором. Доверие кандзи по решению человека
+сюда не переносится. `create` не принимает `REJECTED`, `UNCERTAIN`, устаревшие
+свидетельства или незавершённую публикацию. При `pitch_asset_missing` или
+`asset_integrity_invalid` сверь `batch status` и `corpus check`.
 
-`create` читает только canonical verified records; `REJECTED`, `UNCERTAIN`,
-устаревшее evidence другой версии валидатора и незавершённая публикация для него
-не ресурс. Если `create` возвращает `pitch_asset_missing` или
-`asset_integrity_invalid`, сверь `batch status` и `corpus check`, а не подменяй
-ссылку вручную.
+## Каноническое имя и прежний конфликт
 
-## Canonical имя и legacy-конфликт
+Имя — `<surface>.pitch.png`. Прежнее `<surface>.png` может конфликтовать с
+резервным изображением символа в общем `media/`; `create` отказывает
+(`destination_media_conflict`). Разрешай конфликт через `anki-repo migrate-media`,
+которая доказывает связь идентичности с прежним именем и семантику каждого живого
+потребителя. Порядок — [SKILL.md](../SKILL.md), раздел «Прежнее имя
+файла-потребителя»; контракт — `tools/anki-repo/README.md`.
+Не переименовывай файл и не правь `deck.json` руками, не заканчивай набор на
+N−1 заметках и не меняй слово из-за занятого имени.
 
-Canonical имя pitch-файла — `<surface>.pitch.png`, и оно остаётся таким всегда.
-Прежний конвейер называл файл `<surface>.png`; для односложного слова с
-kanji-fallback это имя совпадает с canonical именем изображения символа, и под
-одним именем в плоском `media/` оказываются два разных файла. `create` в этом
-случае отказывает (`destination_media_conflict`), а не выбирает, чьи байты важнее.
+## Сверка публикации
 
-Это разрешено **не** переименованием файла и не правкой `deck.json` руками, а
-командой `anki-repo migrate-media`, которая доказывает семантику каждой живой
-ссылки и переводит её на canonical имя. Порядок, доказательства и итоговый отчёт —
-в [SKILL.md](../SKILL.md), раздел «Legacy consumer filename»; контракт команды —
-в `tools/anki-repo/README.md`. Не заканчивай набор на N−1 заметках и не заменяй
-слово из-за этого отказа: конфликт ожидаем и разрешается миграцией.
+Общий порядок и проверка прав администратора принадлежат [SKILL.md](../SKILL.md).
+Для pitch-accent повтори **его** `corpus list`, `corpus check` и `batch status`.
+Все `items[].status` должны быть разрешены, `blockers` пусты. Для
+`published`/`existing_verified` запись `records[]` этой `surface` имеет
+`sha256 = items[].canonical_sha256` и текущее автоматическое доверие;
+у опубликованного кандидата сверь также `current_candidate_sha256`.
+`no_pitch_accent_on_source` разрешает элемент без записи и файла; исход
+провайдера в `last_outcome` и `batch` служит свидетельством отсутствия pitch,
+а не пустой снимок владельца.
 
-## Продвижение карточек
+Сравни записи по идентичности/SHA/доверию с сохранённым исходным снимком. Разница
+должна принадлежать исходному плану пакета; независимые идентичности сохраняются.
+Ветка — `pitch-assets/<batch-id>` от сохранённого SHA, отдельно от кандзи.
+Разрешённые пути внутри `.asset-store/pitch-accent`: `.owner.json`, `manifest.json`,
+непосредственные `assets/png/*.png`. Служебные данные и отчёты исключены. Проверку корпуса запускай
+текущим кодом с CWD worktree:
 
-После каждого раунда снова прочитай `batch status` и продвигай notes, у которых
-**все** processor dependencies разрешены. Разрешённые `no_pitch_accent_on_source`
-не блокируют создание: их поле остаётся пустым. Notes с неразрешённой pitch
-зависимостью остаются pending без placeholder media; остальные notes создавай,
-не дожидаясь ручного решения по ним.
+```bash
+cargo run --quiet --locked --manifest-path <checkout>/Cargo.toml \
+  -p asset-store --bin pitch-corpus-gate
+```
 
-## Публикация canonical pitch corpus
+После объединения с актуальной base, при возобновлении и после отдельно разрешённого
+merge повтори **pitch** снимок владельца и проверку корпуса; сверь сохранность независимых
+идентичностей и SHA/доверие пакета. Ошибка, посторонняя разница или нерешённый конфликт
+оставляет `LOCAL_READY_TO_PUBLISH` без повторного получения.
 
-Pitch-корпус публикуется тем же порядком, что и kanji-корпус, отдельной
-asset-only веткой от сохранённого baseline SHA, и только после terminal
-resolution requested identities. Stage только принадлежащие corpus пути:
-`.owner.json`, `manifest.json`, `assets/png/*.png`; `.runtime`, `.tmp`, lock,
-review и browser artifacts в коммит не попадают. Gate — `pitch-corpus-gate`
-(код текущего checkout, CWD — worktree). Публикацию и её admin gate владеет
-родительский [`SKILL.md`](../SKILL.md); не создавай для pitch второй процедуры.
+## Продвижение и проверка карточек
 
-## Продвижение и проверка
+После каждого раунда перечитай состояние и продвигай заметки, чьи **все**
+зависимости разрешены; независимые не ждут остальных. Для доказанного отсутствия
+pitch поле остаётся пустым, ожидающие ресурсы не получают заглушек.
+До первого `--apply` сними состояние «до» вне `decks/**`. После записи —
+`anki-repo validate` и `visual-report` с `--before`/`--after`: PNG читается
+на тёмном фоне, назначенное поле пусто либо ссылается на
+`<surface>.pitch.png`, все медиассылки работают и прежнее имя не подменяет
+каноническое. Отчёт держи вне `decks/**` и Git. Повтор сходится к no-op.
 
-`visual-report` требует явные `--before` и `--after`; до первого `--apply`
-сними состояние «до» в каталог вне `decks/**`. После записи запусти
-`anki-repo validate` и посмотри карточки в отчёте: pitch PNG читается на тёмном
-фоне, `Ударение` либо ссылается на `<surface>.pitch.png`, либо пусто, broken
-media отсутствуют, а `<surface>.png` и `<surface>.pitch.png` не подменяют друг
-друга. Каталог отчёта держи вне `decks/**`. Повтор flow должен дать no-op.
-
-Contract команд — в
+Контракт команд —
 [`tools/asset-store/README.md`](../../../../tools/asset-store/README.md) и
 [`tools/anki-repo/README.md`](../../../../tools/anki-repo/README.md).

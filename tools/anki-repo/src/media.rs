@@ -2,13 +2,13 @@
 //! media-ссылок в значении поля.
 //!
 //! `media_files` — это недоверенный список имён, а не содержимое media.
-//! Tool никогда не конструирует из него filesystem path: сравниваются только
+//! Инструмент никогда не конструирует из него путь файловой системы: сравниваются только
 //! множества имён, а физические имена берутся листингом каталога `media/`.
 //!
 //! Распознавание ссылок в HTML-значении поля тоже живёт здесь, и это
-//! единственный владелец ответа на такой вопрос. Textual-поиск (`contains("src=")`)
-//! отвечает на него неверно: HTML ASCII case-insensitive в именах элементов и
-//! атрибутов, допускает пробелы вокруг `=`, unquoted-значения и одинарные
+//! единственный владелец ответа на такой вопрос. Текстовый поиск (`contains("src=")`)
+//! отвечает на него неверно: HTML не различает ASCII-регистр в именах элементов и
+//! атрибутов, допускает пробелы вокруг `=`, значения без кавычек и одинарные
 //! кавычки — то есть валидная разметка проходила бы мимо гейта
 //! `media_forbidden`. Разбор разметки выполняет [`crate::htmlscan`], а политика
 //! «какой атрибут какого элемента несёт media» объявлена здесь одной таблицей
@@ -54,8 +54,8 @@ pub const SOUND_OPEN: &str = "[sound:";
 pub enum ReferenceKind {
     /// Атрибут несёт media: браузер запрашивает файл, чтобы показать его.
     ///
-    /// Именно эти конструкции запрещены новым значениям полей у `create`: сам
-    /// toolkit файлов не создаёт и не копирует.
+    /// Новые значения полей у `create` могут содержать такие ссылки только
+    /// через явно назначенный обработчик поля.
     Media,
     /// Атрибут несёт адрес перехода: картинка не запрашивается, но переход уводит
     /// документ за его пределы.
@@ -321,6 +321,88 @@ pub fn forbidden_media_references(text: &str) -> Vec<String> {
 /// Незакрытый тег обрабатывается как та же запись атрибута: конструкция неполная,
 /// но значение прочитано, и браузер прочитает его так же.
 fn css_media_references(text: &str) -> Vec<String> {
+    css_references_with(text, css_addresses)
+}
+
+/// Полный набор адресов в HTML для инвентаризации потребителей миграции.
+/// В отличие от текста нарушения `create`, импорт CSS возвращается адресом.
+#[must_use]
+pub fn consumer_media_references(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = extract_media_references(text)
+        .into_iter()
+        .map(|name| {
+            htmlscan::decoded_attribute_value(&name)
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or(name)
+        })
+        .collect();
+    found.extend(css_references_with(text, css::media_addresses));
+    found
+}
+
+/// Возвращает локальное имя ресурса, которое браузер запросит по адресу.
+///
+/// HTML- и CSS-ссылки передаются уже после декодирования их собственной
+/// разметки. Здесь отдельно применяются правила URL: параметры запроса и якорь не входят
+/// в путь, `%XX` декодируется до байтов имени файла, а обратная косая черта
+/// считается разделителем пути. Внешние URI и некорректное кодирование не
+/// считаются локальными именами.
+#[must_use]
+pub fn consumer_media_name(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() || reference.starts_with("//") {
+        return None;
+    }
+
+    let path_end = reference.find(['?', '#']).unwrap_or(reference.len());
+    let path = &reference[..path_end];
+    if path.is_empty() {
+        return None;
+    }
+
+    if let Some((scheme, _)) = path.split_once(':')
+        && !scheme.is_empty()
+        && scheme.as_bytes()[0].is_ascii_alphabetic()
+        && scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+
+    let path = decode_url_path(path)?.replace('\\', "/");
+    let filename = path.rsplit('/').next()?;
+    (!filename.is_empty()).then(|| filename.to_owned())
+}
+
+fn decode_url_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            let high = hex_value(*bytes.get(cursor + 1)?)?;
+            let low = hex_value(*bytes.get(cursor + 2)?)?;
+            decoded.push((high << 4) | low);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn css_references_with(text: &str, addresses: fn(&str) -> Vec<String>) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for tag in htmlscan::scan_tags(text) {
         match tag {
@@ -329,12 +411,12 @@ fn css_media_references(text: &str) -> Vec<String> {
                     if !attribute.name.eq_ignore_ascii_case("style") {
                         continue;
                     }
-                    found.extend(style_attribute_addresses(attribute.value));
+                    found.extend(style_attribute_addresses(attribute.value, addresses));
                 }
             }
             Tag::RawText { name, body, .. } => {
                 if name.eq_ignore_ascii_case("style") {
-                    found.extend(css_addresses(&text[body.clone()]));
+                    found.extend(addresses(&text[body.clone()]));
                 }
             }
             // CSS в незакрытом теге тоже читает браузер: значение поля склеится с
@@ -344,7 +426,7 @@ fn css_media_references(text: &str) -> Vec<String> {
                     if !attribute.name.eq_ignore_ascii_case("style") {
                         continue;
                     }
-                    found.extend(style_attribute_addresses(attribute.value));
+                    found.extend(style_attribute_addresses(attribute.value, addresses));
                 }
             }
         }
@@ -358,9 +440,9 @@ fn css_media_references(text: &str) -> Vec<String> {
 /// `url&#40;a.png&#41;` — это для него адрес, а не текст. Ссылка, которой разбор
 /// не знает, тоже становится отказом: адрес в таком значении разбору не виден, а
 /// «не понял» здесь означает отказ, а не пропуск.
-fn style_attribute_addresses(value: &str) -> Vec<String> {
+fn style_attribute_addresses(value: &str, addresses: fn(&str) -> Vec<String>) -> Vec<String> {
     match htmlscan::decoded_attribute_value(value) {
-        Some(decoded) => css_addresses(&decoded),
+        Some(decoded) => addresses(&decoded),
         None => vec![value.to_string()],
     }
 }
@@ -544,7 +626,7 @@ mod tests {
     }
 
     /// Валидная HTML-грамматика не обходит гейт: регистр, пробелы вокруг `=`,
-    /// unquoted-значения и одинарные кавычки — всё это те же ссылки.
+    /// значения без кавычек и одинарные кавычки — всё это те же ссылки.
     #[test]
     fn every_valid_attribute_spelling_is_a_reference() {
         for text in [
@@ -648,6 +730,25 @@ mod tests {
         assert_eq!(normalize_media_name("dir/a.mp3"), "a.mp3");
         assert_eq!(normalize_media_name("../evil/a.mp3"), "a.mp3");
         assert_eq!(normalize_media_name(".."), "..");
+    }
+
+    #[test]
+    fn resolves_local_consumer_filename_from_url_semantics() {
+        assert_eq!(consumer_media_name("飴.png?cache=1"), Some("飴.png".into()));
+        assert_eq!(consumer_media_name("飴.png#front"), Some("飴.png".into()));
+        assert_eq!(consumer_media_name("%E9%A3%B4.png"), Some("飴.png".into()));
+        assert_eq!(
+            consumer_media_name("/media/%E9%A3%B4.png?x=1"),
+            Some("飴.png".into())
+        );
+        assert_eq!(consumer_media_name(r"folder\飴.png"), Some("飴.png".into()));
+        assert_eq!(
+            consumer_media_name("folder%5C%E9%A3%B4.png"),
+            Some("飴.png".into())
+        );
+        assert_eq!(consumer_media_name("https://example.test/飴.png"), None);
+        assert_eq!(consumer_media_name("//example.test/飴.png"), None);
+        assert_eq!(consumer_media_name("%E9%A3.png"), None);
     }
 
     #[test]

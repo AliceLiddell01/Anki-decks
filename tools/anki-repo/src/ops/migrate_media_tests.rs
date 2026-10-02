@@ -1,10 +1,10 @@
 //! Только синтетические экспорты и изолированные хранилища: контракт миграции
-//! проверяется без live-колоды и без сети.
+//! проверяется без пользовательской колоды и без сети.
 //!
 //! Ключевой случай — ровно тот, ради которого команда существует: одно и то же
 //! имя `飴.png` занято legacy pitch-картинкой, а каноническое имя изображения
 //! символа `飴` в kanji-домене совпадает с ним. После миграции pitch-ссылка
-//! уходит на `飴.pitch.png`, имя `飴.png` освобождается и kanji-fallback
+//! уходит на `飴.pitch.png`, имя `飴.png` освобождается и запасное изображение кандзи
 //! размещается под ним без конфликта.
 use super::*;
 use crate::ops::create::{CreateResult, create_with_options, parse_request_bytes};
@@ -288,7 +288,7 @@ fn reason(error: &DomainError, expected: &str) {
     assert_eq!(error.details["reason"], expected, "{error:?}");
 }
 
-/// Заполняет состояние ровно как в live-колоде: legacy pitch-картинка занимает
+/// Заполняет состояние ровно как в пользовательской колоде: legacy pitch-картинка занимает
 /// `media/飴.png`, а kanji-домен держит для символа `飴` канонические байты под
 /// именем `飴.png`.
 fn colliding_fixture() -> Fixture {
@@ -305,7 +305,7 @@ fn legacy_pitch_reference_migrates_and_frees_the_kanji_fallback_name() {
     let fixture = colliding_fixture();
 
     // До миграции каноническое имя кандзи занято legacy pitch-байтами, поэтому
-    // создание заметки с kanji-fallback обязано отказать, а не перезаписать файл.
+    // создание заметки с запасное изображение кандзи обязано отказать, а не перезаписать файл.
     let blocked = fixture
         .create(&[
             ("Заголовок", "<img src=\"飴.png\">"),
@@ -357,7 +357,7 @@ fn legacy_pitch_reference_migrates_and_frees_the_kanji_fallback_name() {
     assert_eq!(fixture.media_files(), vec!["飴.gif", "飴.pitch.png"]);
     assert_eq!(fs::read(fixture.export.join("deck.json")).unwrap(), before);
 
-    // Освобождённое имя принимает канонический kanji-fallback.
+    // Освобождённое имя принимает канонический запасное изображение кандзи.
     let created = fixture
         .create(&[
             ("Заголовок", "<img src=\"飴.png\">"),
@@ -522,7 +522,7 @@ fn unknown_namespace_and_unsafe_filename_are_rejected() {
     let mismatch = fixture
         .migrate_as("pitch_accent", "語", "飴.png", false)
         .unwrap_err();
-    reason(&mismatch, "pitch_asset_missing");
+    reason(&mismatch, REASON_IDENTITY_UNPROVEN);
 }
 
 #[test]
@@ -558,7 +558,7 @@ fn legacy_name_equal_to_the_canonical_one_is_rejected() {
 #[test]
 fn kanji_domain_policy_is_the_owner_of_the_consumer_name() {
     // Имена, на которые опирается миграция, берутся у владельца домена, а не из
-    // памяти: расхождение сделало бы команду бесполезной на live-данных.
+    // памяти: расхождение сделало бы команду бесполезной на данных пользователя.
     let pitch = PitchAccentDomainPolicy
         .canonical_location(
             &AssetIdentity::new("pitch_accent", "飴").unwrap(),
@@ -575,4 +575,391 @@ fn kanji_domain_policy_is_the_owner_of_the_consumer_name() {
         )
         .unwrap();
     assert_eq!(kanji.consumer_filename, "飴.png");
+}
+
+fn set_value(fixture: &Fixture, value: &Value) {
+    fixture.set_export(&serde_json::to_string(value).unwrap());
+}
+
+fn assert_refusal_preserves_export(fixture: &Fixture, expected_reason: &str) -> DomainError {
+    let before = fs::read(fixture.export.join("deck.json")).unwrap();
+    let declarations = fixture.document();
+    for apply in [false, true] {
+        let error = fixture.migrate(apply).unwrap_err();
+        reason(&error, expected_reason);
+        assert_eq!(fs::read(fixture.export.join("deck.json")).unwrap(), before);
+        assert_eq!(fixture.document(), declarations);
+        assert_eq!(fixture.read_media("飴.png").as_deref(), Some(LEGACY_PNG));
+        assert_eq!(fixture.read_media("飴.pitch.png"), None);
+    }
+    fixture.migrate(false).unwrap_err()
+}
+
+#[test]
+fn identity_binding_refuses_other_identity_or_other_filename_before_store_read() {
+    let fixture = colliding_fixture();
+    fixture.pitch("幽霊", PITCH_PNG);
+    let before = fs::read(fixture.export.join("deck.json")).unwrap();
+    for apply in [false, true] {
+        for (key, filename) in [("幽霊", "飴.png"), ("飴", "幽霊.png"), ("未登録", "飴.png")]
+        {
+            let error = fixture
+                .migrate_as("pitch_accent", key, filename, apply)
+                .unwrap_err();
+            reason(&error, REASON_IDENTITY_UNPROVEN);
+        }
+    }
+    assert_eq!(fs::read(fixture.export.join("deck.json")).unwrap(), before);
+    assert_eq!(fixture.read_media("飴.png").as_deref(), Some(LEGACY_PNG));
+    assert_eq!(fixture.read_media("飴.pitch.png"), None);
+}
+
+#[test]
+fn template_and_model_css_consumers_block_release_without_mutations() {
+    for surface in ["qfmt", "afmt", "css"] {
+        let fixture = colliding_fixture();
+        let mut value = fixture.document();
+        if surface == "css" {
+            value["note_models"][0][surface] = json!(".card { background: url(飴.png) }");
+        } else {
+            value["note_models"][0]["tmpls"][0][surface] =
+                json!("<img src=\"飴.png\">{{Толкование}}");
+        }
+        set_value(&fixture, &value);
+        let error = assert_refusal_preserves_export(&fixture, REASON_UNPROVEN);
+        assert_eq!(error.details["references"][0]["surface"], surface);
+        assert_eq!(
+            error.details["references"][0]["reason"],
+            "static_model_reference_not_owned_by_domain"
+        );
+        assert_eq!(error.details["references"][0]["model_uuid"], "model-1");
+        assert_eq!(error.details["references"][0]["children_path"], json!([]));
+    }
+}
+
+#[test]
+fn query_and_percent_encoded_static_consumers_block_release() {
+    for reference in ["飴.png?cache=1", "%E9%A3%B4.png"] {
+        let fixture = colliding_fixture();
+        let mut value = fixture.document();
+        value["note_models"][0]["tmpls"][0]["qfmt"] = json!(format!("<img src=\"{reference}\">"));
+        set_value(&fixture, &value);
+        let error = assert_refusal_preserves_export(&fixture, REASON_UNPROVEN);
+        assert_eq!(error.details["references"][0]["surface"], "qfmt");
+    }
+}
+
+#[test]
+fn escaped_css_and_imports_use_the_shared_scanner_for_inventory() {
+    for css in [
+        r".card { background: u\72l(\98f4.png) }",
+        "@import '飴.png';",
+        "@import url(飴.png);",
+    ] {
+        let fixture = colliding_fixture();
+        let mut value = fixture.document();
+        value["note_models"][0]["css"] = json!(css);
+        set_value(&fixture, &value);
+        assert_refusal_preserves_export(&fixture, REASON_UNPROVEN);
+    }
+    let fixture = colliding_fixture();
+    let mut value = fixture.document();
+    value["notes"][0]["fields"][1] = json!(r"<div style='background:url(\98f4.png)'></div>");
+    set_value(&fixture, &value);
+    assert_refusal_preserves_export(&fixture, REASON_UNPROVEN);
+}
+
+#[test]
+fn static_consumers_in_child_models_block_even_with_repeated_model_uuid() {
+    let fixture = colliding_fixture();
+    let mut value = fixture.document();
+    let mut model = value["note_models"][0].clone();
+    model["css"] = json!(".card { background:url(飴.png) }");
+    value["children"] = json!([{
+        "__type__":"Deck", "name":"Test::Child", "crowdanki_uuid":"child-1", "deck_config_uuid":"cfg-1",
+        "children":[], "notes":[], "media_files":[], "note_models":[model]
+    }]);
+    set_value(&fixture, &value);
+    let error = assert_refusal_preserves_export(&fixture, REASON_UNPROVEN);
+    assert_eq!(error.details["references"][0]["children_path"], json!([0]));
+}
+
+#[test]
+fn repeated_unicode_and_ascii_links_are_rebuilt_from_the_original_text() {
+    for surface in ["飴", "candy"] {
+        let fixture = Fixture::new();
+        fixture.pitch(surface, PITCH_PNG);
+        let legacy = format!("{surface}.png");
+        let canonical = format!("{surface}.pitch.png");
+        let original = format!(
+            "начало <img src=\"{legacy}\"> промежуток 漢字 <img SRC='{legacy}'> / <IMG src={legacy}> конец"
+        );
+        let mut value = fixture.document();
+        value["notes"][0]["fields"][1] = json!(original);
+        value["media_files"] = json!(["unrelated-before.png", legacy, "unrelated-after.gif"]);
+        set_value(&fixture, &value);
+        fixture.write_media(&legacy, LEGACY_PNG);
+        let before = fs::read(fixture.export.join("deck.json")).unwrap();
+        let dry = fixture
+            .migrate_as("pitch_accent", surface, &legacy, false)
+            .unwrap();
+        assert_eq!(dry.references_total, 3);
+        assert_eq!(fs::read(fixture.export.join("deck.json")).unwrap(), before);
+        let applied = fixture
+            .migrate_as("pitch_accent", surface, &legacy, true)
+            .unwrap();
+        assert_eq!(applied.references_total, 3);
+        assert_eq!(
+            fixture.field("guid-1", 1),
+            original.replace(&legacy, &canonical)
+        );
+        assert_eq!(
+            fixture.media_files(),
+            vec!["unrelated-before.png", &canonical, "unrelated-after.gif"]
+        );
+        let after = fs::read(fixture.export.join("deck.json")).unwrap();
+        let repeat = fixture
+            .migrate_as("pitch_accent", surface, &legacy, true)
+            .unwrap();
+        assert_eq!(repeat.references_total, 0);
+        assert!(!repeat.changed);
+        assert_eq!(fs::read(fixture.export.join("deck.json")).unwrap(), after);
+    }
+}
+
+fn child_migration_value(fixture: &Fixture) -> Value {
+    let mut value = fixture.document();
+    let notes = value["notes"].take();
+    value["notes"] = json!([]);
+    value["media_files"] = json!(["root-unrelated.png"]);
+    value["children"] = json!([{
+        "__type__":"Deck", "name":"Test::Child", "crowdanki_uuid":"child-1", "deck_config_uuid":"cfg-1",
+        "children":[], "notes":notes, "media_files":["before.png", "飴.png", "after.gif"], "note_models":[]
+    }, {
+        "__type__":"Deck", "name":"Test::Other", "crowdanki_uuid":"child-2", "deck_config_uuid":"cfg-1",
+        "children":[], "notes":[], "media_files":["other.png", "other.gif"], "note_models":[]
+    }]);
+    value
+}
+
+#[test]
+fn child_declaration_is_replaced_in_place_and_repeat_is_a_noop() {
+    let fixture = colliding_fixture();
+    let value = child_migration_value(&fixture);
+    set_value(&fixture, &value);
+    let result = fixture.migrate(true).unwrap();
+    assert!(result.legacy_declared && !result.legacy_declared_after);
+    assert_eq!(result.media_files_removed, vec!["飴.png"]);
+    let after = fixture.document();
+    assert_eq!(after["media_files"], value["media_files"]);
+    assert_eq!(after["children"][1], value["children"][1]);
+    assert_eq!(
+        after["children"][0]["media_files"],
+        json!(["before.png", "飴.pitch.png", "after.gif"])
+    );
+    assert_eq!(
+        after["children"][0]["notes"][0]["fields"][1],
+        "<img src=\"飴.pitch.png\">"
+    );
+    assert_eq!(fixture.read_media("飴.png"), None);
+    let bytes = fs::read(fixture.export.join("deck.json")).unwrap();
+    let repeat = fixture.migrate(true).unwrap();
+    assert!(!repeat.changed && !repeat.legacy_declared && !repeat.legacy_released);
+    assert_eq!(fs::read(fixture.export.join("deck.json")).unwrap(), bytes);
+}
+
+#[test]
+fn canonical_declaration_in_another_node_keeps_its_locality() {
+    for legacy_in_child in [true, false] {
+        let fixture = colliding_fixture();
+        let mut value = child_migration_value(&fixture);
+        if legacy_in_child {
+            value["media_files"] = json!(["root-before.png", "飴.pitch.png", "root-after.png"]);
+        } else {
+            value["media_files"] = json!(["root-before.png", "飴.png", "root-after.png"]);
+            value["children"][0]["media_files"] =
+                json!(["before.png", "飴.pitch.png", "after.gif"]);
+        }
+        set_value(&fixture, &value);
+        let result = fixture.migrate(true).unwrap();
+        assert!(result.media_files_added.is_empty());
+        let after = fixture.document();
+        if legacy_in_child {
+            assert_eq!(after["media_files"], value["media_files"]);
+            assert_eq!(
+                after["children"][0]["media_files"],
+                json!(["before.png", "after.gif"])
+            );
+        } else {
+            assert_eq!(
+                after["media_files"],
+                json!(["root-before.png", "root-after.png"])
+            );
+            assert_eq!(
+                after["children"][0]["media_files"],
+                value["children"][0]["media_files"]
+            );
+        }
+        assert_eq!(after["children"][1], value["children"][1]);
+    }
+}
+
+#[test]
+fn duplicate_legacy_or_canonical_declarations_across_nodes_refuse_without_mutations() {
+    for filename in ["飴.png", "飴.pitch.png"] {
+        let fixture = colliding_fixture();
+        let mut value = child_migration_value(&fixture);
+        if filename == "飴.pitch.png" {
+            value["children"][0]["media_files"] = json!(["飴.png", filename]);
+        }
+        value["children"][1]["media_files"] = json!(["other.png", filename]);
+        set_value(&fixture, &value);
+        let error = assert_refusal_preserves_export(&fixture, "media_declaration_conflict");
+        assert_eq!(error.details["evidence"]["filename"], filename);
+        assert_eq!(
+            error.details["evidence"]["children_paths"],
+            json!([[0], [1]])
+        );
+    }
+}
+
+#[test]
+fn undeclared_legacy_media_is_released_after_all_consumers_are_proven() {
+    let fixture = colliding_fixture();
+    let mut value = child_migration_value(&fixture);
+    value["children"][0]["media_files"] = json!(["before.png", "after.gif"]);
+    set_value(&fixture, &value);
+    let result = fixture.migrate(true).unwrap();
+    assert!(!result.legacy_declared);
+    assert!(result.legacy_released);
+    assert_eq!(fixture.read_media("飴.png"), None);
+    assert_eq!(
+        fixture.document()["children"][0]["media_files"],
+        json!(["before.png", "after.gif", "飴.pitch.png"])
+    );
+}
+
+#[test]
+fn migration_render_preserves_pre_state_and_reports_actual_post_state() {
+    let fixture = colliding_fixture();
+    for (apply, expect_released, exists_after) in [
+        (false, false, true),
+        (true, true, false),
+        (true, false, false),
+    ] {
+        let result = fixture.migrate(apply).unwrap();
+        let json: Value =
+            serde_json::from_str(&crate::render::json::migrate_media_json(&result)).unwrap();
+        let data = &json["result"];
+        assert_eq!(data["legacy_released"], expect_released);
+        assert_eq!(data["legacy_media_exists_after"], exists_after);
+        assert_eq!(data["legacy_declared_after"], exists_after);
+        if result.changed {
+            assert_eq!(
+                data["legacy_media"]["sha256"],
+                format!("{:x}", Sha256::digest(LEGACY_PNG))
+            );
+        } else {
+            assert!(data["legacy_media"].is_null());
+        }
+        let human = crate::render::human::migrate_media(&result);
+        assert!(human.contains("Прежний файл до миграции:"));
+        assert_eq!(
+            human.contains("После применения legacy-имя освобождено"),
+            expect_released
+        );
+        assert!(!human.contains("Освободившееся имя занято файлом"));
+        if !result.changed {
+            assert!(human.contains("Мигрировать нечего"));
+        }
+    }
+}
+
+#[test]
+fn applying_migration_reports_when_legacy_file_was_already_absent() {
+    let fixture = colliding_fixture();
+    fs::remove_file(fixture.export.join("media").join("飴.png")).unwrap();
+
+    let result = fixture.migrate(true).unwrap();
+
+    assert!(result.changed);
+    assert!(!result.legacy_released);
+    assert!(!result.legacy_media_exists_after);
+    assert!(result.legacy_media.is_none());
+    let human = crate::render::human::migrate_media(&result);
+    assert!(human.contains("Прежний файл до миграции: media/飴.png физически отсутствовал"));
+    assert!(human.contains("После завершения команды legacy-файл отсутствует"));
+    assert!(!human.contains("После применения legacy-имя освобождено"));
+}
+
+#[test]
+fn canonical_declaration_in_sibling_is_promoted_to_cover_migrated_consumers() {
+    let fixture = colliding_fixture();
+    let mut value = child_migration_value(&fixture);
+    value["children"][1]["media_files"] =
+        json!(["other-before.png", "飴.pitch.png", "other-after.gif"]);
+    set_value(&fixture, &value);
+    let result = fixture.migrate(true).unwrap();
+    assert_eq!(result.media_files_added, vec!["飴.pitch.png"]);
+    assert_eq!(result.media_files_removed, vec!["飴.png", "飴.pitch.png"]);
+    let after = fixture.document();
+    assert_eq!(
+        after["media_files"],
+        json!(["root-unrelated.png", "飴.pitch.png"])
+    );
+    assert_eq!(
+        after["children"][0]["media_files"],
+        json!(["before.png", "after.gif"])
+    );
+    assert_eq!(
+        after["children"][1]["media_files"],
+        json!(["other-before.png", "other-after.gif"])
+    );
+    assert_eq!(fixture.read_media("飴.png"), None);
+}
+
+#[test]
+fn one_declaration_covers_migrated_notes_in_multiple_subtrees() {
+    let fixture = colliding_fixture();
+    let mut value = child_migration_value(&fixture);
+    let mut second = value["children"][0]["notes"][0].clone();
+    second["guid"] = json!("guid-2");
+    value["children"][1]["notes"] = json!([second]);
+    set_value(&fixture, &value);
+    let result = fixture.migrate(true).unwrap();
+    assert_eq!(result.references_total, 2);
+    let after = fixture.document();
+    assert_eq!(
+        after["media_files"],
+        json!(["root-unrelated.png", "飴.pitch.png"])
+    );
+    assert_eq!(
+        after["children"][0]["media_files"],
+        json!(["before.png", "after.gif"])
+    );
+    assert_eq!(
+        after["children"][1]["media_files"],
+        value["children"][1]["media_files"]
+    );
+    assert_eq!(
+        after["children"][1]["notes"][0]["fields"][1],
+        "<img src=\"飴.pitch.png\">"
+    );
+}
+
+#[test]
+fn entity_encoded_static_or_unclaimable_field_reference_blocks_release() {
+    for surface in ["qfmt", "note_field"] {
+        let fixture = colliding_fixture();
+        let mut value = fixture.document();
+        let reference = json!("<img src='&#39156;.png'>");
+        if surface == "qfmt" {
+            value["note_models"][0]["tmpls"][0]["qfmt"] = reference;
+        } else {
+            value["notes"][0]["fields"][1] = reference;
+        }
+        set_value(&fixture, &value);
+        let error = assert_refusal_preserves_export(&fixture, REASON_UNPROVEN);
+        assert_eq!(error.details["references"][0]["surface"], surface);
+    }
 }

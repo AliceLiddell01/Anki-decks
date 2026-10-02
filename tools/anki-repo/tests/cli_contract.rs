@@ -1,6 +1,6 @@
 //! Контракт CLI: аргументы, exit codes, разделение stdout/stderr, JSON envelope.
 //!
-//! Ни один тест этого файла не знает ни layout репозитория, ни содержимого
+//! Ни один тест этого файла не знает ни структуру репозитория, ни содержимого
 //! `decks/`: каждый тест строит фикстуру сам — синтетический экспорт в
 //! собственном временном каталоге. Поэтому сьют остаётся корректным, когда
 //! состав колод, уровни JLPT, note models и media изменятся или временно
@@ -8,7 +8,7 @@
 //!
 //! Ожидаемые количества и значения либо заданы локальной фикстурой этого файла
 //! явно, либо пересчитаны независимо от CLI через `raw_*`/`raw_qa_counts`
-//! helper'ы `common`. Пути в аргументах всегда абсолютны: `run_cli` запускает
+//! вспомогательные функции `common`. Пути в аргументах всегда абсолютны: `run_cli` запускает
 //! бинарь без задания рабочего каталога.
 
 mod common;
@@ -34,7 +34,7 @@ fn path_str(dir: &TempDir) -> String {
 /// Сколько различных значений поля `Толкование` строит [`distribution_export`].
 const DISTINCT_VALUES: usize = 5;
 
-/// Предел distribution output, при котором распределение обязано усечься.
+/// Предел вывода распределения, при котором распределение обязано усечься.
 const DISTRIBUTION_TOP: usize = 3;
 
 /// Синтетический экспорт с предсказуемым распределением значений поля.
@@ -67,10 +67,32 @@ fn help_and_version_succeed() {
     assert_eq!(code, 0);
     assert!(stdout.contains("inspect"));
     assert!(stdout.contains("validate"));
+    assert!(stdout.contains("migrate-media"));
+    assert!(stdout.contains("dry-run"));
+    assert!(stdout.contains("--apply"));
 
     let (code, stdout, _) = run_cli(&["--version"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("anki-repo"));
+}
+
+#[test]
+fn migration_help_exposes_identity_and_explicit_apply_contract() {
+    let (code, stdout, stderr) = run_cli(&["migrate-media", "--help"]);
+    assert_eq!(code, 0, "{stderr}");
+    for literal in [
+        "migrate-media",
+        "--namespace",
+        "--key",
+        "--from",
+        "--apply",
+        "dry-run",
+    ] {
+        assert!(
+            stdout.contains(literal),
+            "в справке отсутствует {literal}: {stdout}"
+        );
+    }
 }
 
 #[test]
@@ -1026,4 +1048,35 @@ fn mixed_export_resolves_field_values_by_ord() {
     let value = parse_json(&stdout);
     assert_eq!(value["result"]["matched_total"], json!(1));
     assert_eq!(value["result"]["notes"][0]["guid"], json!("первая-2"));
+}
+
+#[test]
+fn migration_cli_rejects_unproven_identity_before_reading_missing_store() {
+    let dir = canonical_export("migration-identity", &base_export());
+    let path = path_str(&dir);
+    for apply in [false, true] {
+        let mut args = vec![
+            "migrate-media",
+            &path,
+            "--namespace",
+            "pitch_accent",
+            "--key",
+            "word",
+            "--from",
+            "other.png",
+            "--json",
+        ];
+        if apply {
+            args.push("--apply");
+        }
+        let (code, stdout, stderr) = run_cli(&args);
+        assert_eq!(code, 3, "{stderr}");
+        let json = parse_json(&stdout);
+        assert_eq!(json["command"], "migrate-media");
+        assert_eq!(json["error"]["code"], "invalid_request");
+        assert_eq!(
+            json["error"]["details"]["reason"],
+            "legacy_media_identity_unproven"
+        );
+    }
 }

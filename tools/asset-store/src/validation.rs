@@ -1,4 +1,4 @@
-//! Расширяемый semantic validation contract.
+//! Расширяемый контракт семантической проверки.
 
 use std::io::Read;
 
@@ -9,14 +9,14 @@ use crate::model::{
 };
 use crate::selection::SelectionMode;
 
-/// Контракт domain validator'а. Production core не содержит validator по умолчанию.
+/// Контракт валидатора домена. Общий слой по умолчанию не содержит валидатора.
 pub trait SemanticValidator {
-    /// Устойчивые id и версия алгоритма.
+    /// Устойчивые идентификатор `id` и версия `version` алгоритма.
     fn identity(&self) -> ValidatorIdentity;
 
-    /// Принимает фактические bytes и возвращает decision с evidence либо
+    /// Принимает фактические байты и возвращает решение со свидетельствами либо
     /// техническую ошибку. `VERIFIED` появится только если этот вызов вернёт
-    /// положительное решение с непустым evidence.
+    /// положительное решение с непустыми свидетельствами.
     fn validate(
         &self,
         asset: &AssetRecord,
@@ -24,7 +24,7 @@ pub trait SemanticValidator {
     ) -> Result<SemanticDecision, ValidatorFailure>;
 }
 
-/// Технический отказ validator'а; он не сохраняется как semantic decision.
+/// Технический отказ валидатора; он не сохраняется как семантическое решение.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorFailure {
     pub code: String,
@@ -41,7 +41,7 @@ impl ValidatorFailure {
     }
 }
 
-/// Отчёт о попытке semantic validation одного объекта.
+/// Отчёт о попытке семантической проверки одного объекта.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ValidationAttempt {
     pub identity: AssetIdentity,
@@ -57,7 +57,7 @@ pub struct ValidationAttempt {
     pub blocker_message: Option<String>,
 }
 
-/// Результат запуска общего validator core.
+/// Результат работы общего механизма проверки.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ValidationReport {
     pub mode: String,

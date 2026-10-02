@@ -1,4 +1,4 @@
-//! Регрессии exact-hash human trust и совместимости с прежним корпусом.
+//! Регрессии доверия человека к точному хешу и совместимости с прежним корпусом.
 use super::*;
 use crate::kanji_validator::MAX_MEDIA_BYTES;
 use crate::model::ValidationEvidence;
@@ -226,7 +226,7 @@ fn human_approval_overrides_uncertain_rejected_and_preserves_automated_evidence(
                 .unwrap()
                 .changed
         );
-        // Повторный classifier не отменяет сохранённый human override.
+        // Повторная классификация не отменяет сохранённое переопределение человеком.
         assert_eq!(fixture.classify(status).lifecycle, LifecycleState::Verified);
         let other_validator = ValidatorIdentity::new("new-validator", "2").unwrap();
         assert!(
@@ -445,8 +445,9 @@ fn runtime_batch_extension_survives_open_and_asset_lifecycle_recovery() {
         AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
             .unwrap();
     assert!(reopened.verify_integrity().unwrap().is_empty());
-    // Ingest создаёт publication transaction внутри runtime; затем approval
-    // выполняет runtime removal recovery. Оба используют area-generic loaders.
+    // Импорт создаёт транзакцию публикации внутри каталога `.runtime`; затем подтверждение
+    // выполняет восстановление после удаления из `.runtime`. Оба этапа используют
+    // загрузчики, работающие с любой областью.
     let record = fixture.ingest(&png(90), None);
     fixture.classify(SemanticStatus::Uncertain);
     fixture
