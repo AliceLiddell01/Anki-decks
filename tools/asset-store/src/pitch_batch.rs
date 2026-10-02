@@ -1,8 +1,8 @@
 //! Возобновляемое предметное состояние batch-получения pitch-accent.
 //!
-//! Файловую границу и immutable candidate blobs обслуживает [`SafeBatchRuntime`].
-//! Этот модуль хранит только pitch-specific outcomes, exact identity/SHA,
-//! validation evidence, выбор словарной записи и намерение publication.
+//! Файловые границы и неизменяемые файлы кандидатов обслуживает [`SafeBatchRuntime`].
+//! Этот модуль хранит только результаты pitch-accent, точную идентичность/SHA,
+//! свидетельства проверки, выбор словарной записи и намерение публикации.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -32,12 +32,85 @@ use crate::pitch_accent::{
 };
 use crate::validation::SemanticValidator;
 
-/// Версия формата предметного batch state.
-pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 1;
-/// Максимальный размер причины targeted decision.
+/// Версия формата предметного состояния batch.
+pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 2;
+/// Версия внешней схемы нормализованного плана pitch.
+pub const PITCH_PLAN_SCHEMA_VERSION: u32 = 1;
+/// Максимальный размер причины точечного действия.
 pub const MAX_PITCH_BATCH_REASON_BYTES: usize = 4096;
 
-/// Runtime-состояние одного batch. Request order сохраняется для воспроизводимого CLI output.
+/// Неизменяемая идентичность исходного плана с версией и нормализованными данными.
+/// Исходные запросы сохраняются вместе с хешем, чтобы состояние могло проверить
+/// хеш и не путать исходный план с изменённым текущим запросом.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchBatchPlanIdentity {
+    pub schema_version: u32,
+    pub requests: Vec<JpdbPitchRequest>,
+    pub sha256: String,
+}
+
+impl PitchBatchPlanIdentity {
+    pub fn new(schema_version: u32, requests: Vec<JpdbPitchRequest>) -> Result<Self, AssetError> {
+        if schema_version != PITCH_PLAN_SCHEMA_VERSION {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                "версия идентичности плана pitch-accent не поддерживается",
+            ));
+        }
+        if requests.is_empty() {
+            return Err(invalid(
+                "идентичность плана должна содержать хотя бы один запрос",
+            ));
+        }
+        let mut surfaces = BTreeSet::new();
+        for request in &requests {
+            validate_request(request)?;
+            if !surfaces.insert(request.query.surface.as_str()) {
+                return Err(identity_conflict(
+                    "исходная идентичность плана должна содержать нормализованные уникальные написания",
+                ));
+            }
+        }
+        let sha256 = plan_identity_digest(schema_version, &requests)?;
+        Ok(Self {
+            schema_version,
+            requests,
+            sha256,
+        })
+    }
+
+    fn validate(&self) -> Result<(), AssetError> {
+        if self.schema_version != PITCH_PLAN_SCHEMA_VERSION {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                "версия сохранённой идентичности плана pitch-accent не поддерживается",
+            ));
+        }
+        if self.requests.is_empty() {
+            return Err(invalid("сохранённая идентичность плана повреждена"));
+        }
+        let mut surfaces = BTreeSet::new();
+        for request in &self.requests {
+            validate_request(request)?;
+            if !surfaces.insert(request.query.surface.as_str()) {
+                return Err(identity_conflict(
+                    "сохранённая идентичность плана содержит повторный `surface`",
+                ));
+            }
+        }
+        validate_hash(&self.sha256)?;
+        if self.sha256 != plan_identity_digest(self.schema_version, &self.requests)? {
+            return Err(AssetError::new(
+                ErrorCode::InvalidValidationEvidence,
+                "хеш идентичности плана не совпадает с исходными нормализованными запросами",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Runtime-состояние одного batch. Порядок запросов сохраняется для воспроизводимого вывода CLI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentBatch {
@@ -45,42 +118,47 @@ pub struct PitchAccentBatch {
     pub batch_id: String,
     pub revision: u64,
     pub validator: ValidatorIdentity,
-    /// Смена ожидаемого validation evidence инвалидирует SafeBatchRuntime blob cache.
+    /// Неизменяемый контракт плана; точечные действия меняют `item.request`, но не исходную идентичность.
+    pub original_plan: PitchBatchPlanIdentity,
+    /// Смена ожидаемых свидетельств проверки инвалидирует кэш blob-объектов `SafeBatchRuntime`.
     pub blob_validation_context_sha256: String,
     pub items: Vec<PitchBatchItem>,
 }
 
-/// Одно состояние на exact `surface`; domain identity не содержит reading или vocabulary ID.
+/// Отдельное состояние для каждой точной `surface`; идентичность предметной области не содержит reading или vocabulary ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchItem {
     pub identity: AssetIdentity,
     pub request: JpdbPitchRequest,
-    /// Targeted retry или explicit ambiguity selection начинает новое поколение.
+    /// Точечный повтор или явный выбор при неоднозначности начинает новое поколение.
     pub generation: u32,
-    /// Пер-item CAS counter. Изменение соседней identity не делает acquisition stale.
+    /// CAS-счётчик элемента. Изменение соседней идентичности не делает получение устаревшим.
     pub item_revision: u64,
     pub attempts: Vec<PitchBatchAttempt>,
     pub current_candidate_sha256: Option<String>,
+    /// Точная попытка, которой принадлежит `current_candidate_sha256`; SHA может
+    /// повториться между поколениями.
+    pub current_candidate_attempt_index: Option<u32>,
     pub rejected_candidates: Vec<PitchBatchRejection>,
-    /// Канонический exact SHA, подтверждённый owner snapshot, если он уже был.
+    /// Канонический точный SHA, подтверждённый снимком владельца, если он уже был.
     pub canonical_sha256: Option<String>,
-    /// SHA записи текущей identity, наблюдавшийся в owner snapshot, без вывода о trust.
+    /// SHA записи текущей идентичности из снимка владельца, без вывода о доверии к ней.
     pub owner_current_sha256: Option<String>,
-    /// Owner record, которую можно повторно использовать как current VERIFIED.
+    /// Запись владельца, которую можно повторно использовать как текущую `VERIFIED`.
     pub existing_verified_sha256: Option<String>,
-    /// SHA, подтверждённый завершённым owner publication.
+    /// SHA, подтверждённый завершённой публикацией у владельца.
     pub published_sha256: Option<String>,
-    /// При явном refresh новый candidate должен заменить именно этот SHA.
+    /// При явном обновлении новый кандидат должен заменить именно этот SHA.
     pub refresh_expected_sha256: Option<String>,
-    /// Завершённые publication intents, сохранённые при следующем targeted generation.
+    /// Завершённые намерения публикации, сохранённые при следующем точечном поколении.
     pub publication_history: Vec<PitchBatchPublication>,
     pub publication: Option<PitchBatchPublication>,
     pub owner_conflict: Option<PitchBatchConflict>,
     pub last_action_reason: Option<String>,
 }
 
-/// Один acquisition result с query/selection, действовавшим именно для этой попытки.
+/// Один результат получения с полями `query` и `selection`, действовавшими именно для этой попытки.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchAttempt {
@@ -90,7 +168,7 @@ pub struct PitchBatchAttempt {
     pub outcome: PitchBatchOutcome,
 }
 
-/// Полный typed result провайдера. Acquired bytes заменяются hash-addressed runtime reference.
+/// Полный типизированный результат провайдера. Полученные байты заменяются ссылкой на файл в runtime по SHA.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PitchBatchOutcome {
@@ -114,7 +192,7 @@ pub enum PitchBatchOutcome {
     },
 }
 
-/// Точные acquired PNG bytes и результаты текущего production validator-а.
+/// Точные байты PNG и результаты текущего валидатора.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchCandidate {
@@ -123,11 +201,11 @@ pub struct PitchBatchCandidate {
     pub byte_length: u64,
     pub metadata: PitchAccentDomainMetadata,
     pub validation: ValidationRecord,
-    /// Контекст входит в runtime blob cache и меняется при изменении любого evidence.
+    /// Контекст входит в runtime-кэш blob-объектов и меняется при изменении любого свидетельства.
     pub validation_context_sha256: String,
 }
 
-/// Отказ привязан только к точным байтам; последующий SHA не наследует отказ.
+/// Отказ привязан только к точным байтам; следующий SHA не наследует отказ.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchRejection {
@@ -136,18 +214,20 @@ pub struct PitchBatchRejection {
     pub generation: u32,
 }
 
-/// Durable intent перед owner publication. `expected_previous_sha256` задаёт CAS.
+/// Сохраняемое намерение публикации у владельца. `expected_previous_sha256` задаёт CAS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchPublication {
     pub candidate_sha256: String,
+    /// Точная попытка, чьи метаданные и свидетельства используются при публикации.
+    pub candidate_attempt_index: u32,
     pub expected_previous_sha256: Option<String>,
     pub status: PitchBatchPublicationStatus,
     pub conflict_code: Option<String>,
     pub conflict_message: Option<String>,
 }
 
-/// Итог сверки publication с полным owner snapshot.
+/// Итог сверки публикации с полным снимком владельца.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PitchBatchPublicationStatus {
@@ -156,7 +236,7 @@ pub enum PitchBatchPublicationStatus {
     Conflict,
 }
 
-/// Сохранённая причина, по которой owner snapshot расходится с batch state.
+/// Сохранённая причина расхождения снимка владельца с состоянием batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchConflict {
@@ -164,7 +244,7 @@ pub struct PitchBatchConflict {
     pub message: String,
 }
 
-/// UI/CLI состояние элемента, вычисляемое из typed history и owner intent.
+/// UI/CLI-состояние элемента, вычисляемое по типизированной истории и намерению владельца.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PitchBatchItemStatus {
@@ -190,7 +270,7 @@ impl PitchBatchItemStatus {
     }
 }
 
-/// CAS token, который вызывающая сторона получает перед отпусканием lock на время browser work.
+/// CAS token, который вызывающая сторона получает перед освобождением lock на время работы браузера.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PitchBatchItemToken {
     pub identity: AssetIdentity,
@@ -199,22 +279,22 @@ pub struct PitchBatchItemToken {
     pub request_fingerprint: String,
 }
 
-/// Полный immutable owner view, полученный только после успешной integrity-проверки store.
+/// Полный неизменяемый снимок владельца, полученный только после успешной проверки целостности store.
 #[derive(Debug, Clone, Default)]
 pub struct PitchBatchOwnerSnapshot {
     records: BTreeMap<AssetIdentity, AssetRecord>,
 }
 
 impl PitchBatchOwnerSnapshot {
-    /// Строит snapshot из успешного `AssetStore::verify_integrity()` результата.
-    /// Runtime/quarantine записи сохраняются для CAS, но не считаются verified assets.
+    /// Строит снимок из успешного результата `AssetStore::verify_integrity()`.
+    /// Записи из `runtime` и `quarantine` сохраняются для CAS, но не считаются подтверждёнными ресурсами.
     pub fn from_records(records: Vec<AssetRecord>) -> Result<Self, AssetError> {
         let mut indexed = BTreeMap::new();
         for record in records {
             PitchAccentDomainPolicy.validate_identity(&record.identity)?;
             if indexed.insert(record.identity.clone(), record).is_some() {
                 return Err(identity_conflict(
-                    "owner snapshot содержит повторяющуюся pitch identity",
+                    "снимок владельца содержит повторяющуюся идентичность pitch-accent",
                 ));
             }
         }
@@ -226,26 +306,45 @@ impl PitchBatchOwnerSnapshot {
     }
 }
 
-/// Адаптер сохранённого pitch state над общим безопасным runtime.
+/// Адаптер сохранённого pitch-состояния над общим безопасным runtime.
 #[derive(Debug)]
 pub struct PitchAccentBatchRuntime {
     runtime: SafeBatchRuntime,
 }
 
 impl PitchAccentBatch {
-    /// Создаёт state; одинаковые точные дубли схлопываются, но разные запросы для
-    /// одной canonical identity отвергаются явно.
+    /// Создаёт состояние; одинаковые точные дубли схлопываются, а разные запросы для
+    /// одной канонической идентичности отвергаются явно.
     pub fn new(
         batch_id: impl Into<String>,
         requests: Vec<JpdbPitchRequest>,
         validator: ValidatorIdentity,
     ) -> Result<Self, AssetError> {
-        let batch_id = batch_id.into();
+        Self::new_inner(batch_id.into(), requests, validator, None)
+    }
+
+    /// Создаёт batch с неизменяемой идентичностью плана с версией схемы, откуда пришли запросы.
+    pub fn new_with_plan_identity(
+        batch_id: impl Into<String>,
+        requests: Vec<JpdbPitchRequest>,
+        validator: ValidatorIdentity,
+        original_plan: PitchBatchPlanIdentity,
+    ) -> Result<Self, AssetError> {
+        original_plan.validate()?;
+        Self::new_inner(batch_id.into(), requests, validator, Some(original_plan))
+    }
+
+    fn new_inner(
+        batch_id: String,
+        requests: Vec<JpdbPitchRequest>,
+        validator: ValidatorIdentity,
+        original_plan: Option<PitchBatchPlanIdentity>,
+    ) -> Result<Self, AssetError> {
         validate_batch_id(&batch_id)?;
         if validator != PitchAccentImageValidator::validator_identity() {
             return Err(AssetError::new(
                 ErrorCode::InvalidValidationEvidence,
-                "pitch batch требует текущую версию PitchAccentImageValidator",
+                "пакет pitch-accent требует текущую версию PitchAccentImageValidator",
             ));
         }
 
@@ -258,7 +357,7 @@ impl PitchAccentBatch {
                 Some(previous) if previous == &request => {}
                 Some(_) => {
                     return Err(identity_conflict(format!(
-                        "batch содержит несовместимые reading/selection для canonical surface {surface:?}"
+                        "пакет содержит несовместимые `reading`/`selection` для канонического написания `surface` {surface:?}"
                     )));
                 }
                 None => {
@@ -268,14 +367,16 @@ impl PitchAccentBatch {
             }
         }
         if order.is_empty() {
-            return Err(invalid("pitch batch должен содержать хотя бы один request"));
+            return Err(invalid(
+                "пакет pitch-accent должен содержать хотя бы один запрос",
+            ));
         }
         let items = order
             .into_iter()
             .map(|surface| {
                 let request = by_surface
                     .remove(&surface)
-                    .expect("каждый сохранённый surface имеет request");
+                    .expect("каждый сохранённый `surface` имеет запрос");
                 Ok(PitchBatchItem {
                     identity: AssetIdentity::new("pitch_accent", surface)
                         .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?,
@@ -284,6 +385,7 @@ impl PitchAccentBatch {
                     item_revision: 0,
                     attempts: Vec::new(),
                     current_candidate_sha256: None,
+                    current_candidate_attempt_index: None,
                     rejected_candidates: Vec::new(),
                     canonical_sha256: None,
                     owner_current_sha256: None,
@@ -297,11 +399,27 @@ impl PitchAccentBatch {
                 })
             })
             .collect::<Result<Vec<_>, AssetError>>()?;
+        let normalized_requests = items
+            .iter()
+            .map(|item| item.request.clone())
+            .collect::<Vec<_>>();
+        let original_plan = match original_plan {
+            Some(plan) => {
+                if plan.requests != normalized_requests {
+                    return Err(identity_conflict(
+                        "исходная идентичность плана не совпадает с начальным порядком запросов пакета",
+                    ));
+                }
+                plan
+            }
+            None => PitchBatchPlanIdentity::new(PITCH_PLAN_SCHEMA_VERSION, normalized_requests)?,
+        };
         let batch = Self {
             schema_version: PITCH_BATCH_SCHEMA_VERSION,
             batch_id,
             revision: 0,
             validator,
+            original_plan,
             blob_validation_context_sha256: String::new(),
             items,
         };
@@ -325,166 +443,71 @@ impl PitchAccentBatch {
         self.items.iter().all(|item| item.status().is_resolved())
     }
 
-    /// Возвращает CAS token только для элемента, который ожидает acquisition в текущем поколении.
+    /// Возвращает CAS token только для элемента, ожидающего получения в текущем поколении.
     pub fn item_token(&self, surface: &str) -> Result<PitchBatchItemToken, AssetError> {
         let item = self
             .item(surface)
-            .ok_or_else(|| invalid("surface отсутствует в pitch batch"))?;
+            .ok_or_else(|| invalid("`surface` отсутствует в пакете pitch-accent"))?;
         if item.status() != PitchBatchItemStatus::Pending {
-            return Err(invalid("pitch batch item не ожидает acquisition"));
+            return Err(invalid("элемент пакета pitch-accent не ожидает получения"));
         }
         Ok(item.token())
     }
 
-    /// Прикрепляет любой owner SHA как CAS observation, не объявляя его доверенным.
-    /// Непроверенная/stale запись остаётся blocker-ом до explicit `reacquire`.
+    /// Сохраняет любой SHA владельца как наблюдение CAS, не объявляя его доверенным.
+    /// Непроверенная или устаревшая запись блокирует работу до явного `reacquire`.
     pub fn observe_owner(&mut self, record: &AssetRecord) -> Result<(), AssetError> {
         let validator = self.validator.clone();
         let item = self
             .item_mut(&record.identity.key)
-            .ok_or_else(|| invalid("owner identity отсутствует в pitch batch"))?;
+            .ok_or_else(|| invalid("идентичность владельца отсутствует в пакете pitch-accent"))?;
         if record.identity.namespace != "pitch_accent" || item.identity != record.identity {
             return Err(identity_conflict(
-                "owner record не совпадает с pitch batch identity",
+                "запись владельца не совпадает с идентичностью пакета pitch-accent",
             ));
         }
         validate_hash(&record.sha256)?;
-        let before = (
-            item.owner_current_sha256.clone(),
-            item.canonical_sha256.clone(),
-            item.existing_verified_sha256.clone(),
-            item.published_sha256.clone(),
-            item.owner_conflict.clone(),
-        );
-        let trusted = record_is_verified_for(record, &validator)
-            && record_matches_request(record, &item.request).unwrap_or(false);
-        let refresh_owner_changed = item
-            .refresh_expected_sha256
-            .as_deref()
-            .is_some_and(|expected| expected != record.sha256);
-        item.owner_current_sha256 = Some(record.sha256.clone());
-        if refresh_owner_changed {
-            item.canonical_sha256 = trusted.then(|| record.sha256.clone());
-            item.existing_verified_sha256 = None;
-            item.owner_conflict = Some(PitchBatchConflict {
-                code: "identity_conflict".into(),
-                message: "owner SHA изменился после фиксации refresh CAS".into(),
-            });
-        } else if trusted {
-            item.canonical_sha256 = Some(record.sha256.clone());
-            if item.refresh_expected_sha256.is_none() {
-                item.existing_verified_sha256 = Some(record.sha256.clone());
-            } else {
-                item.existing_verified_sha256 = None;
-            }
-            item.owner_conflict = None;
-        } else if item.refresh_expected_sha256.as_deref() == Some(record.sha256.as_str()) {
-            item.canonical_sha256 = None;
-            item.existing_verified_sha256 = None;
-            item.owner_conflict = None;
-        } else if owner_record_rejected(record) {
-            item.canonical_sha256 = None;
-            item.existing_verified_sha256 = None;
-            item.owner_conflict = Some(PitchBatchConflict {
-                code: "owner_rejected".into(),
-                message: "текущая owner запись отклонена для этого exact SHA".into(),
-            });
-        } else {
-            item.canonical_sha256 = None;
-            item.existing_verified_sha256 = None;
-            item.owner_conflict = Some(PitchBatchConflict {
-                code: "owner_not_current_verified".into(),
-                message:
-                    "owner identity существует, но не подтверждена текущим validator и request"
-                        .into(),
-            });
-        }
-        let after = (
-            item.owner_current_sha256.clone(),
-            item.canonical_sha256.clone(),
-            item.existing_verified_sha256.clone(),
-            item.published_sha256.clone(),
-            item.owner_conflict.clone(),
-        );
+        let before = owner_state(item);
+        item.reconcile_owner_record(Some(record), &validator)?;
+        let after = owner_state(item);
         if before == after {
             return Ok(());
         }
         item.item_revision = item
             .item_revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
         self.bump_revision()?;
         self.validate()
     }
 
-    /// Сохраняет готовый verified asset из owner snapshot без JPDB запроса.
-    pub fn reuse_existing(&mut self, record: &AssetRecord) -> Result<(), AssetError> {
-        let identity = record.identity.clone();
-        let validator = self.validator.clone();
-        let item = self
-            .item_mut(&identity.key)
-            .ok_or_else(|| invalid("verified owner identity отсутствует в batch"))?;
-        if identity.namespace != "pitch_accent" || item.identity != identity {
-            return Err(identity_conflict(
-                "owner asset не совпадает с pitch batch identity",
-            ));
-        }
-        if !record_is_verified_for(record, &validator)
-            || !record_matches_request(record, &item.request)?
-        {
-            return Err(AssetError::new(
-                ErrorCode::InvalidValidationEvidence,
-                "существующий pitch asset не является current VERIFIED для этого request",
-            ));
-        }
-        if item.publication.as_ref().is_some_and(|intent| {
-            intent.candidate_sha256 != record.sha256
-                && intent.status == PitchBatchPublicationStatus::Pending
-        }) {
-            return Err(identity_conflict(
-                "reuse existing конфликтует с незавершённым publication intent",
-            ));
-        }
-        if item.refresh_expected_sha256.is_some() {
-            return Err(invalid("явный refresh уже запрошен для этой identity"));
-        }
-        item.canonical_sha256 = Some(record.sha256.clone());
-        item.owner_current_sha256 = Some(record.sha256.clone());
-        item.existing_verified_sha256 = Some(record.sha256.clone());
-        item.refresh_expected_sha256 = None;
-        item.owner_conflict = None;
-        item.item_revision = item
-            .item_revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
-        self.bump_revision()?;
-        self.validate()
-    }
-
-    /// Явно ставит в очередь только эту identity для нового запроса к провайдеру.
-    /// Точный наблюдавшийся SHA owner сохраняется как значение CAS публикации.
+    /// Ставит в очередь только эту идентичность для нового запроса к провайдеру.
+    /// Точный наблюдавшийся SHA владельца становится новым CAS-основанием публикации.
     pub fn reacquire(&mut self, surface: &str, reason: String) -> Result<(), AssetError> {
         validate_reason(&reason)?;
         let item = self
             .item_mut(surface)
-            .ok_or_else(|| invalid("surface отсутствует в pitch batch"))?;
+            .ok_or_else(|| invalid("`surface` отсутствует в пакете pitch-accent"))?;
         if item.owner_conflict.as_ref().is_some_and(|conflict| {
-            conflict.code != "owner_not_current_verified" && conflict.code != "owner_rejected"
+            conflict.code != "owner_not_current_verified"
+                && conflict.code != "owner_rejected"
+                && conflict.code != "refresh_owner_drift"
         }) || item
             .publication
             .as_ref()
             .is_some_and(|intent| intent.status == PitchBatchPublicationStatus::Pending)
         {
             return Err(invalid(
-                "сначала разрешите owner conflict или завершающийся publication intent",
+                "сначала разрешите конфликт владельца или завершите намерение публикации",
             ));
         }
         item.generation = item
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен generation"))?;
+            .ok_or_else(|| invalid("превышен номер поколения"))?;
         item.refresh_expected_sha256 = item.owner_current_sha256.clone();
         item.current_candidate_sha256 = None;
+        item.current_candidate_attempt_index = None;
         item.owner_conflict = None;
         item.existing_verified_sha256 = None;
         item.archive_publication()?;
@@ -492,13 +515,13 @@ impl PitchAccentBatch {
         item.item_revision = item
             .item_revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
         self.bump_revision()?;
         self.validate()
     }
 
-    /// Выбирает точный candidate из последнего ambiguity inventory.
-    /// Следующий provider run обязан выполнить новый JPDB search.
+    /// Выбирает точный кандидат из последнего списка неоднозначных результатов.
+    /// Следующий запуск провайдера обязан выполнить новый поиск JPDB.
     pub fn select_candidate(
         &mut self,
         surface: &str,
@@ -508,7 +531,7 @@ impl PitchAccentBatch {
         let detail_url = detail_url.into();
         let item = self
             .item_mut(surface)
-            .ok_or_else(|| invalid("surface отсутствует в pitch batch"))?;
+            .ok_or_else(|| invalid("`surface` отсутствует в пакете pitch-accent"))?;
         if item.owner_conflict.as_ref().is_some_and(|conflict| {
             conflict.code != "owner_not_current_verified" && conflict.code != "owner_rejected"
         }) || item
@@ -517,18 +540,20 @@ impl PitchAccentBatch {
             .is_some_and(|intent| intent.status == PitchBatchPublicationStatus::Pending)
         {
             return Err(invalid(
-                "сначала разрешите несовпадение owner identity или publication intent",
+                "сначала разрешите несовпадение идентичности владельца или намерения публикации",
             ));
         }
         let Some(PitchBatchOutcome::AmbiguousVocabulary { candidates, .. }) =
             item.current_outcome()
         else {
-            return Err(invalid("item не ожидает выбора ambiguous vocabulary"));
+            return Err(invalid(
+                "элемент не ожидает выбора неоднозначной словарной записи",
+            ));
         };
         let selection = JpdbPitchSelection::new(vocabulary_id, detail_url.clone())
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
         let selected_route = parse_jpdb_vocabulary_route(&selection.detail_url)
-            .map_err(|_| invalid("detail route выбора невалиден"))?;
+            .map_err(|_| invalid("маршрут словарной записи выбора невалиден"))?;
         let matches = candidates.iter().any(|candidate| {
             candidate.vocabulary_id == vocabulary_id
                 && parse_jpdb_vocabulary_route(&candidate.detail_url)
@@ -536,7 +561,7 @@ impl PitchAccentBatch {
         });
         if !matches {
             return Err(identity_conflict(
-                "выбранные vocabulary ID и detail route отсутствуют в последнем ambiguity inventory",
+                "выбранные ID словарной записи и маршрут словарной записи отсутствуют в последнем списке неоднозначных результатов",
             ));
         }
         item.request.selection = Some(selection);
@@ -545,8 +570,9 @@ impl PitchAccentBatch {
         item.generation = item
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен generation"))?;
+            .ok_or_else(|| invalid("превышен номер поколения"))?;
         item.current_candidate_sha256 = None;
+        item.current_candidate_attempt_index = None;
         item.refresh_expected_sha256 = item.owner_current_sha256.clone();
         item.owner_conflict = None;
         item.existing_verified_sha256 = None;
@@ -555,17 +581,17 @@ impl PitchAccentBatch {
         item.item_revision = item
             .item_revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
         self.bump_revision()?;
         self.validate()
     }
 
-    /// Запускает новый generation только для transient provider failures.
+    /// Запускает новое поколение только для временных сбоев провайдера.
     pub fn retry(&mut self, surface: &str, reason: String) -> Result<(), AssetError> {
         validate_reason(&reason)?;
         let item = self
             .item_mut(surface)
-            .ok_or_else(|| invalid("surface отсутствует в pitch batch"))?;
+            .ok_or_else(|| invalid("`surface` отсутствует в пакете pitch-accent"))?;
         if item.owner_conflict.is_some()
             || item
                 .publication
@@ -573,24 +599,25 @@ impl PitchAccentBatch {
                 .is_some_and(|intent| intent.status == PitchBatchPublicationStatus::Pending)
         {
             return Err(invalid(
-                "сначала разрешите owner conflict или завершающийся publication intent",
+                "сначала разрешите конфликт владельца или завершите намерение публикации",
             ));
         }
         let Some(PitchBatchOutcome::Failed { error }) = item.current_outcome() else {
             return Err(invalid(
-                "targeted retry разрешён только после технического failure",
+                "точечный повтор разрешён только после технического сбоя",
             ));
         };
-        if !retryable_failure(error) {
+        if !is_retryable_failure(error) {
             return Err(invalid(
-                "этот source/input/selection failure нельзя исправить повтором acquisition",
+                "сбой источника, входных данных или выбора нельзя исправить повтором получения",
             ));
         }
         item.generation = item
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен generation"))?;
+            .ok_or_else(|| invalid("превышен номер поколения"))?;
         item.current_candidate_sha256 = None;
+        item.current_candidate_attempt_index = None;
         item.refresh_expected_sha256 = item.owner_current_sha256.clone();
         item.existing_verified_sha256 = None;
         item.archive_publication()?;
@@ -598,12 +625,12 @@ impl PitchAccentBatch {
         item.item_revision = item
             .item_revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
         self.bump_revision()?;
         self.validate()
     }
 
-    /// Отмечает ровно один candidate SHA как отклонённый владельцем.
+    /// Отмечает ровно один SHA кандидата как отклонённый владельцем.
     pub fn reject_candidate(
         &mut self,
         surface: &str,
@@ -614,18 +641,18 @@ impl PitchAccentBatch {
         validate_reason(&reason)?;
         let item = self
             .item_mut(surface)
-            .ok_or_else(|| invalid("surface отсутствует в pitch batch"))?;
+            .ok_or_else(|| invalid("`surface` отсутствует в пакете pitch-accent"))?;
         if item
             .publication
             .as_ref()
             .is_some_and(|intent| intent.status == PitchBatchPublicationStatus::Pending)
         {
             return Err(invalid(
-                "нельзя отклонить candidate при незавершённом publication intent",
+                "нельзя отклонить кандидата при незавершённом намерении публикации",
             ));
         }
         if !item.candidate(candidate_sha256).is_some() {
-            return Err(invalid("точный candidate SHA отсутствует в batch history"));
+            return Err(invalid("точный SHA кандидата отсутствует в истории пакета"));
         }
         if item
             .rejected_candidates
@@ -648,25 +675,26 @@ impl PitchAccentBatch {
         });
         if item.current_candidate_sha256.as_deref() == Some(candidate_sha256) {
             item.current_candidate_sha256 = None;
+            item.current_candidate_attempt_index = None;
         }
         if item.owner_current_sha256.as_deref() == Some(candidate_sha256) {
             item.canonical_sha256 = None;
             item.existing_verified_sha256 = None;
             item.owner_conflict = Some(PitchBatchConflict {
                 code: "owner_rejected".into(),
-                message: "текущая owner запись отклонена для этого exact SHA".into(),
+                message: "текущая запись владельца отклонена для этого точного SHA".into(),
             });
         }
         item.item_revision = item
             .item_revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
         self.bump_revision()?;
         self.validate()
     }
 
-    /// Записывает намерение publication до side effect владельца.
-    /// Не принимает `REJECTED`, `CORRUPT`, incomplete или stale validator evidence.
+    /// Сохраняет намерение публикации до побочного эффекта у владельца.
+    /// Не принимает `REJECTED`, `CORRUPT`, неполные или устаревшие свидетельства validator.
     pub fn begin_publication(
         &mut self,
         surface: &str,
@@ -680,22 +708,25 @@ impl PitchAccentBatch {
         let validator = self.validator.clone();
         let item = self
             .item_mut(surface)
-            .ok_or_else(|| invalid("surface отсутствует в pitch batch"))?;
+            .ok_or_else(|| invalid("`surface` отсутствует в пакете pitch-accent"))?;
         if item.current_candidate_sha256.as_deref() != Some(candidate_sha256) {
             return Err(identity_conflict(
-                "publication intent относится не к текущему exact candidate",
+                "намерение публикации относится не к текущему точному кандидату",
             ));
         }
+        let candidate_attempt_index = item
+            .current_candidate_attempt_index
+            .ok_or_else(|| invalid("попытка текущего кандидата отсутствует"))?;
         let candidate = item
-            .candidate(candidate_sha256)
-            .ok_or_else(|| invalid("candidate evidence отсутствует"))?;
+            .candidate_at(candidate_attempt_index, candidate_sha256)
+            .ok_or_else(|| invalid("свидетельства текущего кандидата отсутствуют"))?;
         if candidate.validation.status != SemanticStatus::Verified
             || candidate.validation.validator != validator
             || candidate.validation.content_sha256 != candidate.sha256
         {
             return Err(AssetError::new(
                 ErrorCode::InvalidValidationEvidence,
-                "публикация разрешена только для current VERIFIED evidence",
+                "публикация разрешена только для текущих свидетельств VERIFIED",
             ));
         }
         if item
@@ -705,18 +736,19 @@ impl PitchAccentBatch {
         {
             return Err(AssetError::new(
                 ErrorCode::InvalidValidationEvidence,
-                "точный candidate SHA был ранее отклонён",
+                "точный SHA кандидата был ранее отклонён",
             ));
         }
         if item.owner_current_sha256 != expected_previous_sha256
             || item.refresh_expected_sha256 != expected_previous_sha256
         {
             return Err(identity_conflict(
-                "publication CAS не совпадает с текущим owner snapshot",
+                "CAS публикации не совпадает с текущим снимком владельца",
             ));
         }
         let requested = PitchBatchPublication {
             candidate_sha256: candidate_sha256.into(),
+            candidate_attempt_index,
             expected_previous_sha256,
             status: PitchBatchPublicationStatus::Pending,
             conflict_code: None,
@@ -724,13 +756,14 @@ impl PitchAccentBatch {
         };
         if let Some(existing) = &item.publication {
             if existing.candidate_sha256 == requested.candidate_sha256
+                && existing.candidate_attempt_index == requested.candidate_attempt_index
                 && existing.expected_previous_sha256 == requested.expected_previous_sha256
             {
                 return Ok(());
             }
             if existing.status == PitchBatchPublicationStatus::Pending {
                 return Err(identity_conflict(
-                    "для identity уже сохранён другой publication intent",
+                    "для идентичности уже сохранено другое намерение публикации",
                 ));
             }
         }
@@ -738,12 +771,12 @@ impl PitchAccentBatch {
         item.item_revision = item
             .item_revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
         self.bump_revision()?;
         self.validate()
     }
 
-    /// Сверяет все durable owner facts с полным снимком. Отсутствие/ошибка snapshot
+    /// Сверяет все сохранённые факты владельца с полным снимком. Отсутствие/ошибка снимка
     /// должна обрабатываться вызывающей стороной до вызова этого метода.
     pub fn reconcile_owner(
         &mut self,
@@ -754,127 +787,12 @@ impl PitchAccentBatch {
         for item in &mut self.items {
             let before = owner_state(item);
             let current = snapshot.current(&item.identity);
-            item.owner_current_sha256 = current.map(|record| record.sha256.clone());
-
-            if let Some(mut publication) = item.publication.clone() {
-                let exact = current.is_some_and(|record| {
-                    record.sha256 == publication.candidate_sha256
-                        && record_is_verified_for(record, &validator)
-                        && record_matches_request(record, &item.request).unwrap_or(false)
-                });
-                if exact {
-                    publication.status = PitchBatchPublicationStatus::Published;
-                    publication.conflict_code = None;
-                    publication.conflict_message = None;
-                    item.canonical_sha256 = Some(publication.candidate_sha256.clone());
-                    item.existing_verified_sha256 = None;
-                    item.published_sha256 = Some(publication.candidate_sha256.clone());
-                    item.refresh_expected_sha256 = None;
-                    item.owner_conflict = None;
-                } else if current.is_some_and(owner_record_rejected) {
-                    let conflict = PitchBatchConflict {
-                        code: "owner_rejected".into(),
-                        message: "текущая owner запись отклонена для этого exact SHA".into(),
-                    };
-                    publication.status = PitchBatchPublicationStatus::Conflict;
-                    publication.conflict_code = Some(conflict.code.clone());
-                    publication.conflict_message = Some(conflict.message.clone());
-                    item.owner_conflict = Some(conflict);
-                    item.canonical_sha256 = None;
-                    item.existing_verified_sha256 = None;
-                    item.refresh_expected_sha256 = None;
-                } else {
-                    let expected_unchanged =
-                        match (current, publication.expected_previous_sha256.as_deref()) {
-                            (None, None) => true,
-                            (Some(record), Some(expected)) => record.sha256 == expected,
-                            _ => false,
-                        };
-                    if publication.status != PitchBatchPublicationStatus::Pending
-                        || !expected_unchanged
-                    {
-                        let conflict = PitchBatchConflict {
-                            code: "identity_conflict".into(),
-                            message: match current {
-                                Some(record)
-                                    if record.sha256 != publication.candidate_sha256 =>
-                                {
-                                    "owner current SHA не совпадает с candidate или ожидаемым CAS SHA".into()
-                                }
-                                Some(_) => "owner не подтверждает current VERIFIED для exact candidate".into(),
-                                None => "owner snapshot не содержит identity publication intent".into(),
-                            },
-                        };
-                        publication.status = PitchBatchPublicationStatus::Conflict;
-                        publication.conflict_code = Some(conflict.code.clone());
-                        publication.conflict_message = Some(conflict.message.clone());
-                        item.owner_conflict = Some(conflict);
-                        item.canonical_sha256 = None;
-                        item.existing_verified_sha256 = None;
-                        item.refresh_expected_sha256 = None;
-                    }
-                }
-                item.publication = Some(publication);
-            } else if let Some(record) = current {
-                let reusable = record_is_verified_for(record, &validator)
-                    && record_matches_request(record, &item.request).unwrap_or(false);
-                let refresh_matches =
-                    item.refresh_expected_sha256.as_deref() == Some(record.sha256.as_str());
-
-                if item.refresh_expected_sha256.is_some() && !refresh_matches {
-                    item.canonical_sha256 = None;
-                    item.existing_verified_sha256 = None;
-                    item.owner_conflict = Some(PitchBatchConflict {
-                        code: "identity_conflict".into(),
-                        message: "owner SHA изменился после фиксации refresh CAS".into(),
-                    });
-                } else if reusable {
-                    item.canonical_sha256 = Some(record.sha256.clone());
-                    if item.refresh_expected_sha256.is_none() {
-                        if item.published_sha256.as_deref() != Some(record.sha256.as_str()) {
-                            item.existing_verified_sha256 = Some(record.sha256.clone());
-                        }
-                    } else {
-                        item.existing_verified_sha256 = None;
-                    }
-                    item.owner_conflict = None;
-                } else if refresh_matches {
-                    item.canonical_sha256 = None;
-                    item.existing_verified_sha256 = None;
-                    item.owner_conflict = None;
-                } else if owner_record_rejected(record) {
-                    item.canonical_sha256 = None;
-                    item.existing_verified_sha256 = None;
-                    item.owner_conflict = Some(PitchBatchConflict {
-                        code: "owner_rejected".into(),
-                        message: "текущая owner запись отклонена для этого exact SHA".into(),
-                    });
-                } else {
-                    item.canonical_sha256 = None;
-                    item.existing_verified_sha256 = None;
-                    item.owner_conflict = Some(PitchBatchConflict {
-                        code: "owner_not_current_verified".into(),
-                        message: "owner identity есть, но её нельзя переиспользовать без explicit refresh".into(),
-                    });
-                }
-            } else {
-                item.canonical_sha256 = None;
-                item.existing_verified_sha256 = None;
-                if item.refresh_expected_sha256.is_some() {
-                    item.owner_conflict = Some(PitchBatchConflict {
-                        code: "identity_conflict".into(),
-                        message: "expected owner SHA для refresh отсутствует в текущем snapshot"
-                            .into(),
-                    });
-                } else {
-                    item.owner_conflict = None;
-                }
-            }
+            item.reconcile_owner_record(current, &validator)?;
             if owner_state(item) != before {
                 item.item_revision = item
                     .item_revision
                     .checked_add(1)
-                    .ok_or_else(|| invalid("превышен item revision"))?;
+                    .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
                 batch_changed = true;
             }
         }
@@ -890,17 +808,32 @@ impl PitchAccentBatch {
         if self.schema_version != PITCH_BATCH_SCHEMA_VERSION {
             return Err(AssetError::new(
                 ErrorCode::UnsupportedSchemaVersion,
-                "версия pitch batch state не поддерживается",
+                "версия состояния пакета pitch-accent не поддерживается",
             ));
         }
         if self.validator != PitchAccentImageValidator::validator_identity() {
             return Err(AssetError::new(
                 ErrorCode::UnsupportedSchemaVersion,
-                "pitch batch state использует устаревший validator; automatic trust не переносится",
+                "состояние пакета pitch-accent использует устаревший валидатор; автоматическое доверие не переносится",
             ));
         }
         if self.items.is_empty() {
-            return Err(invalid("pitch batch state не содержит items"));
+            return Err(invalid(
+                "состояние пакета pitch-accent не содержит элементов",
+            ));
+        }
+        self.original_plan.validate()?;
+        if self.original_plan.requests.len() != self.items.len()
+            || self
+                .original_plan
+                .requests
+                .iter()
+                .zip(&self.items)
+                .any(|(request, item)| request.query.surface != item.identity.key)
+        {
+            return Err(identity_conflict(
+                "написания и порядок исходного плана не совпадают с идентичностями пакета",
+            ));
         }
         let mut identities = BTreeSet::new();
         for item in &self.items {
@@ -909,21 +842,39 @@ impl PitchAccentBatch {
                 || item.request.query.surface != item.identity.key
             {
                 return Err(identity_conflict(
-                    "request surface не уникален или не совпадает с canonical identity",
+                    "написание `surface` запроса не уникально или не совпадает с канонической идентичностью",
                 ));
             }
             validate_request(&item.request)?;
-            if let Some(hash) = &item.current_candidate_sha256 {
-                validate_hash(hash)?;
-                let candidate = item
-                    .candidate(hash)
-                    .ok_or_else(|| invalid("current candidate отсутствует в attempt history"))?;
-                if item.attempts.last().is_none_or(|attempt| {
-                    attempt.generation != item.generation
-                        || !matches!(&attempt.outcome, PitchBatchOutcome::Acquired { candidate: latest } if latest.sha256 == candidate.sha256)
-                }) {
+            match (
+                item.current_candidate_sha256.as_deref(),
+                item.current_candidate_attempt_index,
+            ) {
+                (Some(hash), Some(attempt_index)) => {
+                    validate_hash(hash)?;
+                    let attempt = item
+                        .attempts
+                        .iter()
+                        .find(|attempt| attempt.index == attempt_index)
+                        .ok_or_else(|| {
+                            invalid("попытка текущего кандидата отсутствует в истории")
+                        })?;
+                    if attempt.generation != item.generation
+                        || !matches!(&attempt.outcome, PitchBatchOutcome::Acquired { candidate } if candidate.sha256 == hash)
+                        || item
+                            .attempts
+                            .last()
+                            .is_none_or(|last| last.index != attempt_index)
+                    {
+                        return Err(invalid(
+                            "текущий кандидат не совпадает с точной последней попыткой текущего поколения",
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => {
                     return Err(invalid(
-                        "current candidate не совпадает с последним outcome текущего generation",
+                        "SHA текущего кандидата и индекс попытки должны задаваться вместе",
                     ));
                 }
             }
@@ -937,14 +888,16 @@ impl PitchAccentBatch {
                 validate_hash(hash)?;
                 if item.canonical_sha256.as_deref() != Some(hash) {
                     return Err(invalid(
-                        "existing verified SHA не совпадает с canonical SHA",
+                        "SHA существующей проверенной записи не совпадает с каноническим SHA",
                     ));
                 }
             }
             if let Some(hash) = &item.published_sha256 {
                 validate_hash(hash)?;
                 if item.candidate(hash).is_none() {
-                    return Err(invalid("published SHA отсутствует в acquisition history"));
+                    return Err(invalid(
+                        "опубликованный SHA отсутствует в истории получения",
+                    ));
                 }
             }
             if let Some(hash) = &item.refresh_expected_sha256 {
@@ -958,7 +911,7 @@ impl PitchAccentBatch {
                     || attempt.request.query.surface != item.identity.key
                 {
                     return Err(invalid(
-                        "attempt indexes, generation или surface нарушают batch history",
+                        "индексы попыток, поколение или `surface` нарушают историю пакета",
                     ));
                 }
                 previous_generation = Some(attempt.generation);
@@ -969,6 +922,22 @@ impl PitchAccentBatch {
                     &attempt.request,
                     &self.validator,
                 )?;
+                if attempt.generation == item.generation && attempt.request != item.request {
+                    return Err(identity_conflict(
+                        "активный запрос отличается от результата текущего поколения",
+                    ));
+                }
+            }
+            if item.current_candidate_sha256.is_none()
+                && let Some(PitchBatchOutcome::Acquired { candidate }) = item.current_outcome()
+                && !item
+                    .rejected_candidates
+                    .iter()
+                    .any(|rejection| rejection.candidate_sha256 == candidate.sha256)
+            {
+                return Err(invalid(
+                    "текущий результат получения потерял ссылку на свою точную попытку",
+                ));
             }
             for rejection in &item.rejected_candidates {
                 validate_hash(&rejection.candidate_sha256)?;
@@ -977,7 +946,7 @@ impl PitchAccentBatch {
                     || item.candidate(&rejection.candidate_sha256).is_none()
                 {
                     return Err(invalid(
-                        "rejection не относится к сохранённому exact candidate SHA",
+                        "отклонение не относится к сохранённому точному SHA кандидата",
                     ));
                 }
             }
@@ -987,8 +956,11 @@ impl PitchAccentBatch {
                     validate_hash(expected)?;
                 }
                 let candidate = item
-                    .candidate(&publication.candidate_sha256)
-                    .ok_or_else(|| invalid("publication candidate отсутствует в history"))?;
+                    .candidate_at(
+                        publication.candidate_attempt_index,
+                        &publication.candidate_sha256,
+                    )
+                    .ok_or_else(|| invalid("кандидат публикации отсутствует в истории"))?;
                 if candidate.validation.status != SemanticStatus::Verified
                     || candidate.validation.validator != self.validator
                     || item
@@ -996,21 +968,29 @@ impl PitchAccentBatch {
                         .iter()
                         .any(|rejection| rejection.candidate_sha256 == candidate.sha256)
                     || publication.conflict_code.is_some() != publication.conflict_message.is_some()
+                    || (publication.status == PitchBatchPublicationStatus::Pending
+                        && item.current_candidate_attempt_index
+                            != Some(publication.candidate_attempt_index))
                 {
                     return Err(AssetError::new(
                         ErrorCode::InvalidValidationEvidence,
-                        "publication intent не привязан к VERIFIED current candidate",
+                        "намерение публикации не привязано к текущему кандидату VERIFIED",
                     ));
                 }
             }
             for publication in &item.publication_history {
                 validate_hash(&publication.candidate_sha256)?;
                 if publication.status == PitchBatchPublicationStatus::Pending
-                    || item.candidate(&publication.candidate_sha256).is_none()
+                    || item
+                        .candidate_at(
+                            publication.candidate_attempt_index,
+                            &publication.candidate_sha256,
+                        )
+                        .is_none()
                     || publication.conflict_code.is_some() != publication.conflict_message.is_some()
                 {
                     return Err(invalid(
-                        "архивированный publication intent повреждён или ещё не завершён",
+                        "архивированное намерение публикации повреждено или ещё не завершено",
                     ));
                 }
                 if let Some(expected) = &publication.expected_previous_sha256 {
@@ -1020,18 +1000,18 @@ impl PitchAccentBatch {
             if item.owner_conflict.as_ref().is_some_and(|conflict| {
                 conflict.code.trim().is_empty() || conflict.message.trim().is_empty()
             }) {
-                return Err(invalid("owner conflict содержит пустую диагностику"));
+                return Err(invalid("конфликт владельца содержит пустую диагностику"));
             }
             if item.last_action_reason.as_ref().is_some_and(|reason| {
                 reason.trim().is_empty() || reason.len() > MAX_PITCH_BATCH_REASON_BYTES
             }) {
-                return Err(invalid("причина item action некорректна"));
+                return Err(invalid("причина действия над элементом некорректна"));
             }
         }
         if self.blob_validation_context_sha256 != blob_context_digest(&self.items)? {
             return Err(AssetError::new(
                 ErrorCode::InvalidValidationEvidence,
-                "pitch batch blob validation context не совпадает с candidate evidence",
+                "контекст проверки файлов пакета pitch-accent не совпадает со свидетельствами кандидата",
             ));
         }
         Ok(())
@@ -1041,7 +1021,7 @@ impl PitchAccentBatch {
         self.revision = self
             .revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен revision pitch batch"))?;
+            .ok_or_else(|| invalid("превышен номер изменения пакета pitch-accent"))?;
         Ok(())
     }
 
@@ -1052,6 +1032,150 @@ impl PitchAccentBatch {
 }
 
 impl PitchBatchItem {
+    fn reconcile_owner_record(
+        &mut self,
+        current: Option<&AssetRecord>,
+        validator: &ValidatorIdentity,
+    ) -> Result<(), AssetError> {
+        self.owner_current_sha256 = current.map(|record| record.sha256.clone());
+
+        if let Some(mut publication) = self.publication.clone() {
+            let candidate = self.candidate_at(
+                publication.candidate_attempt_index,
+                &publication.candidate_sha256,
+            );
+            let exact = match (current, candidate) {
+                (Some(record), Some(candidate)) => {
+                    record_is_verified_for(record, validator)
+                        && record_matches_request(record, &self.request)?
+                        && record_matches_candidate(record, candidate)?
+                }
+                _ => false,
+            };
+            if exact {
+                publication.status = PitchBatchPublicationStatus::Published;
+                publication.conflict_code = None;
+                publication.conflict_message = None;
+                self.canonical_sha256 = Some(publication.candidate_sha256.clone());
+                self.existing_verified_sha256 = None;
+                self.published_sha256 = Some(publication.candidate_sha256.clone());
+                self.refresh_expected_sha256 = None;
+                self.owner_conflict = None;
+            } else if current.is_some_and(owner_record_rejected) {
+                let conflict = PitchBatchConflict {
+                    code: "owner_rejected".into(),
+                    message: "текущая запись владельца отклонена для этого точного SHA".into(),
+                };
+                publication.status = PitchBatchPublicationStatus::Conflict;
+                publication.conflict_code = Some(conflict.code.clone());
+                publication.conflict_message = Some(conflict.message.clone());
+                self.owner_conflict = Some(conflict);
+                self.canonical_sha256 = None;
+                self.existing_verified_sha256 = None;
+                self.refresh_expected_sha256 = None;
+            } else {
+                let expected_unchanged =
+                    match (current, publication.expected_previous_sha256.as_deref()) {
+                        (None, None) => true,
+                        (Some(record), Some(expected)) => record.sha256 == expected,
+                        _ => false,
+                    };
+                if publication.status != PitchBatchPublicationStatus::Pending || !expected_unchanged
+                {
+                    let owner_drift = !expected_unchanged
+                        || publication.conflict_code.as_deref() == Some("refresh_owner_drift");
+                    let conflict = PitchBatchConflict {
+                        code: if owner_drift {
+                            "refresh_owner_drift".into()
+                        } else {
+                            "identity_conflict".into()
+                        },
+                        message: if owner_drift {
+                            "SHA владельца изменился после фиксации CAS публикации; явно примите текущий SHA через reacquire".into()
+                        } else {
+                            match current {
+                                Some(record) if record.sha256 != publication.candidate_sha256 => {
+                                    "текущий SHA владельца не совпадает с кандидатом или ожидаемым CAS SHA".into()
+                                }
+                                Some(_) => {
+                                    "владелец не подтверждает текущий VERIFIED для точного кандидата".into()
+                                }
+                                None => {
+                                    "снимок владельца не содержит идентичности намерения публикации".into()
+                                }
+                            }
+                        },
+                    };
+                    publication.status = PitchBatchPublicationStatus::Conflict;
+                    publication.conflict_code = Some(conflict.code.clone());
+                    publication.conflict_message = Some(conflict.message.clone());
+                    self.owner_conflict = Some(conflict);
+                    self.canonical_sha256 = None;
+                    self.existing_verified_sha256 = None;
+                    self.refresh_expected_sha256 = None;
+                }
+            }
+            self.publication = Some(publication);
+            return Ok(());
+        }
+
+        if let Some(record) = current {
+            let refresh_matches = self.refresh_expected_sha256.as_deref() == Some(&record.sha256);
+            let reusable = record_is_verified_for(record, validator)
+                && record_matches_request(record, &self.request)?;
+            if self.refresh_expected_sha256.is_some() && !refresh_matches {
+                self.canonical_sha256 = None;
+                self.existing_verified_sha256 = None;
+                self.owner_conflict = Some(PitchBatchConflict {
+                    code: "refresh_owner_drift".into(),
+                    message: "SHA владельца изменился после фиксации CAS обновления; явно примите текущий SHA через reacquire".into(),
+                });
+            } else if reusable {
+                self.canonical_sha256 = Some(record.sha256.clone());
+                if self.refresh_expected_sha256.is_none()
+                    && self.published_sha256.as_deref() != Some(record.sha256.as_str())
+                {
+                    self.existing_verified_sha256 = Some(record.sha256.clone());
+                } else {
+                    self.existing_verified_sha256 = None;
+                }
+                self.owner_conflict = None;
+            } else if refresh_matches {
+                self.canonical_sha256 = None;
+                self.existing_verified_sha256 = None;
+                self.owner_conflict = None;
+            } else if owner_record_rejected(record) {
+                self.canonical_sha256 = None;
+                self.existing_verified_sha256 = None;
+                self.owner_conflict = Some(PitchBatchConflict {
+                    code: "owner_rejected".into(),
+                    message: "текущая запись владельца отклонена для этого точного SHA".into(),
+                });
+            } else {
+                self.canonical_sha256 = None;
+                self.existing_verified_sha256 = None;
+                self.owner_conflict = Some(PitchBatchConflict {
+                    code: "owner_not_current_verified".into(),
+                    message:
+                        "идентичность владельца есть, но её нельзя переиспользовать без явного обновления"
+                            .into(),
+                });
+            }
+        } else {
+            self.canonical_sha256 = None;
+            self.existing_verified_sha256 = None;
+            self.owner_conflict = if self.refresh_expected_sha256.is_some() {
+                Some(PitchBatchConflict {
+                    code: "refresh_owner_drift".into(),
+                    message: "ожидаемый SHA владельца для обновления отсутствует; явно примите текущую пустую идентичность через reacquire".into(),
+                })
+            } else {
+                None
+            };
+        }
+        Ok(())
+    }
+
     fn archive_publication(&mut self) -> Result<(), AssetError> {
         let Some(publication) = self.publication.take() else {
             return Ok(());
@@ -1059,7 +1183,7 @@ impl PitchBatchItem {
         if publication.status == PitchBatchPublicationStatus::Pending {
             self.publication = Some(publication);
             return Err(invalid(
-                "нельзя завершить новое generation при незавершённом publication intent",
+                "нельзя завершить новое поколение при незавершённом намерении публикации",
             ));
         }
         self.publication_history.push(publication);
@@ -1084,14 +1208,10 @@ impl PitchBatchItem {
         if self.canonical_sha256.is_some() && self.refresh_expected_sha256.is_none() {
             return PitchBatchItemStatus::ExistingVerified;
         }
-        let Some(attempt) = self
-            .attempts
-            .last()
-            .filter(|attempt| attempt.generation == self.generation)
-        else {
+        let Some(outcome) = self.current_outcome() else {
             return PitchBatchItemStatus::Pending;
         };
-        match &attempt.outcome {
+        match outcome {
             PitchBatchOutcome::Acquired { candidate } => {
                 if self
                     .rejected_candidates
@@ -1099,6 +1219,11 @@ impl PitchBatchItem {
                     .any(|rejection| rejection.candidate_sha256 == candidate.sha256)
                 {
                     PitchBatchItemStatus::CandidateRejected
+                } else if self
+                    .current_candidate()
+                    .is_none_or(|current| current.sha256 != candidate.sha256)
+                {
+                    PitchBatchItemStatus::Pending
                 } else if candidate.validation.status == SemanticStatus::Verified {
                     PitchBatchItemStatus::AcquiredVerified
                 } else {
@@ -1126,15 +1251,37 @@ impl PitchBatchItem {
     }
 
     pub fn candidate(&self, sha256: &str) -> Option<&PitchBatchCandidate> {
-        self.attempts.iter().find_map(|attempt| {
-            if let PitchBatchOutcome::Acquired { candidate } = &attempt.outcome
-                && candidate.sha256 == sha256
-            {
-                Some(candidate.as_ref())
-            } else {
-                None
-            }
-        })
+        self.current_candidate()
+            .filter(|candidate| candidate.sha256 == sha256)
+            .or_else(|| {
+                self.attempts.iter().find_map(|attempt| {
+                    if let PitchBatchOutcome::Acquired { candidate } = &attempt.outcome
+                        && candidate.sha256 == sha256
+                    {
+                        Some(candidate.as_ref())
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
+    pub fn current_candidate(&self) -> Option<&PitchBatchCandidate> {
+        let attempt_index = self.current_candidate_attempt_index?;
+        let sha256 = self.current_candidate_sha256.as_deref()?;
+        self.candidate_at(attempt_index, sha256)
+    }
+
+    pub fn candidate_at(&self, attempt_index: u32, sha256: &str) -> Option<&PitchBatchCandidate> {
+        self.attempts
+            .iter()
+            .find(|attempt| attempt.index == attempt_index)
+            .and_then(|attempt| match &attempt.outcome {
+                PitchBatchOutcome::Acquired { candidate } if candidate.sha256 == sha256 => {
+                    Some(candidate.as_ref())
+                }
+                _ => None,
+            })
     }
 
     pub fn token(&self) -> PitchBatchItemToken {
@@ -1154,7 +1301,7 @@ impl PitchAccentBatchRuntime {
         })
     }
 
-    /// Создаёт новый runtime state и сохраняет его до возврата.
+    /// Создаёт новое runtime-состояние и сохраняет его до возврата.
     pub fn create(store_root: &Path, batch: &PitchAccentBatch) -> Result<Self, AssetError> {
         batch.validate()?;
         let mut runtime = Self::open(store_root, &batch.batch_id)?;
@@ -1174,8 +1321,8 @@ impl PitchAccentBatchRuntime {
         self.runtime.save(batch)
     }
 
-    /// Сохраняет one-item outcome по token CAS. Возвращает `false`, если пока
-    /// шёл acquisition этот item сменил generation, request или item revision.
+    /// Сохраняет результат одного элемента по token CAS. Возвращает `false`, если во время
+    /// получения у элемента изменились поколение, запрос или item revision.
     pub fn record_outcome(
         &mut self,
         batch: &mut PitchAccentBatch,
@@ -1183,7 +1330,7 @@ impl PitchAccentBatchRuntime {
         outcome: JpdbPitchOutcome,
     ) -> Result<bool, AssetError> {
         if batch.batch_id != self.batch_id() {
-            return Err(invalid("batch id не совпадает с runtime directory"));
+            return Err(invalid("ID пакета не совпадает с каталогом runtime"));
         }
         let Some(item) = batch
             .items
@@ -1219,9 +1366,10 @@ impl PitchAccentBatchRuntime {
         validate_outcome(&stored, &item.identity, &item.request, &batch.validator)?;
         let item = batch
             .item_mut(&token.identity.key)
-            .expect("token identity проверена выше");
+            .expect("идентичность токена проверена выше");
+        let attempt_index = item.attempts.len() as u32 + 1;
         item.attempts.push(PitchBatchAttempt {
-            index: item.attempts.len() as u32 + 1,
+            index: attempt_index,
             generation: item.generation,
             request: item.request.clone(),
             outcome: stored,
@@ -1233,10 +1381,14 @@ impl PitchAccentBatchRuntime {
                 None
             }
         });
+        item.current_candidate_attempt_index = item
+            .current_candidate_sha256
+            .as_ref()
+            .map(|_| attempt_index);
         item.item_revision = item
             .item_revision
             .checked_add(1)
-            .ok_or_else(|| invalid("превышен item revision"))?;
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
         batch.refresh_blob_validation_context()?;
         batch.bump_revision()?;
         self.save(batch)?;
@@ -1249,11 +1401,12 @@ impl PitchAccentBatchRuntime {
         candidate: &PitchBatchCandidate,
     ) -> Result<Vec<u8>, AssetError> {
         let referenced = batch.items.iter().any(|item| {
-            item.candidate(&candidate.sha256)
-                .is_some_and(|stored| stored == candidate)
+            item.attempts.iter().any(|attempt| {
+                matches!(&attempt.outcome, PitchBatchOutcome::Acquired { candidate: stored } if stored.as_ref() == candidate)
+            })
         });
         if !referenced {
-            return Err(invalid("candidate не принадлежит этому batch state"));
+            return Err(invalid("кандидат не принадлежит этому состоянию пакета"));
         }
         let bytes = self
             .runtime
@@ -1262,7 +1415,7 @@ impl PitchAccentBatchRuntime {
         Ok(bytes)
     }
 
-    /// Review HTML принадлежит `pitch_review`; runtime занимается только safe artifact write.
+    /// HTML-отчёт принадлежит `pitch_review`; runtime только безопасно записывает артефакт.
     pub fn write_review(
         &self,
         batch: &PitchAccentBatch,
@@ -1270,7 +1423,7 @@ impl PitchAccentBatchRuntime {
     ) -> Result<PathBuf, AssetError> {
         batch.validate()?;
         if batch.batch_id != self.batch_id() {
-            return Err(invalid("batch id не совпадает с runtime directory"));
+            return Err(invalid("ID пакета не совпадает с каталогом runtime"));
         }
         let html = crate::pitch_review::render(batch, owner_records, |candidate| {
             self.read_candidate(batch, candidate)
@@ -1289,7 +1442,7 @@ impl PitchAccentBatchRuntime {
             |message| {
                 AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
-                    format!("provider candidate не соответствует request: {message}"),
+                    format!("кандидат провайдера не соответствует запросу: {message}"),
                 )
             },
         )?;
@@ -1298,7 +1451,7 @@ impl PitchAccentBatchRuntime {
         {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "provider acquired candidate превышает лимит или не является PNG",
+                "полученный кандидат провайдера превышает лимит или не является PNG",
             ));
         }
         let sha256 = sha256_hex(&acquired.bytes);
@@ -1385,7 +1538,7 @@ impl RuntimeBatchState for PitchAccentBatch {
         }
         if !found {
             return Err(invalid(
-                "runtime state ссылается на неизвестный pitch candidate",
+                "состояние runtime ссылается на неизвестного кандидата pitch-accent",
             ));
         }
         Ok(())
@@ -1432,6 +1585,21 @@ fn request_fingerprint(request: &JpdbPitchRequest) -> String {
     sha256_hex(&context)
 }
 
+fn plan_identity_digest(
+    schema_version: u32,
+    requests: &[JpdbPitchRequest],
+) -> Result<String, AssetError> {
+    let canonical = serde_json::to_vec(&(schema_version, requests)).map_err(|error| {
+        AssetError::new(
+            ErrorCode::InvalidValidationEvidence,
+            format!("не удалось сериализовать нормализованный план pitch-accent: {error}"),
+        )
+    })?;
+    let mut digest_input = b"pitch-batch-plan-v1\0".to_vec();
+    digest_input.extend_from_slice(&canonical);
+    Ok(sha256_hex(&digest_input))
+}
+
 fn validate_request(request: &JpdbPitchRequest) -> Result<(), AssetError> {
     let query = &request.query;
     if query.surface.trim().is_empty()
@@ -1443,7 +1611,7 @@ fn validate_request(request: &JpdbPitchRequest) -> Result<(), AssetError> {
     {
         return Err(AssetError::new(
             ErrorCode::InvalidIdentity,
-            "surface должен быть exact непустым значением без краевых пробелов; reading — непустым без управляющих символов",
+            "`surface` должен быть точным непустым значением без краевых пробелов; `reading` — непустым без управляющих символов",
         ));
     }
     PitchAccentDomainPolicy.validate_identity(
@@ -1487,7 +1655,7 @@ fn validate_outcome(
             {
                 return Err(AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
-                    "evidence отсутствия pitch accent противоречит exact request или контракту страницы",
+                    "свидетельства отсутствия pitch-accent противоречат точному запросу или контракту страницы",
                 ));
             }
             let selection =
@@ -1495,7 +1663,37 @@ fn validate_outcome(
                     .map_err(|message| {
                     AssetError::new(ErrorCode::InvalidValidationEvidence, message)
                 })?;
-            let _ = selection;
+            if let Some(request_selection) = &request.selection {
+                let requested = JpdbPitchSelection::new(
+                    request_selection.vocabulary_id,
+                    request_selection.detail_url.clone(),
+                )
+                .map_err(|message| {
+                    AssetError::new(ErrorCode::InvalidValidationEvidence, message)
+                })?;
+                let expected_route =
+                    parse_jpdb_vocabulary_route(&requested.detail_url).map_err(|_| {
+                        AssetError::new(
+                            ErrorCode::InvalidValidationEvidence,
+                            "маршрут явно выбранной словарной записи невалиден",
+                        )
+                    })?;
+                let evidence_route =
+                    parse_jpdb_vocabulary_route(&selection.detail_url).map_err(|_| {
+                        AssetError::new(
+                            ErrorCode::InvalidValidationEvidence,
+                            "URL источника свидетельств отсутствия не является маршрутом словарной записи",
+                        )
+                    })?;
+                if selection.vocabulary_id != requested.vocabulary_id
+                    || evidence_route != expected_route
+                {
+                    return Err(AssetError::new(
+                        ErrorCode::InvalidValidationEvidence,
+                        "свидетельства отсутствия не совпадают с точным явным выбором словарной записи",
+                    ));
+                }
+            }
         }
         PitchBatchOutcome::AmbiguousVocabulary {
             surface,
@@ -1512,7 +1710,7 @@ fn validate_outcome(
             {
                 return Err(AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
-                    "ambiguity inventory не соответствует exact request",
+                    "список неоднозначных результатов не соответствует точному запросу",
                 ));
             }
             let mut ids = BTreeSet::new();
@@ -1523,7 +1721,7 @@ fn validate_outcome(
                 {
                     return Err(AssetError::new(
                         ErrorCode::InvalidValidationEvidence,
-                        "ambiguity inventory содержит повторный ID или неподтверждённую форму",
+                        "список неоднозначных результатов содержит повторный ID или неподтверждённую форму",
                     ));
                 }
                 JpdbPitchSelection::new(candidate.vocabulary_id, candidate.detail_url.clone())
@@ -1542,7 +1740,7 @@ fn validate_outcome(
             {
                 return Err(AssetError::new(
                     ErrorCode::InvalidValidationEvidence,
-                    "not-found outcome не соответствует exact request",
+                    "результат отсутствия словарной записи не соответствует точному запросу",
                 ));
             }
         }
@@ -1553,7 +1751,7 @@ fn validate_outcome(
         if candidate.validation.validator != *validator {
             return Err(AssetError::new(
                 ErrorCode::UnsupportedSchemaVersion,
-                "candidate evidence использует не текущий validator",
+                "свидетельства кандидата используют не текущий валидатор",
             ));
         }
     }
@@ -1579,7 +1777,7 @@ fn validate_candidate_record(
     {
         return Err(AssetError::new(
             ErrorCode::InvalidValidationEvidence,
-            "pitch candidate blob, SHA, metadata, validator или context не согласованы",
+            "файл кандидата pitch-accent, SHA, метаданные, валидатор или контекст не согласованы",
         ));
     }
     validate_acquired_metadata(identity, request, &candidate.metadata)
@@ -1599,18 +1797,18 @@ fn validate_acquired_metadata(
     {
         return Err(AssetError::new(
             ErrorCode::InvalidValidationEvidence,
-            "candidate metadata не доказывает requested surface/reading",
+            "метаданные кандидата не доказывают запрошенные `surface`/`reading`",
         ));
     }
     if let Some(selection) = &request.selection {
         let requested_route = parse_jpdb_vocabulary_route(&selection.detail_url)
-            .map_err(|_| identity_conflict("request selection route invalid"))?;
+            .map_err(|_| identity_conflict("маршрут выбранной в запросе записи невалиден"))?;
         let actual_route = parse_jpdb_vocabulary_route(&metadata.evidence.source_url)
-            .map_err(|_| identity_conflict("candidate source route invalid"))?;
+            .map_err(|_| identity_conflict("маршрут источника кандидата невалиден"))?;
         if selection.vocabulary_id != metadata.jpdb_vocabulary_id || requested_route != actual_route
         {
             return Err(identity_conflict(
-                "candidate source не совпадает с explicit vocabulary selection",
+                "источник кандидата не совпадает с явным выбором словарной записи",
             ));
         }
     }
@@ -1633,30 +1831,30 @@ fn validate_candidate(
     let sha256 = sha256_hex(bytes);
     let location =
         PitchAccentDomainPolicy.canonical_location(identity, &sha256, DetectedFormat::Png)?;
-    let asset = AssetRecord {
-        identity: identity.clone(),
-        storage_path: location.storage_path,
-        consumer_filename: location.consumer_filename,
-        sha256: sha256.clone(),
-        byte_length: bytes.len() as u64,
-        format: DetectedFormat::Png,
-        provenance: crate::model::Provenance {
-            source_kind: "jpdb_browser_render".into(),
-            source_name: format!("jpdb-vocabulary-{}.png", metadata.jpdb_vocabulary_id),
-        },
-        lifecycle: LifecycleState::Pending,
-        validation: None,
-        human_attestation: None,
-        domain_metadata: Some(
-            serde_json::to_value(metadata)
-                .map_err(|error| invalid(format!("не удалось сериализовать metadata: {error}")))?,
-        ),
-    };
+    let asset =
+        AssetRecord {
+            identity: identity.clone(),
+            storage_path: location.storage_path,
+            consumer_filename: location.consumer_filename,
+            sha256: sha256.clone(),
+            byte_length: bytes.len() as u64,
+            format: DetectedFormat::Png,
+            provenance: crate::model::Provenance {
+                source_kind: "jpdb_browser_render".into(),
+                source_name: format!("jpdb-vocabulary-{}.png", metadata.jpdb_vocabulary_id),
+            },
+            lifecycle: LifecycleState::Pending,
+            validation: None,
+            human_attestation: None,
+            domain_metadata: Some(serde_json::to_value(metadata).map_err(|error| {
+                invalid(format!("не удалось сериализовать метаданные: {error}"))
+            })?),
+        };
     let validator = PitchAccentImageValidator;
     if validator.identity() != *validator_identity {
         return Err(AssetError::new(
             ErrorCode::UnsupportedSchemaVersion,
-            "candidate acquisition использует не текущий validator",
+            "получение кандидата использует не текущий валидатор",
         ));
     }
     let decision = validator
@@ -1689,13 +1887,13 @@ fn validate_candidate_bytes(
     {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "pitch candidate bytes, длина или PNG signature не совпадают с state",
+            "байты кандидата pitch-accent, длина или сигнатура PNG не совпадают с состоянием",
         ));
     }
     if candidate.validation_context_sha256 != candidate_context(candidate)? {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "pitch candidate validation context не совпадает с metadata/evidence",
+            "контекст проверки кандидата pitch-accent не совпадает с метаданными или свидетельствами",
         ));
     }
     let identity = AssetIdentity::new("pitch_accent", candidate.metadata.surface.clone())
@@ -1704,7 +1902,7 @@ fn validate_candidate_bytes(
     if fresh != candidate.validation {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "PitchAccentImageValidator result не совпадает с сохранённым exact evidence",
+            "результат PitchAccentImageValidator не совпадает с сохранёнными точными свидетельствами",
         ));
     }
     Ok(())
@@ -1733,7 +1931,7 @@ fn candidate_context(candidate: &PitchBatchCandidate) -> Result<String, AssetErr
     })
     .map_err(|error| {
         invalid(format!(
-            "не удалось сериализовать candidate context: {error}"
+            "не удалось сериализовать контекст кандидата: {error}"
         ))
     })?;
     Ok(sha256_hex(&bytes))
@@ -1751,8 +1949,11 @@ fn blob_context_digest(items: &[PitchBatchItem]) -> Result<String, AssetError> {
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let bytes = serde_json::to_vec(&contexts)
-        .map_err(|error| invalid(format!("не удалось сериализовать blob context: {error}")))?;
+    let bytes = serde_json::to_vec(&contexts).map_err(|error| {
+        invalid(format!(
+            "не удалось сериализовать контекст файлов кандидатов: {error}"
+        ))
+    })?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -1765,7 +1966,7 @@ fn record_is_verified_for(record: &AssetRecord, validator: &ValidatorIdentity) -
                 && validation.content_sha256 == record.sha256
                 && validation.is_valid_for_sha(&record.sha256)
         })
-        && record.is_trusted_for(validator)
+        && record.is_trusted_for_automated_validation(validator)
 }
 
 fn record_matches_request(
@@ -1779,7 +1980,7 @@ fn record_matches_request(
         serde_json::from_value(value.clone()).map_err(|_| {
             AssetError::new(
                 ErrorCode::InvalidValidationEvidence,
-                "owner pitch metadata имеет неизвестную форму",
+                "метаданные pitch-accent владельца имеют неизвестную форму",
             )
         })?;
     if metadata.surface != request.query.surface
@@ -1793,15 +1994,37 @@ fn record_matches_request(
     }
     if let Some(selection) = &request.selection {
         let expected = parse_jpdb_vocabulary_route(&selection.detail_url)
-            .map_err(|_| identity_conflict("request selection route invalid"))?;
+            .map_err(|_| identity_conflict("маршрут выбранной в запросе записи невалиден"))?;
         let actual = parse_jpdb_vocabulary_route(&metadata.evidence.source_url)
-            .map_err(|_| identity_conflict("owner metadata source route invalid"))?;
+            .map_err(|_| identity_conflict("маршрут источника в метаданных владельца невалиден"))?;
         return Ok(metadata.jpdb_vocabulary_id == selection.vocabulary_id && actual == expected);
     }
     Ok(true)
 }
 
-fn retryable_failure(error: &JpdbPitchFailure) -> bool {
+fn record_matches_candidate(
+    record: &AssetRecord,
+    candidate: &PitchBatchCandidate,
+) -> Result<bool, AssetError> {
+    if record.sha256 != candidate.sha256
+        || record.validation.as_ref() != Some(&candidate.validation)
+    {
+        return Ok(false);
+    }
+    let Some(value) = &record.domain_metadata else {
+        return Ok(false);
+    };
+    let metadata: PitchAccentDomainMetadata =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            AssetError::new(
+                ErrorCode::InvalidValidationEvidence,
+                "метаданные pitch-accent владельца имеют неизвестную форму",
+            )
+        })?;
+    Ok(metadata == candidate.metadata)
+}
+
+pub fn is_retryable_failure(error: &JpdbPitchFailure) -> bool {
     match error {
         JpdbPitchFailure::Timeout { .. }
         | JpdbPitchFailure::BrowserSetup { .. }
@@ -1837,16 +2060,52 @@ fn contains_retryable_network_error(message: &str) -> bool {
         "ERR_NETWORK_CHANGED",
         "NET::ERR_ABORTED",
         "ERR_ABORTED",
+        "NET::ERR_DNS_TIMED_OUT",
+        "ERR_DNS_TIMED_OUT",
+        "NET::ERR_DNS_SERVER_FAILED",
+        "ERR_DNS_SERVER_FAILED",
+        "NET::ERR_NAME_RESOLUTION_FAILED",
+        "ERR_NAME_RESOLUTION_FAILED",
     ]
     .iter()
     .any(|token| upper.contains(token))
-        || (upper.contains("429") || (500..=599).any(|status| upper.contains(&status.to_string())))
+        || contains_retryable_http_status(&upper)
+}
+
+fn contains_retryable_http_status(message: &str) -> bool {
+    let without_urls = message
+        .split_whitespace()
+        .filter(|part| !part.contains("://"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words = without_urls
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words.iter().enumerate().any(|(index, word)| {
+        let Ok(status) = word.parse::<u16>() else {
+            return false;
+        };
+        if status != 429 && !(500..=599).contains(&status) {
+            return false;
+        }
+        if words
+            .get(index + 1)
+            .is_some_and(|unit| matches!(*unit, "MS" | "MSEC" | "MILLISECONDS"))
+        {
+            return false;
+        }
+        let previous = index.checked_sub(1).and_then(|i| words.get(i));
+        previous.is_some_and(|context| matches!(*context, "HTTP" | "STATUS" | "RESPONSE"))
+            || (previous == Some(&"CODE")
+                && index.checked_sub(2).and_then(|i| words.get(i)) == Some(&"STATUS"))
+    })
 }
 
 fn validate_reason(reason: &str) -> Result<(), AssetError> {
     if reason.trim().is_empty() || reason.len() > MAX_PITCH_BATCH_REASON_BYTES {
         return Err(invalid(format!(
-            "reason должен быть непустым и не длиннее {MAX_PITCH_BATCH_REASON_BYTES} байт"
+            "`reason` должен быть непустым и не длиннее {MAX_PITCH_BATCH_REASON_BYTES} байт"
         )));
     }
     Ok(())

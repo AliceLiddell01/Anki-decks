@@ -48,6 +48,22 @@ const GRAPH_STABILITY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_SEARCH_RESULTS: usize = 128;
 const MAX_GRAPH_COUNT: usize = 32;
 
+/// Единые настройки браузера для получения графиков JPDB.
+pub fn pitch_browser_runtime_config() -> BrowserRuntimeConfig {
+    BrowserRuntimeConfig {
+        device_metrics: Some(
+            DeviceMetrics::new(
+                CAPTURE_VIEWPORT_WIDTH,
+                CAPTURE_VIEWPORT_HEIGHT,
+                CAPTURE_DEVICE_SCALE_FACTOR,
+            )
+            .expect("Заданные метрики захвата JPDB должны быть корректными"),
+        ),
+        prefers_color_scheme: Some("dark".into()),
+        ..BrowserRuntimeConfig::default()
+    }
+}
+
 /// Форма написания и необязательное чтение для поиска в JPDB.
 /// Чтения в хирагане и катакане считаются эквивалентными; написание сравнивается точно.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,18 +343,7 @@ impl JpdbPitchProvider {
             return Vec::new();
         }
 
-        let runtime = BrowserRuntimeConfig {
-            device_metrics: Some(
-                DeviceMetrics::new(
-                    CAPTURE_VIEWPORT_WIDTH,
-                    CAPTURE_VIEWPORT_HEIGHT,
-                    CAPTURE_DEVICE_SCALE_FACTOR,
-                )
-                .expect("Заданные метрики захвата JPDB должны быть корректными"),
-            ),
-            prefers_color_scheme: Some("dark".into()),
-            ..BrowserRuntimeConfig::default()
-        };
+        let runtime = pitch_browser_runtime_config();
         let session = match BrowserSession::launch(runtime).await {
             Ok(session) => session,
             Err(message) => {

@@ -63,14 +63,15 @@ jobs:
             echo "Канонический kanji corpus отсутствует; проверка пропущена"
           fi
 
-      - name: Проверить verified-only pitch corpus
-        # Ветка без tracked corpus допустима. Если store присутствует (в том числе
-        # как symlink), read-only gate обязан подтвердить verified-only содержимое.
+      - name: Проверить корпус pitch-accent на записи только со статусом VERIFIED
+        # Отсутствующий каталог допустим. Если хранилище присутствует (в том числе
+        # как символическая ссылка), проверка только для чтения подтверждает, что
+        # все записи корпуса прошли обязательную автоматическую проверку.
         run: |
           if [ -e .asset-store/pitch-accent ] || [ -L .asset-store/pitch-accent ]; then
             cargo run --quiet --locked --bin pitch-corpus-gate
           else
-            echo "Канонический pitch corpus отсутствует; проверка пропущена"
+            echo "Канонический корпус pitch-accent отсутствует; проверка пропущена"
           fi
 
       - name: Проверить найденные CrowdAnki-экспорты

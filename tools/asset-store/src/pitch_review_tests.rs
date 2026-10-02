@@ -164,6 +164,11 @@ fn item_mut<'a>(batch: &'a mut PitchAccentBatch, surface: &str) -> &'a mut Pitch
 }
 
 fn add_outcome(item: &mut PitchBatchItem, outcome: PitchBatchOutcome) {
+    if matches!(&outcome, PitchBatchOutcome::Acquired { candidate }
+        if item.current_candidate_sha256.as_deref() == Some(candidate.sha256.as_str()))
+    {
+        item.current_candidate_attempt_index = Some(item.attempts.len() as u32 + 1);
+    }
     item.attempts.push(PitchBatchAttempt {
         index: item.attempts.len() as u32 + 1,
         generation: item.generation,
@@ -319,6 +324,7 @@ fn review_renders_every_typed_outcome_and_all_batch_statuses() {
         );
         item.publication = Some(PitchBatchPublication {
             candidate_sha256: hash.clone(),
+            candidate_attempt_index: item.current_candidate_attempt_index.unwrap(),
             expected_previous_sha256: None,
             status: match surface {
                 "pending-publication" => PitchBatchPublicationStatus::Pending,
@@ -377,25 +383,99 @@ fn review_renders_every_typed_outcome_and_all_batch_statuses() {
         assert!(html.contains(status), "missing status {status}");
     }
     for evidence_label in [
-        "Свидетельства источника",
-        "Свидетельства отрисовки",
-        "Свидетельства браузера",
+        "Данные источника",
+        "Данные отрисовки",
+        "Данные браузера",
         "Свидетельства отсутствия",
         "Техническая диагностика",
-        "Фактический detail route",
+        "Фактический адрес страницы",
         "Части речи",
         "Значения",
-        "Canonical PNG",
-        "graph count",
-        "semantic status",
+        "Канонический PNG",
+        "число графиков",
+        "статус проверки",
     ] {
         assert!(html.contains(evidence_label), "missing {evidence_label}");
     }
     assert!(html.contains(&format!("src=\"candidates/{current_sha}.png\"")));
     assert!(html.contains("src=\"../../../assets/png/canonical.png\""));
+    assert!(html.contains("Content-Security-Policy"));
+    assert!(html.contains("default-src 'none'; img-src 'self' file:"));
     assert!(!html.contains("<button"));
     assert!(!html.contains("<form"));
+    assert!(!html.contains("<input"));
+    assert!(!html.contains("<select"));
+    assert!(!html.contains("<textarea"));
     assert!(!html.contains("<script"));
+}
+
+#[test]
+fn review_marks_only_exact_current_attempt_when_candidate_sha_is_reused() {
+    let bytes = png();
+    let mut first = candidate("幽霊", &bytes, SemanticStatus::Verified);
+    first.metadata.reading = "古い読み".into();
+    first.metadata.evidence.source_url = "https://jpdb.io/old-attempt".into();
+    let sha = first.sha256.clone();
+    let mut second = candidate("幽霊", &bytes, SemanticStatus::Verified);
+    second.metadata.reading = "新しい読み".into();
+    second.metadata.evidence.source_url = "https://jpdb.io/current-attempt".into();
+    assert_eq!(second.sha256, sha);
+
+    let mut batch = base_batch(&["幽霊"]);
+    batch.items[0].current_candidate_sha256 = Some(sha);
+    add_outcome(
+        &mut batch.items[0],
+        PitchBatchOutcome::Acquired {
+            candidate: Box::new(first),
+        },
+    );
+    add_outcome(
+        &mut batch.items[0],
+        PitchBatchOutcome::Acquired {
+            candidate: Box::new(second),
+        },
+    );
+    assert_eq!(batch.items[0].current_candidate_attempt_index, Some(2));
+    assert_eq!(
+        batch.items[0].current_candidate().unwrap().metadata.reading,
+        "新しい読み"
+    );
+
+    let reads = std::cell::Cell::new(0);
+    let html = super::render(&batch, &[], |_| {
+        reads.set(reads.get() + 1);
+        Ok(bytes.clone())
+    })
+    .unwrap();
+    let first_attempt = html.find("Попытка 1").unwrap();
+    let second_attempt = html.find("Попытка 2").unwrap();
+    let first_markup = &html[first_attempt..second_attempt];
+    let second_markup = &html[second_attempt..];
+
+    assert!(first_markup.contains("чтение: 古い読み"));
+    assert!(!first_markup.contains("Текущий кандидат"));
+    assert!(second_markup.contains("чтение: 新しい読み"));
+    assert!(second_markup.contains("Текущий кандидат · SHA-256"));
+    assert_eq!(reads.get(), 1, "байты одного SHA должны читаться один раз");
+}
+
+#[test]
+fn review_does_not_link_a_trusted_record_that_is_not_the_current_owner_asset() {
+    let bytes = png();
+    let candidate = candidate("幽霊", &bytes, SemanticStatus::Verified);
+    let old_sha = candidate.sha256.clone();
+    let old_record = owner_record("幽霊", &bytes, &candidate);
+    let mut batch = base_batch(&["幽霊"]);
+    batch.items[0].owner_current_sha256 = Some("a".repeat(64));
+    batch.items[0].existing_verified_sha256 = Some(old_sha);
+
+    let html = super::render(&batch, &[old_record], |_| {
+        panic!("без текущего кандидата не должны читать изображение")
+    })
+    .unwrap();
+
+    assert!(!html.contains("<img"));
+    assert!(!html.contains("../../../assets/png/"));
 }
 
 #[test]
@@ -484,7 +564,7 @@ fn candidate_bytes_are_checked_before_a_relative_image_reference_is_emitted() {
 
     let html = super::render(&batch, &[], |_| Ok(bytes.clone())).unwrap();
     assert!(html.contains(&format!("src=\"candidates/{hash}.png\"")));
-    assert!(html.contains("semantic status: <strong>corrupt</strong>"));
+    assert!(html.contains("статус проверки: <strong><code>corrupt</code></strong>"));
     assert!(!html.contains("<button"));
 
     let mut mismatched = candidate("幽霊", &bytes, SemanticStatus::Uncertain);
@@ -500,7 +580,7 @@ fn candidate_bytes_are_checked_before_a_relative_image_reference_is_emitted() {
     );
     let html = super::render(&mismatch_batch, &[], |_| Ok(bytes.clone())).unwrap();
     assert!(!html.contains("<img"));
-    assert!(html.contains("не совпали с render evidence"));
+    assert!(html.contains("не совпали со свидетельством отрисовки"));
 }
 
 #[test]

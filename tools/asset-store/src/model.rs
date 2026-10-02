@@ -99,7 +99,7 @@ pub enum LifecycleState {
 }
 
 impl LifecycleState {
-    /// Стабильное machine-readable имя состояния.
+    /// Стабильное машиночитаемое имя состояния.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -126,7 +126,7 @@ pub enum SemanticStatus {
 }
 
 impl SemanticStatus {
-    /// Стабильное machine-readable имя результата.
+    /// Стабильное машиночитаемое имя результата.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Verified => "verified",
@@ -324,6 +324,21 @@ impl AssetRecord {
                 || self.validation.as_ref().is_some_and(|decision| {
                     decision.is_valid_for_sha(&self.sha256) && &decision.validator == validator
                 }))
+    }
+
+    /// Домен pitch-accent доверяет публикации только при положительном решении
+    /// ожидаемой версии автоматического валидатора. Одобрение человека не
+    /// заменяет и не переписывает это решение.
+    pub(crate) fn is_trusted_for_automated_validation(
+        &self,
+        validator: &ValidatorIdentity,
+    ) -> bool {
+        self.effective_status() == Some(SemanticStatus::Verified)
+            && self.validation.as_ref().is_some_and(|decision| {
+                decision.status == SemanticStatus::Verified
+                    && decision.is_valid_for_sha(&self.sha256)
+                    && &decision.validator == validator
+            })
     }
 }
 

@@ -3,10 +3,17 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{OutputFormat, StoreSummary, load_batch, reject_batch, run_batch};
+use super::{
+    CorpusCommand, OutputFormat, PitchBatchCommand, PitchCli, PitchCommand, PitchPlanItem,
+    StoreSummary, create_batch, execute, load_batch, reject_batch, run_batch,
+    validate_store_boundary,
+};
 use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
 use crate::hashing::sha256_hex;
-use crate::jpdb::{JpdbPitchAcquired, JpdbPitchOutcome, JpdbPitchQuery, JpdbPitchRequest};
+use crate::jpdb::{
+    JpdbPitchAcquired, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchQuery, JpdbPitchRequest,
+    JpdbPitchStage, JpdbVocabularyCandidate,
+};
 use crate::model::{AssetIdentity, HumanDecision, LifecycleState, Provenance, SemanticStatus};
 use crate::pitch_accent::{
     PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
@@ -166,7 +173,7 @@ async fn run_resumes_a_durable_candidate_without_reacquisition_and_resolved_reru
     let store = store_at(&root);
     let (bytes, _, expected_sha) = save_durable_candidate(&store, "candidate-resume", "幽霊");
 
-    // Candidate bytes и состояние сохранены до этого запуска, как если бы
+    // Байты кандидата и состояние сохранены до этого запуска, как если бы
     // предыдущий процесс остановился перед публикацией. Resume должен опубликовать
     // их из runtime blob.
     let (batch, changed) = run_batch(&store, "candidate-resume").await.unwrap();
@@ -192,7 +199,7 @@ async fn run_resumes_a_durable_candidate_without_reacquisition_and_resolved_reru
         bytes
     );
 
-    // Второй запуск видит уже разрешённый current owner, не открывает browser
+    // Второй запуск видит уже подтверждённую текущую запись владельца, не открывает браузер
     // и не добавляет новую попытку acquisition.
     let (rerun, changed) = run_batch(&store, "candidate-resume").await.unwrap();
     assert!(!changed);
@@ -334,5 +341,720 @@ fn reject_command_attests_the_exact_current_owner_sha_and_quarantines_it() {
     assert_eq!(item.owner_conflict.as_ref().unwrap().code, "owner_rejected");
 
     drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn cli(
+    store: PathBuf,
+    repository_root: PathBuf,
+    output: OutputFormat,
+    command: PitchCommand,
+) -> PitchCli {
+    PitchCli {
+        store: Some(store),
+        repository_root,
+        output,
+        command,
+    }
+}
+
+#[tokio::test]
+async fn pitch_cli_routes_human_errors_to_stderr_and_json_errors_to_stdout() {
+    let root = temp_root();
+    let store = store_at(&root);
+    let store_root = store.root().to_path_buf();
+    drop(store);
+
+    let success = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Human,
+        PitchCommand::Corpus {
+            command: CorpusCommand::List,
+        },
+    ))
+    .await;
+    assert_eq!(success.exit_code, 0);
+    assert!(success.stdout.contains("Операция: список корпуса"));
+    assert!(success.stderr.is_empty());
+
+    let human_status = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Human,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Status {
+                batch_id: "missing-status".into(),
+            },
+        },
+    ))
+    .await;
+    assert_ne!(human_status.exit_code, 0);
+    assert!(human_status.stdout.is_empty());
+    assert!(
+        human_status
+            .stderr
+            .contains("сохранённое состояние batch не найдено")
+    );
+
+    let human_run = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Human,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Run {
+                batch_id: "missing-run".into(),
+            },
+        },
+    ))
+    .await;
+    assert_ne!(human_run.exit_code, 0);
+    assert!(human_run.stdout.is_empty());
+    assert!(
+        human_run
+            .stderr
+            .contains("сохранённое состояние batch не найдено")
+    );
+
+    let json_error = execute(cli(
+        store_root,
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Status {
+                batch_id: "missing-json".into(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(json_error.exit_code, human_status.exit_code);
+    assert!(json_error.stderr.is_empty());
+    let response: serde_json::Value = serde_json::from_str(&json_error.stdout).unwrap();
+    assert_eq!(response["outcome"], "failed");
+    assert_eq!(
+        response["error"]["message"],
+        "сохранённое состояние batch не найдено"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn human_status_explains_technical_failure_ambiguity_and_selection() {
+    let root = temp_root();
+    let store = store_at(&root);
+    let store_root = store.root().to_path_buf();
+    let validator = PitchAccentImageValidator::validator_identity();
+
+    let request = JpdbPitchRequest::new(JpdbPitchQuery::new("幽霊", Some("ゆうれい".into())));
+    let mut failed_batch =
+        PitchAccentBatch::new("human-failure", vec![request.clone()], validator.clone()).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(store.root(), &failed_batch).unwrap();
+    let token = failed_batch.item_token("幽霊").unwrap();
+    runtime
+        .record_outcome(
+            &mut failed_batch,
+            &token,
+            JpdbPitchOutcome::Failed {
+                error: JpdbPitchFailure::Navigation {
+                    stage: JpdbPitchStage::SearchNavigation,
+                    message: "net::ERR_NAME_RESOLUTION_FAILED".into(),
+                },
+            },
+        )
+        .unwrap();
+    drop(runtime);
+
+    let failure_output = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Human,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Status {
+                batch_id: "human-failure".into(),
+            },
+        },
+    ))
+    .await;
+    assert!(failure_output.stdout.contains("техническая ошибка"));
+    assert!(failure_output.stdout.contains("переход к поиску"));
+    assert!(failure_output.stdout.contains("ERR_NAME_RESOLUTION_FAILED"));
+    assert!(failure_output.stdout.contains("повтор допустим"));
+
+    let candidates = vec![
+        JpdbVocabularyCandidate {
+            vocabulary_id: 123,
+            surface_forms: vec!["幽霊".into()],
+            readings: vec!["ゆうれい".into()],
+            resolved_forms: vec![PitchAccentResolvedForm {
+                surface: "幽霊".into(),
+                reading: "ゆうれい".into(),
+            }],
+            part_of_speech: vec!["Noun".into()],
+            meanings: vec!["ghost".into()],
+            detail_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい".into(),
+        },
+        JpdbVocabularyCandidate {
+            vocabulary_id: 124,
+            surface_forms: vec!["幽霊".into()],
+            readings: vec!["ゆうれい".into()],
+            resolved_forms: vec![PitchAccentResolvedForm {
+                surface: "幽霊".into(),
+                reading: "ゆうれい".into(),
+            }],
+            part_of_speech: vec!["Noun".into()],
+            meanings: vec!["phantom".into()],
+            detail_url: "https://jpdb.io/vocabulary/124/幽霊/ゆうれい".into(),
+        },
+    ];
+    let mut ambiguous_batch =
+        PitchAccentBatch::new("human-ambiguity", vec![request], validator).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(store.root(), &ambiguous_batch).unwrap();
+    let token = ambiguous_batch.item_token("幽霊").unwrap();
+    runtime
+        .record_outcome(
+            &mut ambiguous_batch,
+            &token,
+            JpdbPitchOutcome::AmbiguousVocabulary {
+                surface: "幽霊".into(),
+                reading: Some("ゆうれい".into()),
+                candidates,
+            },
+        )
+        .unwrap();
+    drop(runtime);
+
+    let ambiguity_output = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Human,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Status {
+                batch_id: "human-ambiguity".into(),
+            },
+        },
+    ))
+    .await;
+    assert!(
+        ambiguity_output
+            .stdout
+            .contains("Требуется выбрать точную запись JPDB")
+    );
+    assert!(ambiguity_output.stdout.contains("ID 123"));
+    assert!(ambiguity_output.stdout.contains("ID 124"));
+    assert!(ambiguity_output.stdout.contains("ghost"));
+
+    let selection_output = execute(cli(
+        store_root,
+        root.clone(),
+        OutputFormat::Human,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Select {
+                batch_id: "human-ambiguity".into(),
+                surface: "幽霊".into(),
+                vocabulary_id: 123,
+                detail_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい".into(),
+            },
+        },
+    ))
+    .await;
+    assert!(
+        selection_output
+            .stdout
+            .contains("Выбранная запись JPDB: ID 123")
+    );
+    assert!(
+        selection_output
+            .stdout
+            .contains("https://jpdb.io/vocabulary/123/幽霊/ゆうれい")
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn batch_start_noop_and_status_reconcile_report_persistent_changes() {
+    let root = temp_root();
+    let store = store_at(&root);
+    let store_root = store.root().to_path_buf();
+    drop(store);
+    let plan_path = root.join("plan.json");
+    fs::write(
+        &plan_path,
+        r#"{"schema_version":1,"items":[{"surface":"幽霊","reading":"ゆうれい"}]}"#,
+    )
+    .unwrap();
+
+    let start = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Start {
+                batch_id: Some("changed-contract".into()),
+                plan: plan_path.clone(),
+            },
+        },
+    ))
+    .await;
+    let start_response: serde_json::Value = serde_json::from_str(&start.stdout).unwrap();
+    assert_eq!(start_response["changed"], true);
+
+    let repeated_start = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Start {
+                batch_id: Some("changed-contract".into()),
+                plan: plan_path,
+            },
+        },
+    ))
+    .await;
+    let repeated_response: serde_json::Value =
+        serde_json::from_str(&repeated_start.stdout).unwrap();
+    assert_eq!(repeated_response["changed"], false);
+
+    let store = AssetStore::open_existing_with_policy(
+        StoreOptions::new(&store_root),
+        PitchAccentDomainPolicy,
+    )
+    .unwrap();
+    let bytes = png();
+    let metadata = metadata("幽霊", "ゆうれい", 123);
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+                bytes,
+                provenance: Provenance {
+                    source_kind: "jpdb_browser_capture".into(),
+                    source_name: "jpdb-vocabulary-123.png".into(),
+                },
+                domain_metadata: Some(serde_json::to_value(metadata).unwrap()),
+                replace_expected_sha256: None,
+            },
+            &PitchAccentImageValidator,
+        )
+        .unwrap();
+    drop(store);
+
+    let status = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Status {
+                batch_id: "changed-contract".into(),
+            },
+        },
+    ))
+    .await;
+    let status_response: serde_json::Value = serde_json::from_str(&status.stdout).unwrap();
+    assert_eq!(status_response["changed"], true);
+    assert_eq!(status_response["items"][0]["status"], "existing_verified");
+    assert_eq!(
+        status_response["batch"]["items"][0]["attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let repeated_status = execute(cli(
+        store_root,
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Status {
+                batch_id: "changed-contract".into(),
+            },
+        },
+    ))
+    .await;
+    let repeated_status_response: serde_json::Value =
+        serde_json::from_str(&repeated_status.stdout).unwrap();
+    assert_eq!(repeated_status_response["changed"], false);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn ensure_reports_each_new_runtime_batch_as_a_change_for_verified_canonical_items() {
+    let root = temp_root();
+    let store = store_at(&root);
+    let store_root = store.root().to_path_buf();
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+                bytes: png(),
+                provenance: Provenance {
+                    source_kind: "jpdb_browser_capture".into(),
+                    source_name: "jpdb-vocabulary-123.png".into(),
+                },
+                domain_metadata: Some(
+                    serde_json::to_value(metadata("幽霊", "ゆうれい", 123)).unwrap(),
+                ),
+                replace_expected_sha256: None,
+            },
+            &PitchAccentImageValidator,
+        )
+        .unwrap();
+    drop(store);
+
+    let ensure = || PitchCommand::Ensure {
+        plan: None,
+        surface: Some("幽霊".into()),
+        reading: Some("ゆうれい".into()),
+        vocabulary_id: None,
+        detail_url: None,
+        refresh: false,
+    };
+    let first = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        ensure(),
+    ))
+    .await;
+    let first_response: serde_json::Value = serde_json::from_str(&first.stdout).unwrap();
+    assert_eq!(first_response["changed"], true);
+    assert_eq!(first_response["items"][0]["status"], "existing_verified");
+
+    let second = execute(cli(store_root, root.clone(), OutputFormat::Json, ensure())).await;
+    let second_response: serde_json::Value = serde_json::from_str(&second.stdout).unwrap();
+    assert_eq!(second_response["changed"], true);
+    assert_eq!(second_response["items"][0]["status"], "existing_verified");
+    assert_ne!(first_response["batch_id"], second_response["batch_id"]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn cli_reacquire_publishes_current_metadata_when_png_sha_repeats() {
+    let root = temp_root();
+    let store = store_at(&root);
+    let store_root = store.root().to_path_buf();
+    let bytes = png();
+    let expected_sha = sha256_hex(&bytes);
+    let original_metadata = metadata("幽霊", "ゆうれい", 123);
+    let current_metadata = metadata("幽霊", "ゆうれい", 456);
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+                bytes: bytes.clone(),
+                provenance: Provenance {
+                    source_kind: "jpdb_browser_capture".into(),
+                    source_name: "jpdb-vocabulary-123.png".into(),
+                },
+                domain_metadata: Some(serde_json::to_value(&original_metadata).unwrap()),
+                replace_expected_sha256: None,
+            },
+            &PitchAccentImageValidator,
+        )
+        .unwrap();
+    let item = PitchPlanItem {
+        surface: "幽霊".into(),
+        reading: Some("ゆうれい".into()),
+        selection: None,
+    };
+    let (batch, created) = create_batch(&store, "same-sha-metadata", &[item], None).unwrap();
+    assert!(created);
+    assert_eq!(
+        batch.item("幽霊").unwrap().status(),
+        PitchBatchItemStatus::ExistingVerified
+    );
+    drop(store);
+
+    let reacquire = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Reacquire {
+                batch_id: "same-sha-metadata".into(),
+                surface: "幽霊".into(),
+                reason: "повторная проверка источника".into(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(reacquire.exit_code, 0);
+
+    let store = AssetStore::open_existing_with_policy(
+        StoreOptions::new(&store_root),
+        PitchAccentDomainPolicy,
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::open(store.root(), "same-sha-metadata").unwrap();
+    let mut batch = runtime.load().unwrap().unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(
+                &mut batch,
+                &token,
+                JpdbPitchOutcome::Acquired {
+                    asset: Box::new(JpdbPitchAcquired {
+                        bytes: bytes.clone(),
+                        metadata: current_metadata.clone(),
+                    }),
+                },
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        batch
+            .item("幽霊")
+            .unwrap()
+            .current_candidate_sha256
+            .as_deref(),
+        Some(expected_sha.as_str())
+    );
+    drop(runtime);
+    drop(store);
+
+    let run = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Run {
+                batch_id: "same-sha-metadata".into(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(run.exit_code, 0, "{}", run.stdout);
+
+    let store = AssetStore::open_existing_with_policy(
+        StoreOptions::new(&store_root),
+        PitchAccentDomainPolicy,
+    )
+    .unwrap();
+    let canonical = store
+        .verify_integrity()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.identity.key == "幽霊")
+        .unwrap();
+    assert_eq!(canonical.sha256, expected_sha);
+    assert_eq!(
+        canonical.domain_metadata,
+        Some(serde_json::to_value(&current_metadata).unwrap())
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn ambiguity_candidates() -> Vec<JpdbVocabularyCandidate> {
+    [(123, "ghost"), (124, "phantom")]
+        .into_iter()
+        .map(|(vocabulary_id, meaning)| JpdbVocabularyCandidate {
+            vocabulary_id,
+            surface_forms: vec!["幽霊".into()],
+            readings: vec!["ゆうれい".into()],
+            resolved_forms: vec![PitchAccentResolvedForm {
+                surface: "幽霊".into(),
+                reading: "ゆうれい".into(),
+            }],
+            part_of_speech: vec!["Noun".into()],
+            meanings: vec![meaning.into()],
+            detail_url: format!("https://jpdb.io/vocabulary/{vocabulary_id}/幽霊/ゆうれい"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn batch_start_uses_immutable_original_plan_identity_after_selection() {
+    let root = temp_root();
+    let store = store_at(&root);
+    let store_root = store.root().to_path_buf();
+    drop(store);
+    let original_plan_path = root.join("original-plan.json");
+    let history_only_plan_path = root.join("history-only-plan.json");
+    fs::write(
+        &original_plan_path,
+        r#"{"schema_version":1,"items":[{"surface":"幽霊","reading":"ゆうれい"}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &history_only_plan_path,
+        r#"{"schema_version":1,"items":[{"surface":"幽霊","reading":"ゆうれい","selection":{"vocabulary_id":123,"detail_url":"https://jpdb.io/vocabulary/123/幽霊/ゆうれい"}}]}"#,
+    )
+    .unwrap();
+
+    let start = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Start {
+                batch_id: Some("immutable-plan".into()),
+                plan: original_plan_path.clone(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(start.exit_code, 0, "{}", start.stdout);
+
+    let store = AssetStore::open_existing_with_policy(
+        StoreOptions::new(&store_root),
+        PitchAccentDomainPolicy,
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::open(store.root(), "immutable-plan").unwrap();
+    let mut batch = runtime.load().unwrap().unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    runtime
+        .record_outcome(
+            &mut batch,
+            &token,
+            JpdbPitchOutcome::AmbiguousVocabulary {
+                surface: "幽霊".into(),
+                reading: Some("ゆうれい".into()),
+                candidates: ambiguity_candidates(),
+            },
+        )
+        .unwrap();
+    drop(runtime);
+    drop(store);
+
+    let first_selection = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Select {
+                batch_id: "immutable-plan".into(),
+                surface: "幽霊".into(),
+                vocabulary_id: 123,
+                detail_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい".into(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(first_selection.exit_code, 0, "{}", first_selection.stdout);
+
+    let store = AssetStore::open_existing_with_policy(
+        StoreOptions::new(&store_root),
+        PitchAccentDomainPolicy,
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::open(store.root(), "immutable-plan").unwrap();
+    let mut batch = runtime.load().unwrap().unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    runtime
+        .record_outcome(
+            &mut batch,
+            &token,
+            JpdbPitchOutcome::AmbiguousVocabulary {
+                surface: "幽霊".into(),
+                reading: Some("ゆうれい".into()),
+                candidates: ambiguity_candidates(),
+            },
+        )
+        .unwrap();
+    drop(runtime);
+    drop(store);
+
+    let second_selection = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Select {
+                batch_id: "immutable-plan".into(),
+                surface: "幽霊".into(),
+                vocabulary_id: 124,
+                detail_url: "https://jpdb.io/vocabulary/124/幽霊/ゆうれい".into(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(second_selection.exit_code, 0, "{}", second_selection.stdout);
+
+    let repeated_original = execute(cli(
+        store_root.clone(),
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Start {
+                batch_id: Some("immutable-plan".into()),
+                plan: original_plan_path,
+            },
+        },
+    ))
+    .await;
+    assert_eq!(
+        repeated_original.exit_code, 0,
+        "{}",
+        repeated_original.stdout
+    );
+
+    let history_only = execute(cli(
+        store_root,
+        root.clone(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Start {
+                batch_id: Some("immutable-plan".into()),
+                plan: history_only_plan_path,
+            },
+        },
+    ))
+    .await;
+    assert_ne!(history_only.exit_code, 0);
+    let response: serde_json::Value = serde_json::from_str(&history_only.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "identity_conflict");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pitch_store_boundary_rejects_decks_overlap_and_accepts_external_store() {
+    let root = temp_root();
+    let repository = root.join("repository");
+    let decks = repository.join("decks");
+    fs::create_dir_all(&decks).unwrap();
+
+    assert!(validate_store_boundary(&decks.join("pitch-store"), &repository).is_err());
+    assert!(validate_store_boundary(&repository, &repository).is_err());
+    assert!(validate_store_boundary(&root.join("outside-store"), &repository).is_ok());
+
+    let hostile_repository_root = decks.join("nested-checkout");
+    fs::create_dir_all(&hostile_repository_root).unwrap();
+    assert!(
+        validate_store_boundary(&root.join("safe-looking-store"), &hostile_repository_root)
+            .is_err()
+    );
+    assert!(
+        validate_store_boundary(&root.join("outside-store"), &root.join("missing-checkout"))
+            .is_err()
+    );
+    assert!(validate_store_boundary(&decks.join("hidden-store"), &root).is_err());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn pitch_store_boundary_rejects_symlink_alias_into_decks() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_root();
+    let repository = root.join("repository");
+    let decks = repository.join("decks");
+    fs::create_dir_all(&decks).unwrap();
+    let alias = root.join("decks-alias");
+    symlink(&decks, &alias).unwrap();
+
+    assert!(validate_store_boundary(&alias.join("pitch-store"), &repository).is_err());
+
     fs::remove_dir_all(root).unwrap();
 }

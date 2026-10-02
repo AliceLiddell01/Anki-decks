@@ -9,24 +9,24 @@ use image::ImageDecoder;
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
-use crate::model::{AssetRecord, DetectedFormat, LifecycleState, SemanticStatus};
+use crate::model::{AssetRecord, DetectedFormat, LifecycleState};
 use crate::pitch_accent::{
-    PITCH_ACCENT_MAX_ASSET_BYTES, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
+    PITCH_ACCENT_MAX_ASSET_BYTES, PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES,
+    PITCH_ACCENT_MAX_IMAGE_DIMENSION, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
 };
 use crate::pitch_batch::{
     PitchAccentBatch, PitchBatchCandidate, PitchBatchItem, PitchBatchItemStatus, PitchBatchOutcome,
 };
 
-const MAX_IMAGE_DIMENSION: u32 = 4096;
-const MAX_DECODE_ALLOCATION_BYTES: u64 = 48 * 1024 * 1024;
 const MAX_REVIEW_HTML_BYTES: usize = 64 * 1024 * 1024;
 
 /// Собирает локальную страницу проверки без действий, меняющих batch или corpus.
 ///
-/// Кандидатные байты повторно сверяются с exact SHA, размером и PNG decoder-ом.
-/// Canonical-ссылки выводятся только для записи owner store, совпавшей с batch
-/// по identity, SHA, storage path и текущему validator; caller передаёт только
-/// записи, чьи байты уже проверены `read_verified_with_policy`.
+/// Байты кандидата повторно сверяются с SHA, размером и декодером PNG.
+/// Канонические ссылки выводятся только для записи хранилища владельца,
+/// совпавшей с пакетом по идентичности, SHA, пути в хранилище и текущему
+/// проверяющему модулю; вызывающая сторона передаёт только записи, чьи байты
+/// уже проверены через `read_verified_with_policy`.
 pub(crate) fn render(
     batch: &PitchAccentBatch,
     owner_records: &[AssetRecord],
@@ -38,7 +38,7 @@ pub(crate) fn render(
     let validator = serde_json::to_value(&batch.validator).map_err(json_error)?;
     write!(
         &mut html,
-        "<p>Пакет: <code>{}</code>; изменение: {}; validator: <code>{}</code></p>",
+        "<p>Пакет: <code>{}</code>; изменение: {}; проверяющий модуль: <code>{}</code></p>",
         escape_html(&batch.batch_id),
         batch.revision,
         escape_html(&json_text(&validator)?)
@@ -57,14 +57,14 @@ pub(crate) fn render(
         )?;
         if html.len() > MAX_REVIEW_HTML_BYTES {
             return Err(invalid(
-                "HTML-отчёт pitch batch превышает установленный предел",
+                "HTML-отчёт пакета pitch-accent превышает установленный предел",
             ));
         }
     }
     html.push_str("</body></html>");
     if html.len() > MAX_REVIEW_HTML_BYTES {
         return Err(invalid(
-            "HTML-отчёт pitch batch превышает установленный предел",
+            "HTML-отчёт пакета pitch-accent превышает установленный предел",
         ));
     }
     Ok(html)
@@ -87,7 +87,7 @@ fn render_item(
     let query = serde_json::to_value(&item.request).map_err(json_error)?;
     write!(
         html,
-        "<article><h2>{}</h2><p class=\"state\">Состояние: {} (<code>{}</code>)</p><dl><dt>Запрос</dt><dd><pre>{}</pre></dd><dt>Поколение</dt><dd>{}</dd><dt>Изменение элемента</dt><dd>{}</dd><dt>SHA-256 текущего candidate</dt><dd><code>{}</code></dd><dt>SHA-256 записи owner snapshot</dt><dd><code>{}</code></dd><dt>SHA-256 текущего VERIFIED owner asset</dt><dd><code>{}</code></dd><dt>SHA-256 успешной publication</dt><dd><code>{}</code></dd><dt>SHA-256 canonical state</dt><dd><code>{}</code></dd><dt>Ожидаемый SHA для CAS публикации</dt><dd><code>{}</code></dd><dt>Публикация</dt><dd><pre>{}</pre></dd><dt>Owner conflict</dt><dd><pre>{}</pre></dd><dt>Причина последнего действия</dt><dd><pre>{}</pre></dd><dt>Отклонённые exact SHA-256</dt><dd><pre>{}</pre></dd></dl>",
+        "<article><h2>{}</h2><p class=\"state\">Состояние: {} (<code>{}</code>)</p><dl><dt>Запрос</dt><dd><pre>{}</pre></dd><dt>Поколение</dt><dd>{}</dd><dt>Изменение элемента</dt><dd>{}</dd><dt>SHA-256 текущего кандидата</dt><dd><code>{}</code></dd><dt>SHA-256 записи из снимка владельца</dt><dd><code>{}</code></dd><dt>SHA-256 текущего проверенного ресурса владельца</dt><dd><code>{}</code></dd><dt>SHA-256 успешной публикации</dt><dd><code>{}</code></dd><dt>SHA-256 канонического состояния</dt><dd><code>{}</code></dd><dt>Ожидаемый SHA для публикации с CAS</dt><dd><code>{}</code></dd><dt>Публикация</dt><dd><pre>{}</pre></dd><dt>Конфликт владельца</dt><dd><pre>{}</pre></dd><dt>Причина последнего действия</dt><dd><pre>{}</pre></dd><dt>Отклонённые SHA-256</dt><dd><pre>{}</pre></dd></dl>",
         escape_html(&item.identity.key),
         item_status_label(item_status),
         escape_html(&status_text),
@@ -116,6 +116,13 @@ fn render_item(
     }
 
     let mut shown = BTreeSet::new();
+    let current_candidate = item.current_candidate();
+    if item.current_candidate_sha256.is_some() && current_candidate.is_none() {
+        return Err(AssetError::new(
+            ErrorCode::IntegrityMismatch,
+            "текущая попытка не указывает на сохранённый pitch-кандидат с ожидаемым SHA",
+        ));
+    }
     for attempt in &item.attempts {
         write!(
             html,
@@ -126,11 +133,14 @@ fn render_item(
         write_json_block(html, "Запрос этой попытки", &attempt.request)?;
         match &attempt.outcome {
             PitchBatchOutcome::Acquired { candidate } => {
+                // SHA может повторяться; метку текущего получает только точная попытка.
+                let is_current = item.current_candidate_attempt_index == Some(attempt.index)
+                    && current_candidate.is_some_and(|current| current.sha256 == candidate.sha256);
                 render_candidate(
                     html,
                     item,
                     candidate,
-                    item.current_candidate_sha256.as_deref() == Some(candidate.sha256.as_str()),
+                    is_current,
                     item.rejected_candidates
                         .iter()
                         .any(|rejection| rejection.candidate_sha256 == candidate.sha256),
@@ -163,7 +173,7 @@ fn render_item(
             PitchBatchOutcome::VocabularyNotFound { surface, reading } => {
                 write!(
                     html,
-                    "<p>Типизированный исход: <code>vocabulary_not_found</code>. JPDB не нашёл словарную запись для surface {} и reading {}. Это не является доказательством отсутствия pitch-accent.</p>",
+                    "<p>Типизированный исход: <code>vocabulary_not_found</code>. JPDB не нашёл словарную запись для формы {} и чтения {}. Это не является доказательством отсутствия pitch-accent.</p>",
                     escape_html(surface),
                     escape_html(reading.as_deref().unwrap_or("не задано"))
                 )
@@ -182,13 +192,13 @@ fn render_item(
     {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "текущий pitch candidate отсутствует среди сохранённых acquisition outcomes",
+            "текущий pitch-кандидат отсутствует среди сохранённых результатов получения",
         ));
     }
     if item.attempts.is_empty() && canonical_record.is_some() {
-        html.push_str("<p>Для текущего canonical SHA уже есть effective VERIFIED asset; acquisition для этого элемента не выполнялся.</p>");
+        html.push_str("<p>Для текущего канонического SHA уже есть действующий проверенный ресурс; получение для этого элемента не выполнялось.</p>");
     } else if item.attempts.is_empty() {
-        html.push_str("<p>Получение ещё не запускалось; candidate PNG отсутствует.</p>");
+        html.push_str("<p>Получение ещё не запускалось; PNG кандидата отсутствует.</p>");
     }
     html.push_str("</article>");
     Ok(())
@@ -208,7 +218,7 @@ fn render_candidate(
         if image.byte_length != candidate.byte_length {
             return Err(AssetError::new(
                 ErrorCode::IntegrityMismatch,
-                "повторный candidate с тем же SHA указал другой размер файла",
+                "повторный кандидат с тем же SHA указал другой размер файла",
             ));
         }
         image.clone()
@@ -226,7 +236,7 @@ fn render_candidate(
         let actual = (image.width?, image.height?);
         (expected != actual).then(|| {
             format!(
-                "фактические размеры PNG {}×{} не совпали с render evidence {}×{}",
+                "фактические размеры PNG {}×{} не совпали со свидетельством отрисовки {}×{}",
                 actual.0, actual.1, expected.0, expected.1
             )
         })
@@ -235,7 +245,7 @@ fn render_candidate(
     let semantic_status = candidate.validation.status;
     write!(
         html,
-        "<h4>{}candidate · SHA-256 <code>{}</code></h4><p>Surface: {}; reading: {}; JPDB vocabulary ID: {}; detail URL: <code>{}</code></p><p>Фактический размер файла: {} байт; размер PNG: {} × {}; graph count: {}; semantic status: <strong>{}</strong>; validator: <code>{}@{}</code>; публикация: {}</p>",
+        "<h4>{}кандидат · SHA-256 <code>{}</code></h4><p>Форма: {}; чтение: {}; ID словарной записи JPDB: {}; ссылка на страницу: <code>{}</code></p><p>Фактический размер файла: {} байт; размер PNG: {} × {}; число графиков: {}; статус проверки: <strong><code>{}</code></strong>; проверяющий модуль: <code>{}@{}</code>; публикация: {}</p>",
         if is_current { "Текущий " } else { "" },
         escape_html(&candidate.sha256),
         escape_html(&candidate.metadata.surface),
@@ -249,7 +259,7 @@ fn render_candidate(
         semantic_status.as_str(),
         escape_html(&candidate.validation.validator.id),
         escape_html(&candidate.validation.validator.version),
-        if is_rejected { "отклонена для этого exact SHA" } else { "состояние указано в batch" },
+        if is_rejected { "отклонена для этого SHA" } else { "состояние указано в пакете" },
     )
     .expect("запись в String не завершается ошибкой");
     if let Some(reason) = &unavailable_reason {
@@ -263,16 +273,16 @@ fn render_candidate(
         let path = candidate_image_path(&candidate.sha256)?;
         write!(
             html,
-            "<figure><img alt=\"Pitch-accent для {}\" src=\"{}\"><figcaption>Файл относительно страницы: <code>{}</code>. Отображение не меняет validation или publication.</figcaption></figure>",
+            "<figure><img alt=\"Pitch-accent для {}\" src=\"{}\"><figcaption>Путь к файлу относительно страницы: <code>{}</code>. Отображение не меняет результат проверки или публикации.</figcaption></figure>",
             escape_html(&candidate.metadata.surface),
             escape_html(&path),
             escape_html(&path)
         )
         .expect("запись в String не завершается ошибкой");
     }
-    write_json_block(html, "Свидетельства источника", &evidence)?;
-    write_json_block(html, "Свидетельства отрисовки", &evidence.render)?;
-    write_json_block(html, "Свидетельства браузера", &evidence.browser)?;
+    write_json_block(html, "Данные источника", &evidence)?;
+    write_json_block(html, "Данные отрисовки", &evidence.render)?;
+    write_json_block(html, "Данные браузера", &evidence.browser)?;
     write_json_block(
         html,
         "Результат валидатора и диагностика",
@@ -287,7 +297,7 @@ fn render_ambiguous_candidate(
 ) -> Result<(), AssetError> {
     write!(
         html,
-        "<section><h5>JPDB vocabulary ID: {}</h5><dl><dt>Фактический detail route</dt><dd><code>{}</code></dd><dt>Surface forms</dt><dd><ul>",
+        "<section><h5>ID словарной записи JPDB: {}</h5><dl><dt>Фактический адрес страницы</dt><dd><code>{}</code></dd><dt>Формы слова</dt><dd><ul>",
         candidate.vocabulary_id,
         escape_html(&candidate.detail_url)
     )
@@ -296,12 +306,12 @@ fn render_ambiguous_candidate(
         write!(html, "<li>{}</li>", escape_html(surface))
             .expect("запись в String не завершается ошибкой");
     }
-    html.push_str("</ul></dd><dt>Readings</dt><dd><ul>");
+    html.push_str("</ul></dd><dt>Чтения</dt><dd><ul>");
     for reading in &candidate.readings {
         write!(html, "<li>{}</li>", escape_html(reading))
             .expect("запись в String не завершается ошибкой");
     }
-    html.push_str("</ul></dd><dt>Связанные surface/reading forms</dt><dd><ul>");
+    html.push_str("</ul></dd><dt>Связанные формы слова и чтения</dt><dd><ul>");
     for form in &candidate.resolved_forms {
         write!(
             html,
@@ -334,8 +344,12 @@ fn matching_owner_record<'a>(
         item.existing_verified_sha256.as_deref(),
         item.published_sha256.as_deref(),
     ];
+    let Some(current_owner_sha) = item.owner_current_sha256.as_deref() else {
+        return Ok(None);
+    };
     let record = owner_records.iter().find(|record| {
         record.identity == item.identity
+            && record.sha256 == current_owner_sha
             && trusted_owner_shas
                 .iter()
                 .flatten()
@@ -344,14 +358,9 @@ fn matching_owner_record<'a>(
     let Some(record) = record else {
         return Ok(None);
     };
-    let Some(validation) = &record.validation else {
-        return Ok(None);
-    };
     if record.lifecycle != LifecycleState::Verified
         || record.format != DetectedFormat::Png
-        || validation.status != SemanticStatus::Verified
-        || validation.validator != batch.validator
-        || validation.content_sha256 != record.sha256
+        || !record.is_trusted_for_automated_validation(&batch.validator)
     {
         return Ok(None);
     }
@@ -370,8 +379,12 @@ fn matching_owner_record<'a>(
     let Some(value) = &record.domain_metadata else {
         return Ok(None);
     };
-    let metadata: PitchAccentDomainMetadata = serde_json::from_value(value.clone())
-        .map_err(|error| invalid(format!("canonical pitch metadata не читается: {error}")))?;
+    let metadata: PitchAccentDomainMetadata =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            invalid(format!(
+                "метаданные канонического pitch-ресурса не читаются: {error}"
+            ))
+        })?;
     if metadata.surface != item.identity.key
         || metadata.jpdb_vocabulary_id == 0
         || metadata.evidence.graph_count == 0
@@ -395,7 +408,7 @@ fn matching_owner_snapshot_record<'a>(
 fn render_owner_snapshot_record(html: &mut String, record: &AssetRecord) -> Result<(), AssetError> {
     write!(
         html,
-        "<section class=\"candidate\"><h3>Запись owner snapshot без предположения о trust</h3><p>Lifecycle: <code>{}</code>; format: <code>{}</code>; SHA-256: <code>{}</code>; размер: {} байт; storage path: <code>{}</code>; consumer filename: <code>{}</code></p>",
+        "<section class=\"candidate\"><h3>Запись из снимка владельца, доверие не предполагается</h3><p>Состояние ресурса: <code>{}</code>; формат: <code>{}</code>; SHA-256: <code>{}</code>; размер: {} байт; путь в хранилище: <code>{}</code>; имя файла для потребителя: <code>{}</code></p>",
         record.lifecycle.as_str(),
         escape_html(&json_text(&serde_json::to_value(record.format).map_err(json_error)?)?),
         escape_html(&record.sha256),
@@ -404,12 +417,24 @@ fn render_owner_snapshot_record(html: &mut String, record: &AssetRecord) -> Resu
         escape_html(&record.consumer_filename),
     )
     .expect("запись в String не завершается ошибкой");
-    write_json_block(html, "Проверка owner snapshot", &record.validation)?;
-    write_json_block(html, "Метаданные owner snapshot", &record.domain_metadata)?;
-    write_json_block(html, "Provenance owner snapshot", &record.provenance)?;
     write_json_block(
         html,
-        "Human attestation owner snapshot",
+        "Проверка записи из снимка владельца",
+        &record.validation,
+    )?;
+    write_json_block(
+        html,
+        "Метаданные записи из снимка владельца",
+        &record.domain_metadata,
+    )?;
+    write_json_block(
+        html,
+        "Источник данных записи из снимка владельца",
+        &record.provenance,
+    )?;
+    write_json_block(
+        html,
+        "Подтверждение человеком записи из снимка владельца",
         &record.human_attestation,
     )?;
     html.push_str("</section>");
@@ -430,20 +455,24 @@ fn render_canonical(
     if record.storage_path != expected {
         return Err(AssetError::new(
             ErrorCode::PathTraversal,
-            "canonical pitch path отличается от пути domain policy",
+            "путь канонического pitch-ресурса отличается от пути политики предметной области",
         ));
     }
     let metadata: PitchAccentDomainMetadata = serde_json::from_value(
         record
             .domain_metadata
             .clone()
-            .ok_or_else(|| invalid("canonical pitch metadata отсутствует"))?,
+            .ok_or_else(|| invalid("метаданные канонического pitch-ресурса отсутствуют"))?,
     )
-    .map_err(|error| invalid(format!("canonical pitch metadata не читается: {error}")))?;
+    .map_err(|error| {
+        invalid(format!(
+            "метаданные канонического pitch-ресурса не читаются: {error}"
+        ))
+    })?;
     let relative_path = format!("../../../{}", percent_encode_path(&record.storage_path));
     write!(
         html,
-        "<section class=\"candidate\"><h3>Canonical PNG</h3><p>Surface: {}; reading: {}; JPDB vocabulary ID: {}; detail URL: <code>{}</code></p><p>Graph count: {}; SHA-256: <code>{}</code>; размер: {} байт; размер PNG: {} × {}; semantic status: <strong>{}</strong>; validator: <code>{}@{}</code>; publication: VERIFIED</p><figure><img alt=\"Canonical pitch-accent для {}\" src=\"{}\"><figcaption>Canonical storage: <code>{}</code>; consumer filename: <code>{}</code></figcaption></figure>",
+        "<section class=\"candidate\"><h3>Канонический PNG</h3><p>Форма: {}; чтение: {}; ID словарной записи JPDB: {}; ссылка на страницу: <code>{}</code></p><p>Число графиков: {}; SHA-256: <code>{}</code>; размер: {} байт; размер PNG: {} × {}; статус проверки: <strong><code>{}</code></strong>; проверяющий модуль: <code>{}@{}</code>; публикация: подтверждена</p><figure><img alt=\"Канонический pitch-accent для {}\" src=\"{}\"><figcaption>Канонический путь в хранилище: <code>{}</code>; имя файла для потребителя: <code>{}</code></figcaption></figure>",
         escape_html(&metadata.surface),
         escape_html(&metadata.reading),
         metadata.jpdb_vocabulary_id,
@@ -453,19 +482,36 @@ fn render_canonical(
         record.byte_length,
         metadata.evidence.render.pixel_width,
         metadata.evidence.render.pixel_height,
-        record.validation.as_ref().map_or("unknown", |v| v.status.as_str()),
-        escape_html(record.validation.as_ref().map_or("unknown", |v| v.validator.id.as_str())),
-        escape_html(record.validation.as_ref().map_or("unknown", |v| v.validator.version.as_str())),
+        record
+            .validation
+            .as_ref()
+            .map_or("неизвестно", |v| v.status.as_str()),
+        escape_html(
+            record
+                .validation
+                .as_ref()
+                .map_or("неизвестно", |v| v.validator.id.as_str()),
+        ),
+        escape_html(
+            record
+                .validation
+                .as_ref()
+                .map_or("неизвестно", |v| v.validator.version.as_str()),
+        ),
         escape_html(&metadata.surface),
         escape_html(&relative_path),
         escape_html(&record.storage_path),
         escape_html(&record.consumer_filename),
     )
     .expect("запись в String не завершается ошибкой");
-    write_json_block(html, "Canonical source/render evidence", &metadata.evidence)?;
     write_json_block(
         html,
-        "Canonical browser evidence",
+        "Данные канонического источника и отрисовки",
+        &metadata.evidence,
+    )?;
+    write_json_block(
+        html,
+        "Данные канонического браузера",
         &metadata.evidence.browser,
     )?;
     html.push_str("</section>");
@@ -480,7 +526,7 @@ fn validate_candidate_reference(
     if candidate.blob.storage_path != expected_path {
         return Err(AssetError::new(
             ErrorCode::PathTraversal,
-            "candidate path не совпадает с безопасным hash-derived PNG path",
+            "путь кандидата не совпадает с безопасным путём PNG, вычисленным из SHA",
         ));
     }
     if candidate.blob.sha256 != candidate.sha256
@@ -491,7 +537,7 @@ fn validate_candidate_reference(
     {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "ссылка, identity, размер или validation candidate pitch не совпадает",
+            "ссылка, идентичность, размер или проверка pitch-кандидата не совпадает",
         ));
     }
     Ok(())
@@ -508,19 +554,19 @@ fn verify_candidate_bytes(
     {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
-            "прочитанные pitch candidate bytes не совпали с размером, SHA-256 или PNG",
+            "прочитанные байты pitch-кандидата не совпали с размером, SHA-256 или PNG",
         ));
     }
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODE_ALLOCATION_BYTES);
+    limits.max_image_width = Some(PITCH_ACCENT_MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(PITCH_ACCENT_MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES);
     let decoder = match image::codecs::png::PngDecoder::with_limits(Cursor::new(bytes), limits) {
         Ok(decoder) => decoder,
         Err(error) => {
             return Ok(CandidateImage::unavailable(
                 candidate.byte_length,
-                format!("PNG decoder отклонил данные: {error}"),
+                format!("декодер PNG отклонил данные: {error}"),
             ));
         }
     };
@@ -531,7 +577,7 @@ fn verify_candidate_bytes(
         .and_then(|pixels| pixels.checked_mul(bytes_per_pixel));
     if width == 0
         || height == 0
-        || allocation.is_none_or(|value| value > MAX_DECODE_ALLOCATION_BYTES)
+        || allocation.is_none_or(|value| value > PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES)
     {
         return Ok(CandidateImage::unavailable(
             candidate.byte_length,
@@ -584,16 +630,16 @@ fn candidate_image_path(sha256: &str) -> Result<String, AssetError> {
 fn item_status_label(status: PitchBatchItemStatus) -> &'static str {
     match status {
         PitchBatchItemStatus::Pending => "ожидает получения",
-        PitchBatchItemStatus::AcquiredVerified => "candidate проверен валидатором",
-        PitchBatchItemStatus::CandidateRejected => "candidate отклонён или не прошёл проверку",
+        PitchBatchItemStatus::AcquiredVerified => "кандидат проверен валидатором",
+        PitchBatchItemStatus::CandidateRejected => "кандидат отклонён или не прошёл проверку",
         PitchBatchItemStatus::NoPitchAccentOnSource => "на источнике нет pitch-accent",
         PitchBatchItemStatus::AmbiguousVocabulary => "несколько словарных кандидатов",
         PitchBatchItemStatus::VocabularyNotFound => "словарная запись не найдена",
         PitchBatchItemStatus::TechnicalFailure => "техническая ошибка получения",
         PitchBatchItemStatus::PublicationPending => "публикация ожидает сверки",
-        PitchBatchItemStatus::Published => "canonical asset опубликован",
-        PitchBatchItemStatus::ExistingVerified => "canonical asset уже подтверждён",
-        PitchBatchItemStatus::Conflict => "конфликт owner state",
+        PitchBatchItemStatus::Published => "канонический ресурс опубликован",
+        PitchBatchItemStatus::ExistingVerified => "канонический ресурс уже подтверждён",
+        PitchBatchItemStatus::Conflict => "конфликт состояния владельца",
     }
 }
 
@@ -653,7 +699,7 @@ fn escape_html(value: &str) -> String {
 
 fn json_error(error: serde_json::Error) -> AssetError {
     invalid(format!(
-        "не удалось сериализовать pitch review evidence: {error}"
+        "не удалось сериализовать данные проверки pitch-accent: {error}"
     ))
 }
 
