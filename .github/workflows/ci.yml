@@ -63,6 +63,16 @@ jobs:
             echo "Канонический kanji corpus отсутствует; проверка пропущена"
           fi
 
+      - name: Проверить verified-only pitch corpus
+        # Ветка без tracked corpus допустима. Если store присутствует (в том числе
+        # как symlink), read-only gate обязан подтвердить verified-only содержимое.
+        run: |
+          if [ -e .asset-store/pitch-accent ] || [ -L .asset-store/pitch-accent ]; then
+            cargo run --quiet --locked --bin pitch-corpus-gate
+          else
+            echo "Канонический pitch corpus отсутствует; проверка пропущена"
+          fi
+
       - name: Проверить найденные CrowdAnki-экспорты
         # Шаг сам находит экспорты внутри `decks/` и ничего не знает о конкретных
         # колодах, уровнях, моделях заметок и именах полей. Отсутствие экспортов —

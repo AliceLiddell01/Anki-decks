@@ -66,14 +66,16 @@ form, а не reading: только PNG попадает в `assets/png/<surface
 связанной пары среди форм выбранной vocabulary entry JPDB, фактический detail URL
 с тем же ID, положительное число узлов графиков и наблюдаемое
 свидетельство тёмного фона. В evidence отдельно хранятся прямоугольники каждого
-graph в системах координат viewport и документа, их объединение в координатах
-документа, итоговая область захвата с отступом и фактический остаточный отступ
-после ограничения границами документа. Validator сверяет эти связи, масштаб
-страницы `1.0`, масштаб устройства `3.0` и фактические размеры PNG в пикселях с
-CSS capture rect, допуская не более 3 output pixels разницы из-за округления
-границ нативного CDP clip. Он также сравнивает наблюдённый сплошной тёмный фон с
-точками на границе PNG; одних class/media flags недостаточно. Provenance браузера
-обязательна. Evidence старой версии validator не наследует доверие новой версии;
+graph в системах координат viewport и документа, их геометрическое объединение и
+`capture_rect`. Для одного graph снимок совпадает с его DOM rect, для нескольких —
+с геометрическим union; искусственного внешнего padding нет, а естественные
+промежутки layout сохраняются. Validator сверяет эти связи, масштаб страницы
+`1.0`, масштаб устройства `3.0` и фактические размеры PNG в пикселях с CSS capture
+rect, допуская не более 3 output pixels разницы из-за округления границ нативного
+CDP clip. Dark-theme proof связывает browser preference, класс документа и
+вычисленный тёмный фон с непрозрачным фоном и содержимым графика внутри PNG; одних
+class/media flags недостаточно. Provenance браузера обязательна. Render/evidence
+contract проверяет validator v5; старые v4 evidence не наследуют его доверие,
 неполное evidence остаётся `UNCERTAIN`.
 
 Manifest schema — `5`. Помимо exact SHA-256, размера, формата, lifecycle,
@@ -102,17 +104,17 @@ bytes, checksum, размер, формат, validator identity и human decisio
 Общий batch runtime владеет безопасной файловой механикой
 `.runtime/batches/<batch-id>`: `NOFOLLOW`, lock, revision/CAS, atomic state,
 ограниченные reads и content-addressed blobs. Он не знает `KanjiBatch`,
-`KanjiMetrics`, Yarxi evidence или HTML review; эти правила остаются в Kanji
-adapter. Тестовый plain-text state проверяет повторное открытие и чтение blob без
-image/kanji semantics.
+`KanjiMetrics`, Yarxi evidence или HTML review; эти правила остаются в предметных
+adapter-ах. Тестовый plain-text state проверяет повторное открытие и чтение blob
+без image/kanji semantics.
 
 Общие Chromium session, executable discovery, runtime provenance, CDP metrics и
 сетевая техническая телеметрия находятся в `browser_runtime.rs`. Yarxi сохраняет
 свои selectors, URLs, TLS policy, фильтры, fallback, dark theme и геометрию
 capture. Общий runtime позволяет задавать отдельный scale factor `3.0`. Provider
-JPDB использует изолированную сессию и не публикует PNG в canonical store;
-полноценный pitch batch lifecycle и интеграция с `anki-repo` остаются отдельными
-возможностями.
+JPDB использует изолированную сессию; отдельный `pitch-assets` владеет его batch
+lifecycle и публикацией подтверждённых PNG. Интеграция с `anki-repo` остаётся
+отдельной возможностью.
 
 Whitelist для хранения в Git включает `.owner.json` и `manifest.json` каждого
 домена, а также непосредственные пути `assets/gif/*.gif` и `assets/png/*.png`
@@ -126,15 +128,15 @@ Whitelist для хранения в Git включает `.owner.json` и `mani
 bash tools/asset-store/tests/gitignore_regression.sh
 ```
 
-`kanji-corpus-gate` принимает новый nested layout и отклоняет flat,
-hash-suffixed, orphan и незарегистрированные canonical paths. Для других
-publishable domains используется `verify_publishable_corpus_with_policy`; отдельный
-пустой pitch CLI gate не нужен.
+`kanji-corpus-gate` и `pitch-corpus-gate` проверяют свои publishable domains и
+отклоняют неподтверждённые lifecycle states, stale validator, flat,
+hash-suffixed, orphan и незарегистрированные canonical paths.
 
 Проверить Kanji corpus из корня workspace можно read-only командой:
 
 ```bash
 cargo run --quiet --locked -p asset-store --bin kanji-corpus-gate
+cargo run --quiet --locked -p asset-store --bin pitch-corpus-gate
 ```
 
 Gate возвращает ненулевой код при записи кроме effective `VERIFIED`, старом
@@ -145,7 +147,11 @@ canonical corpus.
 ## Получение pitch accent с JPDB
 
 `JpdbPitchProvider` работает с обычными страницами поиска и vocabulary detail
-JPDB. Механизм поиска проверяет связанную пару написания и чтения среди
+JPDB. Search URL задаёт `q` через URL API и явно фиксирует `lang=english`. После
+перехода provider принимает `/search` или допустимый direct landing на
+`/vocabulary/<id>/...`: второй путь проходит отдельную проверку detail ID, query и
+optional explicit selection до продолжения acquisition. Любой другой маршрут или
+origin закрывается fail-closed. Механизм поиска проверяет связанную пару написания и чтения среди
 наблюдённых форм, включая подтверждённые альтернативные формы. При неоднозначности
 он не выбирает первый или наиболее ранжированный результат: возвращает
 `ambiguous_vocabulary` и кандидатов с vocabulary ID, формами и чтениями, частями
@@ -176,17 +182,15 @@ fragment ссылки на identity не влияют. Допустимая сс
 снимком области через CDP при DSF `3.0`; PNG после захвата не масштабируется,
 обрезается или перекодируется. Координаты узлов сохраняются и относительно
 viewport, и относительно документа с учётом `scrollX`/`scrollY`. Область захвата
-задаётся в координатах документа и включает отступ 8 CSS px с каждой стороны;
-если край ограничен границей документа, evidence записывает фактический
-остаточный отступ для каждой стороны. В evidence также входят объединение
-прямоугольников графиков, итоговая область захвата, размеры viewport и страницы,
-масштабы, размеры PNG и свидетельство отрисованного фона. Validator проверяет,
-что прямоугольники графиков образуют указанное объединение и находятся внутри
-области захвата с отступом, размеры PNG соответствуют области захвата и DSF с
-допуском до 3 пикселей для округления границ нативного CDP clip, а
-непрозрачные точки на границе PNG совпадают с наблюдённым сплошным тёмным фоном.
-Он не классифицирует рисунок pitch accent. Естественный вертикальный промежуток
-между несколькими графиками сохраняется.
+совпадает с графическим DOM-узлом либо с геометрическим объединением найденных
+узлов; техническое расхождение ограничено округлением нативного CDP clip. В
+evidence входят объединение прямоугольников графиков, итоговая область захвата,
+размеры viewport и страницы, масштабы, размеры PNG и свидетельство отрисованного
+фона. Validator проверяет геометрию, размеры PNG с допуском до 3 пикселей для
+округления границ нативного clip, browser preference и `dark-mode`, а также
+пиксели тёмного фона и содержимое graph внутри полностью непрозрачного PNG. Он не
+классифицирует рисунок pitch accent. Естественные промежутки между несколькими
+графиками сохраняются; искусственный внешний padding не добавляется.
 
 Каждое получение передаёт исходные bytes и `PitchAccentDomainMetadata`, пригодные
 для `PitchAccentImageValidator`. `JpdbPitchProvider::acquire_requests` запускает
@@ -264,8 +268,7 @@ cargo run --locked -p asset-store --bin jpdb_pitch_acceptance -- \
 Отчёт сохраняет полный план и для каждого элемента ожидаемый и фактический исход,
 результат их сравнения, смысловые сведения о кандидатах, фактические vocabulary
 ID/detail URL, формы и чтения, свидетельство отрисованной тёмной темы, геометрию
-графиков и захвата, отступы, DSF, размеры PNG, SHA-256 и решение production
-validator.
+графиков и захвата, DSF, размеры PNG, SHA-256 и решение production validator.
 `acquired` проходит только при статусе validator `VERIFIED` и выполнении заданных
 ограничений плана. Ожидаемые ambiguity, not-found и отсутствие pitch могут быть
 успешными исходами; неожиданное отсутствие найденной vocabulary entry приводит к
@@ -277,6 +280,90 @@ validator.
 доступен как `.bin` и не показывается как изображение. Harness не меняет
 canonical asset store, пользовательские media или `decks/**`; план и отчёт
 остаются локальными.
+
+## `pitch-assets`: canonical corpus и batch lifecycle
+
+CLI владеет получением pitch-accent, состоянием batch и публикацией в
+`.asset-store/pitch-accent`. Он не обращается к CrowdAnki exports и не знает
+имена note model или поля. Без `--store` используется pitch store текущего
+workspace; `--output json` возвращает машинно-читаемый результат с версией схемы.
+
+```bash
+# Просмотр и проверка присутствующего canonical corpus без записи.
+cargo run --locked -p asset-store --bin pitch-assets -- corpus list
+cargo run --locked -p asset-store --bin pitch-assets -- corpus check
+
+# Одноразовый ensure либо batch по строгому JSON-плану.
+cargo run --locked -p asset-store --bin pitch-assets -- ensure \
+  --surface '幽霊' --reading 'ゆうれい'
+cargo run --locked -p asset-store --bin pitch-assets -- batch start \
+  --plan ./pitch-plan.json
+cargo run --locked -p asset-store --bin pitch-assets -- batch run \
+  --batch-id my-pitch-batch
+
+# Состояние, локальный review и продолжение после решения.
+cargo run --locked -p asset-store --bin pitch-assets -- batch status \
+  --batch-id my-pitch-batch
+cargo run --locked -p asset-store --bin pitch-assets -- batch review \
+  --batch-id my-pitch-batch
+cargo run --locked -p asset-store --bin pitch-assets -- batch resume \
+  --batch-id my-pitch-batch
+```
+
+План начинается с `schema_version: 1`, неизвестные поля и версии отклоняются.
+Каждый элемент сохраняет точную `surface`, необязательный `reading` и
+необязательный явный `selection` с `vocabulary_id` и `detail_url`. Точные дубли
+схлопываются; запросы одной surface с несовместимым чтением или выбором приводят к явному
+`identity_conflict` до старта браузера. Для выбора из ambiguity укажите exact ID
+и route из review, затем `batch run` выполняет новый search и повторно
+подтверждает выбранную запись в JPDB.
+
+```json
+{
+  "schema_version": 1,
+  "items": [
+    { "surface": "幽霊", "reading": "ゆうれい" },
+    {
+      "surface": "重複語",
+      "reading": "ちょうふくご",
+      "selection": {
+        "vocabulary_id": 101,
+        "detail_url": "https://jpdb.io/vocabulary/101/重複語/ちょうふくご"
+      }
+    }
+  ]
+}
+```
+
+Runtime state хранит типизированные outcomes provider-а, exact SHA candidate,
+результат production validator, ambiguity inventory и publication CAS. На время
+получения через браузер runtime lock отпускается; по возвращении CLI сверяет
+generation/item revision, поэтому устаревший результат не заменит новое решение.
+После каждого элемента state сохраняется, а полученные bytes сначала попадают в
+content-addressed `.runtime/batches/<id>/candidates/`. Resume повторно проверяет
+текущий validator и может продолжить публикацию без повторного JPDB запроса.
+Завершение canonical publication сверяется по identity и SHA, включая остановку
+между записью store и final batch update.
+
+Публикуется только candidate со статусом current `VERIFIED`, через
+`AssetStore::ingest_verified` и compare-and-swap. Store использует
+`assets/png/<surface>.png` и consumer filename `<surface>.pitch.png`. Текущий
+verified asset повторно используется без сети. Явный `reacquire`/refresh начинает
+новое поколение и сохраняет ожидаемый старый SHA для CAS; визуальный отказ
+привязан к SHA конкретного candidate. `retry` разрешён только для повторяемых
+технических ошибок. `no_pitch_accent_on_source` завершает только текущий batch и
+не создаёт canonical placeholder или вечный negative cache; `vocabulary_not_found`
+остаётся отдельным unresolved outcome.
+
+`batch review` создаёт `review.html` внутри игнорируемого runtime-каталога пакета.
+Страница показывает acquired/canonical PNG, форму, JPDB route, graph count, SHA,
+размер, validator и source/render evidence; ambiguity перечисляет каждого
+кандидата, а отсутствие pitch, not-found и технический сбой отображаются как
+типизированные outcomes
+без фиктивных картинок. Строки экранируются, HTML не меняет batch и не является
+источником истины. Решения задаются адресными CLI-командами `select`, `reject`,
+`retry` или `reacquire`; ручного способа продвинуть непрошедшие validator bytes в
+canonical store нет.
 
 ## Получение с Yarxi
 

@@ -73,6 +73,7 @@ ignored_paths=(
   '.asset-store/kanji/.tmp/transaction'
   '.asset-store/kanji/.lock'
   '.asset-store/pitch-accent/.runtime/candidates/manifest.json'
+  '.asset-store/pitch-accent/.runtime/batches/review-batch/review.html'
   '.asset-store/pitch-accent/.tmp/transaction'
   '.asset-store/pitch-accent/.lock'
   '.asset-store/kanji/unknown.txt'
