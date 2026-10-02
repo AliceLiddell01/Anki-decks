@@ -1474,7 +1474,16 @@ anki-repo visual-report --before "$ЭТАЛОН" --after "$EXPORT" --out /tmp/о
 | `models` | `export_dir`, `deck` (`path`, `crowdanki_uuid`, `preorder`, `notes_in_deck`), `sample_limit`, `models` |
 | `create` | `export_dir`, `deck_json`, `dry_run`, `applied`, `source_bytes`, `candidate_bytes`, `byte_delta`, `notes_total`, `notes_created`, `notes_already_applied`, `outcomes`, `outcomes_truncated`, `decks_touched`, `validation`, `checks` |
 | `retire` | `export_dir`, `deck_json`, `dry_run`, `applied`, `tag`, `source_bytes`, `candidate_bytes`, `byte_delta`, `notes_total`, `notes_retired`, `notes_already_retired`, `outcomes`, `outcomes_truncated`, `validation`, `checks` |
+| `migrate-media` | `export_dir`, `deck_json`, `dry_run`, `applied`, `changed`, `identity`, `namespace`, `key`, `canonical_filename`, `canonical_sha256`, `canonical_action`, `legacy_filename`, `legacy_declared`, `legacy_media`, `legacy_media_exists_after`, `legacy_declared_after`, `legacy_released`, `references_total`, `references_truncated`, `references`, `media_files_added`, `media_files_removed`, `validation` |
 | `visual-report` | `before`, `after`, `out_dir`, `index_html`, `card_files`, `card_files_total`, `preview_files`, `preview_files_truncated`, `retire_tag`, `counts`, `outcomes`, `outcomes_truncated`, `diagnostics`, `unsupported_constructs`, `media`, `limitations`, `checks` |
+
+У `migrate-media` объект `identity` содержит `namespace` и `key`;
+`legacy_media` равен `null` при отсутствии файла либо содержит
+`filename`, `byte_length`, `sha256`; каждый объект в `references` содержит
+`guid`, `model_uuid`, `model_name`, `field`, `field_ord`. Объект
+`validation` содержит `before`, `after`, `new_error_codes`,
+`new_warning_codes`; счётчики `before` и `after` содержат `errors`,
+`warnings`, `info`.
 
 В `items` команды `review` поля заметки лежат в `fields` — объекте в порядке `ord`
 модели, как и в `find`. В `findings` команды `qa` поле `field_ord` равно `null`

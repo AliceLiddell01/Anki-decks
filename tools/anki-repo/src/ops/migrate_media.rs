@@ -208,6 +208,10 @@ pub fn migrate(
     }
 
     let source = load_editable_source(export_dir)?;
+    let legacy_media = read_legacy_digest(export_dir, &legacy)?;
+    let legacy_expected = legacy_media
+        .as_ref()
+        .map(|digest| (digest.byte_length, digest.sha256.clone()));
     let routing = Routing::load(export_dir, options)?;
     let index = ExportIndex::build(&source.root);
     let canonical = read_canonical(export_dir, &routing, kind, &identity)?;
@@ -267,11 +271,6 @@ pub fn migrate(
         || validation_delta(&source.before, &source.before),
         |candidate| candidate.validation.clone(),
     );
-    let legacy_media = read_legacy_digest(export_dir, &legacy)?;
-    let legacy_expected = legacy_media
-        .as_ref()
-        .map(|digest| (digest.byte_length, digest.sha256.clone()));
-
     let mut legacy_released = false;
     if apply && changed {
         let guard = write::ExportLock::acquire(export_dir)?;
