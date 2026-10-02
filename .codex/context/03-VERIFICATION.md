@@ -170,8 +170,20 @@ cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-
 EXPORT=decks/japanese/words/Words__N1
 BEFORE=/tmp/Words__N1-before-migration
 
-# 0. сохрани полное исходное состояние для фактического отчёта «до / после»
-cp -a "$EXPORT" "$BEFORE"
+# 0. сохрани baseline для фактического отчёта «до / после»; повторный запуск
+#    использует прежний снимок, а не вкладывает экспорт в каталог снимка
+if [[ -e "$BEFORE" ]]; then
+  if [[ ! -f "$BEFORE/deck.json" ]]; then
+    echo "каталог BEFORE уже существует, но не содержит deck.json: $BEFORE" >&2
+    exit 1
+  fi
+else
+  cp -a "$EXPORT" "$BEFORE"
+fi
+if ! cargo run --quiet --bin anki-repo -- validate "$BEFORE"; then
+  echo "снимок BEFORE не прошёл проверку; сохраните его и разберитесь с ошибкой" >&2
+  exit 1
+fi
 
 # 1. фактическая схема полей: имена, порядок ord, примеры значений, шаблоны
 cargo run --quiet --bin anki-repo -- models "$EXPORT"

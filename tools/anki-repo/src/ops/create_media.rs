@@ -846,7 +846,14 @@ pub(crate) fn media_file_digest(
     name: &str,
 ) -> Result<Option<(usize, String)>, DomainError> {
     let directory = File::open(export).map_err(io_failure)?;
-    let Some(media) = open_media(&directory, false)? else {
+    media_file_digest_from_export(&directory, name)
+}
+
+fn media_file_digest_from_export(
+    export: &File,
+    name: &str,
+) -> Result<Option<(usize, String)>, DomainError> {
+    let Some(media) = open_media(export, false)? else {
         return Ok(None);
     };
     let fd = match openat(
@@ -872,11 +879,42 @@ pub(crate) fn media_file_digest(
     Ok(Some((bytes.len(), format!("{:x}", Sha256::digest(&bytes)))))
 }
 
-/// Удаляет файл из `media/` экспорта.
+/// Сверяет физический файл с отпечатком, снятым при построении плана миграции.
+/// Чтение идёт через дескриптор экспорта, удерживаемый `ExportLock`.
+pub(crate) fn verify_media_file_digest(
+    guard: &ExportLock,
+    name: &str,
+    expected: Option<&(usize, String)>,
+) -> Result<(), DomainError> {
+    let actual = media_file_digest_from_export(&guard.directory, name)?;
+    if actual.as_ref() == expected {
+        return Ok(());
+    }
+    let details = |digest: Option<&(usize, String)>| {
+        digest.map(|(byte_length, sha256)| json!({"byte_length": byte_length, "sha256": sha256}))
+    };
+    Err(blocker(
+        ErrorCode::ExpectedMismatch,
+        "legacy_media_changed",
+        json!({
+            "filename": name,
+            "expected": details(expected),
+            "actual": details(actual.as_ref()),
+        }),
+    ))
+}
+
+/// Удаляет файл из `media/` экспорта, если его состояние совпадает со снимком.
 ///
 /// Отсутствие файла — не ошибка: миграция обязана сходиться и после обрыва между
-/// публикацией `deck.json` и удалением освободившегося имени.
-pub(crate) fn remove_media_file(guard: &ExportLock, name: &str) -> Result<bool, DomainError> {
+/// публикацией `deck.json` и удалением освободившегося имени. Проверка под
+/// `ExportLock` защищает от конкурентных writers, соблюдающих общий протокол.
+pub(crate) fn remove_media_file(
+    guard: &ExportLock,
+    name: &str,
+    expected: Option<&(usize, String)>,
+) -> Result<bool, DomainError> {
+    verify_media_file_digest(guard, name, expected)?;
     let Some(media) = open_media(&guard.directory, false)? else {
         return Ok(false);
     };

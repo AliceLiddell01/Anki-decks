@@ -268,11 +268,17 @@ pub fn migrate(
         |candidate| candidate.validation.clone(),
     );
     let legacy_media = read_legacy_digest(export_dir, &legacy)?;
+    let legacy_expected = legacy_media
+        .as_ref()
+        .map(|digest| (digest.byte_length, digest.sha256.clone()));
 
     let mut legacy_released = false;
     if apply && changed {
         let guard = write::ExportLock::acquire(export_dir)?;
         guard.check_source(&source.deck_json, &source.source)?;
+        if declarations.release_legacy {
+            create_media::verify_media_file_digest(&guard, &legacy, legacy_expected.as_ref())?;
+        }
         // Канонические байты размещаются раньше публикации и удаления: ссылка
         // никогда не остаётся без файла, а освобождение legacy-имени видит
         // только тот, кто ещё читает старый `deck.json`.
@@ -281,7 +287,8 @@ pub fn migrate(
             guard.replace(&source.deck_json, &source.source, &candidate.bytes)?;
         }
         if declarations.release_legacy {
-            legacy_released = create_media::remove_media_file(&guard, &legacy)?;
+            legacy_released =
+                create_media::remove_media_file(&guard, &legacy, legacy_expected.as_ref())?;
         }
     }
 

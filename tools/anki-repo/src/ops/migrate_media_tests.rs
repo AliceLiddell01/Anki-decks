@@ -963,3 +963,20 @@ fn entity_encoded_static_or_unclaimable_field_reference_blocks_release() {
         assert_eq!(error.details["references"][0]["surface"], surface);
     }
 }
+
+#[test]
+fn legacy_file_changed_after_snapshot_is_preserved_during_release() {
+    let fixture = colliding_fixture();
+    let expected = create_media::media_file_digest(&fixture.export, "飴.png").unwrap();
+    let guard = crate::write::ExportLock::acquire(&fixture.export).unwrap();
+    fixture.write_media("飴.png", b"changed after migration snapshot");
+
+    let error = create_media::remove_media_file(&guard, "飴.png", expected.as_ref()).unwrap_err();
+
+    assert_eq!(error.code, crate::error::ErrorCode::ExpectedMismatch);
+    reason(&error, "legacy_media_changed");
+    assert_eq!(
+        fixture.read_media("飴.png").unwrap(),
+        b"changed after migration snapshot"
+    );
+}

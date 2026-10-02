@@ -877,6 +877,7 @@ note_models:
 | `canonical_filename_mismatch`, `stale_pinned_asset` | `expected_mismatch` / 7 | Имя файла не совпадает либо закреплённое изображение изменилось, исчезло или было переименовано |
 | `media_filename_collision` | `expected_mismatch` / 7 | Разные идентичности или домены разрешаются в одно имя файла с разными байтами |
 | `destination_media_conflict` | `expected_mismatch` / 7 | Целевой путь занят другими байтами или небезопасным объектом |
+| `legacy_media_changed` | `expected_mismatch` / 7 | Legacy-файл появился, исчез или изменился после построения плана миграции |
 | `asset_store_boundary`, `media_declaration_conflict`, `emit_resolved_protected_path` | `invalid_request` / 3 | Пересечение путей или конфликт объявления медиафайлов |
 | `media_materialization_failed`, `media_disappeared`, `media_directory_changed` | `write_failed` / 8 | Отказ при размещении или итоговой проверке медиафайлов |
 | `source_modified`, `source_missing`, `export_directory_changed` | `source_changed` / 7 | Исходник изменился или каталог экспорта был заменён под общей блокировкой |
@@ -913,6 +914,13 @@ anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png
 # 2. записать: переписать ссылки, разместить канонические байты, освободить имя
 anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png --apply
 ```
+
+Когда план предусматривает освобождение legacy-имени, при `--apply` команда
+удерживает `ExportLock`, повторно сверяет присутствие, размер и SHA-256 файла
+со снимком, снятым при построении плана, и останавливается с
+`legacy_media_changed`, если состояние разошлось. Сверка выполняется до
+размещения файлов и публикации `deck.json`, затем повторяется непосредственно
+перед удалением legacy-файла.
 
 Зачем она нужна. Плоское пространство имён `media/` CrowdAnki общее для всех
 доменов, а канонические имена домены разводят намеренно: kanji-домен кладёт изображение
@@ -1028,6 +1036,7 @@ identity—filename. Команда блокирует операцию цели
 | `legacy_media_reference_unproven` | `expected_mismatch` / 7 | Хотя бы один потребитель `--from` не доказан; `error.details.references` перечисляет недоказанные ссылки и статические потребители |
 | `kanji_asset_missing`, `pitch_asset_missing`, `asset_integrity_invalid` | `invalid_request` / 3 | Проверенный ресурс домена не найден или не прошёл требования доверия |
 | `destination_media_conflict` | `expected_mismatch` / 7 | Каноническое имя занято другими байтами или небезопасным объектом |
+| `legacy_media_changed` | `expected_mismatch` / 7 | Legacy-файл изменился после построения плана; команда сохраняет его и прекращает запись |
 | `media_declaration_conflict` | `invalid_request` / 3 | Legacy- или canonical-имя объявлено несколько раз в дереве; сведения об ошибке указывают конфликтующие поддеревья |
 
 #### Отчёт

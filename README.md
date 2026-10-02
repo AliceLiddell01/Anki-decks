@@ -51,7 +51,7 @@ flowchart LR
     C --> E["create"]
     D --> F["edit"]
     A --> G["retire"]
-    A --> H["migrate-media"]
+    A --> N["migrate-media"]
 
     H["kanji-assets"] --> I["VERIFIED PNG / GIF"]
     I --> E
@@ -59,7 +59,7 @@ flowchart LR
     E --> J["candidate export"]
     F --> J
     G --> J
-    H --> J
+    N --> J
 
     J --> K["validate"]
     K --> L["visual-report"]
