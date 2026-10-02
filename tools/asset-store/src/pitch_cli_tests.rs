@@ -28,6 +28,25 @@ use crate::store::{AssetStore, StoreOptions, VerifiedIngestRequest};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn workspace_root_does_not_require_decks_and_supports_git_worktree_file() {
+    let root = temp_root();
+    fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(root.join(".git"), "gitdir: /tmp/fixture\n").unwrap();
+    let nested = root.join("tools/component");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("Cargo.toml"), "[package]\n").unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+    assert_eq!(super::find_workspace_root(&nested), Some(canonical.clone()));
+    assert_eq!(
+        super::store_path(None, &nested),
+        canonical.join(".asset-store/pitch-accent")
+    );
+    fs::create_dir(root.join("decks")).unwrap();
+    assert_eq!(super::find_workspace_root(&nested), Some(canonical));
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn temp_root() -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(

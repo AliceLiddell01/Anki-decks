@@ -591,7 +591,7 @@ fn store_path(store: Option<&Path>, repository_root: &Path) -> PathBuf {
 fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(start).ok()?;
     canonical.ancestors().find_map(|ancestor| {
-        (ancestor.join("Cargo.toml").is_file() && ancestor.join("decks").is_dir())
+        (ancestor.join("Cargo.toml").is_file() && ancestor.join(".git").exists())
             .then(|| ancestor.to_path_buf())
     })
 }
