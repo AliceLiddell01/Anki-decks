@@ -15,6 +15,7 @@ use crate::ops::create::CreateResult;
 use crate::ops::edit::{EditResult, EditStatus};
 use crate::ops::find::FindResult;
 use crate::ops::inspect::InspectResult;
+use crate::ops::migrate_media::MigrationResult;
 use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
 use crate::ops::retire::RetireResult;
@@ -1452,4 +1453,70 @@ fn model_kind_name(kind: crate::template::ModelKind) -> &'static str {
         crate::template::ModelKind::Standard => "standard",
         crate::template::ModelKind::Cloze => "cloze",
     }
+}
+
+/// Human-readable представление `migrate-media`.
+pub fn migrate_media(result: &MigrationResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir.display()));
+    out.line(format!("deck.json: {}", result.deck_json.display()));
+    out.line(mode_line(result.applied, result.dry_run));
+    out.line(format!(
+        "Идентичность: {} / {}",
+        result.identity.namespace, result.identity.key
+    ));
+    out.line(format!(
+        "Имя файла: {} → {} (SHA-256 канонических байтов {}, размещение {})",
+        result.legacy_filename,
+        result.canonical_filename,
+        result.canonical_sha256,
+        result.canonical_action
+    ));
+    out.line(format!("Доказанных ссылок: {}", result.references_total));
+    if result.references_truncated {
+        out.line(format!("  показаны первые {}", result.references.len()));
+    }
+    for reference in &result.references {
+        out.line(format!(
+            "  guid {} — поле {} (ord {}), модель {} ({})",
+            reference.guid.as_deref().unwrap_or("—"),
+            reference.field,
+            reference.field_ord,
+            reference.model_name.as_deref().unwrap_or("—"),
+            reference.model_uuid
+        ));
+    }
+    out.blank();
+    out.line(format!(
+        "media_files: добавлено {}, снято {}",
+        result.media_files_added.len(),
+        result.media_files_removed.len()
+    ));
+    for name in &result.media_files_added {
+        out.line(format!("  + {name}"));
+    }
+    for name in &result.media_files_removed {
+        out.line(format!("  - {name}"));
+    }
+    match &result.legacy_media {
+        Some(digest) => {
+            out.line(format!(
+                "Освободившееся имя занято файлом: media/{} — {} байт, sha256 {}",
+                digest.filename, digest.byte_length, digest.sha256
+            ));
+        }
+        None => {
+            out.line(format!(
+                "Освободившееся имя media/{} физически не занято",
+                result.legacy_filename
+            ));
+        }
+    }
+    if !result.changed {
+        out.line("Мигрировать нечего: повторный прогон ничего не меняет");
+    }
+
+    push_validation(&mut out, &result.validation);
+    out.finish()
 }

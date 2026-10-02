@@ -1,6 +1,6 @@
 //! Детерминированный выбор целей semantic validation.
 
-use crate::model::{AssetRecord, HumanDecision, ValidatorIdentity};
+use crate::model::{AssetRecord, ValidatorIdentity};
 
 /// Режим выбора ассетов для проверки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,10 @@ impl SelectionMode {
 }
 
 /// Возвращает записи в устойчивом порядке namespace/key.
+///
+/// Это семантика домена по умолчанию (`TrustSemantics::HUMAN_ATTESTED`). Домены,
+/// объявившие другую семантику, выбираются через
+/// `AssetDomainPolicy::trust_semantics`.
 pub fn select_assets<'a>(
     assets: &'a [AssetRecord],
     mode: SelectionMode,
@@ -32,15 +36,8 @@ pub fn select_assets<'a>(
         .filter(|asset| match mode {
             SelectionMode::Full => true,
             SelectionMode::New => {
-                let complete_human_approval = asset.current_human_decision()
-                    == Some(HumanDecision::Approve)
-                    && asset.has_current_validation()
-                    && asset.effective_status() == Some(crate::model::SemanticStatus::Verified);
-                let current_automated_decision =
-                    asset.validation.as_ref().is_some_and(|decision| {
-                        decision.is_valid_for_sha(&asset.sha256) && decision.validator == *validator
-                    });
-                !complete_human_approval && !current_automated_decision
+                !asset.has_complete_human_approval()
+                    && !asset.has_current_automated_decision(validator)
             }
         })
         .collect();

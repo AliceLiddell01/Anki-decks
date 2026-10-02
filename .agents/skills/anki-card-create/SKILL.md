@@ -2,10 +2,12 @@
 name: anki-card-create
 description: >-
   Создание новых карточек в существующей CrowdAnki-колоде от пользовательского
-  запроса до проверки результата, включая configured processors, kanji assets и
-  продолжение ожидающего ручной проверки batch. Применяй к просьбам создать
-  карточку или batch карточек и продолжить такой flow. Не применяй к правке
-  существующих заметок, generic Git, CodeRabbit или объяснению Anki.
+  запроса до проверки результата, включая configured processors, kanji и
+  pitch-accent assets и продолжение ожидающего ручной проверки batch. Применяй к
+  просьбам создать карточку или batch карточек и продолжить такой flow, включая
+  разрешение legacy-конфликта имён через `migrate-media`. Не применяй к правке
+  существующих заметок вне этого конфликта, generic Git, CodeRabbit или
+  объяснению Anki.
 ---
 
 # Создание карточек CrowdAnki
@@ -14,12 +16,12 @@ description: >-
 
 Этот skill владеет агентской оркестрацией создания **новых** заметок в
 существующей колоде и модели. `tools/anki-repo/README.md` владеет контрактом
-`models`, `create`, `validate`, `visual-report` и processor policy;
-`tools/asset-store/README.md` — контрактом `kanji-assets`, asset integrity,
-effective trust и batch state. Общий Git/GitHub lifecycle выполняй через
-`anki-git-workflow`; здесь действуют дополнительные ограничения для публикации
-asset corpus. Не создавай wrapper, вторую копию manifest parser или собственную
-CV/acquisition логику.
+`models`, `create`, `validate`, `visual-report`, processor policy и командой
+`migrate-media`; `tools/asset-store/README.md` — контрактом `kanji-assets`,
+`pitch-assets`, asset integrity, effective trust и batch state. Общий Git/GitHub
+lifecycle выполняй через `anki-git-workflow`; здесь действуют дополнительные
+ограничения для публикации asset corpus. Не создавай wrapper, вторую копию
+manifest parser или собственную CV/acquisition логику.
 
 При первом обращении к колоде прочитай `.codex/context/INDEX.md`, затем
 профильных владельцев. Не загружай многомегабайтный `deck.json` целиком.
@@ -36,19 +38,30 @@ CV/acquisition логику.
    `processors` в объявленном порядке. Отсутствие правила не разрешает media.
    Не угадывай media extension или имя canonical файла. Для `kanji_assets`
    извлекай поддерживаемые kanji identities только из настроенного поля,
-   исключая kana и прочие символы; дедуплицируй зависимости между notes.
+   исключая kana и прочие символы; дедуплицируй зависимости между notes. Для
+   `pitch_accent` извлекай точные surfaces слов из настроенного поля и
+   дедуплицируй их так же.
 3. Подготовь processor dependencies через их владельцев. Для `kanji_assets`
    используй batch/review контракт `kanji-assets` из
-   [references/kanji-batch.md](references/kanji-batch.md). Доверенными считай
+   [references/kanji-batch.md](references/kanji-batch.md); для `pitch_accent` —
+   batch/resume/review контракт `pitch-assets` из
+   [references/pitch-batch.md](references/pitch-batch.md). Доверенными считай
    только assets, которые asset owner подтверждает как effective verified для
-   текущих bytes. Составь media references по его canonical результату.
+   текущих bytes по семантике своего домена. Составь media references по его
+   canonical результату. Запускай браузерные acquisition разных доменов
+   последовательно: они делят runner-каталог браузера.
 4. Раздели notes по состоянию **всех** dependencies. Готовые notes запускай
    через `anki-repo --json create ... --request ...` в dry-run; изучи полный
    machine-readable plan, blockers и per-note outcomes. `--apply` выполняй
    только для notes с разрешёнными зависимостями и успешным dry-run. Остальные
-   оставь pending с причиной, не добавляя missing media. После каждого раунда
-   asset resolution можно продвигать вновь готовые notes, не ожидая ручного
-   решения по независимым notes.
+   оставь pending с причиной, не добавляя missing media. Разрешённая зависимость
+   без media — например доказанный `no_pitch_accent_on_source` — не блокирует
+   создание: соответствующее поле остаётся пустым. После каждого раунда asset
+   resolution можно продвигать вновь готовые notes, не ожидая ручного решения по
+   независимым notes. Отказ по занятому имени файла — это legacy-конфликт, а не
+   отсутствующая зависимость: разбирай его по разделу
+   [Legacy consumer filename](#legacy-consumer-filename), а не заменой слова и не
+   остановкой на неполном наборе.
 5. Сохраняй resolved create request / GUID и статус notes в локальном рабочем
    состоянии вне `decks/**` и Git. При возобновлении сверяй его с фактическим
    экспортом и `create` outcomes, затем создавай только новые разблокированные
@@ -65,7 +78,56 @@ CV/acquisition логику.
 Показывай пользователю раздельные числа/списки: created; ready, но только
 dry-run; blocked by unresolved assets; blocked по другим причинам; auto
 verified, human verified, awaiting human review и scheduled for reacquire
-assets. Независимый item failure не отменяет успешные notes/assets.
+assets. Независимый item failure не отменяет успешные notes/assets. Для pitch
+отдельно называй `no_pitch_accent_on_source`, `ambiguous_vocabulary`,
+`vocabulary_not_found` и технические отказы: это разные исходы с разными
+действиями, а не один «не получилось».
+
+## Legacy consumer filename
+
+Единственная разрешённая правка **уже существующей** заметки в этом flow — перевод
+её ссылки на текущее каноническое имя домена командой
+`anki-repo migrate-media`. Контракт команды, её флаги, доказательства и причины
+отказа — `tools/anki-repo/README.md`.
+
+Когда это нужно. Плоский namespace `media/` общий для всех доменов, а канонические
+имена домены разводят намеренно: kanji-домен кладёт изображение символа под
+`<char>.gif|png`, pitch-домен — под `<surface>.pitch.png`. Прежний конвейер называл
+pitch-картинку `<surface>.png`, и для односложного слова с kanji-fallback это имя
+совпадает с каноническим именем изображения символа. `create` обязан отказать
+(`destination_media_conflict` или `media_filename_collision`) и не выбирать, чьи
+байты важнее.
+
+Это ожидаемый legacy-случай, а не продуктовая коллизия и не повод обойти задачу.
+Разруливай его миграцией, а не так:
+
+- не заканчивай acceptance на N−1 заметках и не оставляй конфликтную identity
+  незакрытой;
+- не заменяй слово в запросе только потому, что его имя конфликтует;
+- не правь `deck.json` и не переименовывай файлы в `media/` руками;
+- не маскируй конфликт под отсутствующий asset и не считай его
+  `kanji_asset_missing` или `pitch_asset_missing`.
+
+Порядок:
+
+1. Докажи семантику **каждой** живой ссылки на legacy-имя: найди её фактический
+   `note_model_uuid` и поле и сверь с разобранной processor policy. Если под тем же
+   именем есть потребитель с другой семантикой, остановись и покажи свидетельства,
+   а не угадывай.
+2. Выполни `migrate-media` в dry-run и покажи план: доказанные ссылки, каноническое
+   имя, действие размещения и освобождаемый файл.
+3. Только после этого `--apply`. Канонические байты берутся из проверенного
+   хранилища домена, а не из переименованного legacy-файла: совпадение SHA даёт
+   `reuse`, расхождение — `copy`. Освободившееся имя после миграции занимает
+   канонический kanji-fallback.
+4. Повтори прогон и убедись, что он сообщает `changed: false`, затем снова
+   `anki-repo validate` и продолжай создание заметок, включая конфликтную.
+5. В итоговом отчёте перечисли затронутые существующие заметки и файлы отдельно:
+   имя до и после и SHA обоих состояний.
+
+Если `migrate-media` отказывает `legacy_media_reference_unproven`, это не повод
+обойти её: покажи свидетельства (`guid`, поле, причину, число вхождений) и уточни
+недостающее у пользователя.
 
 ## Решения человека
 
@@ -78,12 +140,20 @@ semantic решение имеет приоритет над automated semantic 
 human decision криптографической подписью. Неоднозначный текст не меняет state:
 уточни действие или identity. Если hash сменился, запроси новое решение.
 
+Это правило принадлежит домену `kanji_assets`. Домен `pitch_accent` не принимает
+семантическое одобрение человека как основание доверия: там выбор человека
+ограничен точным `select` при `ambiguous_vocabulary`, `reject`/`reacquire` и
+новым acquisition generation. Не переноси kanji-формулировку «подтверждён» на
+pitch PNG и не считай осмотр графика заменой automated `VERIFIED`.
+
 Перед первым `batch start` зафиксируй во внешнем workflow state исходную точку
-asset batch: push remote, default branch и точный SHA этой base. Проверь
-`kanji-corpus-gate`, затем сравни canonical scope `.asset-store/kanji` с этим
-SHA через `git diff` и `git status --short --untracked-files=all`; до batch там
-не должно быть отличий. Сохрани результат `kanji-assets list --output json` как
-owner-снимок исходных verified identities, не читая manifest самостоятельно.
+asset batch: push remote, default branch и точный SHA этой base. Для каждого
+используемого домена проверь его corpus gate (`kanji-corpus-gate`,
+`pitch-corpus-gate`), затем сравни canonical scope его store
+(`.asset-store/kanji`, `.asset-store/pitch-accent`) с этим SHA через `git diff` и
+`git status --short --untracked-files=all`; до batch там не должно быть отличий.
+Сохрани результат `kanji-assets list --output json` как owner-снимок исходных
+verified identities, не читая manifest самостоятельно.
 Если store отсутствует и в baseline нет canonical corpus, исходный owner-снимок
 пуст: `list` завершится ненулевым exit code с `outcome = blocked` и точным
 `error.code = "store_missing"`. Пустым состоянием считай только этот код и
@@ -105,8 +175,14 @@ identity должны принадлежать requested set этого batch, �
 заново. При нулевом delta
 branch/commit не создавай.
 
+Один домен — одна asset-only ветка. Если пакет изменил corpus обоих доменов,
+публикуй их раздельными ветками по общему порядку ниже: у kanji и pitch разные
+gate, разные allowlist путей и разные baseline-снимки, и смешивать их в одном
+коммите нельзя.
+
 Иначе создай поздно отдельную узнаваемую ветку с устойчивым для resume и
-collision-resistant именем `kanji-assets/<batch-id>`. Основание ветки — только
+collision-resistant именем `kanji-assets/<batch-id>` (для pitch —
+`pitch-assets/<batch-id>`). Основание ветки — только
 сохранённый SHA исходной remote base, а не текущий feature HEAD. Изолируй её в
 отдельном worktree, не переключая текущий checkout и не перенося его чужие
 изменения. Перенеси из source store canonical corpus bytes/metadata, исключив
@@ -114,17 +190,19 @@ collision-resistant именем `kanji-assets/<batch-id>`. Основание �
 начальный canonical corpus был сверен с baseline, source сохраняет прежние
 identity и добавляет только delta завершённого batch. Сверь owner-снимок и
 canonical files source/worktree; затем stage явным allowlist фактически
-существующих принадлежащих corpus путей: `.owner.json`, `manifest.json`,
-`assets/*.gif`, `assets/*.png` и только metadata, которая действительно нужна
-store. Проверь staged diff и `git status`: там не должно быть decks,
-runtime/review/browser artifacts, acceptance data, исходного кода или чужих
+существующих принадлежащих corpus путей: для kanji `.owner.json`,
+`manifest.json`, `assets/gif/*.gif`, `assets/png/*.png`, для pitch
+`.owner.json`, `manifest.json`, `assets/png/*.png` — и только metadata, которая
+действительно нужна store. Проверь staged diff и `git status`: там не должно быть
+decks, runtime/review/browser artifacts, acceptance data, исходного кода или чужих
 файлов. Создай локальный asset-only commit даже без GitHub auth.
 
-`kanji-corpus-gate` запускай кодом **текущего** checkout против worktree как
-CWD: worktree стоит на baseline SHA, и его собственный бинарник читает только
-manifest schema, существовавший в baseline. Точная команда и поведение при
-отвергнутом schema — в
-[references/kanji-batch.md](references/kanji-batch.md).
+`kanji-corpus-gate` или `pitch-corpus-gate` запускай кодом **текущего** checkout
+против worktree как CWD: worktree стоит на baseline SHA, и его собственный
+бинарник читает только manifest schema, существовавший в baseline. Точная команда
+и поведение при отвергнутом schema — в
+[references/kanji-batch.md](references/kanji-batch.md); pitch-специфика — в
+[references/pitch-batch.md](references/pitch-batch.md).
 
 Этот asset-only commit — **вторая** ветка, а не замена ветки текущего work item,
 и общий Git lifecycle по-прежнему принадлежит `anki-git-workflow`. Публикуй её

@@ -91,6 +91,7 @@ impl Cli {
             Command::Edit { .. } => "edit",
             Command::Models { .. } => "models",
             Command::Create { .. } => "create",
+            Command::MigrateMedia { .. } => "migrate-media",
             Command::Retire { .. } => "retire",
             Command::VisualReport { .. } => "visual-report",
         }
@@ -315,6 +316,10 @@ pub enum Command {
         /// Проверенное хранилище изображений кандзи; по умолчанию .asset-store/kanji из репозитория экспорта.
         #[arg(long)]
         asset_store: Option<PathBuf>,
+
+        /// Проверенное хранилище pitch-accent; по умолчанию .asset-store/pitch-accent из репозитория экспорта.
+        #[arg(long)]
+        pitch_asset_store: Option<PathBuf>,
     },
 
     /// Вывод заметок из обращения: тег вместо физического удаления.
@@ -411,5 +416,47 @@ pub enum Command {
         /// Записать изменения в deck.json. Без флага выполняется только dry-run.
         #[arg(long)]
         apply: bool,
+    },
+
+    /// Контролируемая миграция legacy consumer filename на каноническое имя домена.
+    ///
+    /// Существует ровно для одного случая: прежний конвейер называл pitch-картинку
+    /// `<surface>.png`, и для односложного слова с kanji-fallback это имя совпадает
+    /// с каноническим именем изображения символа. Команда доказывает семантику
+    /// каждой ссылки, переводит их на каноническое имя домена и освобождает
+    /// legacy-имя. Ни одна ссылка с иной семантикой не переписывается: команда
+    /// останавливается и показывает свидетельства.
+    #[command(name = "migrate-media")]
+    MigrateMedia {
+        /// Каталог CrowdAnki-экспорта: каталог, в котором лежит deck.json.
+        export_dir: PathBuf,
+
+        /// Пространство имён домена, которому принадлежит каноническое имя.
+        #[arg(long, value_name = "NAMESPACE")]
+        namespace: String,
+
+        /// Ключ идентичности внутри домена, например поверхность слова.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+
+        /// Legacy-имя файла, ссылки на которое переводятся на каноническое.
+        #[arg(long = "from", value_name = "FILENAME")]
+        from: String,
+
+        /// Записать изменения в deck.json и освободить legacy-имя. Без флага — dry-run.
+        #[arg(long)]
+        apply: bool,
+
+        /// Правила создания; по умолчанию .anki-repo/create.yaml из репозитория экспорта.
+        #[arg(long)]
+        create_config: Option<PathBuf>,
+
+        /// Проверенное хранилище изображений кандзи; по умолчанию .asset-store/kanji из репозитория экспорта.
+        #[arg(long)]
+        asset_store: Option<PathBuf>,
+
+        /// Проверенное хранилище pitch-accent; по умолчанию .asset-store/pitch-accent из репозитория экспорта.
+        #[arg(long)]
+        pitch_asset_store: Option<PathBuf>,
     },
 }

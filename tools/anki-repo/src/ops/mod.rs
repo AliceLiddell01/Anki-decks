@@ -10,6 +10,7 @@ pub mod deck_select;
 pub mod edit;
 pub mod find;
 pub mod inspect;
+pub mod migrate_media;
 pub mod models;
 pub mod publish;
 pub mod qa;

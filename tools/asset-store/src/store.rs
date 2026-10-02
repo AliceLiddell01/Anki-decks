@@ -24,8 +24,7 @@ use crate::model::{
     MANIFEST_SCHEMA_VERSION, Manifest, Provenance, SemanticDecision, SemanticStatus,
     ValidationRecord, ValidatorIdentity,
 };
-use crate::pitch_accent::PitchAccentDomainPolicy;
-use crate::selection::{SelectionMode, select_assets};
+use crate::selection::SelectionMode;
 use crate::validation::{SemanticValidator, ValidationAttempt, ValidationReport, ValidatorFailure};
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -811,12 +810,13 @@ impl AssetStore {
                     "эти bytes явно отклонены человеком; требуется новое решение или другой hash",
                 ));
             }
-            let pitch_same_sha_refresh = current.sha256 == staged.sha256
-                && is_pitch_domain(self.policy.as_ref())
+            let semantics = self.policy.trust_semantics();
+            let same_sha_metadata_refresh = current.sha256 == staged.sha256
+                && semantics.metadata_change_requires_explicit_cas()
                 && (current.domain_metadata != request.domain_metadata
                     || current.provenance != request.provenance);
             if current.sha256 == staged.sha256
-                && !pitch_same_sha_refresh
+                && !same_sha_metadata_refresh
                 && is_trusted_for_policy(current, &validator_id, self.policy.as_ref())
             {
                 let outcome = VerifiedIngestOutcome {
@@ -835,12 +835,12 @@ impl AssetStore {
                 lock.unlock()?;
                 return Ok(outcome);
             }
-            if (current.sha256 != staged.sha256 || pitch_same_sha_refresh)
+            if (current.sha256 != staged.sha256 || same_sha_metadata_refresh)
                 && request.replace_expected_sha256.as_deref() != Some(current.sha256.as_str())
             {
                 return Err(AssetError::with_details(
                     ErrorCode::IdentityConflict,
-                    if pitch_same_sha_refresh && current.sha256 == staged.sha256 {
+                    if same_sha_metadata_refresh && current.sha256 == staged.sha256 {
                         format!(
                             "метаданные или сведения об источнике ресурса {} изменились; требуется точный ожидаемый SHA для обновления",
                             current.identity
@@ -852,7 +852,7 @@ impl AssetStore {
                         "identity": current.identity,
                         "existing_sha256": current.sha256,
                         "candidate_sha256": staged.sha256,
-                        "same_sha_metadata_refresh": pitch_same_sha_refresh,
+                        "same_sha_metadata_refresh": same_sha_metadata_refresh,
                     }),
                 ));
             }
@@ -2764,11 +2764,9 @@ fn is_trusted_for_policy(
     expected_validator: &ValidatorIdentity,
     policy: &dyn AssetDomainPolicy,
 ) -> bool {
-    if is_pitch_domain(policy) {
-        asset.is_trusted_for_automated_validation(expected_validator)
-    } else {
-        asset.is_trusted_for(expected_validator)
-    }
+    policy
+        .trust_semantics()
+        .confers_trust(asset, expected_validator)
 }
 
 fn select_assets_for_policy<'a>(
@@ -2777,25 +2775,16 @@ fn select_assets_for_policy<'a>(
     validator: &ValidatorIdentity,
     policy: &dyn AssetDomainPolicy,
 ) -> Vec<&'a AssetRecord> {
-    if !is_pitch_domain(policy) {
-        return select_assets(assets, mode, validator);
-    }
-
+    let semantics = policy.trust_semantics();
     let mut selected: Vec<_> = assets
         .iter()
         .filter(|asset| match mode {
             SelectionMode::Full => true,
-            SelectionMode::New => !asset.validation.as_ref().is_some_and(|decision| {
-                decision.is_valid_for_sha(&asset.sha256) && decision.validator == *validator
-            }),
+            SelectionMode::New => semantics.requires_new_validation(asset, validator),
         })
         .collect();
     selected.sort_by(|left, right| left.identity.cmp(&right.identity));
     selected
-}
-
-fn is_pitch_domain(policy: &dyn AssetDomainPolicy) -> bool {
-    policy.domain_id() == PitchAccentDomainPolicy.domain_id()
 }
 
 fn validate_legacy_verified_manifest(

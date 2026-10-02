@@ -2,6 +2,7 @@
 use super::*;
 use crate::kanji_validator::MAX_MEDIA_BYTES;
 use crate::model::ValidationEvidence;
+use crate::selection::select_assets;
 
 struct Fixture {
     directory: PathBuf,

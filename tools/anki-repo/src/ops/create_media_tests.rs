@@ -39,6 +39,28 @@ impl SemanticValidator for Stub {
         ))
     }
 }
+/// Заглушка pitch-домена: заявляет идентификатор владельца домена, а сами байты
+/// и отрисовка остаются предметом его собственных тестов.
+struct PitchStub;
+impl SemanticValidator for PitchStub {
+    fn identity(&self) -> ValidatorIdentity {
+        PitchAccentImageValidator::validator_identity()
+    }
+    fn validate(
+        &self,
+        _: &AssetRecord,
+        _: &mut dyn Read,
+    ) -> Result<SemanticDecision, ValidatorFailure> {
+        Ok(SemanticDecision::new(
+            SemanticStatus::Verified,
+            vec![ValidationEvidence {
+                kind: "synthetic".into(),
+                summary: "контролируемые байты тестовой фикстуры".into(),
+                details: None,
+            }],
+        ))
+    }
+}
 impl Fixture {
     fn new() -> Self {
         let temp = TempDir::new("configured-media");
@@ -55,6 +77,7 @@ impl Fixture {
         let options = MediaOptions {
             config: Some(config),
             asset_store: Some(temp.path().join("store")),
+            pitch_asset_store: Some(temp.path().join("pitch-store")),
         };
         Self {
             temp,
@@ -115,15 +138,91 @@ impl Fixture {
         )
         .unwrap()
     }
+    fn set_policy(&self, yaml: &str) {
+        fs::write(self.options.config.as_ref().unwrap(), yaml).unwrap();
+    }
+    fn pitch(&self, surface: &str, bytes: &[u8]) -> String {
+        let store = AssetStore::open_with_policy(
+            StoreOptions::new(self.options.pitch_asset_store.clone().unwrap()),
+            PitchAccentDomainPolicy,
+        )
+        .unwrap();
+        store
+            .ingest_verified(
+                VerifiedIngestRequest {
+                    identity: AssetIdentity::new("pitch_accent", surface).unwrap(),
+                    bytes: bytes.to_vec(),
+                    provenance: Provenance {
+                        source_kind: "jpdb_browser_capture".into(),
+                        source_name: "synthetic.pitch.png".into(),
+                    },
+                    domain_metadata: Some(json!({
+                        "surface": surface,
+                        "reading": "よみかた",
+                        "vocabulary_id": 1,
+                    })),
+                    replace_expected_sha256: None,
+                },
+                &PitchStub,
+            )
+            .unwrap()
+            .sha256
+    }
+    /// Прогон запроса с явными парами «имя поля → значение»: нужен там, где
+    /// правила включают разные обработчики на разные поля одной модели.
+    fn run_fields(
+        &self,
+        values: &[(&str, &str)],
+        apply: bool,
+    ) -> Result<crate::ops::create::CreateResult, DomainError> {
+        self.run_fields_with(values, apply, &self.options)
+    }
+    fn run_fields_with(
+        &self,
+        values: &[(&str, &str)],
+        apply: bool,
+        options: &MediaOptions,
+    ) -> Result<crate::ops::create::CreateResult, DomainError> {
+        let fields = values
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), json!(value)))
+            .collect::<serde_json::Map<_, _>>();
+        let notes = vec![json!({
+            "guid": "New0",
+            "deck": {"crowdanki_uuid": "deck-uuid-1"},
+            "model": {"mode": "explicit", "crowdanki_uuid": "model-1"},
+            "fields": fields,
+            "tags": ["TEMP"],
+        })];
+        let request = parse_request_bytes(
+            &serde_json::to_vec(&json!({"schema_version": 1, "notes": notes})).unwrap(),
+            "synthetic",
+        )
+        .unwrap();
+        create_with_options(&self.export, &request, apply, None, options)
+    }
 }
 const GIF: &[u8] = b"GIF89a-synthetic-one";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-synthetic";
 // Полный GIF размером 1×1: подтверждение человеком проверяет декодирование,
 // а не только сигнатуру.
+// Полный PNG 1×1: подтверждение человеком проверяет декодирование, а не только
+// сигнатуру.
+const DECODABLE_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x00\x00\x00\x00\x3a\x7e\x9b\x55\x00\x00\x00\x0aIDATx\x9ccp\x00\x00\x00\x42\x00\x41\x29\x37\xf4\xef\x00\x00\x00\x00IEND\xae\x42\x60\x82";
 const DECODABLE_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
 fn policy(uuid: &str, field: &str) -> String {
     format!(
         "schema_version: 1\nnote_models:\n  - crowdanki_uuid: '{uuid}'\n    fields:\n      {field}:\n        processors:\n          - type: kanji_assets\n"
+    )
+}
+fn pitch_policy(uuid: &str, field: &str) -> String {
+    format!(
+        "schema_version: 1\nnote_models:\n  - crowdanki_uuid: '{uuid}'\n    fields:\n      {field}:\n        processors:\n          - type: pitch_accent\n"
+    )
+}
+fn dual_policy(uuid: &str, kanji_field: &str, pitch_field: &str) -> String {
+    format!(
+        "schema_version: 1\nnote_models:\n  - crowdanki_uuid: '{uuid}'\n    fields:\n      {kanji_field}:\n        processors:\n          - type: kanji_assets\n      {pitch_field}:\n        processors:\n          - type: pitch_accent\n"
     )
 }
 fn reason(error: &DomainError, expected: &str) {
@@ -725,6 +824,7 @@ fn resolved_empty_pins_are_distinct_from_legacy_unpinned_requests() {
     let no_store = MediaOptions {
         config: f.options.config.clone(),
         asset_store: None,
+        pitch_asset_store: f.options.pitch_asset_store.clone(),
     };
     reason(
         &create_with_options(&f.export, &resolved, false, None, &no_store).unwrap_err(),
@@ -1287,4 +1387,269 @@ fn required_duplicate_declaration_is_a_blocker_and_unrelated_duplicates_are_pres
     f.run(&["<img src=一.gif>"], true).unwrap();
     let after: Value = serde_json::from_slice(&f.bytes()).unwrap();
     assert_eq!(after["media_files"], json!(["a.mp3", "a.mp3", "一.gif"]));
+}
+
+/// Канонический суффикс потребителя не выводится из памяти: он обязан совпадать
+/// с тем, что фактически объявляет политика домена.
+#[test]
+fn pitch_consumer_suffix_matches_the_domain_policy() {
+    let identity = AssetIdentity::new("pitch_accent", "見本").unwrap();
+    let location = PitchAccentDomainPolicy
+        .canonical_location(&identity, &"0".repeat(64), DetectedFormat::Png)
+        .unwrap();
+    assert_eq!(
+        location.consumer_filename,
+        format!("{}{PITCH_CONSUMER_SUFFIX}", identity.key)
+    );
+}
+
+/// Поле с включённым pitch-обработчиком владеет только точным каноническим
+/// именем домена. Произвольный PNG, URL, data URI, sound и CSS-адрес остаются
+/// незаявленными: иначе ссылка молча прошла бы мимо проверки ресурсов.
+#[test]
+fn pitch_field_claims_only_the_canonical_consumer_filename() {
+    let f = Fixture::new();
+    f.set_policy(&pitch_policy("model-1", "Заголовок"));
+    for value in [
+        "<img src=幽霊.png>",
+        "<img src=幽霊.pitch.PNG>",
+        "<img src=.pitch.png>",
+        "<img src=../幽霊.pitch.png>",
+        "<img src=/幽霊.pitch.png>",
+        "<img src=https://host/幽霊.pitch.png>",
+        "<img src=幽霊.pitch.png?q>",
+        "<img src=幽霊.pitch.png#x>",
+        "<audio src=幽霊.pitch.png>",
+        "[sound:幽霊.pitch.png]",
+        "<div style='background:url(幽霊.pitch.png)'>",
+        "<img src='幽霊.pitch.png'",
+    ] {
+        let error = f.run(&[value], true).unwrap_err();
+        reason(&error, "media_reference_unclaimed");
+        assert!(!f.export.join("media").exists());
+    }
+    reason(
+        &f.run(&["<img src=幽霊.pitch.png>"], true).unwrap_err(),
+        "pitch_asset_missing",
+    );
+}
+
+/// Отсутствие pitch-ресурса не маскируется под отсутствие kanji-ресурса: у
+/// каждого домена своя стабильная причина блокера.
+#[test]
+fn missing_asset_reason_stays_specific_to_the_domain() {
+    let f = Fixture::new();
+    reason(
+        &f.run(&["<img src=一.gif>"], true).unwrap_err(),
+        "kanji_asset_missing",
+    );
+    f.set_policy(&pitch_policy("model-1", "Заголовок"));
+    reason(
+        &f.run(&["<img src=幽霊.pitch.png>"], true).unwrap_err(),
+        "pitch_asset_missing",
+    );
+}
+
+/// Два домена разрешаются одним запросом: каждый читает своё хранилище, и оба
+/// файла попадают в плоский media. Повторный прогон остаётся идемпотентным.
+#[test]
+fn dual_domain_request_resolves_both_stores_in_one_run() {
+    let f = Fixture::new();
+    f.set_policy(&dual_policy("model-1", "Заголовок", "Толкование"));
+    f.asset("一", GIF, None);
+    f.pitch("幽霊", PNG);
+    let values = [
+        ("Заголовок", "<img src=一.gif>"),
+        ("Толкование", "<img src=幽霊.pitch.png>"),
+    ];
+    let before = f.bytes();
+    let dry = f.run_fields(&values, false).unwrap();
+    assert_eq!(dry.media.evidence()["mutations_planned"], 2);
+    assert_eq!(dry.media.references.len(), 2);
+    assert_eq!(before, f.bytes());
+    assert!(!f.export.join("media").exists());
+
+    let applied = f.run_fields(&values, true).unwrap();
+    assert_eq!(applied.notes_created, 1);
+    assert_eq!(applied.media.mutations, 2);
+    assert_eq!(fs::read(f.export.join("media/一.gif")).unwrap(), GIF);
+    assert_eq!(
+        fs::read(f.export.join("media/幽霊.pitch.png")).unwrap(),
+        PNG
+    );
+    let value: Value = serde_json::from_slice(&f.bytes()).unwrap();
+    assert_eq!(
+        value["media_files"],
+        json!(["a.mp3", "b.png", "一.gif", "幽霊.pitch.png"])
+    );
+    let namespaces = applied.media.evidence()["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|asset| asset["identity"]["namespace"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(namespaces, vec!["kanji", "pitch_accent"]);
+
+    let after = f.bytes();
+    let repeat = f.run_fields(&values, true).unwrap();
+    assert!(!repeat.applied);
+    assert_eq!(repeat.notes_already_applied, 1);
+    assert_eq!(repeat.media.mutations, 0);
+    assert_eq!(after, f.bytes());
+}
+
+/// Отсутствие переопределения хранилища блокирует только свой домен: запрос с
+/// kanji-ресурсом и без pitch-ресурса не должен проходить из-за чужого store.
+#[test]
+fn each_domain_needs_its_own_resolved_store() {
+    let f = Fixture::new();
+    f.set_policy(&dual_policy("model-1", "Заголовок", "Толкование"));
+    f.asset("一", GIF, None);
+    f.pitch("幽霊", PNG);
+    let both = [
+        ("Заголовок", "<img src=一.gif>"),
+        ("Толкование", "<img src=幽霊.pitch.png>"),
+    ];
+    let mut without_pitch = f.options.clone();
+    without_pitch.pitch_asset_store = None;
+    let mut without_kanji = f.options.clone();
+    without_kanji.asset_store = None;
+
+    // Домен, на который запрос не ссылается, не обязан иметь хранилище.
+    let kanji_only = f.run_fields_with(
+        &[
+            ("Заголовок", "<img src=一.gif>"),
+            ("Толкование", "значение"),
+        ],
+        false,
+        &without_pitch,
+    );
+    assert_eq!(kanji_only.unwrap().media.evidence()["mutations_planned"], 1);
+
+    reason(
+        &f.run_fields_with(&both, false, &without_pitch).unwrap_err(),
+        "pitch_asset_missing",
+    );
+    reason(
+        &f.run_fields_with(&both, false, &without_kanji).unwrap_err(),
+        "kanji_asset_missing",
+    );
+    assert_eq!(
+        f.run_fields_with(&both, false, &f.options)
+            .unwrap()
+            .media
+            .evidence()["mutations_planned"],
+        2
+    );
+    assert!(!f.export.join("media").exists());
+}
+
+#[test]
+fn cross_domain_consumer_filename_collision_fails_closed() {
+    let kanji = verified_asset_fixture(
+        AssetIdentity::new("kanji", "一").unwrap(),
+        "assets/gif/一.gif",
+        "見本.png",
+        GIF,
+    );
+    let pitch = verified_asset_fixture(
+        AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+        "assets/png/幽霊.png",
+        "見本.png",
+        PNG,
+    );
+    let item = |asset: VerifiedAssetBytes| Item {
+        pin: Pin {
+            identity: asset.record.identity.clone(),
+            filename: asset.record.consumer_filename.clone(),
+            sha256: asset.record.sha256.clone(),
+        },
+        action: String::new(),
+        asset,
+    };
+    let error = check_filename_ownership(&[item(kanji.clone()), item(pitch)]).unwrap_err();
+    reason(&error, "media_filename_collision");
+    assert_eq!(error.details["evidence"]["filename"], "見本.png");
+
+    let same_bytes = verified_asset_fixture(
+        AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+        "assets/png/幽霊.png",
+        "見本.png",
+        GIF,
+    );
+    assert!(check_filename_ownership(&[item(kanji), item(same_bytes)]).is_ok());
+}
+
+/// Подтверждение человека не делает pitch-ресурс пригодным для карточки:
+/// доверие даёт только текущее автоматическое `verified` ожидаемого валидатора.
+#[test]
+fn pitch_asset_requires_current_automated_validation() {
+    struct Disputed;
+    impl SemanticValidator for Disputed {
+        fn identity(&self) -> ValidatorIdentity {
+            PitchAccentImageValidator::validator_identity()
+        }
+        fn validate(
+            &self,
+            _: &AssetRecord,
+            _: &mut dyn Read,
+        ) -> Result<SemanticDecision, ValidatorFailure> {
+            Ok(SemanticDecision::new(
+                SemanticStatus::Uncertain,
+                vec![ValidationEvidence {
+                    kind: "synthetic".into(),
+                    summary: "синтетическое спорное semantic решение".into(),
+                    details: None,
+                }],
+            ))
+        }
+    }
+    let f = Fixture::new();
+    f.set_policy(&pitch_policy("model-1", "Заголовок"));
+    let root = f.options.pitch_asset_store.clone().unwrap();
+    let store =
+        AssetStore::open_with_policy(StoreOptions::new(&root), PitchAccentDomainPolicy).unwrap();
+    let source = f.temp.path().join("candidate.pitch.png");
+    fs::write(&source, DECODABLE_PNG).unwrap();
+    let identity = AssetIdentity::new("pitch_accent", "幽霊").unwrap();
+    let pending = store
+        .ingest(IngestRequest {
+            identity: identity.clone(),
+            source_path: source,
+            expected_source_sha256: None,
+            domain_metadata: None,
+            replace_expected_sha256: None,
+        })
+        .unwrap();
+    store.validate(SelectionMode::New, &Disputed).unwrap();
+    let approved = store
+        .attest(HumanAttestationRequest {
+            identity: identity.clone(),
+            expected_sha256: pending.asset.sha256.clone(),
+            decision: HumanDecision::Approve,
+            reason: "пользователь подтвердил точный candidate в review".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        approved.asset.effective_status(),
+        Some(SemanticStatus::Verified),
+        "решение человека фиксируется, но не подменяет автоматическое"
+    );
+    assert!(
+        AssetStore::read_verified_with_policy(
+            &root,
+            std::slice::from_ref(&identity),
+            &PitchAccentImageValidator::validator_identity(),
+            &PitchAccentDomainPolicy,
+        )
+        .is_err(),
+        "pitch-домен не доверяет подтверждению человека"
+    );
+    let before = f.bytes();
+    reason(
+        &f.run(&["<img src=幽霊.pitch.png>"], true).unwrap_err(),
+        "asset_integrity_invalid",
+    );
+    assert_eq!(before, f.bytes());
+    assert!(!f.export.join("media").exists());
 }

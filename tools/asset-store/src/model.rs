@@ -300,6 +300,21 @@ impl AssetRecord {
         self.current_validation_status().is_some()
     }
 
+    /// Полное решение человека: точное одобрение текущих bytes, подтверждённое
+    /// актуальным автоматическим свидетельством.
+    pub(crate) fn has_complete_human_approval(&self) -> bool {
+        self.current_human_decision() == Some(HumanDecision::Approve)
+            && self.has_current_validation()
+            && self.effective_status() == Some(SemanticStatus::Verified)
+    }
+
+    /// Актуальное автоматическое решение ожидаемой версии валидатора.
+    pub(crate) fn has_current_automated_decision(&self, validator: &ValidatorIdentity) -> bool {
+        self.validation.as_ref().is_some_and(|decision| {
+            decision.is_valid_for_sha(&self.sha256) && decision.validator == *validator
+        })
+    }
+
     /// Семантический статус после решения человека. Вызывающий обязан сначала
     /// проверить физическую целостность; этот метод не читает и не декодирует байты.
     pub fn effective_status(&self) -> Option<SemanticStatus> {

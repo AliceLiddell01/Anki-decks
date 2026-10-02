@@ -20,6 +20,7 @@ use crate::ops::edit::{EditRequest, EditSpec, STDIN_REQUEST_SOURCE};
 use crate::ops::find as find_op;
 use crate::ops::find::{FindCriteria, FindQuery, MatchMode};
 use crate::ops::inspect as inspect_op;
+use crate::ops::migrate_media as migrate_media_op;
 use crate::ops::models as models_op;
 use crate::ops::models::ModelsQuery;
 use crate::ops::qa as qa_op;
@@ -269,6 +270,7 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             emit_resolved,
             create_config,
             asset_store,
+            pitch_asset_store,
         } => {
             let raw = read_document(request_file, create_op::MAX_REQUEST_BYTES, "запрос")?;
             let label = request_file.display().to_string();
@@ -283,6 +285,7 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 &crate::ops::create_media::MediaOptions {
                     config: create_config.clone(),
                     asset_store: asset_store.clone(),
+                    pitch_asset_store: pitch_asset_store.clone(),
                 },
             )?;
             Ok(Rendered {
@@ -291,6 +294,42 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     json::create_json(&result)
                 } else {
                     human::create(&result)
+                },
+                exit: 0,
+            })
+        }
+
+        Command::MigrateMedia {
+            export_dir,
+            namespace,
+            key,
+            from,
+            apply,
+            create_config,
+            asset_store,
+            pitch_asset_store,
+        } => {
+            let request = migrate_media_op::MigrationRequest {
+                namespace: namespace.clone(),
+                key: key.clone(),
+                legacy_filename: from.clone(),
+            };
+            let result = migrate_media_op::migrate(
+                export_dir,
+                &request,
+                &crate::ops::create_media::MediaOptions {
+                    config: create_config.clone(),
+                    asset_store: asset_store.clone(),
+                    pitch_asset_store: pitch_asset_store.clone(),
+                },
+                *apply,
+            )?;
+            Ok(Rendered {
+                command: "migrate-media",
+                stdout: if cli.json {
+                    json::migrate_media_json(&result)
+                } else {
+                    human::migrate_media(&result)
                 },
                 exit: 0,
             })

@@ -43,6 +43,7 @@ pub use browser_runtime::{
 };
 pub use domain::{
     AssetDomainPolicy, CanonicalAssetLocation, GenericDomainPolicy, KanjiDomainPolicy,
+    TrustSemantics,
 };
 pub use error::{AssetError, ErrorCode};
 pub use model::{

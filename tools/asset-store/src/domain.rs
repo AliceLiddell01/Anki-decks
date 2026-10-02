@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
 use crate::kanji_domain::parse_kanji_character;
-use crate::model::{AssetIdentity, AssetRecord, DetectedFormat};
+use crate::model::{AssetIdentity, AssetRecord, DetectedFormat, ValidatorIdentity};
 
 /// Пространства имён, принадлежащие предметным доменам публикации.
 ///
@@ -18,6 +18,68 @@ const PUBLISHABLE_DOMAIN_NAMESPACES: &[&str] = &["kanji", "pitch_accent"];
 pub struct CanonicalAssetLocation {
     pub storage_path: String,
     pub consumer_filename: String,
+}
+
+/// Семантика доверия и обновления записи, которую предметный домен сообщает
+/// общему хранилищу.
+///
+/// Общий core не перечисляет известные домены и не распознаёт их по имени: он
+/// применяет ровно ту семантику, которую объявила политика домена. Поэтому новый
+/// домен не требует правок в `store.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustSemantics {
+    /// Может ли явное решение человека заменить актуальное автоматическое
+    /// решение ожидаемого валидатора при определении доверия потребителя.
+    human_attestation_confers_trust: bool,
+    /// Считает ли домен `domain_metadata` и `provenance` частью семантики
+    /// ресурса: их изменение при неизменных bytes требует явного CAS.
+    metadata_change_requires_explicit_cas: bool,
+}
+
+impl TrustSemantics {
+    /// Доверие подтверждается либо актуальным решением ожидаемого валидатора,
+    /// либо явным решением человека по точным текущим bytes.
+    pub const HUMAN_ATTESTED: Self = Self {
+        human_attestation_confers_trust: true,
+        metadata_change_requires_explicit_cas: false,
+    };
+
+    /// Доверие требует актуального автоматического `verified` ожидаемого
+    /// валидатора: решение человека его не заменяет, а изменение метаданных при
+    /// неизменных bytes считается семантическим изменением ресурса.
+    pub const AUTOMATED_VERIFIED_ONLY: Self = Self {
+        human_attestation_confers_trust: false,
+        metadata_change_requires_explicit_cas: true,
+    };
+
+    /// Считается ли запись доверенной для ожидаемого валидатора.
+    pub fn confers_trust(
+        &self,
+        record: &AssetRecord,
+        expected_validator: &ValidatorIdentity,
+    ) -> bool {
+        if self.human_attestation_confers_trust {
+            record.is_trusted_for(expected_validator)
+        } else {
+            record.is_trusted_for_automated_validation(expected_validator)
+        }
+    }
+
+    /// Требует ли запись новой проверки в режиме `SelectionMode::New`.
+    pub fn requires_new_validation(
+        &self,
+        record: &AssetRecord,
+        expected_validator: &ValidatorIdentity,
+    ) -> bool {
+        let already_decided = record.has_current_automated_decision(expected_validator)
+            || (self.human_attestation_confers_trust && record.has_complete_human_approval());
+        !already_decided
+    }
+
+    /// Требует ли повторная запись тех же bytes с другими метаданными явного CAS.
+    pub const fn metadata_change_requires_explicit_cas(&self) -> bool {
+        self.metadata_change_requires_explicit_cas
+    }
 }
 
 /// Правила одного независимого домена ресурсов.
@@ -104,6 +166,15 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
             ));
         }
         Ok(())
+    }
+
+    /// Семантика доверия и обновления записи для этого домена.
+    ///
+    /// Домен сам сообщает общему хранилищу, что подтверждает доверие потребителя
+    /// и когда запись требует новой проверки. По умолчанию действует семантика с
+    /// учётом явного решения человека.
+    fn trust_semantics(&self) -> TrustSemantics {
+        TrustSemantics::HUMAN_ATTESTED
     }
 }
 

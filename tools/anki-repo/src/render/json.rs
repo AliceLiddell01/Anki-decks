@@ -12,6 +12,7 @@ use crate::ops::create::CreateResult;
 use crate::ops::edit::EditResult;
 use crate::ops::find::FindResult;
 use crate::ops::inspect::{InspectResult, InspectVerbose, ModelSummary};
+use crate::ops::migrate_media::{LegacyMediaDigest, MigratedReference, MigrationResult};
 use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
 use crate::ops::retire::RetireResult;
@@ -1702,6 +1703,62 @@ impl From<&crate::ops::source::ValidationDelta> for ValidationDeltaDto {
             },
             new_error_codes: delta.new_error_codes.clone(),
             new_warning_codes: delta.new_warning_codes.clone(),
+        }
+    }
+}
+
+/// JSON-представление `migrate-media`.
+pub fn migrate_media_json(result: &MigrationResult) -> String {
+    to_json("migrate-media", MigrateMediaDto::from(result))
+}
+
+#[derive(Serialize)]
+struct MigrateMediaDto<'a> {
+    export_dir: String,
+    deck_json: String,
+    dry_run: bool,
+    applied: bool,
+    changed: bool,
+    identity: &'a asset_store::AssetIdentity,
+    namespace: &'a str,
+    key: &'a str,
+    canonical_filename: &'a str,
+    canonical_sha256: &'a str,
+    canonical_action: &'a str,
+    legacy_filename: &'a str,
+    legacy_declared: bool,
+    legacy_media: Option<&'a LegacyMediaDigest>,
+    references_total: usize,
+    references_truncated: bool,
+    references: &'a [MigratedReference],
+    media_files_added: &'a [String],
+    media_files_removed: &'a [String],
+    validation: ValidationDeltaDto,
+}
+
+impl<'a> From<&'a MigrationResult> for MigrateMediaDto<'a> {
+    fn from(result: &'a MigrationResult) -> Self {
+        Self {
+            export_dir: result.export_dir.display().to_string(),
+            deck_json: result.deck_json.display().to_string(),
+            dry_run: result.dry_run,
+            applied: result.applied,
+            changed: result.changed,
+            identity: &result.identity,
+            namespace: &result.identity.namespace,
+            key: &result.identity.key,
+            canonical_filename: &result.canonical_filename,
+            canonical_sha256: &result.canonical_sha256,
+            canonical_action: &result.canonical_action,
+            legacy_filename: &result.legacy_filename,
+            legacy_declared: result.legacy_declared,
+            legacy_media: result.legacy_media.as_ref(),
+            references_total: result.references_total,
+            references_truncated: result.references_truncated,
+            references: &result.references,
+            media_files_added: &result.media_files_added,
+            media_files_removed: &result.media_files_removed,
+            validation: ValidationDeltaDto::from(&result.validation),
         }
     }
 }

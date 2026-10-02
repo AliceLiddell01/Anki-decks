@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::browser_runtime::BrowserRuntimeProvenance;
 use crate::domain::{
-    AssetDomainPolicy, CanonicalAssetLocation, extension_for_format,
+    AssetDomainPolicy, CanonicalAssetLocation, TrustSemantics, extension_for_format,
     validate_safe_consumer_filename,
 };
 use crate::error::{AssetError, ErrorCode};
@@ -155,6 +155,13 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
 
     fn content_addressed_storage(&self) -> bool {
         false
+    }
+
+    /// Доверие pitch-ресурсу даёт только текущее автоматическое решение
+    /// ожидаемого валидатора: подтверждение человека само по себе не делает
+    /// отрисовку пригодной для карточки.
+    fn trust_semantics(&self) -> TrustSemantics {
+        TrustSemantics::AUTOMATED_VERIFIED_ONLY
     }
 }
 
