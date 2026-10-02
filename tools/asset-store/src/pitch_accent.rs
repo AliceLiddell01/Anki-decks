@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::browser_runtime::BrowserRuntimeProvenance;
 use crate::domain::{
-    AssetDomainPolicy, CanonicalAssetLocation, extension_for_format,
+    AssetDomainPolicy, CanonicalAssetLocation, TrustSemantics, extension_for_format,
     validate_safe_consumer_filename,
 };
 use crate::error::{AssetError, ErrorCode};
@@ -26,15 +26,15 @@ use crate::validation::{SemanticValidator, ValidatorFailure};
 /// конечную границу для недоверенного входного потока.
 pub(crate) const PITCH_ACCENT_MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Допуск размеров PNG из-за округления границ нативного CDP capture clip.
+/// Допуск размеров PNG из-за округления границ нативной области снимка CDP.
 /// При DSF 3.0 он ограничивает расхождение одним CSS-пикселем.
 pub(crate) const PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE: f64 = 3.0;
 
-/// Геометрический допуск для согласования DOM, capture clip и сохранённого evidence.
+/// Геометрический допуск для согласования DOM, области снимка и сохранённого свидетельства.
 pub(crate) const PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX: f64 = 0.25;
 
-/// Сравнивает reading JPDB, считая хирагану и катакану эквивалентной записью.
-/// Остальные символы сравниваются буквально; surface form не нормализуется.
+/// Сравнивает чтение JPDB, считая хирагану и катакану эквивалентной записью.
+/// Остальные символы сравниваются буквально; написание не нормализуется.
 pub fn jpdb_readings_equivalent(left: &str, right: &str) -> bool {
     fn hiragana_equivalent(character: char) -> char {
         let code_point = u32::from(character);
@@ -131,13 +131,23 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
         })
     }
 
+    fn proves_legacy_consumer_filename(
+        &self,
+        identity: &crate::model::AssetIdentity,
+        filename: &str,
+    ) -> bool {
+        self.validate_identity(identity).is_ok()
+            && filename == format!("{}.png", identity.key)
+            && validate_safe_consumer_filename(filename, DetectedFormat::Png).is_ok()
+    }
+
     fn legacy_location(
         &self,
         _identity: &crate::model::AssetIdentity,
         _sha256: &str,
         _format: DetectedFormat,
     ) -> Option<CanonicalAssetLocation> {
-        // Домен `pitch_accent` отсутствовал в schema 3/4.
+        // Домен `pitch_accent` отсутствовал в схемах 3/4.
         None
     }
 
@@ -156,6 +166,13 @@ impl AssetDomainPolicy for PitchAccentDomainPolicy {
     fn content_addressed_storage(&self) -> bool {
         false
     }
+
+    /// Доверие pitch-ресурсу даёт только текущее автоматическое решение
+    /// ожидаемого валидатора: подтверждение человека само по себе не делает
+    /// отрисовку пригодной для карточки.
+    fn trust_semantics(&self) -> TrustSemantics {
+        TrustSemantics::AUTOMATED_VERIFIED_ONLY
+    }
 }
 
 /// Метаданные словарной записи JPDB, не участвующие в имени канонического файла.
@@ -166,7 +183,7 @@ pub struct PitchAccentDomainMetadata {
     pub surface: String,
     /// Значение `reading` для карточки и сведений об источнике; оно не входит в имя файла.
     pub reading: String,
-    /// Положительный JPDB vocabulary ID.
+    /// Положительный идентификатор словарной записи JPDB.
     pub jpdb_vocabulary_id: u64,
     /// Структурные сведения об источнике, захвате и среде браузера.
     pub evidence: PitchAccentEvidence,
@@ -219,7 +236,7 @@ pub struct PitchAccentGraphEvidence {
     pub index: u32,
     /// CSS-селектор конкретного узла графика.
     pub selector: String,
-    /// Прямоугольник узла графика относительно viewport.
+    /// Прямоугольник узла графика относительно области просмотра.
     pub viewport_rect: PitchAccentCaptureRect,
     /// Прямоугольник узла графика относительно начала документа.
     pub document_rect: PitchAccentCaptureRect,
@@ -304,7 +321,7 @@ impl PitchAccentImageValidator {
     pub const VALIDATOR_VERSION: &'static str = "5";
     pub const REQUIRED_DEVICE_SCALE_FACTOR: f64 = 3.0;
 
-    /// Устойчивый идентификатор валидатора для manifest и проверок потребителя.
+    /// Устойчивый идентификатор валидатора для манифеста и проверок потребителя.
     pub fn validator_identity() -> ValidatorIdentity {
         Self.identity()
     }
@@ -636,7 +653,7 @@ pub(crate) fn validate_capture_geometry(
                 > f64::from(render.viewport_height) + geometry_tolerance
         {
             return Err(EvidenceFailure::Contradiction(
-                "прямоугольник графика выходит за границы viewport".into(),
+                "прямоугольник графика выходит за границы области просмотра".into(),
             ));
         }
         if (graph.document_rect.x - (graph.viewport_rect.x + render.scroll_x)).abs()
@@ -653,7 +670,8 @@ pub(crate) fn validate_capture_geometry(
                 > f64::from(render.document_height) + geometry_tolerance
         {
             return Err(EvidenceFailure::Contradiction(
-                "прямоугольник графика в документе не соответствует viewport и прокрутке".into(),
+                "прямоугольник графика в документе не соответствует области просмотра и прокрутке"
+                    .into(),
             ));
         }
         left = left.min(graph.document_rect.x);
@@ -817,7 +835,7 @@ pub(crate) enum JpdbVocabularyRouteError {
     Encoding,
 }
 
-/// Разбирает только точный путь словарной записи JPDB, игнорируя query и fragment.
+/// Разбирает только точный путь словарной записи JPDB, игнорируя строку запроса и фрагмент.
 pub(crate) fn parse_jpdb_vocabulary_route(
     value: &str,
 ) -> Result<JpdbVocabularyRoute, JpdbVocabularyRouteError> {
@@ -1412,7 +1430,7 @@ mod tests {
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
             SemanticStatus::Rejected,
-            "ширина графика в координатах документа должна совпадать с viewport"
+            "ширина графика в координатах документа должна совпадать с областью просмотра"
         );
     }
 

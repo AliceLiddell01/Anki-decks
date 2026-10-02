@@ -178,7 +178,7 @@ pub struct ValidationEvidence {
     pub details: Option<serde_json::Value>,
 }
 
-/// Ещё не сохранённый ответ валидатора; его принимает только API жизненного цикла.
+/// Ещё не сохранённый ответ валидатора; его принимает только `API` жизненного цикла.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticDecision {
     pub status: SemanticStatus,
@@ -267,14 +267,14 @@ pub struct AssetRecord {
     pub validation: Option<ValidationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_attestation: Option<HumanAttestation>,
-    /// Потребитель Kanji хранит здесь символ и его кодовые точки Unicode; общий
+    /// Потребитель `kanji` хранит здесь символ и его кодовые точки Unicode; общий
     /// код сохраняет дополнительные сведения о расширении без интерпретации.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_metadata: Option<serde_json::Value>,
 }
 
 impl AssetRecord {
-    /// Решение человека учитывается только для точных identity и хеша.
+    /// Решение человека учитывается только для точной идентичности и хеша.
     pub fn current_human_decision(&self) -> Option<HumanDecision> {
         self.human_attestation
             .as_ref()
@@ -298,6 +298,21 @@ impl AssetRecord {
     /// Есть ли пригодные свидетельства автоматической проверки для текущего хеша.
     pub(crate) fn has_current_validation(&self) -> bool {
         self.current_validation_status().is_some()
+    }
+
+    /// Полное решение человека: точное одобрение текущих байтов, подтверждённое
+    /// актуальным автоматическим свидетельством.
+    pub(crate) fn has_complete_human_approval(&self) -> bool {
+        self.current_human_decision() == Some(HumanDecision::Approve)
+            && self.has_current_validation()
+            && self.effective_status() == Some(SemanticStatus::Verified)
+    }
+
+    /// Актуальное автоматическое решение ожидаемой версии валидатора.
+    pub(crate) fn has_current_automated_decision(&self, validator: &ValidatorIdentity) -> bool {
+        self.validation.as_ref().is_some_and(|decision| {
+            decision.is_valid_for_sha(&self.sha256) && decision.validator == *validator
+        })
     }
 
     /// Семантический статус после решения человека. Вызывающий обязан сначала
@@ -326,7 +341,7 @@ impl AssetRecord {
                 }))
     }
 
-    /// Домен pitch-accent доверяет публикации только при положительном решении
+    /// Домен `pitch-accent` доверяет публикации только при положительном решении
     /// ожидаемой версии автоматического валидатора. Одобрение человека не
     /// заменяет и не переписывает это решение.
     pub(crate) fn is_trusted_for_automated_validation(

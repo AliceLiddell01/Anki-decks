@@ -6,3 +6,6 @@ note_models:
       Слово:
         processors:
           - type: kanji_assets
+      Ударение:
+        processors:
+          - type: pitch_accent

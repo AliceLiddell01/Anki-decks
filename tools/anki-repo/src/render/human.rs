@@ -1,12 +1,12 @@
-//! Human renderer: компактный текст на русском языке.
+//! Человекочитаемый вывод: компактный текст на русском языке.
 //!
-//! Renderer не выполняет доменную работу: он только печатает уже готовый
-//! domain result — включая адресуемость заметок и состав групп, которые команды
-//! уже вычислили. Значения полей в human-режиме приводятся к одной строке и
+//! Модуль вывода не выполняет доменную работу: он только печатает уже готовый
+//! доменный результат — включая адресуемость заметок и состав групп, которые команды
+//! уже вычислили. Значения полей в человекочитаемом режиме приводятся к одной строке и
 //! ограничиваются по длине.
 //!
 //! Сообщение об усечении обязано называть реальную причину и реальный способ
-//! получить остаток. `--json` сериализует ровно тот же vector, поэтому
+//! получить остаток. `--json` сериализует ровно тот же вектор, поэтому
 //! «полный список доступен в --json» запрещено: это обещание, которого команда
 //! не выполняет.
 
@@ -15,6 +15,7 @@ use crate::ops::create::CreateResult;
 use crate::ops::edit::{EditResult, EditStatus};
 use crate::ops::find::FindResult;
 use crate::ops::inspect::InspectResult;
+use crate::ops::migrate_media::MigrationResult;
 use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
 use crate::ops::retire::RetireResult;
@@ -24,7 +25,7 @@ use crate::ops::stats::StatsResult;
 use crate::ops::validate::{Severity, ValidateResult};
 use crate::ops::visual_report::{NoteChangeKind, VisualReportResult};
 
-/// Предел длины значения поля в human-режиме.
+/// Предел длины значения поля в человекочитаемом режиме.
 pub const VALUE_LIMIT: usize = 300;
 
 #[derive(Default)]
@@ -906,7 +907,7 @@ fn describe_related(positions: &[usize], guids: &[String]) -> String {
         .join(", ")
 }
 
-/// Печатает участников группы batch'а в форме `note_index (guid)`.
+/// Печатает участников группы набора в форме `note_index (guid)`.
 fn describe_related_notes(related: &[crate::ops::review::RelatedNote]) -> String {
     if related.is_empty() {
         return "—".to_string();
@@ -944,7 +945,7 @@ fn describe_selection(result: &ReviewResult) -> String {
     parts.join("; ")
 }
 
-/// Human-readable представление `models`.
+/// Человекочитаемое представление `models`.
 pub fn models(result: &ModelsResult) -> String {
     let mut out = Out::default();
 
@@ -1042,7 +1043,7 @@ pub fn models(result: &ModelsResult) -> String {
     out.finish()
 }
 
-/// Human-readable представление `create`.
+/// Человекочитаемое представление `create`.
 pub fn create(result: &CreateResult) -> String {
     let mut out = Out::default();
 
@@ -1173,7 +1174,7 @@ pub fn create(result: &CreateResult) -> String {
     out.finish()
 }
 
-/// Human-readable представление `retire`.
+/// Человекочитаемое представление `retire`.
 pub fn retire(result: &RetireResult) -> String {
     let mut out = Out::default();
 
@@ -1255,7 +1256,7 @@ pub fn retire(result: &RetireResult) -> String {
     out.finish()
 }
 
-/// Human-readable представление `visual-report`.
+/// Человекочитаемое представление `visual-report`.
 pub fn visual_report(result: &VisualReportResult) -> String {
     let mut out = Out::default();
 
@@ -1446,10 +1447,83 @@ fn push_validation(out: &mut Out, validation: &crate::ops::source::ValidationDel
     }
 }
 
-/// Имя вида модели для human-readable вывода.
+/// Имя вида модели для человекочитаемого вывода.
 fn model_kind_name(kind: crate::template::ModelKind) -> &'static str {
     match kind {
         crate::template::ModelKind::Standard => "standard",
         crate::template::ModelKind::Cloze => "cloze",
     }
+}
+
+/// Человекочитаемое представление `migrate-media`.
+pub fn migrate_media(result: &MigrationResult) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Экспорт: {}", result.export_dir.display()));
+    out.line(format!("deck.json: {}", result.deck_json.display()));
+    out.line(mode_line(result.applied, result.dry_run));
+    out.line(format!(
+        "Идентичность: {} / {}",
+        result.identity.namespace, result.identity.key
+    ));
+    out.line(format!(
+        "Имя файла: {} → {} (SHA-256 канонических байтов {}, размещение {})",
+        result.legacy_filename,
+        result.canonical_filename,
+        result.canonical_sha256,
+        result.canonical_action
+    ));
+    out.line(format!("Доказанных ссылок: {}", result.references_total));
+    if result.references_truncated {
+        out.line(format!("  показаны первые {}", result.references.len()));
+    }
+    for reference in &result.references {
+        out.line(format!(
+            "  guid {} — поле {} (ord {}), модель {} ({})",
+            reference.guid.as_deref().unwrap_or("—"),
+            reference.field,
+            reference.field_ord,
+            reference.model_name.as_deref().unwrap_or("—"),
+            reference.model_uuid
+        ));
+    }
+    out.blank();
+    out.line(format!(
+        "media_files: добавлено {}, снято {}",
+        result.media_files_added.len(),
+        result.media_files_removed.len()
+    ));
+    for name in &result.media_files_added {
+        out.line(format!("  + {name}"));
+    }
+    for name in &result.media_files_removed {
+        out.line(format!("  - {name}"));
+    }
+    match &result.legacy_media {
+        Some(digest) => {
+            out.line(format!(
+                "Прежний файл до миграции: media/{} — {} байт, sha256 {}",
+                digest.filename, digest.byte_length, digest.sha256
+            ));
+        }
+        None => {
+            out.line(format!(
+                "Прежний файл до миграции: media/{} физически отсутствовал",
+                result.legacy_filename
+            ));
+        }
+    }
+    if result.legacy_released {
+        out.line("После применения legacy-имя освобождено");
+    } else if result.legacy_media_exists_after {
+        out.line("После завершения команды legacy-файл существует");
+    } else {
+        out.line("После завершения команды legacy-файл отсутствует");
+    }
+    if !result.changed {
+        out.line("Мигрировать нечего: повторный прогон ничего не меняет");
+    }
+
+    push_validation(&mut out, &result.validation);
+    out.finish()
 }

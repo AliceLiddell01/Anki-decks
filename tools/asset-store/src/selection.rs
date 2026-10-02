@@ -1,18 +1,19 @@
-//! Детерминированный выбор целей semantic validation.
+//! Детерминированный выбор целей семантической проверки.
 
-use crate::model::{AssetRecord, HumanDecision, ValidatorIdentity};
+use crate::model::{AssetRecord, ValidatorIdentity};
 
 /// Режим выбора ассетов для проверки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionMode {
-    /// Только assets без актуального decision для hash + validator id/version.
+    /// Только ресурсы без актуального решения для сочетания хеша и
+    /// идентификатора/версии валидатора.
     New,
-    /// Все активные assets из manifest этого store.
+    /// Все активные ресурсы из манифеста этого хранилища.
     Full,
 }
 
 impl SelectionMode {
-    /// Machine-readable имя режима.
+    /// Машиночитаемое имя режима.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::New => "new",
@@ -21,7 +22,11 @@ impl SelectionMode {
     }
 }
 
-/// Возвращает записи в устойчивом порядке namespace/key.
+/// Возвращает записи в устойчивом порядке `namespace`/`key`.
+///
+/// Это семантика домена по умолчанию (`TrustSemantics::HUMAN_ATTESTED`). Домены,
+/// объявившие другую семантику, выбираются через
+/// `AssetDomainPolicy::trust_semantics`.
 pub fn select_assets<'a>(
     assets: &'a [AssetRecord],
     mode: SelectionMode,
@@ -32,15 +37,8 @@ pub fn select_assets<'a>(
         .filter(|asset| match mode {
             SelectionMode::Full => true,
             SelectionMode::New => {
-                let complete_human_approval = asset.current_human_decision()
-                    == Some(HumanDecision::Approve)
-                    && asset.has_current_validation()
-                    && asset.effective_status() == Some(crate::model::SemanticStatus::Verified);
-                let current_automated_decision =
-                    asset.validation.as_ref().is_some_and(|decision| {
-                        decision.is_valid_for_sha(&asset.sha256) && decision.validator == *validator
-                    });
-                !complete_human_approval && !current_automated_decision
+                !asset.has_complete_human_approval()
+                    && !asset.has_current_automated_decision(validator)
             }
         })
         .collect();
@@ -58,7 +56,7 @@ mod tests {
 
     fn asset(key: &str, hash: &str, validation: Option<ValidationRecord>) -> AssetRecord {
         AssetRecord {
-            identity: AssetIdentity::new("generic", key).expect("identity valid"),
+            identity: AssetIdentity::new("generic", key).expect("идентификатор корректен"),
             storage_path: format!("pending/{hash}.blob"),
             consumer_filename: format!("{hash}.bin"),
             sha256: hash.to_owned(),
@@ -90,8 +88,10 @@ mod tests {
 
     #[test]
     fn new_requires_current_hash_and_validator_version_while_full_selects_all() {
-        let v1 = ValidatorIdentity::new("fixture", "1").expect("validator valid");
-        let v2 = ValidatorIdentity::new("fixture", "2").expect("validator valid");
+        let v1 =
+            ValidatorIdentity::new("fixture", "1").expect("идентификатор валидатора корректен");
+        let v2 =
+            ValidatorIdentity::new("fixture", "2").expect("идентификатор валидатора корректен");
         let current_sha = "a".repeat(64);
         let changed_sha = "b".repeat(64);
         let fresh_sha = "c".repeat(64);
@@ -115,8 +115,10 @@ mod tests {
     fn new_does_not_repeat_automated_validation_for_exact_human_approval() {
         use crate::model::{HumanAttestation, HumanDecision};
 
-        let current = ValidatorIdentity::new("fixture", "1").expect("validator valid");
-        let replacement = ValidatorIdentity::new("fixture", "2").expect("validator valid");
+        let current =
+            ValidatorIdentity::new("fixture", "1").expect("идентификатор валидатора корректен");
+        let replacement =
+            ValidatorIdentity::new("fixture", "2").expect("идентификатор валидатора корректен");
         let approved_sha = "a".repeat(64);
         let rejected_sha = "b".repeat(64);
         let mut approved = asset(

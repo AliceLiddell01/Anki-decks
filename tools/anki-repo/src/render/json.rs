@@ -1,6 +1,6 @@
-//! JSON renderer: стабильный machine-readable контракт schema_version 1.
+//! JSON-вывод: стабильный машиночитаемый контракт `schema_version: 1`.
 //!
-//! Human и JSON renderers получают один и тот же domain result. Имена
+//! Человекочитаемый и JSON-вывод получают один и тот же доменный результат. Имена
 //! JSON-ключей и кодов стабильны и не зависят от Rust-имён типов.
 
 use serde::Serialize;
@@ -12,6 +12,7 @@ use crate::ops::create::CreateResult;
 use crate::ops::edit::EditResult;
 use crate::ops::find::FindResult;
 use crate::ops::inspect::{InspectResult, InspectVerbose, ModelSummary};
+use crate::ops::migrate_media::{LegacyMediaDigest, MigratedReference, MigrationResult};
 use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
 use crate::ops::retire::RetireResult;
@@ -22,7 +23,7 @@ use crate::ops::validate::{SeverityCounts, ValidateResult};
 use crate::ops::visual_report::{PreviewFileFact, ReportSide, VisualReportResult};
 use crate::template::ModelKind;
 
-/// Версия machine-readable контракта.
+/// Версия машиночитаемого контракта.
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize)]
@@ -48,8 +49,8 @@ struct ErrorBody<'a> {
 
 /// Поля заметки как JSON-объект в порядке `ord` модели.
 ///
-/// Порядок ключей задаётся самим domain result'ом, а не сортировкой имён.
-/// При дублирующихся именах полей (malformed модель) ключ получает суффикс
+/// Порядок ключей задаётся самим доменным результатом, а не сортировкой имён.
+/// При дублирующихся именах полей (некорректная модель) ключ получает суффикс
 /// `#N`, чтобы JSON оставался однозначным.
 struct OrderedFields<'a>(&'a [NamedField]);
 
@@ -1702,6 +1703,68 @@ impl From<&crate::ops::source::ValidationDelta> for ValidationDeltaDto {
             },
             new_error_codes: delta.new_error_codes.clone(),
             new_warning_codes: delta.new_warning_codes.clone(),
+        }
+    }
+}
+
+/// JSON-представление `migrate-media`.
+pub fn migrate_media_json(result: &MigrationResult) -> String {
+    to_json("migrate-media", MigrateMediaDto::from(result))
+}
+
+#[derive(Serialize)]
+struct MigrateMediaDto<'a> {
+    export_dir: String,
+    deck_json: String,
+    dry_run: bool,
+    applied: bool,
+    changed: bool,
+    identity: &'a asset_store::AssetIdentity,
+    namespace: &'a str,
+    key: &'a str,
+    canonical_filename: &'a str,
+    canonical_sha256: &'a str,
+    canonical_action: &'a str,
+    legacy_filename: &'a str,
+    legacy_declared: bool,
+    legacy_media: Option<&'a LegacyMediaDigest>,
+    legacy_media_exists_after: bool,
+    legacy_declared_after: bool,
+    legacy_released: bool,
+    references_total: usize,
+    references_truncated: bool,
+    references: &'a [MigratedReference],
+    media_files_added: &'a [String],
+    media_files_removed: &'a [String],
+    validation: ValidationDeltaDto,
+}
+
+impl<'a> From<&'a MigrationResult> for MigrateMediaDto<'a> {
+    fn from(result: &'a MigrationResult) -> Self {
+        Self {
+            export_dir: result.export_dir.display().to_string(),
+            deck_json: result.deck_json.display().to_string(),
+            dry_run: result.dry_run,
+            applied: result.applied,
+            changed: result.changed,
+            identity: &result.identity,
+            namespace: &result.identity.namespace,
+            key: &result.identity.key,
+            canonical_filename: &result.canonical_filename,
+            canonical_sha256: &result.canonical_sha256,
+            canonical_action: &result.canonical_action,
+            legacy_filename: &result.legacy_filename,
+            legacy_declared: result.legacy_declared,
+            legacy_media: result.legacy_media.as_ref(),
+            legacy_media_exists_after: result.legacy_media_exists_after,
+            legacy_declared_after: result.legacy_declared_after,
+            legacy_released: result.legacy_released,
+            references_total: result.references_total,
+            references_truncated: result.references_truncated,
+            references: &result.references,
+            media_files_added: &result.media_files_added,
+            media_files_removed: &result.media_files_removed,
+            validation: ValidationDeltaDto::from(&result.validation),
         }
     }
 }

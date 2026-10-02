@@ -161,13 +161,29 @@ cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-
 одного из них: проигравший получает `source_changed` и должен быть повторён по
 актуальному состоянию.
 
-### Через `create`, `retire` и `visual-report`
+### Через `create`, `retire`, `migrate-media` и `visual-report`
 
 Появление новой заметки и вывод старой из обращения проверяются тем же порядком,
 что и правка: сначала схема, потом dry-run, потом запись, потом валидация.
 
 ```bash
 EXPORT=decks/japanese/words/Words__N1
+BEFORE=/tmp/Words__N1-before-migration
+
+# 0. сохрани baseline для фактического отчёта «до / после»; повторный запуск
+#    использует прежний снимок, а не вкладывает экспорт в каталог снимка
+if [[ -e "$BEFORE" ]]; then
+  if [[ ! -f "$BEFORE/deck.json" ]]; then
+    echo "каталог BEFORE уже существует, но не содержит deck.json: $BEFORE" >&2
+    exit 1
+  fi
+else
+  cp -a "$EXPORT" "$BEFORE"
+fi
+if ! cargo run --quiet --bin anki-repo -- validate "$BEFORE"; then
+  echo "снимок BEFORE не прошёл проверку; сохраните его и разберитесь с ошибкой" >&2
+  exit 1
+fi
 
 # 1. фактическая схема полей: имена, порядок ord, примеры значений, шаблоны
 cargo run --quiet --bin anki-repo -- models "$EXPORT"
@@ -189,6 +205,16 @@ cargo run --quiet --bin anki-repo -- find "$EXPORT" --guid '<guid>'
 # 6. валидация и проверка формы
 cargo run --quiet --bin anki-repo -- validate "$EXPORT"
 cargo run --quiet --bin anki-repo -- qa "$EXPORT"
+
+# 7. отдельное исключение: сначала dry-run, затем доказанная миграция
+cargo run --quiet --bin anki-repo -- migrate-media "$EXPORT" \
+  --namespace pitch_accent --key 飴 --from 飴.png
+cargo run --quiet --bin anki-repo -- migrate-media "$EXPORT" \
+  --namespace pitch_accent --key 飴 --from 飴.png --apply
+
+# 8. статический отчёт по фактическим состояниям до и после записи
+cargo run --quiet --bin anki-repo -- visual-report \
+  --before "$BEFORE" --after "$EXPORT" --out /tmp/Words__N1-migration-report
 ```
 
 Что именно проверять по отчётам:
@@ -204,8 +230,21 @@ cargo run --quiet --bin anki-repo -- qa "$EXPORT"
 - `retire`: `notes_retired`, `checks` (все пять), `outcomes[].previous_tags` и
   `outcomes[].tags` — в тегах должен появиться ровно один новый тег, а `fields`
   заметки в diff'е меняться не должны.
-- Повторный запуск любой из трёх мутирующих команд обязан быть идемпотентным:
+- Повторный запуск `edit`, `create` и `retire` обязан быть идемпотентным:
   `already_applied` / `already_retired`, `applied: false`, файл не перезаписан.
+- Для `migrate-media` dry-run сверяй доказанную идентичность с точным legacy
+  filename и проверяй полный список потребителей: связанные поля заметок,
+  `qfmt`, `afmt` и CSS. Любая ссылка, которую обработчик не может заявить,
+  включая статического потребителя в модели, должна блокировать всю операцию.
+- В отчёте `migrate-media` `legacy_media` и `legacy_declared` — снимки до команды;
+  `legacy_media_exists_after` и `legacy_declared_after` — фактическое состояние
+  после её завершения. `legacy_released` отмечает только действительно удалённый
+  на `--apply` legacy-файл. При повторном запуске сверяй `changed: false` и
+  поля фактического состояния после операции, а не считай снимок до неё итогом миграции.
+- Проверяй изменения `media_files` по всему дереву `children`: объявление должно
+  покрывать поддеревья всех перенесённых заметок, а неоднозначные дубли должны
+  блокировать миграцию. Файл `media/<from>` может удаляться только после
+  доказанной миграции и публикации нового `deck.json`.
 
 Статический отчёт о различиях двух состояний собирается командой `visual-report`:
 
@@ -334,9 +373,9 @@ media не требует правки CI или default-тестов и не д
 
 ## Для media
 
-Если задача касается media, отдельно проверять ссылки `[sound:...]`, `<img src="...">` и `media_files`.
+Если задача касается media, отдельно проверять ссылки `[sound:...]`, `<img src="...">`, шаблоны `qfmt`/`afmt`, CSS и объявления `media_files` во всех узлах дерева.
 
-Отсутствие media-файла в Git-репозитории не считать ошибкой автоматически, пока политика хранения media не определена.
+Отсутствие media-файла в Git-репозитории не считать ошибкой автоматически, пока политика хранения media не определена. Для `migrate-media` ручное изменение `deck.json` или `media/` вместо команды запрещено: только команда может сохранить доказательство пары identity—filename и согласовать дерево объявлений.
 
 ## Git-проверка
 

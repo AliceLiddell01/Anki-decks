@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
 use crate::kanji_domain::parse_kanji_character;
-use crate::model::{AssetIdentity, AssetRecord, DetectedFormat};
+use crate::model::{AssetIdentity, AssetRecord, DetectedFormat, ValidatorIdentity};
 
 /// Пространства имён, принадлежащие предметным доменам публикации.
 ///
@@ -20,9 +20,71 @@ pub struct CanonicalAssetLocation {
     pub consumer_filename: String,
 }
 
+/// Семантика доверия и обновления записи, которую предметный домен сообщает
+/// общему хранилищу.
+///
+/// Общий слой не перечисляет известные домены и не распознаёт их по имени: он
+/// применяет ровно ту семантику, которую объявила политика домена. Поэтому новый
+/// домен не требует правок в `store.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustSemantics {
+    /// Может ли явное решение человека заменить актуальное автоматическое
+    /// решение ожидаемого валидатора при определении доверия потребителя.
+    human_attestation_confers_trust: bool,
+    /// Считает ли домен `domain_metadata` и `provenance` частью семантики
+    /// ресурса: их изменение при неизменных байтах требует явного CAS.
+    metadata_change_requires_explicit_cas: bool,
+}
+
+impl TrustSemantics {
+    /// Доверие подтверждается либо актуальным решением ожидаемого валидатора,
+    /// либо явным решением человека по точным текущим байтам.
+    pub const HUMAN_ATTESTED: Self = Self {
+        human_attestation_confers_trust: true,
+        metadata_change_requires_explicit_cas: false,
+    };
+
+    /// Доверие требует актуального автоматического `verified` ожидаемого
+    /// валидатора: решение человека его не заменяет, а изменение метаданных при
+    /// неизменных байтах считается семантическим изменением ресурса.
+    pub const AUTOMATED_VERIFIED_ONLY: Self = Self {
+        human_attestation_confers_trust: false,
+        metadata_change_requires_explicit_cas: true,
+    };
+
+    /// Считается ли запись доверенной для ожидаемого валидатора.
+    pub fn confers_trust(
+        &self,
+        record: &AssetRecord,
+        expected_validator: &ValidatorIdentity,
+    ) -> bool {
+        if self.human_attestation_confers_trust {
+            record.is_trusted_for(expected_validator)
+        } else {
+            record.is_trusted_for_automated_validation(expected_validator)
+        }
+    }
+
+    /// Требует ли запись новой проверки в режиме `SelectionMode::New`.
+    pub fn requires_new_validation(
+        &self,
+        record: &AssetRecord,
+        expected_validator: &ValidatorIdentity,
+    ) -> bool {
+        let already_decided = record.has_current_automated_decision(expected_validator)
+            || (self.human_attestation_confers_trust && record.has_complete_human_approval());
+        !already_decided
+    }
+
+    /// Требует ли повторная запись тех же байтов с другими метаданными явного CAS.
+    pub const fn metadata_change_requires_explicit_cas(&self) -> bool {
+        self.metadata_change_requires_explicit_cas
+    }
+}
+
 /// Правила одного независимого домена ресурсов.
 ///
-/// Реализации отвечают за identity, допустимый формат и детерминированное
+/// Реализации отвечают за идентичность, допустимый формат и детерминированное
 /// каноническое расположение. `legacy_location` используется только для чтения
 /// и миграции старых манифестов; новые записи всегда строятся через
 /// `canonical_location`.
@@ -41,6 +103,13 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
         format: DetectedFormat,
     ) -> Result<CanonicalAssetLocation, AssetError>;
 
+    /// Доказывает, что прежнее имя потребителя принадлежит именно этой
+    /// идентичности. Домен без явно объявленной прежней схемы имён отказывает.
+    /// Эта проверка независима от расположения старого манифеста.
+    fn proves_legacy_consumer_filename(&self, _identity: &AssetIdentity, _filename: &str) -> bool {
+        false
+    }
+
     /// Возвращает расположение, использовавшееся прежней схемой, если домен
     /// существовал в ней.
     fn legacy_location(
@@ -52,7 +121,7 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
         None
     }
 
-    /// Поддерживает ли политика чтение legacy-схем 3/4, исторически созданных
+    /// Поддерживает ли политика чтение прежних схем 3/4, исторически созданных
     /// до фиксации `domain_id`. По умолчанию такие схемы политике не принадлежат.
     fn supports_legacy_schema(&self) -> bool {
         false
@@ -105,11 +174,20 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
         }
         Ok(())
     }
+
+    /// Семантика доверия и обновления записи для этого домена.
+    ///
+    /// Домен сам сообщает общему хранилищу, что подтверждает доверие потребителя
+    /// и когда запись требует новой проверки. По умолчанию действует семантика с
+    /// учётом явного решения человека.
+    fn trust_semantics(&self) -> TrustSemantics {
+        TrustSemantics::HUMAN_ATTESTED
+    }
 }
 
 /// Политика для пространства имён без собственного домена публикации.
 ///
-/// Для совместимости сохраняет прежнее размещение с hash в имени файла.
+/// Для совместимости сохраняет прежнее размещение с хешем в имени файла.
 /// Зарезервированные пространства имён должны обслуживаться своей предметной
 /// политикой.
 #[derive(Debug, Clone, Copy, Default)]
@@ -164,8 +242,8 @@ impl AssetDomainPolicy for GenericDomainPolicy {
     }
 
     fn is_publishable_format(&self, _format: DetectedFormat) -> bool {
-        // Generic objects can use the lifecycle store, but they never enter a
-        // publishable repository corpus.
+        // Общие объекты могут пользоваться жизненным циклом хранилища, но
+        // не входят в публикуемый корпус репозитория.
         false
     }
 
@@ -232,6 +310,16 @@ impl AssetDomainPolicy for KanjiDomainPolicy {
             storage_path: format!("assets/{filename}"),
             consumer_filename: filename,
         })
+    }
+
+    fn proves_legacy_consumer_filename(&self, identity: &AssetIdentity, filename: &str) -> bool {
+        self.validate_identity(identity).is_ok()
+            && [DetectedFormat::Gif, DetectedFormat::Png]
+                .into_iter()
+                .any(|format| {
+                    filename == format!("{}.{}", identity.key, extension_for_format(format))
+                        && validate_safe_consumer_filename(filename, format).is_ok()
+                })
     }
 
     fn supports_legacy_schema(&self) -> bool {

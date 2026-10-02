@@ -1,4 +1,4 @@
-//! Program-owned filesystem store с атомарным versioned manifest.
+//! Файловое хранилище ресурсов, принадлежащих программе, с атомарным манифестом версий.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -24,8 +24,7 @@ use crate::model::{
     MANIFEST_SCHEMA_VERSION, Manifest, Provenance, SemanticDecision, SemanticStatus,
     ValidationRecord, ValidatorIdentity,
 };
-use crate::pitch_accent::PitchAccentDomainPolicy;
-use crate::selection::{SelectionMode, select_assets};
+use crate::selection::SelectionMode;
 use crate::validation::{SemanticValidator, ValidationAttempt, ValidationReport, ValidatorFailure};
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -34,8 +33,9 @@ const LOCK_FILE: &str = ".lock";
 const ASSETS_DIR: &str = "assets";
 const TEMP_DIR: &str = ".tmp";
 const RUNTIME_DIR: &str = ".runtime";
-// Domain-neutral local batch state. Его содержимое принадлежит batch owner;
-// generic store проверяет только отдельный directory boundary.
+// Локальное состояние пакетной обработки без привязки к домену. Его содержимым
+// владеет соответствующий пакет; общий механизм проверяет только отдельную
+// границу каталога.
 const BATCHES_DIR: &str = "batches";
 const REMOVAL_MARKER: &str = "removal.json";
 const REMOVAL_BACKUP: &str = "removal.backup";
@@ -59,7 +59,7 @@ pub struct VerifiedAssetBytes {
     pub bytes: Vec<u8>,
 }
 
-/// Параметры открытия store и защищённых от пересечения каталогов.
+/// Параметры открытия хранилища и защищённых от пересечения каталогов.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
     pub root: PathBuf,
@@ -67,7 +67,7 @@ pub struct StoreOptions {
 }
 
 impl StoreOptions {
-    /// Открывает отдельный store без дополнительных protected roots.
+    /// Открывает отдельное хранилище без дополнительных защищённых корневых каталогов.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -75,21 +75,22 @@ impl StoreOptions {
         }
     }
 
-    /// Запрещает store пересекаться с указанным пользовательским деревом.
+    /// Запрещает хранилищу пересекаться с указанным пользовательским деревом.
     pub fn protect_from(mut self, path: impl Into<PathBuf>) -> Self {
         self.protected_roots.push(path.into());
         self
     }
 }
 
-/// Открытый, проверяемый asset store.
+/// Открытое проверяемое хранилище ресурсов.
 #[derive(Debug)]
 pub struct AssetStore {
     /// Канонический путь для вывода пользователю.
     root: PathBuf,
-    /// Открытый directory handle — все store I/O остаётся привязанным к этому inode.
+    /// Открытый дескриптор каталога: все операции ввода-вывода хранилища остаются
+    /// привязаны к этому `inode`.
     root_handle: File,
-    /// Локальное хранилище записей `Pending` и `Quarantined`; оно целиком исключено из Git.
+    /// Локальное хранилище записей `Pending` и `Quarantined`; оно целиком исключено из `Git`.
     runtime_handle: File,
     store_id: String,
     policy: Arc<dyn AssetDomainPolicy>,
@@ -114,22 +115,23 @@ impl std::fmt::Debug for LockTestHooks {
     }
 }
 
-/// Запрос explicit ingest одного названного локального файла.
+/// Запрос на явный вызов `ingest` для одного указанного локального файла.
 #[derive(Debug, Clone)]
 pub struct IngestRequest {
     pub identity: AssetIdentity,
     pub source_path: PathBuf,
-    /// Exact source CAS перед записью: bytes review не подменяются pending import.
+    /// Проверка исходника по CAS перед записью: байты, проверенные при ревью,
+    /// не подменяются отложенным импортом.
     pub expected_source_sha256: Option<String>,
-    /// Доменное расширение identity, которое generic core сохраняет без
-    /// интерпретации (например character и Unicode code points для kanji).
+    /// Доменное расширение идентичности, которое общий слой сохраняет без
+    /// интерпретации (например, символ и его кодовые точки Unicode для kanji).
     pub domain_metadata: Option<serde_json::Value>,
-    /// Для явной замены требуется hash версии, которую вызывающий ожидает.
+    /// Для явной замены требуется хеш версии, которую ожидает вызывающая сторона.
     pub replace_expected_sha256: Option<String>,
 }
 
-/// Запрос acquire→validate→publish: candidate остаётся во временном staging,
-/// пока semantic validator не вернул `verified`.
+/// Запрос на получение, проверку и публикацию: новый объект остаётся во временной
+/// области подготовки, пока семантический валидатор не вернул `verified`.
 #[derive(Debug, Clone)]
 pub struct VerifiedIngestRequest {
     pub identity: AssetIdentity,
@@ -139,7 +141,7 @@ pub struct VerifiedIngestRequest {
     pub replace_expected_sha256: Option<String>,
 }
 
-/// Явное пользовательское решение, защищённое compare-and-swap текущего hash.
+/// Явное пользовательское решение, защищённое CAS текущего хеша.
 #[derive(Debug, Clone)]
 pub struct HumanAttestationRequest {
     pub identity: AssetIdentity,
@@ -148,7 +150,7 @@ pub struct HumanAttestationRequest {
     pub reason: String,
 }
 
-/// Итог explicit ingest.
+/// Итог явного импорта.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestOutcome {
     pub asset: AssetRecord,
@@ -156,7 +158,7 @@ pub struct IngestOutcome {
     pub changed: bool,
 }
 
-/// Итог атомарной публикации только semantic-verified bytes.
+/// Итог атомарной публикации байтов, прошедших семантическую проверку.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedIngestOutcome {
     pub asset: Option<AssetRecord>,
@@ -284,19 +286,19 @@ impl StoreLock {
 }
 
 impl AssetStore {
-    /// Открывает существующий или создаёт новый store после проверки boundary.
+    /// Открывает существующее или создаёт новое хранилище после проверки границ.
     pub fn open(options: StoreOptions) -> Result<Self, AssetError> {
         Self::open_with_policy(options, GenericDomainPolicy)
     }
 
-    /// Открывает существующее принадлежащее asset-store хранилище без создания нового корня.
+    /// Открывает существующее хранилище, принадлежащее `asset-store`, не создавая новый корень.
     /// При открытии инициализирует отсутствующий `.runtime` и переносит туда
     /// прежние записи `Pending` и `Quarantined`, чтобы восстановить границу жизненного цикла.
     pub fn open_existing(options: StoreOptions) -> Result<Self, AssetError> {
         Self::open_existing_with_policy(options, GenericDomainPolicy)
     }
 
-    /// Открывает store с явной domain/layout policy.
+    /// Открывает хранилище с явной политикой домена и размещения.
     pub fn open_with_policy<P: AssetDomainPolicy + 'static>(
         options: StoreOptions,
         policy: P,
@@ -304,7 +306,7 @@ impl AssetStore {
         Self::open_with_creation(options, Arc::new(policy), true)
     }
 
-    /// Открывает существующий store с явной domain/layout policy.
+    /// Открывает существующее хранилище с явной политикой домена и размещения.
     pub fn open_existing_with_policy<P: AssetDomainPolicy + 'static>(
         options: StoreOptions,
         policy: P,
@@ -312,12 +314,12 @@ impl AssetStore {
         Self::open_with_creation(options, Arc::new(policy), false)
     }
 
-    /// Открывает или создаёт kanji store с закреплённой kanji policy.
+    /// Открывает или создаёт хранилище `kanji` с закреплённой политикой `kanji`.
     pub fn open_kanji(options: StoreOptions) -> Result<Self, AssetError> {
         Self::open_with_policy(options, KanjiDomainPolicy)
     }
 
-    /// Открывает существующий kanji store без его создания.
+    /// Открывает существующее хранилище `kanji`, не создавая его.
     pub fn open_kanji_existing(options: StoreOptions) -> Result<Self, AssetError> {
         Self::open_existing_with_policy(options, KanjiDomainPolicy)
     }
@@ -371,8 +373,9 @@ impl AssetStore {
             }
         }
 
-        // Directory flock сериализует первоначальную проверку и bootstrap,
-        // не оставляя lock-файла в существующем unowned root.
+        // Блокировка каталога через `flock` сериализует первоначальную проверку
+        // и настройку, не оставляя файл блокировки в уже существующем корневом
+        // каталоге, который хранилищу не принадлежит.
         flock(&root_handle, FlockOperation::LockExclusive).map_err(|error| {
             AssetError::io(
                 "не удалось заблокировать store root",
@@ -387,8 +390,8 @@ impl AssetStore {
             ));
         }
         // Для существующего хранилища сначала проверяем совместимость
-        // канонического manifest с запрошенной политикой. До этой проверки
-        // нельзя создавать lock-файл, `.runtime` или восстанавливать
+        // канонического манифеста с запрошенной политикой. До этой проверки
+        // нельзя создавать файл блокировки, `.runtime` или восстанавливать
         // транзакции: открытие чужого хранилища не должно менять его состояние.
         if state == RootState::Owned {
             let manifest = load_manifest(&root_handle)?;
@@ -478,17 +481,17 @@ impl AssetStore {
         Ok(store)
     }
 
-    /// Канонический абсолютный program-owned root.
+    /// Канонический абсолютный корневой каталог, принадлежащий программе.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Постоянный идентификатор store.
+    /// Постоянный идентификатор хранилища.
     pub fn store_id(&self) -> &str {
         &self.store_id
     }
 
-    /// Истина, если этот вызов `open` создал store или завершил его первичную
+    /// Истина, если этот вызов `open` создал хранилище или завершил его первичную
     /// инициализацию.
     pub const fn initialized_on_open(&self) -> bool {
         self.initialized_on_open
@@ -505,7 +508,7 @@ impl AssetStore {
         self.initialized_on_open || self.layout_migrated_on_open
     }
 
-    /// Проверяет manifest и каждый файл, на который он ссылается.
+    /// Проверяет манифест и каждый файл, на который он ссылается.
     pub fn verify_integrity(&self) -> Result<Vec<AssetRecord>, AssetError> {
         let lock = self.lock_shared()?;
         let manifest = load_manifest(&self.root_handle)?;
@@ -524,8 +527,8 @@ impl AssetStore {
         Ok(assets)
     }
 
-    /// Совместимый read-only consumer для kanji store. Для других domains
-    /// вызывайте `read_verified_with_policy` с их явной policy.
+    /// Совместимый клиент только для чтения хранилища `kanji`. Для других доменов
+    /// вызывайте `read_verified_with_policy` с их явной политикой.
     pub fn read_verified(
         root: impl AsRef<Path>,
         identities: &[AssetIdentity],
@@ -535,7 +538,7 @@ impl AssetStore {
     }
 
     /// Вариант только для чтения с явно указанным доменом. Он не изменяет
-    /// manifest и файловую систему; хранилища v3/v4 читаются по правилам
+    /// манифест и файловую систему; хранилища v3/v4 читаются по правилам
     /// расположения старой схемы, заданным политикой домена.
     pub fn read_verified_with_policy(
         root: impl AsRef<Path>,
@@ -652,7 +655,7 @@ impl AssetStore {
         Ok(result)
     }
 
-    /// Проверяет публикуемое в Git представление корпуса кандзи без создания,
+    /// Проверяет публикуемое в `Git` представление корпуса кандзи без создания,
     /// восстановления или изменения файлов. Отсутствующий корпус допустим.
     pub fn verify_publishable_corpus(
         root: impl AsRef<Path>,
@@ -676,8 +679,8 @@ impl AssetStore {
             Err(error) => return Err(error),
         };
         // Все изменяющие хранилище операции сначала берут исключительную
-        // блокировку flock каталога. Эта проверка только для чтения берёт
-        // совместную блокировку того же inode; `.lock` игнорируется Git и может
+        // блокировку каталога через `flock`. Эта проверка только для чтения берёт
+        // совместную блокировку того же `inode`; `.lock` игнорируется `Git` и может
         // отсутствовать в чистой копии репозитория.
         let directory_lock = open_directory_at(&root_handle, ".").map_err(|error| {
             AssetError::io("не удалось открыть каталог публикуемого корпуса", error)
@@ -741,17 +744,22 @@ impl AssetStore {
         Ok(())
     }
 
-    /// Явно импортирует один файл, вычисляя SHA-256 по скопированным bytes.
-    /// Повтор той же identity/hash — no-op; другой hash требует ожидаемый hash.
+    /// Явно импортирует один файл, вычисляя `SHA-256` по скопированным байтам.
+    /// Повтор для той же идентичности и хеша не меняет состояние; другой хеш
+    /// требует указать ожидаемый хеш.
     pub fn ingest(&self, request: IngestRequest) -> Result<IngestOutcome, AssetError> {
         self.policy.validate_identity(&request.identity)?;
         let source = open_source_file(&request.source_path)?;
         self.ingest_from_file(request, source)
     }
 
-    /// Проверяет bytes до публикации и добавляет в manifest только `verified`.
-    /// Ошибка validator'а и любой non-verified статус оставляют canonical state
-    /// неизменным. Повтор текущих hash/version возвращает idempotent success.
+    /// Проверяет байты до публикации и добавляет в манифест только записи со
+    /// статусом `verified`. Ошибка валидатора и любой другой статус оставляют
+    /// каноническое состояние неизменным. Повтор для доверенных байтов с тем же
+    /// SHA-256 и версией валидатора является успешным no-op, если не меняются
+    /// `domain_metadata` и `provenance`. Если policy требует CAS для такого
+    /// обновления, передайте текущий SHA-256 в `replace_expected_sha256`;
+    /// иначе команда вернёт `IdentityConflict`.
     pub fn ingest_verified<V: SemanticValidator>(
         &self,
         request: VerifiedIngestRequest,
@@ -811,12 +819,13 @@ impl AssetStore {
                     "эти bytes явно отклонены человеком; требуется новое решение или другой hash",
                 ));
             }
-            let pitch_same_sha_refresh = current.sha256 == staged.sha256
-                && is_pitch_domain(self.policy.as_ref())
+            let semantics = self.policy.trust_semantics();
+            let same_sha_metadata_refresh = current.sha256 == staged.sha256
+                && semantics.metadata_change_requires_explicit_cas()
                 && (current.domain_metadata != request.domain_metadata
                     || current.provenance != request.provenance);
             if current.sha256 == staged.sha256
-                && !pitch_same_sha_refresh
+                && !same_sha_metadata_refresh
                 && is_trusted_for_policy(current, &validator_id, self.policy.as_ref())
             {
                 let outcome = VerifiedIngestOutcome {
@@ -835,12 +844,12 @@ impl AssetStore {
                 lock.unlock()?;
                 return Ok(outcome);
             }
-            if (current.sha256 != staged.sha256 || pitch_same_sha_refresh)
+            if (current.sha256 != staged.sha256 || same_sha_metadata_refresh)
                 && request.replace_expected_sha256.as_deref() != Some(current.sha256.as_str())
             {
                 return Err(AssetError::with_details(
                     ErrorCode::IdentityConflict,
-                    if pitch_same_sha_refresh && current.sha256 == staged.sha256 {
+                    if same_sha_metadata_refresh && current.sha256 == staged.sha256 {
                         format!(
                             "метаданные или сведения об источнике ресурса {} изменились; требуется точный ожидаемый SHA для обновления",
                             current.identity
@@ -852,7 +861,7 @@ impl AssetStore {
                         "identity": current.identity,
                         "existing_sha256": current.sha256,
                         "candidate_sha256": staged.sha256,
-                        "same_sha_metadata_refresh": pitch_same_sha_refresh,
+                        "same_sha_metadata_refresh": same_sha_metadata_refresh,
                     }),
                 ));
             }
@@ -997,7 +1006,7 @@ impl AssetStore {
         })
     }
 
-    /// Импортирует уже открытый и проверенный CLI source handle.
+    /// Импортирует уже открытый и проверенный дескриптор исходного файла через `CLI`.
     pub(crate) fn ingest_from_file(
         &self,
         request: IngestRequest,
@@ -1175,7 +1184,7 @@ impl AssetStore {
         })
     }
 
-    /// Выбирает `new` или `full` из общего manifest без запуска validator'а.
+    /// Выбирает `new` или `full` из общего манифеста без запуска валидатора.
     pub fn select(
         &self,
         mode: SelectionMode,
@@ -1202,9 +1211,12 @@ impl AssetStore {
         Ok(assets)
     }
 
-    /// Запускает injected semantic validator и атомарно фиксирует все полученные
-    /// decisions. При техническом отказе конкретный asset остаётся без нового
-    /// decision и не становится `verified`.
+    /// Запускает переданный семантический валидатор для выбранных ресурсов.
+    /// Каждое изменённое решение публикуется отдельной атомарной записью:
+    /// сбой поздней записи не откатывает уже сохранённые решения. При
+    /// техническом отказе конкретный ресурс остаётся без нового решения и не
+    /// получает статус `verified`; успешные решения других ресурсов могут
+    /// сохраниться.
     pub fn validate<V: SemanticValidator>(
         &self,
         mode: SelectionMode,
@@ -1213,8 +1225,9 @@ impl AssetStore {
         self.validate_selection(mode, validator, None)
     }
 
-    /// Проверяет одну identity/hash и сохраняет исходное automated evidence.
-    /// Scope не распространяется на соседние unresolved candidates других batch.
+    /// Проверяет одну идентичность и хеш и сохраняет исходные свидетельства
+    /// автоматической проверки для одной записи. Область действия не включает
+    /// неразрешённые варианты из других пакетов.
     pub fn validate_exact<V: SemanticValidator>(
         &self,
         identity: &AssetIdentity,
@@ -1666,7 +1679,7 @@ impl AssetStore {
         let hooks = if exclusive {
             self.lock_test_hooks
                 .lock()
-                .expect("lock test hook mutex is not poisoned")
+                .expect("мьютекс тестового перехватчика блокировки не повреждён")
                 .clone()
         } else {
             None
@@ -1759,8 +1772,9 @@ enum RootState {
 fn initialize_or_load(root: &File, state: RootState, domain_id: &str) -> Result<bool, AssetError> {
     match state {
         RootState::NewlyCreated | RootState::ExistingEmpty => {
-            // Empty root is the only unowned state safe to initialize. Both
-            // the directory bootstrap lock and the store lock are held.
+            // Инициализировать безопасно только пустой корневой каталог,
+            // не принадлежащий хранилищу. Удерживаются обе блокировки:
+            // для начальной настройки каталога и самого хранилища.
             let _assets = ensure_dir_entry(root, ASSETS_DIR)?;
             let _temporary = ensure_dir_entry(root, TEMP_DIR)?;
             let store_id = new_store_id();
@@ -1771,7 +1785,7 @@ fn initialize_or_load(root: &File, state: RootState, domain_id: &str) -> Result<
         }
         RootState::Owned => {
             // Внутренние каталоги можно восстановить только после проверки
-            // канонического manifest для запрошенного домена.
+            // канонического манифеста для запрошенного домена.
             ensure_dir_entry(root, ASSETS_DIR)?;
             ensure_dir_entry(root, TEMP_DIR)?;
             Ok(false)
@@ -1869,10 +1883,11 @@ fn ensure_store_domain(
     Ok(())
 }
 
-/// Переводит legacy flat records под mutating exclusive open. Старые bytes
-/// сначала hard-link-ятся в новый layout и проверяются по SHA, затем одним
-/// atomic manifest replace фиксируются schema/path/name. После commit старые
-/// links удаляются. Marker завершает либо откатывает interrupted переход.
+/// Переносит старые записи из плоской схемы при открытии хранилища с изменениями
+/// под эксклюзивной блокировкой. Старые байты сначала связываются жёсткими
+/// ссылками с новым размещением и проверяются по `SHA-256`; затем одной атомарной
+/// заменой манифеста фиксируются схема, путь и имя. После фиксации старые ссылки
+/// удаляются. Маркер завершает или откатывает прерванный переход.
 fn migrate_layout(
     root: &File,
     manifest: &mut Manifest,
@@ -2191,8 +2206,9 @@ fn inspect_area_top_level(
             ));
         }
         if runtime_extensions && name == BATCHES_DIR {
-            // Открываем relative to pinned runtime fd с DIRECTORY|NOFOLLOW:
-            // pathname metadata недостаточно при конкурентной подмене.
+            // Открываем относительно закреплённого файлового дескриптора каталога `.runtime`
+            // с `DIRECTORY|NOFOLLOW`: метаданных пути недостаточно при его
+            // конкурентной подмене.
             open_directory_at(root, BATCHES_DIR)
                 .map_err(|error| directory_entry_error(BATCHES_DIR, error))?;
         }
@@ -2380,9 +2396,10 @@ fn load_manifest(root: &File) -> Result<Manifest, AssetError> {
     load_owned_manifest(root)
 }
 
-// Recovery работает с уже проверенным canonical либо runtime directory handle.
-// Имена расширений проверяет вызывающий area-specific loader, а owner/schema
-// проверяются повторно при каждом чтении, включая восстановление транзакций.
+// Восстановление работает с уже проверенным дескриптором канонического каталога
+// или каталога `.runtime`. Имена расширений проверяет загрузчик для нужной области,
+// а владельца и схему повторно проверяют при каждом чтении, включая восстановление
+// транзакций.
 fn load_owned_manifest(root: &File) -> Result<Manifest, AssetError> {
     let manifest = read_manifest_file(root)?;
     check_schema(&manifest)?;
@@ -2764,11 +2781,9 @@ fn is_trusted_for_policy(
     expected_validator: &ValidatorIdentity,
     policy: &dyn AssetDomainPolicy,
 ) -> bool {
-    if is_pitch_domain(policy) {
-        asset.is_trusted_for_automated_validation(expected_validator)
-    } else {
-        asset.is_trusted_for(expected_validator)
-    }
+    policy
+        .trust_semantics()
+        .confers_trust(asset, expected_validator)
 }
 
 fn select_assets_for_policy<'a>(
@@ -2777,25 +2792,16 @@ fn select_assets_for_policy<'a>(
     validator: &ValidatorIdentity,
     policy: &dyn AssetDomainPolicy,
 ) -> Vec<&'a AssetRecord> {
-    if !is_pitch_domain(policy) {
-        return select_assets(assets, mode, validator);
-    }
-
+    let semantics = policy.trust_semantics();
     let mut selected: Vec<_> = assets
         .iter()
         .filter(|asset| match mode {
             SelectionMode::Full => true,
-            SelectionMode::New => !asset.validation.as_ref().is_some_and(|decision| {
-                decision.is_valid_for_sha(&asset.sha256) && decision.validator == *validator
-            }),
+            SelectionMode::New => semantics.requires_new_validation(asset, validator),
         })
         .collect();
     selected.sort_by(|left, right| left.identity.cmp(&right.identity));
     selected
-}
-
-fn is_pitch_domain(policy: &dyn AssetDomainPolicy) -> bool {
-    policy.domain_id() == PitchAccentDomainPolicy.domain_id()
 }
 
 fn validate_legacy_verified_manifest(
@@ -3103,8 +3109,9 @@ fn validate_validation_record(
     Ok(())
 }
 
-/// Полный decode всех GIF frames либо PNG; magic bytes недостаточно для
-/// пользовательского approval. Decoder limits ограничивают память одного frame.
+/// Полностью декодирует все кадры GIF или PNG; сигнатуры байтов недостаточно для
+/// одобрения пользователем. Ограничения декодера сдерживают объём памяти для
+/// одного кадра.
 pub(crate) fn validate_image_decode(bytes: &[u8]) -> Result<(), AssetError> {
     use image::{AnimationDecoder, ImageDecoder};
     let failure = |message: String| {
@@ -3181,8 +3188,9 @@ fn validate_asset(
             format!("файл asset {} не совпадает с manifest", record.identity),
         ));
     }
-    // Approval fully decodes candidate bytes in `attest`; later manifest checks
-    // only need to stream the hash. `read_verified` decodes before returning bytes.
+    // `attest(Approve)` декодирует байты при принятии одобрения. При чтении
+    // `read_verified` повторно декодирует данные только для записей с одобрением
+    // человека; остальные проходят потоковую проверку хеша, размера и сигнатуры.
     Ok(())
 }
 
@@ -3397,9 +3405,10 @@ fn validate_relative_path(actual: &str, expected: &str) -> Result<(), AssetError
     Ok(())
 }
 
-/// Открывает parent canonical storage path через последовательные dirfd и
-/// `NOFOLLOW`; промежуточная symlink никогда не передаётся в `openat` вместе
-/// с последующим path компонентом.
+/// Открывает родительский каталог канонического пути хранения через
+/// последовательные файловые дескрипторы каталогов (`dirfd`) и `NOFOLLOW`;
+/// промежуточная символическая ссылка (`symlink`) никогда не передаётся в
+/// `openat` вместе со следующим компонентом пути.
 fn open_storage_parent(
     root: &File,
     storage_path: &str,
@@ -4838,8 +4847,9 @@ fn resolve_store_root(root: &Path) -> Result<PathBuf, AssetError> {
     Ok(normalized)
 }
 
-/// Открывает каждый компонент относительно уже открытого родителя без follow
-/// symlink; отсутствующие компоненты создаёт через тот же directory handle.
+/// Открывает каждый компонент относительно уже открытого родительского каталога,
+/// не переходя по символическим ссылкам; отсутствующие компоненты создаёт через
+/// тот же дескриптор каталога.
 fn open_or_create_store_root(
     path: &Path,
     after_component: impl FnMut(&Path),
@@ -5050,7 +5060,7 @@ mod tests {
             let path = std::env::temp_dir()
                 .join(format!("asset-store-unit-{}-{count}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("temporary test root");
+            fs::create_dir_all(&path).expect("временный корневой каталог теста");
             Self(path)
         }
     }
@@ -5278,9 +5288,10 @@ mod tests {
     fn failed_manifest_publication_cannot_leave_false_verified_state() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open(StoreOptions::new(&root)).expect("empty store opens");
+        let store =
+            AssetStore::open(StoreOptions::new(&root)).expect("пустое хранилище открывается");
         let source = temp.0.join("source.bin");
-        fs::write(&source, b"publication failure fixture").expect("source writes");
+        fs::write(&source, b"publication failure fixture").expect("исходный файл записан");
         store
             .ingest(IngestRequest {
                 identity: AssetIdentity::new("generic", "one").unwrap(),
@@ -5289,26 +5300,27 @@ mod tests {
                 domain_metadata: None,
                 replace_expected_sha256: None,
             })
-            .expect("candidate ingests");
+            .expect("объект импортирован");
 
-        let previous_manifest = fs::read(root.join(MANIFEST_FILE)).expect("manifest exists");
+        let previous_manifest = fs::read(root.join(MANIFEST_FILE)).expect("манифест существует");
         store.fail_next_manifest_write();
         let error = store
             .validate(SelectionMode::Full, &VerifiedValidator)
-            .expect_err("injected publication failure is surfaced");
+            .expect_err("смоделированная ошибка публикации возвращена");
         assert_eq!(error.code, ErrorCode::IoFailure);
         drop(store);
         assert_eq!(
-            fs::read(root.join(MANIFEST_FILE)).expect("canonical manifest remains readable"),
+            fs::read(root.join(MANIFEST_FILE)).expect("канонический манифест доступен для чтения"),
             previous_manifest,
-            "failure before rename keeps the previous canonical bytes"
+            "ошибка до переименования сохраняет прежние канонические байты"
         );
         assert!(root.join(TEMP_DIR).join(TRANSITION_MARKER).exists());
 
-        let reopened = AssetStore::open(StoreOptions::new(&root)).expect("store remains readable");
+        let reopened =
+            AssetStore::open(StoreOptions::new(&root)).expect("хранилище доступно для чтения");
         let records = reopened
             .verify_integrity()
-            .expect("canonical state remains valid");
+            .expect("каноническое состояние остаётся корректным");
         assert!(!root.join(TEMP_DIR).join(TRANSITION_MARKER).exists());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].lifecycle, LifecycleState::Pending);
@@ -5420,7 +5432,8 @@ mod tests {
     fn failed_kanji_cas_manifest_write_restores_previous_stable_bytes() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open_kanji(StoreOptions::new(&root)).expect("empty store opens");
+        let store =
+            AssetStore::open_kanji(StoreOptions::new(&root)).expect("пустое хранилище открывается");
         let validator = VerifiedValidator;
         let first_bytes = b"GIF89a previous fixture".to_vec();
         let first = store
@@ -5437,8 +5450,8 @@ mod tests {
                 },
                 &validator,
             )
-            .expect("first verified bytes publish");
-        let previous = first.asset.expect("first asset exists");
+            .expect("первые проверенные байты опубликованы");
+        let previous = first.asset.expect("первый ресурс существует");
         assert_eq!(previous.storage_path, "assets/gif/元.gif");
 
         store.fail_next_manifest_write();
@@ -5456,25 +5469,25 @@ mod tests {
                 },
                 &validator,
             )
-            .expect_err("injected manifest failure aborts CAS publication");
+            .expect_err("смоделированный отказ записи манифеста прерывает публикацию по CAS");
         assert_eq!(error.code, ErrorCode::IoFailure);
         assert_eq!(
-            fs::read(root.join("assets/gif/元.gif")).expect("old stable path restored"),
+            fs::read(root.join("assets/gif/元.gif")).expect("прежний стабильный путь восстановлен"),
             first_bytes
         );
         assert_eq!(
             fs::read_dir(root.join(TEMP_DIR))
-                .expect("temporary directory exists")
+                .expect("временный каталог существует")
                 .count(),
             0,
-            "rollback removes transaction marker, backup and staged candidate"
+            "откат удаляет маркер транзакции, резервную копию и подготовленный объект"
         );
 
-        let reopened =
-            AssetStore::open_kanji(StoreOptions::new(&root)).expect("store remains readable");
+        let reopened = AssetStore::open_kanji(StoreOptions::new(&root))
+            .expect("хранилище доступно для чтения");
         let records = reopened
             .verify_integrity()
-            .expect("old manifest still matches bytes");
+            .expect("старый манифест по-прежнему соответствует байтам");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].sha256, previous.sha256);
         assert_eq!(records[0].lifecycle, LifecycleState::Verified);
@@ -5484,7 +5497,8 @@ mod tests {
     fn reopening_after_interrupted_kanji_cas_restores_previous_verified_bytes() {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = AssetStore::open_kanji(StoreOptions::new(&root)).expect("empty store opens");
+        let store =
+            AssetStore::open_kanji(StoreOptions::new(&root)).expect("пустое хранилище открывается");
         let previous_bytes = b"GIF89a durable previous fixture".to_vec();
         let first = store
             .ingest_verified(
@@ -5500,12 +5514,13 @@ mod tests {
                 },
                 &VerifiedValidator,
             )
-            .expect("first verified bytes publish");
-        let previous = first.asset.expect("first asset exists");
+            .expect("первые проверенные байты опубликованы");
+        let previous = first.asset.expect("первый ресурс существует");
 
-        let lock = store.lock_exclusive().expect("CAS lock acquired");
+        let lock = store.lock_exclusive().expect("блокировка CAS получена");
         let replacement_bytes = b"GIF89a interrupted replacement";
-        let staged = stage_bytes(&store.root_handle, replacement_bytes).expect("new bytes staged");
+        let staged =
+            stage_bytes(&store.root_handle, replacement_bytes).expect("новые байты подготовлены");
         let mut next = previous.clone();
         next.sha256 = staged.sha256.clone();
         next.byte_length = staged.byte_length;
@@ -5526,51 +5541,53 @@ mod tests {
             &next,
             store.policy.as_ref(),
         )
-        .expect("same-path CAS transaction is durable before publication");
+        .expect("транзакция CAS для того же пути сохранена до публикации");
         let marker_name = publication.marker_name.clone();
         let backup_name = publication
             .transaction
             .backup_name
             .clone()
-            .expect("same-path replacement keeps an old-byte backup");
+            .expect("замена того же пути сохраняет резервную копию прежних байтов");
         apply_publication(&store.root_handle, &staged, &publication)
-            .expect("new bytes atomically replace the stable path");
+            .expect("новые байты атомарно заменяют файл по стабильному пути");
         assert_eq!(
-            fs::read(root.join("assets/gif/元.gif")).expect("replacement is published"),
+            fs::read(root.join("assets/gif/元.gif")).expect("замена опубликована"),
             replacement_bytes
         );
         assert!(root.join(TEMP_DIR).join(&marker_name).exists());
         assert!(root.join(TEMP_DIR).join(&backup_name).exists());
 
         drop(staged);
-        lock.unlock().expect("test releases CAS lock");
+        lock.unlock().expect("тест освобождает блокировку CAS");
         drop(store);
 
         let reopened = AssetStore::open_kanji(StoreOptions::new(&root))
-            .expect("open recovers interrupted in-place CAS before validation");
+            .expect("открытие восстанавливает прерванную замену на месте до проверки");
         let records = reopened
             .verify_integrity()
-            .expect("previous verified manifest and bytes match");
+            .expect("прежний проверенный манифест соответствует байтам");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].sha256, previous.sha256);
         assert_eq!(records[0].lifecycle, LifecycleState::Verified);
         assert_eq!(
-            fs::read(root.join("assets/gif/元.gif")).expect("previous stable bytes restored"),
+            fs::read(root.join("assets/gif/元.gif"))
+                .expect("прежние стабильные байты восстановлены"),
             previous_bytes
         );
         assert_eq!(
             fs::read_dir(root.join(TEMP_DIR))
-                .expect("temporary directory exists")
+                .expect("временный каталог существует")
                 .count(),
             0,
-            "recovery clears the marker, backup and staged artifact"
+            "восстановление удаляет маркер, резервную копию и подготовленный объект"
         );
     }
 
     fn run_serialization_probe(contested_identity: bool) {
         let temp = TempDir::new();
         let root = temp.0.join("store");
-        let store = Arc::new(AssetStore::open(StoreOptions::new(&root)).expect("store opens"));
+        let store =
+            Arc::new(AssetStore::open(StoreOptions::new(&root)).expect("хранилище открывается"));
         let before_count = Arc::new(AtomicUsize::new(0));
         let after_count = Arc::new(AtomicUsize::new(0));
         let (first_locked_tx, first_locked_rx) = mpsc::sync_channel(1);
@@ -5587,11 +5604,12 @@ mod tests {
                     .as_ref()
                     .is_err_and(|error| *error == Errno::WOULDBLOCK);
                 if probe.is_ok() {
-                    flock(lock, FlockOperation::Unlock).expect("successful lock probe is released");
+                    flock(lock, FlockOperation::Unlock)
+                        .expect("блокировка после проверки освобождена");
                 }
                 second_probe_tx
                     .send(blocked)
-                    .expect("main test receives the second writer probe");
+                    .expect("основной тест получил сигнал второй записи");
             }
         });
 
@@ -5600,30 +5618,30 @@ mod tests {
             if after_count_hook.fetch_add(1, Ordering::SeqCst) == 0 {
                 first_locked_tx
                     .send(())
-                    .expect("main test observes first writer holding the lock");
+                    .expect("основной тест проверил, что первая запись удерживает блокировку");
                 release_first_rx
                     .lock()
-                    .expect("release receiver mutex is healthy")
+                    .expect("мьютекс получателя сигнала освобождения исправен")
                     .recv()
-                    .expect("main test releases the first writer");
+                    .expect("основной тест разблокировал первую запись");
             } else {
-                second_locked_tx
-                    .send(())
-                    .expect("main test observes second writer acquire the lock");
+                second_locked_tx.send(()).expect(
+                    "основной тест получил подтверждение захвата блокировки второй записью",
+                );
             }
         });
         *store
             .lock_test_hooks
             .lock()
-            .expect("test hook mutex is healthy") = Some(Arc::new(LockTestHooks {
+            .expect("мьютекс тестового перехватчика исправен") = Some(Arc::new(LockTestHooks {
             before_lock,
             after_lock,
         }));
 
         let first_source = temp.0.join("first.bin");
         let second_source = temp.0.join("second.bin");
-        fs::write(&first_source, b"first writer bytes").expect("first source writes");
-        fs::write(&second_source, b"second writer bytes").expect("second source writes");
+        fs::write(&first_source, b"first writer bytes").expect("первый исходный файл записан");
+        fs::write(&second_source, b"second writer bytes").expect("второй исходный файл записан");
         let first_store = Arc::clone(&store);
         let first = thread::spawn(move || {
             first_store.ingest(IngestRequest {
@@ -5640,7 +5658,7 @@ mod tests {
         });
         first_locked_rx
             .recv()
-            .expect("first writer entered the exclusive lock section");
+            .expect("первая запись вошла в секцию с эксклюзивной блокировкой");
 
         let second_store = Arc::clone(&store);
         let second = thread::spawn(move || {
@@ -5658,24 +5676,26 @@ mod tests {
         });
         let second_was_blocked = second_probe_rx
             .recv()
-            .expect("second writer probes the lock while the first holds it");
-        release_first_tx.send(()).expect("release first writer");
-        let first_result = first.join().expect("first writer thread completes");
-        let second_result = second.join().expect("second writer thread completes");
+            .expect("вторая запись проверяет блокировку, пока первая её удерживает");
+        release_first_tx
+            .send(())
+            .expect("сигнал первой записи отправлен");
+        let first_result = first.join().expect("поток первой записи завершился");
+        let second_result = second.join().expect("поток второй записи завершился");
         second_locked_rx
             .recv()
-            .expect("second writer acquires the lock after release");
+            .expect("вторая запись получила блокировку после её освобождения");
 
         assert!(
             second_was_blocked,
-            "the second writer must observe the first writer's held exclusive lock"
+            "вторая запись должна увидеть, что первая удерживает эксклюзивную блокировку"
         );
         assert!(first_result.is_ok());
         if contested_identity {
             assert_eq!(second_result.unwrap_err().code, ErrorCode::IdentityConflict);
             assert_eq!(store.verify_integrity().unwrap().len(), 1);
         } else {
-            second_result.expect("different-identity writer succeeds");
+            second_result.expect("запись с другой идентичностью завершается успешно");
             assert_eq!(store.verify_integrity().unwrap().len(), 2);
         }
     }
@@ -5699,36 +5719,36 @@ mod tests {
         let parent = temp.0.join("requested-parent");
         let moved_parent = temp.0.join("moved-parent");
         let outside = temp.0.join("outside");
-        fs::create_dir(&parent).expect("requested parent exists");
-        fs::create_dir(&outside).expect("symlink target exists");
+        fs::create_dir(&parent).expect("запрошенный родительский каталог существует");
+        fs::create_dir(&outside).expect("каталог — цель символической ссылки — существует");
         let requested_root = parent.join("store");
         let mut replaced = false;
 
         let error = open_or_create_store_root(&requested_root, |opened_component| {
             if !replaced && opened_component == parent {
-                fs::rename(&parent, &moved_parent).expect("opened parent moves");
-                symlink(&outside, &parent).expect("original pathname becomes a symlink");
+                fs::rename(&parent, &moved_parent)
+                    .expect("открытый родительский каталог перемещён");
+                symlink(&outside, &parent).expect("исходный путь заменён символической ссылкой");
                 replaced = true;
             }
         })
-        .expect_err("the changed parent handle is rejected before creating its child");
-
-        assert!(
-            replaced,
-            "the test replaced the component after it was opened"
+        .expect_err(
+            "изменённый дескриптор родительского каталога отклонён до создания дочернего каталога",
         );
+
+        assert!(replaced, "тест заменил компонент после его открытия");
         assert_eq!(error.code, ErrorCode::BoundaryViolation);
         assert!(
             !requested_root.exists(),
-            "store state is not created via the new symlink"
+            "состояние хранилища не создаётся через новую символическую ссылку"
         );
         assert!(
             fs::read_dir(&outside).unwrap().next().is_none(),
-            "external target remains untouched"
+            "внешний целевой каталог не изменён"
         );
         assert!(
             fs::read_dir(&moved_parent).unwrap().next().is_none(),
-            "pinned original directory remains untouched"
+            "закреплённый исходный каталог не изменён"
         );
     }
 }

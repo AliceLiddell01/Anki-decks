@@ -1,4 +1,5 @@
-//! Правила явного разрешения и локальный план размещения медиафайлов для create.
+//! Правила явного разрешения и локальный план размещения медиафайлов для `create`
+//! и `migrate-media`.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -6,8 +7,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asset_store::kanji_validator::KanjiImageValidator;
+use asset_store::pitch_accent::PitchAccentImageValidator;
 use asset_store::store::VerifiedAssetBytes;
-use asset_store::{AssetIdentity, AssetStore, DetectedFormat};
+use asset_store::{
+    AssetDomainPolicy, AssetIdentity, AssetStore, DetectedFormat, KanjiDomainPolicy,
+    PitchAccentDomainPolicy, ValidatorIdentity,
+};
 use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, openat, unlinkat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,10 +24,19 @@ use crate::{media, write::ExportLock};
 
 pub const CONFIG_PATH: &str = ".anki-repo/create.yaml";
 
+/// Плоский суффикс канонического имени pitch-accent для потребителя.
+///
+/// Совпадение с фактическим именем владельца домена проверяется тестом
+/// `pitch_consumer_suffix_matches_the_domain_policy`, а не выводится из памяти.
+const PITCH_CONSUMER_SUFFIX: &str = ".pitch.png";
+
 #[derive(Debug, Default, Clone)]
 pub struct MediaOptions {
     pub config: Option<PathBuf>,
+    /// Проверенное хранилище изображений кандзи.
     pub asset_store: Option<PathBuf>,
+    /// Проверенное хранилище pitch-accent.
+    pub pitch_asset_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,10 +62,83 @@ struct Processor {
     #[serde(rename = "type")]
     kind: ProcessorType,
 }
-#[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-enum ProcessorType {
+pub(crate) enum ProcessorType {
     KanjiAssets,
+    PitchAccent,
+}
+
+/// Реестр поддерживаемых обработчиков.
+///
+/// Порядок задаёт детерминированный порядок разрешения ресурсов разных доменов
+/// в одном запросе.
+const PROCESSORS: &[ProcessorType] = &[ProcessorType::KanjiAssets, ProcessorType::PitchAccent];
+
+impl ProcessorType {
+    /// Имя обработчика в YAML и в диагностике.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::KanjiAssets => "kanji_assets",
+            Self::PitchAccent => "pitch_accent",
+        }
+    }
+
+    /// Пространство имён идентичностей, которыми владеет этот обработчик.
+    pub(crate) const fn namespace(self) -> &'static str {
+        match self {
+            Self::KanjiAssets => "kanji",
+            Self::PitchAccent => "pitch_accent",
+        }
+    }
+
+    /// Путь хранилища домена по умолчанию относительно корня репозитория экспорта.
+    const fn default_store(self) -> &'static str {
+        match self {
+            Self::KanjiAssets => ".asset-store/kanji",
+            Self::PitchAccent => ".asset-store/pitch-accent",
+        }
+    }
+
+    /// Ожидаемая версия семантического валидатора домена.
+    fn validator(self) -> ValidatorIdentity {
+        match self {
+            Self::KanjiAssets => KanjiImageValidator::validator_identity(),
+            Self::PitchAccent => PitchAccentImageValidator::validator_identity(),
+        }
+    }
+
+    /// Политика домена: каноническое расположение, допустимый формат и уровень доверия.
+    pub(crate) fn domain_policy(self) -> &'static dyn AssetDomainPolicy {
+        match self {
+            Self::KanjiAssets => &KanjiDomainPolicy,
+            Self::PitchAccent => &PitchAccentDomainPolicy,
+        }
+    }
+
+    /// Стабильная причина блокера, когда проверенного ресурса домена нет.
+    pub(crate) const fn missing_reason(self) -> &'static str {
+        match self {
+            Self::KanjiAssets => "kanji_asset_missing",
+            Self::PitchAccent => "pitch_asset_missing",
+        }
+    }
+
+    /// Явный test/local override хранилища домена.
+    fn store_override(self, options: &MediaOptions) -> Option<&PathBuf> {
+        match self {
+            Self::KanjiAssets => options.asset_store.as_ref(),
+            Self::PitchAccent => options.pitch_asset_store.as_ref(),
+        }
+    }
+
+    /// Обратное сопоставление: домен, которому принадлежит пространство имён.
+    pub(crate) fn for_namespace(namespace: &str) -> Option<Self> {
+        PROCESSORS
+            .iter()
+            .copied()
+            .find(|kind| kind.namespace() == namespace)
+    }
 }
 
 /// Обработчик владеет только теми ссылками, которые сам распознал. Включение
@@ -62,30 +149,41 @@ trait MediaProcessor {
 }
 impl MediaProcessor for ProcessorType {
     fn name(&self) -> &'static str {
-        match self {
-            Self::KanjiAssets => "kanji_assets",
-        }
+        (*self).name()
     }
     fn claim(&self, reference: &media::MediaReference) -> Option<AssetIdentity> {
+        if reference.element != "img" || reference.attribute != "src" {
+            return None;
+        }
         match self {
             Self::KanjiAssets => {
-                if reference.element != "img" || reference.attribute != "src" {
-                    return None;
-                }
                 let (stem, ext) = reference.value.rsplit_once('.')?;
                 if !matches!(ext, "gif" | "png")
                     || asset_store::kanji_domain::parse_kanji_character(stem).is_err()
                 {
                     return None;
                 }
-                AssetIdentity::new("kanji", stem).ok()
+                AssetIdentity::new(self.namespace(), stem).ok()
+            }
+            Self::PitchAccent => {
+                // Владельцем ссылки становится только точное каноническое имя
+                // домена: `<surface>.pitch.png`. Произвольный PNG, `<surface>.png`,
+                // URL, data URI и sound остаются незаявленными.
+                let surface = reference.value.strip_suffix(PITCH_CONSUMER_SUFFIX)?;
+                if surface.is_empty() {
+                    return None;
+                }
+                let identity = AssetIdentity::new(self.namespace(), surface).ok()?;
+                self.domain_policy().validate_identity(&identity).ok()?;
+                Some(identity)
             }
         }
     }
 }
 
 /// Цепочка исполняется в порядке YAML. План публикуется только после проверки
-/// единственного владельца каждой ссылки и полного fail-closed media-гейта.
+/// единственного владельца каждой ссылки и полной проверки media, запрещающей
+/// запись при любой неопределённости.
 fn collect_processor_chain(
     processors: &[&dyn MediaProcessor],
     note_index: usize,
@@ -153,8 +251,12 @@ pub fn blocker(code: ErrorCode, reason: &str, details: Value) -> DomainError {
 
 pub struct Routing {
     policy: Option<Policy>,
-    store: Option<PathBuf>,
     config: Option<PathBuf>,
+    /// Разрешённые корни хранилищ по пространству имён доменов.
+    ///
+    /// Владение доменом остаётся явным: один обработчик читает только своё
+    /// хранилище и не получает неявного доступа к чужим.
+    stores: BTreeMap<&'static str, PathBuf>,
 }
 impl Routing {
     pub fn load(export: &Path, options: &MediaOptions) -> Result<Self, DomainError> {
@@ -188,13 +290,20 @@ impl Routing {
             },
             None => None,
         };
+        let mut stores = BTreeMap::new();
+        for kind in PROCESSORS {
+            let root = kind
+                .store_override(options)
+                .cloned()
+                .or_else(|| repository.map(|p| p.join(kind.default_store())));
+            if let Some(root) = root {
+                stores.insert(kind.namespace(), root);
+            }
+        }
         Ok(Self {
             policy,
             config: path,
-            store: options
-                .asset_store
-                .clone()
-                .or_else(|| repository.map(|p| p.join(".asset-store/kanji"))),
+            stores,
         })
     }
     pub fn protect_artifact(&self, artifact: Option<&Path>) -> Result<(), DomainError> {
@@ -206,16 +315,22 @@ impl Routing {
             .config
             .as_ref()
             .is_some_and(|p| crate::paths::paths_alias(path, p))
-            || self
-                .store
-                .as_ref()
-                .is_some_and(|p| absolute.starts_with(crate::paths::canonical_ish(p)))
         {
             return Err(blocker(
                 ErrorCode::InvalidRequest,
                 "emit_resolved_protected_path",
                 json!({}),
             ));
+        }
+        // Артефакт не может попасть ни в одно хранилище, которым пользуется запрос.
+        for (namespace, root) in &self.stores {
+            if absolute.starts_with(crate::paths::canonical_ish(root)) {
+                return Err(blocker(
+                    ErrorCode::InvalidRequest,
+                    "emit_resolved_protected_path",
+                    json!({"domain": namespace}),
+                ));
+            }
         }
         Ok(())
     }
@@ -294,6 +409,29 @@ impl Routing {
         }
         Ok(rule.fields.keys().cloned().collect())
     }
+    /// Владеет ли это поле обработчиком указанного домена.
+    ///
+    /// Это нужно миграции старого имени файла в ссылках: ссылку вправе
+    /// переписать только то поле, которому принадлежит каноническое имя домена.
+    /// Включение обработчика на поле — часть конфигурации, а не догадка по имени
+    /// поля, поэтому ответ берётся из разобранной policy.
+    pub(crate) fn owns_field(&self, uuid: &str, field: &str, kind: ProcessorType) -> bool {
+        self.policy
+            .as_ref()
+            .and_then(|policy| {
+                policy
+                    .note_models
+                    .iter()
+                    .find(|rule| rule.crowdanki_uuid == uuid)
+            })
+            .and_then(|rule| rule.fields.get(field))
+            .is_some_and(|rule| {
+                rule.processors
+                    .iter()
+                    .any(|processor| processor.kind == kind)
+            })
+    }
+
     pub fn collect(
         &self,
         note_index: usize,
@@ -367,79 +505,36 @@ impl Routing {
         if refs.is_empty() {
             return Ok(MediaPlan::default());
         }
-        let identities = identities.into_iter().collect::<Vec<_>>();
-        let root = self.store.as_ref().ok_or_else(|| match pins {
-            Some(pins) => blocker(
-                ErrorCode::ExpectedMismatch,
-                "stale_pinned_asset",
-                json!({"expected": pins, "identities": identities, "store_missing": true}),
-            ),
-            None => blocker(
-                ErrorCode::InvalidRequest,
-                "kanji_asset_missing",
-                json!({"identities": identities}),
-            ),
-        })?;
-        let store_path = crate::paths::canonical_ish(root);
-        let export_path = crate::paths::canonical_ish(export);
-        if store_path.starts_with(&export_path) || export_path.starts_with(&store_path) {
-            return Err(blocker(
-                ErrorCode::InvalidRequest,
-                "asset_store_boundary",
-                json!({}),
-            ));
+        // Каждый домен читается только своим обработчиком: своё хранилище, своя
+        // policy, свой ожидаемый validator. Порядок доменов детерминирован
+        // реестром обработчиков.
+        let mut by_domain = BTreeMap::<ProcessorType, BTreeSet<AssetIdentity>>::new();
+        for identity in identities {
+            let kind = ProcessorType::for_namespace(&identity.namespace).ok_or_else(|| {
+                blocker(
+                    ErrorCode::MediaForbidden,
+                    "media_domain_unknown",
+                    json!({"identity": identity}),
+                )
+            })?;
+            by_domain.entry(kind).or_default().insert(identity);
         }
-        let assets = AssetStore::read_verified_with_policy(
-            root,
-            &identities,
-            &KanjiImageValidator::validator_identity(),
-            &asset_store::KanjiDomainPolicy,
-        )
-        .map_err(|e| {
-            let missing_pinned_identity = e
-                .details
-                .get("identity")
-                .and_then(|identity| serde_json::from_value::<AssetIdentity>(identity.clone()).ok())
-                .is_some_and(|identity| {
-                    pins.is_some_and(|pins| pins.iter().any(|pin| pin.identity == identity))
-                });
-            if pins.is_some()
-                && (e.code == asset_store::ErrorCode::StoreMissing || missing_pinned_identity)
-            {
-                return blocker(
-                    ErrorCode::ExpectedMismatch,
-                    "stale_pinned_asset",
-                    json!({"expected": pins, "missing_identity": e.details.get("identity"), "asset_code": e.code.as_str(), "details": e.details, "message": e.message}),
-                );
-            }
-            let reason = if e.code == asset_store::ErrorCode::StoreMissing
-                || (e.code == asset_store::ErrorCode::MissingAssetFile
-                    && e.details.get("identity").is_some()
-                    && e.details.get("storage_path").is_none())
-            {
-                "kanji_asset_missing"
-            } else {
-                "asset_integrity_invalid"
-            };
-            blocker(
-                ErrorCode::InvalidRequest,
-                reason,
-                json!({"asset_code": e.code.as_str(), "details": e.details, "message": e.message}),
-            )
-        })?;
         let mut plan = MediaPlan::default();
-        for asset in assets {
-            let filename = verified_asset_filename(&asset)?.to_owned();
-            let pin = Pin {
-                identity: asset.record.identity.clone(),
-                filename: filename.clone(),
-                sha256: asset.record.sha256.clone(),
-            };
-            plan.items.push(Item {
-                pin,
-                action: String::new(),
-                asset,
-            });
+        for (kind, domain_identities) in by_domain {
+            let domain_identities = domain_identities.into_iter().collect::<Vec<_>>();
+            for asset in self.read_domain(export, kind, &domain_identities, pins)? {
+                let filename = verified_asset_filename(&asset)?.to_owned();
+                let pin = Pin {
+                    identity: asset.record.identity.clone(),
+                    filename,
+                    sha256: asset.record.sha256.clone(),
+                };
+                plan.items.push(Item {
+                    pin,
+                    action: String::new(),
+                    asset,
+                });
+            }
         }
         let actual_pins = plan.pins();
         if pins.is_some_and(|pins| pins != actual_pins.as_slice()) {
@@ -449,6 +544,9 @@ impl Routing {
                 json!({"expected": pins, "actual": actual_pins}),
             ));
         }
+        // Плоское пространство имён media в CrowdAnki общее для всех доменов:
+        // одно имя не может одновременно означать разные байты.
+        check_filename_ownership(&plan.items)?;
         for item in &plan.items {
             for reference in refs.iter().filter(|r| r.identity == item.pin.identity) {
                 if reference.filename != item.pin.filename {
@@ -469,6 +567,116 @@ impl Routing {
         plan.references = refs;
         Ok(plan)
     }
+
+    /// Читает проверенные байты одного домена через его policy и validator.
+    pub(crate) fn read_domain(
+        &self,
+        export: &Path,
+        kind: ProcessorType,
+        identities: &[AssetIdentity],
+        pins: Option<&[Pin]>,
+    ) -> Result<Vec<VerifiedAssetBytes>, DomainError> {
+        let Some(root) = self.stores.get(kind.namespace()) else {
+            return Err(match pins {
+                Some(pins) => blocker(
+                    ErrorCode::ExpectedMismatch,
+                    "stale_pinned_asset",
+                    json!({"expected": pins, "identities": identities, "store_missing": true, "domain": kind.namespace()}),
+                ),
+                None => blocker(
+                    ErrorCode::InvalidRequest,
+                    kind.missing_reason(),
+                    json!({"identities": identities, "domain": kind.namespace()}),
+                ),
+            });
+        };
+        let store_path = crate::paths::canonical_ish(root);
+        let export_path = crate::paths::canonical_ish(export);
+        if store_path.starts_with(&export_path) || export_path.starts_with(&store_path) {
+            return Err(blocker(
+                ErrorCode::InvalidRequest,
+                "asset_store_boundary",
+                json!({"domain": kind.namespace()}),
+            ));
+        }
+        AssetStore::read_verified_with_policy(
+            root,
+            identities,
+            &kind.validator(),
+            kind.domain_policy(),
+        )
+        .map_err(|error| domain_read_error(kind, error, pins))
+    }
+}
+
+/// Отказывает, если два домена претендуют на одно плоское имя media с разными
+/// байтами. Совпадение имени при одинаковом SHA безвредно: потребитель видит
+/// одни и те же данные.
+fn check_filename_ownership(items: &[Item]) -> Result<(), DomainError> {
+    let mut owners = BTreeMap::<&str, (&AssetIdentity, &str)>::new();
+    for item in items {
+        match owners.entry(item.pin.filename.as_str()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert((&item.pin.identity, item.pin.sha256.as_str()));
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                let (owner_identity, owner_sha256) = *slot.get();
+                if owner_sha256 != item.pin.sha256 {
+                    return Err(blocker(
+                        ErrorCode::ExpectedMismatch,
+                        "media_filename_collision",
+                        json!({
+                            "filename": item.pin.filename,
+                            "identities": [owner_identity, &item.pin.identity],
+                            "sha256": [owner_sha256, &item.pin.sha256],
+                        }),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Блокер отказа чтения проверенного корпуса конкретного домена.
+///
+/// Причина остаётся доменной (`<domain>_asset_missing`), поэтому отсутствие
+/// pitch-ресурса не маскируется под отсутствие kanji-ресурса.
+fn domain_read_error(
+    kind: ProcessorType,
+    error: asset_store::AssetError,
+    pins: Option<&[Pin]>,
+) -> DomainError {
+    let missing_pinned_identity = error
+        .details
+        .get("identity")
+        .and_then(|identity| serde_json::from_value::<AssetIdentity>(identity.clone()).ok())
+        .is_some_and(|identity| {
+            pins.is_some_and(|pins| pins.iter().any(|pin| pin.identity == identity))
+        });
+    if pins.is_some()
+        && (error.code == asset_store::ErrorCode::StoreMissing || missing_pinned_identity)
+    {
+        return blocker(
+            ErrorCode::ExpectedMismatch,
+            "stale_pinned_asset",
+            json!({"expected": pins, "missing_identity": error.details.get("identity"), "asset_code": error.code.as_str(), "details": error.details, "message": error.message, "domain": kind.namespace()}),
+        );
+    }
+    let reason = if error.code == asset_store::ErrorCode::StoreMissing
+        || (error.code == asset_store::ErrorCode::MissingAssetFile
+            && error.details.get("identity").is_some()
+            && error.details.get("storage_path").is_none())
+    {
+        kind.missing_reason()
+    } else {
+        "asset_integrity_invalid"
+    };
+    blocker(
+        ErrorCode::InvalidRequest,
+        reason,
+        json!({"asset_code": error.code.as_str(), "details": error.details, "message": error.message, "domain": kind.namespace()}),
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -512,6 +720,10 @@ impl MediaPlan {
     }
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+    /// Действие размещения единственного файла плана.
+    pub(crate) fn action(&self) -> Option<String> {
+        self.items.first().map(|item| item.action.clone())
     }
     pub fn evidence(&self) -> Value {
         let references_total = self.references.len();
@@ -602,6 +814,120 @@ impl MediaPlan {
         Ok(())
     }
 }
+/// План размещения ровно одного проверенного файла.
+///
+/// Миграция старого имени файла в ссылках использует ту же безопасную проверку
+/// размещения, что и `create`: второй реализации записи файла в `media/` в
+/// toolkit'е нет.
+impl MediaPlan {
+    pub(crate) fn for_asset(asset: VerifiedAssetBytes, export: &Path) -> Result<Self, DomainError> {
+        let filename = verified_asset_filename(&asset)?.to_owned();
+        let action = destination(export, &filename, &asset.bytes)?.to_owned();
+        let pin = Pin {
+            identity: asset.record.identity.clone(),
+            filename,
+            sha256: asset.record.sha256.clone(),
+        };
+        Ok(Self {
+            references: Vec::new(),
+            items: vec![Item { pin, action, asset }],
+            declarations_added: Vec::new(),
+            mutations: 0,
+        })
+    }
+}
+
+/// Длина и SHA-256 физического файла `media/<name>`; `None`, если файла нет.
+///
+/// Читается через тот же `NOFOLLOW`-дескриптор, что и размещение: подмена
+/// legacy-имени симлинком — это отказ, а не «файл, который можно удалить».
+pub(crate) fn media_file_digest(
+    export: &Path,
+    name: &str,
+) -> Result<Option<(usize, String)>, DomainError> {
+    let directory = File::open(export).map_err(io_failure)?;
+    media_file_digest_from_export(&directory, name)
+}
+
+fn media_file_digest_from_export(
+    export: &File,
+    name: &str,
+) -> Result<Option<(usize, String)>, DomainError> {
+    let Some(media) = open_media(export, false)? else {
+        return Ok(None);
+    };
+    let fd = match openat(
+        &media,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(io_failure(e)),
+    };
+    let mut file = File::from(fd);
+    if !file.metadata().map_err(io_failure)?.is_file() {
+        return Err(blocker(
+            ErrorCode::ExpectedMismatch,
+            "destination_media_conflict",
+            json!({"filename": name, "action": "conflict"}),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io_failure)?;
+    Ok(Some((bytes.len(), format!("{:x}", Sha256::digest(&bytes)))))
+}
+
+/// Сверяет физический файл с отпечатком, снятым при построении плана миграции.
+/// Чтение идёт через дескриптор экспорта, удерживаемый `ExportLock`.
+pub(crate) fn verify_media_file_digest(
+    guard: &ExportLock,
+    name: &str,
+    expected: Option<&(usize, String)>,
+) -> Result<(), DomainError> {
+    let actual = media_file_digest_from_export(&guard.directory, name)?;
+    if actual.as_ref() == expected {
+        return Ok(());
+    }
+    let details = |digest: Option<&(usize, String)>| {
+        digest.map(|(byte_length, sha256)| json!({"byte_length": byte_length, "sha256": sha256}))
+    };
+    Err(blocker(
+        ErrorCode::ExpectedMismatch,
+        "legacy_media_changed",
+        json!({
+            "filename": name,
+            "expected": details(expected),
+            "actual": details(actual.as_ref()),
+        }),
+    ))
+}
+
+/// Удаляет файл из `media/` экспорта, если его состояние совпадает со снимком.
+///
+/// Отсутствие файла — не ошибка: миграция обязана сходиться и после обрыва между
+/// публикацией `deck.json` и удалением освободившегося имени. Проверка под
+/// `ExportLock` защищает от конкурентных writers, соблюдающих общий протокол.
+pub(crate) fn remove_media_file(
+    guard: &ExportLock,
+    name: &str,
+    expected: Option<&(usize, String)>,
+) -> Result<bool, DomainError> {
+    verify_media_file_digest(guard, name, expected)?;
+    let Some(media) = open_media(&guard.directory, false)? else {
+        return Ok(false);
+    };
+    match unlinkat(&media, name, AtFlags::empty()) {
+        Ok(()) => {
+            media.sync_all().map_err(io_failure)?;
+            Ok(true)
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(e) => Err(io_failure(e)),
+    }
+}
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 fn verified_asset_filename(asset: &VerifiedAssetBytes) -> Result<&str, DomainError> {
     let filename = asset.record.consumer_filename.as_str();

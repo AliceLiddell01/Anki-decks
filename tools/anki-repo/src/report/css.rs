@@ -1,4 +1,4 @@
-//! CSS как граница доверия: tokenization вместо поиска подстроки.
+//! CSS как граница доверия: лексический разбор вместо поиска подстроки.
 //!
 //! Поиск `url(` по тексту отвечает на вопрос «есть ли здесь запрос» неверно, и
 //! ошибается он только в одну сторону — в сторону пропуска. CSS не различает
@@ -80,7 +80,25 @@ impl Event {
 /// адрес внутри него отдельным событием не становится — правило и так удаляется.
 #[must_use]
 pub fn scan(style: &str) -> Vec<Event> {
+    scan_with_imports(style, false)
+}
+
+/// Декодированные адреса CSS, включая адреса внутри `@import`.
+/// Использует тот же лексический разбор, что и граница доверия отчёта.
+#[must_use]
+pub fn media_addresses(style: &str) -> Vec<String> {
+    scan_with_imports(style, true)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Address(address) => Some(address.target),
+            Event::Import(_) => None,
+        })
+        .collect()
+}
+
+fn scan_with_imports(style: &str, imports_are_addresses: bool) -> Vec<Event> {
     let mut scanner = Scanner {
+        imports_are_addresses,
         style,
         pos: 0,
         events: Vec::new(),
@@ -110,6 +128,8 @@ fn is_local_only_function(name: &str) -> bool {
 }
 
 struct Scanner<'a> {
+    /// Возвращать адрес импорта вместо диапазона всего правила.
+    imports_are_addresses: bool,
     style: &'a str,
     pos: usize,
     events: Vec<Event>,
@@ -180,7 +200,7 @@ impl Scanner<'_> {
         let (name, end) = read_identifier(self.style, self.pos);
         self.pos = end;
         let name = name.to_ascii_lowercase();
-        if name == "import" {
+        if name == "import" && !self.imports_are_addresses {
             let end = self.end_of_at_rule();
             self.events.push(Event::Import(start..end));
             self.pos = end;
@@ -221,13 +241,16 @@ impl Scanner<'_> {
         }
 
         let lower = name.to_ascii_lowercase();
-        if escaped_at && lower == "import" {
+        if escaped_at && lower == "import" && !self.imports_are_addresses {
             let end = self.end_of_at_rule();
             self.events.push(Event::Import(start..end));
             self.pos = end;
             self.pending_at_rule = Some(lower.clone());
             self.note("at-rule");
             return;
+        }
+        if escaped_at && lower == "import" {
+            self.pending_at_rule = Some(lower.clone());
         }
         self.note(&format!("ident:{lower}"));
     }
@@ -301,6 +324,9 @@ impl Scanner<'_> {
 
     /// Строка внутри несущей адрес функции или дескриптора `src` в `@font-face`.
     fn string_is_address(&self) -> bool {
+        if self.imports_are_addresses && self.pending_at_rule.as_deref() == Some("import") {
+            return true;
+        }
         if let Some(innermost) = self.functions.last() {
             if is_local_only_function(innermost) {
                 return false;

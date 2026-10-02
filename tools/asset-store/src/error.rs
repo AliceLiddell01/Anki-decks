@@ -1,4 +1,4 @@
-//! Стабильные machine-readable ошибки asset core.
+//! Стабильные машиночитаемые ошибки общего слоя хранилища ресурсов.
 
 use thiserror::Error;
 
@@ -28,7 +28,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Стабильное snake_case имя кода.
+    /// Стабильное имя кода в формате `snake_case`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidIdentity => "invalid_identity",
@@ -54,8 +54,9 @@ impl ErrorCode {
         }
     }
 
-    /// Process exit code: 0 — только успех/no-op, 3 — блокировка/ввод,
-    /// 4 — integrity/boundary/schema отказ, 5 — I/O или validator failure.
+    /// Код завершения процесса: 0 — успех или отсутствие изменений, 3 —
+    /// блокировка или ошибка ввода, 4 — нарушение целостности, границы или схемы,
+    /// 5 — ошибка ввода-вывода или валидатора.
     pub const fn exit_code(self) -> u8 {
         match self {
             Self::InvalidIdentity
@@ -87,7 +88,7 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 
-/// Ошибка store с устойчивым code и человекочитаемым пояснением.
+/// Ошибка хранилища с устойчивым кодом и человекочитаемым пояснением.
 #[derive(Debug, Error)]
 #[error("{code}: {message}")]
 pub struct AssetError {
@@ -106,7 +107,7 @@ impl AssetError {
         }
     }
 
-    /// Ошибка с дополнительными стабильными machine-readable данными.
+    /// Ошибка с дополнительными стабильными машиночитаемыми данными.
     pub fn with_details(
         code: ErrorCode,
         message: impl Into<String>,
@@ -119,12 +120,12 @@ impl AssetError {
         }
     }
 
-    /// Упаковывает filesystem ошибку с устойчивым кодом.
+    /// Упаковывает ошибку файловой системы с устойчивым кодом.
     pub fn io(context: impl Into<String>, error: std::io::Error) -> Self {
         Self::new(ErrorCode::IoFailure, format!("{}: {error}", context.into()))
     }
 
-    /// Код process exit для CLI.
+    /// Код завершения процесса для CLI.
     pub const fn exit_code(&self) -> u8 {
         self.code.exit_code()
     }
