@@ -2,17 +2,21 @@
 
 use super::*;
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
+use std::time::Instant;
 
 use crate::batch::{
     AggregateResolution, BatchAttemptInput, BatchCandidate, BatchItemStatus, BatchRuntime,
     BatchTrustSource, HumanBatchAction, HumanBatchDecision, KanjiBatch, MAX_ACQUISITION_ROUNDS,
     MAX_HUMAN_REASON_BYTES,
 };
+use crate::batch_runtime::SafeBatchRuntime;
+use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
 use crate::domain::{AssetDomainPolicy, KanjiDomainPolicy};
 use crate::model::{HumanDecision, Provenance, SemanticDecision, ValidationRecord};
 use crate::store::{HumanAttestationRequest, validate_image_decode};
 use crate::validation::ValidatorFailure;
+use crate::yarxi::{AcquisitionEvent, AcquisitionRun, AcquisitionStreamError};
 
 #[derive(Debug, Subcommand)]
 pub enum BatchCommand {
@@ -199,8 +203,203 @@ struct BatchResponse {
     issues: Vec<BatchIssue>,
     blockers: Vec<String>,
     review_artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_log: Option<String>,
     /// Источник истины предметной области остаётся в сохранённом состоянии владельца.
     batch: KanjiBatch,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BatchProgressEvent {
+    schema_version: u32,
+    operation: &'static str,
+    event: &'static str,
+    batch_id: String,
+    elapsed_ms: u128,
+    round: Option<u32>,
+    round_limit: u32,
+    round_completed: usize,
+    round_total: usize,
+    run_completed: usize,
+    batch_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<AssetIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+trait BatchProgressSink {
+    fn emit(&mut self, event: BatchProgressEvent) -> Result<(), AssetError>;
+}
+
+struct StderrProgressSink {
+    output: OutputFormat,
+}
+
+impl BatchProgressSink for StderrProgressSink {
+    fn emit(&mut self, event: BatchProgressEvent) -> Result<(), AssetError> {
+        write_progress_event(&event, self.output, &mut io::stderr().lock())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct NullProgressSink;
+
+#[cfg(test)]
+impl BatchProgressSink for NullProgressSink {
+    fn emit(&mut self, _event: BatchProgressEvent) -> Result<(), AssetError> {
+        Ok(())
+    }
+}
+
+struct BatchProgressReporter<'a> {
+    sink: &'a mut dyn BatchProgressSink,
+    batch_id: String,
+    started: Instant,
+    round: Option<u32>,
+    round_limit: u32,
+    round_completed: usize,
+    round_total: usize,
+    run_completed: usize,
+    batch_total: usize,
+    last_identity: Option<AssetIdentity>,
+}
+
+impl BatchProgressReporter<'_> {
+    fn begin_round(&mut self, round: u32, total: usize) {
+        self.round = Some(round);
+        self.round_completed = 0;
+        self.round_total = total;
+    }
+
+    fn checkpointed(&mut self) {
+        self.round_completed += 1;
+        self.run_completed += 1;
+    }
+
+    fn emit(
+        &mut self,
+        event: &'static str,
+        identity: Option<&AssetIdentity>,
+        session: Option<u32>,
+        attempt: Option<u8>,
+        outcome: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), AssetError> {
+        if identity.is_some() {
+            self.last_identity = identity.cloned();
+        }
+        let reason = reason.map(|reason| safe_message(&reason));
+        tracing::info!(
+            stage = event, batch_id = %self.batch_id,
+            identity = ?identity.map(|identity| identity.key.as_str()), session, attempt,
+            outcome = ?outcome, reason = ?reason,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            round = ?self.round, round_completed = self.round_completed,
+            round_total = self.round_total, run_completed = self.run_completed,
+            batch_total = self.batch_total, "Прогресс обработки пакета"
+        );
+        self.sink.emit(BatchProgressEvent {
+            schema_version: 1,
+            operation: "batch_run",
+            event,
+            batch_id: self.batch_id.clone(),
+            elapsed_ms: self.started.elapsed().as_millis(),
+            round: self.round,
+            round_limit: self.round_limit,
+            round_completed: self.round_completed,
+            round_total: self.round_total,
+            run_completed: self.run_completed,
+            batch_total: self.batch_total,
+            identity: identity.cloned(),
+            session,
+            attempt,
+            outcome,
+            reason,
+        })
+    }
+}
+
+fn write_progress_event(
+    event: &BatchProgressEvent,
+    output: OutputFormat,
+    writer: &mut impl Write,
+) -> Result<(), AssetError> {
+    let line = match output {
+        OutputFormat::Json => serde_json::to_string(event)
+            .map_err(|error| invalid(format!("не удалось сериализовать прогресс: {error}")))?,
+        OutputFormat::Human => {
+            let identity = event
+                .identity
+                .as_ref()
+                .map(|identity| identity.key.as_str())
+                .unwrap_or("-");
+            let outcome = event
+                .outcome
+                .as_deref()
+                .map(progress_outcome_label)
+                .unwrap_or("-");
+            let reason = event.reason.as_deref().unwrap_or("");
+            format!(
+                "Прогресс: {} · раунд {}/{} · запуск {} · всего {} · {:.1} с · символ={} · результат={} {}",
+                progress_event_label(event.event),
+                event.round_completed,
+                event.round_total,
+                event.run_completed,
+                event.batch_total,
+                event.elapsed_ms as f64 / 1000.0,
+                identity,
+                outcome,
+                reason
+            )
+        }
+    };
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|error| AssetError::io("запись прогресса пакета в stderr", error))
+}
+
+fn progress_event_label(event: &str) -> &'static str {
+    match event {
+        "run_started" => "пакет запущен",
+        "round_started" => "раунд начат",
+        "browser_session_started" => "сессия браузера запущена",
+        "browser_session_rotated" => "смена сессии браузера",
+        "browser_session_ended" => "сессия браузера завершена",
+        "item_started" => "получение начато",
+        "retry_started" => "повтор получения",
+        "retry_recovery_started" => "восстановление страницы",
+        "heartbeat" => "операция выполняется",
+        "item_checkpointed" => "результат сохранён",
+        "item_discarded_stale" => "устаревший результат отброшен",
+        "round_finished" => "раунд завершён",
+        "run_stopped" => "пакет остановлен",
+        "run_finished" => "пакет завершён",
+        _ => "событие прогресса",
+    }
+}
+
+fn progress_outcome_label(outcome: &str) -> &str {
+    match outcome {
+        "candidate_recorded" => "кандидат сохранён",
+        "acquisition_failed" => "ошибка получения",
+        "source_identity_mismatch" => "источник не подтвердил символ",
+        "media_format_mismatch" => "формат изображения не совпал",
+        "invalid_validation_evidence" => "недопустимые доказательства проверки",
+        "io_failure" => "ошибка ввода-вывода",
+        "validator_failure" => "ошибка валидатора",
+        "integrity_mismatch" => "нарушение целостности",
+        other => localized_outcome(other),
+    }
 }
 
 pub(super) fn execute(
@@ -210,17 +409,172 @@ pub(super) fn execute(
     output: OutputFormat,
     allow_insecure_tls: bool,
 ) -> CliOutput {
-    match execute_command(store, summary.clone(), command, allow_insecure_tls) {
-        Ok((response, exit_code)) => match output {
-            OutputFormat::Json => CliOutput {
-                stdout: format!(
-                    "{}\n",
-                    serde_json::to_string_pretty(&response)
-                        .expect("ответ пакета содержит конечные сериализуемые значения")
-                ),
-                stderr: String::new(),
-                exit_code,
+    let mut progress = StderrProgressSink { output };
+    execute_with_progress(
+        store,
+        summary,
+        command,
+        output,
+        allow_insecure_tls,
+        &mut progress,
+    )
+}
+
+fn execute_with_progress(
+    store: &AssetStore,
+    summary: StoreSummary,
+    command: &BatchCommand,
+    output: OutputFormat,
+    allow_insecure_tls: bool,
+    progress: &mut dyn BatchProgressSink,
+) -> CliOutput {
+    let mut diagnostic_log = None;
+    let mut diagnostic_guard = None;
+    let mut log_creation_error = None;
+    if let BatchCommand::Run { batch_id, .. } = command {
+        match SafeBatchRuntime::open(store.root(), batch_id)
+            .and_then(|runtime| runtime.create_run_log())
+        {
+            Ok(run_log) => {
+                let log_path = run_log.path.display().to_string();
+                let run_id = run_log.run_id;
+                let mode = match output {
+                    OutputFormat::Human => DiagnosticOutputMode::Human,
+                    OutputFormat::Json => DiagnosticOutputMode::Json,
+                };
+                diagnostic_guard = Some((run_id, RunLogGuard::new(run_log.file, mode)));
+                diagnostic_log = Some(log_path);
+            }
+            Err(error) => log_creation_error = Some(error),
+        }
+    }
+    let initial_revision = if matches!(command, BatchCommand::Run { .. }) {
+        command
+            .id()
+            .and_then(|batch_id| saved_batch(store, batch_id).ok())
+            .map(|batch| batch.revision)
+    } else {
+        None
+    };
+    if let Some(error) = log_creation_error {
+        return render_batch_error(
+            store,
+            summary,
+            output,
+            BatchRunFailure {
+                batch_id: command.id().expect("команда запуска содержит batch_id"),
+                operation: command.operation(),
+                error,
+                initial_revision,
+                diagnostic_log: None,
             },
+        );
+    }
+    let execution = if let Some((run_id, guard)) = diagnostic_guard {
+        let batch_id = command.id().expect("команда запуска содержит batch_id");
+        let path = diagnostic_log
+            .as_deref()
+            .expect("runtime вернул путь диагностического файла");
+        if matches!(output, OutputFormat::Human)
+            && let Err(error) = io::stderr()
+                .lock()
+                .write_all(format!("Диагностический журнал: {path}\n").as_bytes())
+        {
+            let original = AssetError::io("вывод пути диагностического файла", error);
+            let error = match guard.finish() {
+                Ok(()) => original,
+                Err(logging_error) => diagnostic_write_error(Some(original), logging_error),
+            };
+            return render_batch_error(
+                store,
+                summary,
+                output,
+                BatchRunFailure {
+                    batch_id,
+                    operation: command.operation(),
+                    error,
+                    initial_revision,
+                    diagnostic_log,
+                },
+            );
+        }
+        let result = guard.with_default(|| {
+            let span = tracing::info_span!(
+                "kanji_batch_run",
+                operation = command.operation(),
+                batch_id,
+                run_id,
+                diagnostic_log = path,
+            );
+            let _entered = span.enter();
+            tracing::info!(
+                event = "run_started",
+                stage = "run",
+                code = "batch_run_started",
+                batch_id,
+                run_id,
+                "Начата пакетная обработка"
+            );
+            let result = execute_command_with_progress(
+                store,
+                summary.clone(),
+                command,
+                allow_insecure_tls,
+                progress,
+            );
+            match &result {
+                Ok((response, _)) => tracing::info!(
+                    event = "run_finished",
+                    stage = "run",
+                    code = response.outcome,
+                    batch_id,
+                    run_id,
+                    changed = response.changed,
+                    "Пакетная обработка завершена"
+                ),
+                Err(error) => tracing::error!(
+                    event = "run_stopped",
+                    stage = "run",
+                    code = error.code.as_str(),
+                    message = %safe_message(&error.message),
+                    batch_id,
+                    run_id,
+                    "Пакетная обработка остановлена"
+                ),
+            }
+            result
+        });
+        let flush = guard.finish();
+        match (result, flush) {
+            (result, Ok(())) => result,
+            (result, Err(logging_error)) => {
+                Err(diagnostic_write_error(result.err(), logging_error))
+            }
+        }
+    } else {
+        execute_command_with_progress(
+            store,
+            summary.clone(),
+            command,
+            allow_insecure_tls,
+            progress,
+        )
+    };
+    match execution {
+        Ok((response, exit_code)) => match output {
+            OutputFormat::Json => {
+                let mut response = response;
+                response.diagnostic_log = diagnostic_log;
+                CliOutput {
+                    stdout: format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(&response)
+                            .expect("ответ пакета содержит конечные сериализуемые значения")
+                    ),
+                    stderr: String::new(),
+                    exit_code,
+                }
+            }
             OutputFormat::Human => {
                 let mut text = format!(
                     "Операция: {}; результат: {}; пакет: {}\n",
@@ -241,6 +595,9 @@ pub(super) fn execute(
                 if let Some(path) = response.review_artifact {
                     text.push_str(&format!("Страница проверки: {path}\n"));
                 }
+                if let Some(path) = response.diagnostic_log {
+                    text.push_str(&format!("Диагностический журнал: {path}\n"));
+                }
                 for issue in &response.issues {
                     text.push_str(&format!(
                         "{}: {}: {}\n",
@@ -254,6 +611,18 @@ pub(super) fn execute(
                 }
             }
         },
+        Err(error) if matches!(command, BatchCommand::Run { .. }) => render_batch_error(
+            store,
+            summary,
+            output,
+            BatchRunFailure {
+                batch_id: command.id().expect("команда запуска содержит batch_id"),
+                operation: command.operation(),
+                error,
+                initial_revision,
+                diagnostic_log,
+            },
+        ),
         Err(error) => super::render_error(
             command.operation().into(),
             None,
@@ -263,6 +632,119 @@ pub(super) fn execute(
             store.did_mutate_on_open(),
         ),
     }
+}
+
+fn saved_batch(store: &AssetStore, batch_id: &str) -> Result<KanjiBatch, AssetError> {
+    let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
+    load_required(&mut runtime)
+}
+
+struct BatchRunFailure<'a> {
+    batch_id: &'a str,
+    operation: &'a str,
+    error: AssetError,
+    initial_revision: Option<u64>,
+    diagnostic_log: Option<String>,
+}
+
+fn render_batch_error(
+    store: &AssetStore,
+    summary: StoreSummary,
+    output: OutputFormat,
+    failure: BatchRunFailure<'_>,
+) -> CliOutput {
+    let BatchRunFailure {
+        batch_id,
+        operation,
+        error,
+        initial_revision,
+        diagnostic_log,
+    } = failure;
+    let saved = saved_batch(store, batch_id).ok();
+    let changed = store.did_mutate_on_open()
+        || saved.as_ref().map(|batch| batch.revision) != initial_revision;
+    tracing::error!(stage = "run", code = error.code.as_str(), message = %safe_message(&error.message),
+        batch_id, changed, saved_revision = ?saved.as_ref().map(|batch| batch.revision),
+        "Обработка пакета завершилась ошибкой");
+    if matches!(output, OutputFormat::Human) {
+        let mut rendered =
+            super::render_error(operation.into(), None, error, summary, output, changed);
+        if let Some(batch) = saved {
+            let attempts: usize = batch.items.iter().map(|item| item.attempts.len()).sum();
+            rendered.stderr.push_str(&format!(
+                "Пакет: {batch_id}; сохранено попыток: {attempts}; ревизия: {}\n",
+                batch.revision
+            ));
+        }
+        if let Some(path) = diagnostic_log {
+            rendered
+                .stderr
+                .push_str(&format!("Диагностический журнал: {path}\n"));
+        }
+        return rendered;
+    }
+    let exit_code = error.exit_code();
+    let mut response = if let Some(batch) = saved {
+        serde_json::to_value(batch_response(
+            operation,
+            summary,
+            batch,
+            changed,
+            Vec::new(),
+            None,
+            "failed",
+        ))
+        .expect("ответ пакета содержит сериализуемые значения")
+    } else {
+        serde_json::json!({
+            "schema_version": 1, "operation": operation, "store": summary,
+            "batch_id": batch_id, "outcome": "failed", "changed": changed,
+        })
+    };
+    response["error"] = serde_json::json!({
+        "code": error.code.as_str(),
+        "category": if error.code.exit_code() == 3 || error.code.exit_code() == 4 { "domain_blocker" } else { "io_failure" },
+        "message": error.message, "details": error.details,
+    });
+    if let Some(path) = diagnostic_log {
+        response["diagnostic_log"] = serde_json::Value::String(path);
+    }
+    CliOutput {
+        stdout: format!(
+            "{}\n",
+            serde_json::to_string_pretty(&response).expect("ответ ошибки сериализуем")
+        ),
+        stderr: String::new(),
+        exit_code,
+    }
+}
+
+fn diagnostic_write_error(original: Option<AssetError>, logging_error: String) -> AssetError {
+    let (message, cause) = match original {
+        Some(error) => (
+            format!(
+                "{}; дополнительно не удалось записать диагностический журнал: {logging_error}",
+                error.message
+            ),
+            serde_json::json!({
+                "code": error.code.as_str(),
+                "message": safe_message(&error.message),
+                "details": error.details,
+            }),
+        ),
+        None => (
+            format!("не удалось записать диагностический журнал: {logging_error}"),
+            serde_json::Value::Null,
+        ),
+    };
+    AssetError::with_details(
+        ErrorCode::IoFailure,
+        message,
+        serde_json::json!({
+            "diagnostic_log_error": logging_error,
+            "original_error": cause,
+        }),
+    )
 }
 
 fn localized_operation(operation: &str) -> &str {
@@ -354,27 +836,60 @@ fn copy_error(error: &AssetError) -> AssetError {
     AssetError::with_details(error.code, error.message.clone(), error.details.clone())
 }
 
+#[cfg(test)]
 fn execute_command(
     store: &AssetStore,
     summary: StoreSummary,
     command: &BatchCommand,
     allow_insecure_tls: bool,
 ) -> Result<(BatchResponse, u8), AssetError> {
-    execute_command_with_snapshots(
+    let mut progress = NullProgressSink;
+    execute_command_with_progress(store, summary, command, allow_insecure_tls, &mut progress)
+}
+
+fn execute_command_with_progress(
+    store: &AssetStore,
+    summary: StoreSummary,
+    command: &BatchCommand,
+    allow_insecure_tls: bool,
+    progress: &mut dyn BatchProgressSink,
+) -> Result<(BatchResponse, u8), AssetError> {
+    execute_command_with_snapshots_and_progress(
         store,
         summary,
         command,
         allow_insecure_tls,
         &mut StoreSnapshotReader,
+        progress,
     )
 }
 
+#[cfg(test)]
 fn execute_command_with_snapshots(
     store: &AssetStore,
     summary: StoreSummary,
     command: &BatchCommand,
     allow_insecure_tls: bool,
     reader: &mut impl OwnerSnapshotReader,
+) -> Result<(BatchResponse, u8), AssetError> {
+    let mut progress = NullProgressSink;
+    execute_command_with_snapshots_and_progress(
+        store,
+        summary,
+        command,
+        allow_insecure_tls,
+        reader,
+        &mut progress,
+    )
+}
+
+fn execute_command_with_snapshots_and_progress(
+    store: &AssetStore,
+    summary: StoreSummary,
+    command: &BatchCommand,
+    allow_insecure_tls: bool,
+    reader: &mut impl OwnerSnapshotReader,
+    progress: &mut dyn BatchProgressSink,
 ) -> Result<(BatchResponse, u8), AssetError> {
     prevalidate(command)?;
     let operation = command.operation();
@@ -403,7 +918,7 @@ fn execute_command_with_snapshots(
                     || state.policy.validator != KanjiImageValidator::validator_identity()
                 {
                     return Err(invalid(
-                        "batch_id уже связан с другим набором identity или валидатором",
+                        "batch_id уже связан с другим набором символов или валидатором",
                     ));
                 }
                 let revision = state.revision;
@@ -441,13 +956,50 @@ fn execute_command_with_snapshots(
             ))
         }
         BatchCommand::Run { batch_id, rounds } => {
-            let (state, changed, issues) = run_batch_with_snapshots(
+            let mut acquisition_run = None;
+            let result = run_batch_with_stream_and_progress(
                 store,
                 batch_id,
                 *rounds,
-                |characters| acquire_many(characters, allow_insecure_tls),
+                |characters, on_event| {
+                    if acquisition_run.is_none() {
+                        acquisition_run = Some(AcquisitionRun::new()?);
+                    }
+                    acquisition_run
+                        .as_mut()
+                        .expect("среда получения создана")
+                        .acquire(characters, allow_insecure_tls, on_event)
+                        .map(|_| ())
+                },
                 reader,
-            )?;
+                progress,
+            );
+            // Сессии закрыты acquire; owner всего временного run дерева закрывается
+            // при успехе, ошибке consumer/provider и обработанном Ctrl+C.
+            let cleanup = acquisition_run.take().map_or(Ok(()), AcquisitionRun::close);
+            if let Err(error) = cleanup {
+                let message = match error {
+                    AcquisitionStreamError::Provider(message) => message,
+                    AcquisitionStreamError::Consumer(error) => error.to_string(),
+                    AcquisitionStreamError::Interrupted => {
+                        "acquisition_interrupted: получен Ctrl+C".into()
+                    }
+                };
+                tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %safe_message(&message), "Не удалось закрыть временное дерево получения кандзи");
+                return Err(AssetError::with_details(
+                    ErrorCode::IoFailure,
+                    format!("temp_workspace_cleanup_failed: {message}"),
+                    serde_json::json!({
+                        "cleanup_failure": message,
+                        "original_error": result.err().map(|original| serde_json::json!({
+                            "code": original.code.as_str(),
+                            "message": original.message,
+                            "details": original.details,
+                        })),
+                    }),
+                ));
+            }
+            let (state, changed, issues) = result?;
             let resolved = state.is_resolved();
             let outcome = if resolved {
                 "resolved"
@@ -587,6 +1139,7 @@ where
     run_batch_with_snapshots(store, batch_id, rounds, acquire, &mut StoreSnapshotReader)
 }
 
+#[cfg(test)]
 fn run_batch_with_snapshots<F>(
     store: &AssetStore,
     batch_id: &str,
@@ -597,18 +1150,64 @@ fn run_batch_with_snapshots<F>(
 where
     F: FnMut(&[String]) -> Result<Vec<Result<AcquiredMedia, String>>, String>,
 {
+    let mut progress = NullProgressSink;
+    run_batch_with_stream_and_progress(
+        store,
+        batch_id,
+        rounds,
+        |characters, on_event| {
+            let outcomes = acquire(characters).map_err(AcquisitionStreamError::Provider)?;
+            for (index, outcome) in outcomes.into_iter().enumerate() {
+                on_event(AcquisitionEvent::ItemStarted { index })
+                    .map_err(AcquisitionStreamError::Consumer)?;
+                on_event(AcquisitionEvent::ItemCompleted {
+                    index,
+                    outcome: Box::new(outcome),
+                })
+                .map_err(AcquisitionStreamError::Consumer)?;
+            }
+            Ok(())
+        },
+        reader,
+        &mut progress,
+    )
+}
+
+fn run_batch_with_stream_and_progress<F>(
+    store: &AssetStore,
+    batch_id: &str,
+    rounds: u32,
+    mut acquire: F,
+    reader: &mut impl OwnerSnapshotReader,
+    progress_sink: &mut dyn BatchProgressSink,
+) -> Result<(KanjiBatch, bool, Vec<BatchIssue>), AssetError>
+where
+    F: FnMut(
+        &[String],
+        &mut dyn FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    ) -> Result<(), AcquisitionStreamError>,
+{
+    let _run_span = tracing::info_span!(
+        "kanji_batch_run",
+        domain = "kanji",
+        source = "yarxi",
+        operation = "batch_run",
+        batch_id,
+        rounds
+    )
+    .entered();
     if !(1..=MAX_ACQUISITION_ROUNDS).contains(&rounds) {
         return Err(invalid(format!(
             "число раундов должно быть от 1 до {MAX_ACQUISITION_ROUNDS}"
         )));
     }
     let mut issues = Vec::new();
-    let initial_revision;
-    {
+    let (initial_revision, batch_total) = {
         let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
         let mut state = load_required(&mut runtime)?;
         check_current_validator(&state)?;
-        initial_revision = state.revision;
+        let initial_revision = state.revision;
+        let batch_total = state.items.len();
         let mut snapshot = reader.capture(store);
         reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
         runtime.save(&state)?;
@@ -618,97 +1217,211 @@ where
         publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
         reuse_existing(&snapshot, &mut state)?;
         runtime.save(&state)?;
-    }
-    for _ in 0..rounds {
-        let (frontier, generations) = {
-            let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
-            let state = load_required(&mut runtime)?;
-            let frontier = state.next_round();
-            let generations: Vec<_> = frontier
-                .iter()
-                .map(|identity| {
-                    let item = state
-                        .items
-                        .iter()
-                        .find(|item| &item.identity == identity)
-                        .expect("элемент границы обхода присутствует в состоянии");
-                    (item.generation, item.attempts.len())
-                })
-                .collect();
-            (frontier, generations)
-        };
+        (initial_revision, batch_total)
+    };
+    let run_started = Instant::now();
+    let mut progress = BatchProgressReporter {
+        sink: progress_sink,
+        batch_id: batch_id.to_owned(),
+        started: run_started,
+        round: None,
+        round_limit: rounds,
+        round_completed: 0,
+        round_total: 0,
+        run_completed: 0,
+        batch_total,
+        last_identity: None,
+    };
+    progress.emit("run_started", None, None, None, None, None)?;
+
+    for round in 1..=rounds {
+        let _round_span = tracing::info_span!("kanji_batch_round", round).entered();
+        let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
+        let mut state = load_required(&mut runtime)?;
+        let frontier = state.next_round();
         if frontier.is_empty() {
             break;
         }
-        let characters: Vec<_> = frontier
+        let generations: Vec<_> = frontier
             .iter()
-            .map(|identity| identity.key.clone())
-            .collect();
-        // Блокировка runtime снимается на время получения по сети или в браузере.
-        let acquired = acquire(&characters);
-        let mut snapshot = reader.capture(store);
-        {
-            let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
-            let mut state = load_required(&mut runtime)?;
-            reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
-            runtime.save(&state)?;
-            snapshot.checked()?;
-            reuse_existing(&snapshot, &mut state)?;
-            runtime.save(&state)?;
-        }
-        // Один runtime на всю границу обхода: исключительная блокировка
-        // удерживается от первого до последнего элемента, состояние читается
-        // один раз вместо повторного чтения и проверки кандидатов для каждого.
-        {
-            let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
-            let mut state = load_required(&mut runtime)?;
-            for (index, identity) in frontier.iter().enumerate() {
+            .map(|identity| {
                 let item = state
                     .items
                     .iter()
                     .find(|item| &item.identity == identity)
-                    .expect("запрошенная identity присутствует в границе обхода");
-                if (item.generation, item.attempts.len()) != generations[index]
-                    || !state.next_round().contains(identity)
-                {
-                    continue;
+                    .expect("элемент границы обхода присутствует в состоянии");
+                (item.generation, item.attempts.len())
+            })
+            .collect();
+        let characters: Vec<_> = frontier
+            .iter()
+            .map(|identity| identity.key.clone())
+            .collect();
+        progress.begin_round(round, frontier.len());
+        progress.emit("round_started", None, None, None, None, None)?;
+        // Кандидаты уже проверены загрузкой. Объект сохраняет кэш проверок,
+        // но исключительная блокировка не удерживается во время ожидания сети и браузера.
+        runtime.release_lock()?;
+        tracing::debug!(
+            stage = "lock_released",
+            "Блокировка пакета отпущена перед получением"
+        );
+        let acquisition = {
+            let mut on_acquisition_event = |event| match event {
+                AcquisitionEvent::SessionStarted { session } => progress.emit(
+                    "browser_session_started",
+                    None,
+                    Some(session),
+                    None,
+                    None,
+                    None,
+                ),
+                AcquisitionEvent::SessionEnded {
+                    session,
+                    processed,
+                    stop_reason,
+                } => progress.emit(
+                    "browser_session_ended",
+                    None,
+                    Some(session),
+                    None,
+                    Some(format!("{processed} обработано")),
+                    stop_reason.map(|reason| reason.summary()),
+                ),
+                AcquisitionEvent::SessionRotated {
+                    next_session,
+                    reason,
+                } => progress.emit(
+                    "browser_session_rotated",
+                    None,
+                    Some(next_session),
+                    None,
+                    None,
+                    Some(reason.summary()),
+                ),
+                AcquisitionEvent::ItemStarted { index } => {
+                    let identity = frontier.get(index).ok_or_else(|| {
+                        invalid("поставщик сообщил индекс символа вне очереди раунда")
+                    })?;
+                    progress.emit("item_started", Some(identity), None, None, None, None)
                 }
-                let input = match acquired.as_ref() {
-                    Ok(results) => match results.get(index) {
-                        Some(Ok(media)) => validated_candidate(&runtime, identity, media),
-                        Some(Err(message)) => Ok(failure("acquisition_failed", message)),
-                        None => Ok(failure(
-                            "provider_outcome_mismatch",
-                            "число результатов поставщика не совпадает с числом запрошенных элементов",
-                        )),
-                    },
-                    Err(message) => Ok(failure("acquisition_failed", message)),
-                };
-                match input {
-                    Ok(input) => state.record_attempt(identity, input)?,
-                    Err(error) if error.code.exit_code() != 4 => {
-                        issues.push(issue(identity, &error));
-                        state.record_attempt(
-                            identity,
-                            failure(error.code.as_str(), &error.message),
-                        )?;
+                AcquisitionEvent::RetryStarted { index, attempt } => {
+                    let identity = frontier
+                        .get(index)
+                        .ok_or_else(|| invalid("поставщик сообщил повтор вне очереди раунда"))?;
+                    progress.emit(
+                        "retry_started",
+                        Some(identity),
+                        None,
+                        Some(attempt),
+                        None,
+                        None,
+                    )
+                }
+                AcquisitionEvent::RetryRecoveryStarted { index, attempt } => {
+                    let identity = frontier.get(index).ok_or_else(|| {
+                        invalid("поставщик сообщил восстановление вне очереди раунда")
+                    })?;
+                    progress.emit(
+                        "retry_recovery_started",
+                        Some(identity),
+                        None,
+                        Some(attempt),
+                        None,
+                        None,
+                    )
+                }
+                AcquisitionEvent::Heartbeat { index, attempt } => {
+                    let identity = frontier
+                        .get(index)
+                        .ok_or_else(|| invalid("поставщик сообщил ожидание вне очереди раунда"))?;
+                    progress.emit("heartbeat", Some(identity), None, Some(attempt), None, None)
+                }
+                AcquisitionEvent::ItemCompleted { index, outcome } => {
+                    let identity = frontier
+                        .get(index)
+                        .ok_or_else(|| invalid("поставщик сообщил результат вне очереди раунда"))?;
+                    let (latest, saved, outcome_code) = checkpoint_acquisition_outcome(
+                        &mut runtime,
+                        identity,
+                        generations[index],
+                        *outcome,
+                        &mut issues,
+                    )?;
+                    state = latest;
+                    if saved {
+                        progress.checkpointed();
+                        progress.emit(
+                            "item_checkpointed",
+                            Some(identity),
+                            None,
+                            None,
+                            outcome_code,
+                            None,
+                        )
+                    } else {
+                        progress.emit(
+                            "item_discarded_stale",
+                            Some(identity),
+                            None,
+                            None,
+                            None,
+                            Some("состояние символа изменилось во время получения".into()),
+                        )
                     }
-                    Err(error) => return Err(error),
                 }
-                // Сохраняем каждый точный результат; полный снимок владельца
-                // внутри этого цикла не перечитывается.
-                runtime.save(&state)?;
-            }
+            };
+            acquire(&characters, &mut on_acquisition_event)
+        };
+        if let Err(error) = acquisition {
+            let reason = match &error {
+                AcquisitionStreamError::Provider(message) => message.clone(),
+                AcquisitionStreamError::Consumer(error) => error.to_string(),
+                AcquisitionStreamError::Interrupted => "получен Ctrl+C".into(),
+            };
+            let last_identity = progress.last_identity.clone();
+            let _ = progress.emit(
+                "run_stopped",
+                last_identity.as_ref(),
+                None,
+                None,
+                None,
+                Some(reason.clone()),
+            );
+            tracing::warn!(stage = "run_stopped", reason = %safe_message(&reason),
+                checkpointed_items = progress.run_completed, remaining_without_checkpoint = frontier.len().saturating_sub(progress.round_completed),
+                "Получение остановлено; незапущенный хвост сохранён без попыток");
+            return Err(match error {
+                AcquisitionStreamError::Provider(message) => {
+                    AssetError::new(crate::error::ErrorCode::IoFailure, message)
+                }
+                AcquisitionStreamError::Consumer(error) => error,
+                AcquisitionStreamError::Interrupted => AssetError::new(
+                    crate::error::ErrorCode::InvalidTransition,
+                    "batch_interrupted: получен Ctrl+C; сохранённый прогресс доступен для возобновления",
+                ),
+            });
         }
-        {
-            let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
-            let mut state = load_required(&mut runtime)?;
-            // Владелец мог уже явно отклонить только что полученный SHA-256.
-            reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
-            runtime.save(&state)?;
-            publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
-            runtime.save(&state)?;
-        }
+        let mut snapshot = reader.capture(store);
+        runtime.reacquire_lock()?;
+        tracing::debug!(
+            stage = "lock_reacquired",
+            "Блокировка пакета получена после сети"
+        );
+        state = load_required_cached(&mut runtime)?;
+        tracing::debug!(
+            stage = "state_reloaded",
+            revision = state.revision,
+            "Сохранённое состояние перечитано"
+        );
+        reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
+        runtime.save(&state)?;
+        snapshot.checked()?;
+        reuse_existing(&snapshot, &mut state)?;
+        runtime.save(&state)?;
+        publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
+        runtime.save(&state)?;
+        progress.emit("round_finished", None, None, None, None, None)?;
     }
     let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
     let mut state = load_required(&mut runtime)?;
@@ -716,7 +1429,116 @@ where
     reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
     runtime.save(&state)?;
     let changed = state.revision != initial_revision;
+    progress.emit(
+        "run_finished",
+        None,
+        None,
+        None,
+        Some(if state.is_resolved() {
+            "resolved".into()
+        } else {
+            "partial_progress".into()
+        }),
+        None,
+    )?;
     Ok((state, changed, issues))
+}
+
+fn load_required_cached(runtime: &mut BatchRuntime) -> Result<KanjiBatch, AssetError> {
+    runtime.reload_cached()?.ok_or_else(|| {
+        AssetError::new(
+            crate::error::ErrorCode::MissingAssetFile,
+            "пакет отсутствует; сначала выполните команду batch start",
+        )
+    })
+}
+
+fn checkpoint_acquisition_outcome(
+    runtime: &mut BatchRuntime,
+    identity: &AssetIdentity,
+    expected: (u32, usize),
+    outcome: Result<AcquiredMedia, String>,
+    issues: &mut Vec<BatchIssue>,
+) -> Result<(KanjiBatch, bool, Option<String>), AssetError> {
+    let started = Instant::now();
+    let _checkpoint_span = tracing::info_span!("kanji_checkpoint", identity = %identity.key,
+        expected_generation = expected.0, expected_attempts = expected.1)
+    .entered();
+    tracing::info!(stage = "checkpoint_begin", "Начато сохранение результата");
+    runtime.reacquire_lock()?;
+    tracing::debug!(
+        stage = "lock_reacquired",
+        "Блокировка получена для сохранения результата"
+    );
+    let checkpoint = (|| {
+        let mut state = load_required_cached(runtime)?;
+        tracing::debug!(
+            stage = "state_reloaded",
+            revision = state.revision,
+            "Состояние перечитано перед CAS"
+        );
+        let item = state
+            .items
+            .iter()
+            .find(|item| &item.identity == identity)
+            .ok_or_else(|| invalid("символ отсутствует в текущем состоянии пакета"))?;
+        if (item.generation, item.attempts.len()) != expected
+            || !state.next_round().contains(identity)
+        {
+            tracing::warn!(
+                stage = "cas_stale_discard",
+                code = "stale_result",
+                observed_generation = item.generation,
+                observed_attempts = item.attempts.len(),
+                "Устаревший результат получения отброшен"
+            );
+            return Ok((state, false, None));
+        }
+        let input = match outcome {
+            Ok(media) => validated_candidate(runtime, identity, &media),
+            Err(message) => {
+                tracing::warn!(stage = "acquisition", code = "acquisition_failed", message = %safe_message(&message),
+                    "Поставщик вернул ошибку получения");
+                Ok(failure("acquisition_failed", &message))
+            }
+        };
+        let input = match input {
+            Ok(input) => input,
+            Err(error) if error.code.exit_code() != 4 => {
+                issues.push(issue(identity, &error));
+                failure(error.code.as_str(), &error.message)
+            }
+            Err(error) => return Err(error),
+        };
+        let outcome_code = match &input {
+            BatchAttemptInput::Candidate { .. } => "candidate_recorded".to_owned(),
+            BatchAttemptInput::Failed { code, .. } => code.clone(),
+        };
+        state.record_attempt(identity, input)?;
+        runtime.save(&state)?;
+        tracing::info!(stage = "checkpoint_success", revision = state.revision,
+            outcome = %outcome_code, elapsed_ms = started.elapsed().as_millis() as u64,
+            "Результат надёжно сохранён");
+        Ok((state, true, Some(outcome_code)))
+    })();
+    let release = runtime.release_lock();
+    tracing::debug!(
+        stage = "lock_released",
+        released = release.is_ok(),
+        "Завершено освобождение блокировки после сохранения"
+    );
+    match checkpoint {
+        Ok(value) => {
+            release?;
+            Ok(value)
+        }
+        Err(error) => {
+            tracing::error!(stage = "checkpoint_failure", code = error.code.as_str(), message = %safe_message(&error.message),
+                elapsed_ms = started.elapsed().as_millis() as u64, "Не удалось сохранить результат");
+            let _ = release;
+            Err(error)
+        }
+    }
 }
 
 fn validated_candidate(
@@ -725,8 +1547,8 @@ fn validated_candidate(
     media: &AcquiredMedia,
 ) -> Result<BatchAttemptInput, AssetError> {
     // Свидетельства поставщика хранят Unicode статьи как шестнадцатеричную
-    // кодовую точку, а identity — сам символ. Сравнивается точная кодовая точка
-    // запрошенной identity.
+    // кодовую точку, а идентичность — сам символ. Сравнивается точная кодовая точка
+    // запрошенного символа.
     let expected_code = match parse_kanji_character(&identity.key) {
         Ok(character) => format!("{:X}", u32::from(character)),
         Err(message) => return Ok(failure("source_identity_mismatch", &message)),
@@ -783,14 +1605,14 @@ fn reuse_existing(snapshot: &OwnerSnapshot, state: &mut KanjiBatch) -> Result<()
 }
 
 /// Целостность снимка владелец проверил один раз. Готовность определяется по
-/// индексированной точной identity, SHA-256 и текущему доверию без полного
+/// индексированной точной идентичности, SHA-256 и текущему доверию без полного
 /// перечитывания манифеста для каждого элемента.
 fn reconcile_owner_trust(
     snapshot: &OwnerSnapshot,
     state: &mut KanjiBatch,
     issues: &mut Vec<BatchIssue>,
 ) -> Result<(), AssetError> {
-    // Ошибка полной проверки не показывает, какая identity отсутствует;
+    // Ошибка полной проверки не показывает, какая идентичность отсутствует;
     // не сбрасываем доверие всех элементов по частичному/пустому снимку.
     snapshot.checked()?;
     for item in state.items.clone() {
@@ -923,7 +1745,7 @@ fn publish_automated(
         .items
         .iter()
         .find(|item| &item.identity == identity)
-        .expect("identity пакета присутствует в загруженном состоянии");
+        .expect("идентификатор пакета присутствует в загруженном состоянии");
     let candidate = current_candidate(item)?;
     let bytes = runtime.read_candidate(candidate)?;
     let request = verified_request(snapshot, identity, bytes, candidate)?;
@@ -1030,7 +1852,7 @@ fn decide_exact(
         .find(|item| item.identity == identity)
         .ok_or_else(|| invalid("identity отсутствует в пакете"))?;
     let candidate = if item.status == BatchItemStatus::ExistingVerified {
-        // Для повторно использованного канонического элемента нет runtime-попытки.
+        // Для повторно использованного канонического элемента нет попытки получения.
         // Закрепляем байты владельца и добавляем локальные свидетельства, чтобы
         // явный отказ всё ещё можно было проверить.
         let verified = AssetStore::read_verified_with_policy(
@@ -1463,6 +2285,7 @@ fn batch_response(
         issues,
         blockers,
         review_artifact: artifact,
+        diagnostic_log: None,
         batch,
     }
 }
@@ -1473,7 +2296,7 @@ fn generated_batch_id() -> Result<String, AssetError> {
         .and_then(|mut file| file.read_exact(&mut entropy))
         .map_err(|error| {
             AssetError::io(
-                "не удалось получить случайные данные для identity пакета",
+                "не удалось получить случайные данные для идентификатора пакета",
                 error,
             )
         })?;
@@ -1527,6 +2350,7 @@ mod tests;
 #[cfg(test)]
 mod snapshot_cost_tests {
     use super::*;
+    use crate::temp_workspace::TempWorkspace;
 
     struct CountedSnapshots {
         records: Vec<AssetRecord>,
@@ -1544,8 +2368,8 @@ mod snapshot_cost_tests {
     /// повторное `read_verified` для каждого элемента не сможет незаметно пройти.
     #[test]
     fn thousand_ready_identities_use_bounded_full_owner_snapshots() {
-        let directory = std::env::temp_dir().join(generated_batch_id().unwrap());
-        std::fs::create_dir_all(&directory).unwrap();
+        let workspace = TempWorkspace::create("asset-store-batch-snapshot-cost-test").unwrap();
+        let directory = workspace.path();
         let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
         let summary = StoreSummary {
             path: store.root().display().to_string(),
@@ -1685,7 +2509,6 @@ mod snapshot_cost_tests {
             reader.captures, 3,
             "начальный снимок + один снимок границы обработки + итоговый снимок"
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -1693,16 +2516,17 @@ mod snapshot_cost_tests {
 mod candidate_cost_tests {
     use super::*;
     use crate::batch::CANDIDATE_FILE_READS;
+    use crate::temp_workspace::TempWorkspace;
 
     /// Цикл сохранения проверяет состояние после каждого элемента, поэтому
     /// повторная проверка всех файлов кандидатов давала бы квадратичный обход.
-    /// Фикстура хранит по одному настоящему кандидату на identity и падает, если
+    /// Фикстура хранит по одному настоящему кандидату на символ и падает, если
     /// число чтений снова станет пропорционально квадрату числа элементов.
     #[test]
     fn frontier_round_reads_each_candidate_a_bounded_number_of_times() {
         const ITEMS: u32 = 200;
-        let directory = std::env::temp_dir().join(generated_batch_id().unwrap());
-        std::fs::create_dir_all(&directory).unwrap();
+        let workspace = TempWorkspace::create("asset-store-batch-candidate-cost-test").unwrap();
+        let directory = workspace.path();
         let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
         let summary = StoreSummary {
             path: store.root().display().to_string(),
@@ -1760,13 +2584,12 @@ mod candidate_cost_tests {
         let reads = CANDIDATE_FILE_READS.with(std::cell::Cell::get);
         assert_eq!(state.items.len(), ITEMS as usize);
         assert!(state.items.iter().all(|item| item.attempts.len() == 2));
-        // Линейный обход требует несколько чтений на identity; прежний
+        // Линейный обход требует несколько чтений на символ; прежний
         // квадратичный путь давал ITEMS^2 = 40000.
         assert!(
             reads <= 8 * ITEMS as usize,
             "candidate-файлы перечитаны {reads} раз при {ITEMS} identity"
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn synthetic_png(index: u8) -> Vec<u8> {

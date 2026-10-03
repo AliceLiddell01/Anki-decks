@@ -2,15 +2,14 @@
 //!
 //! Компилируется только в test-режиме и не входит в публичный контракт.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 
 use crate::model::DeckNode;
+use asset_store::temp_workspace::TempWorkspace;
 
 /// Временный каталог для unit tests, удаляемый вместе со значением.
 pub struct TempDir {
-    path: PathBuf,
+    workspace: TempWorkspace,
 }
 
 impl TempDir {
@@ -21,27 +20,14 @@ impl TempDir {
     /// Паникует, если каталог невозможно создать: это ошибка окружения.
     #[must_use]
     pub fn new(label: &str) -> Self {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "anki-repo-unit-{}-{label}-{unique}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("временный каталог должен создаваться");
-        Self { path }
+        let workspace = TempWorkspace::create(label).expect("временный каталог должен создаваться");
+        Self { workspace }
     }
 
     /// Путь каталога.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        self.workspace.path()
     }
 }
 
@@ -168,4 +154,37 @@ pub fn export_with(base: &str, mutate: impl FnOnce(&mut serde_json::Value)) -> S
         serde_json::from_str(base).expect("базовый тестовый JSON должен разбираться");
     mutate(&mut value);
     serde_json::to_string(&value).expect("тестовый JSON должен сериализоваться")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TempDir;
+    use std::path::PathBuf;
+
+    fn fixture_that_fails_early(path_out: &mut Option<PathBuf>) -> Result<(), &'static str> {
+        let dir = TempDir::new("anki-repo-unit-early-error");
+        *path_out = Some(dir.path().to_path_buf());
+        Err("synthetic setup failure")
+    }
+
+    #[test]
+    fn dropping_fixture_removes_its_workspace() {
+        let path = {
+            let dir = TempDir::new("anki-repo-unit-drop");
+            let path = dir.path().to_path_buf();
+            assert!(path.is_dir());
+            path
+        };
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn early_error_drops_fixture_workspace() {
+        let mut path = None;
+        let error = fixture_that_fails_early(&mut path).expect_err("fixture завершается ошибкой");
+
+        assert_eq!(error, "synthetic setup failure");
+        assert!(!path.expect("путь fixture").exists());
+    }
 }

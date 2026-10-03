@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 
 pub(crate) use crate::batch_runtime::{validate_batch_id, validate_hash};
 use crate::error::{AssetError, ErrorCode};
@@ -34,9 +32,6 @@ pub const MAX_ACQUISITION_ROUNDS: u32 = 5;
 pub(crate) const MAX_HUMAN_REASON_BYTES: usize = 4096;
 const MAX_REVIEW_HTML_BYTES: u64 = MAX_RUNTIME_STATE_BYTES;
 const MAX_CANDIDATE_BYTES: u64 = crate::kanji_validator::MAX_MEDIA_BYTES as u64;
-#[cfg(test)]
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 /// Пороги совпадают с текущими порогами f32 валидатора кандзи; версия правил закреплена в состоянии.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1151,6 +1146,22 @@ impl BatchRuntime {
 
     pub fn batch_id(&self) -> &str {
         self.runtime.batch_id()
+    }
+
+    /// Освобождает runtime lock на время browser/network ожидания.
+    pub fn release_lock(&mut self) -> Result<(), AssetError> {
+        self.runtime.release_lock()
+    }
+
+    /// Повторно захватывает lock после внешнего ожидания.
+    pub fn reacquire_lock(&mut self) -> Result<(), AssetError> {
+        self.runtime.reacquire_lock()
+    }
+
+    /// Перечитывает состояние с кэшированием уже проверенных неизменяемых
+    /// candidate blobs после повторного захвата lock.
+    pub fn reload_cached(&mut self) -> Result<Option<KanjiBatch>, AssetError> {
+        self.runtime.reload_cached()
     }
 
     pub fn load(&mut self) -> Result<Option<KanjiBatch>, AssetError> {

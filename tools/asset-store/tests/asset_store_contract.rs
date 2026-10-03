@@ -1,7 +1,7 @@
+use asset_store::temp_workspace::TempWorkspace;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asset_store::{
     AssetIdentity, AssetStore, BrowserExecutableSource, BrowserRuntimeProvenance, DetectedFormat,
@@ -13,40 +13,29 @@ use asset_store::{
     ValidationEvidence, ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
 };
 
-static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 fn publishable_validator() -> ValidatorIdentity {
     FixedValidator::new(SemanticStatus::Verified).identity()
 }
 
-struct TempDir(PathBuf);
+struct TempDir {
+    workspace: TempWorkspace,
+}
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "asset-store-contract-{}-{label}-{counter}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("fixture root создаётся");
-        Self(path)
+        let workspace = TempWorkspace::create(&format!("asset-store-contract-{label}"))
+            .expect("fixture root создаётся");
+        Self { workspace }
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        self.workspace.path()
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
         let path = self.path().join(name);
         fs::write(&path, bytes).expect("synthetic fixture записывается");
         path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

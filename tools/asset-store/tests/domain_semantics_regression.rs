@@ -5,11 +5,10 @@
 //! `pitch_accent`. Если бы `store.rs` ветвился по имени домена, обе политики вели
 //! бы себя одинаково и эти проверки не различили бы их.
 
-use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use asset_store::temp_workspace::TempWorkspace;
 use asset_store::{
     AssetDomainPolicy, AssetError, AssetIdentity, AssetRecord, AssetStore, CanonicalAssetLocation,
     DetectedFormat, ErrorCode, HumanAttestationRequest, HumanDecision, Provenance, SelectionMode,
@@ -17,30 +16,19 @@ use asset_store::{
     ValidationEvidence, ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
 };
 
-static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-struct TempDir(PathBuf);
+struct TempDir {
+    workspace: TempWorkspace,
+}
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "domain-semantics-{label}-{}-{counter}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("каталог теста создаётся");
-        Self(path)
+        let workspace = TempWorkspace::create(&format!("domain-semantics-{label}"))
+            .expect("каталог теста создаётся");
+        Self { workspace }
     }
 
     fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        self.workspace.path()
     }
 }
 

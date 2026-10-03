@@ -4,6 +4,8 @@
 //! Модуль не вызывает закрытые API и не реконструирует графики акцентуации.
 //! Элементы одного пакета последовательно используют изолированную `BrowserSession`.
 
+use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use chromiumoxide::{
@@ -20,7 +22,10 @@ use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::{Instant, sleep, timeout};
+use tracing::Instrument;
 use url::Url;
+
+use crate::diagnostics::{safe_message, safe_route};
 
 use crate::browser_runtime::{
     BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor, DeviceMetrics, RuntimeSnapshot,
@@ -177,6 +182,63 @@ pub enum JpdbPitchOutcome {
     },
 }
 
+/// Обработанный префикс пакета и необязательная причина остановки сессии.
+///
+/// `outcomes` содержит только запросы, обработка которых началась. Ошибки запуска
+/// и настройки браузера не создают результаты элементов; после потери телеметрии
+/// необработанный хвост очереди также отсутствует.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JpdbPitchAcquisitionReport {
+    pub outcomes: Vec<JpdbPitchOutcome>,
+    pub session_failure: Option<JpdbPitchFailure>,
+}
+
+impl JpdbPitchAcquisitionReport {
+    fn from_session_failure(error: JpdbPitchFailure) -> Self {
+        trace_failure(&error);
+        Self {
+            outcomes: Vec::new(),
+            session_failure: Some(error),
+        }
+    }
+
+    fn stop_if_monitor_failed(&mut self, stage: JpdbPitchStage, monitor_failed: bool) -> bool {
+        if monitor_failed {
+            tracing::error!(
+                stage = ?stage,
+                monitor_failed,
+                processed_count = self.outcomes.len(),
+                "Очередь JPDB остановлена после отказа монитора CDP"
+            );
+            self.session_failure = Some(JpdbPitchFailure::SessionFailure {
+                stage,
+                message: "Монитор телеметрии CDP завершился с ошибкой; очередь остановлена".into(),
+            });
+        }
+        self.session_failure.is_some()
+    }
+
+    fn stop_with_session_failure(&mut self, stage: JpdbPitchStage, message: String) {
+        let failure = JpdbPitchFailure::SessionFailure { stage, message };
+        trace_failure(&failure);
+        self.session_failure = Some(failure);
+    }
+
+    fn record_processed_outcome(
+        &mut self,
+        outcome: JpdbPitchOutcome,
+        stage: JpdbPitchStage,
+        monitor_failed: bool,
+    ) -> bool {
+        if let JpdbPitchOutcome::Failed { error } = &outcome {
+            trace_failure(error);
+        }
+        self.outcomes.push(outcome);
+        self.stop_if_monitor_failed(stage, monitor_failed)
+    }
+}
+
 /// Байты PNG и метаданные акцентуации, готовые к проверке.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,18 +379,25 @@ pub struct JpdbPitchProvider;
 impl JpdbPitchProvider {
     /// Разрешает запрос и получает данные в новой изолированной сессии Chromium.
     pub async fn acquire(query: &JpdbPitchQuery) -> JpdbPitchOutcome {
-        let mut outcomes = Self::acquire_many(std::slice::from_ref(query)).await;
-        outcomes.pop().unwrap_or_else(|| {
-            failed(JpdbPitchFailure::BrowserSetup {
-                stage: JpdbPitchStage::ConfigureBrowser,
-                message: "Провайдер не вернул результат для элемента".into(),
-            })
+        let mut report = Self::acquire_many(std::slice::from_ref(query)).await;
+        if let Some(error) = report.session_failure.take() {
+            return failed(error);
+        }
+        report.outcomes.pop().unwrap_or_else(|| {
+            failed(
+                report
+                    .session_failure
+                    .unwrap_or(JpdbPitchFailure::BrowserSetup {
+                        stage: JpdbPitchStage::ConfigureBrowser,
+                        message: "Провайдер не вернул результат для элемента".into(),
+                    }),
+            )
         })
     }
 
     /// Последовательно разрешает запросы в одной изолированной сессии браузера.
-    /// Предметный результат или ошибка элемента не останавливает оставшуюся очередь.
-    pub async fn acquire_many(queries: &[JpdbPitchQuery]) -> Vec<JpdbPitchOutcome> {
+    /// Ошибка элемента не останавливает очередь; ошибка сессии оставляет только обработанный префикс.
+    pub async fn acquire_many(queries: &[JpdbPitchQuery]) -> JpdbPitchAcquisitionReport {
         let requests = queries
             .iter()
             .cloned()
@@ -338,34 +407,86 @@ impl JpdbPitchProvider {
     }
 
     /// Последовательно разрешает запросы; явный выбор сверяется с новым поиском.
-    pub async fn acquire_requests(requests: &[JpdbPitchRequest]) -> Vec<JpdbPitchOutcome> {
+    pub async fn acquire_requests(requests: &[JpdbPitchRequest]) -> JpdbPitchAcquisitionReport {
         if requests.is_empty() {
-            return Vec::new();
+            return JpdbPitchAcquisitionReport::default();
         }
 
+        Self::acquire_requests_owned(requests, None).await
+    }
+
+    /// Все временные browser profiles находятся внутри workspace запуска acceptance.
+    pub async fn acquire_requests_in_workspace(
+        requests: &[JpdbPitchRequest],
+        workspace: &Path,
+    ) -> JpdbPitchAcquisitionReport {
+        if requests.is_empty() {
+            return JpdbPitchAcquisitionReport::default();
+        }
+        Self::acquire_requests_owned(requests, Some(workspace)).await
+    }
+
+    async fn acquire_requests_owned(
+        requests: &[JpdbPitchRequest],
+        workspace: Option<&Path>,
+    ) -> JpdbPitchAcquisitionReport {
+        let mut interrupt = JpdbInterrupt(tokio::spawn(tokio::signal::ctrl_c()));
         let runtime = pitch_browser_runtime_config();
-        let session = match BrowserSession::launch(runtime).await {
+        // Не отменяем launch по SIGINT: полученная owning Session явно закрывается.
+        let launched = match workspace {
+            Some(workspace) => BrowserSession::launch_in_workspace(runtime, workspace).await,
+            None => BrowserSession::launch(runtime).await,
+        };
+        let session = match launched {
             Ok(session) => session,
             Err(message) => {
-                return requests
-                    .iter()
-                    .map(|_| {
-                        failed(JpdbPitchFailure::BrowserSetup {
-                            stage: JpdbPitchStage::ConfigureBrowser,
-                            message: message.clone(),
-                        })
-                    })
-                    .collect();
+                return JpdbPitchAcquisitionReport::from_session_failure(
+                    JpdbPitchFailure::BrowserSetup {
+                        stage: JpdbPitchStage::ConfigureBrowser,
+                        message,
+                    },
+                );
             }
         };
-
-        let setup = configure_page(session.page()).await;
-        let outcomes = match setup {
-            Ok(()) => process_requests_in_session(&session, requests).await,
-            Err(error) => requests.iter().map(|_| failed(error.clone())).collect(),
+        let mut report = match wait_jpdb_operation(configure_page(session.page()), &mut interrupt.0)
+            .await
+        {
+            Ok(Ok(())) => {
+                process_requests_with_interrupt(&session, requests, Some(&mut interrupt.0)).await
+            }
+            Ok(Err(error)) => JpdbPitchAcquisitionReport::from_session_failure(error),
+            Err(message) => {
+                JpdbPitchAcquisitionReport::from_session_failure(JpdbPitchFailure::SessionFailure {
+                    stage: JpdbPitchStage::ConfigureBrowser,
+                    message,
+                })
+            }
         };
-        session.close().await;
-        outcomes
+        if let Err(message) = session.close().await {
+            match &mut report.session_failure {
+                Some(
+                    JpdbPitchFailure::SessionFailure {
+                        message: original, ..
+                    }
+                    | JpdbPitchFailure::BrowserSetup {
+                        message: original, ..
+                    }
+                    | JpdbPitchFailure::BrowserConfiguration {
+                        message: original, ..
+                    },
+                ) => {
+                    original.push_str("; ");
+                    original.push_str(&message);
+                    trace_failure(report.session_failure.as_ref().expect("ошибка сохранена"));
+                }
+                Some(_) => {
+                    // Предыдущий полный typed failure остаётся в отчёте; cleanup
+                    // отдельно записан BrowserSession в structured diagnostic log.
+                }
+                None => report.stop_with_session_failure(JpdbPitchStage::ConfigureBrowser, message),
+            }
+        }
+        report
     }
 
     /// Использует переданную `BrowserSession`, но для каждого элемента запускает новый поиск.
@@ -373,7 +494,7 @@ impl JpdbPitchProvider {
     pub async fn acquire_many_in_session(
         session: &BrowserSession,
         queries: &[JpdbPitchQuery],
-    ) -> Vec<JpdbPitchOutcome> {
+    ) -> JpdbPitchAcquisitionReport {
         let requests = queries
             .iter()
             .cloned()
@@ -386,33 +507,67 @@ impl JpdbPitchProvider {
     pub async fn acquire_requests_in_session(
         session: &BrowserSession,
         requests: &[JpdbPitchRequest],
-    ) -> Vec<JpdbPitchOutcome> {
+    ) -> JpdbPitchAcquisitionReport {
         if requests.is_empty() {
-            return Vec::new();
+            return JpdbPitchAcquisitionReport::default();
         }
         if let Err(error) = configure_page(session.page()).await {
-            return requests.iter().map(|_| failed(error.clone())).collect();
+            return JpdbPitchAcquisitionReport::from_session_failure(error);
         }
         process_requests_in_session(session, requests).await
+    }
+}
+
+struct JpdbInterrupt(tokio::task::JoinHandle<std::io::Result<()>>);
+
+impl Drop for JpdbInterrupt {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn wait_jpdb_operation<T>(
+    operation: impl Future<Output = T>,
+    interrupt: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        signal = interrupt => Err(match signal {
+            Ok(Ok(())) => "acquisition_interrupted: получен Ctrl+C".into(),
+            Ok(Err(error)) => format!("ctrl_c_listener_failed: {error}"),
+            Err(error) => format!("ctrl_c_listener_failed: {error}"),
+        }),
+        result = operation => Ok(result),
     }
 }
 
 async fn process_requests_in_session(
     session: &BrowserSession,
     requests: &[JpdbPitchRequest],
-) -> Vec<JpdbPitchOutcome> {
-    let mut outcomes = Vec::with_capacity(requests.len());
-    let mut session_failure: Option<(JpdbPitchStage, String)> = None;
+) -> JpdbPitchAcquisitionReport {
+    process_requests_with_interrupt(session, requests, None).await
+}
+
+async fn process_requests_with_interrupt(
+    session: &BrowserSession,
+    requests: &[JpdbPitchRequest],
+    mut interrupt: Option<&mut tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> JpdbPitchAcquisitionReport {
+    let mut report = JpdbPitchAcquisitionReport {
+        outcomes: Vec::with_capacity(requests.len()),
+        session_failure: None,
+    };
     for request in requests {
-        if let Some((stage, message)) = &session_failure {
-            outcomes.push(failed(JpdbPitchFailure::SessionFailure {
-                stage: *stage,
-                message: message.clone(),
-            }));
-            continue;
+        if report.stop_if_monitor_failed(
+            JpdbPitchStage::SearchNavigation,
+            session.telemetry().monitor_failed(),
+        ) {
+            break;
         }
         let mut stage = JpdbPitchStage::SearchNavigation;
-        let result = timeout(
+        let item_span =
+            tracing::info_span!("jpdb_item", surface = %safe_message(&request.query.surface));
+        let operation = timeout(
             ITEM_TIMEOUT,
             acquire_one_in_session(
                 session.page(),
@@ -420,22 +575,28 @@ async fn process_requests_in_session(
                 session.provenance(),
                 request,
                 &mut stage,
-            ),
-        )
-        .await;
-        outcomes.push(match result {
-            Ok(outcome) => outcome,
-            Err(_) => item_timeout(stage),
-        });
-        if session.telemetry().monitor_failed() {
-            session_failure = Some((
-                stage,
-                "Монитор телеметрии CDP завершился с ошибкой; последующие элементы изолированы"
-                    .into(),
-            ));
+            )
+            .instrument(item_span.clone()),
+        );
+        let result = match interrupt.as_deref_mut() {
+            Some(interrupt) => wait_jpdb_operation(operation, interrupt).await,
+            None => Ok(operation.await),
+        };
+        let outcome = match result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => item_timeout(stage),
+            Err(message) => {
+                report.stop_with_session_failure(stage, message);
+                break;
+            }
+        };
+        if item_span.in_scope(|| {
+            report.record_processed_outcome(outcome, stage, session.telemetry().monitor_failed())
+        }) {
+            break;
         }
     }
-    outcomes
+    report
 }
 
 async fn configure_page(page: &Page) -> Result<(), JpdbPitchFailure> {
@@ -626,7 +787,10 @@ async fn acquire_one_in_session(
     } else {
         return failed(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: format!("После поиска JPDB открыл неожиданный маршрут: {page_url}"),
+            message: format!(
+                "После поиска JPDB открыл неожиданный маршрут: {}",
+                safe_route(&page_url)
+            ),
         });
     };
     match inspect_and_capture(
@@ -649,6 +813,7 @@ async fn acquire_one_in_session(
 }
 
 async fn navigate(page: &Page, url: &str, stage: JpdbPitchStage) -> Result<(), JpdbPitchFailure> {
+    tracing::debug!(stage = ?stage, route = %safe_route(url), "Переход на страницу JPDB");
     timeout(READINESS_TIMEOUT, page.goto(url.to_owned()))
         .await
         .map_err(|_| JpdbPitchFailure::Timeout {
@@ -669,7 +834,10 @@ fn browser_evaluation_failure(
 ) -> JpdbPitchFailure {
     JpdbPitchFailure::BrowserEvaluation {
         stage,
-        message: format!("Сбой выполнения JavaScript через CDP при {action}: {error}"),
+        message: format!(
+            "Сбой выполнения JavaScript через CDP при {action}: {}",
+            safe_message(&error.to_string())
+        ),
     }
 }
 
@@ -693,7 +861,7 @@ async fn wait_for_critical_readiness(
         if !is_jpdb_url(&url) {
             return Err(JpdbPitchFailure::PageContract {
                 stage,
-                message: format!("переход покинул домен jpdb.io: {url}"),
+                message: format!("переход покинул домен jpdb.io: {}", safe_route(&url)),
             });
         }
         let snapshot = telemetry.snapshot(epoch);
@@ -710,6 +878,13 @@ async fn wait_for_critical_readiness(
             .map_err(|error| {
                 browser_evaluation_failure(stage, "декодировании готовности документа", error)
             })?;
+        tracing::trace!(
+            stage = ?stage,
+            route = %safe_route(&url),
+            ready = matches!(ready_state.as_str(), "interactive" | "complete"),
+            pending_request_count = snapshot.pending_requests.len(),
+            "Проверка готовности страницы JPDB"
+        );
         if matches!(ready_state.as_str(), "interactive" | "complete") {
             return Ok(());
         }
@@ -745,6 +920,13 @@ async fn wait_for_critical_network_idle(
                 request.is_top_level,
             )
         });
+        tracing::trace!(
+            stage = ?stage,
+            pending_request_count = snapshot.pending_requests.len(),
+            has_pending_source_request,
+            consecutive_idle_observations,
+            "Проверка завершения критических запросов JPDB"
+        );
         if has_pending_source_request {
             consecutive_idle_observations = 0;
         } else {
@@ -766,6 +948,28 @@ async fn wait_for_critical_network_idle(
 }
 
 fn critical_telemetry_failure(snapshot: &RuntimeSnapshot) -> Option<String> {
+    if snapshot.monitor_failed
+        || snapshot.javascript_exceptions > 0
+        || !snapshot.network_failures.is_empty()
+        || !snapshot.http_errors.is_empty()
+    {
+        tracing::debug!(
+            monitor_failed = snapshot.monitor_failed,
+            javascript_exception_count = snapshot.javascript_exceptions,
+            network_failure_count = snapshot.network_failures.len(),
+            http_error_count = snapshot.http_errors.len(),
+            pending_request_count = snapshot.pending_requests.len(),
+            "Телеметрия JPDB содержит ошибки"
+        );
+    }
+    tracing::trace!(
+        monitor_failed = snapshot.monitor_failed,
+        javascript_exception_count = snapshot.javascript_exceptions,
+        network_failure_count = snapshot.network_failures.len(),
+        http_error_count = snapshot.http_errors.len(),
+        pending_request_count = snapshot.pending_requests.len(),
+        "Проверка критической телеметрии JPDB"
+    );
     if snapshot.monitor_failed {
         return Some("Монитор среды CDP сообщил о потере или неполноте телеметрии".into());
     }
@@ -784,11 +988,13 @@ fn critical_telemetry_failure(snapshot: &RuntimeSnapshot) -> Option<String> {
     }) {
         return Some(format!(
             "Критический запрос завершился ошибкой: {} ({})",
-            outcome.url.as_deref().unwrap_or("неизвестный URL"),
-            outcome
-                .failure_reason
-                .as_deref()
-                .unwrap_or("неизвестная сетевая ошибка")
+            safe_route(outcome.url.as_deref().unwrap_or("неизвестный URL")),
+            safe_message(
+                outcome
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or("неизвестная сетевая ошибка")
+            )
         ));
     }
     if let Some(outcome) = snapshot.http_errors.iter().find(|outcome| {
@@ -801,7 +1007,7 @@ fn critical_telemetry_failure(snapshot: &RuntimeSnapshot) -> Option<String> {
         return Some(format!(
             "Критический запрос вернул HTTP {}: {}",
             outcome.status_code.unwrap_or_default(),
-            outcome.url.as_deref().unwrap_or("неизвестный URL")
+            safe_route(outcome.url.as_deref().unwrap_or("неизвестный URL"))
         ));
     }
     None
@@ -948,6 +1154,17 @@ async fn read_detail_snapshot(
                 error,
             )
         })?;
+    tracing::debug!(
+        stage = ?stage,
+        route = %safe_route(raw["url"].as_str().unwrap_or_default()),
+        pending = raw["pending"].as_bool().unwrap_or(false),
+        base_page_contract_valid = raw["base_page_contract_valid"].as_bool().unwrap_or(false),
+        english_language = raw["search_language"].as_str() == Some("english"),
+        form_count = raw["forms"].as_array().map_or(0, Vec::len),
+        part_of_speech_count = raw["part_of_speech"].as_array().map_or(0, Vec::len),
+        graph_count = raw["graph_count"].as_u64().unwrap_or(0),
+        "Наблюдённые условия словарной страницы JPDB"
+    );
     if raw["pending"].as_bool() == Some(true) {
         return Err(JpdbPitchFailure::Timeout {
             stage,
@@ -1067,11 +1284,43 @@ async fn read_search_candidates(page: &Page) -> Result<RawSearchSnapshot, JpdbPi
                 error,
             )
         })?;
+    decode_search_snapshot(raw)
+}
+
+fn decode_search_snapshot(raw: Value) -> Result<RawSearchSnapshot, JpdbPitchFailure> {
+    tracing::debug!(
+        stage = ?JpdbPitchStage::SearchResolution,
+        ready = raw["ready"].as_bool().unwrap_or(false),
+        no_results_found = raw["no_results_found"].as_bool().unwrap_or(false),
+        result_count = raw["result_count"].as_u64().unwrap_or(0),
+        vocabulary_row_count = raw["vocabulary_row_count"].as_u64().unwrap_or(0),
+        candidate_count = raw["candidate_count"]
+            .as_u64()
+            .or_else(|| raw["candidates"].as_array().map(|rows| rows.len() as u64))
+            .unwrap_or(0),
+        truncated = raw["truncated"].as_bool().unwrap_or(false),
+        parser_error = raw["error"].is_string(),
+        invalid_row_index = raw["invalid_row_index"].as_u64(),
+        form_count = raw["form_count"].as_u64(),
+        has_forms = raw["has_forms"].as_bool(),
+        part_of_speech_count = raw["part_of_speech_count"].as_u64(),
+        has_part_of_speech = raw["has_part_of_speech"].as_bool(),
+        meaning_count = raw["meaning_count"].as_u64(),
+        has_meanings = raw["has_meanings"].as_bool(),
+        has_detail_url = raw["has_detail_url"].as_bool(),
+        has_detail_route = raw["has_detail_route"].as_bool(),
+        detail_route_parse_succeeded = raw["detail_route_parse_succeeded"].as_bool(),
+        "Наблюдённые условия поиска JPDB"
+    );
     if let Some(message) = raw["error"].as_str() {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
             message: message.to_owned(),
         });
+    }
+    let mut raw = raw;
+    if let Some(object) = raw.as_object_mut() {
+        object.remove("vocabulary_row_count");
     }
     let snapshot: RawSearchSnapshot =
         serde_json::from_value(raw).map_err(|error| JpdbPitchFailure::PageContract {
@@ -1114,12 +1363,36 @@ async fn wait_for_search_candidates(
                     diagnostic: diagnostic.or(last_diagnostic),
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if let JpdbPitchFailure::PageContract { stage, message } = &error {
+                    let route = current_url(page, *stage)
+                        .await
+                        .map(|url| safe_route(&url))
+                        .unwrap_or_else(|_| "[маршрут недоступен]".into());
+                    tracing::error!(
+                        stage = ?stage,
+                        code = "page_contract",
+                        route = %route,
+                        message = %safe_message(message),
+                        "Нарушение контракта списка результатов JPDB"
+                    );
+                }
+                return Err(error);
+            }
         }
     }
 }
 
 fn validate_search_inventory(snapshot: &RawSearchSnapshot) -> Result<(), JpdbPitchFailure> {
+    tracing::debug!(
+        stage = ?JpdbPitchStage::SearchResolution,
+        ready = snapshot.ready,
+        result_count = snapshot.result_count,
+        candidate_count = snapshot.candidates.len(),
+        truncated = snapshot.truncated,
+        no_results_found = snapshot.no_results_found,
+        "Проверка целостности списка результатов JPDB"
+    );
     if !snapshot.ready {
         return Err(JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
@@ -1172,7 +1445,17 @@ fn select_candidates(
         });
     }
     let mut by_id: Vec<ResolvedCandidate> = Vec::new();
-    for raw in raw_candidates {
+    for (row_index, raw) in raw_candidates.iter().enumerate() {
+        tracing::debug!(
+            stage = ?JpdbPitchStage::SearchResolution,
+            row_index,
+            form_count = raw.forms.len(),
+            part_of_speech_count = raw.part_of_speech.len(),
+            meaning_count = raw.meanings.len(),
+            has_detail_url = raw.detail_url.is_some(),
+            route_valid = raw.detail_url.as_deref().and_then(parse_detail_route).is_some(),
+            "Проверка строки поиска JPDB"
+        );
         if raw.part_of_speech.is_empty() || raw.forms.is_empty() || raw.meanings.is_empty() {
             return Err(JpdbPitchFailure::PageContract {
                 stage: JpdbPitchStage::SearchResolution,
@@ -1914,6 +2197,17 @@ async fn capture_snapshot(
             message: format!("снимок DOM вернул неполные геометрические данные: {error}"),
         }
     })?;
+    tracing::debug!(
+        stage = ?stage,
+        graph_count = snapshot.graphs.len(),
+        viewport_width = snapshot.viewport_width,
+        viewport_height = snapshot.viewport_height,
+        document_width = snapshot.document_width,
+        document_height = snapshot.document_height,
+        page_scale_factor = snapshot.page_scale_factor,
+        device_pixel_ratio = snapshot.device_pixel_ratio,
+        "Проверка снимка геометрии графиков JPDB"
+    );
     validate_capture_geometry(&snapshot, stage)?;
     Ok(snapshot)
 }
@@ -2100,6 +2394,18 @@ fn vocabulary_not_found(query: &JpdbPitchQuery) -> JpdbPitchOutcome {
     }
 }
 
+/// Записывает только тип и безопасный текст ошибки; исходные DOM/события CDP не экспортируются.
+fn trace_failure(error: &JpdbPitchFailure) {
+    let fields = serde_json::to_value(error).unwrap_or_default();
+    tracing::warn!(
+        stage = fields["stage"].as_str().unwrap_or("unknown"),
+        code = fields["code"].as_str().unwrap_or("unknown"),
+        message = %safe_message(fields["message"].as_str().unwrap_or_default()),
+        diagnostic = %safe_message(fields["diagnostic"].as_str().unwrap_or_default()),
+        "Получение графика JPDB завершилось технической ошибкой"
+    );
+}
+
 fn failed(error: JpdbPitchFailure) -> JpdbPitchOutcome {
     JpdbPitchOutcome::Failed { error }
 }
@@ -2207,7 +2513,7 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
     const meanings = [...row.querySelectorAll('.subsection-meanings .description')]
       .map(node => (node.innerText || node.textContent || '').replace(/\s+/gu, ' ').trim()).filter(Boolean);
     if (!forms.length || !partOfSpeech.length || !meanings.length || !detailRoute) {
-      return { error: 'Строка JPDB не содержит подтверждённые формы, часть речи, значения и фактическую ссылку на словарную запись' };
+      return { error: 'Строка JPDB не содержит подтверждённые формы, часть речи, значения и фактическую ссылку на словарную запись', result_count: resultCount, vocabulary_row_count: vocabularyRows.length, candidate_count: candidates.length, no_results_found: noResultsFound, truncated: resultCount > 128 || vocabularyRows.length > 128, invalid_row_index: candidates.length, form_count: forms.length, has_forms: forms.length > 0, part_of_speech_count: partOfSpeech.length, has_part_of_speech: partOfSpeech.length > 0, meaning_count: meanings.length, has_meanings: meanings.length > 0, has_detail_url: !!detailRoute, has_detail_route: !!detailRoute, detail_route_parse_succeeded: !!route };
     }
     candidates.push({ detail_url: detailRoute.href, forms, part_of_speech: partOfSpeech, meanings });
   }
@@ -2215,6 +2521,7 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
     ready: true,
     no_results_found: noResultsFound,
     result_count: resultCount,
+    vocabulary_row_count: vocabularyRows.length,
     truncated: resultCount > 128 || vocabularyRows.length > 128,
     candidates,
   };
@@ -2422,6 +2729,153 @@ const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn injected_interrupt_keeps_processed_prefix_without_tail_outcomes() {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let mut interrupt = JpdbInterrupt(tokio::spawn(async {
+            cancelled.await.map_err(std::io::Error::other)?;
+            Ok(())
+        }));
+        let mut report = JpdbPitchAcquisitionReport::default();
+        let first = JpdbPitchOutcome::VocabularyNotFound {
+            surface: "猫".into(),
+            reading: None,
+        };
+        let completed = wait_jpdb_operation(std::future::ready(first.clone()), &mut interrupt.0)
+            .await
+            .unwrap();
+        report.record_processed_outcome(completed, JpdbPitchStage::SearchResolution, false);
+        cancel.send(()).unwrap();
+        let interrupted =
+            wait_jpdb_operation(std::future::pending::<JpdbPitchOutcome>(), &mut interrupt.0)
+                .await
+                .unwrap_err();
+        report.stop_with_session_failure(JpdbPitchStage::SearchNavigation, interrupted);
+        assert_eq!(report.outcomes, vec![first]);
+        assert!(
+            matches!(report.session_failure, Some(JpdbPitchFailure::SessionFailure { stage: JpdbPitchStage::SearchNavigation, message }) if message.starts_with("acquisition_interrupted:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_interrupt_listener_is_a_typed_session_failure() {
+        let mut interrupt = JpdbInterrupt(tokio::spawn(async {
+            Err(std::io::Error::other("injected signal error"))
+        }));
+        let message = wait_jpdb_operation(std::future::pending::<()>(), &mut interrupt.0)
+            .await
+            .unwrap_err();
+        let mut report = JpdbPitchAcquisitionReport::default();
+        report.stop_with_session_failure(JpdbPitchStage::ConfigureBrowser, message);
+        assert!(report.outcomes.is_empty());
+        let serialized = serde_json::to_value(report.session_failure.unwrap()).unwrap();
+        assert_eq!(serialized["code"], "session_failure");
+        assert!(
+            serialized["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("ctrl_c_listener_failed:")
+        );
+    }
+
+    #[test]
+    fn startup_and_configuration_failures_have_no_item_outcomes() {
+        for error in [
+            JpdbPitchFailure::BrowserSetup {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "Chromium не запущен".into(),
+            },
+            JpdbPitchFailure::BrowserConfiguration {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "Эмуляция страницы не настроена".into(),
+            },
+        ] {
+            let report = JpdbPitchAcquisitionReport::from_session_failure(error.clone());
+            assert!(report.outcomes.is_empty());
+            assert_eq!(report.session_failure, Some(error));
+        }
+    }
+
+    #[test]
+    fn failed_monitor_before_first_request_leaves_the_entire_queue_unprocessed() {
+        let mut report = JpdbPitchAcquisitionReport::default();
+        assert!(report.stop_if_monitor_failed(JpdbPitchStage::SearchNavigation, true));
+        assert!(report.outcomes.is_empty());
+        assert!(matches!(
+            report.session_failure,
+            Some(JpdbPitchFailure::SessionFailure {
+                stage: JpdbPitchStage::SearchNavigation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn failed_monitor_preserves_processed_prefix_and_does_not_fabricate_tail() {
+        let queue = [
+            JpdbPitchOutcome::VocabularyNotFound {
+                surface: "先頭".into(),
+                reading: None,
+            },
+            failed(JpdbPitchFailure::Telemetry {
+                stage: JpdbPitchStage::DetailReadiness,
+                message: "Телеметрия потеряна во время запроса".into(),
+            }),
+            JpdbPitchOutcome::VocabularyNotFound {
+                surface: "未処理".into(),
+                reading: None,
+            },
+        ];
+        let mut report = JpdbPitchAcquisitionReport::default();
+        let mut started_items = 0;
+        for (index, outcome) in queue.iter().cloned().enumerate() {
+            started_items += 1;
+            if report.record_processed_outcome(outcome, JpdbPitchStage::DetailReadiness, index == 1)
+            {
+                break;
+            }
+        }
+        assert_eq!(started_items, 2);
+        assert_eq!(report.outcomes, queue[..2]);
+        assert!(matches!(
+            report.session_failure,
+            Some(JpdbPitchFailure::SessionFailure {
+                stage: JpdbPitchStage::DetailReadiness,
+                ..
+            })
+        ));
+        assert!(report.stop_if_monitor_failed(JpdbPitchStage::SearchNavigation, false));
+        assert_eq!(report.outcomes.len(), 2);
+    }
+
+    #[test]
+    fn item_local_failures_keep_the_session_and_remaining_queue_available() {
+        let queue = [
+            failed(JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::SearchReadiness,
+                diagnostic: Some("Истёк лимит элемента".into()),
+            }),
+            failed(JpdbPitchFailure::Telemetry {
+                stage: JpdbPitchStage::DetailReadiness,
+                message: "Ошибка критического ресурса страницы".into(),
+            }),
+            JpdbPitchOutcome::VocabularyNotFound {
+                surface: "次".into(),
+                reading: None,
+            },
+        ];
+        let mut report = JpdbPitchAcquisitionReport::default();
+        for outcome in queue.iter().cloned() {
+            assert!(!report.record_processed_outcome(
+                outcome,
+                JpdbPitchStage::DetailReadiness,
+                false,
+            ));
+        }
+        assert_eq!(report.outcomes, queue);
+        assert!(report.session_failure.is_none());
+    }
 
     fn form(surface: &str, reading: &str) -> JpdbVocabularyForm {
         JpdbVocabularyForm {
@@ -2740,6 +3194,80 @@ mod tests {
             select_candidates(&rows, &JpdbPitchQuery::new("元気", None)),
             Err(JpdbPitchFailure::PageContract { .. })
         ));
+    }
+
+    #[test]
+    fn malformed_unrelated_search_row_is_a_contract_failure_in_either_order() {
+        let valid = raw_candidate(
+            "https://jpdb.io/vocabulary/12/元気/げんき",
+            vec![form("元気", "げんき")],
+            &["Noun"],
+            &["health"],
+        );
+        let malformed = raw_candidate(
+            "https://jpdb.io/vocabulary/13/別語/べつご",
+            vec![form("別語", "べつご")],
+            &["Noun"],
+            &[],
+        );
+        let query = JpdbPitchQuery::new("元気", None);
+        assert_eq!(
+            select_candidates(std::slice::from_ref(&valid), &query)
+                .unwrap()
+                .len(),
+            1
+        );
+        for rows in [
+            vec![valid.clone(), malformed.clone()],
+            vec![malformed, valid],
+        ] {
+            assert!(
+                matches!(
+                    select_candidates(&rows, &query),
+                    Err(JpdbPitchFailure::PageContract {
+                        stage: JpdbPitchStage::SearchResolution,
+                        ..
+                    })
+                ),
+                "Неполная строка не подтверждает целостность всего списка поиска"
+            );
+        }
+    }
+
+    #[test]
+    fn script_reported_incomplete_row_is_not_converted_to_vocabulary_not_found() {
+        let message = "Строка JPDB не содержит подтверждённые формы, часть речи, значения и фактическую ссылку на словарную запись";
+        let failure = decode_search_snapshot(serde_json::json!({
+            "error": message,
+            "result_count": 2,
+            "invalid_row_index": 1,
+            "form_count": 0,
+            "part_of_speech_count": 1,
+            "meaning_count": 1,
+            "has_detail_url": true
+        }))
+        .unwrap_err();
+        assert_eq!(
+            failure,
+            JpdbPitchFailure::PageContract {
+                stage: JpdbPitchStage::SearchResolution,
+                message: message.into()
+            }
+        );
+        assert!(matches!(
+            decode_search_snapshot(serde_json::json!({
+                "ready": false, "no_results_found": false, "result_count": 0,
+                "truncated": false, "candidates": []
+            })),
+            Err(JpdbPitchFailure::Timeout { .. })
+        ));
+        assert!(
+            decode_search_snapshot(serde_json::json!({
+                "ready": true, "no_results_found": true, "result_count": 0,
+                "truncated": false, "candidates": []
+            }))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3126,7 +3654,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(&centers[0][..3], &[208, 32, 32]);
         assert_eq!(&centers[1][..3], &[32, 176, 80]);
-        session.close().await;
+        session.close().await.unwrap();
     }
 }
 
@@ -3137,6 +3665,17 @@ enum PitchDomState {
 }
 
 fn classify_pitch_state(detail: &DetailSnapshot) -> Result<PitchDomState, JpdbPitchFailure> {
+    tracing::debug!(
+        stage = ?JpdbPitchStage::PitchInspection,
+        route = %safe_route(&detail.url),
+        base_page_contract_valid = detail.base_page_contract_valid,
+        pitch_section_present = detail.pitch_section_present,
+        pitch_label_valid = detail.pitch_label.as_deref() == Some("Pitch accent"),
+        pitch_marker_count = detail.pitch_marker_count,
+        graph_count = detail.graph_count,
+        section_count = detail.section_inventory.len(),
+        "Проверка присутствия графиков акцентуации JPDB"
+    );
     if detail.vocabulary_id == 0
         || detail.forms.is_empty()
         || detail.part_of_speech.is_empty()
@@ -3145,8 +3684,8 @@ fn classify_pitch_state(detail: &DetailSnapshot) -> Result<PitchDomState, JpdbPi
             .section_inventory
             .iter()
             .any(|label| label == "Meanings")
-        || !parse_detail_route(&detail.url)
-            .is_some_and(|route| route.vocabulary_id == detail.vocabulary_id)
+        || parse_detail_route(&detail.url)
+            .is_none_or(|route| route.vocabulary_id != detail.vocabulary_id)
         || detail
             .part_of_speech
             .iter()

@@ -1102,11 +1102,9 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> C
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::temp_workspace::TempWorkspace;
     use std::fs;
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn kanji_character_accepts_supported_han_and_rejects_other_unicode() {
@@ -1124,38 +1122,34 @@ mod tests {
         }
     }
 
-    struct TempDir(PathBuf);
+    struct TempDir {
+        workspace: TempWorkspace,
+    }
 
     impl TempDir {
         fn new() -> Self {
-            let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "kanji-assets-source-boundary-{}-{count}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("создаётся корень фикстуры теста");
-            Self(path)
+            Self {
+                workspace: TempWorkspace::create("asset-store-source-boundary-tests")
+                    .expect("создаётся корень фикстуры теста"),
+            }
         }
-    }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+        fn path(&self) -> &std::path::Path {
+            self.workspace.path()
         }
     }
 
     #[test]
     fn source_replacement_after_boundary_check_keeps_the_opened_object() {
         let temp = TempDir::new();
-        let repository = temp.0.join("repository");
+        let repository = temp.path().join("repository");
         let decks = repository.join("decks");
         fs::create_dir_all(&decks).expect("создаётся защищённое дерево");
         let protected_source = decks.join("protected.bin");
         let protected_bytes = "нельзя читать из decks".as_bytes();
         fs::write(&protected_source, protected_bytes).expect("записывается защищённая фикстура");
 
-        let candidate = temp.0.join("candidate.bin");
+        let candidate = temp.path().join("candidate.bin");
         let candidate_bytes = "открытый кандидат остаётся источником".as_bytes();
         fs::write(&candidate, candidate_bytes).expect("записывается безопасная фикстура");
         let protected_roots = BTreeSet::from([decks.clone()]);
@@ -1165,7 +1159,7 @@ mod tests {
         fs::remove_file(&candidate).expect("исходный путь удалён");
         symlink(&protected_source, &candidate).expect("путь теперь указывает в защищённое дерево");
 
-        let store_root = temp.0.join("store");
+        let store_root = temp.path().join("store");
         let store = AssetStore::open(StoreOptions::new(&store_root).protect_from(&decks))
             .expect("отдельный store открывается");
         let outcome = store

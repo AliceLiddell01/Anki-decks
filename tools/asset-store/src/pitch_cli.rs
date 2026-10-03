@@ -2,17 +2,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::future::Future;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::batch_runtime::SafeBatchRuntime;
 use crate::browser_runtime::BrowserSession;
+use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
 use crate::jpdb::{
-    JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchProvider, JpdbPitchQuery, JpdbPitchRequest,
-    JpdbPitchSelection, JpdbPitchStage, pitch_browser_runtime_config,
+    JpdbPitchAcquisitionReport, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchProvider,
+    JpdbPitchQuery, JpdbPitchRequest, JpdbPitchSelection, JpdbPitchStage,
+    pitch_browser_runtime_config,
 };
 use crate::model::{
     AssetIdentity, AssetRecord, HumanDecision, LifecycleState, Provenance, SemanticStatus,
@@ -25,9 +30,12 @@ use crate::pitch_batch::{
     is_retryable_failure,
 };
 use crate::store::{AssetStore, HumanAttestationRequest, StoreOptions, VerifiedIngestRequest};
+use crate::temp_workspace::TempWorkspace;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
 
 const MAX_PLAN_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -247,7 +255,7 @@ struct ItemSummary {
     last_outcome: Option<PitchBatchOutcome>,
     #[serde(skip)]
     selection: Option<JpdbPitchSelection>,
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<JpdbPitchFailure>,
     #[serde(skip)]
     failure_retryable: Option<bool>,
@@ -483,7 +491,7 @@ fn read_plan(path: &Path) -> Result<PitchPlan, AssetError> {
     let mut file = fs::File::open(path)
         .map_err(|error| AssetError::io("не удалось открыть JSON-план", error))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(MAX_PLAN_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| AssetError::io("не удалось прочитать JSON-план", error))?;
@@ -1227,36 +1235,43 @@ async fn ensure(
         Ok(batch)
     })();
     match result {
-        Ok(batch) => match run_batch(store, &batch.batch_id).await {
-            Ok((batch, run_changed)) => {
-                let blockers = batch_blockers(&batch);
-                let resolved = batch.is_resolved();
-                render_response(
-                    batch_response(
-                        "ensure",
-                        if resolved { "resolved" } else { "needs_review" },
-                        store_changed
-                            || run_changed
-                            || batch_state_changed_since(store, &batch_id, before_revision),
-                        Some(summary),
-                        &batch,
-                        blockers,
-                        None,
-                    ),
+        Ok(batch) => {
+            let LoggedBatchRun {
+                result,
+                diagnostic_log,
+            } = run_batch_logged(store, &batch.batch_id, output, "ensure").await;
+            let rendered = match result {
+                Ok((batch, run_changed)) => {
+                    let blockers = batch_blockers(&batch);
+                    let resolved = batch.is_resolved();
+                    render_response(
+                        batch_response(
+                            "ensure",
+                            if resolved { "resolved" } else { "needs_review" },
+                            store_changed
+                                || run_changed
+                                || batch_state_changed_since(store, &batch_id, before_revision),
+                            Some(summary),
+                            &batch,
+                            blockers,
+                            None,
+                        ),
+                        output,
+                        if resolved { 0 } else { 3 },
+                    )
+                }
+                Err(error) => render_batch_error(
+                    store,
+                    summary,
+                    &batch_id,
+                    "ensure",
+                    error,
                     output,
-                    if resolved { 0 } else { 3 },
-                )
-            }
-            Err(error) => render_batch_error(
-                store,
-                summary,
-                &batch_id,
-                "ensure",
-                error,
-                output,
-                store_changed || batch_state_changed_since(store, &batch_id, before_revision),
-            ),
-        },
+                    store_changed || batch_state_changed_since(store, &batch_id, before_revision),
+                ),
+            };
+            attach_diagnostic_log(rendered, output, diagnostic_log.as_deref())
+        }
         Err(error) => render_batch_error(
             store,
             summary,
@@ -1462,7 +1477,11 @@ async fn run_batch_output(
     store_changed: bool,
 ) -> PitchCliOutput {
     let before_revision = batch_state_revision(store, batch_id).unwrap_or(None);
-    match run_batch(store, batch_id).await {
+    let LoggedBatchRun {
+        result,
+        diagnostic_log,
+    } = run_batch_logged(store, batch_id, output, operation).await;
+    let rendered = match result {
         Ok((batch, changed)) => {
             let resolved = batch.is_resolved();
             render_response(
@@ -1488,7 +1507,8 @@ async fn run_batch_output(
             output,
             store_changed || batch_state_changed_since(store, batch_id, before_revision),
         ),
-    }
+    };
+    attach_diagnostic_log(rendered, output, diagnostic_log.as_deref())
 }
 
 fn update_batch(
@@ -1716,110 +1736,912 @@ fn reconcile_loaded_batch(
     Ok((batch, changed))
 }
 
+// 64 перехода ограничивают накопленные ресурсы Chromium/CDP, 20 минут —
+// возраст сессии. Смена сессии происходит после надёжного сохранения результата.
+// Уже запущенный запрос сохраняет собственный 90-секундный тайм-аут провайдера.
+const PITCH_SESSION_MAX_ITEMS: usize = 64;
+const PITCH_SESSION_MAX_AGE: Duration = Duration::from_secs(20 * 60);
+const PITCH_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct PitchRunPolicy {
+    max_items: usize,
+    max_age: Duration,
+    heartbeat: Duration,
+}
+
+impl Default for PitchRunPolicy {
+    fn default() -> Self {
+        Self {
+            max_items: PITCH_SESSION_MAX_ITEMS,
+            max_age: PITCH_SESSION_MAX_AGE,
+            heartbeat: PITCH_PROGRESS_HEARTBEAT,
+        }
+    }
+}
+
+// Локальная граница для детерминированных автономных тестов. Сохранённое
+// состояние, token/CAS и байты кандидатов принадлежат владельцу пакета;
+// провайдер их не записывает.
+trait PitchRunDriver {
+    type Session;
+
+    async fn launch(&mut self) -> Result<Self::Session, String>;
+    async fn acquire(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+    ) -> JpdbPitchAcquisitionReport;
+    async fn close(&mut self, session: Self::Session);
+
+    async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
+        self.close(session).await;
+        Ok(())
+    }
+}
+
+struct JpdbRunDriver<'a> {
+    workspace: &'a Path,
+}
+
+impl PitchRunDriver for JpdbRunDriver<'_> {
+    type Session = BrowserSession;
+
+    async fn launch(&mut self) -> Result<Self::Session, String> {
+        BrowserSession::launch_in_workspace(pitch_browser_runtime_config(), self.workspace).await
+    }
+
+    async fn acquire(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+    ) -> JpdbPitchAcquisitionReport {
+        JpdbPitchProvider::acquire_requests_in_session(session, std::slice::from_ref(request)).await
+    }
+
+    async fn close(&mut self, session: Self::Session) {
+        let _ = self.close_checked(session).await;
+    }
+
+    async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
+        session.close().await
+    }
+}
+
+// Общая JSONL-оболочка kanji progress; у pitch нет раундов и лимитов раундов.
+#[derive(Debug, Clone, Serialize)]
+struct PitchProgressEvent {
+    schema_version: u32,
+    operation: &'static str,
+    event: &'static str,
+    batch_id: String,
+    elapsed_ms: u128,
+    run_completed: usize,
+    run_total: usize,
+    batch_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<AssetIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_session: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+trait PitchProgressSink {
+    fn emit(&mut self, event: PitchProgressEvent) -> Result<(), AssetError>;
+}
+
+struct PitchStderrProgressSink(OutputFormat);
+
+impl PitchProgressSink for PitchStderrProgressSink {
+    fn emit(&mut self, event: PitchProgressEvent) -> Result<(), AssetError> {
+        write_pitch_progress(&event, self.0, &mut io::stderr().lock())
+    }
+}
+
+fn write_pitch_progress(
+    event: &PitchProgressEvent,
+    output: OutputFormat,
+    writer: &mut impl Write,
+) -> Result<(), AssetError> {
+    let line = match output {
+        OutputFormat::Json => serde_json::to_string(event)
+            .map_err(|error| invalid_plan(format!("сериализация progress: {error}")))?,
+        OutputFormat::Human => format!(
+            "Прогресс: {} · сохранено {}/{} · всего {} · {:.1} с · запись={} · сессия={} · результат={} {}",
+            human_pitch_progress_event(event.event),
+            event.run_completed,
+            event.run_total,
+            event.batch_total,
+            event.elapsed_ms as f64 / 1000.0,
+            event
+                .identity
+                .as_ref()
+                .map(|identity| identity.key.as_str())
+                .unwrap_or("-"),
+            event
+                .session
+                .map_or_else(|| "-".into(), |session| session.to_string()),
+            event
+                .outcome
+                .as_deref()
+                .map(human_pitch_progress_outcome)
+                .unwrap_or("-"),
+            event
+                .reason
+                .as_deref()
+                .map(human_pitch_progress_reason)
+                .unwrap_or("")
+        ),
+    };
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|error| AssetError::io("запись progress pitch в stderr", error))
+}
+
+fn human_pitch_progress_event(event: &str) -> &'static str {
+    match event {
+        "run_started" => "получение начато",
+        "run_finished" => "получение завершено",
+        "run_stopped" => "получение остановлено",
+        "browser_session_started" => "сессия браузера запущена",
+        "browser_session_ended" => "сессия браузера закрыта",
+        "browser_session_rotated" => "смена сессии браузера",
+        "item_started" => "получение записи начато",
+        "retry_started" => "повторная попытка начата",
+        "heartbeat" => "ожидание браузера",
+        "item_checkpointed" => "результат записи сохранён",
+        "item_discarded_stale" => "устаревший результат отброшен",
+        _ => "событие получения",
+    }
+}
+
+fn human_pitch_progress_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "pending" => "ожидает получения",
+        "acquired_verified" => "проверен, готов к публикации",
+        "candidate_rejected" => "кандидат отклонён",
+        "no_pitch_accent_on_source" => "в источнике JPDB нет ударения",
+        "ambiguous_vocabulary" => "неоднозначность, требуется выбор",
+        "vocabulary_not_found" => "запись JPDB не найдена",
+        "technical_failure" => "техническая ошибка",
+        "publication_pending" => "ожидает публикации",
+        "published" => "опубликован",
+        "existing_verified" => "уже проверен в каноническом корпусе",
+        "conflict" => "конфликт с текущей записью",
+        _ => "результат обработки",
+    }
+}
+
+fn human_pitch_progress_reason(reason: &str) -> &'static str {
+    match reason {
+        "item_limit" => "достигнут лимит записей сессии",
+        "age_limit" => "достигнут лимит времени сессии",
+        "interrupted" => "получен Ctrl+C",
+        "session_failure" => "ошибка сессии браузера",
+        "ctrl_c_listener_failed" => "ошибка обработчика Ctrl+C",
+        "invalid_provider_report" => "некорректный ответ провайдера",
+        "item_token_changed" => "запись изменена другим действием",
+        _ => "ошибка выполнения",
+    }
+}
+
+// Контекст принадлежит событию: heartbeat запуска новой сессии не может
+// перенимать identity или attempt ранее сохранённой записи.
+#[derive(Clone, Copy, Default)]
+struct PitchProgressContext<'a> {
+    identity: Option<&'a AssetIdentity>,
+    session: Option<u32>,
+    next_session: Option<u32>,
+    attempt: Option<usize>,
+}
+
+struct PitchProgressReporter<'a> {
+    sink: &'a mut dyn PitchProgressSink,
+    batch_id: String,
+    operation: &'static str,
+    started: Instant,
+    completed: usize,
+    total: usize,
+    batch_total: usize,
+}
+
+impl PitchProgressReporter<'_> {
+    fn emit(
+        &mut self,
+        event: &'static str,
+        context: PitchProgressContext<'_>,
+        outcome: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), AssetError> {
+        let reason = reason.map(|reason| safe_message(&reason));
+        tracing::info!(
+            operation = self.operation,
+            batch_id = self.batch_id,
+            stage = "pitch_runtime",
+            code = event,
+            session = context.session,
+            next_session = context.next_session,
+            identity = context
+                .identity
+                .map(|identity| safe_message(identity.key.as_str())),
+            attempt = context.attempt,
+            outcome = outcome.as_deref(),
+            reason = ?reason,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            run_completed = self.completed,
+            run_total = self.total,
+            batch_total = self.batch_total,
+            "событие выполнения pitch-accent"
+        );
+        self.sink.emit(PitchProgressEvent {
+            schema_version: 1,
+            operation: self.operation,
+            event,
+            batch_id: self.batch_id.clone(),
+            elapsed_ms: self.started.elapsed().as_millis(),
+            run_completed: self.completed,
+            run_total: self.total,
+            batch_total: self.batch_total,
+            identity: context.identity.cloned(),
+            session: context.session,
+            next_session: context.next_session,
+            attempt: context.attempt,
+            outcome,
+            reason,
+        })
+    }
+}
+
+struct PitchCtrlCListener(tokio::task::JoinHandle<Result<(), io::Error>>);
+
+impl Drop for PitchCtrlCListener {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn pitch_run_stopped(reason: &str, message: impl Into<String>) -> AssetError {
+    AssetError::with_details(
+        if reason == "interrupted" {
+            ErrorCode::InvalidTransition
+        } else {
+            ErrorCode::ValidatorFailure
+        },
+        message,
+        json!({"run_stop_reason": reason}),
+    )
+}
+
+fn trace_pitch_failure(
+    failure: &JpdbPitchFailure,
+    context: PitchProgressContext<'_>,
+    session_failure: bool,
+) {
+    let serialized = serde_json::to_value(failure).expect("типизированная ошибка сериализуется");
+    let (_, message) = human_failure_detail(failure);
+    tracing::error!(
+        event = "pitch_failure",
+        stage = serialized["stage"].as_str(),
+        code = serialized["code"].as_str(),
+        message = %crate::diagnostics::safe_message(&message),
+        identity = context
+            .identity
+            .map(|identity| safe_message(identity.key.as_str())),
+        session = context.session,
+        attempt = context.attempt,
+        session_failure,
+        retryable = is_retryable_failure(failure),
+        tail_started = false,
+    );
+}
+
+fn pitch_session_failure(failure: JpdbPitchFailure) -> AssetError {
+    AssetError::with_details(
+        ErrorCode::ValidatorFailure,
+        "получение остановлено из-за ошибки сессии браузера; хвост доступен для batch resume",
+        json!({"run_stop_reason": "session_failure", "session_failure": failure}),
+    )
+}
+
+fn interruption_result(result: Result<(), String>) -> AssetError {
+    tracing::warn!(
+        stage = "pitch_runtime",
+        code = "interruption_acknowledged",
+        listener_ok = result.is_ok(),
+        "сигнал остановки принят на границе операции"
+    );
+    match result {
+        Ok(()) => pitch_run_stopped(
+            "interrupted",
+            "получение остановлено по Ctrl+C; пакет доступен для resume",
+        ),
+        Err(message) => pitch_run_stopped("ctrl_c_listener_failed", message),
+    }
+}
+
+async fn wait_pitch_operation<T>(
+    operation: impl Future<Output = T>,
+    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
+    progress: &mut PitchProgressReporter<'_>,
+    context: PitchProgressContext<'_>,
+    heartbeat_period: Duration,
+) -> Result<T, AssetError> {
+    tokio::pin!(operation);
+    let mut heartbeat = tokio::time::interval(heartbeat_period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            // Готовый outcome выигрывает у interruption; caller сохраняет его
+            // синхронно без дополнительного await или проверки сигнала.
+            result = &mut operation => return Ok(result),
+            result = interruption.as_mut() => return Err(interruption_result(result)),
+            _ = heartbeat.tick() => progress.emit("heartbeat", context, None, None)?,
+        }
+    }
+}
+
+async fn check_pitch_interruption(
+    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
+) -> Result<(), AssetError> {
+    tokio::task::yield_now().await;
+    tokio::select! {
+        biased;
+        signal = interruption.as_mut() => Err(interruption_result(signal)),
+        _ = std::future::ready(()) => Ok(()),
+    }
+}
+
+// Внутри BrowserSession::launch есть spawned CDP handler: запуск нельзя отменить
+// до получения owning Session. Запоминаем сигнал, дожидаемся ограниченного запуска
+// и закрываем полученную сессию до начала обработки identity.
+async fn wait_pitch_launch<T>(
+    launch: impl Future<Output = Result<T, String>>,
+    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
+    progress: &mut PitchProgressReporter<'_>,
+    context: PitchProgressContext<'_>,
+    heartbeat_period: Duration,
+) -> (Result<T, String>, Option<AssetError>) {
+    tokio::pin!(launch);
+    let mut heartbeat = tokio::time::interval(heartbeat_period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let mut stop = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut launch => return (result, stop),
+            signal = interruption.as_mut(), if stop.is_none() => {
+                stop = Some(interruption_result(signal));
+            }
+            _ = heartbeat.tick(), if stop.is_none() => {
+                if let Err(error) = progress.emit("heartbeat", context, None, None) {
+                    stop = Some(error);
+                }
+            }
+        }
+    }
+}
+
 async fn run_batch(
     store: &AssetStore,
     batch_id: &str,
+    output: OutputFormat,
+    operation: &'static str,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
+    let workspace = TempWorkspace::create("pitch-batch-run")
+        .map_err(|error| AssetError::io("создание временного дерева pitch", error))?;
+    let result = run_batch_in_workspace(store, batch_id, output, operation, workspace.path()).await;
+    match workspace.close() {
+        Ok(()) => result,
+        Err(error) => {
+            tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %safe_message(&error.to_string()), "Не удалось удалить временное дерево pitch");
+            Err(pitch_run_stopped(
+                "temp_workspace_cleanup_failed",
+                format!(
+                    "{}; temp cleanup: {error}",
+                    result.err().map_or_else(
+                        || "получение завершено".into(),
+                        |original| original.to_string()
+                    )
+                ),
+            ))
+        }
+    }
+}
+
+async fn run_batch_in_workspace(
+    store: &AssetStore,
+    batch_id: &str,
+    output: OutputFormat,
+    operation: &'static str,
+    workspace: &Path,
+) -> Result<(PitchAccentBatch, bool), AssetError> {
+    let mut listener = PitchCtrlCListener(tokio::spawn(tokio::signal::ctrl_c()));
+    let interruption = async {
+        match (&mut listener.0).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!("обработчик Ctrl+C: {error}")),
+            Err(error) => Err(format!("задача обработчика Ctrl+C: {error}")),
+        }
+    };
+    run_batch_with_driver(
+        store,
+        batch_id,
+        operation,
+        &mut JpdbRunDriver { workspace },
+        &mut PitchStderrProgressSink(output),
+        PitchRunPolicy::default(),
+        interruption,
+    )
+    .await
+}
+
+struct LoggedBatchRun {
+    result: Result<(PitchAccentBatch, bool), AssetError>,
+    diagnostic_log: Option<String>,
+}
+
+async fn run_batch_logged(
+    store: &AssetStore,
+    batch_id: &str,
+    output: OutputFormat,
+    operation: &'static str,
+) -> LoggedBatchRun {
+    let run_log = match SafeBatchRuntime::open(store.root(), batch_id)
+        .and_then(|runtime| runtime.create_run_log())
+    {
+        Ok(run_log) => run_log,
+        Err(error) => {
+            return LoggedBatchRun {
+                result: Err(error),
+                diagnostic_log: None,
+            };
+        }
+    };
+    let run_id = run_log.run_id;
+    let path = run_log.path.display().to_string();
+    let mode = match output {
+        OutputFormat::Human => DiagnosticOutputMode::Human,
+        OutputFormat::Json => DiagnosticOutputMode::Json,
+    };
+    let guard = RunLogGuard::new(run_log.file, mode);
+    if matches!(output, OutputFormat::Human)
+        && let Err(error) = io::stderr()
+            .lock()
+            .write_all(format!("Диагностический журнал: {path}\n").as_bytes())
+    {
+        guard.with_default(|| {
+            tracing::error!(
+                operation,
+                batch_id,
+                run_id,
+                diagnostic_log = path,
+                stage = "diagnostic_log_path",
+                code = "stderr_write_failed",
+                message = %safe_message(&error.to_string()),
+                "Не удалось вывести путь диагностического файла"
+            );
+        });
+        let original = AssetError::io("вывод пути диагностического файла", error);
+        let result = match guard.finish() {
+            Ok(()) => Err(original),
+            Err(logging_error) => Err(diagnostic_write_error(Some(original), logging_error, &path)),
+        };
+        return LoggedBatchRun {
+            result,
+            diagnostic_log: Some(path),
+        };
+    }
+
+    let future = async {
+        let span = tracing::info_span!(
+            "pitch_batch_run",
+            operation,
+            batch_id,
+            run_id,
+            diagnostic_log = path,
+        );
+        async {
+            tracing::info!(
+                event = "run_started",
+                stage = "run",
+                code = "batch_run_started",
+                operation,
+                batch_id,
+                run_id,
+                "Начата обработка pitch-accent"
+            );
+            let result = run_batch(store, batch_id, output, operation).await;
+            match &result {
+                Ok((batch, changed)) => tracing::info!(
+                    event = "run_finished",
+                    stage = "run",
+                    code = "batch_run_finished",
+                    operation,
+                    batch_id,
+                    run_id,
+                    changed,
+                    total_items = batch.items.len(),
+                    total_attempts = batch
+                        .items
+                        .iter()
+                        .map(|item| item.attempts.len())
+                        .sum::<usize>(),
+                    "Обработка pitch-accent завершена"
+                ),
+                Err(error) => tracing::error!(
+                    event = "run_stopped",
+                    stage = "run",
+                    code = error.code.as_str(),
+                    message = %safe_message(&error.message),
+                    operation,
+                    batch_id,
+                    run_id,
+                    "Обработка pitch-accent остановлена"
+                ),
+            }
+            result
+        }
+        .instrument(span)
+        .await
+    }
+    .with_subscriber(guard.dispatch());
+    let result = future.await;
+    let result = match guard.finish() {
+        Ok(()) => result,
+        Err(logging_error) => Err(diagnostic_write_error(result.err(), logging_error, &path)),
+    };
+    LoggedBatchRun {
+        result,
+        diagnostic_log: Some(path),
+    }
+}
+
+fn diagnostic_write_error(
+    original: Option<AssetError>,
+    logging_error: String,
+    path: &str,
+) -> AssetError {
+    let original = original.map_or(serde_json::Value::Null, |error| {
+        serde_json::json!({
+            "code": error.code.as_str(),
+            "message": safe_message(&error.message),
+            "details": error.details,
+        })
+    });
+    AssetError::with_details(
+        ErrorCode::IoFailure,
+        match &original {
+            serde_json::Value::Null => {
+                format!("не удалось записать диагностический журнал {path}: {logging_error}")
+            }
+            _ => format!(
+                "обработка завершилась ошибкой, и не удалось записать диагностический журнал {path}: {logging_error}"
+            ),
+        },
+        json!({
+            "diagnostic_log": path,
+            "diagnostic_log_error": logging_error,
+            "original_error": original,
+        }),
+    )
+}
+
+fn attach_diagnostic_log(
+    mut output: PitchCliOutput,
+    format: OutputFormat,
+    diagnostic_log: Option<&str>,
+) -> PitchCliOutput {
+    let Some(path) = diagnostic_log else {
+        return output;
+    };
+    match format {
+        OutputFormat::Json => {
+            let mut response: serde_json::Value = serde_json::from_str(&output.stdout)
+                .expect("JSON-ответ batch содержит самостоятельный документ");
+            response["diagnostic_log"] = serde_json::Value::String(path.to_owned());
+            output.stdout = format!(
+                "{}\n",
+                serde_json::to_string_pretty(&response)
+                    .expect("ответ с путём диагностического файла сериализуется")
+            );
+        }
+        OutputFormat::Human => {
+            let line = format!("Диагностический журнал: {path}\n");
+            if output.exit_code == 0 || output.stderr.is_empty() {
+                output.stdout.push_str(&line);
+            } else {
+                output.stderr.push_str(&line);
+            }
+        }
+    }
+    output
+}
+
+async fn run_batch_with_driver(
+    store: &AssetStore,
+    batch_id: &str,
+    operation: &'static str,
+    driver: &mut impl PitchRunDriver,
+    sink: &mut dyn PitchProgressSink,
+    policy: PitchRunPolicy,
+    interruption: impl Future<Output = Result<(), String>>,
+) -> Result<(PitchAccentBatch, bool), AssetError> {
+    if policy.max_items == 0 || policy.max_age.is_zero() || policy.heartbeat.is_zero() {
+        return Err(invalid_plan(
+            "лимиты pitch runtime должны быть положительными",
+        ));
+    }
     let initial_revision = {
         let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
         let mut batch = runtime
             .load()?
             .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
-        let initial_revision = batch.revision;
-        let before_reconcile = batch.clone();
+        let revision = batch.revision;
+        let before = batch.clone();
         reconcile_batch(store, &mut batch)?;
-        if batch != before_reconcile {
+        if batch != before {
             runtime.save(&batch)?;
         }
-        initial_revision
+        revision
     };
-
     publish_ready(store, batch_id)?;
-
-    let acquisitions = {
-        let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
-        let mut batch = runtime
-            .load()?
-            .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
-        let before_reconcile = batch.clone();
-        reconcile_batch(store, &mut batch)?;
-        if batch != before_reconcile {
-            runtime.save(&batch)?;
-        }
-        let mut pending = Vec::new();
-        for item in &batch.items {
-            if item.status() == PitchBatchItemStatus::Pending {
-                pending.push((batch.item_token(&item.identity.key)?, item.request.clone()));
-            }
-        }
-        pending
+    let (batch, _) = reconcile_loaded_batch(store, batch_id)?;
+    let acquisitions = batch
+        .items
+        .iter()
+        .filter(|item| item.status() == PitchBatchItemStatus::Pending)
+        .map(|item| {
+            Ok((
+                batch.item_token(&item.identity.key)?,
+                item.request.clone(),
+                item.attempts.len() + 1,
+            ))
+        })
+        .collect::<Result<Vec<_>, AssetError>>()?;
+    tracing::debug!(
+        stage = "pitch_runtime",
+        code = "runtime_lock_released",
+        batch_id,
+        pending_items = acquisitions.len(),
+        "Блокировка runtime освобождена до обращения к браузеру"
+    );
+    let mut progress = PitchProgressReporter {
+        sink,
+        batch_id: batch_id.into(),
+        operation: if operation == "batch_resume" {
+            "batch_run"
+        } else {
+            operation
+        },
+        started: Instant::now(),
+        completed: 0,
+        total: acquisitions.len(),
+        batch_total: batch.items.len(),
     };
-
-    if !acquisitions.is_empty() {
-        let config = pitch_browser_runtime_config();
-        match BrowserSession::launch(config).await {
-            Ok(session) => {
-                let acquisition_result = async {
-                    for (token, request) in acquisitions {
-                        // На время поиска и снимка браузера блокировка пакета снята.
-                        // Каждый точный результат сохраняется до начала следующего элемента.
-                        let mut outcomes = JpdbPitchProvider::acquire_requests_in_session(
-                            &session,
-                            std::slice::from_ref(&request),
-                        )
-                        .await;
-                        if outcomes.len() != 1 {
-                            return Err(AssetError::new(
-                                ErrorCode::ValidatorFailure,
-                                "JPDB provider вернул число результатов, отличное от одного запроса",
-                            ));
-                        }
-                        let outcome = outcomes.pop().ok_or_else(|| {
-                            AssetError::new(
-                                ErrorCode::ValidatorFailure,
-                                "JPDB provider не вернул результат для элемента",
-                            )
-                        })?;
-                        record_one_outcome(store, batch_id, &token, outcome)?;
-                        publish_ready(store, batch_id)?;
-                    }
-                    Ok::<(), AssetError>(())
+    progress.emit("run_started", PitchProgressContext::default(), None, None)?;
+    tokio::pin!(interruption);
+    let mut session = None;
+    let mut session_started = Instant::now();
+    let mut session_items = 0;
+    let mut session_index = 0;
+    let mut result = async {
+        for (token, request, attempt) in acquisitions {
+            // Обработчик может увидеть сигнал во время синхронной записи результата
+            // или публикации. Проверяем его до начала следующей записи, даже если
+            // следующий результат провайдера готов немедленно.
+            check_pitch_interruption(interruption.as_mut()).await?;
+            if session.is_some()
+                && (session_items >= policy.max_items
+                    || session_started.elapsed() >= policy.max_age)
+            {
+                let reason = if session_items >= policy.max_items {
+                    "item_limit"
+                } else {
+                    "age_limit"
+                };
+                if let Some(active) = session.take() {
+                    tracing::info!(
+                        stage = "browser_close",
+                        code = "browser_close_started",
+                        session = session_index,
+                        reason,
+                        "закрытие сессии перед ротацией"
+                    );
+                    driver
+                        .close_checked(active)
+                        .await
+                        .map_err(|message| pitch_run_stopped("browser_cleanup_failed", message))?;
                 }
-                .await;
-                session.close().await;
-                acquisition_result?;
+                let ended_context = PitchProgressContext {
+                    session: Some(session_index),
+                    ..PitchProgressContext::default()
+                };
+                progress.emit(
+                    "browser_session_ended",
+                    ended_context,
+                    None,
+                    Some(reason.into()),
+                )?;
+                progress.emit(
+                    "browser_session_rotated",
+                    PitchProgressContext {
+                        next_session: Some(session_index + 1),
+                        ..ended_context
+                    },
+                    None,
+                    Some(reason.into()),
+                )?;
             }
-            Err(message) => {
-                for (token, _) in acquisitions {
-                    record_one_outcome(
-                        store,
-                        batch_id,
-                        &token,
-                        JpdbPitchOutcome::Failed {
-                            error: JpdbPitchFailure::BrowserSetup {
+            if session.is_none() {
+                session_index += 1;
+                let launch_context = PitchProgressContext {
+                    session: Some(session_index),
+                    ..PitchProgressContext::default()
+                };
+                check_pitch_interruption(interruption.as_mut()).await?;
+                tracing::info!(
+                    stage = "browser_launch",
+                    code = "browser_launch_started",
+                    session = session_index,
+                    "запуск сессии браузера"
+                );
+                let (launched, stop) = wait_pitch_launch(
+                    driver.launch(),
+                    interruption.as_mut(),
+                    &mut progress,
+                    launch_context,
+                    policy.heartbeat,
+                )
+                .await;
+                match launched {
+                    Ok(launched) => {
+                        session = Some(launched);
+                        session_started = Instant::now();
+                        session_items = 0;
+                        progress.emit("browser_session_started", launch_context, None, None)?;
+                    }
+                    Err(message) => {
+                        return Err(stop.unwrap_or_else(|| {
+                            let failure = JpdbPitchFailure::BrowserSetup {
                                 stage: JpdbPitchStage::ConfigureBrowser,
-                                message: message.clone(),
-                            },
-                        },
+                                message,
+                            };
+                            trace_pitch_failure(&failure, launch_context, true);
+                            pitch_session_failure(failure)
+                        }));
+                    }
+                }
+                if let Some(error) = stop {
+                    return Err(error);
+                }
+                check_pitch_interruption(interruption.as_mut()).await?;
+            }
+            let item_context = PitchProgressContext {
+                identity: Some(&token.identity),
+                session: Some(session_index),
+                attempt: Some(attempt),
+                next_session: None,
+            };
+            progress.emit("item_started", item_context, None, None)?;
+            if attempt > 1 {
+                progress.emit("retry_started", item_context, None, None)?;
+            }
+            let mut report = wait_pitch_operation(
+                driver.acquire(session.as_ref().expect("launched session"), &request),
+                interruption.as_mut(),
+                &mut progress,
+                item_context,
+                policy.heartbeat,
+            )
+            .await?;
+            if report.outcomes.len() > 1
+                || (report.outcomes.is_empty() && report.session_failure.is_none())
+            {
+                return Err(pitch_run_stopped(
+                    "invalid_provider_report",
+                    "Провайдер JPDB вернул некорректное число результатов",
+                ));
+            }
+            if let Some(outcome) = report.outcomes.pop() {
+                if let JpdbPitchOutcome::Failed { error } = &outcome {
+                    trace_pitch_failure(error, item_context, false);
+                }
+                // После получения результата CAS-checkpoint выполняется до следующего ожидания.
+                let recorded = record_one_outcome(store, batch_id, &token, outcome)?;
+                session_items += 1;
+                if recorded {
+                    progress.completed += 1;
+                    let saved = load_batch(store, batch_id)?;
+                    let status = saved
+                        .items
+                        .iter()
+                        .find(|item| item.identity == token.identity)
+                        .map(|item| serde_json::to_value(item.status()))
+                        .transpose()
+                        .map_err(|error| invalid_plan(format!("сериализация статуса: {error}")))?
+                        .and_then(|value| value.as_str().map(str::to_owned));
+                    progress.emit("item_checkpointed", item_context, status, None)?;
+                    publish_ready(store, batch_id)?;
+                } else {
+                    progress.emit(
+                        "item_discarded_stale",
+                        item_context,
+                        None,
+                        Some("item_token_changed".into()),
                     )?;
                 }
             }
+            if let Some(failure) = report.session_failure {
+                trace_pitch_failure(&failure, item_context, true);
+                return Err(pitch_session_failure(failure));
+            }
+            check_pitch_interruption(interruption.as_mut()).await?;
         }
+        let (batch, _) = reconcile_loaded_batch(store, batch_id)?;
+        Ok((batch.clone(), batch.revision != initial_revision))
     }
-
-    let batch = {
-        let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
-        let mut batch = runtime
-            .load()?
-            .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
-        let before_reconcile = batch.clone();
-        reconcile_batch(store, &mut batch)?;
-        if batch != before_reconcile {
-            runtime.save(&batch)?;
+    .await;
+    // Эта задача закрывает активную сессию при любом выходе: ошибка вывода
+    // прогресса, сохранения, Ctrl+C или сбой провайдера либо сессии.
+    if let Some(active) = session.take() {
+        tracing::info!(
+            stage = "browser_close",
+            code = "browser_close_started",
+            session = session_index,
+            "закрытие активной сессии после получения"
+        );
+        if let Err(message) = driver.close_checked(active).await {
+            let original = result.err();
+            result = Err(pitch_run_stopped(
+                "browser_cleanup_failed",
+                match original {
+                    Some(original) => format!("{original}; {message}"),
+                    None => message,
+                },
+            ));
         }
-        batch
-    };
-    Ok((batch.clone(), batch.revision != initial_revision))
+        let reason = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.details["run_stop_reason"].as_str())
+            .map(str::to_owned);
+        progress.emit(
+            "browser_session_ended",
+            PitchProgressContext {
+                session: Some(session_index),
+                ..PitchProgressContext::default()
+            },
+            None,
+            reason,
+        )?;
+    }
+    match &result {
+        Ok(_) => progress.emit("run_finished", PitchProgressContext::default(), None, None)?,
+        Err(error) => progress.emit(
+            "run_stopped",
+            PitchProgressContext::default(),
+            None,
+            Some(
+                error.details["run_stop_reason"]
+                    .as_str()
+                    .unwrap_or(error.code.as_str())
+                    .into(),
+            ),
+        )?,
+    }
+    result
 }
 
 fn record_one_outcome(
@@ -1827,21 +2649,71 @@ fn record_one_outcome(
     batch_id: &str,
     token: &PitchBatchItemToken,
     outcome: JpdbPitchOutcome,
-) -> Result<(), AssetError> {
-    let owner = owner_snapshot(store)?;
-    let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
-    let mut batch = runtime
-        .load()?
-        .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
-    let before_reconcile = batch.clone();
-    batch.reconcile_owner(&owner)?;
-    if batch != before_reconcile {
-        runtime.save(&batch)?;
+) -> Result<bool, AssetError> {
+    let checkpoint = tracing::info_span!(
+        "pitch_checkpoint",
+        batch_id,
+        identity = %safe_message(token.identity.key.as_str()),
+        expected_generation = token.generation,
+        expected_item_revision = token.item_revision,
+        request_fingerprint = token.request_fingerprint,
+    );
+    let _entered = checkpoint.enter();
+    tracing::info!(
+        stage = "checkpoint",
+        code = "checkpoint_begin",
+        "начало сохранения результата"
+    );
+    let result = (|| {
+        let owner = owner_snapshot(store)?;
+        let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
+        let mut batch = runtime
+            .load()?
+            .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
+        tracing::debug!(
+            stage = "checkpoint",
+            code = "runtime_reloaded",
+            revision = batch.revision,
+            "runtime повторно загружен под lock"
+        );
+        let before_reconcile = batch.clone();
+        batch.reconcile_owner(&owner)?;
+        if batch != before_reconcile {
+            runtime.save(&batch)?;
+            tracing::info!(
+                stage = "owner_reconciliation",
+                code = "owner_reconciled",
+                "изменения владельца сохранены"
+            );
+        }
+        let observed = batch.item(&token.identity.key);
+        tracing::debug!(
+            stage = "checkpoint",
+            code = "cas_observed",
+            observed_generation = observed.map(|item| item.generation),
+            observed_item_revision = observed.map(|item| item.item_revision),
+            "проверка актуальности token"
+        );
+        // record_outcome сохраняет полученные байты до смены состояния. Проверка token/CAS
+        // отбрасывает результат, если параллельное действие пользователя изменило элемент.
+        runtime.record_outcome(&mut batch, token, outcome)
+    })();
+    match &result {
+        Ok(true) => tracing::info!(
+            stage = "checkpoint",
+            code = "checkpoint_succeeded",
+            "результат сохранён"
+        ),
+        Ok(false) => tracing::warn!(
+            stage = "checkpoint",
+            code = "cas_stale_discard",
+            "устаревший результат отброшен"
+        ),
+        Err(error) => {
+            tracing::error!(stage = "checkpoint", code = error.code.as_str(), message = %crate::diagnostics::safe_message(&error.message), event = "checkpoint_failed")
+        }
     }
-    // record_outcome сохраняет полученные байты до смены состояния. Проверка token/CAS
-    // отбрасывает результат, если параллельное действие пользователя изменило элемент.
-    let _recorded = runtime.record_outcome(&mut batch, token, outcome)?;
-    Ok(())
+    result
 }
 
 fn publish_ready(store: &AssetStore, batch_id: &str) -> Result<(), AssetError> {
@@ -1933,7 +2805,7 @@ fn publish_ready(store: &AssetStore, batch_id: &str) -> Result<(), AssetError> {
                     |error| {
                         AssetError::new(
                             ErrorCode::InvalidValidationEvidence,
-                            format!("не удалось сериализовать pitch metadata: {error}"),
+                            format!("не удалось сериализовать метаданные pitch accent: {error}"),
                         )
                     },
                 )?),
@@ -1945,7 +2817,16 @@ fn publish_ready(store: &AssetStore, batch_id: &str) -> Result<(), AssetError> {
         let Some(request) = publish else {
             return Ok(());
         };
-        let outcome = store.ingest_verified(request, &PitchAccentImageValidator)?;
+        tracing::info!(
+            stage = "owner_publication",
+            code = "publication_begin",
+            batch_id,
+            identity = %safe_message(request.identity.key.as_str()),
+            "публикация проверенного кандидата"
+        );
+        let outcome = store.ingest_verified(request, &PitchAccentImageValidator).inspect_err(|error| {
+            tracing::error!(stage = "owner_publication", code = error.code.as_str(), batch_id, message = %crate::diagnostics::safe_message(&error.message), event = "publication_failed");
+        })?;
         if outcome.status != SemanticStatus::Verified || outcome.asset.is_none() {
             return Err(AssetError::new(
                 ErrorCode::InvalidValidationEvidence,
@@ -1960,6 +2841,12 @@ fn publish_ready(store: &AssetStore, batch_id: &str) -> Result<(), AssetError> {
             .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
         batch.reconcile_owner(&owner_after)?;
         runtime.save(&batch)?;
+        tracing::info!(
+            stage = "owner_publication",
+            code = "publication_reconciled",
+            batch_id,
+            "публикация подтверждена снимком владельца"
+        );
     }
 }
 

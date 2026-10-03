@@ -3,31 +3,32 @@ use super::*;
 use crate::kanji_validator::MAX_MEDIA_BYTES;
 use crate::model::ValidationEvidence;
 use crate::selection::select_assets;
+use crate::temp_workspace::TempWorkspace;
 
 struct Fixture {
-    directory: PathBuf,
     store: AssetStore,
     identity: AssetIdentity,
+    workspace: TempWorkspace,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "asset-trust-{}-{}",
-            std::process::id(),
-            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        let store = AssetStore::open_kanji(StoreOptions::new(directory.join("store"))).unwrap();
+        let workspace = TempWorkspace::create("asset-store-trust-tests").unwrap();
+        let store =
+            AssetStore::open_kanji(StoreOptions::new(workspace.path().join("store"))).unwrap();
         Self {
-            directory,
             store,
             identity: AssetIdentity::new("kanji", "日").unwrap(),
+            workspace,
         }
     }
 
+    fn directory(&self) -> &std::path::Path {
+        self.workspace.path()
+    }
+
     fn ingest(&self, bytes: &[u8], replace: Option<String>) -> AssetRecord {
-        let source = self.directory.join("candidate.png");
+        let source = self.directory().join("candidate.png");
         fs::write(&source, bytes).unwrap();
         self.store
             .ingest(IngestRequest {
@@ -59,17 +60,11 @@ impl Fixture {
 
     fn read(&self) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
         AssetStore::read_verified_with_policy(
-            self.directory.join("store"),
+            self.directory().join("store"),
             std::slice::from_ref(&self.identity),
             &Classifier(SemanticStatus::Verified).identity(),
             &crate::domain::KanjiDomainPolicy,
         )
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -163,7 +158,7 @@ fn malformed_approval_without_validation_is_rejected_by_manifest_and_read() {
     let fixture = Fixture::new();
     fixture.ingest(&png(36), None);
     let record = fixture.classify(SemanticStatus::Verified);
-    let path = fixture.directory.join("store/manifest.json");
+    let path = fixture.directory().join("store/manifest.json");
     let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let stored = &mut manifest.assets[0];
     assert_eq!(stored.identity, record.identity);
@@ -231,7 +226,7 @@ fn human_approval_overrides_uncertain_rejected_and_preserves_automated_evidence(
         let other_validator = ValidatorIdentity::new("new-validator", "2").unwrap();
         assert!(
             AssetStore::read_verified_with_policy(
-                fixture.directory.join("store"),
+                fixture.directory().join("store"),
                 std::slice::from_ref(&fixture.identity),
                 &other_validator,
                 &crate::domain::KanjiDomainPolicy,
@@ -239,7 +234,7 @@ fn human_approval_overrides_uncertain_rejected_and_preserves_automated_evidence(
             .is_ok()
         );
         drop(
-            AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+            AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory().join("store")))
                 .unwrap(),
         );
     }
@@ -346,12 +341,12 @@ fn hash_and_path_integrity_cannot_be_overridden() {
         let record = fixture.ingest(&png(60), None);
         fixture.classify(SemanticStatus::Uncertain);
         let path = fixture
-            .directory
+            .directory()
             .join("store/.runtime")
             .join(&record.storage_path);
         fs::remove_file(&path).unwrap();
         if symlink {
-            let outside = fixture.directory.join("outside.png");
+            let outside = fixture.directory().join("outside.png");
             fs::write(&outside, png(60)).unwrap();
             std::os::unix::fs::symlink(&outside, &path).unwrap();
         } else {
@@ -372,7 +367,7 @@ fn schema_v3_read_retains_trust_and_first_decision_migrates_without_evidence_los
     let fixture = Fixture::new();
     fixture.ingest(&png(70), None);
     let record = fixture.classify(SemanticStatus::Verified);
-    let path = fixture.directory.join("store/manifest.json");
+    let path = fixture.directory().join("store/manifest.json");
     let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     legacy["schema_version"] = 3.into();
     legacy.as_object_mut().unwrap().remove("domain_id");
@@ -382,16 +377,16 @@ fn schema_v3_read_retains_trust_and_first_decision_migrates_without_evidence_los
         "storage_path".into(),
         serde_json::Value::String("assets/日.png".into()),
     );
-    let old_path = fixture.directory.join("store/assets/png/日.png");
-    let legacy_path = fixture.directory.join("store/assets/日.png");
+    let old_path = fixture.directory().join("store/assets/png/日.png");
+    let legacy_path = fixture.directory().join("store/assets/日.png");
     fs::rename(&old_path, &legacy_path).unwrap();
-    fs::remove_dir(fixture.directory.join("store/assets/png")).unwrap();
+    fs::remove_dir(fixture.directory().join("store/assets/png")).unwrap();
     let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
     fs::write(&path, &legacy_bytes).unwrap();
     assert!(fixture.read().is_ok());
     assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
     let migrated =
-        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory().join("store")))
             .unwrap();
     assert!(migrated.layout_migrated_on_open());
     assert!(!legacy_path.exists());
@@ -424,7 +419,7 @@ fn approval_recovery_keeps_exact_bytes_and_both_decisions() {
         ErrorCode::IoFailure
     );
     let reopened =
-        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory().join("store")))
             .unwrap();
     let result = reopened.verify_integrity().unwrap();
     assert_eq!(result[0].validation, classified.validation);
@@ -438,11 +433,11 @@ fn approval_recovery_keeps_exact_bytes_and_both_decisions() {
 #[test]
 fn runtime_batch_extension_survives_open_and_asset_lifecycle_recovery() {
     let fixture = Fixture::new();
-    let batches = fixture.directory.join("store/.runtime/batches");
+    let batches = fixture.directory().join("store/.runtime/batches");
     fs::create_dir(&batches).unwrap();
     fs::write(batches.join("owned-by-domain.json"), b"domain payload").unwrap();
     let reopened =
-        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory().join("store")))
             .unwrap();
     assert!(reopened.verify_integrity().unwrap().is_empty());
     // Импорт создаёт транзакцию публикации внутри каталога `.runtime`; затем подтверждение
@@ -464,14 +459,14 @@ fn runtime_batch_extension_survives_open_and_asset_lifecycle_recovery() {
 fn runtime_batch_extension_rejects_symlink_and_non_directory() {
     for symlink in [false, true] {
         let fixture = Fixture::new();
-        let batches = fixture.directory.join("store/.runtime/batches");
+        let batches = fixture.directory().join("store/.runtime/batches");
         if symlink {
-            std::os::unix::fs::symlink(fixture.directory.join("store/assets"), &batches).unwrap();
+            std::os::unix::fs::symlink(fixture.directory().join("store/assets"), &batches).unwrap();
         } else {
             fs::write(&batches, b"not a directory").unwrap();
         }
         assert_eq!(
-            AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+            AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory().join("store")))
                 .unwrap_err()
                 .code,
             ErrorCode::BoundaryViolation,
@@ -486,13 +481,13 @@ fn runtime_batch_extension_rejects_symlink_and_non_directory() {
 #[test]
 fn batch_extension_is_not_allowed_in_canonical_store() {
     let fixture = Fixture::new();
-    fs::create_dir(fixture.directory.join("store/batches")).unwrap();
+    fs::create_dir(fixture.directory().join("store/batches")).unwrap();
     assert_eq!(
         fixture.store.verify_integrity().unwrap_err().code,
         ErrorCode::UnexpectedPath
     );
     assert_eq!(
-        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory.join("store")))
+        AssetStore::open_kanji_existing(StoreOptions::new(fixture.directory().join("store")))
             .unwrap_err()
             .code,
         ErrorCode::StoreNotOwned,

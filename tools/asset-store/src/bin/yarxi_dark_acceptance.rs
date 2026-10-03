@@ -3,7 +3,6 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use asset_store::cli::KanjiCharacter;
 use asset_store::hashing::sha256_hex;
@@ -12,10 +11,17 @@ use asset_store::model::{
     AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, Provenance, SemanticStatus,
 };
 use asset_store::validation::SemanticValidator;
-use asset_store::yarxi::{AcquisitionTarget, SelectionResult, acquire_many_with_target};
+use asset_store::yarxi::{
+    AcquisitionEvent, AcquisitionStreamError, AcquisitionTarget, SelectionResult,
+    acquire_many_stream_with_target_in_workspace,
+};
 use clap::Parser;
 use image::GenericImageView;
 use serde_json::{Value, json};
+
+#[path = "common/evidence_zip.rs"]
+mod evidence_zip;
+use evidence_zip::EvidenceRun;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,10 +34,18 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     plan: PathBuf,
 
-    /// Новый каталог HTML-отчёта со свидетельствами. Родитель должен существовать;
-    /// каталог должен быть вне checkout и ещё не существовать.
-    #[arg(long, value_name = "DIR")]
+    /// Новый ZIP вне checkout и run workspace; parent должен существовать.
+    /// По умолчанию: системный temp root/anki-decks-evidence/<уникальный run>.zip.
+    #[arg(long, value_name = "ZIP")]
     output: Option<PathBuf>,
+
+    /// Внешний текстовый transcript проверок; безопасная копия попадёт в ZIP.
+    #[arg(long, value_name = "PATH")]
+    transcript: Option<PathBuf>,
+
+    /// JSON результатов fault injection; отдельная безопасная копия в ZIP.
+    #[arg(long, value_name = "PATH")]
+    fault_evidence: Option<PathBuf>,
 
     /// Разрешить обработку промежуточной страницы TLS-предупреждения только для www.yarxi.su.
     #[arg(long)]
@@ -55,56 +69,115 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let plan_bytes = fs::read(&plan_path)?;
     let plan: Value = serde_json::from_slice(&plan_bytes)?;
     let items = read_plan_items(&plan)?;
-    let report_dir = create_report_dir(args.output.as_deref())?;
+    let run = EvidenceRun::start(
+        "yarxi_dark_acceptance",
+        args.output.as_deref(),
+        &checkout_root()?,
+    )?;
+    if let Some(transcript) = &args.transcript
+        && let Err(error) = run.add_transcript(transcript)
+    {
+        return run.finish(Err(error), Ok(()));
+    }
+    if let Some(source) = &args.fault_evidence
+        && let Err(error) = run.add_fault_evidence(source)
+    {
+        return run.finish(Err(error), Ok(()));
+    }
+    let log = match run.log_guard() {
+        Ok(log) => log,
+        Err(error) => return run.finish(Err(error), Ok(())),
+    };
+    let result = log.with_default(|| run_body(&items, &plan_path, args.allow_insecure_tls, &run));
+    run.finish(result, log.finish())
+}
+
+fn run_body(
+    items: &[PlanItem],
+    plan_path: &Path,
+    allow_insecure_tls: bool,
+    run: &EvidenceRun,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_dir = run.report_dir();
     fs::create_dir(report_dir.join("images"))?;
 
     let characters: Vec<_> = items.iter().map(|item| item.character.clone()).collect();
-    let acquisitions = acquire_many_with_target(
+    let mut acquisitions = Vec::new();
+    let acquisition_result = acquire_many_stream_with_target_in_workspace(
         &characters,
-        args.allow_insecure_tls,
+        allow_insecure_tls,
         AcquisitionTarget::RenderedFontSamplePng,
+        run.path(),
+        |event| {
+            let event_value = match event {
+                AcquisitionEvent::SessionStarted { session } => {
+                    json!({"event":"session_started","session":session})
+                }
+                AcquisitionEvent::SessionEnded {
+                    session,
+                    processed,
+                    stop_reason,
+                } => {
+                    json!({"event":"session_ended","session":session,"processed":processed,"stop_reason":stop_reason.map(|reason|reason.summary())})
+                }
+                AcquisitionEvent::SessionRotated {
+                    next_session,
+                    reason,
+                } => {
+                    json!({"event":"session_rotated","next_session":next_session,"reason":reason.summary()})
+                }
+                AcquisitionEvent::ItemStarted { index } => {
+                    json!({"event":"item_started","index":index})
+                }
+                AcquisitionEvent::RetryStarted { index, attempt } => {
+                    json!({"event":"retry_started","index":index,"attempt":attempt})
+                }
+                AcquisitionEvent::RetryRecoveryStarted { index, attempt } => {
+                    json!({"event":"retry_recovery_started","index":index,"attempt":attempt})
+                }
+                AcquisitionEvent::Heartbeat { index, attempt } => {
+                    json!({"event":"heartbeat","index":index,"attempt":attempt})
+                }
+                AcquisitionEvent::ItemCompleted { index, outcome } => {
+                    if index != acquisitions.len() || index >= items.len() {
+                        return Err(asset_store::error::AssetError::new(
+                            asset_store::error::ErrorCode::InvalidTransition,
+                            "provider выдал непоследовательный индекс",
+                        ));
+                    }
+                    let evidence = match outcome.as_ref() {
+                        Ok(media) => {
+                            json!({"acquisition":media.evidence,"source_url":media.source_url,"sha256":sha256_hex(&media.bytes),"byte_length":media.bytes.len()})
+                        }
+                        Err(error) => {
+                            json!({"failure":{"stage":"acquisition","code":"provider_item_failed","message":error,"diagnostic":null}})
+                        }
+                    };
+                    acquisitions.push(*outcome);
+                    json!({"event":"item_completed","index":index,"result":evidence})
+                }
+            };
+            run.event(event_value).map_err(|error| {
+                asset_store::error::AssetError::new(
+                    asset_store::error::ErrorCode::IoFailure,
+                    error.to_string(),
+                )
+            })
+        },
     );
-    let acquisitions = match acquisitions {
-        Ok(acquisitions) => acquisitions,
-        Err(error) => {
-            let rows: Vec<_> = items
-                .iter()
-                .map(|item| {
-                    let codepoint = unicode_codepoint(&item.character)?;
-                    Ok(item_row(
-                        item,
-                        &codepoint,
-                        "acquisition_failed",
-                        json!({ "failure": error.to_string() }),
-                    ))
-                })
-                .collect::<Result<_, Box<dyn std::error::Error>>>()?;
-            save_evidence(
-                "verification_failed",
-                &plan_path,
-                &items,
-                &rows,
-                &report_dir,
-            )?;
-            return Err(format!(
-                "Не удалось запустить получение изображений: {error}. Отчёт: {}",
-                report_dir.join("index.html").display()
-            )
-            .into());
-        }
-    };
-    if acquisitions.len() != items.len() {
-        return Err(format!(
-            "получено {} результатов для {} запланированных символов",
-            acquisitions.len(),
-            items.len()
-        )
-        .into());
+    let session_failure = acquisition_result.err().map(|error| match error {
+        AcquisitionStreamError::Interrupted => json!({"stage":"interrupt","code":"acquisition_interrupted","message":"Получен Ctrl+C; browser закрыт","diagnostic":null}),
+        AcquisitionStreamError::Provider(message) => json!({"stage":"acquisition","code":"provider_session_failed","message":message,"diagnostic":null}),
+        AcquisitionStreamError::Consumer(error) => json!({"stage":"progress","code":error.code.as_str(),"message":error.message,"diagnostic":null}),
+    });
+    let processed_count = acquisitions.len();
+    if session_failure.is_some() {
+        run.event(json!({"event":"session_failure","failure":session_failure}))?;
     }
 
     let validator = KanjiImageValidator::new();
     let mut rows = Vec::with_capacity(items.len());
-    let mut all_verified = true;
+    let mut all_verified = session_failure.is_none() && processed_count == items.len();
 
     for (item, acquisition) in items.iter().zip(acquisitions) {
         let codepoint = unicode_codepoint(&item.character)?;
@@ -205,12 +278,32 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         })));
     }
 
+    for item in &items[processed_count..] {
+        rows.push(item_row(
+            item,
+            &unicode_codepoint(&item.character)?,
+            "not_started_session_failure",
+            json!({"session_failure_ref":"#/session_failure"}),
+        ));
+    }
+    for row in &rows {
+        run.event(json!({"event":"item_result", "result":row}))?;
+    }
+
     let run_status = if all_verified {
         "automatic_checks_passed_waiting_for_user_review"
     } else {
         "verification_failed"
     };
-    save_evidence(run_status, &plan_path, &items, &rows, &report_dir)?;
+    save_evidence(run_status, plan_path, items, &rows, &report_dir)?;
+    let mut saved: Value = serde_json::from_slice(&fs::read(report_dir.join("evidence.json"))?)?;
+    saved["session_failure"] = session_failure.unwrap_or(Value::Null);
+    saved["processed_item_count"] = json!(processed_count);
+    evidence_zip::redact(&mut saved);
+    fs::write(
+        report_dir.join("evidence.json"),
+        serde_json::to_vec_pretty(&saved)?,
+    )?;
 
     let verified_count = rows
         .iter()
@@ -218,16 +311,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .count();
     if !all_verified {
         return Err(format!(
-            "Автоматическую проверку прошли {verified_count}/{} кандидатов; отчёт: {}",
-            items.len(),
-            report_dir.join("index.html").display()
+            "Автоматическую проверку прошли {verified_count}/{} кандидатов",
+            items.len()
         )
         .into());
     }
 
     println!(
-        "Автоматическая проверка прошла для {verified_count} PNG; ассеты не опубликованы, проверьте изображения вручную. Отчёт: {}",
-        report_dir.join("index.html").display()
+        "Автоматическая проверка прошла для {verified_count} PNG; проверьте изображения вручную в ZIP evidence."
     );
     Ok(())
 }
@@ -291,30 +382,6 @@ fn item_row(item: &PlanItem, codepoint: &str, outcome: &str, extra: Value) -> Va
     row
 }
 
-fn create_report_dir(output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let checkout = checkout_root()?;
-    let report_dir = match output {
-        Some(path) => {
-            let resolved = resolve_new_output_path(path)?;
-            ensure_outside_checkout(&resolved, &checkout)?;
-            fs::create_dir(&resolved)?;
-            resolved
-        }
-        None => {
-            let temp_root = std::env::temp_dir().canonicalize()?;
-            ensure_outside_checkout(&temp_root, &checkout)?;
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let report_dir = temp_root.join(format!(
-                "yarxi-live-acceptance-{}-{timestamp}",
-                std::process::id()
-            ));
-            fs::create_dir(&report_dir)?;
-            report_dir
-        }
-    };
-    Ok(report_dir)
-}
-
 fn checkout_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let package_dir = Path::new(env!("CARGO_MANIFEST_DIR")).canonicalize()?;
     let workspace_root = package_dir
@@ -322,34 +389,6 @@ fn checkout_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .and_then(Path::parent)
         .ok_or("не удалось определить корень checkout")?;
     Ok(workspace_root.canonicalize()?)
-}
-
-fn resolve_new_output_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let file_name = absolute
-        .file_name()
-        .filter(|name| *name != "." && *name != "..")
-        .ok_or("--output должен указывать на новый каталог")?;
-    let parent = absolute
-        .parent()
-        .ok_or("не удалось определить родительский каталог --output")?
-        .canonicalize()?;
-    let resolved = parent.join(file_name);
-    if fs::symlink_metadata(&resolved).is_ok() {
-        return Err(format!("каталог --output уже существует: {}", resolved.display()).into());
-    }
-    Ok(resolved)
-}
-
-fn ensure_outside_checkout(path: &Path, checkout: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if path.starts_with(checkout) {
-        return Err(format!("отчёт должен находиться вне checkout: {}", path.display()).into());
-    }
-    Ok(())
 }
 
 fn read_plan_items(plan: &Value) -> Result<Vec<PlanItem>, Box<dyn std::error::Error>> {
@@ -442,7 +481,7 @@ fn unicode_codepoint(character: &str) -> Result<String, Box<dyn std::error::Erro
 
 fn save_evidence(
     run_status: &str,
-    plan_path: &Path,
+    _plan_path: &Path,
     items: &[PlanItem],
     rows: &[Value],
     report_dir: &Path,
@@ -457,20 +496,22 @@ fn save_evidence(
             }
             map
         });
-    let report = json!({
+    let mut rows = rows.to_vec();
+    rows.iter_mut().for_each(evidence_zip::redact);
+    let mut report = json!({
         "schema_version": 1,
         "run_status": run_status,
-        "plan_path": plan_path.display().to_string(),
         "planned_item_count": items.len(),
         "groups": groups,
         "validator": KanjiImageValidator::validator_identity(),
         "items": rows,
     });
+    evidence_zip::redact(&mut report);
     fs::write(
         report_dir.join("evidence.json"),
         serde_json::to_vec_pretty(&report)?,
     )?;
-    save_html_report(run_status, items, rows, report_dir)?;
+    save_html_report(run_status, items, &rows, report_dir)?;
     Ok(())
 }
 
@@ -772,37 +813,27 @@ mod tests {
     }
 
     #[test]
-    fn report_directory_defaults_to_temp_and_explicit_checkout_output_is_rejected() {
-        let report_dir = create_report_dir(None).unwrap();
+    fn zip_output_is_new_and_outside_checkout_and_run() {
         let checkout = checkout_root().unwrap();
-        let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        assert!(report_dir.starts_with(temp_root));
-        assert!(!report_dir.starts_with(&checkout));
-        fs::remove_dir_all(report_dir).unwrap();
-
-        let checkout_output = checkout.join(".codex/local/acceptance-output");
-        assert!(create_report_dir(Some(&checkout_output)).is_err());
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-output-fixture")
+                .unwrap();
+        let output = workspace.path().join("report.zip");
+        assert!(
+            evidence_zip::resolve_output(Some(&output), &checkout, workspace.path(), "test")
+                .is_err()
+        );
+        let checkout_output = checkout.join("report.zip");
+        assert!(
+            evidence_zip::resolve_output(
+                Some(&checkout_output),
+                &checkout,
+                workspace.path(),
+                "test"
+            )
+            .is_err()
+        );
         assert!(!checkout_output.exists());
-    }
-
-    #[test]
-    fn explicit_output_must_be_new_and_is_created_outside_checkout() {
-        let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let parent = temp_root.join(format!(
-            "yarxi-acceptance-test-{}-{timestamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&parent).unwrap();
-        let output = parent.join("report");
-        let report_dir = create_report_dir(Some(&output)).unwrap();
-        assert_eq!(report_dir, output);
-        assert!(report_dir.is_dir());
-        assert!(create_report_dir(Some(&output)).is_err());
-        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -814,37 +845,24 @@ mod tests {
             ]
         }))
         .unwrap();
-        let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let report_dir = temp_root.join(format!(
-            "yarxi-acceptance-html-test-{}-{timestamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&report_dir).unwrap();
-        save_html_report("test", &items, &[], &report_dir).unwrap();
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
+
+        let report_dir = workspace.path();
+        save_html_report("test", &items, &[], report_dir).unwrap();
         let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
         assert!(html.contains("custom — 1 PNG"));
         assert!(html.contains("Без группы — 1 PNG"));
         assert!(!html.contains("50 тёмных PNG"));
-        fs::remove_dir_all(report_dir).unwrap();
     }
 
     #[test]
     fn evidence_keeps_observed_capture_values_without_a_duplicated_contract() {
         let items = read_plan_items(&json!({ "items": [{ "character": "漢" }] })).unwrap();
-        let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let report_dir = temp_root.join(format!(
-            "yarxi-acceptance-evidence-test-{}-{timestamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&report_dir).unwrap();
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
+
+        let report_dir = workspace.path();
         let rows = [json!({
             "character": "漢",
             "acquisition": {
@@ -860,7 +878,7 @@ mod tests {
             Path::new("external-plan.json"),
             &items,
             &rows,
-            &report_dir,
+            report_dir,
         )
         .unwrap();
         let evidence: Value =
@@ -870,6 +888,5 @@ mod tests {
             evidence["items"][0]["acquisition"]["rendered_font_sample"]["device_scale_factor"],
             2.175
         );
-        fs::remove_dir_all(report_dir).unwrap();
     }
 }

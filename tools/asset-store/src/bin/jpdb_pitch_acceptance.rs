@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use asset_store::domain::AssetDomainPolicy;
 use asset_store::hashing::sha256_hex;
 use asset_store::jpdb::{
-    JpdbPitchOutcome, JpdbPitchProvider, JpdbPitchQuery, JpdbPitchRequest, JpdbPitchSelection,
+    JpdbPitchAcquisitionReport, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchProvider,
+    JpdbPitchQuery, JpdbPitchRequest, JpdbPitchSelection,
 };
 use asset_store::model::{
     AssetIdentity, AssetRecord, DetectedFormat, LifecycleState, Provenance, SemanticStatus,
@@ -20,6 +20,11 @@ use clap::Parser;
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::instrument::WithSubscriber;
+
+#[path = "common/evidence_zip.rs"]
+mod evidence_zip;
+use evidence_zip::EvidenceRun;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,13 +33,22 @@ use serde_json::{Value, json};
 )]
 struct Args {
     /// JSON-план: каждый элемент задаёт `surface` и обязательный `expected_outcome`.
-    /// План и отчёт могут находиться вне checkout.
+    /// План может находиться вне рабочего каталога.
     #[arg(long, value_name = "PATH")]
     plan: PathBuf,
 
-    /// Новый каталог HTML-отчёта вне checkout; родительский каталог должен существовать.
-    #[arg(long, value_name = "DIR")]
+    /// Новый ZIP вне checkout и run workspace; parent должен существовать.
+    /// По умолчанию: системный temp root/anki-decks-evidence/<уникальный run>.zip.
+    #[arg(long, value_name = "ZIP")]
     output: Option<PathBuf>,
+
+    /// Внешний текстовый transcript проверок; безопасная копия попадёт в ZIP.
+    #[arg(long, value_name = "PATH")]
+    transcript: Option<PathBuf>,
+
+    /// JSON результатов fault injection; отдельная безопасная копия в ZIP.
+    #[arg(long, value_name = "PATH")]
+    fault_evidence: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,25 +117,65 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let plan_json: Value = serde_json::from_slice(&fs::read(&plan_path)?)?;
     let items = read_plan_items(&plan_json)?;
 
-    // Все детерминированные ошибки плана и пути --output обнаруживаются до создания
-    // отчёта и запуска браузера.
-    let report_dir = create_report_dir(args.output.as_deref())?;
+    let run = EvidenceRun::start(
+        "jpdb_pitch_acceptance",
+        args.output.as_deref(),
+        &checkout_root()?,
+    )?;
+    if let Some(transcript) = &args.transcript
+        && let Err(error) = run.add_transcript(transcript)
+    {
+        return run.finish(Err(error), Ok(()));
+    }
+    if let Some(source) = &args.fault_evidence
+        && let Err(error) = run.add_fault_evidence(source)
+    {
+        return run.finish(Err(error), Ok(()));
+    }
+    let log = match run.log_guard() {
+        Ok(log) => log,
+        Err(error) => return run.finish(Err(error), Ok(())),
+    };
+    let result = run_body(&items, &plan_path, &run)
+        .with_subscriber(log.dispatch())
+        .await;
+    run.finish(result, log.finish())
+}
+
+async fn run_body(
+    items: &[PlanItem],
+    plan_path: &Path,
+    run: &EvidenceRun,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_dir = run.report_dir();
     let requests = items.iter().map(provider_request).collect::<Vec<_>>();
 
-    let outcomes = JpdbPitchProvider::acquire_requests(&requests).await;
+    let acquisition_report =
+        JpdbPitchProvider::acquire_requests_in_workspace(&requests, run.path()).await;
     let (rows, all_checks_passed) = process_outcomes(
-        &items,
-        &outcomes,
+        items,
+        &acquisition_report,
         &report_dir,
         |index, item, outcome, report_dir| Ok(render_outcome(index, item, outcome, report_dir)),
     );
+
+    for row in &rows {
+        run.event(json!({"event":"item_result", "result":row}))?;
+    }
 
     let run_status = if all_checks_passed {
         "automatic_checks_passed_waiting_for_user_review"
     } else {
         "verification_failed"
     };
-    save_evidence(run_status, &plan_path, &items, &rows, &report_dir)?;
+    save_evidence(
+        run_status,
+        plan_path,
+        items,
+        &rows,
+        &acquisition_report,
+        &report_dir,
+    )?;
 
     let verified_count = rows
         .iter()
@@ -129,16 +183,14 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .count();
     if !all_checks_passed {
         return Err(format!(
-            "Проверка плана не пройдена; подтверждено PNG: {verified_count}/{}; отчёт: {}",
-            items.len(),
-            report_dir.join("index.html").display()
+            "Проверка плана не пройдена; подтверждено PNG: {verified_count}/{}",
+            items.len()
         )
         .into());
     }
 
     println!(
-        "Ожидания плана выполнены; PNG-кандидатов подтверждено: {verified_count}. Ассеты не опубликованы; проверьте исходы и изображения вручную. Отчёт: {}",
-        report_dir.join("index.html").display()
+        "Ожидания плана выполнены; PNG-кандидатов подтверждено: {verified_count}. Проверьте исходы и изображения вручную в ZIP evidence."
     );
     Ok(())
 }
@@ -173,20 +225,26 @@ fn provider_request(item: &PlanItem) -> JpdbPitchRequest {
 
 fn process_outcomes<F>(
     items: &[PlanItem],
-    outcomes: &[JpdbPitchOutcome],
+    acquisition_report: &JpdbPitchAcquisitionReport,
     report_dir: &Path,
     mut render: F,
 ) -> (Vec<Value>, bool)
 where
     F: FnMut(usize, &PlanItem, &JpdbPitchOutcome, &Path) -> Result<(Value, bool), String>,
 {
+    let outcomes = &acquisition_report.outcomes;
     let mut rows = Vec::with_capacity(items.len().max(outcomes.len()));
-    let mut all_checks_passed = outcomes.len() == items.len();
+    let mut all_checks_passed =
+        acquisition_report.session_failure.is_none() && outcomes.len() == items.len();
 
     for (index, item) in items.iter().enumerate() {
         let Some(outcome) = outcomes.get(index) else {
             all_checks_passed = false;
-            rows.push(missing_result_row(index, item));
+            rows.push(if acquisition_report.session_failure.is_some() {
+                not_started_session_failure_row(index, item)
+            } else {
+                missing_result_row(index, item)
+            });
             continue;
         };
 
@@ -282,6 +340,21 @@ fn missing_result_row(index: usize, item: &PlanItem) -> Value {
     row
 }
 
+fn not_started_session_failure_row(index: usize, item: &PlanItem) -> Value {
+    let mut row = base_row(index, item, "not_started");
+    extend_object(
+        &mut row,
+        json!({
+            "item_status": "not_started_session_failure",
+            "session_failure_ref": "#/session_failure",
+            "expectation_status": "not_evaluated",
+            "expectation_issues": ["обработка элемента не началась: сессия браузера остановлена"],
+            "semantic_status": Value::Null,
+        }),
+    );
+    row
+}
+
 fn render_outcome(
     index: usize,
     item: &PlanItem,
@@ -300,7 +373,7 @@ fn render_outcome(
             let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Png);
             let dimensions = decoded.as_ref().ok().map(GenericImageView::dimensions);
 
-            // В отчёт записываются только исходные bytes outcome Acquired. Невалидный PNG
+            // В отчёт записываются только исходные байты результата `Acquired`. Невалидный PNG
             // остаётся доступен как .bin и не встраивается в HTML под видом картинки.
             let extension = if png_signature_valid && dimensions.is_some() {
                 "png"
@@ -322,8 +395,8 @@ fn render_outcome(
                     Ok(domain_metadata) => {
                         let provisional = AssetRecord {
                             identity,
-                            // Временная запись передаёт production validator фактические
-                            // Метаданные provider-а; приёмочный инструмент не создаёт каноническое хранилище.
+                            // Временная запись передаёт действующему валидатору фактические
+                            // метаданные провайдера; приёмочный инструмент не создаёт каноническое хранилище.
                             storage_path: String::new(),
                             consumer_filename: String::new(),
                             sha256: sha256.clone(),
@@ -813,29 +886,6 @@ fn validate_plan_text(
     Ok(())
 }
 
-fn create_report_dir(output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let checkout = checkout_root()?;
-    match output {
-        Some(path) => {
-            let resolved = resolve_new_output_path(path)?;
-            ensure_outside_checkout(&resolved, &checkout)?;
-            fs::create_dir(&resolved)?;
-            Ok(resolved)
-        }
-        None => {
-            let temp_root = std::env::temp_dir().canonicalize()?;
-            ensure_outside_checkout(&temp_root, &checkout)?;
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let report_dir = temp_root.join(format!(
-                "jpdb-live-acceptance-{}-{timestamp}",
-                std::process::id()
-            ));
-            fs::create_dir(&report_dir)?;
-            Ok(report_dir)
-        }
-    }
-}
-
 fn checkout_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let package_dir = Path::new(env!("CARGO_MANIFEST_DIR")).canonicalize()?;
     let workspace_root = package_dir
@@ -845,55 +895,37 @@ fn checkout_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(workspace_root.canonicalize()?)
 }
 
-fn resolve_new_output_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let file_name = absolute
-        .file_name()
-        .filter(|name| *name != "." && *name != "..")
-        .ok_or("--output должен указывать на новый каталог")?;
-    let parent = absolute
-        .parent()
-        .ok_or("не удалось определить родительский каталог --output")?
-        .canonicalize()?;
-    let resolved = parent.join(file_name);
-    if fs::symlink_metadata(&resolved).is_ok() {
-        return Err(format!("каталог --output уже существует: {}", resolved.display()).into());
-    }
-    Ok(resolved)
-}
-
-fn ensure_outside_checkout(path: &Path, checkout: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if path.starts_with(checkout) {
-        return Err(format!("отчёт должен находиться вне checkout: {}", path.display()).into());
-    }
-    Ok(())
-}
-
 fn save_evidence(
     run_status: &str,
-    plan_path: &Path,
+    _plan_path: &Path,
     items: &[PlanItem],
     rows: &[Value],
+    acquisition_report: &JpdbPitchAcquisitionReport,
     report_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let report = json!({
+    let mut rows = rows.to_vec();
+    rows.iter_mut().for_each(evidence_zip::redact);
+    let mut report = json!({
         "schema_version": 2,
         "run_status": run_status,
-        "plan_path": plan_path.display().to_string(),
-        "plan": { "items": items },
         "planned_item_count": items.len(),
+        "processed_item_count": acquisition_report.outcomes.len(),
+        "session_failure": acquisition_report.session_failure,
         "validator": PitchAccentImageValidator::validator_identity(),
         "items": rows,
     });
+    evidence_zip::redact(&mut report);
     fs::write(
         report_dir.join("evidence.json"),
         serde_json::to_vec_pretty(&report)?,
     )?;
-    save_html_report(run_status, items, rows, report_dir)?;
+    save_html_report(
+        run_status,
+        items,
+        &rows,
+        acquisition_report.session_failure.as_ref(),
+        report_dir,
+    )?;
     Ok(())
 }
 
@@ -901,6 +933,7 @@ fn save_html_report(
     run_status: &str,
     items: &[PlanItem],
     rows: &[Value],
+    session_failure: Option<&JpdbPitchFailure>,
     report_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut html = format!(
@@ -928,13 +961,22 @@ small{{color:#505960}}
 <h1>JPDB — приёмка pitch-accent PNG</h1>
 <div class="summary">
 <p><strong>Статус прогона:</strong> {}</p>
-<p>Элементов плана: {}. Для <code>acquired</code> показаны исходные байты из браузера в естественном размере, свидетельства production-валидатора и сверка с ожиданиями.</p>
+<p>Элементов плана: {}. Для <code>acquired</code> показаны исходные байты из браузера в естественном размере, свидетельства действующего валидатора и сверка с ожиданиями.</p>
 <p><a href="evidence.json">Машиночитаемый отчёт (JSON)</a></p>
 </div>
 "##,
         escape_html(run_status),
         items.len()
     );
+
+    if let Some(error) = session_failure {
+        let mut safe_error = serde_json::to_value(error)?;
+        evidence_zip::redact(&mut safe_error);
+        html.push_str(&format!(
+            "<div class=\"summary\" id=\"session-failure\"><p><strong>Ошибка сессии браузера:</strong></p><pre>{}</pre></div>",
+            escape_html(&serde_json::to_string_pretty(&safe_error)?)
+        ));
+    }
 
     html.push_str("<section class=\"items\">");
     for (index, item) in items.iter().enumerate() {
@@ -962,6 +1004,9 @@ fn append_html_item(html: &mut String, index: usize, item: &PlanItem, row: Optio
                 .unwrap_or("provider_result_missing")
         )
     ));
+    if row["session_failure_ref"].as_str().is_some() {
+        html.push_str("<p><a href=\"#session-failure\">Причина остановки сессии браузера</a></p>");
+    }
     if let Some(image_path) = row["image_path"].as_str() {
         if row["image_mime"].as_str() == Some("image/png") {
             html.push_str(&format!(
@@ -1365,6 +1410,212 @@ mod tests {
     }
 
     #[test]
+    fn startup_failure_leaves_every_item_unstarted_without_rendering() {
+        let items = [
+            plan_item(ExpectedOutcome::Acquired),
+            plan_item(ExpectedOutcome::VocabularyNotFound),
+        ];
+        let acquisition_report = JpdbPitchAcquisitionReport {
+            outcomes: Vec::new(),
+            session_failure: Some(JpdbPitchFailure::BrowserSetup {
+                stage: asset_store::jpdb::JpdbPitchStage::ConfigureBrowser,
+                message: "Chromium не запущен".into(),
+            }),
+        };
+        let (rows, passed) = process_outcomes(
+            &items,
+            &acquisition_report,
+            Path::new("synthetic-report"),
+            |_, _, _, _| panic!("необработанный элемент не должен рендериться"),
+        );
+        assert!(!passed);
+        assert_eq!(rows.len(), items.len());
+        for row in rows {
+            assert_eq!(row["outcome"], "not_started");
+            assert_eq!(row["item_status"], "not_started_session_failure");
+            assert_eq!(row["expectation_status"], "not_evaluated");
+            assert_eq!(row["session_failure_ref"], "#/session_failure");
+            assert!(row.get("provider_failure").is_none());
+            assert!(row.get("image_path").is_none());
+        }
+    }
+
+    #[test]
+    fn session_stop_keeps_processed_prefix_and_run_level_evidence() {
+        let items = [
+            plan_item(ExpectedOutcome::VocabularyNotFound),
+            plan_item(ExpectedOutcome::Acquired),
+        ];
+        let failure = JpdbPitchFailure::SessionFailure {
+            stage: asset_store::jpdb::JpdbPitchStage::SearchReadiness,
+            message: "Монитор CDP остановился".into(),
+        };
+        let acquisition_report = JpdbPitchAcquisitionReport {
+            outcomes: vec![JpdbPitchOutcome::VocabularyNotFound {
+                surface: items[0].surface.clone(),
+                reading: items[0].reading.clone(),
+            }],
+            session_failure: Some(failure.clone()),
+        };
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
+
+        let report_dir = workspace.path();
+        let mut rendered_count = 0;
+        let (rows, passed) = process_outcomes(
+            &items,
+            &acquisition_report,
+            report_dir,
+            |index, item, outcome, directory| {
+                rendered_count += 1;
+                Ok(render_outcome(index, item, outcome, directory))
+            },
+        );
+        assert!(!passed);
+        assert_eq!(rendered_count, 1);
+        assert_eq!(rows[0]["outcome"], "vocabulary_not_found");
+        assert_eq!(rows[0]["expectation_status"], "matched");
+        assert_eq!(rows[1]["item_status"], "not_started_session_failure");
+        save_evidence(
+            "verification_failed",
+            Path::new("synthetic-plan.json"),
+            &items,
+            &rows,
+            &acquisition_report,
+            report_dir,
+        )
+        .unwrap();
+        let evidence: Value =
+            serde_json::from_slice(&fs::read(report_dir.join("evidence.json")).unwrap()).unwrap();
+        assert_eq!(
+            evidence["session_failure"],
+            serde_json::to_value(failure).unwrap()
+        );
+        assert_eq!(evidence["processed_item_count"], 1);
+        assert_eq!(evidence["planned_item_count"], 2);
+        assert_eq!(evidence["items"][0], rows[0]);
+        let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
+        assert!(html.contains("Монитор CDP остановился"));
+        assert!(html.contains("href=\"#session-failure\""));
+    }
+
+    #[test]
+    fn session_failure_rejects_run_even_when_every_processed_item_matches() {
+        let items = [plan_item(ExpectedOutcome::VocabularyNotFound)];
+        let acquisition_report = JpdbPitchAcquisitionReport {
+            outcomes: vec![JpdbPitchOutcome::VocabularyNotFound {
+                surface: items[0].surface.clone(),
+                reading: items[0].reading.clone(),
+            }],
+            session_failure: Some(JpdbPitchFailure::SessionFailure {
+                stage: asset_store::jpdb::JpdbPitchStage::PostCaptureVerification,
+                message: "Монитор CDP остановился после последнего элемента".into(),
+            }),
+        };
+        let (rows, passed) = process_outcomes(
+            &items,
+            &acquisition_report,
+            Path::new("synthetic-report"),
+            |index, item, outcome, directory| Ok(render_outcome(index, item, outcome, directory)),
+        );
+        assert!(!passed);
+        assert_eq!(rows[0]["expectation_status"], "matched");
+    }
+
+    #[test]
+    fn saved_typed_failure_is_exported_with_its_exact_text_to_evidence() {
+        use asset_store::jpdb::JpdbPitchStage;
+        use asset_store::pitch_batch::{
+            PitchAccentBatch, PitchAccentBatchRuntime, PitchBatchOutcome,
+        };
+
+        let failures = [
+            JpdbPitchFailure::PageContract {
+                stage: JpdbPitchStage::SearchResolution,
+                message: "Строка JPDB не содержит подтверждённые формы и фактическую ссылку".into(),
+            },
+            JpdbPitchFailure::Telemetry {
+                stage: JpdbPitchStage::PitchInspection,
+                message: "Критический запрос вернул HTTP 503: https://jpdb.io/search".into(),
+            },
+            JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::DetailReadiness,
+                diagnostic: Some("DOM пока не содержит проверяемых форм и блока значений".into()),
+            },
+        ];
+        for failure in failures {
+            let workspace =
+                asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
+
+            let root = workspace.path();
+            let item = plan_item(ExpectedOutcome::Acquired);
+            let mut batch = PitchAccentBatch::new(
+                "typed-failure",
+                vec![provider_request(&item)],
+                PitchAccentImageValidator::validator_identity(),
+            )
+            .unwrap();
+            let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+            batch = runtime.load().unwrap().unwrap();
+            let token = batch.item_token(&item.surface).unwrap();
+            assert!(
+                runtime
+                    .record_outcome(
+                        &mut batch,
+                        &token,
+                        JpdbPitchOutcome::Failed {
+                            error: failure.clone()
+                        }
+                    )
+                    .unwrap()
+            );
+            drop(runtime);
+            let mut runtime = PitchAccentBatchRuntime::open(root, "typed-failure").unwrap();
+            let reloaded = runtime.load().unwrap().unwrap();
+            let PitchBatchOutcome::Failed { error } = &reloaded.items[0].attempts[0].outcome else {
+                panic!("Типизированная ошибка должна сохраниться после загрузки пакета");
+            };
+            let report = JpdbPitchAcquisitionReport {
+                outcomes: vec![JpdbPitchOutcome::Failed {
+                    error: error.clone(),
+                }],
+                session_failure: None,
+            };
+            let directory = root.join("evidence");
+            fs::create_dir(&directory).unwrap();
+            let items = [item];
+            let (rows, passed) = process_outcomes(
+                &items,
+                &report,
+                &directory,
+                |index, item, outcome, directory| {
+                    Ok(render_outcome(index, item, outcome, directory))
+                },
+            );
+            assert!(!passed);
+            save_evidence(
+                "verification_failed",
+                Path::new("synthetic-plan.json"),
+                &items,
+                &rows,
+                &report,
+                &directory,
+            )
+            .unwrap();
+            let evidence: Value =
+                serde_json::from_slice(&fs::read(directory.join("evidence.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                evidence["items"][0]["failure"],
+                serde_json::to_value(failure).unwrap()
+            );
+            assert!(evidence["items"][0].get("dom").is_none());
+            assert!(evidence["items"][0].get("raw_dom").is_none());
+            drop(runtime);
+        }
+    }
+
+    #[test]
     fn an_item_processing_error_keeps_prior_rows_and_final_report_durable() {
         let items = [
             plan_item(ExpectedOutcome::VocabularyNotFound),
@@ -1377,24 +1628,26 @@ mod tests {
                 reading: item.reading.clone(),
             })
             .collect::<Vec<_>>();
-        let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        let report_dir = temp_root.join(format!(
-            "jpdb-report-durability-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&report_dir).unwrap();
+        let acquisition_report = JpdbPitchAcquisitionReport {
+            outcomes,
+            session_failure: None,
+        };
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
 
-        let (rows, passed) =
-            process_outcomes(&items, &outcomes, &report_dir, |index, item, outcome, _| {
+        let report_dir = workspace.path();
+
+        let (rows, passed) = process_outcomes(
+            &items,
+            &acquisition_report,
+            report_dir,
+            |index, item, outcome, _| {
                 if index == 0 {
                     return Err("ошибка обработки синтетического элемента".into());
                 }
-                Ok(render_outcome(index, item, outcome, &report_dir))
-            });
+                Ok(render_outcome(index, item, outcome, report_dir))
+            },
+        );
         assert!(!passed);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["item_status"], "item_processing_failed");
@@ -1405,7 +1658,8 @@ mod tests {
             Path::new("synthetic-plan.json"),
             &items,
             &rows,
-            &report_dir,
+            &acquisition_report,
+            report_dir,
         )
         .unwrap();
         let evidence: Value =
@@ -1413,7 +1667,6 @@ mod tests {
         let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
         assert_eq!(evidence["items"].as_array().unwrap().len(), 2);
         assert!(html.contains("ошибка обработки синтетического элемента"));
-        fs::remove_dir_all(report_dir).unwrap();
     }
 
     #[test]
@@ -1424,42 +1677,51 @@ mod tests {
             "--plan",
             "plan.json",
             "--output",
-            "report-fixture",
+            "report-fixture.zip",
         ])
         .unwrap();
         assert_eq!(args.plan, PathBuf::from("plan.json"));
-        assert_eq!(args.output, Some(PathBuf::from("report-fixture")));
+        assert_eq!(args.output, Some(PathBuf::from("report-fixture.zip")));
     }
 
     #[test]
-    fn reports_must_be_new_and_outside_checkout() {
+    fn zip_outputs_must_be_new_and_outside_checkout() {
         let checkout = checkout_root().unwrap();
-        let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let parent = temp_root.join(format!(
-            "jpdb-acceptance-test-{}-{timestamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&parent).unwrap();
-        let output = parent.join("report");
-        let report_dir = create_report_dir(Some(&output)).unwrap();
-        assert_eq!(report_dir, output);
-        assert!(!report_dir.starts_with(&checkout));
-        assert!(create_report_dir(Some(&output)).is_err());
-        let checkout_output = checkout.join(format!(
-            ".jpdb-acceptance-report-{}-{timestamp}",
-            std::process::id()
-        ));
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-output-fixture")
+                .unwrap();
+        let output = workspace.path().join("report.zip");
+        assert_eq!(
+            evidence_zip::resolve_output(
+                Some(&output),
+                &checkout,
+                Path::new("/nonexistent-run"),
+                "test"
+            )
+            .unwrap(),
+            output
+        );
+        fs::write(&output, b"existing").unwrap();
+        assert!(
+            evidence_zip::resolve_output(
+                Some(&output),
+                &checkout,
+                Path::new("/nonexistent-run"),
+                "test"
+            )
+            .is_err()
+        );
+        let checkout_output = checkout.join("report.zip");
+        assert!(
+            evidence_zip::resolve_output(
+                Some(&checkout_output),
+                &checkout,
+                workspace.path(),
+                "test"
+            )
+            .is_err()
+        );
         assert!(!checkout_output.exists());
-        let error = create_report_dir(Some(&checkout_output))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("отчёт должен находиться вне checkout"));
-        assert!(!checkout_output.exists());
-        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -1472,23 +1734,16 @@ mod tests {
             json!({"item_status": "ambiguous_vocabulary", "outcome": "ambiguous_vocabulary"}),
             json!({"item_status": "candidate_rejected", "outcome": "acquired"}),
         ];
-        let temp_root = std::env::temp_dir().canonicalize().unwrap();
-        let report_dir = temp_root.join(format!(
-            "jpdb-acceptance-html-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&report_dir).unwrap();
-        save_html_report("test", &items, &rows, &report_dir).unwrap();
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
+
+        let report_dir = workspace.path();
+        save_html_report("test", &items, &rows, None, report_dir).unwrap();
         let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
         assert!(html.contains("ambiguous_vocabulary"));
         assert!(html.contains("candidate_rejected"));
         assert!(!html.contains("<img"));
         assert!(!report_dir.join("images").exists());
-        fs::remove_dir_all(report_dir).unwrap();
     }
 
     #[test]

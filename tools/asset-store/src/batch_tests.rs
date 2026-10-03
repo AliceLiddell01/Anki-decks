@@ -1,7 +1,7 @@
 use super::*;
+use crate::temp_workspace::TempWorkspace;
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::sync::atomic::Ordering;
 
 fn validator() -> ValidatorIdentity {
     ValidatorIdentity::new("kanjivg-pixel-chamfer", "synthetic-v1").unwrap()
@@ -77,24 +77,18 @@ fn failed(state: &mut KanjiBatch, character: char) {
 }
 
 struct Temporary {
-    root: PathBuf,
+    workspace: TempWorkspace,
 }
 
 impl Temporary {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "anki-kanji-batch-{}-{}",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).unwrap();
-        Self { root }
+        Self {
+            workspace: TempWorkspace::create("asset-store-kanji-batch-tests").unwrap(),
+        }
     }
-}
 
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.root).unwrap();
+    fn root(&self) -> &std::path::Path {
+        self.workspace.path()
     }
 }
 
@@ -548,7 +542,7 @@ fn state_and_exact_bytes_resume_after_process_restart() {
     let temporary = Temporary::new();
     let mut state = batch(&['漢']);
     {
-        let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+        let mut runtime = BatchRuntime::open(temporary.root(), &state.batch_id).unwrap();
         assert!(runtime.load().unwrap().is_none());
         let bytes = bytes("resume");
         let candidate = runtime
@@ -561,7 +555,7 @@ fn state_and_exact_bytes_resume_after_process_restart() {
         acquire(&mut state, '漢', candidate);
         runtime.save(&state).unwrap();
     }
-    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    let mut runtime = BatchRuntime::open(temporary.root(), &state.batch_id).unwrap();
     let mut recovered = runtime.load().unwrap().unwrap();
     assert_eq!(recovered, state);
     assert!(!recovered.is_resolved());
@@ -589,7 +583,7 @@ fn state_and_exact_bytes_resume_after_process_restart() {
 fn load_rejects_candidate_format_mismatch_before_materialization() {
     let temporary = Temporary::new();
     let state = batch(&['漢']);
-    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    let mut runtime = BatchRuntime::open(temporary.root(), &state.batch_id).unwrap();
     let data = bytes("format-mismatch");
     let candidate = runtime
         .persist_candidate(
@@ -599,7 +593,7 @@ fn load_rejects_candidate_format_mismatch_before_materialization() {
         )
         .unwrap();
     let original_path = temporary
-        .root
+        .root()
         .join(".runtime/batches")
         .join(&state.batch_id)
         .join(&candidate.storage_path);
@@ -608,7 +602,7 @@ fn load_rejects_candidate_format_mismatch_before_materialization() {
     wrong_format.format = DetectedFormat::Png;
     wrong_format.storage_path = candidate_path(&wrong_format.sha256, wrong_format.format).unwrap();
     let mismatched_path = temporary
-        .root
+        .root()
         .join(".runtime/batches")
         .join(&inconsistent.batch_id)
         .join(&wrong_format.storage_path);
@@ -617,7 +611,7 @@ fn load_rejects_candidate_format_mismatch_before_materialization() {
     inconsistent.validate().unwrap();
     fs::write(
         temporary
-            .root
+            .root()
             .join(".runtime/batches")
             .join(&inconsistent.batch_id)
             .join("state.json"),
@@ -634,8 +628,8 @@ fn load_rejects_candidate_format_mismatch_before_materialization() {
 #[test]
 fn runtime_rejects_path_traversal_symlinks_and_changed_bytes() {
     let temporary = Temporary::new();
-    assert!(BatchRuntime::open(&temporary.root, "../escape").is_err());
-    let runtime = BatchRuntime::open(&temporary.root, "safe").unwrap();
+    assert!(BatchRuntime::open(temporary.root(), "../escape").is_err());
+    let runtime = BatchRuntime::open(temporary.root(), "safe").unwrap();
     let data = bytes("safe");
     let mut candidate = runtime
         .persist_candidate(
@@ -652,7 +646,7 @@ fn runtime_rejects_path_traversal_symlinks_and_changed_bytes() {
     );
     candidate.storage_path = original_path;
     let actual_path = temporary
-        .root
+        .root()
         .join(".runtime/batches/safe")
         .join(&candidate.storage_path);
     fs::write(&actual_path, bytes("changed")).unwrap();
@@ -661,7 +655,7 @@ fn runtime_rejects_path_traversal_symlinks_and_changed_bytes() {
         ErrorCode::IntegrityMismatch
     );
     fs::remove_file(&actual_path).unwrap();
-    let outside = temporary.root.join("outside.gif");
+    let outside = temporary.root().join("outside.gif");
     fs::write(&outside, &data).unwrap();
     symlink(&outside, &actual_path).unwrap();
     assert_eq!(
@@ -673,22 +667,22 @@ fn runtime_rejects_path_traversal_symlinks_and_changed_bytes() {
 #[test]
 fn runtime_directory_and_state_symlinks_fail_closed() {
     let temporary = Temporary::new();
-    let outside = temporary.root.join("outside");
+    let outside = temporary.root().join("outside");
     fs::create_dir(&outside).unwrap();
-    symlink(&outside, temporary.root.join(".runtime")).unwrap();
+    symlink(&outside, temporary.root().join(".runtime")).unwrap();
     assert_eq!(
-        BatchRuntime::open(&temporary.root, "safe")
+        BatchRuntime::open(temporary.root(), "safe")
             .unwrap_err()
             .code,
         ErrorCode::BoundaryViolation
     );
-    fs::remove_file(temporary.root.join(".runtime")).unwrap();
-    let mut runtime = BatchRuntime::open(&temporary.root, "safe").unwrap();
+    fs::remove_file(temporary.root().join(".runtime")).unwrap();
+    let mut runtime = BatchRuntime::open(temporary.root(), "safe").unwrap();
     let outside_state = outside.join("state.json");
     fs::write(&outside_state, "{}").unwrap();
     symlink(
         &outside_state,
-        temporary.root.join(".runtime/batches/safe/state.json"),
+        temporary.root().join(".runtime/batches/safe/state.json"),
     )
     .unwrap();
     assert_eq!(
@@ -702,17 +696,17 @@ fn interrupted_temporary_write_does_not_replace_durable_state() {
     let temporary = Temporary::new();
     let state = batch(&['漢']);
     {
-        let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+        let mut runtime = BatchRuntime::open(temporary.root(), &state.batch_id).unwrap();
         runtime.save(&state).unwrap();
         fs::write(
             temporary
-                .root
+                .root()
                 .join(".runtime/batches/synthetic-batch/.tmp-interrupted"),
             "{truncated",
         )
         .unwrap();
     }
-    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    let mut runtime = BatchRuntime::open(temporary.root(), &state.batch_id).unwrap();
     assert_eq!(runtime.load().unwrap().unwrap(), state);
     let mut altered = state.clone();
     altered.schema_version = 999;
@@ -724,7 +718,7 @@ fn interrupted_temporary_write_does_not_replace_durable_state() {
 fn review_references_exact_gif_and_escapes_machine_evidence() {
     let temporary = Temporary::new();
     let mut state = batch(&['漢']);
-    let mut runtime = BatchRuntime::open(&temporary.root, &state.batch_id).unwrap();
+    let mut runtime = BatchRuntime::open(temporary.root(), &state.batch_id).unwrap();
     let data = bytes("review");
     let mut automated = record(&data, SemanticStatus::Uncertain, 0.03, 0.001);
     automated.evidence[0].summary = "<script>alert('unsafe')</script>".into();
