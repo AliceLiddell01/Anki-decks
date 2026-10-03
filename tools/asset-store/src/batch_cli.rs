@@ -957,7 +957,7 @@ fn execute_command_with_snapshots_and_progress(
         }
         BatchCommand::Run { batch_id, rounds } => {
             let mut acquisition_run = None;
-            let (state, changed, issues) = run_batch_with_stream_and_progress(
+            let result = run_batch_with_stream_and_progress(
                 store,
                 batch_id,
                 *rounds,
@@ -973,7 +973,33 @@ fn execute_command_with_snapshots_and_progress(
                 },
                 reader,
                 progress,
-            )?;
+            );
+            // Сессии закрыты acquire; owner всего временного run дерева закрывается
+            // при успехе, ошибке consumer/provider и обработанном Ctrl+C.
+            let cleanup = acquisition_run.take().map_or(Ok(()), AcquisitionRun::close);
+            if let Err(error) = cleanup {
+                let message = match error {
+                    AcquisitionStreamError::Provider(message) => message,
+                    AcquisitionStreamError::Consumer(error) => error.to_string(),
+                    AcquisitionStreamError::Interrupted => {
+                        "acquisition_interrupted: получен Ctrl+C".into()
+                    }
+                };
+                tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %safe_message(&message), "Не удалось закрыть временное дерево получения кандзи");
+                return Err(AssetError::with_details(
+                    ErrorCode::IoFailure,
+                    format!("temp_workspace_cleanup_failed: {message}"),
+                    serde_json::json!({
+                        "cleanup_failure": message,
+                        "original_error": result.err().map(|original| serde_json::json!({
+                            "code": original.code.as_str(),
+                            "message": original.message,
+                            "details": original.details,
+                        })),
+                    }),
+                ));
+            }
+            let (state, changed, issues) = result?;
             let resolved = state.is_resolved();
             let outcome = if resolved {
                 "resolved"
@@ -2324,6 +2350,7 @@ mod tests;
 #[cfg(test)]
 mod snapshot_cost_tests {
     use super::*;
+    use crate::temp_workspace::TempWorkspace;
 
     struct CountedSnapshots {
         records: Vec<AssetRecord>,
@@ -2341,8 +2368,8 @@ mod snapshot_cost_tests {
     /// повторное `read_verified` для каждого элемента не сможет незаметно пройти.
     #[test]
     fn thousand_ready_identities_use_bounded_full_owner_snapshots() {
-        let directory = std::env::temp_dir().join(generated_batch_id().unwrap());
-        std::fs::create_dir_all(&directory).unwrap();
+        let workspace = TempWorkspace::create("asset-store-batch-snapshot-cost-test").unwrap();
+        let directory = workspace.path();
         let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
         let summary = StoreSummary {
             path: store.root().display().to_string(),
@@ -2482,7 +2509,6 @@ mod snapshot_cost_tests {
             reader.captures, 3,
             "начальный снимок + один снимок границы обработки + итоговый снимок"
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -2490,6 +2516,7 @@ mod snapshot_cost_tests {
 mod candidate_cost_tests {
     use super::*;
     use crate::batch::CANDIDATE_FILE_READS;
+    use crate::temp_workspace::TempWorkspace;
 
     /// Цикл сохранения проверяет состояние после каждого элемента, поэтому
     /// повторная проверка всех файлов кандидатов давала бы квадратичный обход.
@@ -2498,8 +2525,8 @@ mod candidate_cost_tests {
     #[test]
     fn frontier_round_reads_each_candidate_a_bounded_number_of_times() {
         const ITEMS: u32 = 200;
-        let directory = std::env::temp_dir().join(generated_batch_id().unwrap());
-        std::fs::create_dir_all(&directory).unwrap();
+        let workspace = TempWorkspace::create("asset-store-batch-candidate-cost-test").unwrap();
+        let directory = workspace.path();
         let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
         let summary = StoreSummary {
             path: store.root().display().to_string(),
@@ -2563,7 +2590,6 @@ mod candidate_cost_tests {
             reads <= 8 * ITEMS as usize,
             "candidate-файлы перечитаны {reads} раз при {ITEMS} identity"
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn synthetic_png(index: u8) -> Vec<u8> {

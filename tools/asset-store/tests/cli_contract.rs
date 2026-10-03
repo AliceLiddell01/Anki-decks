@@ -1,33 +1,24 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asset_store::hashing::sha256_hex;
+use asset_store::temp_workspace::TempWorkspace;
 
-static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-struct TempDir(std::path::PathBuf);
+struct TempDir {
+    workspace: TempWorkspace,
+}
 
 impl TempDir {
     fn new() -> Self {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("kanji-assets-cli-{}-{counter}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(path.join("repository/decks"))
+        let workspace = TempWorkspace::create("kanji-assets-cli").expect("fixture root создаётся");
+        fs::create_dir_all(workspace.path().join("repository/decks"))
             .expect("создаётся корень тестового репозитория");
-        Self(path)
+        Self { workspace }
     }
 
     fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        self.workspace.path()
     }
 }
 

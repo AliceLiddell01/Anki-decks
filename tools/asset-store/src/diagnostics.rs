@@ -557,38 +557,27 @@ fn bound_text(value: &str, maximum: usize) -> String {
 mod tests {
     use std::fs;
     use std::io::{self, Write};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::Value;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{OutputMode, RunLogGuard, safe_message, safe_route};
+    use crate::temp_workspace::TempWorkspace;
 
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    struct TemporaryDirectory(std::path::PathBuf);
+    struct TemporaryDirectory {
+        workspace: TempWorkspace,
+    }
 
     impl TemporaryDirectory {
         fn new() -> Self {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "asset-store-diagnostics-{}-{timestamp}-{}",
-                std::process::id(),
-                TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
+            Self {
+                workspace: TempWorkspace::create("asset-store-diagnostics-tests").unwrap(),
+            }
         }
-    }
 
-    impl Drop for TemporaryDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+        fn path(&self) -> &std::path::Path {
+            self.workspace.path()
         }
     }
 
@@ -620,7 +609,7 @@ mod tests {
     #[test]
     fn file_layer_is_valid_ndjson_without_ansi_and_flushes_before_finish_returns() {
         let temporary = TemporaryDirectory::new();
-        let path = temporary.0.join("run.jsonl");
+        let path = temporary.path().join("run.jsonl");
         let file = fs::File::create(&path).unwrap();
         let logger = RunLogGuard::with_buffered_lines(file, OutputMode::Json, 1);
         logger.with_default(|| {
@@ -700,7 +689,7 @@ mod tests {
         let temporary = TemporaryDirectory::new();
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
-        let human_log = fs::File::create(temporary.0.join("human.jsonl")).unwrap();
+        let human_log = fs::File::create(temporary.path().join("human.jsonl")).unwrap();
         let logger = RunLogGuard::with_buffered_lines_and_terminal_writer(
             human_log,
             OutputMode::Human,
@@ -714,7 +703,7 @@ mod tests {
         assert!(stdout.0.lock().unwrap().is_empty());
 
         let json_stderr = SharedBuffer::default();
-        let json_log = fs::File::create(temporary.0.join("json.jsonl")).unwrap();
+        let json_log = fs::File::create(temporary.path().join("json.jsonl")).unwrap();
         let logger = RunLogGuard::with_buffered_lines_and_terminal_writer(
             json_log,
             OutputMode::Json,

@@ -5050,24 +5050,22 @@ mod tests {
     use super::*;
     use crate::model::{SemanticDecision, ValidationEvidence};
 
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    use crate::temp_workspace::TempWorkspace;
 
-    struct TempDir(PathBuf);
+    struct TempDir {
+        workspace: TempWorkspace,
+    }
 
     impl TempDir {
         fn new() -> Self {
-            let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("asset-store-unit-{}-{count}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("временный корневой каталог теста");
-            Self(path)
+            Self {
+                workspace: TempWorkspace::create("asset-store-store-tests")
+                    .expect("создаётся временный корневой каталог теста"),
+            }
         }
-    }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+        fn path(&self) -> &Path {
+            self.workspace.path()
         }
     }
 
@@ -5104,7 +5102,7 @@ mod tests {
     #[test]
     fn verified_snapshot_is_read_only_and_rechecks_the_returned_bytes() {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
         let identity = AssetIdentity::new("kanji", "一").unwrap();
         store
@@ -5155,7 +5153,7 @@ mod tests {
     #[test]
     fn verified_snapshot_rejects_symlink_replacement_after_validation() {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
         let identity = AssetIdentity::new("kanji", "二").unwrap();
         store
@@ -5173,7 +5171,7 @@ mod tests {
                 &VerifiedValidator,
             )
             .unwrap();
-        let outside = temp.0.join("outside.gif");
+        let outside = temp.path().join("outside.gif");
         fs::write(&outside, b"GIF89a-original").unwrap();
         let error = AssetStore::read_verified_snapshot(
             &root,
@@ -5193,7 +5191,7 @@ mod tests {
     #[test]
     fn layout_migration_recovery_rolls_back_or_finishes_by_manifest_commit() {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
         let identity = AssetIdentity::new("kanji", "元").unwrap();
         let record = store
@@ -5287,10 +5285,10 @@ mod tests {
     #[test]
     fn failed_manifest_publication_cannot_leave_false_verified_state() {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store =
             AssetStore::open(StoreOptions::new(&root)).expect("пустое хранилище открывается");
-        let source = temp.0.join("source.bin");
+        let source = temp.path().join("source.bin");
         fs::write(&source, b"publication failure fixture").expect("исходный файл записан");
         store
             .ingest(IngestRequest {
@@ -5330,7 +5328,7 @@ mod tests {
     #[test]
     fn removal_recovers_after_manifest_commit_before_byte_deletion() {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
         let record = store
             .ingest_verified(
@@ -5379,9 +5377,9 @@ mod tests {
     fn canonical_transition_recovery_keeps_verified_result() {
         for through_validation in [false, true] {
             let temp = TempDir::new();
-            let root = temp.0.join("store");
+            let root = temp.path().join("store");
             let store = AssetStore::open_kanji(StoreOptions::new(&root)).unwrap();
-            let source = temp.0.join("candidate.gif");
+            let source = temp.path().join("candidate.gif");
             let bytes = b"GIF89a pending to verified fixture";
             fs::write(&source, bytes).unwrap();
             let identity = AssetIdentity::new("kanji", "日").unwrap();
@@ -5431,7 +5429,7 @@ mod tests {
     #[test]
     fn failed_kanji_cas_manifest_write_restores_previous_stable_bytes() {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store =
             AssetStore::open_kanji(StoreOptions::new(&root)).expect("пустое хранилище открывается");
         let validator = VerifiedValidator;
@@ -5496,7 +5494,7 @@ mod tests {
     #[test]
     fn reopening_after_interrupted_kanji_cas_restores_previous_verified_bytes() {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store =
             AssetStore::open_kanji(StoreOptions::new(&root)).expect("пустое хранилище открывается");
         let previous_bytes = b"GIF89a durable previous fixture".to_vec();
@@ -5585,7 +5583,7 @@ mod tests {
 
     fn run_serialization_probe(contested_identity: bool) {
         let temp = TempDir::new();
-        let root = temp.0.join("store");
+        let root = temp.path().join("store");
         let store =
             Arc::new(AssetStore::open(StoreOptions::new(&root)).expect("хранилище открывается"));
         let before_count = Arc::new(AtomicUsize::new(0));
@@ -5638,8 +5636,8 @@ mod tests {
             after_lock,
         }));
 
-        let first_source = temp.0.join("first.bin");
-        let second_source = temp.0.join("second.bin");
+        let first_source = temp.path().join("first.bin");
+        let second_source = temp.path().join("second.bin");
         fs::write(&first_source, b"first writer bytes").expect("первый исходный файл записан");
         fs::write(&second_source, b"second writer bytes").expect("второй исходный файл записан");
         let first_store = Arc::clone(&store);
@@ -5716,9 +5714,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new();
-        let parent = temp.0.join("requested-parent");
-        let moved_parent = temp.0.join("moved-parent");
-        let outside = temp.0.join("outside");
+        let parent = temp.path().join("requested-parent");
+        let moved_parent = temp.path().join("moved-parent");
+        let outside = temp.path().join("outside");
         fs::create_dir(&parent).expect("запрошенный родительский каталог существует");
         fs::create_dir(&outside).expect("каталог — цель символической ссылки — существует");
         let requested_root = parent.join("store");

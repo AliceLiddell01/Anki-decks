@@ -1,8 +1,7 @@
 use super::*;
+use crate::temp_workspace::TempWorkspace;
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+use std::sync::atomic::Ordering;
 
 fn read_kanji_verified(
     root: impl AsRef<std::path::Path>,
@@ -18,19 +17,18 @@ fn read_kanji_verified(
 }
 
 struct Fixture {
-    directory: PathBuf,
     store: AssetStore,
+    workspace: TempWorkspace,
 }
 impl Fixture {
     fn new() -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "kanji-batch-cli-{}-{}",
-            std::process::id(),
-            TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        let store = AssetStore::open_kanji(StoreOptions::new(directory.join("corpus"))).unwrap();
-        Self { directory, store }
+        let workspace = TempWorkspace::create("asset-store-kanji-batch-cli-tests").unwrap();
+        let store =
+            AssetStore::open_kanji(StoreOptions::new(workspace.path().join("corpus"))).unwrap();
+        Self { store, workspace }
+    }
+    fn directory(&self) -> &std::path::Path {
+        self.workspace.path()
     }
     fn start(&self, id: &str, characters: &[char]) {
         let (_, code) = execute_command(
@@ -60,12 +58,6 @@ impl Fixture {
         }
     }
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
-}
-
 #[derive(Default)]
 struct CapturedProgress {
     events: Vec<BatchProgressEvent>,
@@ -1033,7 +1025,7 @@ fn confirm_of_exact_asset_without_valid_automated_evidence_does_not_approve_owne
 #[test]
 fn exact_source_cas_fails_before_manifest_mutation() {
     let fixture = Fixture::new();
-    let source = fixture.directory.join("candidate.png");
+    let source = fixture.directory().join("candidate.png");
     fs::write(&source, glyph('元')).unwrap();
     let before = fixture.store.verify_integrity().unwrap();
     let error = fixture
@@ -1291,7 +1283,7 @@ fn targeted_owner_validation_leaves_unrelated_pending_candidate_untouched() {
     let mut hashes = Vec::new();
     for (index, character) in ['漢', '字'].into_iter().enumerate() {
         let bytes = glyph('元');
-        let path = fixture.directory.join(format!("candidate-{index}.png"));
+        let path = fixture.directory().join(format!("candidate-{index}.png"));
         fs::write(&path, &bytes).unwrap();
         let outcome = fixture
             .store

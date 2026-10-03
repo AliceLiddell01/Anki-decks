@@ -30,6 +30,7 @@ use crate::pitch_batch::{
     is_retryable_failure,
 };
 use crate::store::{AssetStore, HumanAttestationRequest, StoreOptions, VerifiedIngestRequest};
+use crate::temp_workspace::TempWorkspace;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1772,15 +1773,22 @@ trait PitchRunDriver {
         request: &JpdbPitchRequest,
     ) -> JpdbPitchAcquisitionReport;
     async fn close(&mut self, session: Self::Session);
+
+    async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
+        self.close(session).await;
+        Ok(())
+    }
 }
 
-struct JpdbRunDriver;
+struct JpdbRunDriver<'a> {
+    workspace: &'a Path,
+}
 
-impl PitchRunDriver for JpdbRunDriver {
+impl PitchRunDriver for JpdbRunDriver<'_> {
     type Session = BrowserSession;
 
     async fn launch(&mut self) -> Result<Self::Session, String> {
-        BrowserSession::launch(pitch_browser_runtime_config()).await
+        BrowserSession::launch_in_workspace(pitch_browser_runtime_config(), self.workspace).await
     }
 
     async fn acquire(
@@ -1792,7 +1800,11 @@ impl PitchRunDriver for JpdbRunDriver {
     }
 
     async fn close(&mut self, session: Self::Session) {
-        session.close().await;
+        let _ = self.close_checked(session).await;
+    }
+
+    async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
+        session.close().await
     }
 }
 
@@ -2127,6 +2139,34 @@ async fn run_batch(
     output: OutputFormat,
     operation: &'static str,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
+    let workspace = TempWorkspace::create("pitch-batch-run")
+        .map_err(|error| AssetError::io("создание временного дерева pitch", error))?;
+    let result = run_batch_in_workspace(store, batch_id, output, operation, workspace.path()).await;
+    match workspace.close() {
+        Ok(()) => result,
+        Err(error) => {
+            tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %safe_message(&error.to_string()), "Не удалось удалить временное дерево pitch");
+            Err(pitch_run_stopped(
+                "temp_workspace_cleanup_failed",
+                format!(
+                    "{}; temp cleanup: {error}",
+                    result.err().map_or_else(
+                        || "получение завершено".into(),
+                        |original| original.to_string()
+                    )
+                ),
+            ))
+        }
+    }
+}
+
+async fn run_batch_in_workspace(
+    store: &AssetStore,
+    batch_id: &str,
+    output: OutputFormat,
+    operation: &'static str,
+    workspace: &Path,
+) -> Result<(PitchAccentBatch, bool), AssetError> {
     let mut listener = PitchCtrlCListener(tokio::spawn(tokio::signal::ctrl_c()));
     let interruption = async {
         match (&mut listener.0).await {
@@ -2139,7 +2179,7 @@ async fn run_batch(
         store,
         batch_id,
         operation,
-        &mut JpdbRunDriver,
+        &mut JpdbRunDriver { workspace },
         &mut PitchStderrProgressSink(output),
         PitchRunPolicy::default(),
         interruption,
@@ -2396,7 +2436,7 @@ async fn run_batch_with_driver(
     let mut session_started = Instant::now();
     let mut session_items = 0;
     let mut session_index = 0;
-    let result = async {
+    let mut result = async {
         for (token, request, attempt) in acquisitions {
             // Обработчик может увидеть сигнал во время синхронной записи результата
             // или публикации. Проверяем его до начала следующей записи, даже если
@@ -2419,7 +2459,10 @@ async fn run_batch_with_driver(
                         reason,
                         "закрытие сессии перед ротацией"
                     );
-                    driver.close(active).await;
+                    driver
+                        .close_checked(active)
+                        .await
+                        .map_err(|message| pitch_run_stopped("browser_cleanup_failed", message))?;
                 }
                 let ended_context = PitchProgressContext {
                     session: Some(session_index),
@@ -2559,7 +2602,16 @@ async fn run_batch_with_driver(
             session = session_index,
             "закрытие активной сессии после получения"
         );
-        driver.close(active).await;
+        if let Err(message) = driver.close_checked(active).await {
+            let original = result.err();
+            result = Err(pitch_run_stopped(
+                "browser_cleanup_failed",
+                match original {
+                    Some(original) => format!("{original}; {message}"),
+                    None => message,
+                },
+            ));
+        }
         let reason = result
             .as_ref()
             .err()

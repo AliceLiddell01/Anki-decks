@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use asset_store::temp_workspace::TempWorkspace;
 use serde_json::{Value, json};
 
 /// Путь к собранному test-binary `anki-repo`.
@@ -23,24 +23,19 @@ pub fn cli_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_anki-repo"))
 }
 
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 /// Временный каталог, удаляемый при разрушении.
 pub struct TempDir {
+    workspace: TempWorkspace,
     path: PathBuf,
 }
 
 impl TempDir {
     /// Создаёт пустой временный каталог.
     pub fn new(label: &str) -> Self {
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "anki-repo-test-{}-{label}-{unique}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("временный каталог должен создаваться");
-        Self { path }
+        let workspace = TempWorkspace::create(label).expect("временный каталог должен создаваться");
+        let path = workspace.path().join("fixture");
+        fs::create_dir(&path).expect("каталог fixture должен создаваться");
+        Self { workspace, path }
     }
 
     /// Путь каталога.
@@ -56,7 +51,7 @@ impl TempDir {
 
     /// Записывает `deck.json` из готового текста.
     pub fn write_raw_deck_json(&self, text: &str) {
-        fs::write(self.path.join("deck.json"), text).expect("deck.json должен записаться");
+        fs::write(self.path().join("deck.json"), text).expect("deck.json должен записаться");
     }
 
     /// Записывает `deck.json` в канонической форме, которую требует `edit`.
@@ -68,12 +63,12 @@ impl TempDir {
 
     /// Записывает `deck.json` из готовых байтов.
     pub fn write_deck_json_bytes(&self, bytes: &[u8]) {
-        fs::write(self.path.join("deck.json"), bytes).expect("deck.json должен записаться");
+        fs::write(self.path().join("deck.json"), bytes).expect("deck.json должен записаться");
     }
 
     /// Читает текущие байты `deck.json`.
     pub fn deck_json_bytes(&self) -> Vec<u8> {
-        fs::read(self.path.join("deck.json")).expect("deck.json должен читаться")
+        fs::read(self.path().join("deck.json")).expect("deck.json должен читаться")
     }
 
     /// Читает текущий `deck.json` как JSON.
@@ -87,7 +82,7 @@ impl TempDir {
     /// Содержимое задаётся явно, потому что два состояния могут содержать
     /// одноимённый файл с разными байтами — именно это и проверяет отчёт.
     pub fn write_media_bytes(&self, name: &str, bytes: &[u8]) {
-        let media = self.path.join("media");
+        let media = self.path().join("media");
         fs::create_dir_all(&media).expect("media должен создаваться");
         fs::write(media.join(name), bytes)
             .unwrap_or_else(|error| panic!("файл media {name}: {error}"));
@@ -95,18 +90,12 @@ impl TempDir {
 
     /// Создаёт каталог `media/` с указанными именами файлов.
     pub fn write_media(&self, names: &[&str]) {
-        let media = self.path.join("media");
+        let media = self.path().join("media");
         fs::create_dir_all(&media).expect("media должен создаваться");
         for name in names {
             fs::write(media.join(name), b"binary")
                 .unwrap_or_else(|error| panic!("файл media {name}: {error}"));
         }
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -763,4 +752,21 @@ pub fn single_line_change(source: &[u8], candidate: &[u8]) -> (String, String) {
         String::from_utf8(left[position].clone()).expect("utf-8"),
         String::from_utf8(right[position].clone()).expect("utf-8"),
     )
+}
+
+#[cfg(test)]
+mod temp_dir_tests {
+    use super::TempDir;
+
+    #[test]
+    fn dropping_fixture_removes_its_workspace() {
+        let path = {
+            let dir = TempDir::new("anki-repo-integration-drop");
+            let path = dir.path().to_path_buf();
+            assert!(path.is_dir());
+            path
+        };
+
+        assert!(!path.exists());
+    }
 }

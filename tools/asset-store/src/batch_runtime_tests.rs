@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,26 +8,26 @@ use crate::batch_runtime::{
     REFERENCED_BLOB_READS, RuntimeBatchState, RuntimeBlobRef, SafeBatchRuntime, create_log_file,
 };
 use crate::error::{AssetError, ErrorCode};
+use crate::temp_workspace::TempWorkspace;
 
-static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TemporaryDirectory(PathBuf);
+struct TemporaryDirectory {
+    _workspace: TempWorkspace,
+    path: PathBuf,
+}
 
 impl TemporaryDirectory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "asset-store-generic-batch-{}-{}",
-            std::process::id(),
-            TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
+        let workspace = TempWorkspace::create("asset-store-generic-batch-tests").unwrap();
+        let path = workspace.path().join("fixture");
         fs::create_dir(&path).unwrap();
-        Self(path)
+        Self {
+            _workspace: workspace,
+            path,
+        }
     }
-}
 
-impl Drop for TemporaryDirectory {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -71,7 +70,7 @@ fn generic_runtime_resumes_non_image_state_and_exact_blob_bytes() {
     let temporary = TemporaryDirectory::new();
     let bytes = "обычный текст, не изображение".as_bytes();
     let state = {
-        let mut runtime = SafeBatchRuntime::open(&temporary.0, "plain-text").unwrap();
+        let mut runtime = SafeBatchRuntime::open(temporary.path(), "plain-text").unwrap();
         assert!(runtime.load::<PlainTextBatch>().unwrap().is_none());
         let blob = runtime.persist_blob(bytes, "bin").unwrap();
         let state = PlainTextBatch {
@@ -85,7 +84,7 @@ fn generic_runtime_resumes_non_image_state_and_exact_blob_bytes() {
         state
     };
 
-    let mut runtime = SafeBatchRuntime::open(&temporary.0, "plain-text").unwrap();
+    let mut runtime = SafeBatchRuntime::open(temporary.path(), "plain-text").unwrap();
     let resumed = runtime.load::<PlainTextBatch>().unwrap().unwrap();
     assert_eq!(resumed, state);
     assert_eq!(
@@ -97,7 +96,7 @@ fn generic_runtime_resumes_non_image_state_and_exact_blob_bytes() {
 #[test]
 fn unlocking_invalidates_stale_save_and_reload_preserves_verified_blob_cache() {
     let temporary = TemporaryDirectory::new();
-    let mut runtime_a = SafeBatchRuntime::open(&temporary.0, "shared-state").unwrap();
+    let mut runtime_a = SafeBatchRuntime::open(temporary.path(), "shared-state").unwrap();
     let blob = runtime_a.persist_blob(b"immutable", "bin").unwrap();
     let initial = PlainTextBatch {
         schema_version: 1,
@@ -111,7 +110,7 @@ fn unlocking_invalidates_stale_save_and_reload_preserves_verified_blob_cache() {
     runtime_a.release_lock().unwrap();
 
     let updated = {
-        let mut runtime_b = SafeBatchRuntime::open(&temporary.0, "shared-state").unwrap();
+        let mut runtime_b = SafeBatchRuntime::open(temporary.path(), "shared-state").unwrap();
         let mut updated = runtime_b.load::<PlainTextBatch>().unwrap().unwrap();
         updated.revision = 2;
         updated.description = "сохранено другим владельцем".into();
@@ -125,7 +124,12 @@ fn unlocking_invalidates_stale_save_and_reload_preserves_verified_blob_cache() {
     let error = runtime_a.save(&stale).unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidTransition);
     let saved: PlainTextBatch = serde_json::from_slice(
-        &fs::read(temporary.0.join(".runtime/batches/shared-state/state.json")).unwrap(),
+        &fs::read(
+            temporary
+                .path()
+                .join(".runtime/batches/shared-state/state.json"),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(saved, updated);
@@ -150,7 +154,7 @@ fn unlocking_invalidates_stale_save_and_reload_preserves_verified_blob_cache() {
 #[test]
 fn relocked_empty_runtime_also_requires_a_new_load() {
     let temporary = TemporaryDirectory::new();
-    let mut runtime = SafeBatchRuntime::open(&temporary.0, "empty-state").unwrap();
+    let mut runtime = SafeBatchRuntime::open(temporary.path(), "empty-state").unwrap();
     assert!(runtime.load::<PlainTextBatch>().unwrap().is_none());
     let state = PlainTextBatch {
         schema_version: 1,
@@ -172,7 +176,7 @@ fn relocked_empty_runtime_also_requires_a_new_load() {
 #[test]
 fn run_logs_are_unique_and_writer_survives_unlock_and_runtime_drop() {
     let temporary = TemporaryDirectory::new();
-    let mut runtime = SafeBatchRuntime::open(&temporary.0, "diagnostic").unwrap();
+    let mut runtime = SafeBatchRuntime::open(temporary.path(), "diagnostic").unwrap();
     let mut first = runtime.create_run_log().unwrap();
     first.file.write_all(b"{\"event\":\"started\"}\n").unwrap();
     let second = runtime.create_run_log().unwrap();
@@ -182,7 +186,7 @@ fn run_logs_are_unique_and_writer_survives_unlock_and_runtime_drop() {
     assert_eq!(
         first.path,
         temporary
-            .0
+            .path()
             .join(".runtime/batches/diagnostic/logs")
             .join(format!("{}.jsonl", first.run_id))
     );
@@ -203,24 +207,27 @@ fn run_log_collision_never_overwrites_existing_files_or_follows_symlinks() {
     use std::os::unix::fs::symlink;
 
     let temporary = TemporaryDirectory::new();
-    let directory = fs::File::open(&temporary.0).unwrap();
+    let directory = fs::File::open(temporary.path()).unwrap();
     let mut writer = create_log_file(&directory, "run.jsonl").unwrap().unwrap();
     writer.write_all(b"original\n").unwrap();
     drop(writer);
     assert!(create_log_file(&directory, "run.jsonl").unwrap().is_none());
     assert_eq!(
-        fs::read(temporary.0.join("run.jsonl")).unwrap(),
+        fs::read(temporary.path().join("run.jsonl")).unwrap(),
         b"original\n"
     );
 
-    fs::write(temporary.0.join("outside"), b"untouched").unwrap();
-    symlink("outside", temporary.0.join("linked.jsonl")).unwrap();
+    fs::write(temporary.path().join("outside"), b"untouched").unwrap();
+    symlink("outside", temporary.path().join("linked.jsonl")).unwrap();
     assert!(
         create_log_file(&directory, "linked.jsonl")
             .unwrap()
             .is_none()
     );
-    assert_eq!(fs::read(temporary.0.join("outside")).unwrap(), b"untouched");
+    assert_eq!(
+        fs::read(temporary.path().join("outside")).unwrap(),
+        b"untouched"
+    );
     assert_eq!(
         create_log_file(&directory, "../escape.jsonl")
             .unwrap_err()
@@ -235,15 +242,15 @@ fn run_log_creation_rejects_symlinked_logs_directory() {
 
     let temporary = TemporaryDirectory::new();
     let outside = TemporaryDirectory::new();
-    let runtime = SafeBatchRuntime::open(&temporary.0, "linked-logs").unwrap();
+    let runtime = SafeBatchRuntime::open(temporary.path(), "linked-logs").unwrap();
     symlink(
-        &outside.0,
-        temporary.0.join(".runtime/batches/linked-logs/logs"),
+        outside.path(),
+        temporary.path().join(".runtime/batches/linked-logs/logs"),
     )
     .unwrap();
     assert_eq!(
         runtime.create_run_log().unwrap_err().code,
         ErrorCode::BoundaryViolation
     );
-    assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }

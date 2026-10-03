@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -12,6 +13,7 @@ use crate::browser_runtime::{
 };
 pub use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
 use crate::error::AssetError;
+use crate::temp_workspace::TempWorkspace;
 use base64::Engine as _;
 use chromiumoxide::{
     Page,
@@ -737,7 +739,38 @@ pub fn acquire_many_stream_with_target<F>(
 where
     F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
 {
-    AcquisitionRun::new()?.acquire_with_target(characters, allow_insecure_tls, target, on_event)
+    let mut run = AcquisitionRun::new()?;
+    let result = run.acquire_with_target(characters, allow_insecure_tls, target, on_event);
+    finish_acquisition_run(result, run.close())
+}
+
+/// Заимствует единое временное дерево acceptance, сохраняя исходную границу Ctrl+C.
+pub fn acquire_many_stream_with_target_in_workspace<F>(
+    characters: &[String],
+    allow_insecure_tls: bool,
+    target: AcquisitionTarget,
+    workspace: &Path,
+    on_event: F,
+) -> Result<AcquisitionSummary, AcquisitionStreamError>
+where
+    F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+{
+    let mut run = AcquisitionRun::new_in_workspace(workspace)?;
+    let result = run.acquire_with_target(characters, allow_insecure_tls, target, on_event);
+    finish_acquisition_run(result, run.close())
+}
+
+fn finish_acquisition_run(
+    result: Result<AcquisitionSummary, AcquisitionStreamError>,
+    cleanup: Result<(), AcquisitionStreamError>,
+) -> Result<AcquisitionSummary, AcquisitionStreamError> {
+    match cleanup {
+        Ok(()) => result,
+        Err(error) => Err(AcquisitionStreamError::Provider(match result {
+            Ok(_) => error.into_message(),
+            Err(original) => format!("{}; {}", original.into_message(), error.into_message()),
+        })),
+    }
 }
 
 /// Сохраняет один обработчик Ctrl+C на весь запуск, включая несколько раундов.
@@ -746,10 +779,26 @@ pub struct AcquisitionRun {
     runtime: tokio::runtime::Runtime,
     interrupt: CtrlCListener,
     stopped: bool,
+    workspace: PathBuf,
+    owned_workspace: Option<TempWorkspace>,
 }
 
 impl AcquisitionRun {
     pub fn new() -> Result<Self, AcquisitionStreamError> {
+        let workspace = TempWorkspace::create("yarxi-acquisition").map_err(|error| {
+            AcquisitionStreamError::Provider(format!("temp_workspace_create_failed: {error}"))
+        })?;
+        Self::with_workspace(workspace.path().to_path_buf(), Some(workspace))
+    }
+
+    pub fn new_in_workspace(workspace: &Path) -> Result<Self, AcquisitionStreamError> {
+        Self::with_workspace(workspace.to_path_buf(), None)
+    }
+
+    fn with_workspace(
+        workspace: PathBuf,
+        owned_workspace: Option<TempWorkspace>,
+    ) -> Result<Self, AcquisitionStreamError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -761,6 +810,17 @@ impl AcquisitionRun {
             runtime,
             interrupt,
             stopped: false,
+            workspace,
+            owned_workspace,
+        })
+    }
+
+    /// Все сессии уже закрыты acquire; borrowed parent остаётся у вызывающего кода.
+    pub fn close(mut self) -> Result<(), AcquisitionStreamError> {
+        self.interrupt.abort();
+        self.owned_workspace.take().map_or(Ok(()), TempWorkspace::close).map_err(|error| {
+            tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %crate::diagnostics::safe_message(&error.to_string()), "Не удалось удалить временное дерево Yarxi");
+            AcquisitionStreamError::Provider(format!("temp_workspace_cleanup_failed: {error}"))
         })
     }
 
@@ -814,11 +874,14 @@ impl AcquisitionRun {
                 let session_start = offset;
                 sessions = sessions.saturating_add(1);
                 let session_result = acquire_one_session(
-                    &characters[offset..],
-                    offset,
-                    sessions,
-                    allow_insecure_tls,
-                    target,
+                    SessionAcquisitionConfig {
+                        characters: &characters[offset..],
+                        base_index: offset,
+                        session_number: sessions,
+                        allow_insecure_tls,
+                        target,
+                        workspace: &self.workspace,
+                    },
                     &mut on_event,
                     interrupt,
                 )
@@ -872,6 +935,15 @@ struct SessionAcquisitionSummary {
     stop_reason: Option<SessionStopReason>,
 }
 
+struct SessionAcquisitionConfig<'a> {
+    characters: &'a [String],
+    base_index: usize,
+    session_number: u32,
+    allow_insecure_tls: bool,
+    target: AcquisitionTarget,
+    workspace: &'a Path,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SessionAction {
     Complete,
@@ -923,14 +995,18 @@ fn session_action(
 }
 
 async fn acquire_one_session(
-    characters: &[String],
-    base_index: usize,
-    session_number: u32,
-    allow_insecure_tls: bool,
-    target: AcquisitionTarget,
+    config: SessionAcquisitionConfig<'_>,
     on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
     interrupt: &mut CtrlCListener,
 ) -> Result<SessionAcquisitionSummary, AcquisitionStreamError> {
+    let SessionAcquisitionConfig {
+        characters,
+        base_index,
+        session_number,
+        allow_insecure_tls,
+        target,
+        workspace,
+    } = config;
     let session_deadline = Instant::now() + OPERATION_TIMEOUT;
     let device_metrics = DeviceMetrics::new(
         CAPTURE_VIEWPORT_WIDTH,
@@ -952,12 +1028,9 @@ async fn acquire_one_session(
         code = "browser_session_starting",
         "Запуск и подготовка браузера Yarxi"
     );
-    let session = match run_setup_before_deadline(
-        session_deadline,
-        BrowserSession::launch(runtime_config),
-    )
-    .await
-    {
+    // Launch имеет собственные таймауты; получаем owner до проверки deadline,
+    // чтобы отмена не опередила явное завершение процесса и уборку профиля.
+    let session = match BrowserSession::launch_in_workspace(runtime_config, workspace).await {
         Ok(session) => session,
         Err(message) => {
             tracing::error!(session = session_number, stage = "browser_launch", code = "browser_session_launch_failed", message = %crate::diagnostics::safe_message(&message), elapsed_ms = session_started_at.elapsed().as_millis() as u64, "Не удалось запустить браузер");
@@ -1039,7 +1112,7 @@ async fn acquire_one_session(
     let tls_exception = match finish_session_setup(setup_result, session_number, on_event) {
         Ok(setup) => setup,
         Err(error) => {
-            session.close().await;
+            let cleanup = session.close().await;
             tracing::info!(
                 session = session_number,
                 stage = "browser_close",
@@ -1047,7 +1120,12 @@ async fn acquire_one_session(
                 elapsed_ms = session_started_at.elapsed().as_millis() as u64,
                 "Браузер закрыт после отказа подготовки"
             );
-            return Err(error);
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => {
+                    AcquisitionStreamError::Provider(format!("{}; {cleanup}", error.into_message()))
+                }
+            });
         }
     };
     tracing::info!(
@@ -1073,7 +1151,7 @@ async fn acquire_one_session(
     };
     let result = process_session_items(characters, base_index, &mut driver, on_event).await;
     evidence_monitor.abort();
-    session.close().await;
+    let cleanup = session.close().await;
     tracing::info!(
         session = session_number,
         stage = "browser_close",
@@ -1081,7 +1159,13 @@ async fn acquire_one_session(
         elapsed_ms = session_started_at.elapsed().as_millis() as u64,
         "Браузер Yarxi закрыт"
     );
-    result
+    match cleanup {
+        Ok(()) => result,
+        Err(cleanup) => Err(AcquisitionStreamError::Provider(match result {
+            Ok(_) => cleanup,
+            Err(error) => format!("{}; {cleanup}", error.into_message()),
+        })),
+    }
 }
 
 fn finish_session_setup<T>(
@@ -2619,6 +2703,41 @@ async fn run_setup_before_deadline<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_acquisition_workspace_survives_early_error_and_close() {
+        let parent = TempWorkspace::create("yarxi-borrowed-workspace-test").unwrap();
+        let runtime_dir = parent.path().join(".runtime");
+        std::fs::create_dir(&runtime_dir).unwrap();
+        let mut events = 0;
+        let result = acquire_many_stream_with_target_in_workspace(
+            &["invalid".into()],
+            false,
+            AcquisitionTarget::PreferredSource,
+            parent.path(),
+            |_| {
+                events += 1;
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(result, Err(AcquisitionStreamError::Provider(message)) if message.starts_with("invalid_kanji_identity:"))
+        );
+        assert_eq!(events, 0);
+        assert!(runtime_dir.is_dir());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 2);
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn standalone_acquisition_close_removes_one_run_workspace() {
+        let mut run = AcquisitionRun::new().unwrap();
+        let path = run.workspace.clone();
+        let summary = run.acquire(&[], false, |_| Ok(())).unwrap();
+        assert_eq!(summary.processed, 0);
+        run.close().unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn dark_theme_setup_changes_page_environment_without_restyling_font_sample() {

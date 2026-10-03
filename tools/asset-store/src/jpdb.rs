@@ -4,6 +4,8 @@
 //! Модуль не вызывает закрытые API и не реконструирует графики акцентуации.
 //! Элементы одного пакета последовательно используют изолированную `BrowserSession`.
 
+use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use chromiumoxide::{
@@ -217,6 +219,12 @@ impl JpdbPitchAcquisitionReport {
         self.session_failure.is_some()
     }
 
+    fn stop_with_session_failure(&mut self, stage: JpdbPitchStage, message: String) {
+        let failure = JpdbPitchFailure::SessionFailure { stage, message };
+        trace_failure(&failure);
+        self.session_failure = Some(failure);
+    }
+
     fn record_processed_outcome(
         &mut self,
         outcome: JpdbPitchOutcome,
@@ -372,6 +380,9 @@ impl JpdbPitchProvider {
     /// Разрешает запрос и получает данные в новой изолированной сессии Chromium.
     pub async fn acquire(query: &JpdbPitchQuery) -> JpdbPitchOutcome {
         let mut report = Self::acquire_many(std::slice::from_ref(query)).await;
+        if let Some(error) = report.session_failure.take() {
+            return failed(error);
+        }
         report.outcomes.pop().unwrap_or_else(|| {
             failed(
                 report
@@ -401,8 +412,32 @@ impl JpdbPitchProvider {
             return JpdbPitchAcquisitionReport::default();
         }
 
+        Self::acquire_requests_owned(requests, None).await
+    }
+
+    /// Все временные browser profiles находятся внутри workspace запуска acceptance.
+    pub async fn acquire_requests_in_workspace(
+        requests: &[JpdbPitchRequest],
+        workspace: &Path,
+    ) -> JpdbPitchAcquisitionReport {
+        if requests.is_empty() {
+            return JpdbPitchAcquisitionReport::default();
+        }
+        Self::acquire_requests_owned(requests, Some(workspace)).await
+    }
+
+    async fn acquire_requests_owned(
+        requests: &[JpdbPitchRequest],
+        workspace: Option<&Path>,
+    ) -> JpdbPitchAcquisitionReport {
+        let mut interrupt = JpdbInterrupt(tokio::spawn(tokio::signal::ctrl_c()));
         let runtime = pitch_browser_runtime_config();
-        let session = match BrowserSession::launch(runtime).await {
+        // Не отменяем launch по SIGINT: полученная owning Session явно закрывается.
+        let launched = match workspace {
+            Some(workspace) => BrowserSession::launch_in_workspace(runtime, workspace).await,
+            None => BrowserSession::launch(runtime).await,
+        };
+        let session = match launched {
             Ok(session) => session,
             Err(message) => {
                 return JpdbPitchAcquisitionReport::from_session_failure(
@@ -413,13 +448,44 @@ impl JpdbPitchProvider {
                 );
             }
         };
-
-        let setup = configure_page(session.page()).await;
-        let report = match setup {
-            Ok(()) => process_requests_in_session(&session, requests).await,
-            Err(error) => JpdbPitchAcquisitionReport::from_session_failure(error),
+        let mut report = match wait_jpdb_operation(configure_page(session.page()), &mut interrupt.0)
+            .await
+        {
+            Ok(Ok(())) => {
+                process_requests_with_interrupt(&session, requests, Some(&mut interrupt.0)).await
+            }
+            Ok(Err(error)) => JpdbPitchAcquisitionReport::from_session_failure(error),
+            Err(message) => {
+                JpdbPitchAcquisitionReport::from_session_failure(JpdbPitchFailure::SessionFailure {
+                    stage: JpdbPitchStage::ConfigureBrowser,
+                    message,
+                })
+            }
         };
-        session.close().await;
+        if let Err(message) = session.close().await {
+            match &mut report.session_failure {
+                Some(
+                    JpdbPitchFailure::SessionFailure {
+                        message: original, ..
+                    }
+                    | JpdbPitchFailure::BrowserSetup {
+                        message: original, ..
+                    }
+                    | JpdbPitchFailure::BrowserConfiguration {
+                        message: original, ..
+                    },
+                ) => {
+                    original.push_str("; ");
+                    original.push_str(&message);
+                    trace_failure(report.session_failure.as_ref().expect("ошибка сохранена"));
+                }
+                Some(_) => {
+                    // Предыдущий полный typed failure остаётся в отчёте; cleanup
+                    // отдельно записан BrowserSession в structured diagnostic log.
+                }
+                None => report.stop_with_session_failure(JpdbPitchStage::ConfigureBrowser, message),
+            }
+        }
         report
     }
 
@@ -452,9 +518,40 @@ impl JpdbPitchProvider {
     }
 }
 
+struct JpdbInterrupt(tokio::task::JoinHandle<std::io::Result<()>>);
+
+impl Drop for JpdbInterrupt {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn wait_jpdb_operation<T>(
+    operation: impl Future<Output = T>,
+    interrupt: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        signal = interrupt => Err(match signal {
+            Ok(Ok(())) => "acquisition_interrupted: получен Ctrl+C".into(),
+            Ok(Err(error)) => format!("ctrl_c_listener_failed: {error}"),
+            Err(error) => format!("ctrl_c_listener_failed: {error}"),
+        }),
+        result = operation => Ok(result),
+    }
+}
+
 async fn process_requests_in_session(
     session: &BrowserSession,
     requests: &[JpdbPitchRequest],
+) -> JpdbPitchAcquisitionReport {
+    process_requests_with_interrupt(session, requests, None).await
+}
+
+async fn process_requests_with_interrupt(
+    session: &BrowserSession,
+    requests: &[JpdbPitchRequest],
+    mut interrupt: Option<&mut tokio::task::JoinHandle<std::io::Result<()>>>,
 ) -> JpdbPitchAcquisitionReport {
     let mut report = JpdbPitchAcquisitionReport {
         outcomes: Vec::with_capacity(requests.len()),
@@ -470,7 +567,7 @@ async fn process_requests_in_session(
         let mut stage = JpdbPitchStage::SearchNavigation;
         let item_span =
             tracing::info_span!("jpdb_item", surface = %safe_message(&request.query.surface));
-        let result = timeout(
+        let operation = timeout(
             ITEM_TIMEOUT,
             acquire_one_in_session(
                 session.page(),
@@ -480,11 +577,18 @@ async fn process_requests_in_session(
                 &mut stage,
             )
             .instrument(item_span.clone()),
-        )
-        .await;
+        );
+        let result = match interrupt.as_deref_mut() {
+            Some(interrupt) => wait_jpdb_operation(operation, interrupt).await,
+            None => Ok(operation.await),
+        };
         let outcome = match result {
-            Ok(outcome) => outcome,
-            Err(_) => item_timeout(stage),
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => item_timeout(stage),
+            Err(message) => {
+                report.stop_with_session_failure(stage, message);
+                break;
+            }
         };
         if item_span.in_scope(|| {
             report.record_processed_outcome(outcome, stage, session.telemetry().monitor_failed())
@@ -2626,6 +2730,55 @@ const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn injected_interrupt_keeps_processed_prefix_without_tail_outcomes() {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let mut interrupt = JpdbInterrupt(tokio::spawn(async {
+            cancelled.await.map_err(std::io::Error::other)?;
+            Ok(())
+        }));
+        let mut report = JpdbPitchAcquisitionReport::default();
+        let first = JpdbPitchOutcome::VocabularyNotFound {
+            surface: "猫".into(),
+            reading: None,
+        };
+        let completed = wait_jpdb_operation(std::future::ready(first.clone()), &mut interrupt.0)
+            .await
+            .unwrap();
+        report.record_processed_outcome(completed, JpdbPitchStage::SearchResolution, false);
+        cancel.send(()).unwrap();
+        let interrupted =
+            wait_jpdb_operation(std::future::pending::<JpdbPitchOutcome>(), &mut interrupt.0)
+                .await
+                .unwrap_err();
+        report.stop_with_session_failure(JpdbPitchStage::SearchNavigation, interrupted);
+        assert_eq!(report.outcomes, vec![first]);
+        assert!(
+            matches!(report.session_failure, Some(JpdbPitchFailure::SessionFailure { stage: JpdbPitchStage::SearchNavigation, message }) if message.starts_with("acquisition_interrupted:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_interrupt_listener_is_a_typed_session_failure() {
+        let mut interrupt = JpdbInterrupt(tokio::spawn(async {
+            Err(std::io::Error::other("injected signal error"))
+        }));
+        let message = wait_jpdb_operation(std::future::pending::<()>(), &mut interrupt.0)
+            .await
+            .unwrap_err();
+        let mut report = JpdbPitchAcquisitionReport::default();
+        report.stop_with_session_failure(JpdbPitchStage::ConfigureBrowser, message);
+        assert!(report.outcomes.is_empty());
+        let serialized = serde_json::to_value(report.session_failure.unwrap()).unwrap();
+        assert_eq!(serialized["code"], "session_failure");
+        assert!(
+            serialized["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("ctrl_c_listener_failed:")
+        );
+    }
+
     #[test]
     fn startup_and_configuration_failures_have_no_item_outcomes() {
         for error in [
@@ -3501,7 +3654,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(&centers[0][..3], &[208, 32, 32]);
         assert_eq!(&centers[1][..3], &[32, 176, 80]);
-        session.close().await;
+        session.close().await.unwrap();
     }
 }
 
