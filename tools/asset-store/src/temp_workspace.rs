@@ -7,13 +7,15 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    AtFlags, Dir, Mode, OFlags, StatxFlags, mkdirat, open, openat, statat, statx, unlinkat,
+    AtFlags, Dir, Mode, OFlags, StatxFlags, mkdirat, open, openat, readlinkat, statat, statx,
+    unlinkat,
 };
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +135,20 @@ impl TempWorkspace {
         &self.path
     }
 
+    pub(crate) fn ensure_no_live_process_references(run_path: &Path) -> io::Result<()> {
+        if Self::has_live_process_references(run_path)? {
+            return Err(io::Error::other(
+                "живой процесс всё ещё использует временное дерево",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_live_process_references(run_path: &Path) -> io::Result<bool> {
+        let uid = current_uid()?;
+        workspace_has_process_references(Path::new("/proc"), run_path, uid)
+    }
+
     /// Ошибка cleanup возвращается вызывающему коду; Drop повторяет best effort.
     pub fn close(mut self) -> io::Result<()> {
         self.remove()?;
@@ -142,6 +158,9 @@ impl TempWorkspace {
 
     fn remove(&self) -> io::Result<()> {
         verify_identity(&self.parent, OsStr::new(&self.run_id), &self.directory)?;
+        if has_browser_artifacts(&self.directory)? {
+            Self::ensure_no_live_process_references(&self.path)?;
+        }
         remove_contents(&self.directory)?;
         verify_identity(&self.parent, OsStr::new(&self.run_id), &self.directory)?;
         unlinkat(&self.parent, self.run_id.as_str(), AtFlags::REMOVEDIR).map_err(Into::into)
@@ -153,7 +172,13 @@ impl Drop for TempWorkspace {
         if !self.closed
             && let Err(error) = self.remove()
         {
-            tracing::warn!(path = %self.path.display(), %error, "temp workspace cleanup failed");
+            tracing::error!(
+                stage = "temp_cleanup",
+                code = "temp_workspace_cleanup_failed",
+                path_category = "run_workspace",
+                message = %crate::diagnostics::safe_message(&error.to_string()),
+                "Не удалось удалить временное дерево"
+            );
         }
     }
 }
@@ -182,6 +207,14 @@ pub fn cleanup_orphans(min_age: Duration) -> io::Result<GcReport> {
 }
 
 fn cleanup_under(temp_root: &Path, min_age: Duration) -> io::Result<GcReport> {
+    cleanup_under_with_proc(temp_root, Path::new("/proc"), min_age)
+}
+
+fn cleanup_under_with_proc(
+    temp_root: &Path,
+    proc_root: &Path,
+    min_age: Duration,
+) -> io::Result<GcReport> {
     let min_age = min_age.max(DEFAULT_ORPHAN_MIN_AGE);
     let mut report = GcReport::default();
     let uid = current_uid()?;
@@ -191,7 +224,7 @@ fn cleanup_under(temp_root: &Path, min_age: Duration) -> io::Result<GcReport> {
     let now = unix_ms()?;
     for name in names(&parent)? {
         let path = temp_root.join(NAMESPACE).join(&name);
-        let result = inspect_orphan(&parent, &name, uid, now, min_age);
+        let result = inspect_orphan(&parent, proc_root, &name, &path, uid, now, min_age);
         let (outcome, reason, bytes) = match result {
             Ok(Inspection::Skip(reason)) => {
                 report.skipped += 1;
@@ -246,7 +279,9 @@ enum Inspection {
 
 fn inspect_orphan(
     parent: &File,
+    proc_root: &Path,
     name: &OsStr,
+    run_path: &Path,
     uid: u32,
     now: u64,
     min_age: Duration,
@@ -301,6 +336,21 @@ fn inspect_orphan(
     {
         return Ok(Inspection::Skip("нельзя доказать отсутствие PID".into()));
     }
+    if has_browser_artifacts(&directory)? {
+        match workspace_has_process_references(proc_root, run_path, uid) {
+            Ok(true) => {
+                return Ok(Inspection::Skip(
+                    "живой browser process использует workspace".into(),
+                ));
+            }
+            Ok(false) => (),
+            Err(_) => {
+                return Ok(Inspection::Skip(
+                    "нельзя доказать отсутствие browser process".into(),
+                ));
+            }
+        }
+    }
     let age_ms = u64::try_from(min_age.as_millis()).unwrap_or(u64::MAX);
     let modified = metadata
         .modified()?
@@ -313,7 +363,7 @@ fn inspect_orphan(
     {
         return Ok(Inspection::Skip("свежий run или время в будущем".into()));
     }
-    let size = inspect_tree(&directory, uid)?;
+    let size = inspect_orphan_tree(&directory, uid, run_path)?;
     verify_identity(parent, name, &directory)?;
     Ok(Inspection::Delete(directory, size))
 }
@@ -326,9 +376,171 @@ fn valid_run_id(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn has_browser_artifacts(directory: &File) -> io::Result<bool> {
+    Ok(names(directory)?
+        .iter()
+        .any(|name| valid_profile_name(name) || valid_browser_temp_name(name)))
+}
+
 fn current_uid() -> io::Result<u32> {
     Ok(fs::metadata("/proc/self")?.uid())
 }
+
+fn workspace_has_process_references(
+    proc_root: &Path,
+    run_path: &Path,
+    uid: u32,
+) -> io::Result<bool> {
+    let run_path = fs::canonicalize(run_path)?;
+    let entries = fs::read_dir(proc_root)?;
+    for entry in entries {
+        let entry = entry?;
+        let pid = entry.file_name();
+        if !pid.as_bytes().iter().all(u8::is_ascii_digit)
+            || pid.as_bytes().is_empty()
+            || pid.as_bytes() == std::process::id().to_string().as_bytes()
+        {
+            continue;
+        }
+        let process = entry.path();
+        let metadata = match fs::metadata(&process) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "нельзя проверить UID процесса",
+                ));
+            }
+        };
+        if metadata.uid() != uid {
+            continue;
+        }
+        let comm = match fs::read(process.join("comm")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "нельзя проверить имя same-UID процесса",
+                ));
+            }
+        };
+        let cmdline = match fs::read(process.join("cmdline")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) if !is_chromium_process(&comm, &[]) => continue,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "нельзя проверить команду same-UID процесса",
+                ));
+            }
+        };
+        if command_uses_workspace(&cmdline, &run_path) {
+            return Ok(true);
+        }
+        if !is_chromium_process(&comm, &cmdline) {
+            continue;
+        }
+        let environment = match fs::read(process.join("environ")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "нельзя проверить окружение browser process",
+                ));
+            }
+        };
+        if environment_uses_workspace(&environment, &run_path) {
+            return Ok(true);
+        }
+
+        let descriptors = match fs::read_dir(process.join("fd")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "нельзя проверить файловые дескрипторы процесса",
+                ));
+            }
+        };
+        for descriptor in descriptors {
+            let descriptor = match descriptor {
+                Ok(value) => value,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "нельзя перечислить файловые дескрипторы процесса",
+                    ));
+                }
+            };
+            let target = match fs::read_link(descriptor.path()) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "нельзя прочитать цель файлового дескриптора",
+                    ));
+                }
+            };
+            let mut target_bytes = target.as_os_str().as_bytes();
+            if let Some(without_deleted) = target_bytes.strip_suffix(b" (deleted)") {
+                target_bytes = without_deleted;
+            }
+            let target = PathBuf::from(OsString::from_vec(target_bytes.to_vec()));
+            if path_is_within(&target, &run_path) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn command_uses_workspace(cmdline: &[u8], run_path: &Path) -> bool {
+    let arguments = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect::<Vec<_>>();
+    for (index, argument) in arguments.iter().enumerate() {
+        let value = argument.strip_prefix(b"--user-data-dir=").or_else(|| {
+            (*argument == b"--user-data-dir")
+                .then(|| arguments.get(index + 1).copied())
+                .flatten()
+        });
+        if let Some(value) = value {
+            let path = PathBuf::from(OsString::from_vec(value.to_vec()));
+            if path_is_within(&path, run_path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn environment_uses_workspace(environment: &[u8], run_path: &Path) -> bool {
+    environment.split(|byte| *byte == 0).any(|entry| {
+        let Some(value) = entry.strip_prefix(b"TMPDIR=") else {
+            return false;
+        };
+        path_is_within(&PathBuf::from(OsString::from_vec(value.to_vec())), run_path)
+    })
+}
+
+fn is_chromium_process(comm: &[u8], cmdline: &[u8]) -> bool {
+    let mut identity = comm.to_ascii_lowercase();
+    identity.extend_from_slice(&cmdline.to_ascii_lowercase());
+    identity.windows(6).any(|part| part == b"chrome")
+        || identity.windows(8).any(|part| part == b"chromium")
+}
+
+fn path_is_within(path: &Path, parent: &Path) -> bool {
+    path == parent || path.starts_with(parent)
+}
+
 fn unix_ms() -> io::Result<u64> {
     u64::try_from(
         SystemTime::now()
@@ -458,6 +670,223 @@ fn inspect_tree(directory: &File, uid: u32) -> io::Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+fn inspect_orphan_tree(directory: &File, uid: u32, run_path: &Path) -> io::Result<u64> {
+    fn inspect(
+        directory: &File,
+        uid: u32,
+        run_path: &Path,
+        relative: &mut Vec<OsString>,
+    ) -> io::Result<u64> {
+        let mut bytes = 0_u64;
+        let device = directory.metadata()?.dev();
+        for name in names(directory)? {
+            let stat = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
+            let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+            if stat.st_uid != uid
+                || (kind != rustix::fs::FileType::Symlink && stat.st_mode & 0o022 != 0)
+                || stat.st_dev != device
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "workspace содержит чужой UID, writable entry или mount",
+                ));
+            }
+            relative.push(name.clone());
+            let browser_temp_path = path_is_browser_temp(relative);
+            match kind {
+                rustix::fs::FileType::Directory => {
+                    if browser_temp_path
+                        && (relative.len() == 3
+                            || (relative.len() == 2
+                                && !valid_chromium_socket_directory(relative.last().unwrap())))
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "browser temp содержит неизвестный каталог",
+                        ));
+                    }
+                    let child = directory_at(directory, &name)?;
+                    same_mount(directory, &child)?;
+                    bytes = bytes.saturating_add(inspect(&child, uid, run_path, relative)?);
+                }
+                rustix::fs::FileType::RegularFile => {
+                    if browser_temp_path && !valid_chromium_temp_file(relative) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "browser temp содержит неизвестный файл",
+                        ));
+                    }
+                    bytes = bytes.saturating_add(u64::try_from(stat.st_size).unwrap_or(0));
+                }
+                rustix::fs::FileType::Symlink => {
+                    let target = readlinkat(directory, &name, Vec::new())
+                        .map_err(io::Error::from)?
+                        .into_bytes();
+                    if !allowed_browser_symlink(relative, &target, run_path) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "workspace содержит неизвестную symbolic link",
+                        ));
+                    }
+                }
+                rustix::fs::FileType::Socket => {
+                    if !valid_browser_socket(relative) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "workspace содержит неизвестный special file",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "workspace содержит неизвестный special file",
+                    ));
+                }
+            }
+            relative.pop();
+        }
+        Ok(bytes)
+    }
+
+    inspect(directory, uid, run_path, &mut Vec::new())
+}
+
+fn path_is_browser_temp(relative: &[OsString]) -> bool {
+    relative
+        .first()
+        .is_some_and(|name| valid_browser_temp_name(name))
+}
+
+fn valid_browser_temp_name(name: &OsStr) -> bool {
+    let value = name.as_bytes();
+    value.len() == 4
+        && value[0] == b't'
+        && value[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn valid_profile_name(name: &OsStr) -> bool {
+    let Some(value) = name.to_str() else {
+        return false;
+    };
+    value.strip_prefix("browser-profile-").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_chromium_socket_directory(name: &OsStr) -> bool {
+    let Some(suffix) = name
+        .to_str()
+        .and_then(|value| value.strip_prefix("org.chromium.Chromium."))
+    else {
+        return false;
+    };
+    suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn valid_chromium_temp_file(relative: &[OsString]) -> bool {
+    if relative.len() != 2 {
+        return false;
+    }
+    let Some(suffix) = relative[1]
+        .to_str()
+        .and_then(|value| value.strip_prefix(".org.chromium.Chromium."))
+    else {
+        return false;
+    };
+    path_is_browser_temp(relative)
+        && suffix.len() == 6
+        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn valid_browser_socket(relative: &[OsString]) -> bool {
+    relative.len() == 3
+        && path_is_browser_temp(relative)
+        && valid_chromium_socket_directory(&relative[1])
+        && relative[2] == OsStr::new("SingletonSocket")
+}
+
+fn allowed_browser_symlink(relative: &[OsString], target: &[u8], run_path: &Path) -> bool {
+    if relative.len() == 2 && valid_profile_name(&relative[0]) {
+        return match relative[1].to_str() {
+            Some("SingletonCookie") => decimal_u64(target),
+            Some("SingletonLock") => valid_singleton_lock_target(target),
+            Some("SingletonSocket") => {
+                let target_path = PathBuf::from(OsString::from_vec(target.to_vec()));
+                valid_global_socket_path(&target_path)
+                    || valid_local_socket_path(&target_path, run_path)
+            }
+            _ => false,
+        };
+    }
+    relative.len() == 3
+        && path_is_browser_temp(relative)
+        && valid_chromium_socket_directory(&relative[1])
+        && relative[2] == OsStr::new("SingletonCookie")
+        && decimal_u64(target)
+}
+
+fn valid_global_socket_path(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent.parent() == Some(Path::new(TEMP_ROOT))
+        && path.file_name() == Some(OsStr::new("SingletonSocket"))
+        && parent
+            .file_name()
+            .is_some_and(valid_chromium_socket_directory)
+}
+
+fn valid_local_socket_path(path: &Path, run_path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(chromium_dir) = parent.file_name() else {
+        return false;
+    };
+    let Some(temp_dir) = parent.parent() else {
+        return false;
+    };
+    temp_dir.parent() == Some(run_path)
+        && temp_dir.file_name().is_some_and(valid_browser_temp_name)
+        && valid_chromium_socket_directory(chromium_dir)
+        && path.file_name() == Some(OsStr::new("SingletonSocket"))
+}
+
+fn valid_singleton_lock_target(target: &[u8]) -> bool {
+    let Some(separator) = target.iter().rposition(|byte| *byte == b'-') else {
+        return false;
+    };
+    let (host, pid_with_separator) = target.split_at(separator);
+    let pid = &pid_with_separator[1..];
+    !host.is_empty()
+        && host
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+        && decimal_bytes(pid)
+        && std::str::from_utf8(pid)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|pid| pid > 0)
+}
+
+fn decimal_bytes(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().all(u8::is_ascii_digit)
+}
+
+fn decimal_u64(value: &[u8]) -> bool {
+    decimal_bytes(value)
+        && std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some()
 }
 
 // Измерение считает собственные regular files, включая деревья с symlink,
@@ -851,7 +1280,9 @@ fn parse_pid(value: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::fs::FileTimes;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
 
     fn sandbox() -> TempWorkspace {
         TempWorkspace::create_under(Path::new(TEMP_ROOT), "temp-workspace-unit").unwrap()
@@ -871,6 +1302,74 @@ mod tests {
             .unwrap();
         owner.closed = true; // Имитация SIGKILL без уничтожения тестового процесса.
         owner.path().to_path_buf()
+    }
+
+    fn random_hex() -> String {
+        let mut random = [0_u8; 16];
+        File::open("/dev/urandom")
+            .unwrap()
+            .read_exact(&mut random)
+            .unwrap();
+        crate::hashing::encode_lower_hex(random)
+    }
+
+    fn fake_chromium_process(
+        proc_root: &Path,
+        pid_suffix: u32,
+        cmdline: &[u8],
+        environment: &[u8],
+        fd_target: Option<&Path>,
+    ) -> PathBuf {
+        let process = proc_root.join((std::process::id() + pid_suffix).to_string());
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::write(process.join("comm"), b"chrome\n").unwrap();
+        fs::write(process.join("cmdline"), cmdline).unwrap();
+        fs::write(process.join("environ"), environment).unwrap();
+        if let Some(target) = fd_target {
+            symlink(target, process.join("fd/7")).unwrap();
+        }
+        process
+    }
+
+    fn make_browser_temp_entries(run_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let profile = run_path.join(format!("browser-profile-{}", random_hex()));
+        let legacy_profile = run_path.join(format!("browser-profile-{}", random_hex()));
+        let temp = run_path.join(format!("t{}", &random_hex()[..3]));
+        let suffix = &random_hex()[..6];
+        let socket_directory = temp.join(format!("org.chromium.Chromium.{suffix}"));
+        fs::create_dir(&profile).unwrap();
+        fs::create_dir(&legacy_profile).unwrap();
+        fs::create_dir(&temp).unwrap();
+        fs::create_dir(&socket_directory).unwrap();
+        fs::write(
+            temp.join(format!(".org.chromium.Chromium.{suffix}")),
+            b"deleted-open temp representation",
+        )
+        .unwrap();
+        symlink("123456789", profile.join("SingletonCookie")).unwrap();
+        symlink("host-name-12345", profile.join("SingletonLock")).unwrap();
+        symlink("678901234", socket_directory.join("SingletonCookie")).unwrap();
+        let socket = socket_directory.join("SingletonSocket");
+        let listener = bind_socket_at(&socket_directory, "SingletonSocket");
+        drop(listener);
+        symlink(&socket, profile.join("SingletonSocket")).unwrap();
+        let global_socket = Path::new(TEMP_ROOT)
+            .join(format!("org.chromium.Chromium.{suffix}"))
+            .join("SingletonSocket");
+        symlink(global_socket, legacy_profile.join("SingletonSocket")).unwrap();
+        (profile, temp, socket)
+    }
+
+    fn bind_socket_at(directory: &Path, name: &str) -> UnixListener {
+        let descriptor = File::open(directory).unwrap();
+        UnixListener::bind(format!("/proc/self/fd/{}/{}", descriptor.as_raw_fd(), name)).unwrap()
+    }
+
+    fn set_old_directory_time(path: &Path, age: Duration) {
+        File::open(path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now() - age))
+            .unwrap();
     }
 
     #[test]
@@ -946,13 +1445,133 @@ mod tests {
             )
             .unwrap();
         let first = cleanup_under(root.path(), DEFAULT_ORPHAN_MIN_AGE).unwrap();
-        assert_eq!(first.removed, 1);
+        assert_eq!(first.removed, 1, "{first:?}");
         assert!(first.removed_bytes >= 7);
         assert!(!path.exists());
         assert_eq!(
             cleanup_under(root.path(), Duration::ZERO).unwrap().removed,
             0
         );
+    }
+
+    #[test]
+    fn orphan_gc_removes_only_allowlisted_browser_temp_objects() {
+        let root = sandbox();
+        let orphan = make_orphan(root.path(), Duration::from_secs(172800));
+        let (_profile, _temp, _socket) = make_browser_temp_entries(&orphan);
+        let unrelated = root
+            .path()
+            .join(format!("org.chromium.Chromium.{}", &random_hex()[..6]));
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep"), b"unrelated global object").unwrap();
+        set_old_directory_time(&orphan, Duration::from_secs(172800));
+
+        let report = cleanup_under(root.path(), Duration::ZERO).unwrap();
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!orphan.exists());
+        assert_eq!(
+            fs::read(unrelated.join("keep")).unwrap(),
+            b"unrelated global object"
+        );
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn orphan_gc_waits_for_live_browser_references_then_collects() {
+        let root = sandbox();
+        let proc_root = root.path().join("proc-fixture");
+        fs::create_dir(&proc_root).unwrap();
+        let orphan = make_orphan(root.path(), Duration::from_secs(172800));
+        let profile = orphan.join(format!("browser-profile-{}", random_hex()));
+        fs::create_dir(&profile).unwrap();
+        let candidate = fake_chromium_process(
+            &proc_root,
+            100_001,
+            format!("/usr/bin/chrome\0--user-data-dir={}\0", profile.display()).as_bytes(),
+            b"TMPDIR=/tmp\0",
+            None,
+        );
+        set_old_directory_time(&orphan, Duration::from_secs(172800));
+
+        let active = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+        assert_eq!(active.removed, 0);
+        assert_eq!(active.skipped, 1);
+        assert!(orphan.exists());
+
+        fs::remove_dir_all(candidate).unwrap();
+        let closed = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+        assert_eq!(closed.removed, 1, "{closed:?}");
+        assert!(!orphan.exists());
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn browser_process_environment_and_open_fds_are_workspace_references() {
+        let run = sandbox();
+        let proc_root = sandbox();
+        let temp = run.path().join(format!("t{}", &random_hex()[..3]));
+        fs::create_dir(&temp).unwrap();
+        let env_process = fake_chromium_process(
+            proc_root.path(),
+            100_002,
+            b"/usr/bin/chrome\0--type=renderer\0",
+            format!("TMPDIR={}\0", temp.display()).as_bytes(),
+            None,
+        );
+        assert!(
+            workspace_has_process_references(proc_root.path(), run.path(), current_uid().unwrap())
+                .unwrap()
+        );
+        fs::remove_dir_all(env_process).unwrap();
+
+        let referenced_file = temp.join("open-file");
+        fs::write(&referenced_file, b"held").unwrap();
+        let fd_process = fake_chromium_process(
+            proc_root.path(),
+            100_003,
+            b"/usr/bin/chrome\0--type=renderer\0",
+            b"TMPDIR=/tmp\0",
+            Some(&referenced_file),
+        );
+        assert!(
+            workspace_has_process_references(proc_root.path(), run.path(), current_uid().unwrap())
+                .unwrap()
+        );
+        fs::remove_dir_all(fd_process).unwrap();
+        proc_root.close().unwrap();
+        run.close().unwrap();
+    }
+
+    #[test]
+    fn inaccessible_browser_candidate_fails_closed() {
+        let run = sandbox();
+        let proc_root = sandbox();
+        let process = proc_root
+            .path()
+            .join((std::process::id() + 100_004).to_string());
+        fs::create_dir_all(process.join("cmdline")).unwrap();
+        fs::write(process.join("comm"), b"chrome\n").unwrap();
+        assert!(
+            workspace_has_process_references(proc_root.path(), run.path(), current_uid().unwrap())
+                .is_err()
+        );
+        proc_root.close().unwrap();
+        run.close().unwrap();
+    }
+
+    #[test]
+    fn orphan_gc_rejects_unrecognized_special_files() {
+        let root = sandbox();
+        let orphan = make_orphan(root.path(), Duration::from_secs(172800));
+        let socket = orphan.join("unrelated-socket");
+        let listener = bind_socket_at(&orphan, "unrelated-socket");
+        drop(listener);
+        set_old_directory_time(&orphan, Duration::from_secs(172800));
+        let report = cleanup_under(root.path(), Duration::ZERO).unwrap();
+        assert_eq!(report.removed, 0);
+        assert!(orphan.exists());
+        fs::remove_file(socket).unwrap();
+        root.close().unwrap();
     }
 
     #[test]

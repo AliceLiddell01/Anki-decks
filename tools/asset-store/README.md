@@ -631,8 +631,19 @@ session state не включаются в ZIP evidence.
 `/tmp/anki-decks-work/run-<32 lowercase hex>` с правами `0700` и маркером
 `.anki-decks-owner.json` (schema, repository, tool, PID, время создания, `run_id`
 и назначение). При необходимости профиль браузера создаётся как отдельная
-поддиректория workspace. Временный workspace закрывается явно после сборки
-evidence; при обычном выходе `Drop` выполняет уборку с best effort. ZIP создаётся
+поддиректория workspace. Профиль `browser-profile-<32 lowercase hex>` и каталог
+Chromium temp `t<3 lowercase hex>` — соседние приватные каталоги (`0700`) одного
+`BrowserProfile`. Короткое имя temp сохраняет путь Unix socket Chromium короче
+ограничения `sockaddr_un.sun_path`. При запуске только дочерний процесс Chromium
+получает `TMPDIR=<run>/t<3 lowercase hex>` через `BrowserConfig`; окружение
+процесса asset-store и shell пользователя не меняется. Перед удалением профиль
+проверяется по одноимённому workspace: если командная строка, `TMPDIR` или fd
+same-UID Chromium process всё ещё ссылаются на run, cleanup отказывает и
+оставляет дерево на месте. Сначала завершаются браузер и CDP handler, затем
+удаляются профиль и browser temp, и только после этого закрывается run workspace.
+Временный workspace закрывается явно после сборки evidence; при обычном выходе
+`Drop` выполняет уборку с best effort. Ошибки cleanup содержат `stage`, стабильный
+`code`, `path_category` и очищенное сообщение без абсолютного пути. ZIP создаётся
 отдельно и сохраняется после удаления временного workspace. Для
 артефакта обязательны `summary.md`, `manifest.sha256`,
 `raw-evidence/events.jsonl`, `raw-evidence/technical-failures.json`,
@@ -658,9 +669,18 @@ evidence; при обычном выходе `Drop` выполняет убор�
 и валидным marker текущего репозитория и инструмента; требует совпадения
 `run_id`, истечения TTL и доказанного отсутствия PID процесса. Проверки
 выполняются относительно открытых дескрипторов каталогов с `NOFOLLOW`; чужой
-UID, небезопасные права, mount, символическая ссылка, специальный файл, живой
-PID, будущая временная отметка и любой сомнительный маркер приводят к пропуску,
-а не к удалению.
+UID, небезопасные права, mount, неизвестная символическая ссылка или special
+file, живой PID, будущая временная отметка и любой сомнительный marker приводят
+к пропуску, а не к удалению. Дополнительно GC проверяет same-UID процессы по
+`--user-data-dir`, browser `TMPDIR` и открытым fd внутри run; если данные
+подходящего browser process недоступны, дерево пропускается. Он распознаёт
+только созданные runtime формы Chromium внутри подтверждённого orphan run:
+профильные `SingletonCookie`, `SingletonLock`, `SingletonSocket`, каталог
+`org.chromium.Chromium.<6 alphanumeric>`, его cookie symlink и socket, а также
+regular-файлы `.org.chromium.Chromium.<6 alphanumeric>` в собственном browser
+temp. Symlink никогда не обходится; каталог, fd-граница, тип объекта, UID и mount
+проверяются до удаления. Глобальные объекты `/tmp/org.chromium.*` и
+`/tmp/.org.chromium.*` не являются целью cleanup.
 Начальный `snapshot` снимается до startup cleanup; финальный — после удаления
 текущего workspace и final GC. Результаты уборки и факт удаления текущего
 workspace записываются в `hygiene.json`.

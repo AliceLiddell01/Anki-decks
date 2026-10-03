@@ -837,11 +837,11 @@ mod tests {
         assert!(
             fs::read_dir(output.parent().unwrap())
                 .unwrap()
-                .all(|entry| !entry
+                .all(|entry| entry
                     .unwrap()
                     .path()
                     .extension()
-                    .is_some_and(|extension| extension == "tmp"))
+                    .is_none_or(|extension| extension != "tmp"))
         );
     }
 

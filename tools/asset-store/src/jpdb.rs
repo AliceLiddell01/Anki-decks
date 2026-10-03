@@ -3684,8 +3684,8 @@ fn classify_pitch_state(detail: &DetailSnapshot) -> Result<PitchDomState, JpdbPi
             .section_inventory
             .iter()
             .any(|label| label == "Meanings")
-        || !parse_detail_route(&detail.url)
-            .is_some_and(|route| route.vocabulary_id == detail.vocabulary_id)
+        || parse_detail_route(&detail.url)
+            .is_none_or(|route| route.vocabulary_id != detail.vocabulary_id)
         || detail
             .part_of_speech
             .iter()

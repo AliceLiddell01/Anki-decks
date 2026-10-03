@@ -2195,10 +2195,10 @@ fn inspect_area_top_level(
         let entry =
             entry.map_err(|error| AssetError::io("не удалось прочитать store entry", error))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !matches!(
+        if !(matches!(
             name.as_str(),
             LOCK_FILE | OWNER_FILE | MANIFEST_FILE | ASSETS_DIR | TEMP_DIR | RUNTIME_DIR
-        ) && !(runtime_extensions && name == BATCHES_DIR)
+        ) || runtime_extensions && name == BATCHES_DIR)
         {
             return Err(AssetError::new(
                 unknown_code,
@@ -2453,8 +2453,7 @@ fn read_manifest_file(root: &File) -> Result<Manifest, AssetError> {
         return Err(AssetError::new(
             ErrorCode::UnsupportedSchemaVersion,
             format!(
-                "manifest schema_version {schema_version} не поддерживается (ожидается {})",
-                MANIFEST_SCHEMA_VERSION
+                "manifest schema_version {schema_version} не поддерживается (ожидается {MANIFEST_SCHEMA_VERSION})"
             ),
         ));
     }
