@@ -1153,6 +1153,22 @@ impl BatchRuntime {
         self.runtime.batch_id()
     }
 
+    /// Освобождает runtime lock на время browser/network ожидания.
+    pub fn release_lock(&mut self) -> Result<(), AssetError> {
+        self.runtime.release_lock()
+    }
+
+    /// Повторно захватывает lock после внешнего ожидания.
+    pub fn reacquire_lock(&mut self) -> Result<(), AssetError> {
+        self.runtime.reacquire_lock()
+    }
+
+    /// Перечитывает состояние с кэшированием уже проверенных неизменяемых
+    /// candidate blobs после повторного захвата lock.
+    pub fn reload_cached(&mut self) -> Result<Option<KanjiBatch>, AssetError> {
+        self.runtime.reload_cached()
+    }
+
     pub fn load(&mut self) -> Result<Option<KanjiBatch>, AssetError> {
         self.runtime.load()
     }

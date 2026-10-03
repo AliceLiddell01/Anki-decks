@@ -75,6 +75,7 @@ pub struct SafeBatchRuntime {
     batch_id: String,
     loaded_revision: Option<u64>,
     directory_path: PathBuf,
+    locked: bool,
     verified_blob_keys: BTreeSet<(String, String, u64, Option<String>)>,
 }
 
@@ -101,6 +102,7 @@ impl SafeBatchRuntime {
             batch_id: batch_id.into(),
             loaded_revision: None,
             directory_path: store_root.join(".runtime").join("batches").join(batch_id),
+            locked: true,
             verified_blob_keys: BTreeSet::new(),
         })
     }
@@ -109,8 +111,46 @@ impl SafeBatchRuntime {
         &self.batch_id
     }
 
+    /// Освобождает исключительную блокировку на время внешнего ожидания.
+    /// Дескрипторы и кэш уже проверенных неизменяемых blob остаются привязаны
+    /// к этому объекту; после повторного захвата новые ссылки проверяются до
+    /// использования.
+    pub fn release_lock(&mut self) -> Result<(), AssetError> {
+        if !self.locked {
+            return Err(invalid("блокировка runtime уже освобождена"));
+        }
+        flock(&self.directory, FlockOperation::Unlock).map_err(boundary_io)?;
+        self.locked = false;
+        Ok(())
+    }
+
+    /// Повторно захватывает блокировку после внешнего ожидания.
+    pub fn reacquire_lock(&mut self) -> Result<(), AssetError> {
+        if self.locked {
+            return Err(invalid("блокировка runtime уже удерживается"));
+        }
+        flock(&self.directory, FlockOperation::LockExclusive).map_err(boundary_io)?;
+        self.locked = true;
+        Ok(())
+    }
+
     /// Загружает состояние и сверяет все сохранённые ссылки на blob.
     pub fn load<S: RuntimeBatchState>(&mut self) -> Result<Option<S>, AssetError> {
+        self.load_inner(true)
+    }
+
+    /// Перечитывает состояние после повторного захвата блокировки. Ключи
+    /// ссылок на blob, которые были проверены этим объектом до освобождения
+    /// блокировки, переиспользуются; новые ссылки проходят полную проверку.
+    pub fn reload_cached<S: RuntimeBatchState>(&mut self) -> Result<Option<S>, AssetError> {
+        self.load_inner(false)
+    }
+
+    fn load_inner<S: RuntimeBatchState>(
+        &mut self,
+        force_recheck: bool,
+    ) -> Result<Option<S>, AssetError> {
+        self.require_lock()?;
         let bytes = match read_file(&self.directory, "state.json", MAX_RUNTIME_STATE_BYTES) {
             Ok(bytes) => bytes,
             Err(error) if error.code == ErrorCode::MissingAssetFile => {
@@ -131,7 +171,7 @@ impl SafeBatchRuntime {
                 "идентификатор пакета не совпадает с каталогом runtime-данных",
             ));
         }
-        self.verify_referenced_blobs(&state, true)?;
+        self.verify_referenced_blobs(&state, force_recheck)?;
         self.loaded_revision = Some(state.revision());
         Ok(Some(state))
     }
@@ -140,6 +180,7 @@ impl SafeBatchRuntime {
     /// если `state.json` ещё отсутствует. Запись атомарна и синхронизирует файл
     /// и каталог до возврата.
     pub fn save<S: RuntimeBatchState>(&mut self, state: &S) -> Result<(), AssetError> {
+        self.require_lock()?;
         state.validate()?;
         if state.batch_id() != self.batch_id {
             return Err(invalid(
@@ -185,6 +226,7 @@ impl SafeBatchRuntime {
         bytes: &[u8],
         extension: &str,
     ) -> Result<RuntimeBlobRef, AssetError> {
+        self.require_lock()?;
         self.persist_blob_with_limit(bytes, extension, MAX_RUNTIME_BLOB_BYTES)
     }
 
@@ -194,6 +236,7 @@ impl SafeBatchRuntime {
         extension: &str,
         maximum: u64,
     ) -> Result<RuntimeBlobRef, AssetError> {
+        self.require_lock()?;
         if maximum > MAX_RUNTIME_BLOB_BYTES || bytes.len() as u64 > maximum {
             return Err(invalid("blob превышает общий предел размера runtime"));
         }
@@ -224,6 +267,7 @@ impl SafeBatchRuntime {
 
     /// Возвращает байты только после проверки пути, обычного файла, размера и SHA.
     pub fn read_blob(&self, blob: &RuntimeBlobRef) -> Result<Vec<u8>, AssetError> {
+        self.require_lock()?;
         self.read_blob_with_limit(blob, MAX_RUNTIME_BLOB_BYTES)
     }
 
@@ -256,12 +300,21 @@ impl SafeBatchRuntime {
         bytes: &[u8],
         maximum: u64,
     ) -> Result<PathBuf, AssetError> {
+        self.require_lock()?;
         validate_leaf_name(name)?;
         if bytes.len() as u64 > maximum {
             return Err(invalid("runtime-артефакт превышает ограничение размера"));
         }
         atomic_write(&self.directory, name, bytes, maximum)?;
         Ok(self.directory_path.join(name))
+    }
+
+    fn require_lock(&self) -> Result<(), AssetError> {
+        if self.locked {
+            Ok(())
+        } else {
+            Err(invalid("операция runtime требует удерживаемую блокировку"))
+        }
     }
 
     fn verify_referenced_blobs<S: RuntimeBatchState>(

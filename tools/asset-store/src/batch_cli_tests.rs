@@ -66,6 +66,31 @@ impl Drop for Fixture {
     }
 }
 
+#[derive(Default)]
+struct CapturedProgress {
+    events: Vec<BatchProgressEvent>,
+}
+
+impl BatchProgressSink for CapturedProgress {
+    fn emit(&mut self, event: BatchProgressEvent) -> Result<(), AssetError> {
+        self.events.push(event);
+        Ok(())
+    }
+}
+
+fn emit_stream_item(
+    on_event: &mut dyn FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    index: usize,
+    outcome: Result<AcquiredMedia, String>,
+) -> Result<(), AcquisitionStreamError> {
+    on_event(AcquisitionEvent::ItemStarted { index }).map_err(AcquisitionStreamError::Consumer)?;
+    on_event(AcquisitionEvent::ItemCompleted {
+        index,
+        outcome: Box::new(outcome),
+    })
+    .map_err(AcquisitionStreamError::Consumer)
+}
+
 fn identity(value: char) -> AssetIdentity {
     AssetIdentity::new("kanji", value.to_string()).unwrap()
 }
@@ -377,6 +402,223 @@ fn acquisition_releases_runtime_lock_and_finishes_all_items_before_retry() {
             .unwrap()
             .contains("example.invalid")
     );
+}
+
+#[test]
+fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
+    let fixture = Fixture::new();
+    fixture.start("partial-checkpoint", &['元', '漢', '字']);
+    let mut progress = CapturedProgress::default();
+    let first = run_batch_with_stream_and_progress(
+        &fixture.store,
+        "partial-checkpoint",
+        1,
+        |characters, on_event| {
+            assert_eq!(characters, ["元", "漢", "字"]);
+            // Во время provider wait другой владелец может открыть runtime.
+            let probe = BatchRuntime::open(fixture.store.root(), "partial-checkpoint").unwrap();
+            drop(probe);
+            on_event(AcquisitionEvent::SessionStarted { session: 1 })
+                .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(AcquisitionEvent::ItemStarted { index: 0 })
+                .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(AcquisitionEvent::Heartbeat {
+                index: 0,
+                attempt: 1,
+            })
+            .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(AcquisitionEvent::ItemCompleted {
+                index: 0,
+                outcome: Box::new(Ok(media("元", glyph('元')))),
+            })
+            .map_err(AcquisitionStreamError::Consumer)?;
+
+            // Item callback вернулся только после атомарного checkpoint.
+            let checkpoint = fixture.load("partial-checkpoint");
+            assert_eq!(checkpoint.items[0].attempts.len(), 1);
+            let BatchAttemptInput::Candidate { candidate } =
+                &checkpoint.items[0].attempts[0].result
+            else {
+                panic!("полученный кандидат должен быть сохранён до продолжения provider")
+            };
+            let runtime = BatchRuntime::open(fixture.store.root(), "partial-checkpoint").unwrap();
+            assert_eq!(runtime.read_candidate(candidate).unwrap(), glyph('元'));
+            for item in &checkpoint.items[1..] {
+                assert!(item.attempts.is_empty());
+                assert_eq!(item.generation, 0);
+                assert_eq!(item.status, BatchItemStatus::Unresolved);
+            }
+            Err(AcquisitionStreamError::Provider(
+                "synthetic interruption after first durable outcome".into(),
+            ))
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    );
+    assert!(first.is_err());
+    assert!(progress.events.iter().any(|event| {
+        event.event == "item_checkpointed"
+            && event
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.key == "元")
+            && event.outcome.as_deref() == Some("candidate_recorded")
+    }));
+    let heartbeat = progress
+        .events
+        .iter()
+        .find(|event| event.event == "heartbeat")
+        .unwrap();
+    let checkpoint_event = progress
+        .events
+        .iter()
+        .find(|event| event.event == "item_checkpointed")
+        .unwrap();
+    assert_eq!(heartbeat.identity.as_ref().unwrap().key, "元");
+    assert!(heartbeat.elapsed_ms <= checkpoint_event.elapsed_ms);
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.event == "run_stopped")
+    );
+    assert_eq!(
+        fixture.load("partial-checkpoint").items[0].attempts.len(),
+        1
+    );
+
+    let mut resumed_requests = Vec::new();
+    let mut resumed_progress = CapturedProgress::default();
+    let (state, _, _) = run_batch_with_stream_and_progress(
+        &fixture.store,
+        "partial-checkpoint",
+        1,
+        |characters, on_event| {
+            resumed_requests.push(characters.to_vec());
+            assert_eq!(characters, ["漢", "字"]);
+            for (index, character) in characters.iter().enumerate() {
+                emit_stream_item(
+                    on_event,
+                    index,
+                    Ok(media(character, glyph(character.chars().next().unwrap()))),
+                )?;
+            }
+            Ok(())
+        },
+        &mut StoreSnapshotReader,
+        &mut resumed_progress,
+    )
+    .unwrap();
+    assert_eq!(resumed_requests, [vec!["漢".to_owned(), "字".to_owned()]]);
+    assert!(state.is_resolved());
+    assert!(state.items.iter().all(|item| item.attempts.len() == 1));
+    assert!(resumed_progress.events.iter().any(|event| {
+        event.event == "run_finished" && event.outcome.as_deref() == Some("resolved")
+    }));
+}
+
+#[test]
+fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
+    let fixture = Fixture::new();
+    fixture.start("frontier-tail", &['元', '漢', '字']);
+    let interrupted = run_batch_with_stream_and_progress(
+        &fixture.store,
+        "frontier-tail",
+        1,
+        |_characters, on_event| {
+            emit_stream_item(on_event, 0, Ok(media("元", glyph('元'))))?;
+            Err(AcquisitionStreamError::Provider(
+                "synthetic session stop".into(),
+            ))
+        },
+        &mut StoreSnapshotReader,
+        &mut CapturedProgress::default(),
+    );
+    assert!(interrupted.is_err());
+
+    let state = fixture.load("frontier-tail");
+    assert_eq!(state.items[0].attempts.len(), 1);
+    for item in &state.items[1..] {
+        assert!(item.attempts.is_empty());
+        assert_eq!(item.generation, 0);
+        assert_eq!(item.status, BatchItemStatus::Unresolved);
+        assert!(item.aggregate.distinct_valid_hashes.is_empty());
+    }
+    assert_eq!(state.next_round(), [identity('漢'), identity('字')]);
+
+    let mut resumed_requests = Vec::new();
+    let (state, _, _) = run_batch_with_stream_and_progress(
+        &fixture.store,
+        "frontier-tail",
+        1,
+        |characters, on_event| {
+            resumed_requests.push(characters.to_vec());
+            assert_eq!(characters, ["漢", "字"]);
+            emit_stream_item(on_event, 0, Err("item-local failure for 漢".into()))?;
+            assert_eq!(fixture.load("frontier-tail").next_round(), [identity('字')]);
+            emit_stream_item(on_event, 1, Err("item-local failure for 字".into()))?;
+            assert_eq!(
+                fixture.load("frontier-tail").next_round(),
+                [identity('漢'), identity('字')],
+                "вторая попытка соседей разрешена только после первой попытки всего frontier"
+            );
+            Ok(())
+        },
+        &mut StoreSnapshotReader,
+        &mut CapturedProgress::default(),
+    )
+    .unwrap();
+    assert_eq!(resumed_requests, [vec!["漢".to_owned(), "字".to_owned()]]);
+    assert_eq!(state.items[0].attempts.len(), 1);
+    assert_eq!(state.items[1].attempts.len(), 1);
+    assert_eq!(state.items[2].attempts.len(), 1);
+    assert_eq!(state.next_round(), [identity('漢'), identity('字')]);
+}
+
+#[test]
+fn progress_jsonl_is_separate_from_the_single_final_json_response() {
+    let fixture = Fixture::new();
+    fixture.start("progress-contract", &['漢']);
+    let event = BatchProgressEvent {
+        schema_version: 1,
+        operation: "batch_run",
+        event: "item_checkpointed",
+        batch_id: "progress-contract".into(),
+        elapsed_ms: 1250,
+        round: Some(1),
+        round_limit: 5,
+        round_completed: 1,
+        round_total: 1,
+        run_completed: 1,
+        batch_total: 1,
+        identity: Some(identity('漢')),
+        session: Some(1),
+        attempt: None,
+        outcome: Some("acquisition_failed".into()),
+        reason: None,
+    };
+    let mut stderr = Vec::new();
+    write_progress_event(&event, OutputFormat::Json, &mut stderr).unwrap();
+    let progress_line = std::str::from_utf8(&stderr).unwrap();
+    assert_eq!(progress_line.lines().count(), 1);
+    let progress_json: serde_json::Value = serde_json::from_str(progress_line).unwrap();
+    assert_eq!(progress_json["event"], "item_checkpointed");
+    assert_eq!(progress_json["round_completed"], 1);
+    assert_eq!(progress_json["identity"]["key"], "漢");
+
+    let final_output = execute(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Status {
+            batch_id: "progress-contract".into(),
+        },
+        OutputFormat::Json,
+        false,
+    );
+    assert!(final_output.stderr.is_empty());
+    let final_json: serde_json::Value = serde_json::from_str(&final_output.stdout).unwrap();
+    assert_eq!(final_json["operation"], "batch_status");
+    assert_eq!(final_json["batch_id"], "progress-contract");
 }
 
 #[test]
@@ -896,7 +1138,7 @@ fn persisted_rejection_before_owner_commit_resumes_before_acquisition() {
             .unwrap();
         assert_eq!(owner.sha256, hash);
         assert_eq!(owner.current_human_decision(), Some(HumanDecision::Reject));
-        Err("синтетический повтор недоступен".into())
+        Ok(vec![Err("синтетический повтор недоступен".into())])
     })
     .unwrap();
 }
@@ -1100,7 +1342,7 @@ fn stale_reject_never_materializes_or_demotes_newer_owner_sha() {
     assert_eq!(after[0].record, before[0].record);
     assert_eq!(after[0].bytes, new_bytes);
     let (state, _, _) = run_batch(&fixture.store, "old-batch", 1, |_| {
-        Err("синтетическое получение недоступно".into())
+        Ok(vec![Err("синтетическое получение недоступно".into())])
     })
     .unwrap();
     assert!(!state.is_resolved());

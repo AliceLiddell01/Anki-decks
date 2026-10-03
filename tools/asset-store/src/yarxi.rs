@@ -11,6 +11,7 @@ use crate::browser_runtime::{
     RetryTrigger, RuntimeSnapshot,
 };
 pub use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
+use crate::error::AssetError;
 use base64::Engine as _;
 use chromiumoxide::{
     Page,
@@ -33,6 +34,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const BROWSER_SETUP_TIMEOUT_MESSAGE: &str =
     "browser_setup_timeout: истёк срок подготовки сеанса браузера";
 const ITEM_TIMEOUT: Duration = Duration::from_secs(90);
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(15);
 const TLS_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const BATCH_PACING: Duration = Duration::from_millis(900);
 const RETRY_BACKOFF: Duration = Duration::from_millis(300);
@@ -45,6 +47,7 @@ const CAPTURE_MAX_EDGE_PX: u32 = 220;
 const CAPTURE_LIGHT_GLYPH_MIN_LUMINANCE: f64 = 0.60;
 const YARXI_DARK_THEME_STYLE_ID: &str = "asset-store-yarxi-dark-theme";
 const YARXI_DARK_THEME_STYLE: &str = ":root { color-scheme: dark !important; } #app { color: rgb(var(--w-base-color-rgb)) !important; }";
+type CtrlCListener = tokio::task::JoinHandle<std::io::Result<()>>;
 
 /// Источник байтов и ограниченный набор свидетельств при работе браузера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,59 +568,316 @@ pub fn acquire_many_with_target(
     allow_insecure_tls: bool,
     target: AcquisitionTarget,
 ) -> Result<Vec<Result<AcquiredMedia, String>>, String> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("среда браузера: {error}"))?;
-    runtime
-        .block_on(async move { acquire_many_async(characters, allow_insecure_tls, target).await })
-}
-
-async fn acquire_many_async(
-    characters: &[String],
-    allow_insecure_tls: bool,
-    target: AcquisitionTarget,
-) -> Result<Vec<Result<AcquiredMedia, String>>, String> {
     if characters.is_empty() {
         return Ok(Vec::new());
     }
-    for character in characters {
-        crate::kanji_domain::parse_kanji_character(character)
-            .map_err(|error| format!("invalid_kanji_identity: {error}"))?;
-    }
+    let mut outcomes = vec![None; characters.len()];
+    acquire_many_stream_with_target(characters, allow_insecure_tls, target, |event| {
+        if let AcquisitionEvent::ItemCompleted { index, outcome } = event {
+            let slot = outcomes.get_mut(index).ok_or_else(|| {
+                AssetError::new(
+                    crate::error::ErrorCode::InvalidTransition,
+                    "provider выдал индекс вне исходного набора",
+                )
+            })?;
+            if slot.replace(*outcome).is_some() {
+                return Err(AssetError::new(
+                    crate::error::ErrorCode::InvalidTransition,
+                    "provider повторно выдал identity в одном наборе",
+                ));
+            }
+        }
+        Ok(())
+    })
+    .map_err(AcquisitionStreamError::into_message)?;
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| {
+                "provider_stream_incomplete: browser завершил работу до обработки всего набора"
+                    .to_owned()
+            })
+        })
+        .collect()
+}
 
-    let session_deadline = Instant::now() + OPERATION_TIMEOUT;
-    let runtime_config = BrowserRuntimeConfig {
-        device_metrics: Some(
-            DeviceMetrics::new(
-                CAPTURE_VIEWPORT_WIDTH,
-                CAPTURE_VIEWPORT_HEIGHT,
-                CAPTURE_DEVICE_SCALE_FACTOR,
+#[derive(Debug)]
+pub enum AcquisitionEvent {
+    SessionStarted {
+        session: u32,
+    },
+    SessionEnded {
+        session: u32,
+        processed: usize,
+        stop_reason: Option<SessionStopReason>,
+    },
+    SessionRotated {
+        next_session: u32,
+        reason: SessionStopReason,
+    },
+    ItemStarted {
+        index: usize,
+    },
+    RetryStarted {
+        index: usize,
+        attempt: u8,
+    },
+    RetryRecoveryStarted {
+        index: usize,
+        attempt: u8,
+    },
+    Heartbeat {
+        index: usize,
+        attempt: u8,
+    },
+    ItemCompleted {
+        index: usize,
+        outcome: Box<Result<AcquiredMedia, String>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionStopReason {
+    Deadline,
+    ItemTimeout,
+    RetryRecoveryFailed(String),
+    Interrupted,
+}
+
+impl SessionStopReason {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Deadline => "истёк срок browser session".into(),
+            Self::ItemTimeout => "превышен item timeout; browser session остановлена".into(),
+            Self::RetryRecoveryFailed(error) => {
+                format!("не удалось восстановить страницу: {error}")
+            }
+            Self::Interrupted => "получен Ctrl+C; browser session закрыта".into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AcquisitionStreamError {
+    Provider(String),
+    Consumer(AssetError),
+    Interrupted,
+}
+
+impl AcquisitionStreamError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Provider(message) => message,
+            Self::Consumer(error) => format!("progress_consumer_failed: {error}"),
+            Self::Interrupted => "acquisition_interrupted: получен Ctrl+C".into(),
+        }
+    }
+}
+
+impl From<AssetError> for AcquisitionStreamError {
+    fn from(error: AssetError) -> Self {
+        Self::Consumer(error)
+    }
+}
+
+fn signal_error(
+    signal: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> AcquisitionStreamError {
+    match signal {
+        Ok(Ok(())) => AcquisitionStreamError::Interrupted,
+        Ok(Err(error)) => {
+            AcquisitionStreamError::Provider(format!("ctrl_c_listener_failed: {error}"))
+        }
+        Err(error) => AcquisitionStreamError::Provider(format!("ctrl_c_listener_failed: {error}")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquisitionSummary {
+    pub processed: usize,
+    pub sessions: u32,
+}
+
+/// Потоково получает медиа, закрывая BrowserSession на границе её срока.
+/// Незатронутый хвост продолжается в новой session без фиктивных outcomes.
+pub fn acquire_many_stream<F>(
+    characters: &[String],
+    allow_insecure_tls: bool,
+    on_event: F,
+) -> Result<AcquisitionSummary, AcquisitionStreamError>
+where
+    F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+{
+    acquire_many_stream_with_target(
+        characters,
+        allow_insecure_tls,
+        AcquisitionTarget::PreferredSource,
+        on_event,
+    )
+}
+
+pub fn acquire_many_stream_with_target<F>(
+    characters: &[String],
+    allow_insecure_tls: bool,
+    target: AcquisitionTarget,
+    mut on_event: F,
+) -> Result<AcquisitionSummary, AcquisitionStreamError>
+where
+    F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+{
+    if characters.is_empty() {
+        return Ok(AcquisitionSummary {
+            processed: 0,
+            sessions: 0,
+        });
+    }
+    for character in characters {
+        crate::kanji_domain::parse_kanji_character(character).map_err(|error| {
+            AcquisitionStreamError::Provider(format!("invalid_kanji_identity: {error}"))
+        })?;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| AcquisitionStreamError::Provider(format!("среда браузера: {error}")))?;
+    runtime.block_on(async move {
+        let mut interrupt: CtrlCListener = tokio::spawn(tokio::signal::ctrl_c());
+        let mut offset = 0;
+        let mut sessions = 0_u32;
+        while offset < characters.len() {
+            let session_start = offset;
+            sessions = sessions.saturating_add(1);
+            on_event(AcquisitionEvent::SessionStarted { session: sessions })
+                .map_err(AcquisitionStreamError::Consumer)?;
+            let session_result = acquire_one_session(
+                &characters[offset..],
+                offset,
+                allow_insecure_tls,
+                target,
+                &mut on_event,
+                &mut interrupt,
             )
-            .map_err(|error| format!("настройка viewport Yarxi: {error}"))?,
-        ),
+            .await?;
+            on_event(AcquisitionEvent::SessionEnded {
+                session: sessions,
+                processed: session_result.processed,
+                stop_reason: session_result.stop_reason.clone(),
+            })
+            .map_err(AcquisitionStreamError::Consumer)?;
+            match session_action(session_start, characters.len(), &session_result)? {
+                SessionAction::Complete => {
+                    offset = characters.len();
+                    break;
+                }
+                SessionAction::Interrupted { .. } => {
+                    return Err(AcquisitionStreamError::Interrupted);
+                }
+                SessionAction::Rotate {
+                    next_offset,
+                    reason,
+                } => {
+                    offset = next_offset;
+                    on_event(AcquisitionEvent::SessionRotated {
+                        next_session: sessions.saturating_add(1),
+                        reason,
+                    })
+                    .map_err(AcquisitionStreamError::Consumer)?;
+                }
+            }
+        }
+        Ok(AcquisitionSummary {
+            processed: offset,
+            sessions,
+        })
+    })
+}
+
+struct SessionAcquisitionSummary {
+    processed: usize,
+    stop_reason: Option<SessionStopReason>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionAction {
+    Complete,
+    Interrupted {
+        next_offset: usize,
+    },
+    Rotate {
+        next_offset: usize,
+        reason: SessionStopReason,
+    },
+}
+
+fn session_action(
+    offset: usize,
+    total: usize,
+    summary: &SessionAcquisitionSummary,
+) -> Result<SessionAction, AcquisitionStreamError> {
+    let next_offset = offset
+        .checked_add(summary.processed)
+        .filter(|next| *next <= total)
+        .ok_or_else(|| {
+            AcquisitionStreamError::Provider(
+                "browser_session_invalid_progress: processed count exceeds frontier".into(),
+            )
+        })?;
+    if next_offset == total {
+        return Ok(SessionAction::Complete);
+    }
+    if summary.stop_reason == Some(SessionStopReason::Interrupted) {
+        return Ok(SessionAction::Interrupted { next_offset });
+    }
+    match (&summary.stop_reason, summary.processed) {
+        (Some(reason), 1..) => Ok(SessionAction::Rotate {
+            next_offset,
+            reason: reason.clone(),
+        }),
+        (Some(reason), 0) => Err(AcquisitionStreamError::Provider(format!(
+            "browser_session_no_progress: {reason:?}"
+        ))),
+        (None, _) => Err(AcquisitionStreamError::Provider(
+            "browser_session_incomplete: session завершилась без результата для хвоста".into(),
+        )),
+    }
+}
+
+async fn acquire_one_session(
+    characters: &[String],
+    base_index: usize,
+    allow_insecure_tls: bool,
+    target: AcquisitionTarget,
+    on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    interrupt: &mut CtrlCListener,
+) -> Result<SessionAcquisitionSummary, AcquisitionStreamError> {
+    let session_deadline = Instant::now() + OPERATION_TIMEOUT;
+    let device_metrics = DeviceMetrics::new(
+        CAPTURE_VIEWPORT_WIDTH,
+        CAPTURE_VIEWPORT_HEIGHT,
+        CAPTURE_DEVICE_SCALE_FACTOR,
+    )
+    .map_err(|error| {
+        AcquisitionStreamError::Provider(format!("настройка viewport Yarxi: {error}"))
+    })?;
+    let runtime_config = BrowserRuntimeConfig {
+        device_metrics: Some(device_metrics),
         prefers_color_scheme: Some("dark".into()),
         ..BrowserRuntimeConfig::default()
     };
     let session =
-        run_setup_before_deadline(session_deadline, BrowserSession::launch(runtime_config)).await?;
+        run_setup_before_deadline(session_deadline, BrowserSession::launch(runtime_config))
+            .await
+            .map_err(AcquisitionStreamError::Provider)?;
     let evidence_monitor = BrowserEvidenceMonitor::new(session.telemetry().clone());
     let browser_runtime = session.provenance().clone();
 
-    let setup_result = run_setup_before_deadline(session_deadline, async {
+    let setup = run_setup_before_deadline(session_deadline, async {
         let page = session.page();
         let tls_exception = match page.goto(SITE_URL).await {
-            Err(error) => {
-                Some(
-                    async_error_or_tls_interstitial(
-                        page,
-                        &evidence_monitor,
-                        allow_insecure_tls,
-                        error,
-                    )
+            Err(error) => Some(
+                async_error_or_tls_interstitial(page, &evidence_monitor, allow_insecure_tls, error)
                     .await?,
-                )
-            }
+            ),
             Ok(_) => {
                 let tls_probe: Value = page
                     .evaluate("() => ({ code: document.querySelector('#error-code')?.textContent?.trim() || '', proceed: Boolean(document.querySelector('#proceed-link')) })")
@@ -663,124 +923,155 @@ async fn acquire_many_async(
             apply_dark_theme(page).await?;
         }
         Ok::<_, String>(tls_exception)
-    })
-    .await;
-
+    });
+    let setup_result = tokio::select! {
+        result = setup => Ok(result),
+        signal = &mut *interrupt => Err(signal),
+    };
     let tls_exception = match setup_result {
-        Ok(setup) => setup,
-        Err(error) => {
+        Ok(Ok(setup)) => setup,
+        Ok(Err(error)) => {
             session.close().await;
-            return Err(error);
+            return Err(AcquisitionStreamError::Provider(error));
+        }
+        Err(signal) => {
+            session.close().await;
+            return Err(signal_error(signal));
         }
     };
 
-    let mut outcomes = Vec::with_capacity(characters.len());
-    for (index, character) in characters.iter().enumerate() {
-        if index > 0
-            && timeout_at(session_deadline, sleep(BATCH_PACING))
-                .await
-                .is_err()
-        {
-            append_session_deadline_outcomes(&mut outcomes, characters.len() - index);
-            break;
+    let mut processed = 0;
+    let mut stop_reason = None;
+    let result = async {
+        for (index, character) in characters.iter().enumerate() {
+            if index > 0 {
+                let pacing = tokio::select! {
+                    result = timeout_at(session_deadline, sleep(BATCH_PACING)) => {
+                        if result.is_err() { Some(SessionStopReason::Deadline) } else { None }
+                    }
+                    signal = &mut *interrupt => Some(match signal_error(signal) {
+                        AcquisitionStreamError::Interrupted => SessionStopReason::Interrupted,
+                        AcquisitionStreamError::Provider(message) => {
+                            return Err(AcquisitionStreamError::Provider(message));
+                        }
+                        AcquisitionStreamError::Consumer(error) => {
+                            return Err(AcquisitionStreamError::Consumer(error));
+                        }
+                    }),
+                };
+                if let Some(reason) = pacing {
+                    stop_reason = Some(reason);
+                    break;
+                }
+            }
+            if Instant::now() >= session_deadline {
+                stop_reason = Some(SessionStopReason::Deadline);
+                break;
+            }
+            let absolute_index = base_index + index;
+            on_event(AcquisitionEvent::ItemStarted {
+                index: absolute_index,
+            })
+            .map_err(AcquisitionStreamError::Consumer)?;
+            let context = RetryAcquisitionContext {
+                page: session.page(),
+                target,
+                evidence_monitor: &evidence_monitor,
+                browser_runtime: &browser_runtime,
+                tls_exception: tls_exception
+                    .as_ref()
+                    .map(|approved| approved.provenance.clone()),
+                session_deadline,
+                interrupt,
+            };
+            let (outcome, item_stop_reason) =
+                acquire_one_with_retries(context, absolute_index, character, on_event).await?;
+            on_event(AcquisitionEvent::ItemCompleted {
+                index: absolute_index,
+                outcome: Box::new(outcome),
+            })
+            .map_err(AcquisitionStreamError::Consumer)?;
+            processed += 1;
+            if item_stop_reason.is_some() {
+                stop_reason = item_stop_reason;
+                break;
+            }
         }
-        if Instant::now() >= session_deadline {
-            append_session_deadline_outcomes(&mut outcomes, characters.len() - index);
-            break;
-        }
-        let (outcome, stop_reason) = acquire_one_with_retries(
-            session.page(),
-            character,
-            target,
-            &evidence_monitor,
-            &browser_runtime,
-            tls_exception
-                .as_ref()
-                .map(|approved| approved.provenance.clone()),
-            session_deadline,
-        )
-        .await;
-        outcomes.push(outcome);
-        if let Some(stop_reason) = stop_reason {
-            append_batch_stopped_outcomes(
-                &mut outcomes,
-                characters.len().saturating_sub(index + 1),
-                &stop_reason,
-            );
-            break;
-        }
+        Ok(())
     }
+    .await;
     evidence_monitor.abort();
     session.close().await;
-    Ok(outcomes)
+    match result {
+        Ok(()) => Ok(SessionAcquisitionSummary {
+            processed,
+            stop_reason,
+        }),
+        Err(AcquisitionStreamError::Interrupted) => Ok(SessionAcquisitionSummary {
+            processed,
+            stop_reason: Some(SessionStopReason::Interrupted),
+        }),
+        Err(error) => Err(error),
+    }
 }
 
-fn append_session_deadline_outcomes<T>(outcomes: &mut Vec<Result<T, String>>, count: usize) {
-    append_batch_stopped_outcomes(outcomes, count, &BatchStopReason::SessionDeadline);
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BatchStopReason {
-    SessionDeadline,
-    ItemTimeout,
-    RetryRecoveryFailed(String),
-}
-
-fn append_batch_stopped_outcomes<T>(
-    outcomes: &mut Vec<Result<T, String>>,
-    count: usize,
-    reason: &BatchStopReason,
-) {
-    let error = match reason {
-        BatchStopReason::SessionDeadline => {
-            "browser_session_deadline: общий срок пакета истёк".to_owned()
-        }
-        BatchStopReason::ItemTimeout => "browser_batch_stopped_after_item_timeout: обработка предыдущего символа отменена по таймауту; сеанс браузера остановлен, чтобы поздний ответ не изменил страницу".to_owned(),
-        BatchStopReason::RetryRecoveryFailed(detail) => format!(
-            "browser_batch_stopped_after_retry_recovery_failure: не удалось безопасно восстановить страницу: {detail}"
-        ),
-    };
-    outcomes.extend((0..count).map(|_| Err(error.clone())));
+struct RetryAcquisitionContext<'a> {
+    page: &'a Page,
+    target: AcquisitionTarget,
+    evidence_monitor: &'a BrowserEvidenceMonitor,
+    browser_runtime: &'a BrowserRuntimeProvenance,
+    tls_exception: Option<TlsExceptionProvenance>,
+    session_deadline: Instant,
+    interrupt: &'a mut CtrlCListener,
 }
 
 async fn acquire_one_with_retries(
-    page: &Page,
+    context: RetryAcquisitionContext<'_>,
+    index: usize,
     character: &str,
-    target: AcquisitionTarget,
-    evidence_monitor: &BrowserEvidenceMonitor,
-    browser_runtime: &BrowserRuntimeProvenance,
-    tls_exception: Option<TlsExceptionProvenance>,
-    session_deadline: Instant,
-) -> (Result<AcquiredMedia, String>, Option<BatchStopReason>) {
+    on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError> {
     for attempt in 1..=MAX_ACQUISITION_ATTEMPTS {
-        if Instant::now() >= session_deadline {
-            return (
+        if Instant::now() >= context.session_deadline {
+            return Ok((
                 Err("browser_session_deadline: общий срок пакета истёк".into()),
-                Some(BatchStopReason::SessionDeadline),
-            );
+                Some(SessionStopReason::Deadline),
+            ));
         }
-        let epoch = evidence_monitor.begin_acquisition();
-        let item_deadline = (Instant::now() + ITEM_TIMEOUT).min(session_deadline);
-        let acquisition = timeout_at(
-            item_deadline,
-            acquire_one(
-                page,
-                character,
-                target,
-                epoch,
-                evidence_monitor,
-                browser_runtime,
-                tls_exception.clone(),
-            ),
-        )
-        .await;
+        let epoch = context.evidence_monitor.begin_acquisition();
+        let item_deadline = (Instant::now() + ITEM_TIMEOUT).min(context.session_deadline);
+        let acquisition = acquire_one(
+            context.page,
+            character,
+            context.target,
+            epoch,
+            context.evidence_monitor,
+            context.browser_runtime,
+            context.tls_exception.clone(),
+        );
+        tokio::pin!(acquisition);
+        let item_timeout = timeout_at(item_deadline, &mut acquisition);
+        tokio::pin!(item_timeout);
+        let mut heartbeat = tokio::time::interval(PROGRESS_HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        let acquisition = loop {
+            tokio::select! {
+                result = &mut item_timeout => break result,
+                _ = heartbeat.tick() => on_event(AcquisitionEvent::Heartbeat {
+                    index,
+                    attempt,
+                })?,
+                signal = &mut *context.interrupt => return Err(signal_error(signal)),
+            }
+        };
         let (result, timed_out) = match acquisition {
             Ok(result) => (result, false),
-            Err(_) if Instant::now() >= session_deadline => {
-                return (
+            Err(_) if Instant::now() >= context.session_deadline => {
+                return Ok((
                     Err("browser_session_deadline: общий срок пакета истёк".into()),
-                    Some(BatchStopReason::SessionDeadline),
-                );
+                    Some(SessionStopReason::Deadline),
+                ));
             }
             Err(_) => (
                 Err("browser_item_timeout: превышен ограниченный срок обработки символа".into()),
@@ -791,64 +1082,80 @@ async fn acquire_one_with_retries(
         match result {
             Ok(mut media) => {
                 media.evidence.acquisition_attempts = attempt;
-                return (Ok(media), None);
+                return Ok((Ok(media), None));
             }
             Err(error) => {
-                if should_retry_acquisition(&error, evidence_monitor, epoch, attempt) {
-                    if timeout_at(session_deadline, sleep(RETRY_BACKOFF))
-                        .await
-                        .is_err()
-                    {
-                        return (
+                if should_retry_acquisition(&error, context.evidence_monitor, epoch, attempt) {
+                    on_event(AcquisitionEvent::RetryStarted {
+                        index,
+                        attempt: attempt + 1,
+                    })?;
+                    let backoff_complete = tokio::select! {
+                        result = timeout_at(context.session_deadline, sleep(RETRY_BACKOFF)) => result.is_ok(),
+                        signal = &mut *context.interrupt => return Err(signal_error(signal)),
+                    };
+                    if !backoff_complete {
+                        return Ok((
                             Err("browser_session_deadline: общий срок пакета истёк".into()),
-                            Some(BatchStopReason::SessionDeadline),
-                        );
+                            Some(SessionStopReason::Deadline),
+                        ));
                     }
                     let recovery_deadline = (Instant::now()
                         + ITEM_TIMEOUT.min(Duration::from_secs(30)))
-                    .min(session_deadline);
-                    match timeout_at(
-                        recovery_deadline,
-                        recover_page_for_retry(page, target, evidence_monitor, recovery_deadline),
-                    )
-                    .await
-                    {
+                    .min(context.session_deadline);
+                    on_event(AcquisitionEvent::RetryRecoveryStarted {
+                        index,
+                        attempt: attempt + 1,
+                    })?;
+                    let recovery = tokio::select! {
+                        result = timeout_at(
+                            recovery_deadline,
+                            recover_page_for_retry(
+                                context.page,
+                                context.target,
+                                context.evidence_monitor,
+                                recovery_deadline,
+                            ),
+                        ) => result,
+                        signal = &mut *context.interrupt => return Err(signal_error(signal)),
+                    };
+                    match recovery {
                         Ok(Ok(())) => {}
-                        Err(_) if Instant::now() >= session_deadline => {
-                            return (
+                        Err(_) if Instant::now() >= context.session_deadline => {
+                            return Ok((
                                 Err("browser_session_deadline: общий срок пакета истёк при восстановлении страницы".into()),
-                                Some(BatchStopReason::SessionDeadline),
-                            );
+                                Some(SessionStopReason::Deadline),
+                            ));
                         }
                         Ok(Err(recovery_error)) => {
-                            return (
+                            return Ok((
                                 Err(format!(
                                     "{error}; browser_retry_recovery_failed: {recovery_error}"
                                 )),
-                                Some(BatchStopReason::RetryRecoveryFailed(recovery_error)),
-                            );
+                                Some(SessionStopReason::RetryRecoveryFailed(recovery_error)),
+                            ));
                         }
                         Err(_) => {
                             let error = "восстановление страницы превысило ограниченный срок";
-                            return (
+                            return Ok((
                                 Err(format!("{error}; browser_retry_recovery_failed")),
-                                Some(BatchStopReason::RetryRecoveryFailed(error.to_owned())),
-                            );
+                                Some(SessionStopReason::RetryRecoveryFailed(error.to_owned())),
+                            ));
                         }
                     }
                     continue;
                 }
                 if timed_out {
-                    return (Err(error), Some(BatchStopReason::ItemTimeout));
+                    return Ok((Err(error), Some(SessionStopReason::ItemTimeout)));
                 }
-                return (Err(error), None);
+                return Ok((Err(error), None));
             }
         }
     }
-    (
+    Ok((
         Err("browser_retry_exhausted: лимит попыток acquisition исчерпан".into()),
         None,
-    )
+    ))
 }
 
 fn is_retryable_acquisition_error(
@@ -2274,49 +2581,78 @@ mod tests {
     }
 
     #[test]
-    fn session_deadline_outcomes_keep_completed_prefix_and_fill_remaining_items() {
-        let mut outcomes = vec![Ok("first"), Ok("second")];
-        append_session_deadline_outcomes(&mut outcomes, 2);
-        assert_eq!(outcomes.len(), 4);
-        assert_eq!(outcomes[0], Ok("first"));
-        assert_eq!(outcomes[1], Ok("second"));
+    fn session_stop_reasons_are_reported_without_tail_outcomes() {
         assert!(
-            outcomes[2]
-                .as_ref()
-                .unwrap_err()
-                .starts_with("browser_session_deadline:")
+            SessionStopReason::Deadline
+                .summary()
+                .contains("срок browser session")
         );
         assert!(
-            outcomes[3]
-                .as_ref()
-                .unwrap_err()
-                .starts_with("browser_session_deadline:")
+            SessionStopReason::ItemTimeout
+                .summary()
+                .contains("item timeout")
+        );
+        assert!(
+            SessionStopReason::RetryRecoveryFailed("offline".into())
+                .summary()
+                .contains("offline")
         );
     }
 
     #[test]
-    fn item_timeout_keeps_completed_prefix_and_uses_a_distinct_batch_stop_reason() {
-        let mut outcomes = vec![
-            Ok("first"),
-            Ok("second"),
-            Err("browser_item_timeout: item".into()),
-        ];
-        append_batch_stopped_outcomes(&mut outcomes, 2, &BatchStopReason::ItemTimeout);
-
-        assert_eq!(outcomes.len(), 5);
-        assert_eq!(outcomes[0], Ok("first"));
-        assert_eq!(outcomes[1], Ok("second"));
-        assert!(
-            outcomes[2]
-                .as_ref()
-                .unwrap_err()
-                .starts_with("browser_item_timeout:")
+    fn session_frontier_rotates_only_after_a_durable_prefix() {
+        let rotate = session_action(
+            10,
+            30,
+            &SessionAcquisitionSummary {
+                processed: 7,
+                stop_reason: Some(SessionStopReason::Deadline),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rotate,
+            SessionAction::Rotate {
+                next_offset: 17,
+                reason: SessionStopReason::Deadline,
+            }
         );
-        for outcome in &outcomes[3..] {
-            let error = outcome.as_ref().unwrap_err();
-            assert!(error.starts_with("browser_batch_stopped_after_item_timeout:"));
-            assert!(!error.starts_with("browser_session_deadline:"));
-        }
+
+        let interrupted = session_action(
+            10,
+            30,
+            &SessionAcquisitionSummary {
+                processed: 7,
+                stop_reason: Some(SessionStopReason::Interrupted),
+            },
+        )
+        .unwrap();
+        assert_eq!(interrupted, SessionAction::Interrupted { next_offset: 17 });
+
+        let no_progress = session_action(
+            10,
+            30,
+            &SessionAcquisitionSummary {
+                processed: 0,
+                stop_reason: Some(SessionStopReason::Deadline),
+            },
+        );
+        assert!(matches!(
+            no_progress,
+            Err(AcquisitionStreamError::Provider(message))
+                if message.contains("browser_session_no_progress")
+        ));
+
+        let complete = session_action(
+            10,
+            17,
+            &SessionAcquisitionSummary {
+                processed: 7,
+                stop_reason: Some(SessionStopReason::Interrupted),
+            },
+        )
+        .unwrap();
+        assert_eq!(complete, SessionAction::Complete);
     }
 
     #[test]

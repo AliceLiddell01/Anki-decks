@@ -765,9 +765,37 @@ candidate. Формат/hash определяются по bytes. Для compare
 раундов получения ресурсов. Каждый раунд обрабатывает всю текущую очередь до
 следующего `retry`; опубликованные и уже действующие подтверждённые записи повторно
 не запрашиваются. Ошибка отдельного элемента остаётся в `issues` и не отменяет
-результаты соседних. Получение в браузере проходит без блокировки пакета; после
-него CLI заново открывает состояние и отбрасывает результат, если элемент уже
-вышел из текущей очереди.
+результаты соседних. Получение в браузере проходит без блокировки пакета. После
+каждого фактического результата CLI повторно захватывает runtime lock, сверяет
+актуальные generation и attempt count, сохраняет candidate bytes/evidence и
+атомарно записывает состояние до запуска следующей identity. Устаревший результат
+отбрасывается, если состояние identity изменилось во время acquisition.
+
+Во время `batch run` прогресс сразу выводится в `stderr`: человекочитаемыми
+строками в обычном режиме и JSON Lines при `--output json`. В JSON Lines каждое
+событие имеет `schema_version: 1`, `operation: "batch_run"`, `event`, `batch_id`,
+`elapsed_ms`, `round`, `round_limit`, `round_completed`, `round_total`,
+`run_completed` и `batch_total`; у событий identity также есть `identity`, а у
+событий browser session, retry и результата — соответствующие `session`,
+`attempt`, `outcome` и `reason`. Стабильные значения `event`: `run_started`,
+`round_started`, `browser_session_started`, `browser_session_ended`,
+`browser_session_rotated`, `item_started`, `retry_started`,
+`retry_recovery_started`, `heartbeat`, `item_checkpointed`,
+`item_discarded_stale`, `round_finished`, `run_stopped`, `run_finished`.
+`round_completed` увеличивается только после durable checkpoint. При `--output
+json` `stdout` по-прежнему содержит один самостоятельный итоговый JSON-ответ
+команды; progress не смешивается с ним.
+
+Срок в 20 минут относится к одной browser session. Если он истекает до старта
+следующей identity, session закрывается и оставшийся frontier автоматически
+продолжается в новой session. Таймаут или ошибка восстановления страницы могут
+дать технический outcome только фактически начатой identity; незапущенный хвост
+остаётся pending и не получает попыток, изменений generation или aggregate.
+Ошибка подготовки новой session останавливает команду и сохраняет уже
+зафиксированный prefix; следующий `batch run` продолжает с оставшихся identity.
+На `Ctrl+C` provider закрывает текущую browser session и завершает команду после
+текущего уже зафиксированного результата; identity без финального checkpoint
+остаётся доступной для повторного получения тем же `batch_id`.
 
 До автоматической публикации попытка и байты кандидата записываются в runtime.
 Единственный кандидат со статусом `VERIFIED` проходит проверку владельца домена
