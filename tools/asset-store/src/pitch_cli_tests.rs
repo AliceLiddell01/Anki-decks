@@ -2,6 +2,8 @@ use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
 
 use super::{
     CorpusCommand, OutputFormat, PitchBatchCommand, PitchCli, PitchCommand, PitchPlanItem,
@@ -251,7 +253,7 @@ async fn run_reconciles_a_store_commit_after_restart_without_reacquisition() {
     runtime.save(&batch).unwrap();
     drop(runtime);
 
-    // Имитируем сбой после commit owner store и до финального обновления batch state.
+    // Имитируем сбой после фиксации изменения в хранилище и до итогового обновления состояния пакета.
     let identity = AssetIdentity::new("pitch_accent", "幽霊").unwrap();
     let result = store
         .ingest_verified(
@@ -1089,8 +1091,8 @@ fn pitch_store_boundary_rejects_symlink_alias_into_decks() {
     fs::remove_dir_all(root).unwrap();
 }
 
-// Провайдер и сессия подменяются только на boundary CLI; реальная запись batch,
-// token/CAS, candidate validation и публикация остаются production-кодом.
+// Провайдер и сессия подменяются только на границе CLI; запись пакета,
+// token/CAS, проверка кандидата и публикация остаются боевым кодом.
 enum ScriptedPitchAction {
     Complete,
     WaitForHeartbeat(futures::channel::oneshot::Receiver<()>),
@@ -1108,6 +1110,7 @@ struct ScriptedPitchDriver {
     actions: std::collections::VecDeque<ScriptedPitchAction>,
     launches: usize,
     fail_launch_on: Option<usize>,
+    slow_launch: Option<(usize, futures::channel::oneshot::Receiver<()>)>,
     interrupt_during_launch: Option<futures::channel::oneshot::Sender<()>>,
     active: Option<usize>,
     closed: Vec<usize>,
@@ -1123,6 +1126,7 @@ impl ScriptedPitchDriver {
             actions: actions.into(),
             launches: 0,
             fail_launch_on: None,
+            slow_launch: None,
             interrupt_during_launch: None,
             active: None,
             closed: Vec::new(),
@@ -1146,14 +1150,22 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
     async fn launch(&mut self) -> Result<Self::Session, String> {
         assert!(self.active.is_none(), "сессии не должны пересекаться");
         self.launches += 1;
+        if self
+            .slow_launch
+            .as_ref()
+            .is_some_and(|(index, _)| *index == self.launches)
+        {
+            let (_, permit) = self.slow_launch.take().unwrap();
+            permit.await.unwrap();
+        }
         if let Some(signal) = self.interrupt_during_launch.take() {
             signal.send(()).unwrap();
-            // Дать listener увидеть сигнал до появления owning Session.
+            // Дать обработчику увидеть сигнал до создания сессии браузера.
             tokio::task::yield_now().await;
             tokio::task::yield_now().await;
         }
         if self.fail_launch_on == Some(self.launches) {
-            return Err("offline launch failure".into());
+            return Err("сбой запуска в автономном сценарии".into());
         }
         self.active = Some(self.launches);
         Ok(self.launches)
@@ -1176,7 +1188,7 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
         let action = self
             .actions
             .pop_front()
-            .expect("запрос вне offline сценария");
+            .expect("запрос вне автономного сценария");
         let mut failure = None;
         match action {
             ScriptedPitchAction::Complete => {}
@@ -1191,7 +1203,7 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
                     outcomes: vec![JpdbPitchOutcome::Failed {
                         error: JpdbPitchFailure::Timeout {
                             stage: JpdbPitchStage::SearchNavigation,
-                            diagnostic: Some("offline item-local timeout".into()),
+                            diagnostic: Some("тайм-аут элемента в автономной проверке".into()),
                         },
                     }],
                     session_failure: None,
@@ -1202,14 +1214,14 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
                     outcomes: Vec::new(),
                     session_failure: Some(JpdbPitchFailure::BrowserConfiguration {
                         stage: JpdbPitchStage::ConfigureBrowser,
-                        message: "offline page setup failure".into(),
+                        message: "сбой подготовки страницы в автономной проверке".into(),
                     }),
                 };
             }
             ScriptedPitchAction::SessionFailure { after_outcome } => {
                 failure = Some(JpdbPitchFailure::SessionFailure {
                     stage: JpdbPitchStage::SearchNavigation,
-                    message: "offline telemetry stop".into(),
+                    message: "остановка телеметрии в автономной проверке".into(),
                 });
                 if !after_outcome {
                     return crate::jpdb::JpdbPitchAcquisitionReport {
@@ -1889,5 +1901,393 @@ async fn pitch_manual_retry_reports_actual_attempt_and_pending_denominator() {
         .unwrap();
     assert_eq!(checkpoint.attempt, Some(2));
     assert_eq!(checkpoint.run_completed, 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn pitch_rotation_and_launch_heartbeat_have_explicit_session_context() {
+    let root = temp_root();
+    let store = store_at(&root);
+    offline_pitch_batch(&store, "rotation-context", &["一", "二"]);
+    let (permit, receiver) = futures::channel::oneshot::channel();
+    let mut driver = ScriptedPitchDriver::new(
+        &store,
+        "rotation-context",
+        vec![ScriptedPitchAction::Complete, ScriptedPitchAction::Complete],
+    );
+    driver.slow_launch = Some((2, receiver));
+    let mut progress = CapturedPitchProgress {
+        release_on_heartbeat: Some(permit),
+        ..CapturedPitchProgress::default()
+    };
+    super::run_batch_with_driver(
+        &store,
+        "rotation-context",
+        "batch_run",
+        &mut driver,
+        &mut progress,
+        offline_pitch_policy(1),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap();
+    let checkpoint = progress
+        .events
+        .iter()
+        .position(|event| event.event == "item_checkpointed")
+        .unwrap();
+    let rotation = progress
+        .events
+        .iter()
+        .position(|event| event.event == "browser_session_rotated")
+        .unwrap();
+    let heartbeat = progress
+        .events
+        .iter()
+        .position(|event| event.event == "heartbeat")
+        .unwrap();
+    let next_start = progress
+        .events
+        .iter()
+        .rposition(|event| event.event == "item_started")
+        .unwrap();
+    assert!(checkpoint < rotation && rotation < heartbeat && heartbeat < next_start);
+    assert_eq!(progress.events[rotation].session, Some(1));
+    assert_eq!(progress.events[rotation].next_session, Some(2));
+    assert_eq!(progress.events[heartbeat].session, Some(2));
+    for event in &progress.events {
+        if matches!(event.event, "item_started" | "item_checkpointed") {
+            let identity = event.identity.as_ref().unwrap();
+            assert_eq!(
+                event.session,
+                Some(if identity.key == "一" { 1 } else { 2 })
+            );
+            assert_eq!(event.attempt, Some(1));
+            assert!(event.next_session.is_none());
+        } else {
+            assert!(
+                event.identity.is_none(),
+                "{} inherited identity",
+                event.event
+            );
+            assert!(event.attempt.is_none(), "{} inherited attempt", event.event);
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pitch_human_progress_localizes_protocol_values_without_changing_jsonl() {
+    let cases = [
+        (
+            "browser_session_rotated",
+            None,
+            Some("item_limit"),
+            "смена сессии браузера",
+            "достигнут лимит записей сессии",
+        ),
+        (
+            "run_stopped",
+            None,
+            Some("session_failure"),
+            "получение остановлено",
+            "ошибка сессии браузера",
+        ),
+        (
+            "item_checkpointed",
+            Some("technical_failure"),
+            None,
+            "результат записи сохранён",
+            "техническая ошибка",
+        ),
+        (
+            "item_checkpointed",
+            Some("vocabulary_not_found"),
+            None,
+            "результат записи сохранён",
+            "запись JPDB не найдена",
+        ),
+        (
+            "item_discarded_stale",
+            None,
+            Some("item_token_changed"),
+            "устаревший результат отброшен",
+            "запись изменена другим действием",
+        ),
+    ];
+    for (event, outcome, reason, label, detail) in cases {
+        let progress = super::PitchProgressEvent {
+            schema_version: 1,
+            operation: "batch_run",
+            event,
+            batch_id: "human-progress".into(),
+            elapsed_ms: 25,
+            run_completed: 1,
+            run_total: 2,
+            batch_total: 2,
+            identity: None,
+            session: Some(1),
+            next_session: None,
+            attempt: None,
+            outcome: outcome.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+        };
+        let mut human = Vec::new();
+        super::write_pitch_progress(&progress, OutputFormat::Human, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains(label));
+        assert!(human.contains(detail));
+        assert!(!human.contains(event));
+        if let Some(value) = outcome.or(reason) {
+            assert!(!human.contains(value));
+        }
+        let mut machine = Vec::new();
+        super::write_pitch_progress(&progress, OutputFormat::Json, &mut machine).unwrap();
+        let machine: serde_json::Value = serde_json::from_slice(&machine).unwrap();
+        assert_eq!(machine["event"], event);
+        assert_eq!(machine["outcome"].as_str(), outcome);
+        assert_eq!(machine["reason"].as_str(), reason);
+    }
+}
+
+#[tokio::test]
+async fn pitch_saved_typed_failure_is_available_in_status_and_error_json_summary() {
+    for failure in [
+        JpdbPitchFailure::PageContract {
+            stage: JpdbPitchStage::SearchResolution,
+            message: "row contract: has_forms=false; 日本語\nточный diagnostic".into(),
+        },
+        JpdbPitchFailure::Telemetry {
+            stage: JpdbPitchStage::SearchReadiness,
+            message: "monitor_failed=true; relevant_pending=2; безопасная подробность".into(),
+        },
+    ] {
+        let root = temp_root();
+        let store = store_at(&root);
+        offline_pitch_batch(&store, "typed-summary", &["一"]);
+        let token = load_batch(&store, "typed-summary")
+            .unwrap()
+            .item_token("一")
+            .unwrap();
+        assert!(
+            super::record_one_outcome(
+                &store,
+                "typed-summary",
+                &token,
+                JpdbPitchOutcome::Failed {
+                    error: failure.clone()
+                }
+            )
+            .unwrap()
+        );
+        let saved = load_batch(&store, "typed-summary").unwrap();
+        let expected = serde_json::to_value(&failure).unwrap();
+        let snapshot = serde_json::to_value(&saved).unwrap();
+        assert_eq!(
+            snapshot["items"][0]["attempts"][0]["outcome"]["error"],
+            expected
+        );
+        let status = execute(cli(
+            store.root().to_path_buf(),
+            root.clone(),
+            OutputFormat::Json,
+            PitchCommand::Batch {
+                command: PitchBatchCommand::Status {
+                    batch_id: "typed-summary".into(),
+                },
+            },
+        ))
+        .await;
+        assert_eq!(status.exit_code, 0);
+        let status: serde_json::Value = serde_json::from_str(&status.stdout).unwrap();
+        assert_eq!(status["items"][0]["failure"], expected);
+        assert_eq!(status["items"][0]["last_outcome"]["error"], expected);
+        let stopped = super::render_batch_error(
+            &store,
+            StoreSummary {
+                path: store.root().display().to_string(),
+                store_id: store.store_id().into(),
+            },
+            "typed-summary",
+            "batch_run",
+            super::pitch_session_failure(failure),
+            OutputFormat::Json,
+            true,
+        );
+        let stopped: serde_json::Value = serde_json::from_str(&stopped.stdout).unwrap();
+        assert_eq!(stopped["items"][0]["failure"], expected);
+        assert_eq!(stopped["error"]["details"]["session_failure"], expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn json_batch_response_exposes_flushed_log_on_success_and_failure() {
+    for succeeds in [true, false] {
+        let root = temp_root();
+        let store = store_at(&root);
+        let batch_id = if succeeds {
+            save_durable_candidate(&store, "diagnostic-success", "幽霊");
+            "diagnostic-success"
+        } else {
+            "diagnostic-missing-batch"
+        };
+        let summary = StoreSummary {
+            path: store.root().display().to_string(),
+            store_id: store.store_id().to_owned(),
+        };
+        let output = super::run_batch_output(
+            &store,
+            batch_id,
+            "batch_run",
+            summary,
+            OutputFormat::Json,
+            false,
+        )
+        .await;
+        assert_eq!(output.stderr, "");
+        let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        let log_path = PathBuf::from(response["diagnostic_log"].as_str().unwrap());
+        assert!(log_path.exists());
+        assert!(log_path.to_string_lossy().contains("/logs/"));
+        let events = fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["fields"]["event"] == "run_started")
+        );
+        let terminal_event = if succeeds {
+            "run_finished"
+        } else {
+            "run_stopped"
+        };
+        let terminal = events
+            .iter()
+            .find(|event| event["fields"]["event"] == terminal_event)
+            .unwrap();
+        assert!(terminal["spans"].as_array().unwrap().iter().any(|span| {
+            span["name"] == "pitch_batch_run"
+                && span["run_id"] == terminal["fields"]["run_id"]
+                && span["diagnostic_log"] == response["diagnostic_log"]
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn session_failure_log_records_real_prefix_and_leaves_tail_unstarted() {
+    let root = temp_root();
+    let store = store_at(&root);
+    offline_pitch_batch(&store, "diagnostic-session-failure", &["一", "二", "三"]);
+    let run_log =
+        crate::batch_runtime::SafeBatchRuntime::open(store.root(), "diagnostic-session-failure")
+            .unwrap()
+            .create_run_log()
+            .unwrap();
+    let run_id = run_log.run_id;
+    let log_path = run_log.path.display().to_string();
+    let guard =
+        crate::diagnostics::RunLogGuard::new(run_log.file, crate::diagnostics::OutputMode::Json);
+    let mut driver = ScriptedPitchDriver::new(
+        &store,
+        "diagnostic-session-failure",
+        vec![ScriptedPitchAction::SessionFailure {
+            after_outcome: true,
+        }],
+    );
+    let mut progress = CapturedPitchProgress::default();
+    let batch_id = "diagnostic-session-failure";
+    let operation = "batch_run";
+    let span_run_id = run_id.clone();
+    let span_log_path = log_path.clone();
+    let future = async {
+        let span = tracing::info_span!(
+            "pitch_batch_run",
+            operation,
+            batch_id,
+            run_id = span_run_id,
+            diagnostic_log = span_log_path,
+        );
+        async {
+            tracing::info!(event = "run_started", operation, batch_id, run_id);
+            let result = super::run_batch_with_driver(
+                &store,
+                batch_id,
+                operation,
+                &mut driver,
+                &mut progress,
+                offline_pitch_policy(4),
+                no_pitch_interruption(),
+            )
+            .await;
+            if let Err(error) = &result {
+                tracing::error!(
+                    event = "run_stopped",
+                    operation,
+                    batch_id,
+                    run_id,
+                    code = error.code.as_str(),
+                    message = %crate::diagnostics::safe_message(&error.message),
+                );
+            }
+            result
+        }
+        .instrument(span)
+        .await
+    }
+    .with_subscriber(guard.dispatch());
+    let error = future.await.unwrap_err();
+    assert_eq!(error.details["run_stop_reason"], "session_failure");
+    guard.finish().unwrap();
+
+    let batch = load_batch(&store, batch_id).unwrap();
+    assert_eq!(batch.items[0].attempts.len(), 1);
+    assert!(batch.items[1..].iter().all(|item| item.attempts.is_empty()));
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.event == "item_started")
+            .map(|event| event.identity.as_ref().unwrap().key.as_str())
+            .collect::<Vec<_>>(),
+        ["一"]
+    );
+
+    let contents = fs::read_to_string(log_path).unwrap();
+    assert!(!contents.contains('\u{1b}'));
+    let events = contents
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let failure = events
+        .iter()
+        .find(|event| event["fields"]["event"] == "pitch_failure")
+        .unwrap();
+    assert_eq!(failure["fields"]["code"], "session_failure");
+    assert_eq!(failure["fields"]["identity"], "一");
+    assert_eq!(failure["fields"]["tail_started"], false);
+    assert!(
+        failure["fields"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("автономной проверке")
+    );
+    assert!(events.iter().any(|event| {
+        event["fields"]["event"] == "run_stopped"
+            && event["spans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|span| span["name"] == "pitch_batch_run" && span["run_id"] == run_id)
+    }));
+    assert!(!events.iter().any(|event| {
+        event["fields"]["code"] == "item_started" && event["fields"]["identity"] != "一"
+    }));
     fs::remove_dir_all(root).unwrap();
 }

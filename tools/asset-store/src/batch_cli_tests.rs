@@ -415,7 +415,7 @@ fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
         1,
         |characters, on_event| {
             assert_eq!(characters, ["元", "漢", "字"]);
-            // Во время provider wait другой владелец может открыть runtime.
+            // Во время ожидания поставщика другой владелец может открыть среду пакета.
             let probe = BatchRuntime::open(fixture.store.root(), "partial-checkpoint").unwrap();
             drop(probe);
             on_event(AcquisitionEvent::SessionStarted { session: 1 })
@@ -433,13 +433,13 @@ fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
             })
             .map_err(AcquisitionStreamError::Consumer)?;
 
-            // Item callback вернулся только после атомарного checkpoint.
+            // Обработчик элемента вернулся только после атомарного сохранения.
             let checkpoint = fixture.load("partial-checkpoint");
             assert_eq!(checkpoint.items[0].attempts.len(), 1);
             let BatchAttemptInput::Candidate { candidate } =
                 &checkpoint.items[0].attempts[0].result
             else {
-                panic!("полученный кандидат должен быть сохранён до продолжения provider")
+                panic!("полученный кандидат должен быть сохранён до продолжения поставщика")
             };
             let runtime = BatchRuntime::open(fixture.store.root(), "partial-checkpoint").unwrap();
             assert_eq!(runtime.read_candidate(candidate).unwrap(), glyph('元'));
@@ -449,7 +449,7 @@ fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
                 assert_eq!(item.status, BatchItemStatus::Unresolved);
             }
             Err(AcquisitionStreamError::Provider(
-                "synthetic interruption after first durable outcome".into(),
+                "синтетическое прерывание после первого сохранённого результата".into(),
             ))
         },
         &mut StoreSnapshotReader,
@@ -528,7 +528,7 @@ fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
         |_characters, on_event| {
             emit_stream_item(on_event, 0, Ok(media("元", glyph('元'))))?;
             Err(AcquisitionStreamError::Provider(
-                "synthetic session stop".into(),
+                "синтетическая остановка сессии".into(),
             ))
         },
         &mut StoreSnapshotReader,
@@ -554,13 +554,13 @@ fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
         |characters, on_event| {
             resumed_requests.push(characters.to_vec());
             assert_eq!(characters, ["漢", "字"]);
-            emit_stream_item(on_event, 0, Err("item-local failure for 漢".into()))?;
+            emit_stream_item(on_event, 0, Err("ошибка получения символа 漢".into()))?;
             assert_eq!(fixture.load("frontier-tail").next_round(), [identity('字')]);
-            emit_stream_item(on_event, 1, Err("item-local failure for 字".into()))?;
+            emit_stream_item(on_event, 1, Err("ошибка получения символа 字".into()))?;
             assert_eq!(
                 fixture.load("frontier-tail").next_round(),
                 [identity('漢'), identity('字')],
-                "вторая попытка соседей разрешена только после первой попытки всего frontier"
+                "вторая попытка соседей разрешена только после первой попытки всей очереди раунда"
             );
             Ok(())
         },
@@ -573,6 +573,226 @@ fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
     assert_eq!(state.items[1].attempts.len(), 1);
     assert_eq!(state.items[2].attempts.len(), 1);
     assert_eq!(state.next_round(), [identity('漢'), identity('字')]);
+}
+
+#[test]
+fn partial_checkpoint_error_response_reports_durable_change_and_saved_tail() {
+    for interrupted in [true, false] {
+        let mut fixture = Fixture::new();
+        let batch_id = "partial-error-response";
+        fixture.start(batch_id, &['元', '漢', '字']);
+        fixture.store = AssetStore::open_kanji(StoreOptions::new(fixture.store.root())).unwrap();
+        assert!(!fixture.store.did_mutate_on_open());
+        let initial_revision = fixture.load(batch_id).revision;
+        let error = run_batch_with_stream_and_progress(
+            &fixture.store,
+            batch_id,
+            2,
+            |_characters, on_event| {
+                emit_stream_item(
+                    on_event,
+                    0,
+                    Err("сохранённая ошибка первого символа".into()),
+                )?;
+                if interrupted {
+                    Err(AcquisitionStreamError::Interrupted)
+                } else {
+                    Err(AcquisitionStreamError::Provider(
+                        "сессия браузера недоступна".into(),
+                    ))
+                }
+            },
+            &mut StoreSnapshotReader,
+            &mut CapturedProgress::default(),
+        )
+        .unwrap_err();
+        let final_output = render_batch_error(
+            &fixture.store,
+            fixture.summary(),
+            OutputFormat::Json,
+            BatchRunFailure {
+                batch_id,
+                operation: "batch_run",
+                error,
+                initial_revision: Some(initial_revision),
+                diagnostic_log: None,
+            },
+        );
+        assert!(final_output.stderr.is_empty());
+        let response: serde_json::Value = serde_json::from_str(&final_output.stdout).unwrap();
+        assert_eq!(response["batch_id"], batch_id);
+        assert_eq!(response["changed"], true);
+        assert_eq!(response["items"][0]["acquisition_attempts"], 1);
+        assert_eq!(
+            response["batch"]["items"][0]["attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            response["batch"]["revision"],
+            fixture.load(batch_id).revision
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(if interrupted {
+                    "Ctrl+C"
+                } else {
+                    "сессия браузера недоступна"
+                })
+        );
+        for index in 1..3 {
+            assert_eq!(response["items"][index]["acquisition_attempts"], 0);
+            assert!(
+                response["batch"]["items"][index]["attempts"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(fixture.load(batch_id).items[index].generation, 0);
+        }
+    }
+}
+
+#[test]
+fn batch_error_without_durable_mutation_reports_unchanged_existing_state() {
+    let mut fixture = Fixture::new();
+    fixture.start("unchanged-error", &['漢']);
+    fixture.store = AssetStore::open_kanji(StoreOptions::new(fixture.store.root())).unwrap();
+    assert!(!fixture.store.did_mutate_on_open());
+    let revision = fixture.load("unchanged-error").revision;
+    let final_output = render_batch_error(
+        &fixture.store,
+        fixture.summary(),
+        OutputFormat::Json,
+        BatchRunFailure {
+            batch_id: "unchanged-error",
+            operation: "batch_run",
+            error: AssetError::new(ErrorCode::IoFailure, "ошибка запуска браузера"),
+            initial_revision: Some(revision),
+            diagnostic_log: None,
+        },
+    );
+    let response: serde_json::Value = serde_json::from_str(&final_output.stdout).unwrap();
+    assert_eq!(response["changed"], false);
+    assert_eq!(response["batch_id"], "unchanged-error");
+    assert_eq!(response["batch"]["revision"], revision);
+    assert_eq!(response["items"][0]["acquisition_attempts"], 0);
+}
+
+#[test]
+fn signal_accepted_in_last_checkpoint_stops_before_second_round_acquisition() {
+    use std::sync::atomic::AtomicBool;
+    struct StopAtCheckpoint<'a> {
+        stopped: &'a AtomicBool,
+        events: Vec<BatchProgressEvent>,
+    }
+    impl BatchProgressSink for StopAtCheckpoint<'_> {
+        fn emit(&mut self, event: BatchProgressEvent) -> Result<(), AssetError> {
+            if event.event == "item_checkpointed" {
+                self.stopped.store(true, Ordering::SeqCst);
+            }
+            self.events.push(event);
+            Ok(())
+        }
+    }
+    let fixture = Fixture::new();
+    fixture.start("stop-round-boundary", &['漢']);
+    let stopped = AtomicBool::new(false);
+    let mut progress = StopAtCheckpoint {
+        stopped: &stopped,
+        events: Vec::new(),
+    };
+    let mut acquisitions = 0;
+    let error = run_batch_with_stream_and_progress(
+        &fixture.store,
+        "stop-round-boundary",
+        2,
+        |characters, on_event| {
+            acquisitions += 1;
+            assert_eq!(characters, ["漢"]);
+            emit_stream_item(on_event, 0, Err("ошибка получения первого раунда".into()))?;
+            // Сигнал принят из синхронного callback после надёжного сохранения.
+            // Поставщик обязан проверить тот же флаг остановки до успешного возврата.
+            assert_eq!(
+                fixture.load("stop-round-boundary").items[0].attempts.len(),
+                1
+            );
+            assert!(stopped.load(Ordering::SeqCst));
+            Err(AcquisitionStreamError::Interrupted)
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    )
+    .unwrap_err();
+    assert!(error.message.contains("batch_interrupted"));
+    assert_eq!(acquisitions, 1);
+    let saved = fixture.load("stop-round-boundary");
+    assert_eq!(saved.items[0].attempts.len(), 1);
+    assert_eq!(saved.next_round(), [identity('漢')]);
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.event == "round_started")
+            .count(),
+        1
+    );
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.event == "run_stopped")
+    );
+    assert!(
+        !progress
+            .events
+            .iter()
+            .any(|event| event.event == "run_finished")
+    );
+}
+
+#[test]
+fn human_progress_localizes_event_and_outcome_without_changing_machine_values() {
+    let event = BatchProgressEvent {
+        schema_version: 1,
+        operation: "batch_run",
+        event: "browser_session_started",
+        batch_id: "localized-progress".into(),
+        elapsed_ms: 100,
+        round: Some(1),
+        round_limit: 2,
+        round_completed: 0,
+        round_total: 1,
+        run_completed: 0,
+        batch_total: 1,
+        identity: None,
+        session: Some(1),
+        attempt: None,
+        outcome: Some("candidate_recorded".into()),
+        reason: None,
+    };
+    let mut human = Vec::new();
+    write_progress_event(&event, OutputFormat::Human, &mut human).unwrap();
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("сессия браузера запущена"));
+    assert!(human.contains("кандидат сохранён"));
+    for machine in [
+        "browser_session_started",
+        "candidate_recorded",
+        "identity=",
+        "browser session",
+    ] {
+        assert!(!human.contains(machine));
+    }
+    let mut machine = Vec::new();
+    write_progress_event(&event, OutputFormat::Json, &mut machine).unwrap();
+    let machine: serde_json::Value = serde_json::from_slice(&machine).unwrap();
+    assert_eq!(machine["event"], "browser_session_started");
+    assert_eq!(machine["outcome"], "candidate_recorded");
 }
 
 #[test]
@@ -670,7 +890,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
     assert!(state.items[0].is_ready());
     assert_eq!(state.review_queue().len(), 2);
     // Кандидат REJECTED показывает, что другой эталон Unicode ближе, поэтому он
-    // не считается независимым пригодным образцом этой identity.
+    // не считается независимым пригодным образцом этого символа.
     assert!(state.items[1].aggregate.distinct_valid_hashes.is_empty());
     assert_eq!(state.items[1].attempts.len(), 5);
     let confirm_hash = state.items[1].current_sha256.clone().unwrap();
@@ -1565,7 +1785,7 @@ fn expected_validator_trust_loss_invalidates_cached_ready() {
                 SemanticStatus::Verified,
                 vec![ValidationEvidence {
                     kind: "synthetic_other_classifier".into(),
-                    summary: "точная identity другого валидатора".into(),
+                    summary: "точная идентичность другого валидатора".into(),
                     details: None,
                 }],
             ))
@@ -1607,7 +1827,7 @@ fn stale_pinned_validator_blocks_decision_before_mutation() {
                 SemanticStatus::Verified,
                 vec![ValidationEvidence {
                     kind: "synthetic_other_classifier".into(),
-                    summary: "точная identity другого валидатора".into(),
+                    summary: "точная идентичность другого валидатора".into(),
                     details: None,
                 }],
             ))
@@ -1615,7 +1835,7 @@ fn stale_pinned_validator_blocks_decision_before_mutation() {
     }
     let fixture = Fixture::new();
     let hash = publish_reference(&fixture, "seed");
-    // Пакет создан до обновления рабочего валидатора: закреплённая identity
+    // Пакет создан до обновления рабочего валидатора: закреплённая идентичность
     // отличается от текущей, поэтому ни решение, ни повторное получение не могут
     // публиковать соседние элементы текущим валидатором.
     let pinned = OtherValidator.identity();
@@ -1694,4 +1914,86 @@ fn repeated_exact_confirm_passes_owner_attestation_after_external_reject() {
         owner[0].record.current_human_decision(),
         Some(HumanDecision::Approve)
     );
+}
+
+#[test]
+fn run_error_response_exposes_a_flushed_per_run_diagnostic_log() {
+    let fixture = Fixture::new();
+    let command = BatchCommand::Run {
+        batch_id: "diagnostic-missing-batch".into(),
+        rounds: 1,
+    };
+    let output = execute_with_progress(
+        &fixture.store,
+        fixture.summary(),
+        &command,
+        OutputFormat::Json,
+        false,
+        &mut CapturedProgress::default(),
+    );
+    assert!(!output.stderr.lines().any(|line| !line.is_empty()));
+    let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    let log_path = std::path::PathBuf::from(response["diagnostic_log"].as_str().unwrap());
+    assert!(log_path.exists());
+    assert!(log_path.to_string_lossy().contains("/logs/"));
+    let events = fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["fields"]["event"] == "run_started")
+    );
+    let stopped = events
+        .iter()
+        .find(|event| event["fields"]["event"] == "run_stopped")
+        .unwrap();
+    assert!(
+        stopped["spans"].as_array().unwrap().iter().any(|span| {
+            span["name"] == "kanji_batch_run"
+                && span["run_id"] == stopped["fields"]["run_id"]
+                && span["diagnostic_log"] == response["diagnostic_log"]
+        }),
+        "стоп-событие: {stopped}"
+    );
+}
+
+#[test]
+fn successful_run_response_exposes_a_flushed_per_run_diagnostic_log() {
+    let fixture = Fixture::new();
+    publish_reference(&fixture, "diagnostic-success");
+    let command = BatchCommand::Run {
+        batch_id: "diagnostic-success".into(),
+        rounds: 1,
+    };
+    let output = execute_with_progress(
+        &fixture.store,
+        fixture.summary(),
+        &command,
+        OutputFormat::Json,
+        false,
+        &mut CapturedProgress::default(),
+    );
+    let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    let log_path = std::path::PathBuf::from(response["diagnostic_log"].as_str().unwrap());
+    assert!(log_path.exists());
+    assert!(log_path.to_string_lossy().contains("/logs/"));
+    let events = fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let finished = events
+        .iter()
+        .find(|event| event["fields"]["event"] == "run_finished")
+        .unwrap();
+    assert!(finished["spans"].as_array().unwrap().iter().any(|span| {
+        span["name"] == "kanji_batch_run"
+            && span["run_id"] == finished["fields"]["run_id"]
+            && span["diagnostic_log"] == response["diagnostic_log"]
+    }));
 }

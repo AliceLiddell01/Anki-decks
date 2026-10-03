@@ -1,10 +1,13 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::batch_runtime::{RuntimeBatchState, RuntimeBlobRef, SafeBatchRuntime};
+use crate::batch_runtime::{
+    REFERENCED_BLOB_READS, RuntimeBatchState, RuntimeBlobRef, SafeBatchRuntime, create_log_file,
+};
 use crate::error::{AssetError, ErrorCode};
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -89,4 +92,158 @@ fn generic_runtime_resumes_non_image_state_and_exact_blob_bytes() {
         runtime.read_blob(resumed.blob.as_ref().unwrap()).unwrap(),
         bytes
     );
+}
+
+#[test]
+fn unlocking_invalidates_stale_save_and_reload_preserves_verified_blob_cache() {
+    let temporary = TemporaryDirectory::new();
+    let mut runtime_a = SafeBatchRuntime::open(&temporary.0, "shared-state").unwrap();
+    let blob = runtime_a.persist_blob(b"immutable", "bin").unwrap();
+    let initial = PlainTextBatch {
+        schema_version: 1,
+        batch_id: "shared-state".into(),
+        revision: 1,
+        description: "исходное состояние".into(),
+        blob: Some(blob),
+    };
+    runtime_a.save(&initial).unwrap();
+    let mut stale = runtime_a.load::<PlainTextBatch>().unwrap().unwrap();
+    runtime_a.release_lock().unwrap();
+
+    let updated = {
+        let mut runtime_b = SafeBatchRuntime::open(&temporary.0, "shared-state").unwrap();
+        let mut updated = runtime_b.load::<PlainTextBatch>().unwrap().unwrap();
+        updated.revision = 2;
+        updated.description = "сохранено другим владельцем".into();
+        runtime_b.save(&updated).unwrap();
+        updated
+    };
+
+    runtime_a.reacquire_lock().unwrap();
+    // Даже большая revision stale snapshot не даёт права перезаписать чужое состояние.
+    stale.revision = 10;
+    let error = runtime_a.save(&stale).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidTransition);
+    let saved: PlainTextBatch = serde_json::from_slice(
+        &fs::read(temporary.0.join(".runtime/batches/shared-state/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved, updated);
+
+    REFERENCED_BLOB_READS.with(|reads| reads.set(0));
+    let mut reloaded = runtime_a
+        .reload_cached::<PlainTextBatch>()
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded, updated);
+    REFERENCED_BLOB_READS.with(|reads| assert_eq!(reads.get(), 0));
+    reloaded.revision += 1;
+    reloaded.description = "изменено после перечитывания".into();
+    runtime_a.save(&reloaded).unwrap();
+    REFERENCED_BLOB_READS.with(|reads| assert_eq!(reads.get(), 0));
+    assert_eq!(
+        runtime_a.load::<PlainTextBatch>().unwrap().unwrap(),
+        reloaded
+    );
+}
+
+#[test]
+fn relocked_empty_runtime_also_requires_a_new_load() {
+    let temporary = TemporaryDirectory::new();
+    let mut runtime = SafeBatchRuntime::open(&temporary.0, "empty-state").unwrap();
+    assert!(runtime.load::<PlainTextBatch>().unwrap().is_none());
+    let state = PlainTextBatch {
+        schema_version: 1,
+        batch_id: "empty-state".into(),
+        revision: 1,
+        description: "новое состояние".into(),
+        blob: None,
+    };
+    runtime.release_lock().unwrap();
+    runtime.reacquire_lock().unwrap();
+    assert_eq!(
+        runtime.save(&state).unwrap_err().code,
+        ErrorCode::InvalidTransition
+    );
+    assert!(runtime.load::<PlainTextBatch>().unwrap().is_none());
+    runtime.save(&state).unwrap();
+}
+
+#[test]
+fn run_logs_are_unique_and_writer_survives_unlock_and_runtime_drop() {
+    let temporary = TemporaryDirectory::new();
+    let mut runtime = SafeBatchRuntime::open(&temporary.0, "diagnostic").unwrap();
+    let mut first = runtime.create_run_log().unwrap();
+    first.file.write_all(b"{\"event\":\"started\"}\n").unwrap();
+    let second = runtime.create_run_log().unwrap();
+    assert_ne!(first.run_id, second.run_id);
+    assert_ne!(first.path, second.path);
+    assert!(first.path.is_absolute());
+    assert_eq!(
+        first.path,
+        temporary
+            .0
+            .join(".runtime/batches/diagnostic/logs")
+            .join(format!("{}.jsonl", first.run_id))
+    );
+    runtime.release_lock().unwrap();
+    first.file.write_all(b"{\"event\":\"waiting\"}\n").unwrap();
+    drop(runtime);
+    first.file.write_all(b"{\"event\":\"finished\"}\n").unwrap();
+    first.file.sync_all().unwrap();
+    assert_eq!(
+        fs::read_to_string(&first.path).unwrap(),
+        "{\"event\":\"started\"}\n{\"event\":\"waiting\"}\n{\"event\":\"finished\"}\n"
+    );
+    assert!(fs::read(second.path).unwrap().is_empty());
+}
+
+#[test]
+fn run_log_collision_never_overwrites_existing_files_or_follows_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let directory = fs::File::open(&temporary.0).unwrap();
+    let mut writer = create_log_file(&directory, "run.jsonl").unwrap().unwrap();
+    writer.write_all(b"original\n").unwrap();
+    drop(writer);
+    assert!(create_log_file(&directory, "run.jsonl").unwrap().is_none());
+    assert_eq!(
+        fs::read(temporary.0.join("run.jsonl")).unwrap(),
+        b"original\n"
+    );
+
+    fs::write(temporary.0.join("outside"), b"untouched").unwrap();
+    symlink("outside", temporary.0.join("linked.jsonl")).unwrap();
+    assert!(
+        create_log_file(&directory, "linked.jsonl")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fs::read(temporary.0.join("outside")).unwrap(), b"untouched");
+    assert_eq!(
+        create_log_file(&directory, "../escape.jsonl")
+            .unwrap_err()
+            .code,
+        ErrorCode::PathTraversal
+    );
+}
+
+#[test]
+fn run_log_creation_rejects_symlinked_logs_directory() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let outside = TemporaryDirectory::new();
+    let runtime = SafeBatchRuntime::open(&temporary.0, "linked-logs").unwrap();
+    symlink(
+        &outside.0,
+        temporary.0.join(".runtime/batches/linked-logs/logs"),
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.create_run_log().unwrap_err().code,
+        ErrorCode::BoundaryViolation
+    );
+    assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
 }

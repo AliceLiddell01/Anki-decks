@@ -194,7 +194,7 @@ fn rejected_owner(mut record: AssetRecord) -> AssetRecord {
         identity: record.identity.clone(),
         content_sha256: record.sha256.clone(),
         decision: HumanDecision::Reject,
-        reason: "synthetic exact-SHA rejection".into(),
+        reason: "Синтетический отказ для точного SHA".into(),
     });
     record
 }
@@ -269,7 +269,7 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
                 JpdbPitchOutcome::Failed {
                     error: JpdbPitchFailure::Timeout {
                         stage: JpdbPitchStage::DetailReadiness,
-                        diagnostic: Some("request timed out".into()),
+                        diagnostic: Some("Истёк лимит запроса".into()),
                     },
                 },
             )
@@ -281,7 +281,7 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
         PitchBatchItemStatus::TechnicalFailure
     );
     batch
-        .retry("幽霊", "retry transient timeout".into())
+        .retry("幽霊", "Повторить после временного истечения лимита".into())
         .unwrap();
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
@@ -297,7 +297,7 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
                 JpdbPitchOutcome::Failed {
                     error: JpdbPitchFailure::Timeout {
                         stage: JpdbPitchStage::Capture,
-                        diagnostic: Some("stale pre-retry result".into()),
+                        diagnostic: Some("Устаревший результат до повторной попытки".into()),
                     },
                 },
             )
@@ -318,7 +318,7 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
                 JpdbPitchOutcome::Failed {
                     error: JpdbPitchFailure::PageContract {
                         stage: JpdbPitchStage::DetailVerification,
-                        message: "unexpected source page".into(),
+                        message: "Неожиданная страница источника".into(),
                     },
                 },
             )
@@ -326,12 +326,66 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
     );
     assert!(
         batch
-            .retry("幽霊", "must not repeat a page contract failure".into())
+            .retry(
+                "幽霊",
+                "Нарушение контракта страницы нельзя повторять".into()
+            )
             .is_err()
     );
 
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_source_failure_text_survives_checkpoint_reload_and_json() {
+    let failures = [
+        JpdbPitchFailure::PageContract {
+            stage: JpdbPitchStage::SearchResolution,
+            message: "Строка JPDB не содержит подтверждённые формы и фактическую ссылку".into(),
+        },
+        JpdbPitchFailure::Telemetry {
+            stage: JpdbPitchStage::PitchInspection,
+            message: "Критический запрос вернул HTTP 503: https://jpdb.io/search".into(),
+        },
+        JpdbPitchFailure::Timeout {
+            stage: JpdbPitchStage::DetailReadiness,
+            diagnostic: Some("DOM пока не содержит проверяемых форм и блока значений".into()),
+        },
+    ];
+    for failure in failures {
+        let root = temp_store();
+        let mut batch = batch("durable-source-failure", "幽霊", Some("ゆうれい"));
+        let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+        batch = runtime.load().unwrap().unwrap();
+        record_provider_outcome(
+            &mut runtime,
+            &mut batch,
+            "幽霊",
+            JpdbPitchOutcome::Failed {
+                error: failure.clone(),
+            },
+        );
+        drop(runtime);
+        let mut runtime = PitchAccentBatchRuntime::open(&root, "durable-source-failure").unwrap();
+        let reloaded = runtime.load().unwrap().unwrap();
+        let item = reloaded.item("幽霊").unwrap();
+        assert_eq!(item.status(), PitchBatchItemStatus::TechnicalFailure);
+        assert_eq!(item.attempts.len(), 1);
+        assert_eq!(
+            item.attempts[0].outcome,
+            crate::pitch_batch::PitchBatchOutcome::Failed {
+                error: failure.clone()
+            }
+        );
+        let saved_json = serde_json::to_value(&reloaded).unwrap();
+        assert_eq!(
+            saved_json["items"][0]["attempts"][0]["outcome"]["error"],
+            serde_json::to_value(failure).unwrap()
+        );
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -626,7 +680,7 @@ fn publication_reconcile_recovers_crash_after_owner_publish_before_final_state_s
     runtime.save(&batch).unwrap();
     drop(runtime);
 
-    // Публикация owner завершилась, затем процесс упал до обновления state.json.
+    // Публикация владельца завершилась, затем процесс упал до обновления state.json.
     let owner_record = verified_record("幽霊", false);
     assert_eq!(owner_record.sha256, sha);
     let snapshot = PitchBatchOwnerSnapshot::from_records(vec![owner_record]).unwrap();

@@ -12,6 +12,7 @@ pub mod batch;
 pub mod batch_runtime;
 pub mod browser_runtime;
 pub mod cli;
+pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod hashing;

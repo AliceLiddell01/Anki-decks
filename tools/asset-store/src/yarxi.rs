@@ -422,7 +422,7 @@ fn runtime_is_clean(runtime: RuntimeReadiness) -> bool {
 
 fn runtime_failure_reason(runtime: RuntimeReadiness) -> String {
     format!(
-        "сетевая/runtime-среда не чиста (monitor_failed={}, ожидают={}, сетевых ошибок={}, HTTP-ошибок={}, JS-исключений={})",
+        "сетевая среда выполнения не чиста (monitor_failed={}, ожидают={}, сетевых ошибок={}, HTTP-ошибок={}, JS-исключений={})",
         runtime.monitor_failed,
         runtime.pending_relevant_requests,
         runtime.network_failures,
@@ -577,13 +577,13 @@ pub fn acquire_many_with_target(
             let slot = outcomes.get_mut(index).ok_or_else(|| {
                 AssetError::new(
                     crate::error::ErrorCode::InvalidTransition,
-                    "provider выдал индекс вне исходного набора",
+                    "провайдер выдал индекс вне исходного набора",
                 )
             })?;
             if slot.replace(*outcome).is_some() {
                 return Err(AssetError::new(
                     crate::error::ErrorCode::InvalidTransition,
-                    "provider повторно выдал identity в одном наборе",
+                    "провайдер повторно выдал идентичность в одном наборе",
                 ));
             }
         }
@@ -594,7 +594,7 @@ pub fn acquire_many_with_target(
         .into_iter()
         .map(|outcome| {
             outcome.ok_or_else(|| {
-                "provider_stream_incomplete: browser завершил работу до обработки всего набора"
+                "provider_stream_incomplete: браузер завершил работу до обработки всего набора"
                     .to_owned()
             })
         })
@@ -642,17 +642,21 @@ pub enum SessionStopReason {
     ItemTimeout,
     RetryRecoveryFailed(String),
     Interrupted,
+    RuntimeFailure(String),
 }
 
 impl SessionStopReason {
     pub fn summary(&self) -> String {
         match self {
-            Self::Deadline => "истёк срок browser session".into(),
-            Self::ItemTimeout => "превышен item timeout; browser session остановлена".into(),
+            Self::Deadline => "истёк срок сеанса браузера".into(),
+            Self::ItemTimeout => {
+                "превышен срок обработки элемента; сеанс браузера остановлен".into()
+            }
             Self::RetryRecoveryFailed(error) => {
                 format!("не удалось восстановить страницу: {error}")
             }
-            Self::Interrupted => "получен Ctrl+C; browser session закрыта".into(),
+            Self::Interrupted => "получен Ctrl+C; сеанс браузера закрыт".into(),
+            Self::RuntimeFailure(message) => format!("отказ среды сеанса браузера: {message}"),
         }
     }
 }
@@ -684,7 +688,14 @@ fn signal_error(
     signal: Result<std::io::Result<()>, tokio::task::JoinError>,
 ) -> AcquisitionStreamError {
     match signal {
-        Ok(Ok(())) => AcquisitionStreamError::Interrupted,
+        Ok(Ok(())) => {
+            tracing::info!(
+                stage = "interrupt",
+                code = "acquisition_interrupted",
+                "Принятый Ctrl+C подтверждён на границе получения ресурса"
+            );
+            AcquisitionStreamError::Interrupted
+        }
         Ok(Err(error)) => {
             AcquisitionStreamError::Provider(format!("ctrl_c_listener_failed: {error}"))
         }
@@ -699,7 +710,8 @@ pub struct AcquisitionSummary {
 }
 
 /// Потоково получает медиа, закрывая BrowserSession на границе её срока.
-/// Незатронутый хвост продолжается в новой session без фиктивных outcomes.
+/// Незатронутый хвост продолжается в новом сеансе без фиктивных результатов.
+/// Отказ монитора останавливает запуск и оставляет хвост для продолжения.
 pub fn acquire_many_stream<F>(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -720,76 +732,139 @@ pub fn acquire_many_stream_with_target<F>(
     characters: &[String],
     allow_insecure_tls: bool,
     target: AcquisitionTarget,
-    mut on_event: F,
+    on_event: F,
 ) -> Result<AcquisitionSummary, AcquisitionStreamError>
 where
     F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
 {
-    if characters.is_empty() {
-        return Ok(AcquisitionSummary {
-            processed: 0,
-            sessions: 0,
-        });
+    AcquisitionRun::new()?.acquire_with_target(characters, allow_insecure_tls, target, on_event)
+}
+
+/// Сохраняет один обработчик Ctrl+C на весь запуск, включая несколько раундов.
+/// Принятый сигнал остаётся остановкой до уничтожения этого объекта.
+pub struct AcquisitionRun {
+    runtime: tokio::runtime::Runtime,
+    interrupt: CtrlCListener,
+    stopped: bool,
+}
+
+impl AcquisitionRun {
+    pub fn new() -> Result<Self, AcquisitionStreamError> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                AcquisitionStreamError::Provider(format!("среда браузера: {error}"))
+            })?;
+        let interrupt = runtime.spawn(tokio::signal::ctrl_c());
+        Ok(Self {
+            runtime,
+            interrupt,
+            stopped: false,
+        })
     }
-    for character in characters {
-        crate::kanji_domain::parse_kanji_character(character).map_err(|error| {
-            AcquisitionStreamError::Provider(format!("invalid_kanji_identity: {error}"))
-        })?;
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped || self.interrupt.is_finished()
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| AcquisitionStreamError::Provider(format!("среда браузера: {error}")))?;
-    runtime.block_on(async move {
-        let mut interrupt: CtrlCListener = tokio::spawn(tokio::signal::ctrl_c());
-        let mut offset = 0;
-        let mut sessions = 0_u32;
-        while offset < characters.len() {
-            let session_start = offset;
-            sessions = sessions.saturating_add(1);
-            on_event(AcquisitionEvent::SessionStarted { session: sessions })
+
+    pub fn acquire<F>(
+        &mut self,
+        characters: &[String],
+        allow_insecure_tls: bool,
+        on_event: F,
+    ) -> Result<AcquisitionSummary, AcquisitionStreamError>
+    where
+        F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    {
+        self.acquire_with_target(
+            characters,
+            allow_insecure_tls,
+            AcquisitionTarget::PreferredSource,
+            on_event,
+        )
+    }
+
+    fn acquire_with_target<F>(
+        &mut self,
+        characters: &[String],
+        allow_insecure_tls: bool,
+        target: AcquisitionTarget,
+        mut on_event: F,
+    ) -> Result<AcquisitionSummary, AcquisitionStreamError>
+    where
+        F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    {
+        if self.stopped {
+            return Err(AcquisitionStreamError::Interrupted);
+        }
+        for character in characters {
+            crate::kanji_domain::parse_kanji_character(character).map_err(|error| {
+                AcquisitionStreamError::Provider(format!("invalid_kanji_identity: {error}"))
+            })?;
+        }
+        let interrupt = &mut self.interrupt;
+        let result = self.runtime.block_on(async {
+            if interrupt.is_finished() {
+                return Err(signal_error((&mut *interrupt).await));
+            }
+            let mut offset = 0;
+            let mut sessions = 0_u32;
+            while offset < characters.len() {
+                let session_start = offset;
+                sessions = sessions.saturating_add(1);
+                let session_result = acquire_one_session(
+                    &characters[offset..],
+                    offset,
+                    sessions,
+                    allow_insecure_tls,
+                    target,
+                    &mut on_event,
+                    interrupt,
+                )
+                .await?;
+                tracing::info!(session = sessions, processed = session_result.processed, pending = characters.len() - offset - session_result.processed, stage = "session_stop", code = "browser_session_ended", reason = %session_result.stop_reason.as_ref().map_or_else(|| "complete".to_owned(), |reason| crate::diagnostics::safe_message(&reason.summary())), "Сеанс завершён; счётчики отражают только реальные результаты");
+                on_event(AcquisitionEvent::SessionEnded {
+                    session: sessions,
+                    processed: session_result.processed,
+                    stop_reason: session_result.stop_reason.clone(),
+                })
                 .map_err(AcquisitionStreamError::Consumer)?;
-            let session_result = acquire_one_session(
-                &characters[offset..],
-                offset,
-                allow_insecure_tls,
-                target,
-                &mut on_event,
-                &mut interrupt,
-            )
-            .await?;
-            on_event(AcquisitionEvent::SessionEnded {
-                session: sessions,
-                processed: session_result.processed,
-                stop_reason: session_result.stop_reason.clone(),
-            })
-            .map_err(AcquisitionStreamError::Consumer)?;
-            match session_action(session_start, characters.len(), &session_result)? {
-                SessionAction::Complete => {
-                    offset = characters.len();
-                    break;
-                }
-                SessionAction::Interrupted { .. } => {
-                    return Err(AcquisitionStreamError::Interrupted);
-                }
-                SessionAction::Rotate {
-                    next_offset,
-                    reason,
-                } => {
-                    offset = next_offset;
-                    on_event(AcquisitionEvent::SessionRotated {
-                        next_session: sessions.saturating_add(1),
-                        reason,
-                    })
-                    .map_err(AcquisitionStreamError::Consumer)?;
+                match session_action(session_start, characters.len(), &session_result)? {
+                    SessionAction::Complete => {
+                        offset = characters.len();
+                        break;
+                    }
+                    SessionAction::Interrupted { .. } => return Err(AcquisitionStreamError::Interrupted),
+                    SessionAction::Rotate { next_offset, reason } => {
+                        offset = next_offset;
+                        tracing::info!(session = sessions, next_session = sessions.saturating_add(1), processed = offset, stage = "session_rotation", code = "browser_session_rotated", reason = %crate::diagnostics::safe_message(&reason.summary()), "Продолжение очереди в новом сеансе");
+                        on_event(AcquisitionEvent::SessionRotated {
+                            next_session: sessions.saturating_add(1), reason,
+                        })
+                        .map_err(AcquisitionStreamError::Consumer)?;
+                    }
                 }
             }
+            if interrupt.is_finished() {
+                return Err(signal_error((&mut *interrupt).await));
+            }
+            Ok(AcquisitionSummary { processed: offset, sessions })
+        });
+        // После завершения обработчика сигнала stop сохраняется для следующих раундов.
+        if matches!(result, Err(AcquisitionStreamError::Interrupted))
+            || self.interrupt.is_finished()
+        {
+            self.stopped = true;
         }
-        Ok(AcquisitionSummary {
-            processed: offset,
-            sessions,
-        })
-    })
+        result
+    }
+}
+
+impl Drop for AcquisitionRun {
+    fn drop(&mut self) {
+        self.interrupt.abort();
+    }
 }
 
 struct SessionAcquisitionSummary {
@@ -819,14 +894,19 @@ fn session_action(
         .filter(|next| *next <= total)
         .ok_or_else(|| {
             AcquisitionStreamError::Provider(
-                "browser_session_invalid_progress: processed count exceeds frontier".into(),
+                "browser_session_invalid_progress: число обработанных элементов превышает очередь"
+                    .into(),
             )
         })?;
-    if next_offset == total {
-        return Ok(SessionAction::Complete);
-    }
     if summary.stop_reason == Some(SessionStopReason::Interrupted) {
         return Ok(SessionAction::Interrupted { next_offset });
+    }
+    if let Some(SessionStopReason::RuntimeFailure(message)) = &summary.stop_reason {
+        tracing::error!(processed = summary.processed, pending = total - next_offset, stage = "session_stop", code = "browser_session_runtime_failure", message = %crate::diagnostics::safe_message(message), "Отказ сеанса; незапущенный хвост остаётся без попыток");
+        return Err(AcquisitionStreamError::Provider(message.clone()));
+    }
+    if next_offset == total {
+        return Ok(SessionAction::Complete);
     }
     match (&summary.stop_reason, summary.processed) {
         (Some(reason), 1..) => Ok(SessionAction::Rotate {
@@ -837,7 +917,7 @@ fn session_action(
             "browser_session_no_progress: {reason:?}"
         ))),
         (None, _) => Err(AcquisitionStreamError::Provider(
-            "browser_session_incomplete: session завершилась без результата для хвоста".into(),
+            "browser_session_incomplete: сеанс завершился без результата для хвоста".into(),
         )),
     }
 }
@@ -845,6 +925,7 @@ fn session_action(
 async fn acquire_one_session(
     characters: &[String],
     base_index: usize,
+    session_number: u32,
     allow_insecure_tls: bool,
     target: AcquisitionTarget,
     on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
@@ -864,10 +945,29 @@ async fn acquire_one_session(
         prefers_color_scheme: Some("dark".into()),
         ..BrowserRuntimeConfig::default()
     };
-    let session =
-        run_setup_before_deadline(session_deadline, BrowserSession::launch(runtime_config))
-            .await
-            .map_err(AcquisitionStreamError::Provider)?;
+    let session_started_at = Instant::now();
+    tracing::info!(
+        session = session_number,
+        stage = "browser_launch",
+        code = "browser_session_starting",
+        "Запуск и подготовка браузера Yarxi"
+    );
+    let session = match run_setup_before_deadline(
+        session_deadline,
+        BrowserSession::launch(runtime_config),
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(message) => {
+            tracing::error!(session = session_number, stage = "browser_launch", code = "browser_session_launch_failed", message = %crate::diagnostics::safe_message(&message), elapsed_ms = session_started_at.elapsed().as_millis() as u64, "Не удалось запустить браузер");
+            return finish_session_setup(
+                Err(AcquisitionStreamError::Provider(message)),
+                session_number,
+                on_event,
+            );
+        }
+    };
     let evidence_monitor = BrowserEvidenceMonitor::new(session.telemetry().clone());
     let browser_runtime = session.provenance().clone();
 
@@ -928,80 +1028,124 @@ async fn acquire_one_session(
         result = setup => Ok(result),
         signal = &mut *interrupt => Err(signal),
     };
-    let tls_exception = match setup_result {
-        Ok(Ok(setup)) => setup,
-        Ok(Err(error)) => {
-            session.close().await;
-            return Err(AcquisitionStreamError::Provider(error));
+    let setup_result = match setup_result {
+        Ok(Ok(setup)) => Ok(setup),
+        Ok(Err(message)) => {
+            tracing::error!(session = session_number, stage = "browser_setup", code = "browser_session_setup_failed", message = %crate::diagnostics::safe_message(&message), "Не удалось подготовить страницу Yarxi");
+            Err(AcquisitionStreamError::Provider(message))
         }
-        Err(signal) => {
+        Err(signal) => Err(signal_error(signal)),
+    };
+    let tls_exception = match finish_session_setup(setup_result, session_number, on_event) {
+        Ok(setup) => setup,
+        Err(error) => {
             session.close().await;
-            return Err(signal_error(signal));
+            tracing::info!(
+                session = session_number,
+                stage = "browser_close",
+                code = "browser_session_closed",
+                elapsed_ms = session_started_at.elapsed().as_millis() as u64,
+                "Браузер закрыт после отказа подготовки"
+            );
+            return Err(error);
         }
     };
+    tracing::info!(
+        session = session_number,
+        stage = "browser_setup",
+        code = "browser_session_started",
+        elapsed_ms = session_started_at.elapsed().as_millis() as u64,
+        "Браузер и страница Yarxi подготовлены"
+    );
 
+    let mut driver = BrowserSessionItemDriver {
+        context: RetryAcquisitionContext {
+            page: session.page(),
+            target,
+            evidence_monitor: &evidence_monitor,
+            browser_runtime: &browser_runtime,
+            tls_exception: tls_exception.map(|approved| approved.provenance),
+            session_deadline,
+            session: session_number,
+            interrupt,
+        },
+        session: session_number,
+    };
+    let result = process_session_items(characters, base_index, &mut driver, on_event).await;
+    evidence_monitor.abort();
+    session.close().await;
+    tracing::info!(
+        session = session_number,
+        stage = "browser_close",
+        code = "browser_session_closed",
+        elapsed_ms = session_started_at.elapsed().as_millis() as u64,
+        "Браузер Yarxi закрыт"
+    );
+    result
+}
+
+fn finish_session_setup<T>(
+    result: Result<T, AcquisitionStreamError>,
+    session: u32,
+    on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+) -> Result<T, AcquisitionStreamError> {
+    let setup = result?;
+    on_event(AcquisitionEvent::SessionStarted { session })?;
+    Ok(setup)
+}
+
+/// Узкая граница браузера позволяет проверять очередь без сети и CDP.
+trait SessionItemDriver {
+    async fn before_item(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<SessionStopReason>, AcquisitionStreamError>;
+    async fn acquire(
+        &mut self,
+        index: usize,
+        character: &str,
+        on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    ) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError>;
+    async fn after_checkpoint(
+        &mut self,
+    ) -> Result<Option<SessionStopReason>, AcquisitionStreamError>;
+}
+
+async fn process_session_items(
+    characters: &[String],
+    base_index: usize,
+    driver: &mut impl SessionItemDriver,
+    on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+) -> Result<SessionAcquisitionSummary, AcquisitionStreamError> {
     let mut processed = 0;
     let mut stop_reason = None;
     let result = async {
         for (index, character) in characters.iter().enumerate() {
-            if index > 0 {
-                let pacing = tokio::select! {
-                    result = timeout_at(session_deadline, sleep(BATCH_PACING)) => {
-                        if result.is_err() { Some(SessionStopReason::Deadline) } else { None }
-                    }
-                    signal = &mut *interrupt => Some(match signal_error(signal) {
-                        AcquisitionStreamError::Interrupted => SessionStopReason::Interrupted,
-                        AcquisitionStreamError::Provider(message) => {
-                            return Err(AcquisitionStreamError::Provider(message));
-                        }
-                        AcquisitionStreamError::Consumer(error) => {
-                            return Err(AcquisitionStreamError::Consumer(error));
-                        }
-                    }),
-                };
-                if let Some(reason) = pacing {
-                    stop_reason = Some(reason);
-                    break;
-                }
-            }
-            if Instant::now() >= session_deadline {
-                stop_reason = Some(SessionStopReason::Deadline);
+            if let Some(reason) = driver.before_item(index).await? {
+                stop_reason = Some(reason);
                 break;
             }
             let absolute_index = base_index + index;
             on_event(AcquisitionEvent::ItemStarted {
                 index: absolute_index,
-            })
-            .map_err(AcquisitionStreamError::Consumer)?;
-            let context = RetryAcquisitionContext {
-                page: session.page(),
-                target,
-                evidence_monitor: &evidence_monitor,
-                browser_runtime: &browser_runtime,
-                tls_exception: tls_exception
-                    .as_ref()
-                    .map(|approved| approved.provenance.clone()),
-                session_deadline,
-                interrupt,
-            };
+            })?;
             let (outcome, item_stop_reason) =
-                acquire_one_with_retries(context, absolute_index, character, on_event).await?;
+                driver.acquire(absolute_index, character, on_event).await?;
             on_event(AcquisitionEvent::ItemCompleted {
                 index: absolute_index,
                 outcome: Box::new(outcome),
-            })
-            .map_err(AcquisitionStreamError::Consumer)?;
+            })?;
             processed += 1;
-            if item_stop_reason.is_some() {
-                stop_reason = item_stop_reason;
+            // Сначала потребитель фиксирует готовый результат, затем признаём stop.
+            let checkpoint_stop = driver.after_checkpoint().await?;
+            if checkpoint_stop.is_some() || item_stop_reason.is_some() {
+                stop_reason = checkpoint_stop.or(item_stop_reason);
                 break;
             }
         }
-        Ok(())
+        Ok::<_, AcquisitionStreamError>(())
     }
     .await;
-    evidence_monitor.abort();
-    session.close().await;
     match result {
         Ok(()) => Ok(SessionAcquisitionSummary {
             processed,
@@ -1015,6 +1159,98 @@ async fn acquire_one_session(
     }
 }
 
+struct BrowserSessionItemDriver<'a> {
+    context: RetryAcquisitionContext<'a>,
+    session: u32,
+}
+
+impl SessionItemDriver for BrowserSessionItemDriver<'_> {
+    async fn before_item(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+        if let Some(reason) = self.after_checkpoint().await? {
+            return Ok(Some(reason));
+        }
+        if index > 0 {
+            tokio::select! {
+                result = timeout_at(self.context.session_deadline, sleep(BATCH_PACING)) => {
+                    if result.is_err() { return Ok(Some(SessionStopReason::Deadline)); }
+                }
+                signal = &mut *self.context.interrupt => return Err(signal_error(signal)),
+            }
+        }
+        if Instant::now() >= self.context.session_deadline {
+            return Ok(Some(SessionStopReason::Deadline));
+        }
+        self.after_checkpoint().await
+    }
+
+    async fn acquire(
+        &mut self,
+        index: usize,
+        character: &str,
+        on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    ) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError>
+    {
+        let started_at = Instant::now();
+        tracing::info!(
+            session = self.session,
+            identity = character,
+            index,
+            attempt = 1,
+            stage = "acquisition",
+            code = "item_started",
+            "Получение изображения кандзи"
+        );
+        let result = acquire_one_with_retries(
+            RetryAcquisitionContext {
+                page: self.context.page,
+                target: self.context.target,
+                evidence_monitor: self.context.evidence_monitor,
+                browser_runtime: self.context.browser_runtime,
+                tls_exception: self.context.tls_exception.clone(),
+                session_deadline: self.context.session_deadline,
+                session: self.session,
+                interrupt: &mut *self.context.interrupt,
+            },
+            index,
+            character,
+            on_event,
+        )
+        .await;
+        tracing::info!(
+            session = self.session,
+            identity = character,
+            index,
+            stage = "acquisition",
+            code = "item_acquisition_finished",
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "Получение кандзи завершено"
+        );
+        result
+    }
+
+    async fn after_checkpoint(
+        &mut self,
+    ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+        if self.context.interrupt.is_finished() {
+            return Err(signal_error((&mut *self.context.interrupt).await));
+        }
+        Ok(monitor_stop_reason(self.context.evidence_monitor))
+    }
+}
+
+fn monitor_stop_reason(monitor: &BrowserEvidenceMonitor) -> Option<SessionStopReason> {
+    monitor.telemetry.monitor_failed().then(|| {
+        let message = format!(
+            "browser_network_runtime_failure: {}",
+            runtime_failure_reason(monitor.readiness(0, None))
+        );
+        SessionStopReason::RuntimeFailure(message)
+    })
+}
+
 struct RetryAcquisitionContext<'a> {
     page: &'a Page,
     target: AcquisitionTarget,
@@ -1022,9 +1258,11 @@ struct RetryAcquisitionContext<'a> {
     browser_runtime: &'a BrowserRuntimeProvenance,
     tls_exception: Option<TlsExceptionProvenance>,
     session_deadline: Instant,
+    session: u32,
     interrupt: &'a mut CtrlCListener,
 }
 
+#[tracing::instrument(skip_all, fields(session = context.session, identity = character, index, stage = "acquisition"))]
 async fn acquire_one_with_retries(
     context: RetryAcquisitionContext<'_>,
     index: usize,
@@ -1032,6 +1270,9 @@ async fn acquire_one_with_retries(
     on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
 ) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError> {
     for attempt in 1..=MAX_ACQUISITION_ATTEMPTS {
+        if let Some(reason) = monitor_stop_reason(context.evidence_monitor) {
+            return Ok((Err(reason.summary()), Some(reason)));
+        }
         if Instant::now() >= context.session_deadline {
             return Ok((
                 Err("browser_session_deadline: общий срок пакета истёк".into()),
@@ -1085,7 +1326,14 @@ async fn acquire_one_with_retries(
                 return Ok((Ok(media), None));
             }
             Err(error) => {
-                if should_retry_acquisition(&error, context.evidence_monitor, epoch, attempt) {
+                let stop = monitor_stop_reason(context.evidence_monitor);
+                let retry_allowed = stop.is_none()
+                    && should_retry_acquisition(&error, context.evidence_monitor, epoch, attempt);
+                tracing::warn!(session = context.session, identity = character, index, attempt, stage = "retry_decision", code = acquisition_failure_code(&error), message = %crate::diagnostics::safe_message(&error), retry_allowed, monitor_failed = stop.is_some(), "Ошибка получения; решение о повторной попытке");
+                if let Some(reason) = stop {
+                    return Ok((Err(error), Some(reason)));
+                }
+                if retry_allowed {
                     on_event(AcquisitionEvent::RetryStarted {
                         index,
                         attempt: attempt + 1,
@@ -1103,6 +1351,15 @@ async fn acquire_one_with_retries(
                     let recovery_deadline = (Instant::now()
                         + ITEM_TIMEOUT.min(Duration::from_secs(30)))
                     .min(context.session_deadline);
+                    tracing::info!(
+                        session = context.session,
+                        identity = character,
+                        index,
+                        attempt = attempt + 1,
+                        stage = "retry_recovery",
+                        code = "retry_recovery_started",
+                        "Восстановление страницы перед повторной попыткой"
+                    );
                     on_event(AcquisitionEvent::RetryRecoveryStarted {
                         index,
                         attempt: attempt + 1,
@@ -1153,9 +1410,26 @@ async fn acquire_one_with_retries(
         }
     }
     Ok((
-        Err("browser_retry_exhausted: лимит попыток acquisition исчерпан".into()),
+        Err("browser_retry_exhausted: лимит попыток получения исчерпан".into()),
         None,
     ))
+}
+
+fn acquisition_failure_code(error: &str) -> &str {
+    error
+        .split_once(':')
+        .map_or("acquisition_failed", |(code, _)| {
+            if !code.is_empty()
+                && code.len() <= 80
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            {
+                code
+            } else {
+                "acquisition_failed"
+            }
+        })
 }
 
 fn is_retryable_acquisition_error(
@@ -1745,6 +2019,7 @@ async fn wait_for_media_snapshot(
             } else {
                 evidence_monitor.network_failure_details(epoch, None)
             };
+            tracing::warn!(identity = expected_character, stage = "media_readiness", code = "browser_network_runtime_failure", monitor_failed = runtime.monitor_failed, pending_relevant_requests = runtime.pending_relevant_requests, network_failures = runtime.network_failures, http_errors = runtime.http_errors, javascript_exceptions = runtime.javascript_exceptions, details = %crate::diagnostics::safe_message(&network_details), "CDP не подтверждает готовность источника изображения");
             return Err(format!(
                 "browser_network_runtime_failure: {}; network_failures=[{network_details}]",
                 runtime_failure_reason(runtime),
@@ -2585,17 +2860,17 @@ mod tests {
         assert!(
             SessionStopReason::Deadline
                 .summary()
-                .contains("срок browser session")
+                .contains("срок сеанса браузера")
         );
         assert!(
             SessionStopReason::ItemTimeout
                 .summary()
-                .contains("item timeout")
+                .contains("срок обработки элемента")
         );
         assert!(
-            SessionStopReason::RetryRecoveryFailed("offline".into())
+            SessionStopReason::RetryRecoveryFailed("сеть недоступна".into())
                 .summary()
-                .contains("offline")
+                .contains("сеть недоступна")
         );
     }
 
@@ -2652,7 +2927,248 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(complete, SessionAction::Complete);
+        assert_eq!(complete, SessionAction::Interrupted { next_offset: 17 });
+    }
+
+    struct FaultInjectedSession {
+        monitor: BrowserEvidenceMonitor,
+        fail_after_item: bool,
+        acquisitions: usize,
+        stop_at_checkpoint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    fn monitor_with_failure(failed: bool) -> BrowserEvidenceMonitor {
+        BrowserEvidenceMonitor::new(CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot {
+            monitor_failed: failed,
+            ..RuntimeSnapshot::default()
+        }))
+    }
+
+    impl SessionItemDriver for FaultInjectedSession {
+        async fn before_item(
+            &mut self,
+            _: usize,
+        ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+            Ok(monitor_stop_reason(&self.monitor))
+        }
+
+        async fn acquire(
+            &mut self,
+            _: usize,
+            _: &str,
+            _: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+        ) -> Result<
+            (Result<AcquiredMedia, String>, Option<SessionStopReason>),
+            AcquisitionStreamError,
+        > {
+            self.acquisitions += 1;
+            if self.fail_after_item {
+                self.monitor = monitor_with_failure(true);
+                assert!(!should_retry_acquisition(
+                    "browser_network_runtime_failure: отказ CDP",
+                    &self.monitor,
+                    0,
+                    1
+                ));
+            }
+            Ok((
+                Err("browser_network_runtime_failure: реальный отказ первого элемента".into()),
+                monitor_stop_reason(&self.monitor),
+            ))
+        }
+
+        async fn after_checkpoint(
+            &mut self,
+        ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+            if self
+                .stop_at_checkpoint
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err(AcquisitionStreamError::Interrupted);
+            }
+            Ok(monitor_stop_reason(&self.monitor))
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_failure_before_first_request_preserves_whole_pending_frontier() {
+        let characters = vec!["漢".into(), "字".into(), "語".into()];
+        let mut driver = FaultInjectedSession {
+            monitor: monitor_with_failure(true),
+            fail_after_item: false,
+            acquisitions: 0,
+            stop_at_checkpoint: None,
+        };
+        let mut events = Vec::new();
+        let summary = process_session_items(&characters, 0, &mut driver, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.processed, 0);
+        assert_eq!(driver.acquisitions, 0);
+        assert!(events.is_empty());
+        assert!(
+            matches!(session_action(0, characters.len(), &summary), Err(AcquisitionStreamError::Provider(message)) if message.contains("browser_network_runtime_failure"))
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_failure_checkpoints_only_started_prefix_and_resume_starts_first_pending() {
+        let characters = vec!["漢".into(), "字".into(), "語".into()];
+        let mut attempts = [0_usize; 3];
+        let mut started = Vec::new();
+        let mut driver = FaultInjectedSession {
+            monitor: monitor_with_failure(false),
+            fail_after_item: true,
+            acquisitions: 0,
+            stop_at_checkpoint: None,
+        };
+        let summary = process_session_items(&characters, 0, &mut driver, &mut |event| {
+            match event {
+                AcquisitionEvent::ItemStarted { index } => started.push(index),
+                AcquisitionEvent::ItemCompleted { index, outcome } => {
+                    assert!(outcome.is_err());
+                    attempts[index] += 1;
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.processed, 1);
+        assert_eq!(started, vec![0]);
+        assert_eq!(attempts, [1, 0, 0]);
+        assert_eq!(driver.acquisitions, 1);
+        assert!(matches!(
+            session_action(0, characters.len(), &summary),
+            Err(AcquisitionStreamError::Provider(_))
+        ));
+        // Продолжение использует ту же границу обработанного префикса, что и очередь CLI.
+        let first_pending = attempts.iter().position(|attempt| *attempt == 0).unwrap();
+        let mut resumed = FaultInjectedSession {
+            monitor: monitor_with_failure(false),
+            fail_after_item: false,
+            acquisitions: 0,
+            stop_at_checkpoint: None,
+        };
+        let resumed_summary = process_session_items(
+            &characters[first_pending..],
+            first_pending,
+            &mut resumed,
+            &mut |event| {
+                match event {
+                    AcquisitionEvent::ItemStarted { index } => started.push(index),
+                    AcquisitionEvent::ItemCompleted { index, .. } => attempts[index] += 1,
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed_summary.processed, 2);
+        assert_eq!(started, vec![0, 1, 2]);
+        assert_eq!(attempts, [1, 1, 1]);
+    }
+
+    #[test]
+    fn final_item_monitor_failure_cannot_be_reported_as_success() {
+        let result = session_action(
+            0,
+            1,
+            &SessionAcquisitionSummary {
+                processed: 1,
+                stop_reason: monitor_stop_reason(&monitor_with_failure(true)),
+            },
+        );
+        assert!(
+            matches!(result, Err(AcquisitionStreamError::Provider(message)) if message.contains("browser_network_runtime_failure"))
+        );
+    }
+
+    #[test]
+    fn launch_or_setup_failure_never_emits_session_started() {
+        for message in [
+            "launch_failure: нет браузера",
+            "setup_failure: отказ страницы",
+        ] {
+            let mut events = Vec::new();
+            let result = finish_session_setup::<()>(
+                Err(AcquisitionStreamError::Provider(message.into())),
+                1,
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(AcquisitionStreamError::Provider(_))));
+            assert!(events.is_empty());
+        }
+        let mut events = Vec::new();
+        finish_session_setup(Ok(()), 2, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [AcquisitionEvent::SessionStarted { session: 2 }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_last_checkpoint_is_acknowledged_after_durable_outcome() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let characters = vec!["漢".into()];
+        let mut checkpoints = 0;
+        let mut driver = FaultInjectedSession {
+            monitor: monitor_with_failure(false),
+            fail_after_item: false,
+            acquisitions: 0,
+            stop_at_checkpoint: Some(stop.clone()),
+        };
+        let summary = process_session_items(&characters, 0, &mut driver, &mut |event| {
+            if matches!(event, AcquisitionEvent::ItemCompleted { .. }) {
+                checkpoints += 1;
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(checkpoints, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.stop_reason, Some(SessionStopReason::Interrupted));
+        assert_eq!(
+            session_action(0, 1, &summary).unwrap(),
+            SessionAction::Interrupted { next_offset: 1 }
+        );
+    }
+
+    #[test]
+    fn acquisition_run_keeps_accepted_signal_across_rounds() {
+        let mut run = AcquisitionRun::new().unwrap();
+        run.interrupt.abort();
+        run.interrupt = run.runtime.spawn(async { Ok(()) });
+        run.runtime.block_on(async {
+            while !run.interrupt.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut events = 0;
+        for _ in 0..2 {
+            let result = run.acquire(&["漢".into()], false, |_| {
+                events += 1;
+                Ok(())
+            });
+            assert!(matches!(result, Err(AcquisitionStreamError::Interrupted)));
+            assert!(run.is_stopped());
+        }
+        assert_eq!(events, 0);
     }
 
     #[test]

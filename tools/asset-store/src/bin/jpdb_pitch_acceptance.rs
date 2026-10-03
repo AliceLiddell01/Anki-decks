@@ -29,11 +29,11 @@ use serde_json::{Value, json};
 )]
 struct Args {
     /// JSON-план: каждый элемент задаёт `surface` и обязательный `expected_outcome`.
-    /// План и отчёт могут находиться вне checkout.
+    /// План и отчёт могут находиться вне рабочего каталога.
     #[arg(long, value_name = "PATH")]
     plan: PathBuf,
 
-    /// Новый каталог HTML-отчёта вне checkout; родительский каталог должен существовать.
+    /// Новый каталог HTML-отчёта вне рабочего каталога; родительский каталог должен существовать.
     #[arg(long, value_name = "DIR")]
     output: Option<PathBuf>,
 }
@@ -329,7 +329,7 @@ fn render_outcome(
             let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Png);
             let dimensions = decoded.as_ref().ok().map(GenericImageView::dimensions);
 
-            // В отчёт записываются только исходные bytes outcome Acquired. Невалидный PNG
+            // В отчёт записываются только исходные байты результата `Acquired`. Невалидный PNG
             // остаётся доступен как .bin и не встраивается в HTML под видом картинки.
             let extension = if png_signature_valid && dimensions.is_some() {
                 "png"
@@ -351,8 +351,8 @@ fn render_outcome(
                     Ok(domain_metadata) => {
                         let provisional = AssetRecord {
                             identity,
-                            // Временная запись передаёт production validator фактические
-                            // Метаданные provider-а; приёмочный инструмент не создаёт каноническое хранилище.
+                            // Временная запись передаёт действующему валидатору фактические
+                            // метаданные провайдера; приёмочный инструмент не создаёт каноническое хранилище.
                             storage_path: String::new(),
                             consumer_filename: String::new(),
                             sha256: sha256.clone(),
@@ -897,7 +897,11 @@ fn resolve_new_output_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::E
 
 fn ensure_outside_checkout(path: &Path, checkout: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if path.starts_with(checkout) {
-        return Err(format!("отчёт должен находиться вне checkout: {}", path.display()).into());
+        return Err(format!(
+            "отчёт должен находиться вне рабочего каталога: {}",
+            path.display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -967,7 +971,7 @@ small{{color:#505960}}
 <h1>JPDB — приёмка pitch-accent PNG</h1>
 <div class="summary">
 <p><strong>Статус прогона:</strong> {}</p>
-<p>Элементов плана: {}. Для <code>acquired</code> показаны исходные байты из браузера в естественном размере, свидетельства production-валидатора и сверка с ожиданиями.</p>
+<p>Элементов плана: {}. Для <code>acquired</code> показаны исходные байты из браузера в естественном размере, свидетельства действующего валидатора и сверка с ожиданиями.</p>
 <p><a href="evidence.json">Машиночитаемый отчёт (JSON)</a></p>
 </div>
 "##,
@@ -1533,6 +1537,105 @@ mod tests {
     }
 
     #[test]
+    fn saved_typed_failure_is_exported_with_its_exact_text_to_evidence() {
+        use asset_store::jpdb::JpdbPitchStage;
+        use asset_store::pitch_batch::{
+            PitchAccentBatch, PitchAccentBatchRuntime, PitchBatchOutcome,
+        };
+
+        let failures = [
+            JpdbPitchFailure::PageContract {
+                stage: JpdbPitchStage::SearchResolution,
+                message: "Строка JPDB не содержит подтверждённые формы и фактическую ссылку".into(),
+            },
+            JpdbPitchFailure::Telemetry {
+                stage: JpdbPitchStage::PitchInspection,
+                message: "Критический запрос вернул HTTP 503: https://jpdb.io/search".into(),
+            },
+            JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::DetailReadiness,
+                diagnostic: Some("DOM пока не содержит проверяемых форм и блока значений".into()),
+            },
+        ];
+        for failure in failures {
+            let root = std::env::temp_dir().join(format!(
+                "jpdb-failure-evidence-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            let item = plan_item(ExpectedOutcome::Acquired);
+            let mut batch = PitchAccentBatch::new(
+                "typed-failure",
+                vec![provider_request(&item)],
+                PitchAccentImageValidator::validator_identity(),
+            )
+            .unwrap();
+            let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+            batch = runtime.load().unwrap().unwrap();
+            let token = batch.item_token(&item.surface).unwrap();
+            assert!(
+                runtime
+                    .record_outcome(
+                        &mut batch,
+                        &token,
+                        JpdbPitchOutcome::Failed {
+                            error: failure.clone()
+                        }
+                    )
+                    .unwrap()
+            );
+            drop(runtime);
+            let mut runtime = PitchAccentBatchRuntime::open(&root, "typed-failure").unwrap();
+            let reloaded = runtime.load().unwrap().unwrap();
+            let PitchBatchOutcome::Failed { error } = &reloaded.items[0].attempts[0].outcome else {
+                panic!("Типизированная ошибка должна сохраниться после загрузки пакета");
+            };
+            let report = JpdbPitchAcquisitionReport {
+                outcomes: vec![JpdbPitchOutcome::Failed {
+                    error: error.clone(),
+                }],
+                session_failure: None,
+            };
+            let directory = root.join("evidence");
+            fs::create_dir(&directory).unwrap();
+            let items = [item];
+            let (rows, passed) = process_outcomes(
+                &items,
+                &report,
+                &directory,
+                |index, item, outcome, directory| {
+                    Ok(render_outcome(index, item, outcome, directory))
+                },
+            );
+            assert!(!passed);
+            save_evidence(
+                "verification_failed",
+                Path::new("synthetic-plan.json"),
+                &items,
+                &rows,
+                &report,
+                &directory,
+            )
+            .unwrap();
+            let evidence: Value =
+                serde_json::from_slice(&fs::read(directory.join("evidence.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                evidence["items"][0]["failure"],
+                serde_json::to_value(failure).unwrap()
+            );
+            assert!(evidence["items"][0].get("dom").is_none());
+            assert!(evidence["items"][0].get("raw_dom").is_none());
+            drop(runtime);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn an_item_processing_error_keeps_prior_rows_and_final_report_durable() {
         let items = [
             plan_item(ExpectedOutcome::VocabularyNotFound),
@@ -1634,7 +1737,7 @@ mod tests {
         let error = create_report_dir(Some(&checkout_output))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("отчёт должен находиться вне checkout"));
+        assert!(error.contains("отчёт должен находиться вне рабочего каталога"));
         assert!(!checkout_output.exists());
         fs::remove_dir_all(parent).unwrap();
     }
