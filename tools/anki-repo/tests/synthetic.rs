@@ -45,7 +45,7 @@ fn valid_export_has_no_errors() {
     dir.write_media(&["a.mp3"]);
 
     let result = run_validate(&dir);
-    assert!(result.valid, "issues: {:?}", result.issues);
+    assert!(result.valid, "синтетический экспорт должен быть валидным");
     assert_eq!(result.summary.errors, 0);
     assert_eq!(result.summary.warnings, 0);
     assert!(has_issue(&result, "export_summary"));
@@ -284,7 +284,10 @@ fn repeated_model_declaration_with_same_definition_is_not_a_warning() {
     dir.write_media(&["a.mp3"]);
 
     let result = run_validate(&dir);
-    assert_eq!(result.summary.warnings, 0, "issues: {:?}", result.issues);
+    assert_eq!(
+        result.summary.warnings, 0,
+        "синтетический экспорт не должен содержать предупреждений"
+    );
     assert!(result.valid);
 }
 
@@ -329,8 +332,7 @@ fn ord_matrix_is_covered_by_distinct_error_codes() {
         assert_eq!(
             severity_of(&result, expected_code),
             Some(Severity::Error),
-            "случай {label}: issues {:?}",
-            result.issues
+            "проверка должна вернуть ожидаемый код ошибки"
         );
         assert!(
             !result.valid,
@@ -443,7 +445,10 @@ fn unterminated_template_construct_is_only_a_warning() {
         Some(Severity::Warning)
     );
     assert!(!has_issue(&result, "template_field_unresolved"));
-    assert!(result.valid, "issues: {:?}", result.issues);
+    assert!(
+        result.valid,
+        "предупреждение о шаблоне не должно делать экспорт невалидным"
+    );
 }
 
 #[test]
@@ -648,8 +653,7 @@ fn documented_validation_codes_are_reachable_with_expected_severity() {
         assert_eq!(
             severity_of(&result, code),
             Some(severity),
-            "код {code}: issues {:?}",
-            result.issues
+            "правило валидации должно вернуть ожидаемую серьёзность"
         );
         assert_eq!(
             result.valid,
@@ -844,7 +848,7 @@ fn nested_nodes_are_indexed_with_their_own_deck_paths() {
     assert_eq!(index.notes.len(), 3);
 
     let result = run_validate(&dir);
-    assert!(result.valid, "issues: {:?}", result.issues);
+    assert!(result.valid, "синтетический экспорт должен быть валидным");
 }
 
 #[test]
