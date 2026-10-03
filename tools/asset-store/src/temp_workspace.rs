@@ -1,11 +1,12 @@
 //! Владелец временного дерева и консервативная уборка собственных orphan runs.
 //!
 //! Все операции обхода и удаления закреплены на directory descriptors. Marker
-//! подтверждает назначение, а UID, namespace, NOFOLLOW и TTL ограничивают уборку.
+//! подтверждает назначение, а UID, namespace, NOFOLLOW и process identity ограничивают уборку.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
@@ -14,8 +15,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    AtFlags, Dir, Mode, OFlags, StatxFlags, mkdirat, open, openat, readlinkat, statat, statx,
-    unlinkat,
+    AtFlags, Dir, Mode, OFlags, RenameFlags, StatxFlags, mkdirat, open, openat, readlinkat,
+    renameat_with, statat, statx, unlinkat,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +25,8 @@ const NAMESPACE: &str = "anki-decks-work";
 const MARKER: &str = ".anki-decks-owner.json";
 const REPOSITORY: &str = "AliceLiddell01/Anki-decks";
 const TOOL: &str = "asset-store";
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
+const LEGACY_SCHEMA: u32 = 1;
 const MARKER_LIMIT: u64 = 16 * 1024;
 static STARTUP_GC: OnceLock<Result<(), (io::ErrorKind, String)>> = OnceLock::new();
 pub const DEFAULT_ORPHAN_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -36,6 +38,10 @@ struct OwnershipMarker {
     repository: String,
     tool: String,
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_ticks: Option<u64>,
     created_unix_ms: u64,
     run_id: String,
     purpose: String,
@@ -52,7 +58,7 @@ pub struct TempWorkspace {
 }
 
 impl TempWorkspace {
-    /// Создаёт приватное дерево после startup GC (TTL — 24 часа).
+    /// Создаёт приватное дерево после startup GC; TTL применяется только к schema 1.
     pub fn create(purpose: &str) -> io::Result<Self> {
         STARTUP_GC
             .get_or_init(|| {
@@ -79,6 +85,9 @@ impl TempWorkspace {
                 "temp purpose должен содержать 1..4096 байт",
             ));
         }
+        let pid = std::process::id();
+        let boot_id = read_boot_id(Path::new("/proc/sys/kernel/random/boot_id"))?;
+        let process_start_ticks = read_process_start_ticks(Path::new("/proc"), pid)?;
         let uid = current_uid()?;
         let parent = namespace(temp_root, uid, true)?
             .ok_or_else(|| io::Error::other("не удалось создать temp namespace"))?;
@@ -100,14 +109,16 @@ impl TempWorkspace {
                         schema: SCHEMA,
                         repository: REPOSITORY.into(),
                         tool: TOOL.into(),
-                        pid: std::process::id(),
+                        pid,
+                        boot_id: Some(boot_id),
+                        process_start_ticks: Some(process_start_ticks),
                         created_unix_ms: unix_ms()?,
                         run_id,
                         purpose: purpose.into(),
                     };
                     let fd = openat(
                         &owner.directory,
-                        MARKER,
+                        ".anki-decks-owner.tmp",
                         OFlags::WRONLY
                             | OFlags::CREATE
                             | OFlags::EXCL
@@ -119,6 +130,14 @@ impl TempWorkspace {
                     serde_json::to_writer(&mut file, &marker).map_err(io::Error::other)?;
                     file.write_all(b"\n")?;
                     file.sync_all()?;
+                    renameat_with(
+                        &owner.directory,
+                        ".anki-decks-owner.tmp",
+                        &owner.directory,
+                        MARKER,
+                        RenameFlags::NOREPLACE,
+                    )?;
+                    owner.directory.sync_all()?;
                     return Ok(owner);
                 }
                 Err(error) if error == rustix::io::Errno::EXIST => continue,
@@ -200,7 +219,8 @@ pub struct GcEntry {
     pub bytes: u64,
 }
 
-/// Удаляет только старые, подтверждённые marker orphan runs мёртвых PID.
+/// Удаляет подтверждённые marker orphan runs доказанно мёртвых владельцев.
+/// Schema 1 дополнительно требует TTL; schema 2 использует точную process identity.
 /// Ошибки отдельных деревьев отражены в `errors` и `entries`, затем GC продолжается.
 pub fn cleanup_orphans(min_age: Duration) -> io::Result<GcReport> {
     cleanup_under(Path::new(TEMP_ROOT), min_age)
@@ -215,6 +235,20 @@ fn cleanup_under_with_proc(
     proc_root: &Path,
     min_age: Duration,
 ) -> io::Result<GcReport> {
+    cleanup_under_with_sources(
+        temp_root,
+        proc_root,
+        &proc_root.join("sys/kernel/random/boot_id"),
+        min_age,
+    )
+}
+
+fn cleanup_under_with_sources(
+    temp_root: &Path,
+    proc_root: &Path,
+    boot_id_path: &Path,
+    min_age: Duration,
+) -> io::Result<GcReport> {
     let min_age = min_age.max(DEFAULT_ORPHAN_MIN_AGE);
     let mut report = GcReport::default();
     let uid = current_uid()?;
@@ -224,25 +258,43 @@ fn cleanup_under_with_proc(
     let now = unix_ms()?;
     for name in names(&parent)? {
         let path = temp_root.join(NAMESPACE).join(&name);
-        let result = inspect_orphan(&parent, proc_root, &name, &path, uid, now, min_age);
+        let result = inspect_orphan(
+            &parent,
+            &ProcessSources {
+                proc_root,
+                boot_id_path,
+            },
+            &name,
+            &path,
+            uid,
+            now,
+            min_age,
+        );
         let (outcome, reason, bytes) = match result {
             Ok(Inspection::Skip(reason)) => {
                 report.skipped += 1;
                 ("skipped", reason, 0)
             }
-            Ok(Inspection::Delete(directory, bytes)) => {
-                match verify_identity(&parent, &name, &directory)
-                    .and_then(|()| remove_contents(&directory))
-                    .and_then(|()| verify_identity(&parent, &name, &directory))
-                    .and_then(|()| {
-                        unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)
-                    }) {
+            Ok(Inspection::Delete(directory, bytes, reference_policy)) => {
+                match remove_inspected_orphan(
+                    &parent,
+                    proc_root,
+                    &name,
+                    &path,
+                    &directory,
+                    uid,
+                    reference_policy,
+                ) {
                     Ok(()) => {
                         report.removed += 1;
                         report.removed_bytes = report.removed_bytes.saturating_add(bytes);
-                        ("removed", "старый owned orphan".into(), bytes)
+                        ("removed", "owned orphan мёртвого владельца".into(), bytes)
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Err(DeleteFailure::Skip(reason)) => {
+                        report.skipped += 1;
+                        ("skipped", reason.into(), 0)
+                    }
+                    Err(DeleteFailure::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                         report.skipped += 1;
                         (
                             "skipped",
@@ -250,7 +302,7 @@ fn cleanup_under_with_proc(
                             0,
                         )
                     }
-                    Err(error) => {
+                    Err(DeleteFailure::Io(error)) => {
                         report.errors += 1;
                         ("error", error.to_string(), 0)
                     }
@@ -274,12 +326,61 @@ fn cleanup_under_with_proc(
 
 enum Inspection {
     Skip(String),
-    Delete(File, u64),
+    Delete(File, u64, ProcessReferencePolicy),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcessReferencePolicy {
+    None,
+    Browser,
+    AllSameUid,
+}
+
+enum DeleteFailure {
+    Skip(&'static str),
+    Io(io::Error),
+}
+
+fn remove_inspected_orphan(
+    parent: &File,
+    proc_root: &Path,
+    name: &OsStr,
+    run_path: &Path,
+    directory: &File,
+    uid: u32,
+    reference_policy: ProcessReferencePolicy,
+) -> Result<(), DeleteFailure> {
+    verify_identity(parent, name, directory).map_err(DeleteFailure::Io)?;
+    if reference_policy != ProcessReferencePolicy::None {
+        match workspace_process_references(
+            proc_root,
+            run_path,
+            uid,
+            reference_policy == ProcessReferencePolicy::AllSameUid,
+            &[directory.as_raw_fd()],
+        ) {
+            Ok(false) => (),
+            Ok(true) => {
+                return Err(DeleteFailure::Skip("живой process использует workspace"));
+            }
+            Err(_) => {
+                return Err(DeleteFailure::Skip(
+                    "нельзя доказать отсутствие process references",
+                ));
+            }
+        }
+    }
+    verify_identity(parent, name, directory).map_err(DeleteFailure::Io)?;
+    remove_contents(directory).map_err(DeleteFailure::Io)?;
+    verify_identity(parent, name, directory).map_err(DeleteFailure::Io)?;
+    unlinkat(parent, name, AtFlags::REMOVEDIR)
+        .map_err(io::Error::from)
+        .map_err(DeleteFailure::Io)
 }
 
 fn inspect_orphan(
     parent: &File,
-    proc_root: &Path,
+    sources: &ProcessSources<'_>,
     name: &OsStr,
     run_path: &Path,
     uid: u32,
@@ -316,7 +417,7 @@ fn inspect_orphan(
         .take(MARKER_LIMIT + 1)
         .read_to_end(&mut bytes)?;
     let marker: OwnershipMarker = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    if marker.schema != SCHEMA
+    if !matches!(marker.schema, LEGACY_SCHEMA | SCHEMA)
         || marker.repository != REPOSITORY
         || marker.tool != TOOL
         || marker.run_id != run_id
@@ -325,47 +426,207 @@ fn inspect_orphan(
     {
         return Ok(Inspection::Skip("чужой или неподдерживаемый marker".into()));
     }
-    if marker.pid == std::process::id()
-        || fs::symlink_metadata(format!("/proc/{}", marker.pid)).is_ok()
-    {
-        return Ok(Inspection::Skip("текущий или живой PID".into()));
+    match owner_is_dead(&marker, sources) {
+        Ok(true) => (),
+        Ok(false) => return Ok(Inspection::Skip("original owner жив".into())),
+        Err(_) => {
+            return Ok(Inspection::Skip(
+                "нельзя доказать смерть original owner".into(),
+            ));
+        }
     }
-    // Любая ошибка проверки PID кроме NotFound — сомнение, а значит skip.
-    if fs::symlink_metadata(format!("/proc/{}", marker.pid))
-        .is_err_and(|error| error.kind() != io::ErrorKind::NotFound)
-    {
-        return Ok(Inspection::Skip("нельзя доказать отсутствие PID".into()));
-    }
-    if has_browser_artifacts(&directory)? {
-        match workspace_has_process_references(proc_root, run_path, uid) {
+    let browser_artifacts = has_browser_artifacts(&directory)?;
+    let reference_policy = if marker.schema == SCHEMA {
+        ProcessReferencePolicy::AllSameUid
+    } else if browser_artifacts {
+        ProcessReferencePolicy::Browser
+    } else {
+        ProcessReferencePolicy::None
+    };
+    if reference_policy != ProcessReferencePolicy::None {
+        match workspace_process_references(
+            sources.proc_root,
+            run_path,
+            uid,
+            reference_policy == ProcessReferencePolicy::AllSameUid,
+            &[directory.as_raw_fd(), file.as_raw_fd()],
+        ) {
             Ok(true) => {
                 return Ok(Inspection::Skip(
-                    "живой browser process использует workspace".into(),
+                    "живой process использует workspace".into(),
                 ));
             }
             Ok(false) => (),
             Err(_) => {
                 return Ok(Inspection::Skip(
-                    "нельзя доказать отсутствие browser process".into(),
+                    "нельзя доказать отсутствие process references".into(),
                 ));
             }
         }
     }
-    let age_ms = u64::try_from(min_age.as_millis()).unwrap_or(u64::MAX);
     let modified = metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_millis();
-    if marker.created_unix_ms > now
-        || now - marker.created_unix_ms < age_ms
-        || modified > u128::from(now.saturating_sub(age_ms))
-    {
-        return Ok(Inspection::Skip("свежий run или время в будущем".into()));
+    if marker.created_unix_ms > now || modified > u128::from(now) {
+        return Ok(Inspection::Skip("время run в будущем".into()));
+    }
+    // Schema 2 обходит только TTL: остальные проверки остаются обязательными.
+    if marker.schema == LEGACY_SCHEMA {
+        let age_ms = u64::try_from(min_age.as_millis()).unwrap_or(u64::MAX);
+        if now - marker.created_unix_ms < age_ms
+            || modified > u128::from(now.saturating_sub(age_ms))
+        {
+            return Ok(Inspection::Skip("свежий schema 1 run".into()));
+        }
     }
     let size = inspect_orphan_tree(&directory, uid, run_path)?;
     verify_identity(parent, name, &directory)?;
-    Ok(Inspection::Delete(directory, size))
+    Ok(Inspection::Delete(directory, size, reference_policy))
+}
+
+struct ProcessSources<'a> {
+    proc_root: &'a Path,
+    boot_id_path: &'a Path,
+}
+
+fn valid_boot_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
+fn read_boot_id(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    let value = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    if !valid_boot_id(value) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "невалидный boot_id",
+        ));
+    }
+    Ok(value.into())
+}
+
+fn parse_process_start_ticks(bytes: &[u8], expected_pid: u32) -> io::Result<u64> {
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "невалидный /proc/PID/stat");
+    let opening = bytes
+        .windows(2)
+        .position(|part| part == b" (")
+        .ok_or_else(malformed)?;
+    let pid = std::str::from_utf8(&bytes[..opening]).map_err(|_| malformed())?;
+    if parse_pid(pid) != Some(expected_pid) {
+        return Err(malformed());
+    }
+    // comm может содержать произвольные байты, пробелы, ')' и '('.
+    // Последняя ')' завершает field 2; UTF-8 требуется только числовым полям.
+    let closing = bytes
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(malformed)?;
+    if closing < opening + 2 {
+        return Err(malformed());
+    }
+    let tail = bytes[closing + 1..]
+        .strip_prefix(b" ")
+        .ok_or_else(malformed)?;
+    let tail = std::str::from_utf8(tail).map_err(|_| malformed())?;
+    let fields = tail.split_ascii_whitespace().collect::<Vec<_>>();
+    // tail начинается с field 3 (state), следовательно field 22 имеет индекс 19.
+    if fields.len() < 20
+        || fields[0].len() != 1
+        || !matches!(
+            fields[0].as_bytes()[0],
+            b'R' | b'S' | b'D' | b'Z' | b'T' | b't' | b'X' | b'x' | b'K' | b'W' | b'P' | b'I'
+        )
+        || fields[1..]
+            .iter()
+            .any(|field| field.parse::<i128>().is_err())
+        || !decimal_bytes(fields[19].as_bytes())
+    {
+        return Err(malformed());
+    }
+    fields[19].parse().map_err(|_| malformed())
+}
+
+fn read_process_start_ticks(proc_root: &Path, pid: u32) -> io::Result<u64> {
+    parse_process_start_ticks(
+        &fs::read(proc_root.join(pid.to_string()).join("stat"))?,
+        pid,
+    )
+}
+
+fn owner_is_dead(marker: &OwnershipMarker, sources: &ProcessSources<'_>) -> io::Result<bool> {
+    match marker.schema {
+        LEGACY_SCHEMA => {
+            if marker.boot_id.is_some() || marker.process_start_ticks.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "schema 1 содержит schema 2 identity",
+                ));
+            }
+            if marker.pid == std::process::id() {
+                return Ok(false);
+            }
+        }
+        SCHEMA => {
+            let boot_id = marker
+                .boot_id
+                .as_deref()
+                .filter(|id| valid_boot_id(id))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "невалидный marker boot_id")
+                })?;
+            let start_ticks = marker.process_start_ticks.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "нет marker starttime")
+            })?;
+            if boot_id != read_boot_id(sources.boot_id_path)? {
+                return Ok(true);
+            }
+            let process = sources.proc_root.join(marker.pid.to_string());
+            match fs::symlink_metadata(&process) {
+                Ok(metadata) if metadata.is_dir() => (),
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PID не является каталогом",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+                Err(error) => return Err(error),
+            }
+            return match read_process_start_ticks(sources.proc_root, marker.pid) {
+                Ok(current) => Ok(current != start_ticks),
+                // Исчезновение только stat не доказывает исчезновение процесса.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match fs::symlink_metadata(&process) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                        Err(error) => Err(error),
+                        Ok(_) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "неизвестная schema",
+            ));
+        }
+    }
+    match fs::symlink_metadata(sources.proc_root.join(marker.pid.to_string())) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn valid_run_id(name: &str) -> bool {
@@ -391,15 +652,27 @@ fn workspace_has_process_references(
     run_path: &Path,
     uid: u32,
 ) -> io::Result<bool> {
+    workspace_process_references(proc_root, run_path, uid, false, &[])
+}
+
+fn workspace_process_references(
+    proc_root: &Path,
+    run_path: &Path,
+    uid: u32,
+    include_generic: bool,
+    ignored_current_fds: &[i32],
+) -> io::Result<bool> {
     let run_path = fs::canonicalize(run_path)?;
     let entries = fs::read_dir(proc_root)?;
+    let current_pid = std::process::id().to_string();
     for entry in entries {
         let entry = entry?;
         let pid = entry.file_name();
-        if !pid.as_bytes().iter().all(u8::is_ascii_digit)
-            || pid.as_bytes().is_empty()
-            || pid.as_bytes() == std::process::id().to_string().as_bytes()
-        {
+        if !pid.as_bytes().iter().all(u8::is_ascii_digit) || pid.as_bytes().is_empty() {
+            continue;
+        }
+        let is_current_process = pid.as_bytes() == current_pid.as_bytes();
+        if is_current_process && !include_generic {
             continue;
         }
         let process = entry.path();
@@ -418,7 +691,15 @@ fn workspace_has_process_references(
         }
         let comm = match fs::read(process.join("comm")) {
             Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if include_generic
+                    && !fs::symlink_metadata(&process)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                {
+                    return Err(error);
+                }
+                continue;
+            }
             Err(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -428,8 +709,16 @@ fn workspace_has_process_references(
         };
         let cmdline = match fs::read(process.join("cmdline")) {
             Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) if !is_chromium_process(&comm, &[]) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if include_generic
+                    && !fs::symlink_metadata(&process)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                {
+                    return Err(error);
+                }
+                continue;
+            }
+            Err(_) if !include_generic && !is_chromium_process(&comm, &[]) => continue,
             Err(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -440,26 +729,58 @@ fn workspace_has_process_references(
         if command_uses_workspace(&cmdline, &run_path) {
             return Ok(true);
         }
-        if !is_chromium_process(&comm, &cmdline) {
+        let chromium = is_chromium_process(&comm, &cmdline);
+        if !chromium && !include_generic {
             continue;
         }
-        let environment = match fs::read(process.join("environ")) {
-            Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "нельзя проверить окружение browser process",
-                ));
+        if chromium {
+            let environment = match fs::read(process.join("environ")) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if include_generic
+                        && !fs::symlink_metadata(&process)
+                            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "нельзя проверить окружение browser process",
+                    ));
+                }
+            };
+            if environment_uses_workspace(&environment, &run_path) {
+                return Ok(true);
             }
-        };
-        if environment_uses_workspace(&environment, &run_path) {
-            return Ok(true);
         }
-
+        if include_generic {
+            if is_current_process {
+                let environment = fs::read(process.join("environ"))?;
+                if environment_uses_workspace(&environment, &run_path) {
+                    return Ok(true);
+                }
+            }
+            match fs::read_link(process.join("cwd")) {
+                Ok(target) if path_is_within(&target, &run_path) => return Ok(true),
+                Ok(_) => (),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error),
+            }
+        }
         let descriptors = match fs::read_dir(process.join("fd")) {
             Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if include_generic
+                    && !fs::symlink_metadata(&process)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                {
+                    return Err(error);
+                }
+                continue;
+            }
             Err(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -477,6 +798,15 @@ fn workspace_has_process_references(
                     ));
                 }
             };
+            if is_current_process
+                && descriptor
+                    .file_name()
+                    .to_str()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .is_some_and(|fd| ignored_current_fds.contains(&fd))
+            {
+                continue;
+            }
             let target = match fs::read_link(descriptor.path()) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -1293,6 +1623,9 @@ mod tests {
         let marker_path = owner.path().join(MARKER);
         let mut marker: OwnershipMarker =
             serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker.schema = LEGACY_SCHEMA;
+        marker.boot_id = None;
+        marker.process_start_ticks = None;
         marker.pid = u32::MAX;
         marker.created_unix_ms = unix_ms().unwrap() - u64::try_from(age.as_millis()).unwrap();
         fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
@@ -1302,6 +1635,589 @@ mod tests {
             .unwrap();
         owner.closed = true; // Имитация SIGKILL без уничтожения тестового процесса.
         owner.path().to_path_buf()
+    }
+
+    const TEST_BOOT_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+    const OTHER_BOOT_ID: &str = "fedcba98-7654-3210-fedc-ba9876543210";
+
+    fn proc_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let proc_root = root.join("proc-fixture");
+        let boot_id = proc_root.join("sys/kernel/random/boot_id");
+        fs::create_dir_all(boot_id.parent().unwrap()).unwrap();
+        fs::write(&boot_id, format!("{TEST_BOOT_ID}\n")).unwrap();
+        (proc_root, boot_id)
+    }
+
+    fn update_marker(path: &Path, change: impl FnOnce(&mut OwnershipMarker)) {
+        let marker_path = path.join(MARKER);
+        let mut marker = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        change(&mut marker);
+        fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    fn exact_orphan(root: &Path) -> (PathBuf, u32) {
+        let path = make_orphan(root, Duration::ZERO);
+        let pid = std::process::id() + 200_000;
+        update_marker(&path, |marker| {
+            marker.schema = SCHEMA;
+            marker.pid = pid;
+            marker.boot_id = Some(TEST_BOOT_ID.into());
+            marker.process_start_ticks = Some(123_456);
+        });
+        (path, pid)
+    }
+
+    fn stat_fixture(pid: u32, comm: &[u8], start_ticks: &str) -> Vec<u8> {
+        let mut bytes = format!("{pid} (").into_bytes();
+        bytes.extend_from_slice(comm);
+        bytes.extend_from_slice(b") S");
+        for field in 4..22 {
+            bytes.extend_from_slice(format!(" {field}").as_bytes());
+        }
+        bytes.extend_from_slice(format!(" {start_ticks} 0 0\n").as_bytes());
+        bytes
+    }
+
+    fn fake_owner(proc_root: &Path, pid: u32, start_ticks: &str) -> PathBuf {
+        let process = proc_root.join(pid.to_string());
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::write(process.join("comm"), b"fixture-owner\n").unwrap();
+        fs::write(process.join("cmdline"), b"fixture-owner\0").unwrap();
+        fs::write(
+            process.join("stat"),
+            stat_fixture(pid, b"owner", start_ticks),
+        )
+        .unwrap();
+        process
+    }
+
+    #[test]
+    fn stat_parser_handles_comm_parentheses_spaces_and_non_utf8() {
+        let pid = std::process::id() + 200_000;
+        for comm in [
+            b"owner".as_slice(),
+            b"name with ) and ( parentheses))",
+            b"name\xff)",
+        ] {
+            assert_eq!(
+                parse_process_start_ticks(&stat_fixture(pid, comm, "987654"), pid).unwrap(),
+                987654
+            );
+        }
+        let mut missing_tail = stat_fixture(pid, b"owner", "123");
+        missing_tail.truncate(missing_tail.iter().rposition(|byte| *byte == b')').unwrap() + 1);
+        for malformed in [
+            Vec::new(),
+            missing_tail,
+            stat_fixture(pid + 1, b"owner", "123"),
+            stat_fixture(pid, b"owner", "-1"),
+            stat_fixture(pid, b"owner", "+1"),
+            stat_fixture(pid, b"owner", "18446744073709551616"),
+            stat_fixture(pid, b"owner", "nonnumeric"),
+            stat_fixture(pid, b"owner", "123")
+                .into_iter()
+                .chain(b") S 0".iter().copied())
+                .collect(),
+        ] {
+            assert!(
+                parse_process_start_ticks(&malformed, pid).is_err(),
+                "{malformed:?}"
+            );
+        }
+        assert!(
+            parse_process_start_ticks(format!("{pid} (owner) S 1 2\n").as_bytes(), pid).is_err()
+        );
+        assert!(
+            parse_process_start_ticks(
+                format!("{pid} (owner) ? {} 123", "0 ".repeat(18)).as_bytes(),
+                pid
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn new_marker_publishes_complete_exact_identity() {
+        let owner = sandbox();
+        let marker: OwnershipMarker =
+            serde_json::from_slice(&fs::read(owner.path().join(MARKER)).unwrap()).unwrap();
+        assert_eq!(marker.schema, SCHEMA);
+        assert_eq!(marker.pid, std::process::id());
+        assert_eq!(
+            marker.boot_id.unwrap(),
+            read_boot_id(Path::new("/proc/sys/kernel/random/boot_id")).unwrap()
+        );
+        assert_eq!(
+            marker.process_start_ticks.unwrap(),
+            read_process_start_ticks(Path::new("/proc"), std::process::id()).unwrap()
+        );
+        assert!(!owner.path().join(".anki-decks-owner.tmp").exists());
+    }
+
+    #[test]
+    fn exact_live_owner_survives_regardless_of_age() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (path, pid) = exact_orphan(root.path());
+        fake_owner(&proc_root, pid, "123456");
+        for age in [Duration::ZERO, DEFAULT_ORPHAN_MIN_AGE * 2] {
+            update_marker(&path, |marker| {
+                marker.created_unix_ms =
+                    unix_ms().unwrap() - u64::try_from(age.as_millis()).unwrap()
+            });
+            set_old_directory_time(&path, age);
+            let report =
+                cleanup_under_with_proc(root.path(), &proc_root, DEFAULT_ORPHAN_MIN_AGE).unwrap();
+            assert_eq!(report.removed, 0);
+            assert_eq!(report.skipped, 1);
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn fresh_exact_dead_owner_collects_without_ttl_and_pid_alone_is_insufficient() {
+        for death in ["missing", "reused", "reboot"] {
+            let root = sandbox();
+            let (proc_root, boot_id) = proc_fixture(root.path());
+            let (path, pid) = exact_orphan(root.path());
+            match death {
+                "reused" => {
+                    fake_owner(&proc_root, pid, "123457");
+                }
+                "reboot" => {
+                    fake_owner(&proc_root, pid, "123456");
+                    fs::write(boot_id, format!("{OTHER_BOOT_ID}\n")).unwrap();
+                }
+                _ => (),
+            }
+            let marker: OwnershipMarker =
+                serde_json::from_slice(&fs::read(path.join(MARKER)).unwrap()).unwrap();
+            assert!(unix_ms().unwrap() - marker.created_unix_ms < 60_000);
+            if death == "reused" {
+                assert!(proc_root.join(marker.pid.to_string()).exists());
+                assert_ne!(
+                    read_process_start_ticks(&proc_root, marker.pid).unwrap(),
+                    marker.process_start_ticks.unwrap()
+                );
+            }
+            let report =
+                cleanup_under_with_proc(root.path(), &proc_root, DEFAULT_ORPHAN_MIN_AGE * 2)
+                    .unwrap();
+            assert_eq!(report.removed, 1, "{death}: {report:?}");
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn exact_owner_errors_and_incomplete_identity_fail_closed() {
+        for failure in [
+            "boot-missing",
+            "boot-malformed",
+            "boot-io",
+            "proc-io",
+            "stat-missing",
+            "stat-malformed",
+            "stat-io",
+            "pid-symlink",
+            "marker-boot-malformed",
+            "marker-boot-missing",
+            "marker-start-missing",
+        ] {
+            let root = sandbox();
+            let (proc_root, boot_id) = proc_fixture(root.path());
+            let (path, pid) = exact_orphan(root.path());
+            let process = fake_owner(&proc_root, pid, "123457");
+            match failure {
+                "boot-missing" => fs::remove_file(&boot_id).unwrap(),
+                "boot-malformed" => fs::write(&boot_id, b"not-a-boot-id\n").unwrap(),
+                "boot-io" => {
+                    fs::remove_file(&boot_id).unwrap();
+                    fs::create_dir(&boot_id).unwrap();
+                }
+                "proc-io" => {
+                    fs::remove_dir_all(&process).unwrap();
+                    fs::write(&process, b"not a PID directory").unwrap();
+                }
+                "stat-missing" => fs::remove_file(process.join("stat")).unwrap(),
+                "stat-malformed" => fs::write(process.join("stat"), b"malformed").unwrap(),
+                "stat-io" => {
+                    fs::remove_file(process.join("stat")).unwrap();
+                    fs::create_dir(process.join("stat")).unwrap();
+                }
+                "pid-symlink" => {
+                    fs::remove_dir_all(&process).unwrap();
+                    symlink(root.path(), &process).unwrap();
+                }
+                "marker-boot-malformed" => {
+                    update_marker(&path, |marker| marker.boot_id = Some("invalid".into()))
+                }
+                "marker-boot-missing" => update_marker(&path, |marker| marker.boot_id = None),
+                "marker-start-missing" => {
+                    update_marker(&path, |marker| marker.process_start_ticks = None)
+                }
+                _ => unreachable!(),
+            }
+            let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+            assert_eq!(report.removed, 0, "{failure}: {report:?}");
+            assert_eq!(report.skipped, 1, "{failure}: {report:?}");
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn permission_denied_boot_and_proc_stat_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        if current_uid().unwrap() == 0 {
+            return; // Root игнорирует DAC permissions; остальные I/O tests работают и под root.
+        }
+        for failure in ["boot", "pid", "stat", "proc"] {
+            let root = sandbox();
+            let (proc_root, boot_id) = proc_fixture(root.path());
+            let (path, pid) = exact_orphan(root.path());
+            let process = fake_owner(&proc_root, pid, "123457");
+            let blocked = match failure {
+                "boot" => boot_id,
+                "pid" => process,
+                "stat" => process.join("stat"),
+                "proc" => proc_root.clone(),
+                _ => unreachable!(),
+            };
+            let permissions = fs::metadata(&blocked).unwrap().permissions();
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+            let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+            fs::set_permissions(&blocked, permissions).unwrap();
+            assert_eq!(report.removed, 0, "{failure}: {report:?}");
+            assert_eq!(report.skipped, 1);
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn mount_identity_rejects_cross_mount_descriptors() {
+        let root = sandbox();
+        let proc = root_directory(Path::new("/proc")).unwrap();
+        same_mount(&root.directory, &root.directory).unwrap();
+        assert_eq!(
+            same_mount(&root.directory, &proc).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn fresh_exact_owner_future_timestamps_fail_closed() {
+        for future in ["marker", "directory"] {
+            let root = sandbox();
+            let (proc_root, _) = proc_fixture(root.path());
+            let (path, _) = exact_orphan(root.path());
+            if future == "marker" {
+                update_marker(&path, |marker| {
+                    marker.created_unix_ms = unix_ms().unwrap() + 60_000
+                });
+            } else {
+                File::open(&path)
+                    .unwrap()
+                    .set_times(
+                        FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(60)),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO)
+                    .unwrap()
+                    .removed,
+                0
+            );
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn boot_id_parser_rejects_ambiguous_or_noncanonical_input() {
+        let root = sandbox();
+        let boot_id = root.path().join("boot-id");
+        for value in [
+            format!("{TEST_BOOT_ID}\n\n"),
+            format!(" {TEST_BOOT_ID}\n"),
+            format!("{TEST_BOOT_ID}\r\n"),
+            TEST_BOOT_ID.to_uppercase(),
+            "0".repeat(36),
+        ] {
+            fs::write(&boot_id, value).unwrap();
+            assert!(read_boot_id(&boot_id).is_err());
+        }
+    }
+
+    #[test]
+    fn exact_dead_owner_preserves_browser_and_generic_process_references() {
+        for reference in [
+            "browser-profile",
+            "browser-env",
+            "browser-fd",
+            "generic-fd",
+            "generic-cwd",
+        ] {
+            let root = sandbox();
+            let (proc_root, _) = proc_fixture(root.path());
+            let (path, _) = exact_orphan(root.path());
+            let profile = path.join(format!("browser-profile-{}", random_hex()));
+            fs::create_dir(&profile).unwrap();
+            let process = fake_chromium_process(
+                &proc_root,
+                300_000,
+                if reference == "browser-profile" {
+                    format!("chrome\0--user-data-dir={}\0", profile.display()).into_bytes()
+                } else {
+                    b"chrome\0".to_vec()
+                }
+                .as_slice(),
+                if reference == "browser-env" {
+                    format!("TMPDIR={}\0", profile.display()).into_bytes()
+                } else {
+                    b"TMPDIR=/tmp\0".to_vec()
+                }
+                .as_slice(),
+                matches!(reference, "browser-fd" | "generic-fd").then_some(profile.as_path()),
+            );
+            if reference.starts_with("generic") {
+                fs::write(process.join("comm"), b"generic\n").unwrap();
+                fs::write(process.join("cmdline"), b"generic\0").unwrap();
+            }
+            if reference == "generic-cwd" {
+                symlink(&profile, process.join("cwd")).unwrap();
+            }
+            let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+            assert_eq!(report.removed, 0, "{reference}: {report:?}");
+            assert!(path.exists());
+            fs::remove_dir_all(process).unwrap();
+            assert_eq!(
+                cleanup_under_with_proc(root.path(), &proc_root, DEFAULT_ORPHAN_MIN_AGE)
+                    .unwrap()
+                    .removed,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn exact_gc_checks_current_process_cwd_and_ignores_only_its_own_directory_fd() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (path, _) = exact_orphan(root.path());
+        let process = proc_root.join(std::process::id().to_string());
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::write(process.join("comm"), b"gc-fixture\n").unwrap();
+        fs::write(process.join("cmdline"), b"gc-fixture\0").unwrap();
+        fs::write(process.join("environ"), b"TMPDIR=/tmp\0").unwrap();
+
+        symlink(&path, process.join("cwd")).unwrap();
+        assert!(
+            workspace_process_references(&proc_root, &path, current_uid().unwrap(), true, &[7],)
+                .unwrap()
+        );
+        fs::remove_file(process.join("cwd")).unwrap();
+
+        symlink(&path, process.join("fd/7")).unwrap();
+        assert!(
+            !workspace_process_references(&proc_root, &path, current_uid().unwrap(), true, &[7],)
+                .unwrap()
+        );
+        symlink(&path, process.join("fd/8")).unwrap();
+        assert!(
+            workspace_process_references(&proc_root, &path, current_uid().unwrap(), true, &[7],)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_gc_rechecks_process_references_immediately_before_removal() {
+        let root = sandbox();
+        let (proc_root, boot_id_path) = proc_fixture(root.path());
+        let (path, _) = exact_orphan(root.path());
+        let uid = current_uid().unwrap();
+        let parent = namespace(root.path(), uid, false).unwrap().unwrap();
+        let name = path.file_name().unwrap();
+        let inspected = inspect_orphan(
+            &parent,
+            &ProcessSources {
+                proc_root: &proc_root,
+                boot_id_path: &boot_id_path,
+            },
+            name,
+            &path,
+            uid,
+            unix_ms().unwrap(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let Inspection::Delete(directory, _, reference_policy) = inspected else {
+            panic!("ожидался orphan, готовый к удалению");
+        };
+        assert!(matches!(
+            reference_policy,
+            ProcessReferencePolicy::AllSameUid
+        ));
+
+        let referenced_path = path.join("referenced-file");
+        fs::write(&referenced_path, b"live process reference").unwrap();
+        let process = fake_chromium_process(
+            &proc_root,
+            400_000,
+            b"generic-process\0",
+            b"TMPDIR=/tmp\0",
+            Some(&referenced_path),
+        );
+        fs::write(process.join("comm"), b"generic\n").unwrap();
+
+        assert!(matches!(
+            remove_inspected_orphan(
+                &parent,
+                &proc_root,
+                name,
+                &path,
+                &directory,
+                uid,
+                reference_policy,
+            ),
+            Err(DeleteFailure::Skip("живой process использует workspace"))
+        ));
+        assert!(path.exists());
+
+        fs::remove_dir_all(process).unwrap();
+        drop(directory);
+        assert_eq!(
+            cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO)
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn missing_process_sources_do_not_prove_absence_of_references() {
+        for source in ["comm", "cmdline", "environ", "fd"] {
+            let root = sandbox();
+            let (proc_root, _) = proc_fixture(root.path());
+            let (path, _) = exact_orphan(root.path());
+            let process =
+                fake_chromium_process(&proc_root, 300_000, b"chrome\0", b"TMPDIR=/tmp\0", None);
+            if source == "fd" {
+                fs::remove_dir(process.join(source)).unwrap();
+            } else {
+                fs::remove_file(process.join(source)).unwrap();
+            }
+            let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+            assert_eq!(report.removed, 0, "{source}: {report:?}");
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn fresh_exact_orphan_tree_checks_preserve_unknown_entries_and_foreign_objects() {
+        for unsafe_entry in [
+            "browser-file",
+            "browser-directory",
+            "symlink",
+            "socket",
+            "writable",
+        ] {
+            let root = sandbox();
+            let (proc_root, _) = proc_fixture(root.path());
+            let (path, _) = exact_orphan(root.path());
+            let foreign = root.path().join("foreign");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("keep"), b"foreign").unwrap();
+            let zip = root.path().join("user.zip");
+            fs::write(&zip, b"user ZIP").unwrap();
+            match unsafe_entry {
+                "browser-file" | "browser-directory" => {
+                    let temp = path.join("t123");
+                    fs::create_dir(&temp).unwrap();
+                    if unsafe_entry == "browser-file" {
+                        fs::write(temp.join("unknown"), b"keep").unwrap();
+                    } else {
+                        fs::create_dir(temp.join("unknown")).unwrap();
+                    }
+                }
+                "symlink" => symlink(&foreign, path.join("escape")).unwrap(),
+                "socket" => {
+                    drop(bind_socket_at(&path, "unknown-socket"));
+                }
+                "writable" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::write(path.join("writable"), b"keep").unwrap();
+                    fs::set_permissions(path.join("writable"), fs::Permissions::from_mode(0o666))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO)
+                    .unwrap()
+                    .removed,
+                0,
+                "{unsafe_entry}"
+            );
+            assert!(path.exists());
+            assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"foreign");
+            assert_eq!(fs::read(zip).unwrap(), b"user ZIP");
+        }
+    }
+
+    #[test]
+    fn fresh_exact_allowlisted_browser_orphan_preserves_unrelated_directory_and_zip() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (path, _) = exact_orphan(root.path());
+        make_browser_temp_entries(&path);
+        let foreign = root.path().join("unrelated");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep"), b"unrelated").unwrap();
+        let zip = root.path().join("user.zip");
+        fs::write(&zip, b"user ZIP").unwrap();
+        let report =
+            cleanup_under_with_proc(root.path(), &proc_root, DEFAULT_ORPHAN_MIN_AGE).unwrap();
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!path.exists());
+        assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"unrelated");
+        assert_eq!(fs::read(zip).unwrap(), b"user ZIP");
+    }
+
+    #[test]
+    fn schema_one_retains_ttl_and_rejects_schema_two_identity() {
+        let root = sandbox();
+        let (proc_root, boot_id) = proc_fixture(root.path());
+        fs::remove_file(boot_id).unwrap(); // Schema 1 не требует нового источника.
+        let fresh = make_orphan(root.path(), Duration::ZERO);
+        let aged = make_orphan(root.path(), DEFAULT_ORPHAN_MIN_AGE * 2);
+        let modified_fresh = make_orphan(root.path(), DEFAULT_ORPHAN_MIN_AGE * 2);
+        set_old_directory_time(&modified_fresh, Duration::ZERO);
+        let mixed = make_orphan(root.path(), DEFAULT_ORPHAN_MIN_AGE * 2);
+        update_marker(&mixed, |marker| marker.boot_id = Some(TEST_BOOT_ID.into()));
+        let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(!aged.exists());
+        for kept in [fresh, modified_fresh, mixed] {
+            assert!(kept.exists());
+        }
+    }
+
+    #[test]
+    fn parallel_gc_never_deletes_active_exact_workspace() {
+        let root = sandbox();
+        let active = TempWorkspace::create_under(root.path(), "active-gc-unit").unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..8 {
+                        let report = cleanup_under(root.path(), Duration::ZERO).unwrap();
+                        assert_eq!(report.removed, 0);
+                        assert!(active.path().join(MARKER).exists());
+                    }
+                });
+            }
+        });
+        active.close().unwrap();
     }
 
     fn random_hex() -> String {
@@ -1583,7 +2499,7 @@ mod tests {
         let live_marker_path = live.join(MARKER);
         let mut marker: OwnershipMarker =
             serde_json::from_slice(&fs::read(&live_marker_path).unwrap()).unwrap();
-        marker.pid = 1;
+        marker.pid = std::process::id();
         fs::write(&live_marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         let missing = make_orphan(root.path(), Duration::from_secs(172800));
         fs::remove_file(missing.join(MARKER)).unwrap();
@@ -1612,7 +2528,7 @@ mod tests {
 
     #[test]
     fn marker_schema_and_run_id_cannot_escape_root() {
-        for (schema, run_id) in [(2, "invalid"), (SCHEMA, "../escape")] {
+        for (schema, run_id) in [(SCHEMA + 1, "invalid"), (SCHEMA, "../escape")] {
             let root = sandbox();
             let path = make_orphan(root.path(), Duration::from_secs(172800));
             let marker_path = path.join(MARKER);
