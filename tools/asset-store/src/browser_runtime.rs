@@ -314,16 +314,16 @@ fn profile_setup_failure(profile: BrowserProfile, message: String) -> String {
 
 impl Drop for BrowserProfile {
     fn drop(&mut self) {
-        if !self.closed {
-            if let Err(error) = self.cleanup() {
-                tracing::error!(
-                    stage = "temp_cleanup",
-                    code = "browser_profile_cleanup_failed",
-                    path_category = "browser_workspace",
-                    message = %crate::diagnostics::safe_message(&error.to_string()),
-                    "Не удалось безопасно удалить профиль и временный каталог браузера"
-                );
-            }
+        if !self.closed
+            && let Err(error) = self.cleanup()
+        {
+            tracing::error!(
+                stage = "temp_cleanup",
+                code = "browser_profile_cleanup_failed",
+                path_category = "browser_workspace",
+                message = %crate::diagnostics::safe_message(&error.to_string()),
+                "Не удалось безопасно удалить профиль и временный каталог браузера"
+            );
         }
     }
 }
