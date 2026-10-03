@@ -424,6 +424,41 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
 После перезапуска `resume` повторно проверяет кандидата текущим валидатором и
 может продолжить публикацию без повторного JPDB запроса.
 
+`batch run` и `batch resume` сохраняют каждый исход отдельным durable checkpoint
+до перехода к следующей identity. После получения CLI повторно загружает состояние
+пакета и применяет результат только при совпадении token/CAS элемента; если его
+поколение, запрос или revision изменились во время получения, результат
+отбрасывается и не заменяет новое состояние. `run_completed` увеличивается только
+для сохранённого checkpoint, а не для отброшенного результата.
+
+Во время получения прогресс сразу отправляется в `stderr`: человекочитаемыми
+строками в обычном режиме и JSON Lines при `--output json`. Каждое событие JSONL
+имеет `schema_version: 1`, `operation: "batch_run"`, `event`, `batch_id`,
+`elapsed_ms`, `run_completed`, `run_total` и `batch_total`; `run_total` — число
+pending identity после сверки пакета в начале запуска, `batch_total` — полный
+размер пакета. В зависимости от события добавляются `identity`, `session`,
+`attempt`, `outcome` и `reason`. События: `run_started`, `item_started`,
+`retry_started`, `heartbeat`, `item_checkpointed`, `item_discarded_stale`,
+`browser_session_started`, `browser_session_ended`, `browser_session_rotated`,
+`run_stopped` и `run_finished`. `attempt` — номер попытки по сохранённой истории;
+`retry_started` появляется при повторной попытке. Pitch progress не
+содержит полей раундов. Для `ensure` поле `operation` имеет значение `ensure`.
+При `--output json` progress остаётся в `stderr`, а
+`stdout` содержит один итоговый JSON-ответ команды.
+
+Перед следующей identity session закрывается, если достигнут любой из лимитов:
+64 завершённых запроса или 20 минут с запуска session. Уже начатый запрос не
+обрывается ради ротации и ограничен собственным timeout провайдера в 90 секунд.
+Если следующая session не запускается или setup/монитор текущей session завершается
+ошибкой, команда останавливается fail-closed: сохранённый prefix остаётся в runtime,
+а pending хвост не получает синтетических ошибок или попыток и доступен для
+`batch resume`.
+
+На `Ctrl+C` активная browser session закрывается. До этого сохраняются все
+checkpoint prefix; активная identity без завершённого durable checkpoint и
+оставшийся хвост остаются pending и не получают фиктивного failed outcome или
+сохранённой попытки. Следующий `batch resume` продолжает пакет с этих identity.
+
 Публикация читает метаданные и `evidence` только из указанной попытки и требует её
 текущий `VERIFIED` результат от `PitchAccentImageValidator` v5. Перед записью
 `AssetStore::ingest_verified` повторно проверяет байты и сверяет ожидаемый SHA

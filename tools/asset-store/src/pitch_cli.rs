@@ -2,17 +2,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::future::Future;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::browser_runtime::BrowserSession;
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
 use crate::jpdb::{
-    JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchProvider, JpdbPitchQuery, JpdbPitchRequest,
-    JpdbPitchSelection, JpdbPitchStage, pitch_browser_runtime_config,
+    JpdbPitchAcquisitionReport, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchProvider,
+    JpdbPitchQuery, JpdbPitchRequest, JpdbPitchSelection, JpdbPitchStage,
+    pitch_browser_runtime_config,
 };
 use crate::model::{
     AssetIdentity, AssetRecord, HumanDecision, LifecycleState, Provenance, SemanticStatus,
@@ -483,7 +486,7 @@ fn read_plan(path: &Path) -> Result<PitchPlan, AssetError> {
     let mut file = fs::File::open(path)
         .map_err(|error| AssetError::io("не удалось открыть JSON-план", error))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(MAX_PLAN_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| AssetError::io("не удалось прочитать JSON-план", error))?;
@@ -1227,7 +1230,7 @@ async fn ensure(
         Ok(batch)
     })();
     match result {
-        Ok(batch) => match run_batch(store, &batch.batch_id).await {
+        Ok(batch) => match run_batch(store, &batch.batch_id, output, "ensure").await {
             Ok((batch, run_changed)) => {
                 let blockers = batch_blockers(&batch);
                 let resolved = batch.is_resolved();
@@ -1462,7 +1465,7 @@ async fn run_batch_output(
     store_changed: bool,
 ) -> PitchCliOutput {
     let before_revision = batch_state_revision(store, batch_id).unwrap_or(None);
-    match run_batch(store, batch_id).await {
+    match run_batch(store, batch_id, output, operation).await {
         Ok((batch, changed)) => {
             let resolved = batch.is_resolved();
             render_response(
@@ -1716,110 +1719,505 @@ fn reconcile_loaded_batch(
     Ok((batch, changed))
 }
 
+// 64 перехода ограничивают накопленные ресурсы Chromium/CDP, 20 минут —
+// возраст сессии. Ротация идёт после durable checkpoint. Уже запущенный запрос
+// сохраняет собственный 90-секундный timeout провайдера.
+const PITCH_SESSION_MAX_ITEMS: usize = 64;
+const PITCH_SESSION_MAX_AGE: Duration = Duration::from_secs(20 * 60);
+const PITCH_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct PitchRunPolicy {
+    max_items: usize,
+    max_age: Duration,
+    heartbeat: Duration,
+}
+
+impl Default for PitchRunPolicy {
+    fn default() -> Self {
+        Self {
+            max_items: PITCH_SESSION_MAX_ITEMS,
+            max_age: PITCH_SESSION_MAX_AGE,
+            heartbeat: PITCH_PROGRESS_HEARTBEAT,
+        }
+    }
+}
+
+// Локальная boundary для детерминированных offline tests. Сохранённое состояние,
+// token/CAS и байты кандидатов остаются у batch owner; провайдер их не пишет.
+trait PitchRunDriver {
+    type Session;
+
+    async fn launch(&mut self) -> Result<Self::Session, String>;
+    async fn acquire(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+    ) -> JpdbPitchAcquisitionReport;
+    async fn close(&mut self, session: Self::Session);
+}
+
+struct JpdbRunDriver;
+
+impl PitchRunDriver for JpdbRunDriver {
+    type Session = BrowserSession;
+
+    async fn launch(&mut self) -> Result<Self::Session, String> {
+        BrowserSession::launch(pitch_browser_runtime_config()).await
+    }
+
+    async fn acquire(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+    ) -> JpdbPitchAcquisitionReport {
+        JpdbPitchProvider::acquire_requests_in_session(session, std::slice::from_ref(request)).await
+    }
+
+    async fn close(&mut self, session: Self::Session) {
+        session.close().await;
+    }
+}
+
+// Общая JSONL-оболочка kanji progress; у pitch нет раундов и лимитов раундов.
+#[derive(Debug, Clone, Serialize)]
+struct PitchProgressEvent {
+    schema_version: u32,
+    operation: &'static str,
+    event: &'static str,
+    batch_id: String,
+    elapsed_ms: u128,
+    run_completed: usize,
+    run_total: usize,
+    batch_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<AssetIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+trait PitchProgressSink {
+    fn emit(&mut self, event: PitchProgressEvent) -> Result<(), AssetError>;
+}
+
+struct PitchStderrProgressSink(OutputFormat);
+
+impl PitchProgressSink for PitchStderrProgressSink {
+    fn emit(&mut self, event: PitchProgressEvent) -> Result<(), AssetError> {
+        write_pitch_progress(&event, self.0, &mut io::stderr().lock())
+    }
+}
+
+fn write_pitch_progress(
+    event: &PitchProgressEvent,
+    output: OutputFormat,
+    writer: &mut impl Write,
+) -> Result<(), AssetError> {
+    let line = match output {
+        OutputFormat::Json => serde_json::to_string(event)
+            .map_err(|error| invalid_plan(format!("сериализация progress: {error}")))?,
+        OutputFormat::Human => format!(
+            "Прогресс: {} · сохранено {}/{} · всего {} · {:.1} с · identity={} · результат={} {}",
+            event.event,
+            event.run_completed,
+            event.run_total,
+            event.batch_total,
+            event.elapsed_ms as f64 / 1000.0,
+            event
+                .identity
+                .as_ref()
+                .map(|identity| identity.key.as_str())
+                .unwrap_or("-"),
+            event.outcome.as_deref().unwrap_or("-"),
+            event.reason.as_deref().unwrap_or("")
+        ),
+    };
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|error| AssetError::io("запись progress pitch в stderr", error))
+}
+
+struct PitchProgressReporter<'a> {
+    sink: &'a mut dyn PitchProgressSink,
+    batch_id: String,
+    operation: &'static str,
+    started: Instant,
+    completed: usize,
+    total: usize,
+    batch_total: usize,
+    identity: Option<AssetIdentity>,
+    session: Option<u32>,
+    attempt: Option<usize>,
+}
+
+impl PitchProgressReporter<'_> {
+    fn emit(
+        &mut self,
+        event: &'static str,
+        outcome: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), AssetError> {
+        self.sink.emit(PitchProgressEvent {
+            schema_version: 1,
+            operation: self.operation,
+            event,
+            batch_id: self.batch_id.clone(),
+            elapsed_ms: self.started.elapsed().as_millis(),
+            run_completed: self.completed,
+            run_total: self.total,
+            batch_total: self.batch_total,
+            identity: self.identity.clone(),
+            session: self.session,
+            attempt: if matches!(
+                event,
+                "item_started"
+                    | "retry_started"
+                    | "heartbeat"
+                    | "item_checkpointed"
+                    | "item_discarded_stale"
+            ) {
+                self.attempt
+            } else {
+                None
+            },
+            outcome,
+            reason,
+        })
+    }
+}
+
+struct PitchCtrlCListener(tokio::task::JoinHandle<Result<(), io::Error>>);
+
+impl Drop for PitchCtrlCListener {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn pitch_run_stopped(reason: &str, message: impl Into<String>) -> AssetError {
+    AssetError::with_details(
+        if reason == "interrupted" {
+            ErrorCode::InvalidTransition
+        } else {
+            ErrorCode::ValidatorFailure
+        },
+        message,
+        json!({"run_stop_reason": reason}),
+    )
+}
+
+fn pitch_session_failure(failure: JpdbPitchFailure) -> AssetError {
+    AssetError::with_details(
+        ErrorCode::ValidatorFailure,
+        "получение остановлено из-за ошибки browser session; хвост доступен для resume",
+        json!({"run_stop_reason": "session_failure", "session_failure": failure}),
+    )
+}
+
+fn interruption_result(result: Result<(), String>) -> AssetError {
+    match result {
+        Ok(()) => pitch_run_stopped(
+            "interrupted",
+            "получение остановлено по Ctrl+C; пакет доступен для resume",
+        ),
+        Err(message) => pitch_run_stopped("ctrl_c_listener_failed", message),
+    }
+}
+
+async fn wait_pitch_operation<T>(
+    operation: impl Future<Output = T>,
+    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
+    progress: &mut PitchProgressReporter<'_>,
+    heartbeat_period: Duration,
+) -> Result<T, AssetError> {
+    tokio::pin!(operation);
+    let mut heartbeat = tokio::time::interval(heartbeat_period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            // Готовый outcome выигрывает у interruption; caller сохраняет его
+            // синхронно без дополнительного await или проверки сигнала.
+            result = &mut operation => return Ok(result),
+            result = interruption.as_mut() => return Err(interruption_result(result)),
+            _ = heartbeat.tick() => progress.emit("heartbeat", None, None)?,
+        }
+    }
+}
+
+async fn check_pitch_interruption(
+    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
+) -> Result<(), AssetError> {
+    tokio::task::yield_now().await;
+    tokio::select! {
+        biased;
+        signal = interruption.as_mut() => Err(interruption_result(signal)),
+        _ = std::future::ready(()) => Ok(()),
+    }
+}
+
+// Внутри BrowserSession::launch есть spawned CDP handler: запуск нельзя отменить
+// до получения owning Session. Запоминаем сигнал, дожидаемся ограниченного запуска
+// и закрываем полученную сессию до начала обработки identity.
+async fn wait_pitch_launch<T>(
+    launch: impl Future<Output = Result<T, String>>,
+    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
+    progress: &mut PitchProgressReporter<'_>,
+    heartbeat_period: Duration,
+) -> (Result<T, String>, Option<AssetError>) {
+    tokio::pin!(launch);
+    let mut heartbeat = tokio::time::interval(heartbeat_period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let mut stop = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut launch => return (result, stop),
+            signal = interruption.as_mut(), if stop.is_none() => {
+                stop = Some(interruption_result(signal));
+            }
+            _ = heartbeat.tick(), if stop.is_none() => {
+                if let Err(error) = progress.emit("heartbeat", None, None) {
+                    stop = Some(error);
+                }
+            }
+        }
+    }
+}
+
 async fn run_batch(
     store: &AssetStore,
     batch_id: &str,
+    output: OutputFormat,
+    operation: &'static str,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
+    let mut listener = PitchCtrlCListener(tokio::spawn(tokio::signal::ctrl_c()));
+    let interruption = async {
+        match (&mut listener.0).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!("Ctrl+C listener: {error}")),
+            Err(error) => Err(format!("Ctrl+C listener task: {error}")),
+        }
+    };
+    run_batch_with_driver(
+        store,
+        batch_id,
+        operation,
+        &mut JpdbRunDriver,
+        &mut PitchStderrProgressSink(output),
+        PitchRunPolicy::default(),
+        interruption,
+    )
+    .await
+}
+
+async fn run_batch_with_driver(
+    store: &AssetStore,
+    batch_id: &str,
+    operation: &'static str,
+    driver: &mut impl PitchRunDriver,
+    sink: &mut dyn PitchProgressSink,
+    policy: PitchRunPolicy,
+    interruption: impl Future<Output = Result<(), String>>,
+) -> Result<(PitchAccentBatch, bool), AssetError> {
+    if policy.max_items == 0 || policy.max_age.is_zero() || policy.heartbeat.is_zero() {
+        return Err(invalid_plan(
+            "лимиты pitch runtime должны быть положительными",
+        ));
+    }
     let initial_revision = {
         let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
         let mut batch = runtime
             .load()?
             .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
-        let initial_revision = batch.revision;
-        let before_reconcile = batch.clone();
+        let revision = batch.revision;
+        let before = batch.clone();
         reconcile_batch(store, &mut batch)?;
-        if batch != before_reconcile {
+        if batch != before {
             runtime.save(&batch)?;
         }
-        initial_revision
+        revision
     };
-
     publish_ready(store, batch_id)?;
-
-    let acquisitions = {
-        let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
-        let mut batch = runtime
-            .load()?
-            .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
-        let before_reconcile = batch.clone();
-        reconcile_batch(store, &mut batch)?;
-        if batch != before_reconcile {
-            runtime.save(&batch)?;
-        }
-        let mut pending = Vec::new();
-        for item in &batch.items {
-            if item.status() == PitchBatchItemStatus::Pending {
-                pending.push((batch.item_token(&item.identity.key)?, item.request.clone()));
-            }
-        }
-        pending
+    let (batch, _) = reconcile_loaded_batch(store, batch_id)?;
+    let acquisitions = batch
+        .items
+        .iter()
+        .filter(|item| item.status() == PitchBatchItemStatus::Pending)
+        .map(|item| {
+            Ok((
+                batch.item_token(&item.identity.key)?,
+                item.request.clone(),
+                item.attempts.len() + 1,
+            ))
+        })
+        .collect::<Result<Vec<_>, AssetError>>()?;
+    let mut progress = PitchProgressReporter {
+        sink,
+        batch_id: batch_id.into(),
+        operation: if operation == "batch_resume" {
+            "batch_run"
+        } else {
+            operation
+        },
+        started: Instant::now(),
+        completed: 0,
+        total: acquisitions.len(),
+        batch_total: batch.items.len(),
+        identity: None,
+        session: None,
+        attempt: None,
     };
-
-    if !acquisitions.is_empty() {
-        let config = pitch_browser_runtime_config();
-        match BrowserSession::launch(config).await {
-            Ok(session) => {
-                let acquisition_result = async {
-                    for (token, request) in acquisitions {
-                        // На время поиска и снимка браузера блокировка пакета снята.
-                        // Каждый точный результат сохраняется до начала следующего элемента.
-                        let mut outcomes = JpdbPitchProvider::acquire_requests_in_session(
-                            &session,
-                            std::slice::from_ref(&request),
-                        )
-                        .await;
-                        if outcomes.len() != 1 {
-                            return Err(AssetError::new(
-                                ErrorCode::ValidatorFailure,
-                                "JPDB provider вернул число результатов, отличное от одного запроса",
-                            ));
-                        }
-                        let outcome = outcomes.pop().ok_or_else(|| {
-                            AssetError::new(
-                                ErrorCode::ValidatorFailure,
-                                "JPDB provider не вернул результат для элемента",
-                            )
-                        })?;
-                        record_one_outcome(store, batch_id, &token, outcome)?;
-                        publish_ready(store, batch_id)?;
-                    }
-                    Ok::<(), AssetError>(())
+    progress.emit("run_started", None, None)?;
+    tokio::pin!(interruption);
+    let mut session = None;
+    let mut session_started = Instant::now();
+    let mut session_items = 0;
+    let mut session_index = 0;
+    let result = async {
+        for (token, request, attempt) in acquisitions {
+            progress.attempt = None;
+            // Listener может увидеть сигнал во время синхронного checkpoint/
+            // publication. Проверяем его до начала следующей identity, даже если
+            // следующий результат провайдера готов немедленно.
+            check_pitch_interruption(interruption.as_mut()).await?;
+            if session.is_some()
+                && (session_items >= policy.max_items
+                    || session_started.elapsed() >= policy.max_age)
+            {
+                let reason = if session_items >= policy.max_items {
+                    "item_limit"
+                } else {
+                    "age_limit"
+                };
+                if let Some(active) = session.take() {
+                    driver.close(active).await;
                 }
-                .await;
-                session.close().await;
-                acquisition_result?;
+                progress.emit("browser_session_ended", None, Some(reason.into()))?;
+                progress.emit("browser_session_rotated", None, Some(reason.into()))?;
             }
-            Err(message) => {
-                for (token, _) in acquisitions {
-                    record_one_outcome(
-                        store,
-                        batch_id,
-                        &token,
-                        JpdbPitchOutcome::Failed {
-                            error: JpdbPitchFailure::BrowserSetup {
+            if session.is_none() {
+                session_index += 1;
+                progress.session = Some(session_index);
+                check_pitch_interruption(interruption.as_mut()).await?;
+                let (launched, stop) = wait_pitch_launch(
+                    driver.launch(),
+                    interruption.as_mut(),
+                    &mut progress,
+                    policy.heartbeat,
+                )
+                .await;
+                match launched {
+                    Ok(launched) => {
+                        session = Some(launched);
+                        session_started = Instant::now();
+                        session_items = 0;
+                        progress.emit("browser_session_started", None, None)?;
+                    }
+                    Err(message) => {
+                        return Err(stop.unwrap_or_else(|| {
+                            pitch_session_failure(JpdbPitchFailure::BrowserSetup {
                                 stage: JpdbPitchStage::ConfigureBrowser,
-                                message: message.clone(),
-                            },
-                        },
+                                message,
+                            })
+                        }));
+                    }
+                }
+                if let Some(error) = stop {
+                    return Err(error);
+                }
+                check_pitch_interruption(interruption.as_mut()).await?;
+            }
+            progress.identity = Some(token.identity.clone());
+            progress.attempt = Some(attempt);
+            progress.emit("item_started", None, None)?;
+            if attempt > 1 {
+                progress.emit("retry_started", None, None)?;
+            }
+            let mut report = wait_pitch_operation(
+                driver.acquire(session.as_ref().expect("launched session"), &request),
+                interruption.as_mut(),
+                &mut progress,
+                policy.heartbeat,
+            )
+            .await?;
+            if report.outcomes.len() > 1
+                || (report.outcomes.is_empty() && report.session_failure.is_none())
+            {
+                return Err(pitch_run_stopped(
+                    "invalid_provider_report",
+                    "JPDB provider вернул некорректное число результатов",
+                ));
+            }
+            if let Some(outcome) = report.outcomes.pop() {
+                // Между готовым outcome и durable CAS checkpoint нет await.
+                let recorded = record_one_outcome(store, batch_id, &token, outcome)?;
+                session_items += 1;
+                if recorded {
+                    progress.completed += 1;
+                    let saved = load_batch(store, batch_id)?;
+                    let status = saved
+                        .items
+                        .iter()
+                        .find(|item| item.identity == token.identity)
+                        .map(|item| serde_json::to_value(item.status()))
+                        .transpose()
+                        .map_err(|error| invalid_plan(format!("сериализация статуса: {error}")))?
+                        .and_then(|value| value.as_str().map(str::to_owned));
+                    progress.emit("item_checkpointed", status, None)?;
+                    publish_ready(store, batch_id)?;
+                } else {
+                    progress.emit(
+                        "item_discarded_stale",
+                        None,
+                        Some("item_token_changed".into()),
                     )?;
                 }
             }
+            if let Some(failure) = report.session_failure {
+                return Err(pitch_session_failure(failure));
+            }
+            check_pitch_interruption(interruption.as_mut()).await?;
         }
+        let (batch, _) = reconcile_loaded_batch(store, batch_id)?;
+        Ok((batch.clone(), batch.revision != initial_revision))
     }
-
-    let batch = {
-        let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
-        let mut batch = runtime
-            .load()?
-            .ok_or_else(|| invalid_plan("сохранённое состояние batch не найдено"))?;
-        let before_reconcile = batch.clone();
-        reconcile_batch(store, &mut batch)?;
-        if batch != before_reconcile {
-            runtime.save(&batch)?;
-        }
-        batch
-    };
-    Ok((batch.clone(), batch.revision != initial_revision))
+    .await;
+    // Один owner закрывает активную сессию при любом выходе: progress I/O,
+    // ошибка записи, interruption или provider/session failure.
+    if let Some(active) = session.take() {
+        driver.close(active).await;
+        let reason = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.details["run_stop_reason"].as_str())
+            .map(str::to_owned);
+        progress.emit("browser_session_ended", None, reason)?;
+    }
+    match &result {
+        Ok(_) => progress.emit("run_finished", None, None)?,
+        Err(error) => progress.emit(
+            "run_stopped",
+            None,
+            Some(
+                error.details["run_stop_reason"]
+                    .as_str()
+                    .unwrap_or(error.code.as_str())
+                    .into(),
+            ),
+        )?,
+    }
+    result
 }
 
 fn record_one_outcome(
@@ -1827,7 +2225,7 @@ fn record_one_outcome(
     batch_id: &str,
     token: &PitchBatchItemToken,
     outcome: JpdbPitchOutcome,
-) -> Result<(), AssetError> {
+) -> Result<bool, AssetError> {
     let owner = owner_snapshot(store)?;
     let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
     let mut batch = runtime
@@ -1840,8 +2238,7 @@ fn record_one_outcome(
     }
     // record_outcome сохраняет полученные байты до смены состояния. Проверка token/CAS
     // отбрасывает результат, если параллельное действие пользователя изменило элемент.
-    let _recorded = runtime.record_outcome(&mut batch, token, outcome)?;
-    Ok(())
+    runtime.record_outcome(&mut batch, token, outcome)
 }
 
 fn publish_ready(store: &AssetStore, batch_id: &str) -> Result<(), AssetError> {

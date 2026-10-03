@@ -275,6 +275,7 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
             )
             .unwrap()
     );
+    let timed_out_token = token;
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::TechnicalFailure
@@ -282,6 +283,27 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
     batch
         .retry("幽霊", "retry transient timeout".into())
         .unwrap();
+    assert_eq!(
+        batch.item("幽霊").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert_eq!(batch.item("幽霊").unwrap().generation, 1);
+    assert_eq!(batch.item("幽霊").unwrap().attempts.len(), 1);
+    assert!(
+        !runtime
+            .record_outcome(
+                &mut batch,
+                &timed_out_token,
+                JpdbPitchOutcome::Failed {
+                    error: JpdbPitchFailure::Timeout {
+                        stage: JpdbPitchStage::Capture,
+                        diagnostic: Some("stale pre-retry result".into()),
+                    },
+                },
+            )
+            .unwrap()
+    );
+    assert_eq!(batch.item("幽霊").unwrap().attempts.len(), 1);
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::Pending
@@ -381,6 +403,10 @@ fn ambiguity_selection_uses_exact_inventory_id_and_route_then_starts_new_generat
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::AmbiguousVocabulary
     );
+    let ambiguous_item = batch.item("幽霊").unwrap();
+    assert!(ambiguous_item.request.selection.is_none());
+    assert!(ambiguous_item.current_candidate_sha256.is_none());
+    assert!(batch.item_token("幽霊").is_err());
     assert!(
         batch
             .select_candidate("幽霊", 999, "https://jpdb.io/vocabulary/999/幽霊/ゆうれい",)
@@ -446,6 +472,44 @@ fn no_pitch_is_a_typed_terminal_outcome_without_canonical_cache() {
     assert!(batch.is_resolved());
     assert!(item.canonical_sha256.is_none());
     assert!(item.published_sha256.is_none());
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn vocabulary_not_found_is_preserved_as_a_typed_non_acquired_outcome() {
+    let root = temp_store();
+    let mut batch = batch("vocabulary-not-found", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(
+                &mut batch,
+                &token,
+                JpdbPitchOutcome::VocabularyNotFound {
+                    surface: "幽霊".into(),
+                    reading: Some("ゆうれい".into()),
+                },
+            )
+            .unwrap()
+    );
+
+    let item = batch.item("幽霊").unwrap();
+    assert_eq!(item.status(), PitchBatchItemStatus::VocabularyNotFound);
+    assert!(!batch.is_resolved());
+    assert!(item.request.selection.is_none());
+    assert!(item.current_candidate_sha256.is_none());
+    assert!(item.canonical_sha256.is_none());
+    assert!(matches!(
+        item.current_outcome(),
+        Some(crate::pitch_batch::PitchBatchOutcome::VocabularyNotFound {
+            surface,
+            reading: Some(reading),
+        }) if surface == "幽霊" && reading == "ゆうれい"
+    ));
+
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
@@ -541,6 +605,8 @@ fn acquired_png_reopens_verifies_and_rejects_stale_item_token() {
     let mut reopened = PitchAccentBatchRuntime::open(&root, "durable-candidate").unwrap();
     let batch = reopened.load().unwrap().unwrap();
     let item = batch.item("幽霊").unwrap();
+    assert_eq!(item.status(), PitchBatchItemStatus::AcquiredVerified);
+    assert!(batch.item_token("幽霊").is_err());
     let candidate = item.candidate(&sha).unwrap();
     let bytes = reopened.read_candidate(&batch, candidate).unwrap();
     assert_eq!(sha256_hex(&bytes), sha);

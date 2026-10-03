@@ -177,6 +177,47 @@ pub enum JpdbPitchOutcome {
     },
 }
 
+/// Обработанный префикс пакета и необязательная причина остановки сессии.
+///
+/// `outcomes` содержит только запросы, обработка которых началась. Ошибки запуска
+/// и настройки браузера не создают результаты элементов; после потери телеметрии
+/// необработанный хвост очереди также отсутствует.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JpdbPitchAcquisitionReport {
+    pub outcomes: Vec<JpdbPitchOutcome>,
+    pub session_failure: Option<JpdbPitchFailure>,
+}
+
+impl JpdbPitchAcquisitionReport {
+    fn from_session_failure(error: JpdbPitchFailure) -> Self {
+        Self {
+            outcomes: Vec::new(),
+            session_failure: Some(error),
+        }
+    }
+
+    fn stop_if_monitor_failed(&mut self, stage: JpdbPitchStage, monitor_failed: bool) -> bool {
+        if monitor_failed {
+            self.session_failure = Some(JpdbPitchFailure::SessionFailure {
+                stage,
+                message: "Монитор телеметрии CDP завершился с ошибкой; очередь остановлена".into(),
+            });
+        }
+        self.session_failure.is_some()
+    }
+
+    fn record_processed_outcome(
+        &mut self,
+        outcome: JpdbPitchOutcome,
+        stage: JpdbPitchStage,
+        monitor_failed: bool,
+    ) -> bool {
+        self.outcomes.push(outcome);
+        self.stop_if_monitor_failed(stage, monitor_failed)
+    }
+}
+
 /// Байты PNG и метаданные акцентуации, готовые к проверке.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,18 +358,22 @@ pub struct JpdbPitchProvider;
 impl JpdbPitchProvider {
     /// Разрешает запрос и получает данные в новой изолированной сессии Chromium.
     pub async fn acquire(query: &JpdbPitchQuery) -> JpdbPitchOutcome {
-        let mut outcomes = Self::acquire_many(std::slice::from_ref(query)).await;
-        outcomes.pop().unwrap_or_else(|| {
-            failed(JpdbPitchFailure::BrowserSetup {
-                stage: JpdbPitchStage::ConfigureBrowser,
-                message: "Провайдер не вернул результат для элемента".into(),
-            })
+        let mut report = Self::acquire_many(std::slice::from_ref(query)).await;
+        report.outcomes.pop().unwrap_or_else(|| {
+            failed(
+                report
+                    .session_failure
+                    .unwrap_or(JpdbPitchFailure::BrowserSetup {
+                        stage: JpdbPitchStage::ConfigureBrowser,
+                        message: "Провайдер не вернул результат для элемента".into(),
+                    }),
+            )
         })
     }
 
     /// Последовательно разрешает запросы в одной изолированной сессии браузера.
-    /// Предметный результат или ошибка элемента не останавливает оставшуюся очередь.
-    pub async fn acquire_many(queries: &[JpdbPitchQuery]) -> Vec<JpdbPitchOutcome> {
+    /// Ошибка элемента не останавливает очередь; ошибка сессии оставляет только обработанный префикс.
+    pub async fn acquire_many(queries: &[JpdbPitchQuery]) -> JpdbPitchAcquisitionReport {
         let requests = queries
             .iter()
             .cloned()
@@ -338,34 +383,31 @@ impl JpdbPitchProvider {
     }
 
     /// Последовательно разрешает запросы; явный выбор сверяется с новым поиском.
-    pub async fn acquire_requests(requests: &[JpdbPitchRequest]) -> Vec<JpdbPitchOutcome> {
+    pub async fn acquire_requests(requests: &[JpdbPitchRequest]) -> JpdbPitchAcquisitionReport {
         if requests.is_empty() {
-            return Vec::new();
+            return JpdbPitchAcquisitionReport::default();
         }
 
         let runtime = pitch_browser_runtime_config();
         let session = match BrowserSession::launch(runtime).await {
             Ok(session) => session,
             Err(message) => {
-                return requests
-                    .iter()
-                    .map(|_| {
-                        failed(JpdbPitchFailure::BrowserSetup {
-                            stage: JpdbPitchStage::ConfigureBrowser,
-                            message: message.clone(),
-                        })
-                    })
-                    .collect();
+                return JpdbPitchAcquisitionReport::from_session_failure(
+                    JpdbPitchFailure::BrowserSetup {
+                        stage: JpdbPitchStage::ConfigureBrowser,
+                        message,
+                    },
+                );
             }
         };
 
         let setup = configure_page(session.page()).await;
-        let outcomes = match setup {
+        let report = match setup {
             Ok(()) => process_requests_in_session(&session, requests).await,
-            Err(error) => requests.iter().map(|_| failed(error.clone())).collect(),
+            Err(error) => JpdbPitchAcquisitionReport::from_session_failure(error),
         };
         session.close().await;
-        outcomes
+        report
     }
 
     /// Использует переданную `BrowserSession`, но для каждого элемента запускает новый поиск.
@@ -373,7 +415,7 @@ impl JpdbPitchProvider {
     pub async fn acquire_many_in_session(
         session: &BrowserSession,
         queries: &[JpdbPitchQuery],
-    ) -> Vec<JpdbPitchOutcome> {
+    ) -> JpdbPitchAcquisitionReport {
         let requests = queries
             .iter()
             .cloned()
@@ -386,12 +428,12 @@ impl JpdbPitchProvider {
     pub async fn acquire_requests_in_session(
         session: &BrowserSession,
         requests: &[JpdbPitchRequest],
-    ) -> Vec<JpdbPitchOutcome> {
+    ) -> JpdbPitchAcquisitionReport {
         if requests.is_empty() {
-            return Vec::new();
+            return JpdbPitchAcquisitionReport::default();
         }
         if let Err(error) = configure_page(session.page()).await {
-            return requests.iter().map(|_| failed(error.clone())).collect();
+            return JpdbPitchAcquisitionReport::from_session_failure(error);
         }
         process_requests_in_session(session, requests).await
     }
@@ -400,16 +442,17 @@ impl JpdbPitchProvider {
 async fn process_requests_in_session(
     session: &BrowserSession,
     requests: &[JpdbPitchRequest],
-) -> Vec<JpdbPitchOutcome> {
-    let mut outcomes = Vec::with_capacity(requests.len());
-    let mut session_failure: Option<(JpdbPitchStage, String)> = None;
+) -> JpdbPitchAcquisitionReport {
+    let mut report = JpdbPitchAcquisitionReport {
+        outcomes: Vec::with_capacity(requests.len()),
+        session_failure: None,
+    };
     for request in requests {
-        if let Some((stage, message)) = &session_failure {
-            outcomes.push(failed(JpdbPitchFailure::SessionFailure {
-                stage: *stage,
-                message: message.clone(),
-            }));
-            continue;
+        if report.stop_if_monitor_failed(
+            JpdbPitchStage::SearchNavigation,
+            session.telemetry().monitor_failed(),
+        ) {
+            break;
         }
         let mut stage = JpdbPitchStage::SearchNavigation;
         let result = timeout(
@@ -423,19 +466,15 @@ async fn process_requests_in_session(
             ),
         )
         .await;
-        outcomes.push(match result {
+        let outcome = match result {
             Ok(outcome) => outcome,
             Err(_) => item_timeout(stage),
-        });
-        if session.telemetry().monitor_failed() {
-            session_failure = Some((
-                stage,
-                "Монитор телеметрии CDP завершился с ошибкой; последующие элементы изолированы"
-                    .into(),
-            ));
+        };
+        if report.record_processed_outcome(outcome, stage, session.telemetry().monitor_failed()) {
+            break;
         }
     }
-    outcomes
+    report
 }
 
 async fn configure_page(page: &Page) -> Result<(), JpdbPitchFailure> {
@@ -2422,6 +2461,104 @@ const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_and_configuration_failures_have_no_item_outcomes() {
+        for error in [
+            JpdbPitchFailure::BrowserSetup {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "Chromium не запущен".into(),
+            },
+            JpdbPitchFailure::BrowserConfiguration {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "Эмуляция страницы не настроена".into(),
+            },
+        ] {
+            let report = JpdbPitchAcquisitionReport::from_session_failure(error.clone());
+            assert!(report.outcomes.is_empty());
+            assert_eq!(report.session_failure, Some(error));
+        }
+    }
+
+    #[test]
+    fn failed_monitor_before_first_request_leaves_the_entire_queue_unprocessed() {
+        let mut report = JpdbPitchAcquisitionReport::default();
+        assert!(report.stop_if_monitor_failed(JpdbPitchStage::SearchNavigation, true));
+        assert!(report.outcomes.is_empty());
+        assert!(matches!(
+            report.session_failure,
+            Some(JpdbPitchFailure::SessionFailure {
+                stage: JpdbPitchStage::SearchNavigation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn failed_monitor_preserves_processed_prefix_and_does_not_fabricate_tail() {
+        let queue = [
+            JpdbPitchOutcome::VocabularyNotFound {
+                surface: "先頭".into(),
+                reading: None,
+            },
+            failed(JpdbPitchFailure::Telemetry {
+                stage: JpdbPitchStage::DetailReadiness,
+                message: "Телеметрия потеряна во время запроса".into(),
+            }),
+            JpdbPitchOutcome::VocabularyNotFound {
+                surface: "未処理".into(),
+                reading: None,
+            },
+        ];
+        let mut report = JpdbPitchAcquisitionReport::default();
+        let mut started_items = 0;
+        for (index, outcome) in queue.iter().cloned().enumerate() {
+            started_items += 1;
+            if report.record_processed_outcome(outcome, JpdbPitchStage::DetailReadiness, index == 1)
+            {
+                break;
+            }
+        }
+        assert_eq!(started_items, 2);
+        assert_eq!(report.outcomes, queue[..2]);
+        assert!(matches!(
+            report.session_failure,
+            Some(JpdbPitchFailure::SessionFailure {
+                stage: JpdbPitchStage::DetailReadiness,
+                ..
+            })
+        ));
+        assert!(report.stop_if_monitor_failed(JpdbPitchStage::SearchNavigation, false));
+        assert_eq!(report.outcomes.len(), 2);
+    }
+
+    #[test]
+    fn item_local_failures_keep_the_session_and_remaining_queue_available() {
+        let queue = [
+            failed(JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::SearchReadiness,
+                diagnostic: Some("Истёк лимит элемента".into()),
+            }),
+            failed(JpdbPitchFailure::Telemetry {
+                stage: JpdbPitchStage::DetailReadiness,
+                message: "Ошибка критического ресурса страницы".into(),
+            }),
+            JpdbPitchOutcome::VocabularyNotFound {
+                surface: "次".into(),
+                reading: None,
+            },
+        ];
+        let mut report = JpdbPitchAcquisitionReport::default();
+        for outcome in queue.iter().cloned() {
+            assert!(!report.record_processed_outcome(
+                outcome,
+                JpdbPitchStage::DetailReadiness,
+                false,
+            ));
+        }
+        assert_eq!(report.outcomes, queue);
+        assert!(report.session_failure.is_none());
+    }
 
     fn form(surface: &str, reading: &str) -> JpdbVocabularyForm {
         JpdbVocabularyForm {
