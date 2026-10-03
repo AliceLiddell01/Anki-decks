@@ -1445,7 +1445,7 @@ mod tests {
             )
             .unwrap();
         let first = cleanup_under(root.path(), DEFAULT_ORPHAN_MIN_AGE).unwrap();
-        assert_eq!(first.removed, 1, "{first:?}");
+        assert_eq!(first.removed, 1);
         assert!(first.removed_bytes >= 7);
         assert!(!path.exists());
         assert_eq!(
@@ -1467,7 +1467,7 @@ mod tests {
         set_old_directory_time(&orphan, Duration::from_secs(172800));
 
         let report = cleanup_under(root.path(), Duration::ZERO).unwrap();
-        assert_eq!(report.removed, 1, "{report:?}");
+        assert_eq!(report.removed, 1);
         assert!(!orphan.exists());
         assert_eq!(
             fs::read(unrelated.join("keep")).unwrap(),
@@ -1500,7 +1500,7 @@ mod tests {
 
         fs::remove_dir_all(candidate).unwrap();
         let closed = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
-        assert_eq!(closed.removed, 1, "{closed:?}");
+        assert_eq!(closed.removed, 1);
         assert!(!orphan.exists());
         root.close().unwrap();
     }
