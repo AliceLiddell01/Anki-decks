@@ -28,3 +28,13 @@ debug = 0
 # переводя весь workspace на более дорогую release-подобную компиляцию.
 [profile.test.package.asset-store]
 opt-level = 1
+
+# Hosted CI использует один профиль и для test harness, и для последующих
+# repository-level CLI gates. Это позволяет переиспользовать codegen зависимостей
+# вместо перехода из test-профиля обратно в dev при каждом cargo run.
+[profile.ci]
+inherits = "dev"
+debug = 0
+
+[profile.ci.package.asset-store]
+opt-level = 1
