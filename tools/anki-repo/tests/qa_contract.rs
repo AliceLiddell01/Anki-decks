@@ -13,7 +13,7 @@
 //! выводятся из этих counts, а адрес каждого показанного finding'а проверяется
 //! по сырым заметкам, а не по выводу tool'а.
 
-mod common;
+use crate::common;
 
 use common::{
     QA_CODES, TempDir, collect_notes, export_with, mixed_export, parse_json, raw_field_position,
