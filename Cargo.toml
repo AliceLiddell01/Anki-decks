@@ -17,6 +17,12 @@ rust-version = "1.88"
 edition = "2024"
 license = "MIT"
 
+# CI и локальный cargo test не требуют полноценных DWARF-символов. При этом
+# test-профиль по-прежнему наследует debug-assertions=true и overflow-checks=true
+# от dev, поэтому диагностические проверки поведения не ослабляются.
+[profile.test]
+debug = 0
+
 # asset-store содержит CPU-тяжёлые проверки растровых эталонов кандзи.
 # Умеренная оптимизация test-profile сокращает время этих проверок, не
 # переводя весь workspace на более дорогую release-подобную компиляцию.
