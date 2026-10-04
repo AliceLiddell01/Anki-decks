@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
@@ -260,9 +261,15 @@ async fn run_resumes_a_durable_candidate_without_reacquisition_and_resolved_reru
     // Байты кандидата и состояние сохранены до этого запуска, как если бы
     // предыдущий процесс остановился перед публикацией. Resume должен опубликовать
     // их из runtime blob.
-    let (batch, changed) = run_batch(&store, "candidate-resume", OutputFormat::Json, "batch_run")
-        .await
-        .unwrap();
+    let (batch, changed) = run_batch(
+        &store,
+        "candidate-resume",
+        OutputFormat::Json,
+        "batch_run",
+        1,
+    )
+    .await
+    .unwrap();
     assert!(changed);
     let item = batch.item("幽霊").unwrap();
     assert_eq!(item.status(), PitchBatchItemStatus::Published);
@@ -287,9 +294,15 @@ async fn run_resumes_a_durable_candidate_without_reacquisition_and_resolved_reru
 
     // Второй запуск видит уже подтверждённую текущую запись владельца, не открывает браузер
     // и не добавляет новую попытку acquisition.
-    let (rerun, changed) = run_batch(&store, "candidate-resume", OutputFormat::Json, "batch_run")
-        .await
-        .unwrap();
+    let (rerun, changed) = run_batch(
+        &store,
+        "candidate-resume",
+        OutputFormat::Json,
+        "batch_run",
+        1,
+    )
+    .await
+    .unwrap();
     assert!(!changed);
     assert_eq!(rerun.item("幽霊").unwrap().attempts.len(), 1);
     assert_eq!(
@@ -341,6 +354,7 @@ async fn run_reconciles_a_store_commit_after_restart_without_reacquisition() {
         "owner-commit-resume",
         OutputFormat::Json,
         "batch_run",
+        1,
     )
     .await
     .unwrap();
@@ -499,6 +513,7 @@ async fn pitch_cli_routes_human_errors_to_stderr_and_json_errors_to_stdout() {
         PitchCommand::Batch {
             command: PitchBatchCommand::Run {
                 batch_id: "missing-run".into(),
+                workers: 1,
             },
         },
     ))
@@ -923,6 +938,7 @@ async fn cli_reacquire_publishes_current_metadata_when_png_sha_repeats() {
         PitchCommand::Batch {
             command: PitchBatchCommand::Run {
                 batch_id: "same-sha-metadata".into(),
+                workers: 1,
             },
         },
     ))
@@ -1318,12 +1334,254 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ParallelPitchAttempt {
+    worker: u32,
+    worker_session: u32,
+    session: u32,
+    surface: String,
+}
+
+#[derive(Default)]
+struct ParallelPitchTraceState {
+    active: usize,
+    max_active: usize,
+    next_session: u32,
+    starts: Vec<ParallelPitchAttempt>,
+    closed: Vec<ParallelPitchAttempt>,
+    finished: Vec<u32>,
+    workspace_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Default)]
+struct ParallelPitchTrace(Arc<Mutex<ParallelPitchTraceState>>);
+
+impl ParallelPitchTrace {
+    fn begin(&self, attempt: ParallelPitchAttempt) -> ActivePitchAcquire {
+        let mut state = self.0.lock().unwrap();
+        state.active += 1;
+        state.max_active = state.max_active.max(state.active);
+        state.starts.push(attempt);
+        ActivePitchAcquire(self.clone())
+    }
+
+    fn launch(&self) -> u32 {
+        let mut state = self.0.lock().unwrap();
+        state.next_session += 1;
+        state.next_session
+    }
+
+    fn close(&self, attempt: ParallelPitchAttempt) {
+        self.0.lock().unwrap().closed.push(attempt);
+    }
+
+    fn finish(&self, worker: u32, workspace: PathBuf) {
+        let mut state = self.0.lock().unwrap();
+        state.finished.push(worker);
+        state.workspace_paths.push(workspace);
+    }
+
+    fn snapshot(&self) -> ParallelPitchTraceStateSnapshot {
+        let state = self.0.lock().unwrap();
+        ParallelPitchTraceStateSnapshot {
+            active: state.active,
+            max_active: state.max_active,
+            starts: state.starts.clone(),
+            closed: state.closed.clone(),
+            finished: state.finished.clone(),
+            workspace_paths: state.workspace_paths.clone(),
+        }
+    }
+}
+
+struct ActivePitchAcquire(ParallelPitchTrace);
+
+impl Drop for ActivePitchAcquire {
+    fn drop(&mut self) {
+        let mut state = self.0.0.lock().unwrap();
+        state.active -= 1;
+    }
+}
+
+struct ParallelPitchTraceStateSnapshot {
+    active: usize,
+    max_active: usize,
+    starts: Vec<ParallelPitchAttempt>,
+    closed: Vec<ParallelPitchAttempt>,
+    finished: Vec<u32>,
+    workspace_paths: Vec<PathBuf>,
+}
+
+enum ParallelPitchAction {
+    Complete,
+    SessionFailure {
+        started: Option<futures::channel::oneshot::Sender<()>>,
+    },
+    Wait {
+        started: Option<futures::channel::oneshot::Sender<()>>,
+        release: futures::channel::oneshot::Receiver<()>,
+    },
+}
+
+struct ParallelPitchSession {
+    worker: u32,
+    worker_session: u32,
+    session: u32,
+}
+
+struct ParallelPitchDriver {
+    worker: u32,
+    worker_session_count: u32,
+    active_session: Option<u32>,
+    trace: ParallelPitchTrace,
+    actions: std::collections::BTreeMap<String, ParallelPitchAction>,
+    workspace: Option<TempWorkspace>,
+    fail_finish: bool,
+}
+
+impl ParallelPitchDriver {
+    fn new(
+        worker: u32,
+        trace: ParallelPitchTrace,
+        actions: impl IntoIterator<Item = (String, ParallelPitchAction)>,
+    ) -> Self {
+        let workspace = TempWorkspace::create("pitch-parallel-synthetic-worker").unwrap();
+        Self {
+            worker,
+            worker_session_count: 0,
+            active_session: None,
+            trace,
+            actions: actions.into_iter().collect(),
+            workspace: Some(workspace),
+            fail_finish: false,
+        }
+    }
+
+    fn complete_actions(surfaces: &[&str]) -> Vec<(String, ParallelPitchAction)> {
+        surfaces
+            .iter()
+            .map(|surface| ((*surface).into(), ParallelPitchAction::Complete))
+            .collect()
+    }
+}
+
+impl super::PitchRunDriver for ParallelPitchDriver {
+    type Session = ParallelPitchSession;
+
+    async fn launch(&mut self) -> Result<Self::Session, String> {
+        assert!(
+            self.active_session.is_none(),
+            "у worker не должно быть двух сессий"
+        );
+        self.worker_session_count += 1;
+        let worker_session = self.worker_session_count;
+        let session = self.trace.launch();
+        self.active_session = Some(worker_session);
+        Ok(ParallelPitchSession {
+            worker: self.worker,
+            worker_session,
+            session,
+        })
+    }
+
+    async fn acquire(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+    ) -> crate::jpdb::JpdbPitchAcquisitionReport {
+        assert_eq!(self.worker, session.worker);
+        assert_eq!(self.active_session, Some(session.worker_session));
+        let surface = request.query.surface.clone();
+        let _active = self.trace.begin(ParallelPitchAttempt {
+            worker: self.worker,
+            worker_session: session.worker_session,
+            session: session.session,
+            surface: surface.clone(),
+        });
+        let action = self
+            .actions
+            .remove(&surface)
+            .unwrap_or(ParallelPitchAction::Complete);
+        let session_failure = match action {
+            ParallelPitchAction::Complete => None,
+            ParallelPitchAction::SessionFailure { started } => {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                Some(JpdbPitchFailure::SessionFailure {
+                    stage: JpdbPitchStage::SearchNavigation,
+                    message: "synthetic worker session failure".into(),
+                })
+            }
+            ParallelPitchAction::Wait { started, release } => {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                release.await.expect("тест должен освободить запрос worker");
+                None
+            }
+        };
+        let outcomes = if session_failure.is_some() {
+            Vec::new()
+        } else {
+            vec![JpdbPitchOutcome::VocabularyNotFound {
+                surface: request.query.surface.clone(),
+                reading: request.query.reading.clone(),
+            }]
+        };
+        crate::jpdb::JpdbPitchAcquisitionReport {
+            outcomes,
+            session_failure,
+        }
+    }
+
+    async fn close(&mut self, session: Self::Session) {
+        assert_eq!(self.worker, session.worker);
+        assert_eq!(self.active_session.take(), Some(session.worker_session));
+        self.trace.close(ParallelPitchAttempt {
+            worker: session.worker,
+            worker_session: session.worker_session,
+            session: session.session,
+            surface: String::new(),
+        });
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        if self.active_session.is_some() {
+            return Err(format!(
+                "worker {} завершился с активной сессией",
+                self.worker
+            ));
+        }
+        let workspace = self
+            .workspace
+            .take()
+            .expect("synthetic worker workspace закрывается один раз");
+        let workspace_path = workspace.path().to_path_buf();
+        workspace
+            .close()
+            .map_err(|error| format!("synthetic worker workspace cleanup: {error}"))?;
+        self.trace.finish(self.worker, workspace_path);
+        if self.fail_finish {
+            Err(format!(
+                "synthetic cleanup failure for worker {}",
+                self.worker
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Default)]
 struct CapturedPitchProgress {
     events: Vec<super::PitchProgressEvent>,
     jsonl: Vec<u8>,
     interrupt_on_checkpoint: Option<futures::channel::oneshot::Sender<()>>,
+    checkpoint_signals: std::collections::BTreeMap<String, futures::channel::oneshot::Sender<()>>,
+    session_end_signals: std::collections::BTreeMap<u32, futures::channel::oneshot::Sender<()>>,
     release_on_heartbeat: Option<futures::channel::oneshot::Sender<()>>,
+    release_on_session_heartbeat: Option<(u32, futures::channel::oneshot::Sender<()>)>,
     state_path: Option<PathBuf>,
     heartbeat_states: Vec<Vec<u8>>,
 }
@@ -1337,11 +1595,31 @@ impl super::PitchProgressSink for CapturedPitchProgress {
             if let Some(permit) = self.release_on_heartbeat.take() {
                 permit.send(()).unwrap();
             }
+            if self
+                .release_on_session_heartbeat
+                .as_ref()
+                .is_some_and(|(session, _)| event.session == Some(*session))
+            {
+                let (_, permit) = self.release_on_session_heartbeat.take().unwrap();
+                permit.send(()).unwrap();
+            }
         }
         if event.event == "item_checkpointed"
             && let Some(signal) = self.interrupt_on_checkpoint.take()
         {
             signal.send(()).unwrap();
+        }
+        if event.event == "item_checkpointed"
+            && let Some(identity) = &event.identity
+            && let Some(signal) = self.checkpoint_signals.remove(&identity.key)
+        {
+            let _ = signal.send(());
+        }
+        if event.event == "browser_session_ended"
+            && let Some(worker) = event.worker
+            && let Some(signal) = self.session_end_signals.remove(&worker)
+        {
+            let _ = signal.send(());
         }
         super::write_pitch_progress(&event, OutputFormat::Json, &mut self.jsonl)?;
         self.events.push(event);
@@ -1383,6 +1661,755 @@ fn assert_untouched_pitch_tail(batch: &PitchAccentBatch, start: usize) {
         assert!(item.attempts.is_empty());
         assert!(item.current_candidate_sha256.is_none());
     }
+}
+
+async fn wait_for_worker_signal<T: std::fmt::Debug, F: std::future::Future<Output = T>>(
+    run: &mut std::pin::Pin<Box<F>>,
+    signal: &mut futures::channel::oneshot::Receiver<()>,
+) {
+    tokio::select! {
+        biased;
+        result = run.as_mut() => panic!("run завершился до ожидаемого worker-события: {result:?}"),
+        result = signal => result.expect("synthetic barrier должен быть освобождён"),
+    }
+}
+
+fn parallel_pitch_policy(max_items: usize) -> super::PitchRunPolicy {
+    super::PitchRunPolicy {
+        max_items,
+        max_age: std::time::Duration::from_secs(1200),
+        heartbeat: std::time::Duration::from_secs(60),
+    }
+}
+
+fn assert_parallel_workspaces_removed(trace: &ParallelPitchTrace, expected_workers: usize) {
+    let snapshot = trace.snapshot();
+    assert_eq!(snapshot.finished.len(), expected_workers);
+    assert_eq!(
+        snapshot
+            .finished
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        (1..=expected_workers as u32).collect()
+    );
+    assert_eq!(snapshot.workspace_paths.len(), expected_workers);
+    assert_eq!(
+        snapshot
+            .workspace_paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected_workers
+    );
+    assert!(snapshot.workspace_paths.iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
+async fn parallel_pitch_worker_count_bounds_unique_dispatch_and_json_progress() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(&store, "parallel-one-worker", &["一", "二", "三", "四"]);
+
+    let trace = ParallelPitchTrace::default();
+    let driver = ParallelPitchDriver::new(
+        1,
+        trace.clone(),
+        ParallelPitchDriver::complete_actions(&["一", "二", "三", "四"]),
+    );
+    let mut drivers = [driver];
+    let mut progress = CapturedPitchProgress::default();
+    let (batch, _) = super::run_batch_with_drivers(
+        &store,
+        "parallel-one-worker",
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap();
+
+    let snapshot = trace.snapshot();
+    assert_eq!(snapshot.max_active, 1);
+    assert_eq!(snapshot.active, 0);
+    assert_eq!(snapshot.starts.len(), 4);
+    assert_eq!(snapshot.closed.len(), 1);
+    assert!(snapshot.starts.iter().all(|attempt| attempt.worker == 1));
+    let dispatched = snapshot
+        .starts
+        .iter()
+        .map(|attempt| attempt.surface.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(dispatched, ["一", "二", "三", "四"].into_iter().collect());
+    assert!(batch.items.iter().all(|item| item.attempts.len() == 1));
+    assert_parallel_workspaces_removed(&trace, 1);
+
+    let jsonl = String::from_utf8(progress.jsonl).unwrap();
+    let events = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty());
+    for event in &events {
+        assert_eq!(event["workers"], 1);
+        assert!(event["in_flight"].as_u64().unwrap() <= 1);
+    }
+    for event in events
+        .iter()
+        .filter(|event| event["event"] == "item_started" || event["event"] == "item_checkpointed")
+    {
+        assert_eq!(event["worker"], 1);
+        assert_eq!(event["worker_session"], 1);
+        assert!(event["session"].as_u64().is_some());
+    }
+    let session_started = events
+        .iter()
+        .find(|event| event["event"] == "browser_session_started")
+        .unwrap();
+    assert_eq!(session_started["in_flight"], 1);
+    assert_eq!(session_started["identity"]["key"], "一");
+}
+
+#[tokio::test]
+async fn parallel_pitch_rejects_invalid_worker_counts_before_creating_actors() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(&store, "parallel-invalid-workers", &["一"]);
+
+    let mut no_drivers: Vec<ParallelPitchDriver> = Vec::new();
+    let error = super::run_batch_with_drivers(
+        &store,
+        "parallel-invalid-workers",
+        "batch_run",
+        &mut no_drivers,
+        &mut CapturedPitchProgress::default(),
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidIdentity);
+
+    let too_many_trace = ParallelPitchTrace::default();
+    let mut too_many = (1..=5)
+        .map(|worker| ParallelPitchDriver::new(worker, too_many_trace.clone(), []))
+        .collect::<Vec<_>>();
+    let error = super::run_batch_with_drivers(
+        &store,
+        "parallel-invalid-workers",
+        "batch_run",
+        &mut too_many,
+        &mut CapturedPitchProgress::default(),
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidIdentity);
+    let snapshot = too_many_trace.snapshot();
+    assert!(snapshot.starts.is_empty());
+    assert!(snapshot.closed.is_empty());
+    assert!(snapshot.finished.is_empty());
+    drop(too_many);
+}
+
+#[test]
+fn pitch_batch_workers_default_to_four_and_cli_rejects_values_outside_supported_range() {
+    let parsed = <PitchCli as clap::Parser>::try_parse_from([
+        "pitch-assets",
+        "batch",
+        "run",
+        "--batch-id",
+        "worker-cli-default",
+    ])
+    .unwrap();
+    match parsed.command {
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Run { workers, .. },
+        } => assert_eq!(workers, 4),
+        _ => panic!("ожидалась команда batch run"),
+    }
+
+    for workers in ["0", "5"] {
+        assert!(
+            <PitchCli as clap::Parser>::try_parse_from([
+                "pitch-assets",
+                "batch",
+                "run",
+                "--batch-id",
+                "worker-cli-range",
+                "--workers",
+                workers,
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn parallel_pitch_checkpoints_out_of_order_reports_by_identity_and_cas_token() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(&store, "parallel-out-of-order", &["一", "二", "三"]);
+    let trace = ParallelPitchTrace::default();
+
+    let (start_a_tx, mut start_a_rx) = futures::channel::oneshot::channel();
+    let (release_a_tx, release_a_rx) = futures::channel::oneshot::channel();
+    let (start_b_tx, mut start_b_rx) = futures::channel::oneshot::channel();
+    let (release_b_tx, release_b_rx) = futures::channel::oneshot::channel();
+    let (start_c_tx, mut start_c_rx) = futures::channel::oneshot::channel();
+    let (release_c_tx, release_c_rx) = futures::channel::oneshot::channel();
+    let (checkpoint_b_tx, mut checkpoint_b_rx) = futures::channel::oneshot::channel();
+    let (checkpoint_c_tx, mut checkpoint_c_rx) = futures::channel::oneshot::channel();
+    let mut drivers = [
+        ParallelPitchDriver::new(
+            1,
+            trace.clone(),
+            [(
+                "一".into(),
+                ParallelPitchAction::Wait {
+                    started: Some(start_a_tx),
+                    release: release_a_rx,
+                },
+            )],
+        ),
+        ParallelPitchDriver::new(
+            2,
+            trace.clone(),
+            [
+                (
+                    "二".into(),
+                    ParallelPitchAction::Wait {
+                        started: Some(start_b_tx),
+                        release: release_b_rx,
+                    },
+                ),
+                (
+                    "三".into(),
+                    ParallelPitchAction::Wait {
+                        started: Some(start_c_tx),
+                        release: release_c_rx,
+                    },
+                ),
+            ],
+        ),
+    ];
+    let mut progress = CapturedPitchProgress::default();
+    progress
+        .checkpoint_signals
+        .insert("二".into(), checkpoint_b_tx);
+    progress
+        .checkpoint_signals
+        .insert("三".into(), checkpoint_c_tx);
+    let mut run = Box::pin(super::run_batch_with_drivers(
+        &store,
+        "parallel-out-of-order",
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    ));
+
+    wait_for_worker_signal(&mut run, &mut start_a_rx).await;
+    wait_for_worker_signal(&mut run, &mut start_b_rx).await;
+    release_b_tx.send(()).unwrap();
+    wait_for_worker_signal(&mut run, &mut checkpoint_b_rx).await;
+    wait_for_worker_signal(&mut run, &mut start_c_rx).await;
+    assert_eq!(
+        load_batch(&store, "parallel-out-of-order")
+            .unwrap()
+            .item("二")
+            .unwrap()
+            .attempts
+            .len(),
+        1
+    );
+    assert!(
+        load_batch(&store, "parallel-out-of-order")
+            .unwrap()
+            .item("一")
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    release_c_tx.send(()).unwrap();
+    wait_for_worker_signal(&mut run, &mut checkpoint_c_rx).await;
+    release_a_tx.send(()).unwrap();
+    let (batch, _) = run.await.unwrap();
+
+    let snapshot = trace.snapshot();
+    assert_eq!(snapshot.max_active, 2);
+    assert_eq!(snapshot.active, 0);
+    assert_eq!(snapshot.starts.len(), 3);
+    assert_eq!(
+        snapshot
+            .starts
+            .iter()
+            .filter(|attempt| attempt.surface == "一")
+            .count(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .starts
+            .iter()
+            .filter(|attempt| attempt.surface == "二")
+            .count(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .starts
+            .iter()
+            .filter(|attempt| attempt.surface == "三")
+            .count(),
+        1
+    );
+    let checkpoints = progress
+        .events
+        .iter()
+        .filter(|event| event.event == "item_checkpointed")
+        .map(|event| {
+            (
+                event.identity.as_ref().unwrap().key.as_str(),
+                event.run_completed,
+                event.worker,
+                event.worker_session,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoints,
+        vec![
+            ("二", 1, Some(2), Some(1)),
+            ("三", 2, Some(2), Some(1)),
+            ("一", 3, Some(1), Some(1))
+        ]
+    );
+    let jsonl = String::from_utf8(progress.jsonl).unwrap();
+    let json_events = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        json_events
+            .iter()
+            .all(|event| event["workers"] == 2 && event["in_flight"].as_u64().unwrap() <= 2)
+    );
+    assert_eq!(
+        json_events
+            .iter()
+            .map(|event| event["in_flight"].as_u64().unwrap())
+            .max(),
+        Some(2)
+    );
+    assert!(batch.items.iter().all(|item| item.attempts.len() == 1));
+    assert_parallel_workspaces_removed(&trace, 2);
+}
+
+#[tokio::test]
+async fn parallel_pitch_discards_stale_cas_result_without_counting_it_as_checkpoint() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(&store, "parallel-stale-cas", &["一", "二"]);
+    let trace = ParallelPitchTrace::default();
+    let (start_a_tx, mut start_a_rx) = futures::channel::oneshot::channel();
+    let (release_a_tx, release_a_rx) = futures::channel::oneshot::channel();
+    let mut drivers = [
+        ParallelPitchDriver::new(
+            1,
+            trace.clone(),
+            [(
+                "一".into(),
+                ParallelPitchAction::Wait {
+                    started: Some(start_a_tx),
+                    release: release_a_rx,
+                },
+            )],
+        ),
+        ParallelPitchDriver::new(
+            2,
+            trace.clone(),
+            ParallelPitchDriver::complete_actions(&["二"]),
+        ),
+    ];
+    let mut progress = CapturedPitchProgress::default();
+    let mut run = Box::pin(super::run_batch_with_drivers(
+        &store,
+        "parallel-stale-cas",
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    ));
+    wait_for_worker_signal(&mut run, &mut start_a_rx).await;
+
+    let mut runtime = PitchAccentBatchRuntime::open(store.root(), "parallel-stale-cas").unwrap();
+    let mut batch = runtime.load().unwrap().unwrap();
+    batch
+        .reacquire("一", "параллельное изменение перед CAS".into())
+        .unwrap();
+    runtime.save(&batch).unwrap();
+    drop(runtime);
+    release_a_tx.send(()).unwrap();
+    let (batch, _) = run.await.unwrap();
+
+    assert_eq!(
+        batch.item("一").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert!(batch.item("一").unwrap().attempts.is_empty());
+    assert_eq!(batch.item("二").unwrap().attempts.len(), 1);
+    let discarded = progress
+        .events
+        .iter()
+        .find(|event| event.event == "item_discarded_stale")
+        .unwrap();
+    assert_eq!(discarded.identity.as_ref().unwrap().key, "一");
+    assert_eq!(discarded.run_completed, 1);
+    assert_eq!(progress.events.last().unwrap().run_completed, 1);
+    assert_parallel_workspaces_removed(&trace, 2);
+}
+
+#[tokio::test]
+async fn parallel_pitch_session_failure_stops_tail_but_joins_a_live_neighbor() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(
+        &store,
+        "parallel-neighbor-failure",
+        &["一", "二", "三", "四"],
+    );
+    let trace = ParallelPitchTrace::default();
+    let (start_b_tx, mut start_b_rx) = futures::channel::oneshot::channel();
+    let (release_b_tx, release_b_rx) = futures::channel::oneshot::channel();
+    let (worker_one_end_tx, mut worker_one_end_rx) = futures::channel::oneshot::channel();
+    let mut drivers = [
+        ParallelPitchDriver::new(
+            1,
+            trace.clone(),
+            [(
+                "一".into(),
+                ParallelPitchAction::SessionFailure { started: None },
+            )],
+        ),
+        ParallelPitchDriver::new(
+            2,
+            trace.clone(),
+            [(
+                "二".into(),
+                ParallelPitchAction::Wait {
+                    started: Some(start_b_tx),
+                    release: release_b_rx,
+                },
+            )],
+        ),
+    ];
+    let mut progress = CapturedPitchProgress::default();
+    progress.session_end_signals.insert(1, worker_one_end_tx);
+    let mut run = Box::pin(super::run_batch_with_drivers(
+        &store,
+        "parallel-neighbor-failure",
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    ));
+    wait_for_worker_signal(&mut run, &mut start_b_rx).await;
+    wait_for_worker_signal(&mut run, &mut worker_one_end_rx).await;
+    release_b_tx.send(()).unwrap();
+    let error = run.await.unwrap_err();
+
+    assert_eq!(error.details["run_stop_reason"], "session_failure");
+    let batch = load_batch(&store, "parallel-neighbor-failure").unwrap();
+    assert!(batch.item("一").unwrap().attempts.is_empty());
+    assert_eq!(batch.item("二").unwrap().attempts.len(), 1);
+    for surface in ["三", "四"] {
+        assert!(batch.item(surface).unwrap().attempts.is_empty());
+        assert_eq!(
+            batch.item(surface).unwrap().status(),
+            PitchBatchItemStatus::Pending
+        );
+    }
+    let snapshot = trace.snapshot();
+    assert_eq!(snapshot.starts.len(), 2);
+    assert!(
+        snapshot
+            .starts
+            .iter()
+            .any(|attempt| attempt.surface == "一")
+    );
+    assert!(
+        snapshot
+            .starts
+            .iter()
+            .any(|attempt| attempt.surface == "二")
+    );
+    assert_eq!(snapshot.closed.len(), 2);
+    assert_parallel_workspaces_removed(&trace, 2);
+}
+
+#[tokio::test]
+async fn parallel_pitch_ctrl_c_keeps_completed_set_and_resumes_without_reacquiring_it() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(&store, "parallel-interrupt-resume", &["一", "二", "三"]);
+    let trace = ParallelPitchTrace::default();
+    let (start_a_tx, mut start_a_rx) = futures::channel::oneshot::channel();
+    let (_release_a_tx, release_a_rx) = futures::channel::oneshot::channel();
+    let (start_b_tx, mut start_b_rx) = futures::channel::oneshot::channel();
+    let (release_b_tx, release_b_rx) = futures::channel::oneshot::channel();
+    let mut drivers = [
+        ParallelPitchDriver::new(
+            1,
+            trace.clone(),
+            [(
+                "一".into(),
+                ParallelPitchAction::Wait {
+                    started: Some(start_a_tx),
+                    release: release_a_rx,
+                },
+            )],
+        ),
+        ParallelPitchDriver::new(
+            2,
+            trace.clone(),
+            [(
+                "二".into(),
+                ParallelPitchAction::Wait {
+                    started: Some(start_b_tx),
+                    release: release_b_rx,
+                },
+            )],
+        ),
+    ];
+    let (interrupt_tx, interrupt_rx) = futures::channel::oneshot::channel();
+    let mut progress = CapturedPitchProgress {
+        interrupt_on_checkpoint: Some(interrupt_tx),
+        ..Default::default()
+    };
+    let mut run = Box::pin(super::run_batch_with_drivers(
+        &store,
+        "parallel-interrupt-resume",
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(8),
+        pitch_signal(interrupt_rx),
+    ));
+    wait_for_worker_signal(&mut run, &mut start_a_rx).await;
+    wait_for_worker_signal(&mut run, &mut start_b_rx).await;
+    release_b_tx.send(()).unwrap();
+    let error = run.await.unwrap_err();
+
+    assert_eq!(error.details["run_stop_reason"], "interrupted");
+    let batch = load_batch(&store, "parallel-interrupt-resume").unwrap();
+    assert!(batch.item("一").unwrap().attempts.is_empty());
+    assert_eq!(batch.item("二").unwrap().attempts.len(), 1);
+    assert!(batch.item("三").unwrap().attempts.is_empty());
+    let snapshot = trace.snapshot();
+    assert_eq!(snapshot.active, 0);
+    assert_eq!(snapshot.starts.len(), 2);
+    assert_eq!(snapshot.closed.len(), 2);
+    assert_parallel_workspaces_removed(&trace, 2);
+    assert_eq!(progress.events.last().unwrap().run_completed, 1);
+
+    let resume_trace = ParallelPitchTrace::default();
+    let mut resume_drivers = [ParallelPitchDriver::new(
+        1,
+        resume_trace.clone(),
+        ParallelPitchDriver::complete_actions(&["一", "三"]),
+    )];
+    let mut resume_progress = CapturedPitchProgress::default();
+    let (resumed, _) = super::run_batch_with_drivers(
+        &store,
+        "parallel-interrupt-resume",
+        "batch_resume",
+        &mut resume_drivers,
+        &mut resume_progress,
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap();
+    let resume_snapshot = resume_trace.snapshot();
+    assert_eq!(resume_snapshot.starts.len(), 2);
+    assert!(
+        resume_snapshot
+            .starts
+            .iter()
+            .all(|attempt| attempt.surface != "二")
+    );
+    assert!(resumed.items.iter().all(|item| item.attempts.len() == 1));
+    assert_eq!(resume_progress.events[0].run_total, 2);
+    assert_parallel_workspaces_removed(&resume_trace, 1);
+}
+
+#[tokio::test]
+async fn parallel_pitch_worker_sessions_rotate_independently() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(
+        &store,
+        "parallel-independent-rotation",
+        &["一", "二", "三", "四"],
+    );
+    let trace = ParallelPitchTrace::default();
+    let (start_b_tx, mut start_b_rx) = futures::channel::oneshot::channel();
+    let (release_b_tx, release_b_rx) = futures::channel::oneshot::channel();
+    let (start_c_tx, mut start_c_rx) = futures::channel::oneshot::channel();
+    let (release_c_tx, release_c_rx) = futures::channel::oneshot::channel();
+    let (worker_one_rotation_tx, mut worker_one_rotation_rx) = futures::channel::oneshot::channel();
+    let mut drivers = [
+        ParallelPitchDriver::new(
+            1,
+            trace.clone(),
+            [
+                ("一".into(), ParallelPitchAction::Complete),
+                (
+                    "三".into(),
+                    ParallelPitchAction::Wait {
+                        started: Some(start_c_tx),
+                        release: release_c_rx,
+                    },
+                ),
+                ("四".into(), ParallelPitchAction::Complete),
+            ],
+        ),
+        ParallelPitchDriver::new(
+            2,
+            trace.clone(),
+            [(
+                "二".into(),
+                ParallelPitchAction::Wait {
+                    started: Some(start_b_tx),
+                    release: release_b_rx,
+                },
+            )],
+        ),
+    ];
+    let mut progress = CapturedPitchProgress::default();
+    progress
+        .session_end_signals
+        .insert(1, worker_one_rotation_tx);
+    let mut run = Box::pin(super::run_batch_with_drivers(
+        &store,
+        "parallel-independent-rotation",
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(1),
+        no_pitch_interruption(),
+    ));
+    wait_for_worker_signal(&mut run, &mut start_b_rx).await;
+    wait_for_worker_signal(&mut run, &mut worker_one_rotation_rx).await;
+    wait_for_worker_signal(&mut run, &mut start_c_rx).await;
+
+    let snapshot = trace.snapshot();
+    assert!(snapshot.starts.iter().any(|attempt| {
+        attempt.worker == 1 && attempt.surface == "一" && attempt.worker_session == 1
+    }));
+    assert!(snapshot.starts.iter().any(|attempt| {
+        attempt.worker == 2 && attempt.surface == "二" && attempt.worker_session == 1
+    }));
+    assert!(snapshot.starts.iter().any(|attempt| {
+        attempt.worker == 1 && attempt.surface == "三" && attempt.worker_session == 2
+    }));
+    assert_eq!(
+        snapshot.active, 2,
+        "worker 2 должен оставаться в своей первой сессии"
+    );
+    release_c_tx.send(()).unwrap();
+    release_b_tx.send(()).unwrap();
+    let (batch, _) = run.await.unwrap();
+    assert!(batch.items.iter().all(|item| item.attempts.len() == 1));
+    let rotation = progress
+        .events
+        .iter()
+        .find(|event| event.event == "browser_session_rotated" && event.worker == Some(1))
+        .unwrap();
+    assert_eq!(rotation.worker_session, Some(1));
+    let worker_two_item = progress
+        .events
+        .iter()
+        .find(|event| {
+            event.event == "item_started"
+                && event.worker == Some(2)
+                && event
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.key == "二")
+        })
+        .unwrap();
+    assert_eq!(worker_two_item.worker_session, Some(1));
+    let worker_one_rotated_item = progress
+        .events
+        .iter()
+        .find(|event| {
+            event.event == "item_started"
+                && event.worker == Some(1)
+                && event
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.key == "三")
+        })
+        .unwrap();
+    assert_eq!(worker_one_rotated_item.worker_session, Some(2));
+    assert_eq!(rotation.next_session, worker_one_rotated_item.session);
+    let snapshot = trace.snapshot();
+    let sessions = snapshot
+        .starts
+        .iter()
+        .map(|attempt| attempt.session)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(sessions.len(), snapshot.starts.len());
+    assert_parallel_workspaces_removed(&trace, 2);
+}
+
+#[tokio::test]
+async fn parallel_pitch_reports_worker_workspace_cleanup_failure_after_checkpoint() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(&store, "parallel-cleanup-error", &["一"]);
+    let trace = ParallelPitchTrace::default();
+    let mut drivers = [ParallelPitchDriver::new(
+        1,
+        trace.clone(),
+        ParallelPitchDriver::complete_actions(&["一"]),
+    )];
+    drivers[0].fail_finish = true;
+    let error = super::run_batch_with_drivers(
+        &store,
+        "parallel-cleanup-error",
+        "batch_run",
+        &mut drivers,
+        &mut CapturedPitchProgress::default(),
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("synthetic cleanup failure for worker 1")
+    );
+    assert_eq!(
+        load_batch(&store, "parallel-cleanup-error")
+            .unwrap()
+            .item("一")
+            .unwrap()
+            .attempts
+            .len(),
+        1
+    );
+    assert_eq!(trace.snapshot().closed.len(), 1);
+    assert_parallel_workspaces_removed(&trace, 1);
 }
 
 #[tokio::test]
@@ -1981,7 +3008,7 @@ async fn pitch_rotation_and_launch_heartbeat_have_explicit_session_context() {
     );
     driver.slow_launch = Some((2, receiver));
     let mut progress = CapturedPitchProgress {
-        release_on_heartbeat: Some(permit),
+        release_on_session_heartbeat: Some((2, permit)),
         ..CapturedPitchProgress::default()
     };
     super::run_batch_with_driver(
@@ -2008,7 +3035,7 @@ async fn pitch_rotation_and_launch_heartbeat_have_explicit_session_context() {
     let heartbeat = progress
         .events
         .iter()
-        .position(|event| event.event == "heartbeat")
+        .position(|event| event.event == "heartbeat" && event.session == Some(2))
         .unwrap();
     let next_start = progress
         .events
@@ -2020,20 +3047,23 @@ async fn pitch_rotation_and_launch_heartbeat_have_explicit_session_context() {
     assert_eq!(progress.events[rotation].next_session, Some(2));
     assert_eq!(progress.events[heartbeat].session, Some(2));
     for event in &progress.events {
-        if matches!(event.event, "item_started" | "item_checkpointed") {
-            let identity = event.identity.as_ref().unwrap();
-            assert_eq!(
-                event.session,
-                Some(if identity.key == "一" { 1 } else { 2 })
-            );
+        if let Some(identity) = event.identity.as_ref() {
+            if event.session.is_some() {
+                assert_eq!(
+                    event.session,
+                    Some(if identity.key == "一" { 1 } else { 2 }),
+                    "event={} identity={} context={event:?}",
+                    event.event,
+                    identity.key
+                );
+                assert!(event.worker_session.is_some());
+            } else {
+                assert_eq!(event.event, "heartbeat");
+                assert!(event.worker_session.is_none());
+            }
             assert_eq!(event.attempt, Some(1));
             assert!(event.next_session.is_none());
         } else {
-            assert!(
-                event.identity.is_none(),
-                "{} inherited identity",
-                event.event
-            );
             assert!(event.attempt.is_none(), "{} inherited attempt", event.event);
         }
     }
@@ -2088,7 +3118,11 @@ fn pitch_human_progress_localizes_protocol_values_without_changing_jsonl() {
             run_completed: 1,
             run_total: 2,
             batch_total: 2,
+            workers: Some(2),
+            in_flight: Some(0),
             identity: None,
+            worker: None,
+            worker_session: None,
             session: Some(1),
             next_session: None,
             attempt: None,
@@ -2207,6 +3241,7 @@ async fn json_batch_response_exposes_flushed_log_on_success_and_failure() {
             summary,
             OutputFormat::Json,
             false,
+            1,
         )
         .await;
         assert_eq!(output.stderr, "");
@@ -2335,7 +3370,10 @@ async fn session_failure_log_records_real_prefix_and_leaves_tail_unstarted() {
         .unwrap();
     assert_eq!(failure["fields"]["code"], "session_failure");
     assert_eq!(failure["fields"]["identity"], "一");
-    assert_eq!(failure["fields"]["tail_started"], false);
+    assert_eq!(failure["fields"]["worker"], 1);
+    assert_eq!(failure["fields"]["worker_session"], 1);
+    assert_eq!(failure["fields"]["session"], 1);
+    assert_eq!(failure["fields"]["attempt"], 1);
     assert!(
         failure["fields"]["message"]
             .as_str()

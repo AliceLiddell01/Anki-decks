@@ -1,12 +1,13 @@
 //! Самостоятельная командная строка для получения и публикации японского ударения.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::io::{self, Read, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::batch_runtime::SafeBatchRuntime;
@@ -32,6 +33,9 @@ use crate::pitch_batch::{
 use crate::store::{AssetStore, HumanAttestationRequest, StoreOptions, VerifiedIngestRequest};
 use crate::temp_workspace::TempWorkspace;
 use clap::{Parser, Subcommand, ValueEnum};
+use futures::channel::{mpsc, oneshot};
+use futures::future::{FutureExt, LocalBoxFuture, Shared};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::Instrument;
@@ -116,11 +120,17 @@ pub enum PitchBatchCommand {
     Run {
         #[arg(long, required = true)]
         batch_id: String,
+        /// Число независимых browser workers, от 1 до 4.
+        #[arg(long, default_value_t = PITCH_DEFAULT_WORKERS, value_parser = clap::value_parser!(u8).range(1..=4))]
+        workers: u8,
     },
     /// Возобновляет пакет тем же путём обработки, что и `run`.
     Resume {
         #[arg(long, required = true)]
         batch_id: String,
+        /// Число независимых browser workers, от 1 до 4.
+        #[arg(long, default_value_t = PITCH_DEFAULT_WORKERS, value_parser = clap::value_parser!(u8).range(1..=4))]
+        workers: u8,
     },
     /// Сверяет сохранённое состояние с каноническим хранилищем без сетевого получения.
     Status {
@@ -460,10 +470,13 @@ fn prevalidate_command(
                 validate_reason(reason)?;
                 Ok((None, None))
             }
-            PitchBatchCommand::Run { batch_id }
-            | PitchBatchCommand::Resume { batch_id }
-            | PitchBatchCommand::Status { batch_id }
-            | PitchBatchCommand::Review { batch_id } => {
+            PitchBatchCommand::Run { batch_id, workers }
+            | PitchBatchCommand::Resume { batch_id, workers } => {
+                crate::batch_runtime::validate_batch_id(batch_id)?;
+                validate_pitch_workers(usize::from(*workers))?;
+                Ok((None, None))
+            }
+            PitchBatchCommand::Status { batch_id } | PitchBatchCommand::Review { batch_id } => {
                 crate::batch_runtime::validate_batch_id(batch_id)?;
                 Ok((None, None))
             }
@@ -1239,7 +1252,7 @@ async fn ensure(
             let LoggedBatchRun {
                 result,
                 diagnostic_log,
-            } = run_batch_logged(store, &batch.batch_id, output, "ensure").await;
+            } = run_batch_logged(store, &batch.batch_id, output, "ensure", 1).await;
             let rendered = match result {
                 Ok((batch, run_changed)) => {
                     let blockers = batch_blockers(&batch);
@@ -1339,7 +1352,7 @@ async fn execute_batch(
                 ),
             }
         }
-        PitchBatchCommand::Run { batch_id } => {
+        PitchBatchCommand::Run { batch_id, workers } => {
             run_batch_output(
                 store,
                 &batch_id,
@@ -1347,10 +1360,11 @@ async fn execute_batch(
                 summary,
                 output,
                 store_changed,
+                usize::from(workers),
             )
             .await
         }
-        PitchBatchCommand::Resume { batch_id } => {
+        PitchBatchCommand::Resume { batch_id, workers } => {
             run_batch_output(
                 store,
                 &batch_id,
@@ -1358,6 +1372,7 @@ async fn execute_batch(
                 summary,
                 output,
                 store_changed,
+                usize::from(workers),
             )
             .await
         }
@@ -1475,12 +1490,13 @@ async fn run_batch_output(
     summary: StoreSummary,
     output: OutputFormat,
     store_changed: bool,
+    workers: usize,
 ) -> PitchCliOutput {
     let before_revision = batch_state_revision(store, batch_id).unwrap_or(None);
     let LoggedBatchRun {
         result,
         diagnostic_log,
-    } = run_batch_logged(store, batch_id, output, operation).await;
+    } = run_batch_logged(store, batch_id, output, operation, workers).await;
     let rendered = match result {
         Ok((batch, changed)) => {
             let resolved = batch.is_resolved();
@@ -1742,6 +1758,17 @@ fn reconcile_loaded_batch(
 const PITCH_SESSION_MAX_ITEMS: usize = 64;
 const PITCH_SESSION_MAX_AGE: Duration = Duration::from_secs(20 * 60);
 const PITCH_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
+const PITCH_DEFAULT_WORKERS: u8 = 4;
+const PITCH_MAX_WORKERS: usize = 4;
+
+fn validate_pitch_workers(workers: usize) -> Result<(), AssetError> {
+    if !(1..=PITCH_MAX_WORKERS).contains(&workers) {
+        return Err(invalid_plan(format!(
+            "workers должен быть от 1 до {PITCH_MAX_WORKERS}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 struct PitchRunPolicy {
@@ -1778,17 +1805,33 @@ trait PitchRunDriver {
         self.close(session).await;
         Ok(())
     }
+
+    /// Вызывается один раз после явного закрытия последней browser session.
+    fn finish(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
-struct JpdbRunDriver<'a> {
-    workspace: &'a Path,
+#[derive(Default)]
+struct JpdbRunDriver {
+    workspace: Option<TempWorkspace>,
 }
 
-impl PitchRunDriver for JpdbRunDriver<'_> {
+impl PitchRunDriver for JpdbRunDriver {
     type Session = BrowserSession;
 
     async fn launch(&mut self) -> Result<Self::Session, String> {
-        BrowserSession::launch_in_workspace(pitch_browser_runtime_config(), self.workspace).await
+        if self.workspace.is_none() {
+            self.workspace = Some(
+                TempWorkspace::create("pitch-batch-worker")
+                    .map_err(|error| format!("worker_workspace_create_failed: {error}"))?,
+            );
+        }
+        BrowserSession::launch_in_workspace(
+            pitch_browser_runtime_config(),
+            self.workspace.as_ref().expect("workspace создан").path(),
+        )
+        .await
     }
 
     async fn acquire(
@@ -1806,6 +1849,14 @@ impl PitchRunDriver for JpdbRunDriver<'_> {
     async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
         session.close().await
     }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.workspace.take().map_or(Ok(()), |workspace| {
+            workspace
+                .close()
+                .map_err(|error| format!("worker_workspace_cleanup_failed: {error}"))
+        })
+    }
 }
 
 // Общая JSONL-оболочка kanji progress; у pitch нет раундов и лимитов раундов.
@@ -1820,7 +1871,15 @@ struct PitchProgressEvent {
     run_total: usize,
     batch_total: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    workers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    in_flight: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<AssetIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_session: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1854,11 +1913,17 @@ fn write_pitch_progress(
         OutputFormat::Json => serde_json::to_string(event)
             .map_err(|error| invalid_plan(format!("сериализация progress: {error}")))?,
         OutputFormat::Human => format!(
-            "Прогресс: {} · сохранено {}/{} · всего {} · {:.1} с · запись={} · сессия={} · результат={} {}",
+            "Прогресс: {} · сохранено {}/{} · всего {} · активно {} · workers {} · {:.1} с · запись={} · worker={} · сессия={} · worker-сессия={} · результат={} {}",
             human_pitch_progress_event(event.event),
             event.run_completed,
             event.run_total,
             event.batch_total,
+            event
+                .in_flight
+                .map_or_else(|| "-".into(), |count| count.to_string()),
+            event
+                .workers
+                .map_or_else(|| "-".into(), |count| count.to_string()),
             event.elapsed_ms as f64 / 1000.0,
             event
                 .identity
@@ -1866,7 +1931,13 @@ fn write_pitch_progress(
                 .map(|identity| identity.key.as_str())
                 .unwrap_or("-"),
             event
+                .worker
+                .map_or_else(|| "-".into(), |worker| worker.to_string()),
+            event
                 .session
+                .map_or_else(|| "-".into(), |session| session.to_string()),
+            event
+                .worker_session
                 .map_or_else(|| "-".into(), |session| session.to_string()),
             event
                 .outcome
@@ -1929,6 +2000,8 @@ fn human_pitch_progress_reason(reason: &str) -> &'static str {
         "session_failure" => "ошибка сессии браузера",
         "ctrl_c_listener_failed" => "ошибка обработчика Ctrl+C",
         "invalid_provider_report" => "некорректный ответ провайдера",
+        "worker_panic" => "паника browser worker",
+        "worker_channel_closed" => "канал browser worker закрыт",
         "item_token_changed" => "запись изменена другим действием",
         _ => "ошибка выполнения",
     }
@@ -1939,6 +2012,8 @@ fn human_pitch_progress_reason(reason: &str) -> &'static str {
 #[derive(Clone, Copy, Default)]
 struct PitchProgressContext<'a> {
     identity: Option<&'a AssetIdentity>,
+    worker: Option<u32>,
+    worker_session: Option<u32>,
     session: Option<u32>,
     next_session: Option<u32>,
     attempt: Option<usize>,
@@ -1952,6 +2027,8 @@ struct PitchProgressReporter<'a> {
     completed: usize,
     total: usize,
     batch_total: usize,
+    workers: usize,
+    in_flight: usize,
 }
 
 impl PitchProgressReporter<'_> {
@@ -1968,6 +2045,8 @@ impl PitchProgressReporter<'_> {
             batch_id = self.batch_id,
             stage = "pitch_runtime",
             code = event,
+            worker = context.worker,
+            worker_session = context.worker_session,
             session = context.session,
             next_session = context.next_session,
             identity = context
@@ -1980,6 +2059,8 @@ impl PitchProgressReporter<'_> {
             run_completed = self.completed,
             run_total = self.total,
             batch_total = self.batch_total,
+            workers = self.workers,
+            in_flight = self.in_flight,
             "событие выполнения pitch-accent"
         );
         self.sink.emit(PitchProgressEvent {
@@ -1991,7 +2072,11 @@ impl PitchProgressReporter<'_> {
             run_completed: self.completed,
             run_total: self.total,
             batch_total: self.batch_total,
+            workers: Some(self.workers),
+            in_flight: Some(self.in_flight),
             identity: context.identity.cloned(),
+            worker: context.worker,
+            worker_session: context.worker_session,
             session: context.session,
             next_session: context.next_session,
             attempt: context.attempt,
@@ -2037,17 +2122,18 @@ fn trace_pitch_failure(
             .identity
             .map(|identity| safe_message(identity.key.as_str())),
         session = context.session,
+        worker = context.worker,
+        worker_session = context.worker_session,
         attempt = context.attempt,
         session_failure,
         retryable = is_retryable_failure(failure),
-        tail_started = false,
     );
 }
 
 fn pitch_session_failure(failure: JpdbPitchFailure) -> AssetError {
     AssetError::with_details(
         ErrorCode::ValidatorFailure,
-        "получение остановлено из-за ошибки сессии браузера; хвост доступен для batch resume",
+        "получение остановлено из-за ошибки сессии браузера; незавершённые элементы доступны для batch resume",
         json!({"run_stop_reason": "session_failure", "session_failure": failure}),
     )
 }
@@ -2068,29 +2154,6 @@ fn interruption_result(result: Result<(), String>) -> AssetError {
     }
 }
 
-async fn wait_pitch_operation<T>(
-    operation: impl Future<Output = T>,
-    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
-    progress: &mut PitchProgressReporter<'_>,
-    context: PitchProgressContext<'_>,
-    heartbeat_period: Duration,
-) -> Result<T, AssetError> {
-    tokio::pin!(operation);
-    let mut heartbeat = tokio::time::interval(heartbeat_period);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    heartbeat.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            // Готовый outcome выигрывает у interruption; caller сохраняет его
-            // синхронно без дополнительного await или проверки сигнала.
-            result = &mut operation => return Ok(result),
-            result = interruption.as_mut() => return Err(interruption_result(result)),
-            _ = heartbeat.tick() => progress.emit("heartbeat", context, None, None)?,
-        }
-    }
-}
-
 async fn check_pitch_interruption(
     mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
 ) -> Result<(), AssetError> {
@@ -2102,46 +2165,17 @@ async fn check_pitch_interruption(
     }
 }
 
-// Внутри BrowserSession::launch есть spawned CDP handler: запуск нельзя отменить
-// до получения owning Session. Запоминаем сигнал, дожидаемся ограниченного запуска
-// и закрываем полученную сессию до начала обработки identity.
-async fn wait_pitch_launch<T>(
-    launch: impl Future<Output = Result<T, String>>,
-    mut interruption: Pin<&mut impl Future<Output = Result<(), String>>>,
-    progress: &mut PitchProgressReporter<'_>,
-    context: PitchProgressContext<'_>,
-    heartbeat_period: Duration,
-) -> (Result<T, String>, Option<AssetError>) {
-    tokio::pin!(launch);
-    let mut heartbeat = tokio::time::interval(heartbeat_period);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    heartbeat.tick().await;
-    let mut stop = None;
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut launch => return (result, stop),
-            signal = interruption.as_mut(), if stop.is_none() => {
-                stop = Some(interruption_result(signal));
-            }
-            _ = heartbeat.tick(), if stop.is_none() => {
-                if let Err(error) = progress.emit("heartbeat", context, None, None) {
-                    stop = Some(error);
-                }
-            }
-        }
-    }
-}
-
 async fn run_batch(
     store: &AssetStore,
     batch_id: &str,
     output: OutputFormat,
     operation: &'static str,
+    workers: usize,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
+    validate_pitch_workers(workers)?;
     let workspace = TempWorkspace::create("pitch-batch-run")
         .map_err(|error| AssetError::io("создание временного дерева pitch", error))?;
-    let result = run_batch_in_workspace(store, batch_id, output, operation, workspace.path()).await;
+    let result = run_batch_workers(store, batch_id, output, operation, workers).await;
     match workspace.close() {
         Ok(()) => result,
         Err(error) => {
@@ -2186,12 +2220,12 @@ fn temp_workspace_cleanup_error<T>(
     )
 }
 
-async fn run_batch_in_workspace(
+async fn run_batch_workers(
     store: &AssetStore,
     batch_id: &str,
     output: OutputFormat,
     operation: &'static str,
-    workspace: &Path,
+    workers: usize,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
     let mut listener = PitchCtrlCListener(tokio::spawn(tokio::signal::ctrl_c()));
     let interruption = async {
@@ -2201,11 +2235,14 @@ async fn run_batch_in_workspace(
             Err(error) => Err(format!("задача обработчика Ctrl+C: {error}")),
         }
     };
-    run_batch_with_driver(
+    let mut drivers = (0..workers)
+        .map(|_| JpdbRunDriver::default())
+        .collect::<Vec<_>>();
+    run_batch_with_drivers(
         store,
         batch_id,
         operation,
-        &mut JpdbRunDriver { workspace },
+        &mut drivers,
         &mut PitchStderrProgressSink(output),
         PitchRunPolicy::default(),
         interruption,
@@ -2223,6 +2260,7 @@ async fn run_batch_logged(
     batch_id: &str,
     output: OutputFormat,
     operation: &'static str,
+    workers: usize,
 ) -> LoggedBatchRun {
     let run_log = match SafeBatchRuntime::open(store.root(), batch_id)
         .and_then(|runtime| runtime.create_run_log())
@@ -2288,7 +2326,7 @@ async fn run_batch_logged(
                 run_id,
                 "Начата обработка pitch-accent"
             );
-            let result = run_batch(store, batch_id, output, operation).await;
+            let result = run_batch(store, batch_id, output, operation, workers).await;
             match &result {
                 Ok((batch, changed)) => tracing::info!(
                     event = "run_finished",
@@ -2388,6 +2426,429 @@ fn attach_diagnostic_log(
     output
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PitchAcquisitionJob {
+    token: PitchBatchItemToken,
+    request: JpdbPitchRequest,
+    attempt: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PitchWorkerContext {
+    worker: u32,
+    session: Option<u32>,
+    worker_session: Option<u32>,
+    identity: Option<AssetIdentity>,
+    attempt: Option<usize>,
+    next_session: Option<u32>,
+}
+
+impl PitchWorkerContext {
+    fn progress(&self) -> PitchProgressContext<'_> {
+        PitchProgressContext {
+            identity: self.identity.as_ref(),
+            worker: Some(self.worker),
+            worker_session: self.worker_session,
+            session: self.session,
+            next_session: self.next_session,
+            attempt: self.attempt,
+        }
+    }
+}
+
+enum PitchWorkerEvent {
+    Progress {
+        event: &'static str,
+        context: PitchWorkerContext,
+        reason: Option<String>,
+    },
+    Report {
+        context: PitchWorkerContext,
+        job: Box<PitchAcquisitionJob>,
+        report: Box<JpdbPitchAcquisitionReport>,
+    },
+    Cancelled {
+        context: PitchWorkerContext,
+    },
+    Failure {
+        context: PitchWorkerContext,
+        error: AssetError,
+    },
+    Stopped {
+        worker: u32,
+    },
+}
+
+struct PitchWorkerExit {
+    worker: u32,
+    result: Result<(), AssetError>,
+}
+
+type PitchCancellation = Shared<LocalBoxFuture<'static, ()>>;
+
+struct PitchWorkerControl<'a> {
+    worker: u32,
+    cancellation: PitchCancellation,
+    dispatch_stopped: &'a AtomicBool,
+    session_sequence: &'a AtomicU32,
+    policy: PitchRunPolicy,
+}
+
+fn pitch_worker_progress(
+    sender: &mpsc::UnboundedSender<PitchWorkerEvent>,
+    event: &'static str,
+    context: &PitchWorkerContext,
+    reason: Option<&str>,
+) -> Result<(), AssetError> {
+    sender
+        .unbounded_send(PitchWorkerEvent::Progress {
+            event,
+            context: context.clone(),
+            reason: reason.map(str::to_owned),
+        })
+        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))
+}
+
+fn pitch_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .map(safe_message)
+        .unwrap_or_else(|| "panic без текстового сообщения".into())
+}
+
+// Session принадлежит actor до конца acquisition. Паника acquisition перехватывается
+// внутри этой границы, поэтому owning Session остаётся доступной для explicit close.
+async fn run_pitch_worker<D: PitchRunDriver>(
+    driver: &mut D,
+    mut commands: mpsc::UnboundedReceiver<PitchAcquisitionJob>,
+    events: mpsc::UnboundedSender<PitchWorkerEvent>,
+    control: PitchWorkerControl<'_>,
+) -> PitchWorkerExit {
+    let mut session = None;
+    let mut session_started = Instant::now();
+    let mut session_items = 0_usize;
+    let mut worker_session = 0_u32;
+    let mut stop_reason = None;
+    let mut context = PitchWorkerContext {
+        worker: control.worker,
+        ..PitchWorkerContext::default()
+    };
+    let result = async {
+        loop {
+            let job = tokio::select! {
+                biased;
+                _ = control.cancellation.clone() => {
+                    stop_reason = Some("interrupted");
+                    break;
+                },
+                job = commands.next() => match job {
+                    Some(job) => job,
+                    None => break,
+                },
+            };
+            // Уже назначенные jobs продолжаются при session failure соседа.
+            // Новые jobs выдаёт только coordinator после своего checkpoint.
+            if session.is_some()
+                && (session_items >= control.policy.max_items
+                    || session_started.elapsed() >= control.policy.max_age)
+            {
+                let reason = if session_items >= control.policy.max_items {
+                    "item_limit"
+                } else {
+                    "age_limit"
+                };
+                context.identity = None;
+                context.attempt = None;
+                tracing::info!(
+                    stage = "browser_close", code = "browser_close_started",
+                    worker = control.worker, worker_session, session = context.session,
+                    reason, "закрытие сессии worker перед ротацией"
+                );
+                let active = session.take().expect("активная сессия существует");
+                checked_pitch_worker_close(driver, active).await
+                    .map_err(|message| pitch_run_stopped("browser_cleanup_failed", message))?;
+                pitch_worker_progress(&events, "browser_session_ended", &context, Some(reason))?;
+                let next = control.session_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                context.next_session = Some(next);
+                pitch_worker_progress(&events, "browser_session_rotated", &context, Some(reason))?;
+                context.session = Some(next);
+            }
+            context.identity = Some(job.token.identity.clone());
+            context.attempt = Some(job.attempt);
+            if session.is_none() {
+                if control.cancellation.clone().now_or_never().is_some() {
+                    stop_reason = Some("interrupted");
+                    events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
+                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+                    break;
+                }
+                worker_session += 1;
+                context.worker_session = Some(worker_session);
+                context.session = Some(context.next_session.take().unwrap_or_else(|| {
+                    control.session_sequence.fetch_add(1, Ordering::Relaxed) + 1
+                }));
+                tracing::info!(
+                    stage = "browser_launch", code = "browser_launch_started",
+                    worker = control.worker, worker_session, session = context.session,
+                    "запуск независимой сессии worker"
+                );
+                // Немедленно публикуем контекст назначенной identity и новой
+                // session: периодический coordinator heartbeat не должен
+                // приписать ей предыдущую сессию во время медленного запуска.
+                pitch_worker_progress(&events, "heartbeat", &context, None)?;
+                // Launch нельзя отменить до получения owning Session: внутри него
+                // запускается CDP handler. Сигнал проверяем сразу после launch.
+                let launched = AssertUnwindSafe(driver.launch().instrument(tracing::info_span!(
+                    "pitch_worker_launch", worker = control.worker, worker_session,
+                    session = context.session,
+                ))).catch_unwind().await;
+                session = Some(match launched {
+                    Ok(Ok(launched)) => launched,
+                    Ok(Err(message)) => {
+                        let failure = JpdbPitchFailure::BrowserSetup {
+                            stage: JpdbPitchStage::ConfigureBrowser,
+                            message,
+                        };
+                        trace_pitch_failure(&failure, context.progress(), true);
+                        return Err(pitch_session_failure(failure));
+                    }
+                    Err(payload) => return Err(pitch_run_stopped(
+                        "worker_panic", pitch_panic_message(payload),
+                    )),
+                });
+                session_started = Instant::now();
+                session_items = 0;
+                pitch_worker_progress(&events, "browser_session_started", &context, None)?;
+                if control.cancellation.clone().now_or_never().is_some() {
+                    stop_reason = Some("interrupted");
+                    events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
+                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+                    break;
+                }
+            }
+            pitch_worker_progress(&events, "item_started", &context, None)?;
+            if job.attempt > 1 {
+                pitch_worker_progress(&events, "retry_started", &context, None)?;
+            }
+            let acquired = {
+                let acquisition = AssertUnwindSafe(
+                    driver.acquire(session.as_ref().expect("сессия запущена"), &job.request)
+                        .instrument(tracing::info_span!(
+                            "pitch_worker_acquisition", worker = control.worker, worker_session,
+                            session = context.session, identity = %safe_message(&job.token.identity.key),
+                            attempt = job.attempt,
+                        )),
+                ).catch_unwind();
+                tokio::pin!(acquisition);
+                tokio::select! {
+                    biased;
+                    // Готовые bytes/outcome выигрывают у Ctrl+C и идут owner-у.
+                    result = &mut acquisition => Some(result),
+                    _ = control.cancellation.clone() => None,
+                }
+            };
+            let report = match acquired {
+                Some(Ok(report)) => report,
+                Some(Err(payload)) => return Err(pitch_run_stopped(
+                    "worker_panic", pitch_panic_message(payload),
+                )),
+                None => {
+                    stop_reason = Some("interrupted");
+                    events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
+                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+                    break;
+                }
+            };
+            let fatal = report.session_failure.is_some()
+                || report.outcomes.len() > 1
+                || report.outcomes.is_empty();
+            if fatal {
+                stop_reason = Some(if report.session_failure.is_some() {
+                    "session_failure"
+                } else {
+                    "invalid_provider_report"
+                });
+                // Закрываем refill до доставки event: report другого worker,
+                // поступивший раньше, уже не сможет запустить незапущенный tail.
+                control.dispatch_stopped.store(true, Ordering::Release);
+            }
+            session_items += report.outcomes.len();
+            events.unbounded_send(PitchWorkerEvent::Report {
+                context: context.clone(), job: Box::new(job), report: Box::new(report),
+            }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+            if fatal {
+                break;
+            }
+            // Coordinator вернёт следующую job только после durable CAS/publish.
+        }
+        Ok(())
+    }.await;
+    let mut error = result.err();
+    if let Some(original) = &error {
+        control.dispatch_stopped.store(true, Ordering::Release);
+        tracing::error!(
+            stage = "pitch_worker", code = original.code.as_str(),
+            worker = control.worker, worker_session = context.worker_session,
+            session = context.session,
+            identity = context.identity.as_ref().map(|identity| safe_message(&identity.key)),
+            message = %safe_message(&original.message), "worker остановлен с ошибкой"
+        );
+        if let Err(send_error) = events.unbounded_send(PitchWorkerEvent::Failure {
+            context: context.clone(),
+            error: copy_pitch_error(original),
+        }) {
+            tracing::error!(stage = "pitch_worker", code = "worker_channel_closed", worker = control.worker, message = %send_error, "канал coordinator закрыт");
+        }
+    }
+    if let Some(active) = session.take() {
+        tracing::info!(
+            stage = "browser_close",
+            code = "browser_close_started",
+            worker = control.worker,
+            worker_session = context.worker_session,
+            session = context.session,
+            "закрытие сессии worker после получения"
+        );
+        if let Err(message) = checked_pitch_worker_close(driver, active).await {
+            retain_pitch_run_error(
+                &mut error,
+                pitch_run_stopped("browser_cleanup_failed", message),
+            );
+            control.dispatch_stopped.store(true, Ordering::Release);
+        }
+        let reason = error
+            .as_ref()
+            .and_then(|error| error.details["run_stop_reason"].as_str())
+            .or(stop_reason);
+        if let Err(progress_error) =
+            pitch_worker_progress(&events, "browser_session_ended", &context, reason)
+        {
+            retain_pitch_run_error(&mut error, progress_error);
+        }
+    }
+    let finished = std::panic::catch_unwind(AssertUnwindSafe(|| driver.finish()));
+    let cleanup = match finished {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "worker_finish_panic: {}",
+            pitch_panic_message(payload)
+        )),
+    };
+    if let Err(message) = cleanup {
+        control.dispatch_stopped.store(true, Ordering::Release);
+        tracing::error!(stage = "temp_cleanup", code = "worker_workspace_cleanup_failed", worker = control.worker, message = %safe_message(&message), "не удалось убрать workspace worker");
+        retain_pitch_run_error(
+            &mut error,
+            pitch_run_stopped("browser_cleanup_failed", message),
+        );
+    }
+    // FIFO этого sender сохраняет report до stopped независимо от того,
+    // в каком порядке coordinator poll-ит events и owning actor futures.
+    let _ = events.unbounded_send(PitchWorkerEvent::Stopped {
+        worker: control.worker,
+    });
+    PitchWorkerExit {
+        worker: control.worker,
+        result: error.map_or(Ok(()), Err),
+    }
+}
+
+async fn checked_pitch_worker_close<D: PitchRunDriver>(
+    driver: &mut D,
+    session: D::Session,
+) -> Result<(), String> {
+    match AssertUnwindSafe(driver.close_checked(session))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "worker_close_panic: {}",
+            pitch_panic_message(payload)
+        )),
+    }
+}
+
+fn copy_pitch_error(error: &AssetError) -> AssetError {
+    AssetError::with_details(error.code, error.message.clone(), error.details.clone())
+}
+
+fn retain_pitch_run_error(saved: &mut Option<AssetError>, error: AssetError) {
+    if let Some(original) = saved {
+        if original.code == error.code
+            && original.message == error.message
+            && original.details == error.details
+        {
+            return;
+        }
+        let detail = json!({
+            "code": error.code.as_str(),
+            "message": safe_message(&error.message),
+            "details": error.details,
+        });
+        let entry = original.details.as_object_mut().map(|details| {
+            details
+                .entry("additional_errors")
+                .or_insert_with(|| json!([]))
+        });
+        if let Some(serde_json::Value::Array(errors)) = entry {
+            errors.push(detail);
+        }
+    } else {
+        *saved = Some(error);
+    }
+}
+
+fn stop_pitch_dispatch(
+    commands: &mut [Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
+    stopped: &AtomicBool,
+) {
+    stopped.store(true, Ordering::Release);
+    for command in commands {
+        command.take();
+    }
+}
+
+fn dispatch_pitch_job(
+    worker: usize,
+    commands: &[Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
+    pending: &mut VecDeque<PitchAcquisitionJob>,
+    active: &mut [Option<PitchAcquisitionJob>],
+) -> Result<(), AssetError> {
+    if let Some(job) = pending.pop_front() {
+        commands[worker]
+            .as_ref()
+            .ok_or_else(|| pitch_run_stopped("worker_channel_closed", "канал job worker закрыт"))?
+            .unbounded_send(job.clone())
+            .map_err(|_| {
+                pitch_run_stopped("worker_channel_closed", "worker больше не принимает job")
+            })?;
+        active[worker] = Some(job);
+    }
+    Ok(())
+}
+
+fn emit_pitch_coordinator_progress(
+    progress: &mut PitchProgressReporter<'_>,
+    enabled: &mut bool,
+    event: &'static str,
+    context: PitchProgressContext<'_>,
+    outcome: Option<String>,
+    reason: Option<String>,
+) -> Result<(), AssetError> {
+    if !*enabled {
+        return Ok(());
+    }
+    let result = progress.emit(event, context, outcome, reason);
+    if result.is_err() {
+        *enabled = false;
+    }
+    result
+}
+
+#[cfg(test)]
 async fn run_batch_with_driver(
     store: &AssetStore,
     batch_id: &str,
@@ -2397,6 +2858,28 @@ async fn run_batch_with_driver(
     policy: PitchRunPolicy,
     interruption: impl Future<Output = Result<(), String>>,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
+    run_batch_with_drivers(
+        store,
+        batch_id,
+        operation,
+        std::slice::from_mut(driver),
+        sink,
+        policy,
+        interruption,
+    )
+    .await
+}
+
+async fn run_batch_with_drivers(
+    store: &AssetStore,
+    batch_id: &str,
+    operation: &'static str,
+    drivers: &mut [impl PitchRunDriver],
+    sink: &mut dyn PitchProgressSink,
+    policy: PitchRunPolicy,
+    interruption: impl Future<Output = Result<(), String>>,
+) -> Result<(PitchAccentBatch, bool), AssetError> {
+    validate_pitch_workers(drivers.len())?;
     if policy.max_items == 0 || policy.max_age.is_zero() || policy.heartbeat.is_zero() {
         return Err(invalid_plan(
             "лимиты pitch runtime должны быть положительными",
@@ -2417,24 +2900,32 @@ async fn run_batch_with_driver(
     };
     publish_ready(store, batch_id)?;
     let (batch, _) = reconcile_loaded_batch(store, batch_id)?;
-    let acquisitions = batch
+    let mut pending = batch
         .items
         .iter()
         .filter(|item| item.status() == PitchBatchItemStatus::Pending)
         .map(|item| {
-            Ok((
-                batch.item_token(&item.identity.key)?,
-                item.request.clone(),
-                item.attempts.len() + 1,
-            ))
+            Ok(PitchAcquisitionJob {
+                token: batch.item_token(&item.identity.key)?,
+                request: item.request.clone(),
+                attempt: item.attempts.len() + 1,
+            })
         })
-        .collect::<Result<Vec<_>, AssetError>>()?;
+        .collect::<Result<VecDeque<_>, AssetError>>()?;
+    let unique = pending
+        .iter()
+        .map(|job| job.token.identity.clone())
+        .collect::<BTreeSet<_>>();
+    if unique.len() != pending.len() {
+        return Err(invalid_plan("pending frontier содержит повторную identity"));
+    }
     tracing::debug!(
         stage = "pitch_runtime",
         code = "runtime_lock_released",
         batch_id,
-        pending_items = acquisitions.len(),
-        "Блокировка runtime освобождена до обращения к браузеру"
+        pending_items = pending.len(),
+        workers = drivers.len(),
+        "Блокировка runtime освобождена до параллельного обращения к браузерам"
     );
     let mut progress = PitchProgressReporter {
         sink,
@@ -2446,220 +2937,270 @@ async fn run_batch_with_driver(
         },
         started: Instant::now(),
         completed: 0,
-        total: acquisitions.len(),
+        total: pending.len(),
         batch_total: batch.items.len(),
+        workers: drivers.len(),
+        in_flight: 0,
     };
     progress.emit("run_started", PitchProgressContext::default(), None, None)?;
     tokio::pin!(interruption);
-    let mut session = None;
-    let mut session_started = Instant::now();
-    let mut session_items = 0;
-    let mut session_index = 0;
-    let mut result = async {
-        for (token, request, attempt) in acquisitions {
-            // Обработчик может увидеть сигнал во время синхронной записи результата
-            // или публикации. Проверяем его до начала следующей записи, даже если
-            // следующий результат провайдера готов немедленно.
-            check_pitch_interruption(interruption.as_mut()).await?;
-            if session.is_some()
-                && (session_items >= policy.max_items
-                    || session_started.elapsed() >= policy.max_age)
-            {
-                let reason = if session_items >= policy.max_items {
-                    "item_limit"
-                } else {
-                    "age_limit"
-                };
-                if let Some(active) = session.take() {
-                    tracing::info!(
-                        stage = "browser_close",
-                        code = "browser_close_started",
-                        session = session_index,
-                        reason,
-                        "закрытие сессии перед ротацией"
-                    );
-                    driver
-                        .close_checked(active)
-                        .await
-                        .map_err(|message| pitch_run_stopped("browser_cleanup_failed", message))?;
-                }
-                let ended_context = PitchProgressContext {
-                    session: Some(session_index),
-                    ..PitchProgressContext::default()
-                };
-                progress.emit(
-                    "browser_session_ended",
-                    ended_context,
-                    None,
-                    Some(reason.into()),
-                )?;
-                progress.emit(
-                    "browser_session_rotated",
-                    PitchProgressContext {
-                        next_session: Some(session_index + 1),
-                        ..ended_context
-                    },
-                    None,
-                    Some(reason.into()),
-                )?;
-            }
-            if session.is_none() {
-                session_index += 1;
-                let launch_context = PitchProgressContext {
-                    session: Some(session_index),
-                    ..PitchProgressContext::default()
-                };
-                check_pitch_interruption(interruption.as_mut()).await?;
-                tracing::info!(
-                    stage = "browser_launch",
-                    code = "browser_launch_started",
-                    session = session_index,
-                    "запуск сессии браузера"
-                );
-                let (launched, stop) = wait_pitch_launch(
-                    driver.launch(),
-                    interruption.as_mut(),
-                    &mut progress,
-                    launch_context,
-                    policy.heartbeat,
-                )
-                .await;
-                match launched {
-                    Ok(launched) => {
-                        session = Some(launched);
-                        session_started = Instant::now();
-                        session_items = 0;
-                        progress.emit("browser_session_started", launch_context, None, None)?;
-                    }
-                    Err(message) => {
-                        return Err(stop.unwrap_or_else(|| {
-                            let failure = JpdbPitchFailure::BrowserSetup {
-                                stage: JpdbPitchStage::ConfigureBrowser,
-                                message,
-                            };
-                            trace_pitch_failure(&failure, launch_context, true);
-                            pitch_session_failure(failure)
-                        }));
-                    }
-                }
-                if let Some(error) = stop {
-                    return Err(error);
-                }
-                check_pitch_interruption(interruption.as_mut()).await?;
-            }
-            let item_context = PitchProgressContext {
-                identity: Some(&token.identity),
-                session: Some(session_index),
-                attempt: Some(attempt),
-                next_session: None,
-            };
-            progress.emit("item_started", item_context, None, None)?;
-            if attempt > 1 {
-                progress.emit("retry_started", item_context, None, None)?;
-            }
-            let mut report = wait_pitch_operation(
-                driver.acquire(session.as_ref().expect("launched session"), &request),
-                interruption.as_mut(),
-                &mut progress,
-                item_context,
-                policy.heartbeat,
-            )
-            .await?;
-            if report.outcomes.len() > 1
-                || (report.outcomes.is_empty() && report.session_failure.is_none())
-            {
-                return Err(pitch_run_stopped(
-                    "invalid_provider_report",
-                    "Провайдер JPDB вернул некорректное число результатов",
-                ));
-            }
-            if let Some(outcome) = report.outcomes.pop() {
-                if let JpdbPitchOutcome::Failed { error } = &outcome {
-                    trace_pitch_failure(error, item_context, false);
-                }
-                // После получения результата CAS-checkpoint выполняется до следующего ожидания.
-                let recorded = record_one_outcome(store, batch_id, &token, outcome)?;
-                session_items += 1;
-                if recorded {
-                    progress.completed += 1;
-                    let saved = load_batch(store, batch_id)?;
-                    let status = saved
-                        .items
-                        .iter()
-                        .find(|item| item.identity == token.identity)
-                        .map(|item| serde_json::to_value(item.status()))
-                        .transpose()
-                        .map_err(|error| invalid_plan(format!("сериализация статуса: {error}")))?
-                        .and_then(|value| value.as_str().map(str::to_owned));
-                    progress.emit("item_checkpointed", item_context, status, None)?;
-                    publish_ready(store, batch_id)?;
-                } else {
-                    progress.emit(
-                        "item_discarded_stale",
-                        item_context,
-                        None,
-                        Some("item_token_changed".into()),
-                    )?;
-                }
-            }
-            if let Some(failure) = report.session_failure {
-                trace_pitch_failure(&failure, item_context, true);
-                return Err(pitch_session_failure(failure));
-            }
-            check_pitch_interruption(interruption.as_mut()).await?;
-        }
-        let (batch, _) = reconcile_loaded_batch(store, batch_id)?;
-        Ok((batch.clone(), batch.revision != initial_revision))
+    let mut stop_error = None;
+    let mut interruption_seen = false;
+    let mut progress_enabled = true;
+    let dispatch_stopped = AtomicBool::new(false);
+    let session_sequence = AtomicU32::new(0);
+    let (cancel_sender, cancel_receiver) = oneshot::channel::<()>();
+    let mut cancel_sender = Some(cancel_sender);
+    let cancellation: PitchCancellation = async move {
+        let _ = cancel_receiver.await;
     }
-    .await;
-    // Эта задача закрывает активную сессию при любом выходе: ошибка вывода
-    // прогресса, сохранения, Ctrl+C или сбой провайдера либо сессии.
-    if let Some(active) = session.take() {
-        tracing::info!(
-            stage = "browser_close",
-            code = "browser_close_started",
-            session = session_index,
-            "закрытие активной сессии после получения"
-        );
-        if let Err(message) = driver.close_checked(active).await {
-            let original = result.err();
-            result = Err(pitch_run_stopped(
-                "browser_cleanup_failed",
-                match original {
-                    Some(original) => format!("{original}; {message}"),
-                    None => message,
+    .boxed_local()
+    .shared();
+    let (event_sender, mut events) = mpsc::unbounded();
+    let mut workers = FuturesUnordered::new();
+    let mut commands = Vec::new();
+    for (index, driver) in drivers.iter_mut().enumerate() {
+        let (sender, receiver) = mpsc::unbounded();
+        commands.push(Some(sender));
+        workers.push(
+            run_pitch_worker(
+                driver,
+                receiver,
+                event_sender.clone(),
+                PitchWorkerControl {
+                    worker: index as u32 + 1,
+                    cancellation: cancellation.clone(),
+                    dispatch_stopped: &dispatch_stopped,
+                    session_sequence: &session_sequence,
+                    policy,
                 },
-            ));
-        }
-        let reason = result
-            .as_ref()
-            .err()
-            .and_then(|error| error.details["run_stop_reason"].as_str())
-            .map(str::to_owned);
-        progress.emit(
-            "browser_session_ended",
-            PitchProgressContext {
-                session: Some(session_index),
-                ..PitchProgressContext::default()
-            },
-            None,
-            reason,
-        )?;
+            )
+            .instrument(tracing::info_span!(
+                "pitch_worker",
+                worker = index as u32 + 1
+            )),
+        );
     }
-    match &result {
-        Ok(_) => progress.emit("run_finished", PitchProgressContext::default(), None, None)?,
-        Err(error) => progress.emit(
+    drop(event_sender);
+    let mut live_workers = commands.len();
+    let mut active = vec![None; commands.len()];
+    let mut contexts = (1..=commands.len())
+        .map(|worker| PitchWorkerContext {
+            worker: worker as u32,
+            ..PitchWorkerContext::default()
+        })
+        .collect::<Vec<_>>();
+    // Сигнал, уже готовый на входе, не должен запускать браузер.
+    if let Err(error) = check_pitch_interruption(interruption.as_mut()).await {
+        interruption_seen = true;
+        retain_pitch_run_error(&mut stop_error, error);
+        if let Some(sender) = cancel_sender.take() {
+            let _ = sender.send(());
+        }
+    }
+    if stop_error.is_none() {
+        for worker in 0..commands.len() {
+            if let Err(error) = dispatch_pitch_job(worker, &commands, &mut pending, &mut active) {
+                retain_pitch_run_error(&mut stop_error, error);
+                break;
+            }
+            if active[worker].is_none() {
+                commands[worker].take();
+            }
+        }
+    }
+    if stop_error.is_some() {
+        stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+    }
+    progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+    let mut heartbeat = tokio::time::interval(policy.heartbeat);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let mut events_closed = false;
+    while live_workers > 0 || !events_closed {
+        tokio::select! {
+            biased;
+            event = events.next(), if !events_closed => {
+                let Some(event) = event else { events_closed = true; continue; };
+                let mut refill = None;
+                let handled = (|| -> Result<(), AssetError> {
+                    match event {
+                        PitchWorkerEvent::Progress { event, context, reason } => {
+                            let index = context.worker as usize - 1;
+                            contexts[index] = context.clone();
+                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
+                                event, context.progress(), None, reason)?;
+                        }
+                        PitchWorkerEvent::Report { context, job, report } => {
+                            let job = *job;
+                            let mut report = *report;
+                            let checkpoint = tracing::info_span!(
+                                "pitch_worker_commit", worker = context.worker,
+                                worker_session = context.worker_session, session = context.session,
+                                identity = %safe_message(&job.token.identity.key), attempt = job.attempt,
+                            );
+                            let _entered = checkpoint.enter();
+                            let index = context.worker as usize - 1;
+                            let expected = active[index].take();
+                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            if expected.as_ref() != Some(&job) {
+                                return Err(pitch_run_stopped("invalid_provider_report", "report не соответствует точной назначенной identity/token/request"));
+                            }
+                            if report.outcomes.len() > 1
+                                || (report.outcomes.is_empty() && report.session_failure.is_none())
+                            {
+                                return Err(pitch_run_stopped("invalid_provider_report", "Провайдер JPDB вернул некорректное число результатов"));
+                            }
+                            // CAS и bytes сохранение происходят синхронно до следующего await.
+                            if let Some(outcome) = report.outcomes.pop() {
+                                if let JpdbPitchOutcome::Failed { error } = &outcome {
+                                    trace_pitch_failure(error, context.progress(), false);
+                                }
+                                if record_one_outcome(store, batch_id, &job.token, outcome)? {
+                                    progress.completed += 1;
+                                    let saved = load_batch(store, batch_id)?;
+                                    let status = saved.items.iter().find(|item| item.identity == job.token.identity)
+                                        .map(|item| status_name(item.status()).to_owned());
+                                    let emitted = emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
+                                        "item_checkpointed", context.progress(), status, None);
+                                    // Даже ошибка stderr не отменяет publication уже durable результата.
+                                    publish_ready(store, batch_id)?;
+                                    emitted?;
+                                } else {
+                                    emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
+                                        "item_discarded_stale", context.progress(), None, Some("item_token_changed".into()))?;
+                                }
+                            }
+                            if let Some(failure) = report.session_failure {
+                                trace_pitch_failure(&failure, context.progress(), true);
+                                return Err(pitch_session_failure(failure));
+                            }
+                            refill = Some(index);
+                        }
+                        PitchWorkerEvent::Cancelled { context } => {
+                            let index = context.worker as usize - 1;
+                            active[index].take();
+                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                        }
+                        PitchWorkerEvent::Failure { context, error } => {
+                            let index = context.worker as usize - 1;
+                            contexts[index] = context;
+                            active[index].take();
+                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            return Err(error);
+                        }
+                        PitchWorkerEvent::Stopped { worker } => {
+                            let index = worker as usize - 1;
+                            active[index].take();
+                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = handled { retain_pitch_run_error(&mut stop_error, error); }
+                // У сигнала из checkpoint callback должна быть граница до refill.
+                if refill.is_some()
+                    && !interruption_seen
+                    && let Err(error) = check_pitch_interruption(interruption.as_mut()).await
+                {
+                    interruption_seen = true;
+                    retain_pitch_run_error(&mut stop_error, error);
+                    if let Some(sender) = cancel_sender.take() { let _ = sender.send(()); }
+                }
+                if stop_error.is_some() || dispatch_stopped.load(Ordering::Acquire) {
+                    stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                } else if let Some(index) = refill {
+                    if let Err(error) = dispatch_pitch_job(index, &commands, &mut pending, &mut active) {
+                        retain_pitch_run_error(&mut stop_error, error);
+                        stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                    }
+                    if active[index].is_none() { commands[index].take(); }
+                    progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                }
+            }
+            signal = interruption.as_mut(), if !interruption_seen => {
+                interruption_seen = true;
+                retain_pitch_run_error(&mut stop_error, interruption_result(signal));
+                stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                if let Some(sender) = cancel_sender.take() { let _ = sender.send(()); }
+            }
+            exited = workers.next(), if live_workers > 0 => {
+                if let Some(exited) = exited {
+                    live_workers -= 1;
+                    tracing::debug!(stage = "pitch_worker", code = "worker_joined", worker = exited.worker, "worker закрыт и joined");
+                    if let Err(error) = exited.result {
+                        retain_pitch_run_error(&mut stop_error, error);
+                        stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                let result = if active.iter().all(Option::is_none) {
+                    emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
+                        "heartbeat", PitchProgressContext::default(), None, None)
+                } else {
+                    let mut result = Ok(());
+                        for (index, job) in active.iter().enumerate() {
+                            if let Some(job) = job {
+                                let mut context = contexts[index].clone();
+                                let context_matches_job = context.identity.as_ref()
+                                    == Some(&job.token.identity)
+                                    && context.attempt == Some(job.attempt);
+                                context.identity = Some(job.token.identity.clone());
+                                context.attempt = Some(job.attempt);
+                                if !context_matches_job {
+                                    // Не связываем новую job со старой browser session
+                                    // между dispatch и worker-aware событием запуска.
+                                    context.session = None;
+                                    context.worker_session = None;
+                                    context.next_session = None;
+                                }
+                                if let Err(error) = emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
+                                "heartbeat", context.progress(), None, None) {
+                                result = Err(error);
+                                break;
+                            }
+                        }
+                    }
+                    result
+                };
+                if let Err(error) = result {
+                    retain_pitch_run_error(&mut stop_error, error);
+                    stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                }
+            }
+        }
+    }
+    // Все actor futures завершены: explicit browser close и workspace finish await-нуты.
+    let result = if let Some(error) = stop_error {
+        Err(error)
+    } else {
+        reconcile_loaded_batch(store, batch_id).map(|(batch, _)| {
+            let changed = batch.revision != initial_revision;
+            (batch, changed)
+        })
+    };
+    let (event, reason) = match &result {
+        Ok(_) => ("run_finished", None),
+        Err(error) => (
             "run_stopped",
-            PitchProgressContext::default(),
-            None,
             Some(
                 error.details["run_stop_reason"]
                     .as_str()
                     .unwrap_or(error.code.as_str())
-                    .into(),
+                    .to_owned(),
             ),
-        )?,
-    }
+        ),
+    };
+    emit_pitch_coordinator_progress(
+        &mut progress,
+        &mut progress_enabled,
+        event,
+        PitchProgressContext::default(),
+        None,
+        reason,
+    )?;
     result
 }
 

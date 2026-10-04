@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::{self, Read};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,7 +21,7 @@ use chromiumoxide::{
     },
     cdp::js_protocol::runtime::{EnableParams as RuntimeEnableParams, EventExceptionThrown},
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use url::Url;
@@ -258,9 +260,22 @@ fn remove_browser_directory(path: &Path) -> io::Result<()> {
 }
 
 async fn wait_for_workspace_processes(workspace: &Path) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    wait_for_workspace_processes_with(
+        || TempWorkspace::has_live_process_references(workspace),
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
+    .await
+}
+
+async fn wait_for_workspace_processes_with(
+    mut has_references: impl FnMut() -> io::Result<bool>,
+    wait_limit: Duration,
+    poll_interval: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + wait_limit;
     loop {
-        let result = TempWorkspace::has_live_process_references(workspace);
+        let result = has_references();
         if matches!(result, Ok(false)) {
             return Ok(());
         }
@@ -273,7 +288,8 @@ async fn wait_for_workspace_processes(workspace: &Path) -> io::Result<()> {
                 Ok(false) => Ok(()),
             };
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }
 
@@ -335,6 +351,56 @@ struct BrowserResources {
     profile: Option<BrowserProfile>,
 }
 
+/// Panic остаётся отдельным исходом до закрытия принадлежащих setup ресурсов.
+enum BrowserSetupFailure {
+    Error(String),
+    Panic(Box<dyn std::any::Any + Send>),
+}
+
+impl BrowserSetupFailure {
+    fn message(self) -> String {
+        self.message_with_panic_code("browser_setup_panicked")
+    }
+
+    fn message_with_panic_code(self, panic_code: &str) -> String {
+        match self {
+            Self::Error(message) => message,
+            Self::Panic(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("panic с нетекстовым payload");
+                format!(
+                    "{panic_code}: {}",
+                    crate::diagnostics::safe_message(message)
+                )
+            }
+        }
+    }
+}
+
+async fn catch_browser_setup<T>(
+    setup: impl Future<Output = Result<T, String>>,
+) -> Result<T, BrowserSetupFailure> {
+    match AssertUnwindSafe(setup).catch_unwind().await {
+        Ok(result) => result.map_err(BrowserSetupFailure::Error),
+        Err(payload) => Err(BrowserSetupFailure::Panic(payload)),
+    }
+}
+
+async fn profile_launch_failure(profile: BrowserProfile, failure: BrowserSetupFailure) -> String {
+    let original = failure.message_with_panic_code("browser_launch_panicked");
+    match profile.close_after_browser_stop().await {
+        Ok(()) => original,
+        Err(error) => {
+            let cleanup = crate::diagnostics::safe_message(&error.to_string());
+            tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %cleanup, "Ошибка уборки после отказа или panic запуска браузера");
+            format!("{original}; browser_profile_cleanup_failed: {cleanup}")
+        }
+    }
+}
+
 async fn stop_browser(browser: &mut Browser) -> Result<(), String> {
     let close = timeout(Duration::from_secs(2), browser.close()).await;
     let wait = timeout(Duration::from_secs(2), browser.wait()).await;
@@ -354,6 +420,25 @@ async fn stop_browser(browser: &mut Browser) -> Result<(), String> {
 }
 
 impl BrowserResources {
+    async fn finish_setup<T>(
+        self,
+        setup: Result<T, BrowserSetupFailure>,
+    ) -> Result<(Self, T), String> {
+        match setup {
+            Ok(value) => Ok((self, value)),
+            Err(failure) => {
+                let original = failure.message();
+                match self.close().await {
+                    Ok(()) => Err(original),
+                    Err(cleanup) => Err(format!(
+                        "{original}; {}",
+                        crate::diagnostics::safe_message(&cleanup)
+                    )),
+                }
+            }
+        }
+    }
+
     async fn close(mut self) -> Result<(), String> {
         let browser_result = match self.browser.as_mut() {
             Some(browser) => stop_browser(browser).await,
@@ -463,13 +548,20 @@ impl BrowserSession {
                 return Err(profile_setup_failure(profile, message));
             }
         };
-        let (browser, mut handler) = match Browser::launch(browser_config).await {
+        // При unwind до Browser ownership chromiumoxide Child использует
+        // kill_on_drop. catch_browser_setup полностью drop-ит launch future;
+        // затем ждём наблюдаемого отсутствия workspace references, прежде чем
+        // удалять профиль. Это не даёт доступа к waitpid скрытого Child.
+        let launched = catch_browser_setup(async {
+            Browser::launch(browser_config)
+                .await
+                .map_err(|error| format!("запуск браузера: {error}"))
+        })
+        .await;
+        let (browser, mut handler) = match launched {
             Ok(launched) => launched,
-            Err(error) => {
-                return Err(profile_setup_failure(
-                    profile,
-                    format!("запуск браузера: {error}"),
-                ));
+            Err(failure) => {
+                return Err(profile_launch_failure(profile, failure).await);
             }
         };
         let handler_task = tokio::spawn(async move {
@@ -485,7 +577,9 @@ impl BrowserSession {
             handler_task: Some(handler_task),
             profile: Some(profile),
         };
-        let setup = async {
+        // Перехватываем unwind, пока resources остаётся у launch: Drop запускает
+        // только detached fallback и не является барьером завершения cleanup.
+        let setup = catch_browser_setup(async {
             let browser = resources.browser.as_mut().expect("браузер запущен");
             let version = browser
                 .version()
@@ -522,21 +616,16 @@ impl BrowserSession {
             }
             let telemetry = CdpRuntimeMonitor::start(&page).await?;
             Ok::<_, String>((page, provenance, telemetry))
-        }
+        })
         .await;
 
-        match setup {
-            Ok((page, provenance, telemetry)) => Ok(Self {
-                resources: Some(resources),
-                page,
-                provenance,
-                telemetry,
-            }),
-            Err(error) => match resources.close().await {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(format!("{error}; {cleanup}")),
-            },
-        }
+        let (resources, (page, provenance, telemetry)) = resources.finish_setup(setup).await?;
+        Ok(Self {
+            resources: Some(resources),
+            page,
+            provenance,
+            telemetry,
+        })
     }
 
     pub fn page(&self) -> &Page {
@@ -1330,6 +1419,204 @@ mod tests {
         );
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), before);
         parent.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_panic_drops_child_before_observing_process_stop_and_removing_profile() {
+        struct LaunchChild(Option<futures::channel::oneshot::Sender<()>>);
+        impl Drop for LaunchChild {
+            fn drop(&mut self) {
+                if let Some(stopped) = self.0.take() {
+                    let _ = stopped.send(());
+                }
+            }
+        }
+
+        let parent = TempWorkspace::create("browser-launch-panic-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        let profile_path = profile.path.clone();
+        let (kill_tx, kill_rx) = futures::channel::oneshot::channel();
+        let launched = catch_browser_setup(async {
+            let _child = LaunchChild(Some(kill_tx));
+            tokio::task::yield_now().await;
+            panic!("injected pre-ownership launch panic");
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        })
+        .await;
+        // Аналог kill_on_drop уже завершился до начала проверки references.
+        kill_rx.now_or_never().unwrap().unwrap();
+        let failure = match launched {
+            Err(failure) => failure,
+            Ok(_) => panic!("launch panic должен вернуть ошибку"),
+        };
+        assert_eq!(
+            failure.message_with_panic_code("browser_launch_panicked"),
+            "browser_launch_panicked: injected pre-ownership launch panic"
+        );
+        let (checked_tx, checked_rx) = futures::channel::oneshot::channel();
+        let (released_tx, mut released_rx) = futures::channel::oneshot::channel();
+        let mut first_check = Some(checked_tx);
+        let mut checks = 0;
+        let waiting = wait_for_workspace_processes_with(
+            || {
+                checks += 1;
+                if let Some(checked) = first_check.take() {
+                    checked.send(()).unwrap();
+                }
+                Ok(released_rx.try_recv().unwrap().is_none())
+            },
+            Duration::from_secs(1),
+            Duration::ZERO,
+        );
+        let stop = async {
+            checked_rx.await.unwrap();
+            // Kill request не означает, что процесс уже прекратил references.
+            assert!(profile_path.is_dir());
+            released_tx.send(()).unwrap();
+        };
+        let (observed, ()) = futures::join!(waiting, stop);
+        observed.unwrap();
+        assert!(checks >= 2);
+        profile.close().unwrap();
+        assert!(!profile_path.exists());
+        parent.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_stop_observation_reports_live_references_and_probe_errors_at_deadline() {
+        let live = wait_for_workspace_processes_with(|| Ok(true), Duration::ZERO, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(live.to_string().contains("всё ещё использует workspace"));
+        let failed = wait_for_workspace_processes_with(
+            || Err(io::Error::other("injected process observation failure")),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failed.to_string(), "injected process observation failure");
+    }
+
+    #[tokio::test]
+    async fn launch_panic_failure_waits_for_profile_cleanup_and_keeps_its_error() {
+        let parent = TempWorkspace::create("browser-launch-panic-cleanup-error-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        let temp_path = profile.temp_path.clone();
+        fs::remove_dir(&profile.path).unwrap();
+        fs::write(&profile.path, "injected cleanup failure").unwrap();
+        let error = profile_launch_failure(
+            profile,
+            BrowserSetupFailure::Panic(Box::new("injected launch panic")),
+        )
+        .await;
+        assert!(error.starts_with("browser_launch_panicked: injected launch panic;"));
+        assert!(error.contains("browser_profile_cleanup_failed:"));
+        assert!(!temp_path.exists());
+        parent.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_panic_waits_for_handler_and_profile_cleanup_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct HandlerStopped(Arc<AtomicBool>);
+        impl Drop for HandlerStopped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let parent = TempWorkspace::create("browser-setup-panic-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        let profile_path = profile.path.clone();
+        let temp_path = profile.temp_path.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&stopped);
+        let (started_tx, started_rx) = futures::channel::oneshot::channel();
+        let handler = tokio::spawn(async move {
+            let _guard = HandlerStopped(observed);
+            started_tx.send(()).unwrap();
+            futures::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let resources = BrowserResources {
+            browser: None,
+            handler_task: Some(handler),
+            profile: Some(profile),
+        };
+        let setup = catch_browser_setup(async {
+            // Panic происходит при poll после suspension, как в CDP setup.
+            tokio::task::yield_now().await;
+            panic!("injected browser setup panic");
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        })
+        .await;
+        assert!(matches!(&setup, Err(BrowserSetupFailure::Panic(_))));
+        let error = match resources.finish_setup(setup).await {
+            Err(error) => error,
+            Ok(_) => panic!("setup panic должен вернуть ошибку"),
+        };
+        assert_eq!(
+            error,
+            "browser_setup_panicked: injected browser setup panic"
+        );
+        // Эти утверждения идут до yield: detached Drop cleanup их не выполнит.
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(!profile_path.exists());
+        assert!(!temp_path.exists());
+        assert!(parent.path().is_dir());
+        parent.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_panic_keeps_original_failure_and_cleanup_error_with_safe_diagnostics() {
+        let parent = TempWorkspace::create("browser-setup-panic-cleanup-error-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        let temp_path = profile.temp_path.clone();
+        fs::remove_dir(&profile.path).unwrap();
+        fs::write(&profile.path, "injected cleanup failure").unwrap();
+        let resources = BrowserResources {
+            browser: None,
+            handler_task: None,
+            profile: Some(profile),
+        };
+        let setup = catch_browser_setup(async {
+            std::panic::panic_any(String::from("injected setup panic token=secret-value"));
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        })
+        .await;
+        let error = match resources.finish_setup(setup).await {
+            Err(error) => error,
+            Ok(_) => panic!("setup panic должен вернуть ошибку"),
+        };
+        assert!(error.contains("browser_setup_panicked: injected setup panic"));
+        assert!(error.contains("browser_profile_cleanup_failed:"));
+        assert!(!error.contains("secret-value"));
+        assert!(!temp_path.exists());
+        assert!(parent.path().is_dir());
+        parent.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_panic_with_nontext_payload_has_stable_failure_code() {
+        let setup = catch_browser_setup(async {
+            std::panic::panic_any(17_u8);
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        })
+        .await;
+        let failure = match setup {
+            Err(failure) => failure,
+            Ok(_) => panic!("setup panic должен вернуть ошибку"),
+        };
+        assert_eq!(
+            failure.message(),
+            "browser_setup_panicked: panic с нетекстовым payload"
+        );
     }
 
     fn outcome(
