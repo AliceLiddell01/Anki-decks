@@ -718,19 +718,32 @@ fn symmetric_distance_quantized(
     let mut candidate_to_reference = 0.0;
     let mut reference_to_candidate = 0.0;
     let (mut candidate_count, mut reference_count) = (0u32, 0u32);
-    for y in 0..MASK_SIDE {
-        for x in 0..MASK_SIDE {
-            let index = y * MASK_SIDE + x;
-            if get_ink(candidate, x, y) {
-                candidate_to_reference += f32::from(reference_distances_sixteenths[index]) / 16.0;
-                candidate_count += 1;
-            }
-            if get_ink(reference, x, y) {
-                reference_to_candidate += candidate_distances[index];
-                reference_count += 1;
-            }
+
+    // Маска хранится побитно. Обход только установленных битов сохраняет тот же
+    // возрастающий порядок индексов и, следовательно, тот же порядок сложения
+    // f32, но не выполняет две проверки get_ink для каждого из 4096 пикселей
+    // на каждый эталон каталога.
+    for (byte_index, &byte) in candidate.iter().enumerate() {
+        let mut bits = byte;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            let index = byte_index * u8::BITS as usize + bit;
+            candidate_to_reference += f32::from(reference_distances_sixteenths[index]) / 16.0;
+            candidate_count += 1;
+            bits &= bits - 1;
         }
     }
+    for (byte_index, &byte) in reference.iter().enumerate() {
+        let mut bits = byte;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            let index = byte_index * u8::BITS as usize + bit;
+            reference_to_candidate += candidate_distances[index];
+            reference_count += 1;
+            bits &= bits - 1;
+        }
+    }
+
     if candidate_count == 0 || reference_count == 0 {
         return f32::INFINITY;
     }
