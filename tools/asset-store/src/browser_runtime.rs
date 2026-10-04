@@ -1,9 +1,11 @@
 //! Повторно используемая среда Chromium и техническая телеметрия CDP.
 
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chromiumoxide::{
     Browser, BrowserConfig, Page,
@@ -21,6 +23,8 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use url::Url;
+
+use crate::temp_workspace::TempWorkspace;
 
 const MAX_TRACKED_REQUESTS: usize = 256;
 const MAX_NETWORK_OUTCOMES: usize = 256;
@@ -147,10 +151,279 @@ pub struct BrowserExecutableSelection {
     pub source: BrowserExecutableSource,
 }
 
+/// Только созданная этим объектом подпапка может быть удалена при закрытии.
+struct BrowserProfile {
+    path: PathBuf,
+    temp_path: PathBuf,
+    workspace_path: PathBuf,
+    workspace: Option<TempWorkspace>,
+    closed: bool,
+}
+
+impl BrowserProfile {
+    fn standalone() -> io::Result<Self> {
+        let workspace = TempWorkspace::create("browser-session")?;
+        let parent = workspace.path().to_path_buf();
+        Self::create(&parent, Some(workspace))
+    }
+
+    fn in_workspace(workspace: &Path) -> io::Result<Self> {
+        Self::create(workspace, None)
+    }
+
+    fn create(parent: &Path, workspace: Option<TempWorkspace>) -> io::Result<Self> {
+        if !fs::symlink_metadata(parent)?.is_dir() {
+            return Err(io::Error::other(
+                "browser profile parent не является каталогом",
+            ));
+        }
+        let parent = fs::canonicalize(parent)?;
+        let mut random = [0_u8; 18];
+        for _ in 0..32 {
+            File::open("/dev/urandom")?.read_exact(&mut random)?;
+            let path = parent.join(format!(
+                "browser-profile-{}",
+                crate::hashing::encode_lower_hex(&random[..16])
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    if let Err(error) = set_private_directory(&path) {
+                        let _ = fs::remove_dir(&path);
+                        return Err(error);
+                    }
+                    let temp_path =
+                        parent.join(format!("t{:x}{:02x}", random[16] & 0x0f, random[17]));
+                    match fs::create_dir(&temp_path) {
+                        Ok(()) => {
+                            if let Err(error) = set_private_directory(&temp_path) {
+                                let _ = fs::remove_dir(&temp_path);
+                                let _ = fs::remove_dir(&path);
+                                return Err(error);
+                            }
+                            return Ok(Self {
+                                path,
+                                temp_path,
+                                workspace_path: parent,
+                                workspace,
+                                closed: false,
+                            });
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            fs::remove_dir(&path)?;
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = fs::remove_dir(&path);
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::other(
+            "не удалось создать уникальный browser profile",
+        ))
+    }
+
+    fn close(mut self) -> io::Result<()> {
+        self.finish_close()
+    }
+
+    async fn close_after_browser_stop(mut self) -> io::Result<()> {
+        wait_for_workspace_processes(&self.workspace_path).await?;
+        self.finish_close()
+    }
+
+    fn finish_close(&mut self) -> io::Result<()> {
+        self.cleanup()?;
+        self.closed = true;
+        self.workspace.take().map_or(Ok(()), TempWorkspace::close)
+    }
+
+    fn cleanup(&self) -> io::Result<()> {
+        TempWorkspace::ensure_no_live_process_references(&self.workspace_path)?;
+        let profile = remove_browser_directory(&self.path);
+        let temp = remove_browser_directory(&self.temp_path);
+        profile.and(temp)
+    }
+}
+
+fn remove_browser_directory(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+async fn wait_for_workspace_processes(workspace: &Path) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let result = TempWorkspace::has_live_process_references(workspace);
+        if matches!(result, Ok(false)) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return match result {
+                Ok(true) => Err(io::Error::other(
+                    "browser process всё ещё использует workspace",
+                )),
+                Err(error) => Err(error),
+                Ok(false) => Ok(()),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn set_private_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+fn build_browser_config(
+    profile: &BrowserProfile,
+    config: &BrowserRuntimeConfig,
+    executable: Option<BrowserExecutableSelection>,
+) -> Result<BrowserConfig, String> {
+    let mut builder = BrowserConfig::builder()
+        .user_data_dir(&profile.path)
+        .env("TMPDIR", profile.temp_path.to_string_lossy().into_owned())
+        .incognito()
+        .respect_https_errors()
+        .launch_timeout(config.launch_timeout)
+        .request_timeout(config.request_timeout);
+    if let Some(executable) = executable {
+        builder = builder.chrome_executable(executable.path);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("настройка браузера: {error}"))
+}
+
+fn profile_setup_failure(profile: BrowserProfile, message: String) -> String {
+    match profile.close() {
+        Ok(()) => message,
+        Err(error) => {
+            tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(&error.to_string()), "Ошибка уборки после отказа запуска браузера");
+            format!("{message}; browser_profile_cleanup_failed: {error}")
+        }
+    }
+}
+
+impl Drop for BrowserProfile {
+    fn drop(&mut self) {
+        if !self.closed
+            && let Err(error) = self.cleanup()
+        {
+            tracing::error!(
+                stage = "temp_cleanup",
+                code = "browser_profile_cleanup_failed",
+                path_category = "browser_workspace",
+                message = %crate::diagnostics::safe_message(&error.to_string()),
+                "Не удалось безопасно удалить профиль и временный каталог браузера"
+            );
+        }
+    }
+}
+
+/// Ресурсы создаются до асинхронного setup: отмена setup также закрывает браузер.
+struct BrowserResources {
+    browser: Option<Browser>,
+    handler_task: Option<tokio::task::JoinHandle<()>>,
+    profile: Option<BrowserProfile>,
+}
+
+async fn stop_browser(browser: &mut Browser) -> Result<(), String> {
+    let close = timeout(Duration::from_secs(2), browser.close()).await;
+    let wait = timeout(Duration::from_secs(2), browser.wait()).await;
+    if matches!(wait, Ok(Ok(_))) {
+        return match close {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!("browser_close_failed: {error}")),
+            Err(_) => Err("browser_close_timeout".into()),
+        };
+    }
+    match browser.kill().await {
+        Some(Ok(())) | None => {
+            Err("browser_close_failed: потребовалось принудительное завершение".into())
+        }
+        Some(Err(error)) => Err(format!("browser_kill_failed: {error}")),
+    }
+}
+
+impl BrowserResources {
+    async fn close(mut self) -> Result<(), String> {
+        let browser_result = match self.browser.as_mut() {
+            Some(browser) => stop_browser(browser).await,
+            None => Ok(()),
+        };
+        if let Some(handler) = self.handler_task.take() {
+            handler.abort();
+            let _ = handler.await;
+        }
+        drop(self.browser.take());
+        let cleanup = match self.profile.take() {
+            Some(profile) => profile
+                .close_after_browser_stop()
+                .await
+                .map_err(|error| format!("browser_profile_cleanup_failed: {error}")),
+            None => Ok(()),
+        };
+        let result = combine_browser_close_results(browser_result, cleanup);
+        if let Err(error) = &result {
+            tracing::error!(stage = "temp_cleanup", code = "browser_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(error), "Ошибка закрытия браузера или уборки профиля");
+        }
+        result
+    }
+}
+
+fn combine_browser_close_results(
+    browser_result: Result<(), String>,
+    cleanup_result: Result<(), String>,
+) -> Result<(), String> {
+    match (browser_result, cleanup_result) {
+        (Err(browser), Err(cleanup)) => Err(format!("{browser}; {cleanup}")),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+impl Drop for BrowserResources {
+    fn drop(&mut self) {
+        let browser = self.browser.take();
+        let handler = self.handler_task.take();
+        let profile = self.profile.take();
+        if browser.is_none() && handler.is_none() && profile.is_none() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut browser = browser;
+                if let Some(browser) = browser.as_mut() {
+                    let _ = stop_browser(browser).await;
+                }
+                if let Some(handler) = handler {
+                    handler.abort();
+                    let _ = handler.await;
+                }
+                drop(browser);
+                drop(profile);
+            });
+        } else {
+            if let Some(handler) = handler {
+                handler.abort();
+            }
+            drop(browser);
+            drop(profile);
+        }
+    }
+}
+
 /// Изолированный Chromium-процесс, его начальная страница и CDP-монитор.
 pub struct BrowserSession {
-    browser: Browser,
-    handler_task: tokio::task::JoinHandle<()>,
+    resources: Option<BrowserResources>,
     page: Page,
     provenance: BrowserRuntimeProvenance,
     telemetry: CdpRuntimeMonitor,
@@ -159,25 +432,46 @@ pub struct BrowserSession {
 impl BrowserSession {
     pub async fn launch(config: BrowserRuntimeConfig) -> Result<Self, String> {
         config.validate()?;
+        let profile = BrowserProfile::standalone()
+            .map_err(|error| format!("browser_profile_create_failed: {error}"))?;
+        Self::launch_with_profile(config, profile).await
+    }
+
+    /// Профиль принадлежит сеансу; переданный run workspace никогда не удаляется.
+    pub async fn launch_in_workspace(
+        config: BrowserRuntimeConfig,
+        workspace: &Path,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        let profile = BrowserProfile::in_workspace(workspace)
+            .map_err(|error| format!("browser_profile_create_failed: {error}"))?;
+        Self::launch_with_profile(config, profile).await
+    }
+
+    async fn launch_with_profile(
+        config: BrowserRuntimeConfig,
+        profile: BrowserProfile,
+    ) -> Result<Self, String> {
         let executable = find_browser_executable();
         let executable_source = executable
             .as_ref()
             .map(|selection| selection.source)
             .unwrap_or(BrowserExecutableSource::ChromiumoxideDefault);
-        let mut browser_config = BrowserConfig::builder()
-            .incognito()
-            .respect_https_errors()
-            .launch_timeout(config.launch_timeout)
-            .request_timeout(config.request_timeout);
-        if let Some(executable) = executable {
-            browser_config = browser_config.chrome_executable(executable.path);
-        }
-        let browser_config = browser_config
-            .build()
-            .map_err(|error| format!("настройка браузера: {error}"))?;
-        let (mut browser, mut handler) = Browser::launch(browser_config)
-            .await
-            .map_err(|error| format!("запуск браузера: {error}"))?;
+        let browser_config = match build_browser_config(&profile, &config, executable) {
+            Ok(config) => config,
+            Err(message) => {
+                return Err(profile_setup_failure(profile, message));
+            }
+        };
+        let (browser, mut handler) = match Browser::launch(browser_config).await {
+            Ok(launched) => launched,
+            Err(error) => {
+                return Err(profile_setup_failure(
+                    profile,
+                    format!("запуск браузера: {error}"),
+                ));
+            }
+        };
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
                 if event.is_err() {
@@ -186,7 +480,13 @@ impl BrowserSession {
             }
         });
 
+        let mut resources = BrowserResources {
+            browser: Some(browser),
+            handler_task: Some(handler_task),
+            profile: Some(profile),
+        };
         let setup = async {
+            let browser = resources.browser.as_mut().expect("браузер запущен");
             let version = browser
                 .version()
                 .await
@@ -227,17 +527,15 @@ impl BrowserSession {
 
         match setup {
             Ok((page, provenance, telemetry)) => Ok(Self {
-                browser,
-                handler_task,
+                resources: Some(resources),
                 page,
                 provenance,
                 telemetry,
             }),
-            Err(error) => {
-                let _ = timeout(Duration::from_secs(2), browser.close()).await;
-                handler_task.abort();
-                Err(error)
-            }
+            Err(error) => match resources.close().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; {cleanup}")),
+            },
         }
     }
 
@@ -253,17 +551,19 @@ impl BrowserSession {
         &self.telemetry
     }
 
-    pub async fn close(mut self) {
+    pub async fn close(mut self) -> Result<(), String> {
         self.telemetry.abort();
-        let _ = timeout(Duration::from_secs(2), self.browser.close()).await;
-        self.handler_task.abort();
+        self.resources
+            .take()
+            .expect("ресурсы сеанса доступны")
+            .close()
+            .await
     }
 }
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         self.telemetry.abort();
-        self.handler_task.abort();
     }
 }
 
@@ -874,6 +1174,163 @@ fn sanitized_network_failure_reason(raw_reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn borrowed_profile_drop_removes_only_its_child() {
+        let parent = TempWorkspace::create("borrowed-browser-profile-test").unwrap();
+        let sentinel = parent.path().join(".runtime");
+        fs::create_dir(&sentinel).unwrap();
+        fs::write(sentinel.join("keep"), "sentinel").unwrap();
+        let path;
+        let temp_path;
+        {
+            let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+            path = profile.path.clone();
+            temp_path = profile.temp_path.clone();
+            fs::write(path.join("data"), "browser").unwrap();
+            fs::write(temp_path.join("data"), "browser temp").unwrap();
+        }
+        assert!(!path.exists());
+        assert!(!temp_path.exists());
+        assert_eq!(
+            fs::read_to_string(sentinel.join("keep")).unwrap(),
+            "sentinel"
+        );
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn standalone_profile_close_removes_its_owned_workspace() {
+        let profile = BrowserProfile::standalone().unwrap();
+        let root = profile.workspace.as_ref().unwrap().path().to_path_buf();
+        fs::write(profile.path.join("data"), "browser").unwrap();
+        fs::write(profile.temp_path.join("data"), "browser temp").unwrap();
+        let profile_path = profile.path.clone();
+        let temp_path = profile.temp_path.clone();
+        profile.close().unwrap();
+        assert!(!root.exists());
+        assert!(!profile_path.exists());
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn standalone_profile_is_cleaned_after_early_error() {
+        fn failing_setup(observed_root: &mut PathBuf) -> io::Result<()> {
+            let profile = BrowserProfile::standalone()?;
+            *observed_root = profile.workspace.as_ref().unwrap().path().to_path_buf();
+            fs::write(profile.path.join("data"), "browser")?;
+            fs::write(profile.temp_path.join("data"), "browser temp")?;
+            Err(io::Error::other("injected setup failure"))
+        }
+        let mut root = PathBuf::new();
+        assert!(failing_setup(&mut root).is_err());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn cleanup_runs_and_removes_browser_tree_after_kill_fallback_error() {
+        let parent = TempWorkspace::create("browser-kill-fallback-cleanup-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        let profile_path = profile.path.clone();
+        let temp_path = profile.temp_path.clone();
+        fs::write(profile_path.join("profile-data"), b"profile").unwrap();
+        fs::write(temp_path.join("temp-data"), b"temp").unwrap();
+
+        let stop = Err("browser_close_failed: потребовалось принудительное завершение".into());
+        let cleanup = profile
+            .close()
+            .map_err(|error| format!("browser_profile_cleanup_failed: {error}"));
+        let result = combine_browser_close_results(stop, cleanup);
+        assert!(result.is_err());
+        assert!(!profile_path.exists());
+        assert!(!temp_path.exists());
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn profile_cleanup_failure_is_returned_without_deleting_borrowed_parent() {
+        let parent = TempWorkspace::create("browser-profile-error-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        fs::remove_dir(&profile.path).unwrap();
+        fs::write(&profile.path, "injected filesystem error").unwrap();
+        assert!(profile.close().is_err());
+        assert!(parent.path().is_dir());
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn simultaneous_profiles_under_one_parent_do_not_conflict() {
+        let parent = TempWorkspace::create("browser-profile-parallel-test").unwrap();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| BrowserProfile::in_workspace(parent.path()).unwrap());
+            let second = scope.spawn(|| BrowserProfile::in_workspace(parent.path()).unwrap());
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            assert_ne!(first.path, second.path);
+            assert_ne!(first.temp_path, second.temp_path);
+            assert_eq!(first.path.parent(), first.temp_path.parent());
+            assert_eq!(second.path.parent(), second.temp_path.parent());
+            for profile in [&first, &second] {
+                let socket_path = profile
+                    .temp_path
+                    .join("org.chromium.Chromium.XXXXXX")
+                    .join("SingletonSocket");
+                assert!(socket_path.as_os_str().as_bytes().len() < 108);
+            }
+            first.close().unwrap();
+            second.close().unwrap();
+        });
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn browser_config_scopes_tmpdir_to_profile_owner_without_global_change() {
+        let parent = TempWorkspace::create("browser-scoped-tmpdir-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        let before = std::env::var_os("TMPDIR");
+        let executable = BrowserExecutableSelection {
+            path: PathBuf::from("/bin/true"),
+            source: BrowserExecutableSource::PathLookup,
+        };
+        let config =
+            build_browser_config(&profile, &BrowserRuntimeConfig::default(), Some(executable))
+                .unwrap();
+        assert_eq!(
+            config.user_data_dir.as_deref(),
+            Some(profile.path.as_path())
+        );
+        assert_eq!(
+            config
+                .process_envs
+                .as_ref()
+                .and_then(|environment| environment.get("TMPDIR"))
+                .map(String::as_str),
+            profile.temp_path.to_str()
+        );
+        assert!(profile.temp_path.starts_with(parent.path()));
+        assert_eq!(std::env::var_os("TMPDIR"), before);
+        assert!(profile.temp_path.as_os_str().as_bytes().len() < 108);
+        profile.close().unwrap();
+        parent.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_browser_setup_creates_no_profile_in_borrowed_workspace() {
+        let parent = TempWorkspace::create("browser-invalid-setup-test").unwrap();
+        let before = fs::read_dir(parent.path()).unwrap().count();
+        let config = BrowserRuntimeConfig {
+            launch_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(
+            BrowserSession::launch_in_workspace(config, parent.path())
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), before);
+        parent.close().unwrap();
+    }
 
     fn outcome(
         resource_type: ResourceType,

@@ -1,46 +1,34 @@
-use std::fs;
-use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use asset_store::temp_workspace::TempWorkspace;
 use asset_store::{AssetStore, PitchAccentDomainPolicy, StoreOptions};
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-struct Fixture(PathBuf);
+struct Fixture {
+    workspace: TempWorkspace,
+}
 
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "pitch-cli-contract-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).unwrap();
+        let workspace =
+            TempWorkspace::create("pitch-cli-contract").expect("fixture root создаётся");
         AssetStore::open_with_policy(
-            StoreOptions::new(path.join("store")),
+            StoreOptions::new(workspace.path().join("store")),
             PitchAccentDomainPolicy,
         )
         .unwrap();
-        Self(path)
+        Self { workspace }
     }
 
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_pitch-assets"))
-            .current_dir(&self.0)
+            .current_dir(self.workspace.path())
             .arg("--repository-root")
-            .arg(&self.0)
+            .arg(self.workspace.path())
             .arg("--store")
-            .arg(self.0.join("store"))
+            .arg(self.workspace.path().join("store"))
             .args(args)
             .output()
             .unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

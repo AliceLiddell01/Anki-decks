@@ -1182,10 +1182,7 @@ fn verify_only_notes_appended(
     if found.truncated {
         return Err(DomainError::with_details(
             ErrorCode::Internal,
-            format!(
-                "изменений больше {}, чем инструмент готов доказывать",
-                DEFAULT_PATH_LIMIT
-            ),
+            format!("изменений больше {DEFAULT_PATH_LIMIT}, чем инструмент готов доказывать"),
             details! {
                 "reason" => "too_many_changes",
                 "total" => found.total,

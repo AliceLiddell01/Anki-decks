@@ -1,7 +1,4 @@
-use std::fs;
 use std::io::Cursor;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain::AssetDomainPolicy;
 use crate::hashing::sha256_hex;
@@ -22,9 +19,8 @@ use crate::pitch_accent::{
 use crate::pitch_batch::{
     PitchAccentBatch, PitchAccentBatchRuntime, PitchBatchItemStatus, PitchBatchOwnerSnapshot,
 };
+use crate::temp_workspace::TempWorkspace;
 use crate::validation::SemanticValidator;
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn request(surface: &str, reading: Option<&str>) -> JpdbPitchRequest {
     JpdbPitchRequest::new(JpdbPitchQuery::new(surface, reading.map(str::to_owned)))
@@ -39,14 +35,24 @@ fn batch(batch_id: &str, surface: &str, reading: Option<&str>) -> PitchAccentBat
     .unwrap()
 }
 
-fn temp_store() -> PathBuf {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "asset-store-pitch-batch-{}-{sequence}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).unwrap();
-    path
+struct TemporaryStore {
+    workspace: TempWorkspace,
+}
+
+impl TemporaryStore {
+    fn new() -> Self {
+        Self {
+            workspace: TempWorkspace::create("asset-store-pitch-batch-tests").unwrap(),
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.workspace.path()
+    }
+}
+
+fn temp_store() -> TemporaryStore {
+    TemporaryStore::new()
 }
 
 fn browser() -> crate::browser_runtime::BrowserRuntimeProvenance {
@@ -194,7 +200,7 @@ fn rejected_owner(mut record: AssetRecord) -> AssetRecord {
         identity: record.identity.clone(),
         content_sha256: record.sha256.clone(),
         decision: HumanDecision::Reject,
-        reason: "synthetic exact-SHA rejection".into(),
+        reason: "Синтетический отказ для точного SHA".into(),
     });
     record
 }
@@ -255,9 +261,10 @@ fn legacy_batch_schema_without_exact_attempt_and_plan_identity_fails_closed() {
 
 #[test]
 fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("retry-lifecycle", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
 
     let token = batch.item_token("幽霊").unwrap();
@@ -269,19 +276,41 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
                 JpdbPitchOutcome::Failed {
                     error: JpdbPitchFailure::Timeout {
                         stage: JpdbPitchStage::DetailReadiness,
-                        diagnostic: Some("request timed out".into()),
+                        diagnostic: Some("Истёк лимит запроса".into()),
                     },
                 },
             )
             .unwrap()
     );
+    let timed_out_token = token;
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::TechnicalFailure
     );
     batch
-        .retry("幽霊", "retry transient timeout".into())
+        .retry("幽霊", "Повторить после временного истечения лимита".into())
         .unwrap();
+    assert_eq!(
+        batch.item("幽霊").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert_eq!(batch.item("幽霊").unwrap().generation, 1);
+    assert_eq!(batch.item("幽霊").unwrap().attempts.len(), 1);
+    assert!(
+        !runtime
+            .record_outcome(
+                &mut batch,
+                &timed_out_token,
+                JpdbPitchOutcome::Failed {
+                    error: JpdbPitchFailure::Timeout {
+                        stage: JpdbPitchStage::Capture,
+                        diagnostic: Some("Устаревший результат до повторной попытки".into()),
+                    },
+                },
+            )
+            .unwrap()
+    );
+    assert_eq!(batch.item("幽霊").unwrap().attempts.len(), 1);
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::Pending
@@ -296,7 +325,7 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
                 JpdbPitchOutcome::Failed {
                     error: JpdbPitchFailure::PageContract {
                         stage: JpdbPitchStage::DetailVerification,
-                        message: "unexpected source page".into(),
+                        message: "Неожиданная страница источника".into(),
                     },
                 },
             )
@@ -304,12 +333,65 @@ fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
     );
     assert!(
         batch
-            .retry("幽霊", "must not repeat a page contract failure".into())
+            .retry(
+                "幽霊",
+                "Нарушение контракта страницы нельзя повторять".into()
+            )
             .is_err()
     );
 
     drop(runtime);
-    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_source_failure_text_survives_checkpoint_reload_and_json() {
+    let failures = [
+        JpdbPitchFailure::PageContract {
+            stage: JpdbPitchStage::SearchResolution,
+            message: "Строка JPDB не содержит подтверждённые формы и фактическую ссылку".into(),
+        },
+        JpdbPitchFailure::Telemetry {
+            stage: JpdbPitchStage::PitchInspection,
+            message: "Критический запрос вернул HTTP 503: https://jpdb.io/search".into(),
+        },
+        JpdbPitchFailure::Timeout {
+            stage: JpdbPitchStage::DetailReadiness,
+            diagnostic: Some("DOM пока не содержит проверяемых форм и блока значений".into()),
+        },
+    ];
+    for failure in failures {
+        let temporary = temp_store();
+        let root = temporary.path();
+        let mut batch = batch("durable-source-failure", "幽霊", Some("ゆうれい"));
+        let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+        batch = runtime.load().unwrap().unwrap();
+        record_provider_outcome(
+            &mut runtime,
+            &mut batch,
+            "幽霊",
+            JpdbPitchOutcome::Failed {
+                error: failure.clone(),
+            },
+        );
+        drop(runtime);
+        let mut runtime = PitchAccentBatchRuntime::open(root, "durable-source-failure").unwrap();
+        let reloaded = runtime.load().unwrap().unwrap();
+        let item = reloaded.item("幽霊").unwrap();
+        assert_eq!(item.status(), PitchBatchItemStatus::TechnicalFailure);
+        assert_eq!(item.attempts.len(), 1);
+        assert_eq!(
+            item.attempts[0].outcome,
+            crate::pitch_batch::PitchBatchOutcome::Failed {
+                error: failure.clone()
+            }
+        );
+        let saved_json = serde_json::to_value(&reloaded).unwrap();
+        assert_eq!(
+            saved_json["items"][0]["attempts"][0]["outcome"]["error"],
+            serde_json::to_value(failure).unwrap()
+        );
+        drop(runtime);
+    }
 }
 
 #[test]
@@ -346,9 +428,10 @@ fn navigation_retry_classifier_requires_error_or_http_context() {
 
 #[test]
 fn ambiguity_selection_uses_exact_inventory_id_and_route_then_starts_new_generation() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("ambiguity-selection", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
     let immutable_plan = batch.original_plan.clone();
     let token = batch.item_token("幽霊").unwrap();
@@ -381,6 +464,10 @@ fn ambiguity_selection_uses_exact_inventory_id_and_route_then_starts_new_generat
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::AmbiguousVocabulary
     );
+    let ambiguous_item = batch.item("幽霊").unwrap();
+    assert!(ambiguous_item.request.selection.is_none());
+    assert!(ambiguous_item.current_candidate_sha256.is_none());
+    assert!(batch.item_token("幽霊").is_err());
     assert!(
         batch
             .select_candidate("幽霊", 999, "https://jpdb.io/vocabulary/999/幽霊/ゆうれい",)
@@ -407,14 +494,14 @@ fn ambiguity_selection_uses_exact_inventory_id_and_route_then_starts_new_generat
         .reading = None;
     assert!(tampered_plan_identity.validate().is_err());
     drop(runtime);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn no_pitch_is_a_typed_terminal_outcome_without_canonical_cache() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("no-pitch-terminal", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
     let token = batch.item_token("幽霊").unwrap();
     let evidence = JpdbPitchAbsenceEvidence {
@@ -447,7 +534,44 @@ fn no_pitch_is_a_typed_terminal_outcome_without_canonical_cache() {
     assert!(item.canonical_sha256.is_none());
     assert!(item.published_sha256.is_none());
     drop(runtime);
-    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn vocabulary_not_found_is_preserved_as_a_typed_non_acquired_outcome() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let mut batch = batch("vocabulary-not-found", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(
+                &mut batch,
+                &token,
+                JpdbPitchOutcome::VocabularyNotFound {
+                    surface: "幽霊".into(),
+                    reading: Some("ゆうれい".into()),
+                },
+            )
+            .unwrap()
+    );
+
+    let item = batch.item("幽霊").unwrap();
+    assert_eq!(item.status(), PitchBatchItemStatus::VocabularyNotFound);
+    assert!(!batch.is_resolved());
+    assert!(item.request.selection.is_none());
+    assert!(item.current_candidate_sha256.is_none());
+    assert!(item.canonical_sha256.is_none());
+    assert!(matches!(
+        item.current_outcome(),
+        Some(crate::pitch_batch::PitchBatchOutcome::VocabularyNotFound {
+            surface,
+            reading: Some(reading),
+        }) if surface == "幽霊" && reading == "ゆうれい"
+    ));
+
+    drop(runtime);
 }
 
 #[test]
@@ -474,14 +598,15 @@ fn absence_evidence_must_match_explicit_vocabulary_id_and_detail_route() {
         browser: browser(),
     };
     let accepted = |batch_id: &str, evidence| {
-        let root = temp_store();
+        let temporary = temp_store();
+        let root = temporary.path();
         let batch = PitchAccentBatch::new(
             batch_id,
             vec![request.clone()],
             PitchAccentImageValidator::validator_identity(),
         )
         .unwrap();
-        let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+        let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
         let mut batch = runtime.load().unwrap().unwrap();
         let token = batch.item_token("幽霊").unwrap();
         let result = runtime
@@ -492,7 +617,7 @@ fn absence_evidence_must_match_explicit_vocabulary_id_and_detail_route() {
             )
             .is_ok_and(|recorded| recorded);
         drop(runtime);
-        fs::remove_dir_all(root).unwrap();
+
         result
     };
 
@@ -512,9 +637,10 @@ fn absence_evidence_must_match_explicit_vocabulary_id_and_detail_route() {
 
 #[test]
 fn acquired_png_reopens_verifies_and_rejects_stale_item_token() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("durable-candidate", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
     let token = batch.item_token("幽霊").unwrap();
     let sha = record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", false));
@@ -538,33 +664,35 @@ fn acquired_png_reopens_verifies_and_rejects_stale_item_token() {
     );
     drop(runtime);
 
-    let mut reopened = PitchAccentBatchRuntime::open(&root, "durable-candidate").unwrap();
+    let mut reopened = PitchAccentBatchRuntime::open(root, "durable-candidate").unwrap();
     let batch = reopened.load().unwrap().unwrap();
     let item = batch.item("幽霊").unwrap();
+    assert_eq!(item.status(), PitchBatchItemStatus::AcquiredVerified);
+    assert!(batch.item_token("幽霊").is_err());
     let candidate = item.candidate(&sha).unwrap();
     let bytes = reopened.read_candidate(&batch, candidate).unwrap();
     assert_eq!(sha256_hex(&bytes), sha);
     assert_eq!(bytes, png(false));
     drop(reopened);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn publication_reconcile_recovers_crash_after_owner_publish_before_final_state_save() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("publication-recovery", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
     let sha = record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", false));
     batch.begin_publication("幽霊", &sha, None).unwrap();
     runtime.save(&batch).unwrap();
     drop(runtime);
 
-    // Публикация owner завершилась, затем процесс упал до обновления state.json.
+    // Публикация владельца завершилась, затем процесс упал до обновления state.json.
     let owner_record = verified_record("幽霊", false);
     assert_eq!(owner_record.sha256, sha);
     let snapshot = PitchBatchOwnerSnapshot::from_records(vec![owner_record]).unwrap();
-    let mut reopened = PitchAccentBatchRuntime::open(&root, "publication-recovery").unwrap();
+    let mut reopened = PitchAccentBatchRuntime::open(root, "publication-recovery").unwrap();
     let mut recovered = reopened.load().unwrap().unwrap();
     assert_eq!(
         recovered.item("幽霊").unwrap().status(),
@@ -584,24 +712,24 @@ fn publication_reconcile_recovers_crash_after_owner_publish_before_final_state_s
     reopened.save(&recovered).unwrap();
     drop(reopened);
 
-    let mut final_open = PitchAccentBatchRuntime::open(&root, "publication-recovery").unwrap();
+    let mut final_open = PitchAccentBatchRuntime::open(root, "publication-recovery").unwrap();
     let final_state = final_open.load().unwrap().unwrap();
     let item = final_state.item("幽霊").unwrap();
     assert_eq!(item.published_sha256.as_deref(), Some(sha.as_str()));
     assert_eq!(item.canonical_sha256.as_deref(), Some(sha.as_str()));
     assert!(final_state.is_resolved());
     drop(final_open);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn same_sha_in_new_generation_publishes_metadata_from_exact_current_attempt() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let bytes = png(false);
     let metadata_a = metadata("幽霊", "ゆうれい", 123);
     let metadata_b = metadata("幽霊", "ゆうれい", 456);
     let mut batch = batch("same-sha-attempt-identity", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
 
     let sha_a = record_provider_outcome(
@@ -683,12 +811,12 @@ fn same_sha_in_new_generation_publishes_metadata_from_exact_current_attempt() {
     batch.validate().unwrap();
 
     drop(runtime);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn owner_sha_drift_after_refresh_blocks_stale_candidate_publication() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("refresh-cas-drift", "幽霊", Some("ゆうれい"));
     let old_owner = rejected_owner(verified_record("幽霊", false));
     let old_sha = old_owner.sha256.clone();
@@ -709,7 +837,7 @@ fn owner_sha_drift_after_refresh_blocks_stale_candidate_publication() {
         Some(old_sha.as_str())
     );
 
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
     let sha = record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", true));
     assert_ne!(sha, old_sha);
@@ -777,14 +905,14 @@ fn owner_sha_drift_after_refresh_blocks_stale_candidate_publication() {
     batch.validate().unwrap();
 
     drop(runtime);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn publication_owner_drift_requires_reasoned_reacquire_with_new_cas_baseline() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("publication-cas-drift", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
     let candidate_sha =
         record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", false));
@@ -854,14 +982,14 @@ fn publication_owner_drift_requires_reasoned_reacquire_with_new_cas_baseline() {
     batch.validate().unwrap();
 
     drop(runtime);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn published_exact_sha_rejection_quarantines_and_reacquires_with_observed_cas() {
-    let root = temp_store();
+    let temporary = temp_store();
+    let root = temporary.path();
     let mut batch = batch("reject-published", "幽霊", Some("ゆうれい"));
-    let mut runtime = PitchAccentBatchRuntime::create(&root, &batch).unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
     batch = runtime.load().unwrap().unwrap();
     let published_sha =
         record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", false));
@@ -948,7 +1076,6 @@ fn published_exact_sha_rejection_quarantines_and_reacquires_with_observed_cas() 
     batch.validate().unwrap();
 
     drop(runtime);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

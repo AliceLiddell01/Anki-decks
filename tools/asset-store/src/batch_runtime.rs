@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
     AtFlags, FlockOperation, Mode, OFlags, flock, mkdirat, open, openat, renameat, unlinkat,
@@ -25,6 +26,16 @@ pub const MAX_RUNTIME_STATE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Открытый диагностический файл одного запуска. Его дескриптор сохраняет
+/// работоспособность при освобождении блокировки состояния пакета.
+#[derive(Debug)]
+pub struct RuntimeRunLog {
+    pub run_id: String,
+    pub path: PathBuf,
+    pub file: File,
+}
 
 /// Минимальный контракт сериализуемого состояния предметного пакета.
 ///
@@ -66,8 +77,9 @@ pub struct RuntimeBlobRef {
     pub storage_path: String,
 }
 
-/// Безопасный runtime-пакет: dirfd-relative доступ, `NOFOLLOW`, lock на весь
-/// срок жизни объекта, ограниченное состояние и атомарная запись.
+/// Безопасный runtime-пакет: доступ относительно dirfd, `NOFOLLOW`, явный жизненный цикл
+/// блокировки, ограниченное состояние и атомарная запись. После освобождения
+/// и повторного захвата блокировки состояние требуется загрузить заново.
 #[derive(Debug)]
 pub struct SafeBatchRuntime {
     directory: File,
@@ -75,6 +87,8 @@ pub struct SafeBatchRuntime {
     batch_id: String,
     loaded_revision: Option<u64>,
     directory_path: PathBuf,
+    locked: bool,
+    needs_reload: bool,
     verified_blob_keys: BTreeSet<(String, String, u64, Option<String>)>,
 }
 
@@ -82,6 +96,13 @@ impl SafeBatchRuntime {
     /// Корень должен принадлежать вызывающему владельцу хранилища.
     pub fn open(store_root: &Path, batch_id: &str) -> Result<Self, AssetError> {
         validate_batch_id(batch_id)?;
+        let store_path = if store_root.is_absolute() {
+            store_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| AssetError::io("текущий каталог runtime", error))?
+                .join(store_root)
+        };
         let root = File::from(
             open(
                 store_root,
@@ -100,7 +121,9 @@ impl SafeBatchRuntime {
             blobs,
             batch_id: batch_id.into(),
             loaded_revision: None,
-            directory_path: store_root.join(".runtime").join("batches").join(batch_id),
+            directory_path: store_path.join(".runtime").join("batches").join(batch_id),
+            locked: true,
+            needs_reload: false,
             verified_blob_keys: BTreeSet::new(),
         })
     }
@@ -109,12 +132,185 @@ impl SafeBatchRuntime {
         &self.batch_id
     }
 
+    /// Безопасно создаёт отдельный JSONL-файл запуска в пространстве имён пакета.
+    /// Имя и путь принадлежат runtime. Коллизия имён не перезаписывает прежний
+    /// файл: создаётся другое имя. Возвращённый writer живёт независимо от блокировки.
+    pub fn create_run_log(&self) -> Result<RuntimeRunLog, AssetError> {
+        self.require_lock()?;
+        tracing::debug!(
+            operation = "batch_runtime_log_create",
+            stage = "diagnostic_log",
+            code = "run_log_create_started",
+            batch_id = self.batch_id,
+            "Создание отдельного диагностического файла"
+        );
+        let logs = ensure_directory(&self.directory, "logs")?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| invalid(format!("не удалось определить время запуска: {error}")))?
+            .as_nanos();
+        loop {
+            let run_id = format!(
+                "{timestamp}-{}-{}",
+                std::process::id(),
+                RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            let name = format!("{run_id}.jsonl");
+            match create_log_file(&logs, &name)? {
+                Some(file) => {
+                    logs.sync_all()
+                        .map_err(|error| AssetError::io("синхронизация каталога логов", error))?;
+                    tracing::info!(
+                        operation = "batch_runtime_log_create",
+                        stage = "diagnostic_log",
+                        code = "run_log_created",
+                        batch_id = self.batch_id,
+                        run_id,
+                        path = %self.directory_path.join("logs").join(&name).display(),
+                        "Диагностический файл создан безопасным runtime"
+                    );
+                    return Ok(RuntimeRunLog {
+                        run_id,
+                        path: self.directory_path.join("logs").join(name),
+                        file,
+                    });
+                }
+                None => continue,
+            }
+        }
+    }
+
+    /// Освобождает исключительную блокировку на время внешнего ожидания.
+    /// Дескрипторы и кэш уже проверенных неизменяемых blob остаются привязаны
+    /// к этому объекту. Право сохранять загруженный snapshot аннулируется;
+    /// после повторного захвата необходимо успешное `load`/`reload_cached`.
+    pub fn release_lock(&mut self) -> Result<(), AssetError> {
+        if !self.locked {
+            tracing::warn!(
+                operation = "batch_runtime_lock",
+                stage = "runtime_lock",
+                code = "lock_release_without_lock",
+                batch_id = self.batch_id,
+                "Запрошено освобождение уже снятой блокировки"
+            );
+            return Err(invalid("блокировка runtime уже освобождена"));
+        }
+        tracing::debug!(
+            operation = "batch_runtime_lock",
+            stage = "runtime_lock",
+            code = "lock_release_started",
+            batch_id = self.batch_id,
+            loaded_revision = ?self.loaded_revision,
+            "Освобождение блокировки состояния пакета"
+        );
+        if let Err(error) = flock(&self.directory, FlockOperation::Unlock) {
+            let error = boundary_io(error);
+            tracing::error!(
+                operation = "batch_runtime_lock",
+                stage = "runtime_lock",
+                code = "lock_release_failed",
+                batch_id = self.batch_id,
+                message = %crate::diagnostics::safe_message(&error.message),
+                "Не удалось освободить блокировку состояния пакета"
+            );
+            return Err(error);
+        }
+        self.locked = false;
+        self.loaded_revision = None;
+        self.needs_reload = true;
+        tracing::debug!(
+            operation = "batch_runtime_lock",
+            stage = "runtime_lock",
+            code = "lock_released_snapshot_invalidated",
+            batch_id = self.batch_id,
+            "Блокировка снята; сохранение старого снимка запрещено"
+        );
+        Ok(())
+    }
+
+    /// Повторно захватывает блокировку после внешнего ожидания.
+    pub fn reacquire_lock(&mut self) -> Result<(), AssetError> {
+        if self.locked {
+            tracing::warn!(
+                operation = "batch_runtime_lock",
+                stage = "runtime_lock",
+                code = "lock_reacquire_while_locked",
+                batch_id = self.batch_id,
+                "Запрошено повторное получение удерживаемой блокировки"
+            );
+            return Err(invalid("блокировка runtime уже удерживается"));
+        }
+        tracing::debug!(
+            operation = "batch_runtime_lock",
+            stage = "runtime_lock",
+            code = "lock_reacquire_started",
+            batch_id = self.batch_id,
+            "Повторное получение блокировки состояния пакета"
+        );
+        if let Err(error) = flock(&self.directory, FlockOperation::LockExclusive) {
+            let error = boundary_io(error);
+            tracing::error!(
+                operation = "batch_runtime_lock",
+                stage = "runtime_lock",
+                code = "lock_reacquire_failed",
+                batch_id = self.batch_id,
+                message = %crate::diagnostics::safe_message(&error.message),
+                "Не удалось повторно получить блокировку состояния пакета"
+            );
+            return Err(error);
+        }
+        self.locked = true;
+        tracing::debug!(
+            operation = "batch_runtime_lock",
+            stage = "runtime_lock",
+            code = "lock_reacquired_reload_required",
+            batch_id = self.batch_id,
+            reload_required = self.needs_reload,
+            "Блокировка повторно получена; перед записью нужно перечитать состояние"
+        );
+        Ok(())
+    }
+
     /// Загружает состояние и сверяет все сохранённые ссылки на blob.
     pub fn load<S: RuntimeBatchState>(&mut self) -> Result<Option<S>, AssetError> {
+        self.load_inner(true)
+    }
+
+    /// Перечитывает состояние после повторного захвата блокировки. Ключи
+    /// ссылок на blob, которые были проверены этим объектом до освобождения
+    /// блокировки, переиспользуются; новые ссылки проходят полную проверку.
+    pub fn reload_cached<S: RuntimeBatchState>(&mut self) -> Result<Option<S>, AssetError> {
+        self.load_inner(false)
+    }
+
+    fn load_inner<S: RuntimeBatchState>(
+        &mut self,
+        force_recheck: bool,
+    ) -> Result<Option<S>, AssetError> {
+        self.require_lock()?;
+        tracing::debug!(
+            operation = "batch_runtime_state_load",
+            stage = "runtime_reload",
+            code = "state_load_started",
+            batch_id = self.batch_id,
+            force_blob_recheck = force_recheck,
+            "Загрузка текущего состояния пакета"
+        );
+        // Неудачная загрузка тоже лишает старый snapshot права на запись.
+        self.loaded_revision = None;
+        self.needs_reload = true;
         let bytes = match read_file(&self.directory, "state.json", MAX_RUNTIME_STATE_BYTES) {
             Ok(bytes) => bytes,
             Err(error) if error.code == ErrorCode::MissingAssetFile => {
                 self.loaded_revision = None;
+                self.needs_reload = false;
+                tracing::debug!(
+                    operation = "batch_runtime_state_load",
+                    stage = "runtime_reload",
+                    code = "state_missing",
+                    batch_id = self.batch_id,
+                    "Состояние пакета ещё не создано"
+                );
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -131,8 +327,19 @@ impl SafeBatchRuntime {
                 "идентификатор пакета не совпадает с каталогом runtime-данных",
             ));
         }
-        self.verify_referenced_blobs(&state, true)?;
+        self.verify_referenced_blobs(&state, force_recheck)?;
         self.loaded_revision = Some(state.revision());
+        self.needs_reload = false;
+        tracing::debug!(
+            operation = "batch_runtime_state_load",
+            stage = "runtime_reload",
+            code = "state_loaded",
+            batch_id = self.batch_id,
+            revision = state.revision(),
+            force_blob_recheck = force_recheck,
+            cached_blob_verifications = self.verified_blob_keys.len(),
+            "Текущее состояние пакета загружено"
+        );
         Ok(Some(state))
     }
 
@@ -140,6 +347,30 @@ impl SafeBatchRuntime {
     /// если `state.json` ещё отсутствует. Запись атомарна и синхронизирует файл
     /// и каталог до возврата.
     pub fn save<S: RuntimeBatchState>(&mut self, state: &S) -> Result<(), AssetError> {
+        self.require_lock()?;
+        if self.needs_reload {
+            tracing::warn!(
+                operation = "batch_runtime_state_save",
+                stage = "compare_and_swap",
+                code = "stale_snapshot_save_rejected",
+                batch_id = self.batch_id,
+                requested_revision = state.revision(),
+                loaded_revision = ?self.loaded_revision,
+                "Сохранение запрещено до повторной загрузки состояния"
+            );
+            return Err(invalid(
+                "состояние требуется успешно загрузить перед сохранением",
+            ));
+        }
+        tracing::debug!(
+            operation = "batch_runtime_state_save",
+            stage = "checkpoint",
+            code = "state_save_started",
+            batch_id = self.batch_id,
+            requested_revision = state.revision(),
+            loaded_revision = ?self.loaded_revision,
+            "Начата запись состояния пакета"
+        );
         state.validate()?;
         if state.batch_id() != self.batch_id {
             return Err(invalid(
@@ -175,6 +406,14 @@ impl SafeBatchRuntime {
             MAX_RUNTIME_STATE_BYTES,
         )?;
         self.loaded_revision = Some(state.revision());
+        tracing::info!(
+            operation = "batch_runtime_state_save",
+            stage = "checkpoint",
+            code = "state_save_succeeded",
+            batch_id = self.batch_id,
+            revision = state.revision(),
+            "Состояние пакета надёжно записано"
+        );
         Ok(())
     }
 
@@ -185,6 +424,7 @@ impl SafeBatchRuntime {
         bytes: &[u8],
         extension: &str,
     ) -> Result<RuntimeBlobRef, AssetError> {
+        self.require_lock()?;
         self.persist_blob_with_limit(bytes, extension, MAX_RUNTIME_BLOB_BYTES)
     }
 
@@ -194,6 +434,7 @@ impl SafeBatchRuntime {
         extension: &str,
         maximum: u64,
     ) -> Result<RuntimeBlobRef, AssetError> {
+        self.require_lock()?;
         if maximum > MAX_RUNTIME_BLOB_BYTES || bytes.len() as u64 > maximum {
             return Err(invalid("blob превышает общий предел размера runtime"));
         }
@@ -224,6 +465,7 @@ impl SafeBatchRuntime {
 
     /// Возвращает байты только после проверки пути, обычного файла, размера и SHA.
     pub fn read_blob(&self, blob: &RuntimeBlobRef) -> Result<Vec<u8>, AssetError> {
+        self.require_lock()?;
         self.read_blob_with_limit(blob, MAX_RUNTIME_BLOB_BYTES)
     }
 
@@ -256,12 +498,21 @@ impl SafeBatchRuntime {
         bytes: &[u8],
         maximum: u64,
     ) -> Result<PathBuf, AssetError> {
+        self.require_lock()?;
         validate_leaf_name(name)?;
         if bytes.len() as u64 > maximum {
             return Err(invalid("runtime-артефакт превышает ограничение размера"));
         }
         atomic_write(&self.directory, name, bytes, maximum)?;
         Ok(self.directory_path.join(name))
+    }
+
+    fn require_lock(&self) -> Result<(), AssetError> {
+        if self.locked {
+            Ok(())
+        } else {
+            Err(invalid("операция runtime требует удерживаемую блокировку"))
+        }
     }
 
     fn verify_referenced_blobs<S: RuntimeBatchState>(
@@ -289,6 +540,22 @@ impl SafeBatchRuntime {
             self.verified_blob_keys.insert(cache_key);
         }
         Ok(())
+    }
+}
+
+/// `None` означает коллизию имени, включая существующую символическую ссылку:
+/// вызывающий код выбирает другое имя, не открывая и не меняя чужой файл.
+pub(crate) fn create_log_file(parent: &File, name: &str) -> Result<Option<File>, AssetError> {
+    validate_leaf_name(name)?;
+    match openat(
+        parent,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(descriptor) => Ok(Some(File::from(descriptor))),
+        Err(error) if error == rustix::io::Errno::EXIST => Ok(None),
+        Err(error) => Err(boundary_io(error)),
     }
 }
 

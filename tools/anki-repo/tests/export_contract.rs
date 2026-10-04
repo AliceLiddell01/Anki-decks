@@ -60,8 +60,7 @@ fn prepared_export(label: &str, export: &Value, media: &[&str]) -> TempDir {
 /// Загружает экспорт; `ExportIndex` строится вызывающим тестом, потому что
 /// индекс ссылается на корневой узел и не может быть возвращён вместе с ним.
 fn load(dir: &Path) -> anki_repo::loader::LoadedExport {
-    load_export(dir)
-        .unwrap_or_else(|error| panic!("{}: deck.json не загрузился: {error}", dir.display()))
+    load_export(dir).unwrap_or_else(|_| panic!("тестовый deck.json должен загружаться"))
 }
 
 fn count_nodes(value: &Value) -> usize {
@@ -415,17 +414,19 @@ fn valid_export_has_no_errors_and_only_recomputed_media_warnings() {
 
     let result = validate(dir.path()).expect("validate");
     assert!(result.valid, "экспорт должен быть валидным");
-    assert_eq!(result.summary.errors, 0, "issues {:?}", result.issues);
+    assert_eq!(
+        result.summary.errors, 0,
+        "экспорт не должен содержать ошибок"
+    );
 
     for issue in &result.issues {
         if issue.severity == Severity::Error {
-            panic!("неожиданный ERROR {:?}", issue.message);
+            panic!("экспорт не должен содержать ERROR");
         }
         if issue.severity == Severity::Warning {
-            assert_eq!(
-                issue.code, "media_physical_missing",
-                "неожиданный WARNING {}",
-                issue.code
+            assert!(
+                issue.code == "media_physical_missing",
+                "экспорт содержит неожиданный WARNING"
             );
         }
     }

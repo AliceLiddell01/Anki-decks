@@ -1366,9 +1366,7 @@ mod tests {
             assert_ne!(
                 semantic_status_for(&candidate, wrong),
                 SemanticStatus::Verified,
-                "пиксели {} не должны подтверждаться как {}",
-                actual,
-                wrong
+                "пиксели {actual} не должны подтверждаться как {wrong}"
             );
         }
     }

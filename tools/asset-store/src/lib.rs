@@ -12,6 +12,7 @@ pub mod batch;
 pub mod batch_runtime;
 pub mod browser_runtime;
 pub mod cli;
+pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod hashing;
@@ -26,6 +27,7 @@ pub mod pitch_cli;
 pub mod pitch_review;
 pub mod selection;
 pub mod store;
+pub mod temp_workspace;
 pub mod validation;
 pub mod yarxi;
 

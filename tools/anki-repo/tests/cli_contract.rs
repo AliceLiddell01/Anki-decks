@@ -158,9 +158,9 @@ fn conflicting_or_incomplete_criteria_are_usage_errors() {
         &["stats", path.as_str(), "--top", "5"],
     ];
     for args in cases {
-        let (code, stdout, stderr) = run_cli(args);
-        assert_eq!(code, 2, "аргументы {args:?}: stderr {stderr}");
-        assert!(stdout.is_empty(), "аргументы {args:?}: stdout {stdout}");
+        let (code, stdout, _) = run_cli(args);
+        assert_eq!(code, 2, "clap должен отклонить некорректные аргументы");
+        assert!(stdout.is_empty(), "clap не должен писать в stdout");
     }
 }
 
@@ -805,11 +805,11 @@ fn removed_word_flag_is_rejected() {
     ];
     for args in cases {
         let (code, stdout, stderr) = run_cli(args);
-        assert_eq!(code, 2, "аргументы {args:?}: stderr {stderr}");
-        assert!(stdout.is_empty(), "аргументы {args:?}: stdout {stdout}");
+        assert_eq!(code, 2, "удалённый флаг должен отклоняться");
+        assert!(stdout.is_empty(), "ошибка clap не должна писать в stdout");
         assert!(
             stderr.contains("--word"),
-            "аргументы {args:?}: stderr {stderr}"
+            "ошибка должна указывать на неизвестный флаг"
         );
     }
 }

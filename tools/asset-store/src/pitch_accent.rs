@@ -952,8 +952,7 @@ fn decode_png(bytes: &[u8]) -> Result<image::DynamicImage, String> {
         .ok_or_else(|| "объём декодируемого PNG выходит за числовой предел".to_owned())?;
     if output_allocation > PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES {
         return Err(format!(
-            "декодированное изображение потребует {output_allocation} байт при пределе {} байт",
-            PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES
+            "декодированное изображение потребует {output_allocation} байт при пределе {PITCH_ACCENT_MAX_DECODE_ALLOCATION_BYTES} байт"
         ));
     }
     image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())

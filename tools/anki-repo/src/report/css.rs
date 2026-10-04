@@ -231,7 +231,7 @@ impl Scanner<'_> {
         if self.byte_at(self.pos) == Some(b'(') {
             self.pos += 1;
             let lower = name.to_ascii_lowercase();
-            if lower == "url" || (escaped_at && lower == "url") {
+            if lower == "url" {
                 self.read_url_argument(start);
                 return;
             }

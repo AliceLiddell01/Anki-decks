@@ -874,16 +874,31 @@ fn manifest_invalid(path: &Path, message: &str, entry: Option<&String>) -> Domai
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asset_store::temp_workspace::TempWorkspace;
+    use std::ops::Deref;
 
-    fn temp(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "anki-manifest-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("каталог");
-        dir
+    struct TempRoot {
+        _workspace: TempWorkspace,
+        path: PathBuf,
+    }
+
+    impl Deref for TempRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    fn temp(label: &str) -> TempRoot {
+        let workspace = TempWorkspace::create(&format!("anki-manifest-{label}"))
+            .expect("временный каталог должен создаваться");
+        let path = workspace.path().join("report");
+        fs::create_dir(&path).expect("папка отчёта создаётся внутри workspace");
+        TempRoot {
+            _workspace: workspace,
+            path,
+        }
     }
 
     fn paths(entries: Vec<Entry>) -> Vec<String> {
@@ -1313,7 +1328,7 @@ mod tests {
             .commit(&["index.html".to_string(), "media/before/a.png".to_string()])
             .expect("перенос");
 
-        let root_real = fs::canonicalize(&root).expect("настоящий путь");
+        let root_real = fs::canonicalize(&*root).expect("настоящий путь");
         for relative in ["index.html", "media/before/a.png", MANIFEST_FILE] {
             let real = fs::canonicalize(root.join(relative)).expect("настоящий путь");
             assert!(real.starts_with(&root_real), "{relative} внутри каталога");
