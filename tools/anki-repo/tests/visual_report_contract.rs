@@ -6,7 +6,7 @@
 //! команда имеет право писать, какие ссылки попадают в HTML и что происходит с
 //! media, на которые ссылаются значения полей.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 use std::path::Path;
