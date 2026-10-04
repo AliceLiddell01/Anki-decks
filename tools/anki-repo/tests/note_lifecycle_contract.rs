@@ -7,7 +7,7 @@
 //! канонических копиях синтетических экспортов и фиксируют exit code, JSON-схему
 //! результата и фактическое состояние `deck.json` после записи.
 
-mod common;
+use crate::common;
 
 use common::{
     TempDir, base_export, canonical_base_export, canonical_export, export_with, mixed_export,
