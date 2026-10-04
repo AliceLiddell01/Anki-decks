@@ -176,7 +176,7 @@ impl BrowserProfile {
     fn create(parent: &Path, workspace: Option<TempWorkspace>) -> io::Result<Self> {
         if !fs::symlink_metadata(parent)?.is_dir() {
             return Err(io::Error::other(
-                "browser profile parent не является каталогом",
+                "путь для профиля браузера должен указывать на каталог",
             ));
         }
         let parent = fs::canonicalize(parent)?;
@@ -225,7 +225,7 @@ impl BrowserProfile {
             }
         }
         Err(io::Error::other(
-            "не удалось создать уникальный browser profile",
+            "не удалось создать уникальный профиль браузера",
         ))
     }
 
@@ -282,7 +282,7 @@ async fn wait_for_workspace_processes_with(
         if Instant::now() >= deadline {
             return match result {
                 Ok(true) => Err(io::Error::other(
-                    "browser process всё ещё использует workspace",
+                    "процесс браузера всё ещё использует временное дерево",
                 )),
                 Err(error) => Err(error),
                 Ok(false) => Ok(()),
@@ -322,7 +322,7 @@ fn profile_setup_failure(profile: BrowserProfile, message: String) -> String {
     match profile.close() {
         Ok(()) => message,
         Err(error) => {
-            tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(&error.to_string()), "Ошибка уборки после отказа запуска браузера");
+            tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(&error.to_string()), "Ошибка очистки после отказа запуска браузера");
             format!("{message}; browser_profile_cleanup_failed: {error}")
         }
     }
@@ -344,14 +344,14 @@ impl Drop for BrowserProfile {
     }
 }
 
-/// Ресурсы создаются до асинхронного setup: отмена setup также закрывает браузер.
+/// Ресурсы создаются до асинхронной настройки: её отмена также закрывает браузер.
 struct BrowserResources {
     browser: Option<Browser>,
     handler_task: Option<tokio::task::JoinHandle<()>>,
     profile: Option<BrowserProfile>,
 }
 
-/// Panic остаётся отдельным исходом до закрытия принадлежащих setup ресурсов.
+/// Паника остаётся отдельным исходом, пока не закрыты ресурсы настройки.
 enum BrowserSetupFailure {
     Error(String),
     Panic(Box<dyn std::any::Any + Send>),
@@ -370,7 +370,7 @@ impl BrowserSetupFailure {
                     .downcast_ref::<String>()
                     .map(String::as_str)
                     .or_else(|| payload.downcast_ref::<&str>().copied())
-                    .unwrap_or("panic с нетекстовым payload");
+                    .unwrap_or("паника с нетекстовым содержимым");
                 format!(
                     "{panic_code}: {}",
                     crate::diagnostics::safe_message(message)
@@ -395,7 +395,7 @@ async fn profile_launch_failure(profile: BrowserProfile, failure: BrowserSetupFa
         Ok(()) => original,
         Err(error) => {
             let cleanup = crate::diagnostics::safe_message(&error.to_string());
-            tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %cleanup, "Ошибка уборки после отказа или panic запуска браузера");
+            tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %cleanup, "Ошибка очистки после отказа или паники при запуске браузера");
             format!("{original}; browser_profile_cleanup_failed: {cleanup}")
         }
     }
@@ -458,7 +458,7 @@ impl BrowserResources {
         };
         let result = combine_browser_close_results(browser_result, cleanup);
         if let Err(error) = &result {
-            tracing::error!(stage = "temp_cleanup", code = "browser_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(error), "Ошибка закрытия браузера или уборки профиля");
+            tracing::error!(stage = "temp_cleanup", code = "browser_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(error), "Ошибка закрытия браузера или очистки профиля");
         }
         result
     }
@@ -522,7 +522,7 @@ impl BrowserSession {
         Self::launch_with_profile(config, profile).await
     }
 
-    /// Профиль принадлежит сеансу; переданный run workspace никогда не удаляется.
+    /// Профиль принадлежит сеансу; переданное временное дерево запуска не удаляется.
     pub async fn launch_in_workspace(
         config: BrowserRuntimeConfig,
         workspace: &Path,
@@ -548,10 +548,11 @@ impl BrowserSession {
                 return Err(profile_setup_failure(profile, message));
             }
         };
-        // При unwind до Browser ownership chromiumoxide Child использует
-        // kill_on_drop. catch_browser_setup полностью drop-ит launch future;
-        // затем ждём наблюдаемого отсутствия workspace references, прежде чем
-        // удалять профиль. Это не даёт доступа к waitpid скрытого Child.
+        // Если разворачивание стека прервёт получение Browser, дочерний процесс
+        // chromiumoxide применит `kill_on_drop`. `catch_browser_setup` полностью
+        // уничтожит `Future` запуска; затем ждём, пока процессы перестанут
+        // использовать временное дерево, и только после этого удаляем профиль.
+        // Это не требует обращаться к скрытому дочернему процессу через `waitpid`.
         let launched = catch_browser_setup(async {
             Browser::launch(browser_config)
                 .await
@@ -577,8 +578,8 @@ impl BrowserSession {
             handler_task: Some(handler_task),
             profile: Some(profile),
         };
-        // Перехватываем unwind, пока resources остаётся у launch: Drop запускает
-        // только detached fallback и не является барьером завершения cleanup.
+        // Перехватываем панику, пока `resources` принадлежит запуску: `Drop`
+        // запускает только фоновую резервную очистку и не гарантирует её завершение.
         let setup = catch_browser_setup(async {
             let browser = resources.browser.as_mut().expect("браузер запущен");
             let version = browser
@@ -1037,8 +1038,8 @@ impl CdpRuntimeMonitor {
             && (trigger == RetryTrigger::ItemTimeout || has_epoch_failure)
     }
 
-    /// Удаляет только запись с совпадающими CDP request id, URL и причиной.
-    /// Provider сам проверяет, что такое исключение разрешено его политикой.
+    /// Удаляет только запись с совпадающими идентификатором запроса CDP, URL и причиной.
+    /// Провайдер сам проверяет, что такое исключение разрешено его политикой.
     pub fn clear_exact_network_failure(
         &self,
         request_id: &str,
@@ -1310,7 +1311,7 @@ mod tests {
             *observed_root = profile.workspace.as_ref().unwrap().path().to_path_buf();
             fs::write(profile.path.join("data"), "browser")?;
             fs::write(profile.temp_path.join("data"), "browser temp")?;
-            Err(io::Error::other("injected setup failure"))
+            Err(io::Error::other("искусственно вызванный сбой настройки"))
         }
         let mut root = PathBuf::new();
         assert!(failing_setup(&mut root).is_err());
@@ -1342,7 +1343,11 @@ mod tests {
         let parent = TempWorkspace::create("browser-profile-error-test").unwrap();
         let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
         fs::remove_dir(&profile.path).unwrap();
-        fs::write(&profile.path, "injected filesystem error").unwrap();
+        fs::write(
+            &profile.path,
+            "искусственно вызванная ошибка файловой системы",
+        )
+        .unwrap();
         assert!(profile.close().is_err());
         assert!(parent.path().is_dir());
         parent.close().unwrap();
@@ -1439,20 +1444,20 @@ mod tests {
         let launched = catch_browser_setup(async {
             let _child = LaunchChild(Some(kill_tx));
             tokio::task::yield_now().await;
-            panic!("injected pre-ownership launch panic");
+            panic!("искусственная паника до получения владения браузером");
             #[allow(unreachable_code)]
             Ok::<(), String>(())
         })
         .await;
-        // Аналог kill_on_drop уже завершился до начала проверки references.
+        // Аналог `kill_on_drop` уже завершился до проверки обращений к временному дереву.
         kill_rx.now_or_never().unwrap().unwrap();
         let failure = match launched {
             Err(failure) => failure,
-            Ok(_) => panic!("launch panic должен вернуть ошибку"),
+            Ok(_) => panic!("паника при запуске должна вернуть ошибку"),
         };
         assert_eq!(
             failure.message_with_panic_code("browser_launch_panicked"),
-            "browser_launch_panicked: injected pre-ownership launch panic"
+            "browser_launch_panicked: искусственная паника до получения владения браузером"
         );
         let (checked_tx, checked_rx) = futures::channel::oneshot::channel();
         let (released_tx, mut released_rx) = futures::channel::oneshot::channel();
@@ -1471,7 +1476,7 @@ mod tests {
         );
         let stop = async {
             checked_rx.await.unwrap();
-            // Kill request не означает, что процесс уже прекратил references.
+            // Запрос на завершение не означает, что процесс уже перестал обращаться к дереву.
             assert!(profile_path.is_dir());
             released_tx.send(()).unwrap();
         };
@@ -1488,15 +1493,25 @@ mod tests {
         let live = wait_for_workspace_processes_with(|| Ok(true), Duration::ZERO, Duration::ZERO)
             .await
             .unwrap_err();
-        assert!(live.to_string().contains("всё ещё использует workspace"));
+        assert!(
+            live.to_string()
+                .contains("всё ещё использует временное дерево")
+        );
         let failed = wait_for_workspace_processes_with(
-            || Err(io::Error::other("injected process observation failure")),
+            || {
+                Err(io::Error::other(
+                    "искусственно вызванный сбой проверки процесса",
+                ))
+            },
             Duration::ZERO,
             Duration::ZERO,
         )
         .await
         .unwrap_err();
-        assert_eq!(failed.to_string(), "injected process observation failure");
+        assert_eq!(
+            failed.to_string(),
+            "искусственно вызванный сбой проверки процесса"
+        );
     }
 
     #[tokio::test]
@@ -1505,13 +1520,13 @@ mod tests {
         let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
         let temp_path = profile.temp_path.clone();
         fs::remove_dir(&profile.path).unwrap();
-        fs::write(&profile.path, "injected cleanup failure").unwrap();
+        fs::write(&profile.path, "искусственно вызванный сбой очистки").unwrap();
         let error = profile_launch_failure(
             profile,
-            BrowserSetupFailure::Panic(Box::new("injected launch panic")),
+            BrowserSetupFailure::Panic(Box::new("искусственная паника при запуске")),
         )
         .await;
-        assert!(error.starts_with("browser_launch_panicked: injected launch panic;"));
+        assert!(error.starts_with("browser_launch_panicked: искусственная паника при запуске;"));
         assert!(error.contains("browser_profile_cleanup_failed:"));
         assert!(!temp_path.exists());
         parent.close().unwrap();
@@ -1547,9 +1562,10 @@ mod tests {
             profile: Some(profile),
         };
         let setup = catch_browser_setup(async {
-            // Panic происходит при poll после suspension, как в CDP setup.
+            // Паника возникает при очередном `poll` после приостановки `Future`,
+            // как и во время настройки CDP.
             tokio::task::yield_now().await;
-            panic!("injected browser setup panic");
+            panic!("искусственная паника при настройке браузера");
             #[allow(unreachable_code)]
             Ok::<(), String>(())
         })
@@ -1557,13 +1573,13 @@ mod tests {
         assert!(matches!(&setup, Err(BrowserSetupFailure::Panic(_))));
         let error = match resources.finish_setup(setup).await {
             Err(error) => error,
-            Ok(_) => panic!("setup panic должен вернуть ошибку"),
+            Ok(_) => panic!("паника при настройке должна вернуть ошибку"),
         };
         assert_eq!(
             error,
-            "browser_setup_panicked: injected browser setup panic"
+            "browser_setup_panicked: искусственная паника при настройке браузера"
         );
-        // Эти утверждения идут до yield: detached Drop cleanup их не выполнит.
+        // Эти утверждения выполняются до передачи управления: фоновая очистка из `Drop` их не заменит.
         assert!(stopped.load(Ordering::SeqCst));
         assert!(!profile_path.exists());
         assert!(!temp_path.exists());
@@ -1577,23 +1593,25 @@ mod tests {
         let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
         let temp_path = profile.temp_path.clone();
         fs::remove_dir(&profile.path).unwrap();
-        fs::write(&profile.path, "injected cleanup failure").unwrap();
+        fs::write(&profile.path, "искусственно вызванный сбой очистки").unwrap();
         let resources = BrowserResources {
             browser: None,
             handler_task: None,
             profile: Some(profile),
         };
         let setup = catch_browser_setup(async {
-            std::panic::panic_any(String::from("injected setup panic token=secret-value"));
+            std::panic::panic_any(String::from(
+                "искусственная паника настройки token=secret-value",
+            ));
             #[allow(unreachable_code)]
             Ok::<(), String>(())
         })
         .await;
         let error = match resources.finish_setup(setup).await {
             Err(error) => error,
-            Ok(_) => panic!("setup panic должен вернуть ошибку"),
+            Ok(_) => panic!("паника при настройке должна вернуть ошибку"),
         };
-        assert!(error.contains("browser_setup_panicked: injected setup panic"));
+        assert!(error.contains("browser_setup_panicked: искусственная паника настройки"));
         assert!(error.contains("browser_profile_cleanup_failed:"));
         assert!(!error.contains("secret-value"));
         assert!(!temp_path.exists());
@@ -1611,11 +1629,11 @@ mod tests {
         .await;
         let failure = match setup {
             Err(failure) => failure,
-            Ok(_) => panic!("setup panic должен вернуть ошибку"),
+            Ok(_) => panic!("паника при настройке должна вернуть ошибку"),
         };
         assert_eq!(
             failure.message(),
-            "browser_setup_panicked: panic с нетекстовым payload"
+            "browser_setup_panicked: паника с нетекстовым содержимым"
         );
     }
 

@@ -57,7 +57,7 @@ pub struct TempWorkspace {
     closed: bool,
 }
 
-/// Один раз за время жизни процесса убирает orphan runs перед работой с временными данными.
+/// Один раз за время жизни процесса удаляет осиротевшие запуски перед работой с временными данными.
 /// Вызывающий запуск может выполнить уборку без создания нового временного дерева.
 pub(crate) fn cleanup_orphans_on_startup() -> io::Result<()> {
     STARTUP_GC
@@ -68,7 +68,7 @@ pub(crate) fn cleanup_orphans_on_startup() -> io::Result<()> {
                         removed = report.removed,
                         skipped = report.skipped,
                         errors = report.errors,
-                        "startup temp cleanup"
+                        "начальная очистка временных деревьев"
                     );
                 })
                 .map_err(|error| (error.kind(), error.to_string()))
@@ -79,7 +79,7 @@ pub(crate) fn cleanup_orphans_on_startup() -> io::Result<()> {
 }
 
 impl TempWorkspace {
-    /// Создаёт приватное дерево после startup GC; TTL применяется только к schema 1.
+    /// Создаёт приватное дерево после начальной очистки; TTL действует только для schema 1.
     pub fn create(purpose: &str) -> io::Result<Self> {
         cleanup_orphans_on_startup()?;
         Self::create_under(Path::new(TEMP_ROOT), purpose)

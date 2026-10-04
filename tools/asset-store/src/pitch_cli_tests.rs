@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
@@ -29,6 +30,95 @@ use crate::pitch_batch::{
 };
 use crate::store::{AssetStore, StoreOptions, VerifiedIngestRequest};
 use crate::temp_workspace::TempWorkspace;
+
+#[test]
+fn panic_hook_subprocess_writes_sanitized_jsonl_to_real_stderr() {
+    let parent_workspace = TempWorkspace::create("pitch-panic-hook-parent").unwrap();
+    let response_path = parent_workspace.path().join("response.json");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "panic_hook_child_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASSET_STORE_PITCH_PANIC_HOOK_CHILD", "1")
+        .env("ASSET_STORE_PITCH_PANIC_HOOK_RESPONSE", &response_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "дочерняя проверка паники завершилась ошибкой"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr дочернего процесса — UTF-8");
+    let lines = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !lines.is_empty(),
+        "обработчик записал сообщение в настоящий stderr"
+    );
+    let events = lines
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("строка stderr — JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["event"], "panic");
+    assert!(!stderr.contains("secret-value"));
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout дочернего процесса — UTF-8");
+    let response_text = fs::read_to_string(&response_path).unwrap();
+    assert!(
+        stdout.contains(&response_text),
+        "итоговый JSON выведен в stdout процесса"
+    );
+    let response: serde_json::Value = serde_json::from_str(&response_text).unwrap();
+    assert_eq!(response["error"]["code"], "validator_failure");
+    assert_eq!(
+        response["error"]["details"]["run_stop_reason"],
+        "worker_panic"
+    );
+    assert!(
+        !response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("secret-value")
+    );
+    parent_workspace.close().unwrap();
+}
+
+#[test]
+fn panic_hook_child_process() {
+    if std::env::var_os("ASSET_STORE_PITCH_PANIC_HOOK_CHILD").is_none() {
+        return;
+    }
+
+    super::install_safe_panic_hook(OutputFormat::Json);
+    let workspace = TempWorkspace::create("pitch-panic-hook-subprocess").unwrap();
+    let workspace_path = workspace.path().to_path_buf();
+    let payload = std::panic::catch_unwind(|| panic!("token=secret-value"))
+        .expect_err("паника должна быть перехвачена");
+    let error = super::pitch_run_stopped("worker_panic", super::pitch_panic_message(payload));
+    let output = super::render_error("batch_run".into(), None, error, OutputFormat::Json, false);
+    assert_eq!(output.exit_code, 5);
+    let response: serde_json::Value =
+        serde_json::from_str(&output.stdout).expect("итоговый ответ — JSON");
+    assert_eq!(response["error"]["code"], "validator_failure");
+    assert_eq!(
+        response["error"]["details"]["run_stop_reason"],
+        "worker_panic"
+    );
+    assert!(!output.stdout.contains("secret-value"));
+    workspace.close().unwrap();
+    assert!(
+        !workspace_path.exists(),
+        "временное дерево удалено после перехвата паники"
+    );
+    let response_path = std::env::var_os("ASSET_STORE_PITCH_PANIC_HOOK_RESPONSE")
+        .expect("путь ответа передан родительским тестом");
+    fs::write(response_path, &output.stdout).unwrap();
+    std::io::Write::write_all(&mut std::io::stdout().lock(), output.stdout.as_bytes()).unwrap();
+}
 
 #[test]
 fn human_output_does_not_append_a_second_diagnostic_log_path() {
@@ -224,8 +314,8 @@ async fn run_resumes_a_durable_candidate_without_reacquisition_and_resolved_reru
     let (bytes, _, expected_sha) = save_durable_candidate(&store, "candidate-resume", "幽霊");
 
     // Байты кандидата и состояние сохранены до этого запуска, как если бы
-    // предыдущий процесс остановился перед публикацией. Resume должен опубликовать
-    // их из runtime blob.
+    // предыдущий процесс остановился перед публикацией. `resume` должен
+    // опубликовать их из сохранённых данных runtime.
     let (batch, changed) = run_batch(
         &store,
         "candidate-resume",
@@ -258,7 +348,7 @@ async fn run_resumes_a_durable_candidate_without_reacquisition_and_resolved_reru
     );
 
     // Второй запуск видит уже подтверждённую текущую запись владельца, не открывает браузер
-    // и не добавляет новую попытку acquisition.
+    // и не добавляет новую попытку получения.
     let (rerun, changed) = run_batch(
         &store,
         "candidate-resume",
@@ -1436,7 +1526,7 @@ impl super::PitchRunDriver for ParallelPitchDriver {
     async fn launch(&mut self) -> Result<Self::Session, String> {
         assert!(
             self.active_session.is_none(),
-            "у worker не должно быть двух сессий"
+            "у исполнителя не может быть двух сессий"
         );
         self.worker_session_count += 1;
         let worker_session = self.worker_session_count;
@@ -1463,10 +1553,12 @@ impl super::PitchRunDriver for ParallelPitchDriver {
             session: session.session,
             surface: surface.clone(),
         });
-        let action = self
-            .actions
-            .remove(&surface)
-            .unwrap_or(ParallelPitchAction::Complete);
+        let action = self.actions.remove(&surface).unwrap_or_else(|| {
+            panic!(
+                "исполнитель {} получил неожиданную identity {:?}; действие не задано в сценарии",
+                self.worker, surface
+            )
+        });
         let session_failure = match action {
             ParallelPitchAction::Complete => None,
             ParallelPitchAction::SessionFailure { started } => {
@@ -1475,14 +1567,16 @@ impl super::PitchRunDriver for ParallelPitchDriver {
                 }
                 Some(JpdbPitchFailure::SessionFailure {
                     stage: JpdbPitchStage::SearchNavigation,
-                    message: "synthetic worker session failure".into(),
+                    message: "искусственный сбой сессии исполнителя".into(),
                 })
             }
             ParallelPitchAction::Wait { started, release } => {
                 if let Some(started) = started {
                     let _ = started.send(());
                 }
-                release.await.expect("тест должен освободить запрос worker");
+                release
+                    .await
+                    .expect("тест должен возобновить запрос исполнителя");
                 None
             }
         };
@@ -1514,22 +1608,22 @@ impl super::PitchRunDriver for ParallelPitchDriver {
     fn finish(&mut self) -> Result<(), String> {
         if self.active_session.is_some() {
             return Err(format!(
-                "worker {} завершился с активной сессией",
+                "исполнитель {} завершился с активной сессией",
                 self.worker
             ));
         }
         let workspace = self
             .workspace
             .take()
-            .expect("synthetic worker workspace закрывается один раз");
+            .expect("временное дерево исполнителя закрывается один раз");
         let workspace_path = workspace.path().to_path_buf();
         workspace
             .close()
-            .map_err(|error| format!("synthetic worker workspace cleanup: {error}"))?;
+            .map_err(|error| format!("очистка временного дерева исполнителя: {error}"))?;
         self.trace.finish(self.worker, workspace_path);
         if self.fail_finish {
             Err(format!(
-                "synthetic cleanup failure for worker {}",
+                "искусственный сбой очистки для исполнителя {}",
                 self.worker
             ))
         } else {
@@ -1634,8 +1728,8 @@ async fn wait_for_worker_signal<T: std::fmt::Debug, F: std::future::Future<Outpu
 ) {
     tokio::select! {
         biased;
-        result = run.as_mut() => panic!("run завершился до ожидаемого worker-события: {result:?}"),
-        result = signal => result.expect("synthetic barrier должен быть освобождён"),
+        result = run.as_mut() => panic!("запуск завершился до ожидаемого события исполнителя: {result:?}"),
+        result = signal => result.expect("искусственный барьер должен быть снят"),
     }
 }
 
@@ -2144,13 +2238,16 @@ async fn parallel_pitch_ctrl_c_keeps_completed_set_and_resumes_without_reacquiri
         ParallelPitchDriver::new(
             2,
             trace.clone(),
-            [(
-                "二".into(),
-                ParallelPitchAction::Wait {
-                    started: Some(start_b_tx),
-                    release: release_b_rx,
-                },
-            )],
+            [
+                (
+                    "二".into(),
+                    ParallelPitchAction::Wait {
+                        started: Some(start_b_tx),
+                        release: release_b_rx,
+                    },
+                ),
+                ("四".into(), ParallelPitchAction::Complete),
+            ],
         ),
     ];
     let (interrupt_tx, interrupt_rx) = futures::channel::oneshot::channel();
@@ -2362,7 +2459,7 @@ async fn parallel_pitch_reports_worker_workspace_cleanup_failure_after_checkpoin
     assert!(
         error
             .message
-            .contains("synthetic cleanup failure for worker 1")
+            .contains("искусственный сбой очистки для исполнителя 1")
     );
     assert_eq!(
         load_batch(&store, "parallel-cleanup-error")
@@ -2378,7 +2475,7 @@ async fn parallel_pitch_reports_worker_workspace_cleanup_failure_after_checkpoin
 }
 
 // Эти тесты проверяют аварийные границы независимо от сценариев распределения
-// ParallelPitchDriver. Освобождение каждой сессии и запроса наблюдается через RAII.
+// `ParallelPitchDriver`. Закрытие каждой сессии и запроса наблюдается через RAII.
 #[derive(Clone, Copy)]
 enum LifecyclePitchFault {
     None,
@@ -2500,7 +2597,7 @@ impl super::PitchRunDriver for LifecyclePitchDriver {
             .remove(&request.query.surface)
             .unwrap_or_else(|| {
                 panic!(
-                    "worker {} получил неожиданную identity {}",
+                    "исполнитель {} получил неожиданную identity {}",
                     self.worker, request.query.surface
                 )
             });
@@ -2523,7 +2620,7 @@ impl super::PitchRunDriver for LifecyclePitchDriver {
         {
             started.send(()).unwrap();
             release.await.expect("тест должен освободить запрос");
-            assert!(!panic, "искусственная panic в acquire");
+            assert!(!panic, "искусственная паника при получении запроса");
         }
         crate::jpdb::JpdbPitchAcquisitionReport {
             outcomes: vec![JpdbPitchOutcome::VocabularyNotFound {
@@ -2543,9 +2640,9 @@ impl super::PitchRunDriver for LifecyclePitchDriver {
     async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
         assert_eq!(session.worker, self.worker);
         self.trace.lock().unwrap().close_calls.push(self.worker);
-        // При panic или раннем Err принадлежащая драйверу сессия освобождается через Drop.
+        // При панике или раннем Err сессия драйвера освобождается через `Drop`.
         match self.fault {
-            LifecyclePitchFault::ClosePanic => panic!("искусственная panic close_checked"),
+            LifecyclePitchFault::ClosePanic => panic!("искусственная паника в `close_checked`"),
             LifecyclePitchFault::CloseError => Err("искусственная ошибка close_checked".into()),
             _ => {
                 drop(session);
@@ -2556,10 +2653,10 @@ impl super::PitchRunDriver for LifecyclePitchDriver {
 
     fn finish(&mut self) -> Result<(), String> {
         self.trace.lock().unwrap().finished.push(self.worker);
-        let workspace = self.workspace.take().expect("finish вызывается один раз");
-        // Локальный TempWorkspace проходит Drop даже при аварии в finish.
+        let workspace = self.workspace.take().expect("`finish` вызывается один раз");
+        // `TempWorkspace` удаляется через `Drop` даже при панике в `finish`.
         match self.fault {
-            LifecyclePitchFault::FinishPanic => panic!("искусственная panic finish"),
+            LifecyclePitchFault::FinishPanic => panic!("искусственная паника в `finish`"),
             LifecyclePitchFault::FinishError => Err("искусственная ошибка finish".into()),
             _ => {
                 workspace.close().unwrap();
@@ -2674,7 +2771,7 @@ async fn parallel_pitch_acquire_panic_closes_and_joins_workers_without_fabricate
     wait_for_worker_signal(&mut run, &mut finished_rx).await;
     assert!(
         futures::poll!(run.as_mut()).is_pending(),
-        "запуск должен дождаться назначенного запроса соседнего worker"
+        "запуск должен дождаться назначенного запроса соседнего исполнителя"
     );
     {
         let state = trace.lock().unwrap();
@@ -2687,7 +2784,11 @@ async fn parallel_pitch_acquire_panic_closes_and_joins_workers_without_fabricate
     let error = run.await.unwrap_err();
     assert_eq!(error.code, ErrorCode::ValidatorFailure);
     assert_eq!(error.details["run_stop_reason"], "worker_panic");
-    assert!(error.message.contains("искусственная panic в acquire"));
+    assert!(
+        error
+            .message
+            .contains("искусственная паника при получении запроса")
+    );
     let saved = load_batch(&store, batch_id).unwrap();
     assert_untouched_pitch_tail(&saved, 2);
     assert_eq!(
@@ -2723,7 +2824,7 @@ async fn assert_pitch_cleanup_fault_preserves_checkpoint_and_resume(fault: Lifec
     let mut interrupt_sender = Some(interrupt_tx);
     let mut progress = CapturedPitchProgress::default();
     if finish_fault {
-        // Сигнал возникает после устойчивого checkpoint и до выдачи следующей identity.
+        // Сигнал возникает после надёжного сохранения результата и до выдачи следующей identity.
         progress.interrupt_on_checkpoint = interrupt_sender.take();
     }
     let error = super::run_batch_with_drivers(

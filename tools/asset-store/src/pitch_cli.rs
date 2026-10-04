@@ -49,7 +49,7 @@ const MAX_PLAN_BYTES: u64 = 8 * 1024 * 1024;
 #[command(
     name = "pitch-assets",
     version,
-    about = "Получение и verified-only публикация изображений pitch accent"
+    about = "Получение и публикация проверенных изображений японского ударения"
 )]
 pub struct PitchCli {
     /// Корень локального хранилища ударений; по умолчанию `.asset-store/pitch-accent`.
@@ -121,7 +121,7 @@ pub enum PitchBatchCommand {
     Run {
         #[arg(long, required = true)]
         batch_id: String,
-        /// Число независимых browser workers, от 1 до 4.
+        /// Число независимых исполнителей браузера, от 1 до 4.
         #[arg(long, default_value_t = PITCH_DEFAULT_WORKERS, value_parser = clap::value_parser!(u8).range(1..=4))]
         workers: u8,
     },
@@ -129,7 +129,7 @@ pub enum PitchBatchCommand {
     Resume {
         #[arg(long, required = true)]
         batch_id: String,
-        /// Число независимых browser workers, от 1 до 4.
+        /// Число независимых исполнителей браузера, от 1 до 4.
         #[arg(long, default_value_t = PITCH_DEFAULT_WORKERS, value_parser = clap::value_parser!(u8).range(1..=4))]
         workers: u8,
     },
@@ -195,22 +195,23 @@ pub enum OutputFormat {
 ///
 /// Вызывается CLI после разбора аргументов, до запуска получения ресурсов.
 /// Первая установка фиксирует формат на весь процесс: конкурентные операции
-/// не переключают глобальный hook. Библиотечные вызовы сами его не устанавливают,
-/// поэтому общий browser runtime не меняет диагностику других бинарников.
+/// не переключают глобальный обработчик паник. Библиотечные вызовы сами его не
+/// устанавливают, поэтому общий runtime браузера не меняет диагностику других программ.
 pub fn install_safe_panic_hook(output: OutputFormat) {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         std::panic::set_hook(Box::new(move |_| {
-            // Не читаем payload, location или backtrace и не форматируем ошибку:
-            // hook выполняется до catch_unwind и не должен раскрывать её данные.
+            // Не читаем содержимое паники, место возникновения или стек вызовов и
+            // не форматируем ошибку: обработчик вызывается до `catch_unwind` и не
+            // должен раскрывать скрываемые данные.
             let message = match output {
                 OutputFormat::Human => "Внутренняя паника; подробности скрыты.\n",
                 OutputFormat::Json => {
                     "{\"event\":\"panic\",\"message\":\"Внутренняя паника; подробности скрыты.\"}\n"
                 }
             };
-            // Ошибка записи не запускает повторную панику. Один lock сохраняет
-            // целостность строки при одновременной диагностике разных workers.
+            // Ошибка записи не запускает повторную панику. Одна блокировка
+            // сохраняет целостность строки при одновременной диагностике исполнителей.
             let _ = io::stderr().lock().write_all(message.as_bytes());
         }));
     });
@@ -328,7 +329,7 @@ struct ErrorSummary {
 
 const CLI_SCHEMA_VERSION: u32 = 1;
 
-/// Выполняет команду; в JSON-режиме машиночитаемый ответ идёт в stdout.
+/// Выполняет команду; в JSON-режиме машиночитаемый ответ идёт в `stdout`.
 pub async fn execute(cli: PitchCli) -> PitchCliOutput {
     let operation = operation_name(&cli.command).to_owned();
     let store_path = store_path(cli.store.as_deref(), &cli.repository_root);
@@ -372,7 +373,7 @@ pub async fn execute(cli: PitchCli) -> PitchCliOutput {
         } => list_corpus(&store, operation, summary, cli.output, store_changed),
         PitchCommand::Corpus {
             command: CorpusCommand::Check,
-        } => unreachable!("read-only corpus gate возвращается до открытия store"),
+        } => unreachable!("проверка корпуса без записи завершается до открытия хранилища"),
         PitchCommand::Ensure { refresh, .. } => {
             ensure(
                 &store,
@@ -1778,9 +1779,9 @@ fn reconcile_loaded_batch(
     Ok((batch, changed))
 }
 
-// 64 перехода ограничивают накопленные ресурсы Chromium/CDP, 20 минут —
-// возраст сессии. Смена сессии происходит после надёжного сохранения результата.
-// Уже запущенный запрос сохраняет собственный 90-секундный тайм-аут провайдера.
+// 64 завершённых запроса ограничивают накопление ресурсов Chromium/CDP, а
+// 20 минут — возраст сессии. Меняем сессию после надёжного сохранения результата.
+// Уже запущенный запрос сохраняет собственный тайм-аут провайдера в 90 секунд.
 const PITCH_SESSION_MAX_ITEMS: usize = 64;
 const PITCH_SESSION_MAX_AGE: Duration = Duration::from_secs(20 * 60);
 const PITCH_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
@@ -1790,7 +1791,7 @@ const PITCH_MAX_WORKERS: usize = 4;
 fn validate_pitch_workers(workers: usize) -> Result<(), AssetError> {
     if !(1..=PITCH_MAX_WORKERS).contains(&workers) {
         return Err(invalid_plan(format!(
-            "workers должен быть от 1 до {PITCH_MAX_WORKERS}"
+            "число исполнителей должно быть от 1 до {PITCH_MAX_WORKERS}"
         )));
     }
     Ok(())
@@ -1832,7 +1833,7 @@ trait PitchRunDriver {
         Ok(())
     }
 
-    /// Вызывается один раз после явного закрытия последней browser session.
+    /// Вызывается один раз после явного закрытия последней сессии браузера.
     fn finish(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -1855,7 +1856,10 @@ impl PitchRunDriver for JpdbRunDriver {
         }
         BrowserSession::launch_in_workspace(
             pitch_browser_runtime_config(),
-            self.workspace.as_ref().expect("workspace создан").path(),
+            self.workspace
+                .as_ref()
+                .expect("временное дерево создано")
+                .path(),
         )
         .await
     }
@@ -1885,7 +1889,7 @@ impl PitchRunDriver for JpdbRunDriver {
     }
 }
 
-// Общая JSONL-оболочка kanji progress; у pitch нет раундов и лимитов раундов.
+// Общая оболочка JSONL для прогресса получения кандзи; у pitch нет раундов и их лимитов.
 #[derive(Debug, Clone, Serialize)]
 struct PitchProgressEvent {
     schema_version: u32,
@@ -1937,9 +1941,9 @@ fn write_pitch_progress(
 ) -> Result<(), AssetError> {
     let line = match output {
         OutputFormat::Json => serde_json::to_string(event)
-            .map_err(|error| invalid_plan(format!("сериализация progress: {error}")))?,
+            .map_err(|error| invalid_plan(format!("сериализация прогресса: {error}")))?,
         OutputFormat::Human => format!(
-            "Прогресс: {} · сохранено {}/{} · всего {} · активно {} · workers {} · {:.1} с · запись={} · worker={} · сессия={} · worker-сессия={} · результат={} {}",
+            "Прогресс: {} · сохранено {}/{} · всего {} · активно {} · исполнителей {} · {:.1} с · запись={} · исполнитель={} · сессия={} · сессия исполнителя={} · результат={} {}",
             human_pitch_progress_event(event.event),
             event.run_completed,
             event.run_total,
@@ -1981,7 +1985,7 @@ fn write_pitch_progress(
         .write_all(line.as_bytes())
         .and_then(|()| writer.write_all(b"\n"))
         .and_then(|()| writer.flush())
-        .map_err(|error| AssetError::io("запись progress pitch в stderr", error))
+        .map_err(|error| AssetError::io("запись прогресса pitch в stderr", error))
 }
 
 fn human_pitch_progress_event(event: &str) -> &'static str {
@@ -2026,15 +2030,15 @@ fn human_pitch_progress_reason(reason: &str) -> &'static str {
         "session_failure" => "ошибка сессии браузера",
         "ctrl_c_listener_failed" => "ошибка обработчика Ctrl+C",
         "invalid_provider_report" => "некорректный ответ провайдера",
-        "worker_panic" => "паника browser worker",
-        "worker_channel_closed" => "канал browser worker закрыт",
+        "worker_panic" => "сбой исполнителя браузера",
+        "worker_channel_closed" => "канал исполнителя браузера закрыт",
         "item_token_changed" => "запись изменена другим действием",
         _ => "ошибка выполнения",
     }
 }
 
-// Контекст принадлежит событию: heartbeat запуска новой сессии не может
-// перенимать identity или attempt ранее сохранённой записи.
+// Контекст принадлежит событию: `heartbeat` при запуске новой сессии не должен
+// наследовать `identity` или `attempt` ранее сохранённой записи.
 #[derive(Clone, Copy, Default)]
 struct PitchProgressContext<'a> {
     identity: Option<&'a AssetIdentity>,
@@ -2199,8 +2203,8 @@ async fn run_batch(
     workers: usize,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
     validate_pitch_workers(workers)?;
-    // Уборка orphan runs принадлежит запуску пакета и нужна даже без новых workers.
-    // Временные деревья создают только workers, когда запускают браузер.
+    // Уборка осиротевших временных деревьев принадлежит запуску пакета и нужна,
+    // даже если новые исполнители не запускаются. Свои деревья они создают при старте браузера.
     cleanup_orphans_on_startup()
         .map_err(|error| AssetError::io("начальная уборка временных деревьев pitch", error))?;
     run_batch_workers(store, batch_id, output, operation, workers).await
@@ -2492,7 +2496,7 @@ fn pitch_worker_progress(
             context: context.clone(),
             reason: reason.map(str::to_owned),
         })
-        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))
+        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))
 }
 
 fn pitch_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -2501,11 +2505,12 @@ fn pitch_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .map(safe_message)
-        .unwrap_or_else(|| "panic без текстового сообщения".into())
+        .unwrap_or_else(|| "паника без текстового сообщения".into())
 }
 
-// Session принадлежит actor до конца acquisition. Паника acquisition перехватывается
-// внутри этой границы, поэтому owning Session остаётся доступной для explicit close.
+// Сессия принадлежит исполнителю до конца получения. Паника при получении
+// перехватывается внутри этой границы, поэтому исполнитель сохраняет свою сессию
+// и может явно её закрыть.
 async fn run_pitch_worker<D: PitchRunDriver>(
     driver: &mut D,
     mut commands: mpsc::UnboundedReceiver<PitchAcquisitionJob>,
@@ -2534,8 +2539,8 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                     None => break,
                 },
             };
-            // Уже назначенные jobs продолжаются при session failure соседа.
-            // Новые jobs выдаёт только coordinator после своего checkpoint.
+            // Уже назначенные задачи продолжаются при сбое сессии соседнего исполнителя.
+            // Координатор выдаёт новые задачи только после сохранения результата.
             if session.is_some()
                 && (session_items >= control.policy.max_items
                     || session_started.elapsed() >= control.policy.max_age)
@@ -2550,7 +2555,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 tracing::info!(
                     stage = "browser_close", code = "browser_close_started",
                     worker = control.worker, worker_session, session = context.session,
-                    reason, "закрытие сессии worker перед ротацией"
+                    reason, "закрытие сессии исполнителя перед сменой"
                 );
                 let active = session.take().expect("активная сессия существует");
                 checked_pitch_worker_close(driver, active).await
@@ -2567,7 +2572,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 if control.cancellation.clone().now_or_never().is_some() {
                     stop_reason = Some("interrupted");
                     events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
-                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
                     break;
                 }
                 worker_session += 1;
@@ -2578,14 +2583,14 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 tracing::info!(
                     stage = "browser_launch", code = "browser_launch_started",
                     worker = control.worker, worker_session, session = context.session,
-                    "запуск независимой сессии worker"
+                    "запуск независимой сессии исполнителя"
                 );
-                // Немедленно публикуем контекст назначенной identity и новой
-                // session: периодический coordinator heartbeat не должен
-                // приписать ей предыдущую сессию во время медленного запуска.
+                // Сразу передаём контекст назначенной записи и новой сессии, чтобы
+                // периодический сигнал координатора не приписал ей предыдущую
+                // сессию во время долгого запуска.
                 pitch_worker_progress(&events, "heartbeat", &context, None)?;
-                // Launch нельзя отменить до получения owning Session: внутри него
-                // запускается CDP handler. Сигнал проверяем сразу после launch.
+                // Запуск нельзя отменить до получения сессии во владение: внутри
+                // запускается обработчик CDP. Проверяем сигнал сразу после запуска.
                 let launched = AssertUnwindSafe(driver.launch().instrument(tracing::info_span!(
                     "pitch_worker_launch", worker = control.worker, worker_session,
                     session = context.session,
@@ -2610,7 +2615,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 if control.cancellation.clone().now_or_never().is_some() {
                     stop_reason = Some("interrupted");
                     events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
-                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
                     break;
                 }
             }
@@ -2630,7 +2635,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 tokio::pin!(acquisition);
                 tokio::select! {
                     biased;
-                    // Готовые bytes/outcome выигрывают у Ctrl+C и идут owner-у.
+                    // Уже готовый результат выигрывает у Ctrl+C и передаётся координатору.
                     result = &mut acquisition => Some(result),
                     _ = control.cancellation.clone() => None,
                 }
@@ -2643,7 +2648,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 None => {
                     stop_reason = Some("interrupted");
                     events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
-                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+                        .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
                     break;
                 }
             };
@@ -2656,18 +2661,19 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 } else {
                     "invalid_provider_report"
                 });
-                // Закрываем refill до доставки event: report другого worker,
-                // поступивший раньше, уже не сможет запустить незапущенный tail.
+                // Останавливаем выдачу новых задач до доставки результата: более
+                // ранний отчёт другого исполнителя не запустит ещё не начатый хвост.
                 control.dispatch_stopped.store(true, Ordering::Release);
             }
             session_items += report.outcomes.len();
             events.unbounded_send(PitchWorkerEvent::Report {
                 context: context.clone(), job: Box::new(job), report: Box::new(report),
-            }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий worker закрыт"))?;
+            }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
             if fatal {
                 break;
             }
-            // Coordinator вернёт следующую job только после durable CAS/publish.
+            // Координатор назначит следующую задачу только после сохранения CAS
+            // и публикации результата.
         }
         Ok(())
     }.await;
@@ -2679,13 +2685,13 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             worker = control.worker, worker_session = context.worker_session,
             session = context.session,
             identity = context.identity.as_ref().map(|identity| safe_message(&identity.key)),
-            message = %safe_message(&original.message), "worker остановлен с ошибкой"
+            message = %safe_message(&original.message), "исполнитель остановлен с ошибкой"
         );
         if let Err(send_error) = events.unbounded_send(PitchWorkerEvent::Failure {
             context: context.clone(),
             error: copy_pitch_error(original),
         }) {
-            tracing::error!(stage = "pitch_worker", code = "worker_channel_closed", worker = control.worker, message = %send_error, "канал coordinator закрыт");
+            tracing::error!(stage = "pitch_worker", code = "worker_channel_closed", worker = control.worker, message = %send_error, "канал координатора закрыт");
         }
     }
     if let Some(active) = session.take() {
@@ -2695,7 +2701,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             worker = control.worker,
             worker_session = context.worker_session,
             session = context.session,
-            "закрытие сессии worker после получения"
+            "закрытие сессии исполнителя после получения"
         );
         if let Err(message) = checked_pitch_worker_close(driver, active).await {
             retain_pitch_run_error(
@@ -2724,14 +2730,14 @@ async fn run_pitch_worker<D: PitchRunDriver>(
     };
     if let Err(message) = cleanup {
         control.dispatch_stopped.store(true, Ordering::Release);
-        tracing::error!(stage = "temp_cleanup", code = "worker_workspace_cleanup_failed", worker = control.worker, message = %safe_message(&message), "не удалось убрать workspace worker");
+        tracing::error!(stage = "temp_cleanup", code = "worker_workspace_cleanup_failed", worker = control.worker, message = %safe_message(&message), "не удалось убрать временное дерево исполнителя");
         retain_pitch_run_error(
             &mut error,
             pitch_run_stopped("browser_cleanup_failed", message),
         );
     }
-    // FIFO этого sender сохраняет report до stopped независимо от того,
-    // в каком порядке coordinator poll-ит events и owning actor futures.
+    // FIFO этого отправителя сохраняет отчёт до события остановки, независимо
+    // от порядка обработки событий координатором и завершения задач исполнителей.
     let _ = events.unbounded_send(PitchWorkerEvent::Stopped {
         worker: control.worker,
     });
@@ -2806,10 +2812,15 @@ fn dispatch_pitch_job(
     if let Some(job) = pending.pop_front() {
         commands[worker]
             .as_ref()
-            .ok_or_else(|| pitch_run_stopped("worker_channel_closed", "канал job worker закрыт"))?
+            .ok_or_else(|| {
+                pitch_run_stopped("worker_channel_closed", "канал задач исполнителя закрыт")
+            })?
             .unbounded_send(job.clone())
             .map_err(|_| {
-                pitch_run_stopped("worker_channel_closed", "worker больше не принимает job")
+                pitch_run_stopped(
+                    "worker_channel_closed",
+                    "исполнитель больше не принимает задачи",
+                )
             })?;
         active[worker] = Some(job);
     }
@@ -3031,14 +3042,14 @@ async fn run_batch_with_drivers(
                             let expected = active[index].take();
                             progress.in_flight = active.iter().filter(|job| job.is_some()).count();
                             if expected.as_ref() != Some(&job) {
-                                return Err(pitch_run_stopped("invalid_provider_report", "report не соответствует точной назначенной identity/token/request"));
+                                return Err(pitch_run_stopped("invalid_provider_report", "отчёт не соответствует назначенным identity, token и запросу"));
                             }
                             if report.outcomes.len() > 1
                                 || (report.outcomes.is_empty() && report.session_failure.is_none())
                             {
-                                return Err(pitch_run_stopped("invalid_provider_report", "Провайдер JPDB вернул некорректное число результатов"));
+                                return Err(pitch_run_stopped("invalid_provider_report", "Провайдер JPDB вернул неверное число результатов"));
                             }
-                            // CAS и bytes сохранение происходят синхронно до следующего await.
+                            // Проверяем CAS и сохраняем байты до следующего ожидания.
                             if let Some(outcome) = report.outcomes.pop() {
                                 if let JpdbPitchOutcome::Failed { error } = &outcome {
                                     trace_pitch_failure(error, context.progress(), false);
@@ -3050,7 +3061,7 @@ async fn run_batch_with_drivers(
                                         .map(|item| status_name(item.status()).to_owned());
                                     let emitted = emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
                                         "item_checkpointed", context.progress(), status, None);
-                                    // Даже ошибка stderr не отменяет publication уже durable результата.
+                                    // Ошибка записи в stderr не отменяет уже сохранённый результат.
                                     publish_ready(store, batch_id)?;
                                     emitted?;
                                 } else {
@@ -3085,7 +3096,8 @@ async fn run_batch_with_drivers(
                     Ok(())
                 })();
                 if let Err(error) = handled { retain_pitch_run_error(&mut stop_error, error); }
-                // У сигнала из checkpoint callback должна быть граница до refill.
+                // После сохранения контрольной точки проверяем сигнал до выдачи
+                // следующей задачи.
                 if refill.is_some()
                     && !interruption_seen
                     && let Err(error) = check_pitch_interruption(interruption.as_mut()).await
@@ -3114,7 +3126,7 @@ async fn run_batch_with_drivers(
             exited = workers.next(), if live_workers > 0 => {
                 if let Some(exited) = exited {
                     live_workers -= 1;
-                    tracing::debug!(stage = "pitch_worker", code = "worker_joined", worker = exited.worker, "worker закрыт и joined");
+                    tracing::debug!(stage = "pitch_worker", code = "worker_joined", worker = exited.worker, "исполнитель завершился");
                     if let Err(error) = exited.result {
                         retain_pitch_run_error(&mut stop_error, error);
                         stop_pitch_dispatch(&mut commands, &dispatch_stopped);
@@ -3136,8 +3148,8 @@ async fn run_batch_with_drivers(
                                 context.identity = Some(job.token.identity.clone());
                                 context.attempt = Some(job.attempt);
                                 if !context_matches_job {
-                                    // Не связываем новую job со старой browser session
-                                    // между dispatch и worker-aware событием запуска.
+                                    // Не связываем новое задание со старой сессией браузера
+                                    // между выдачей задания и событием о запуске исполнителя.
                                     context.session = None;
                                     context.worker_session = None;
                                     context.next_session = None;
@@ -3158,7 +3170,8 @@ async fn run_batch_with_drivers(
             }
         }
     }
-    // Все actor futures завершены: explicit browser close и workspace finish await-нуты.
+    // Все исполнители завершены: сессии браузера закрыты, завершение и очистка
+    // временных деревьев дождались выполнения.
     let result = if let Some(error) = stop_error {
         Err(error)
     } else {
@@ -3240,7 +3253,7 @@ fn record_one_outcome(
             observed_item_revision = observed.map(|item| item.item_revision),
             "проверка актуальности token"
         );
-        // record_outcome сохраняет полученные байты до смены состояния. Проверка token/CAS
+        // `record_outcome` сохраняет полученные байты до смены состояния. Проверка token/CAS
         // отбрасывает результат, если параллельное действие пользователя изменило элемент.
         runtime.record_outcome(&mut batch, token, outcome)
     })();
