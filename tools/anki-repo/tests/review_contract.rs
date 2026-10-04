@@ -11,7 +11,7 @@
 //! Групповые правила добавляют четвёртый: в batch попадают все участники группы,
 //! а не только заметка, к которой приписан finding.
 
-mod common;
+use crate::common;
 
 use common::{
     TempDir, base_export, collect_notes, export_with, mixed_export, parse_json,
