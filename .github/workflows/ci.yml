@@ -71,6 +71,10 @@ jobs:
 
       - name: Восстановить Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # test profile отличается от dev-профиля lint job (debug=0), поэтому
+          # держим отдельное поколение dependency cache.
+          key: test-nodebug-v1
 
       - name: Собрать и выполнить тесты
         # В workspace нет feature-gated test-кода. Единственная feature
