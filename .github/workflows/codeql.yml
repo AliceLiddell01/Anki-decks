@@ -1,0 +1,81 @@
+name: CodeQL
+
+# Advanced setup запускает анализ только когда меняется код или конфигурация,
+# способная повлиять на Rust/GitHub Actions. Изменения одних колод и media не
+# должны запускать многоминутный security scan.
+on:
+  pull_request:
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'rust-toolchain'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/**'
+      - '.github/codeql/**'
+      - '.github/codeql-config.yml'
+  push:
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'rust-toolchain'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/**'
+      - '.github/codeql/**'
+      - '.github/codeql-config.yml'
+  schedule:
+    # Независимый полный security scan раз в неделю, даже если код не менялся.
+    - cron: '17 2 * * 1'
+  workflow_dispatch:
+
+# Новый commit в PR делает предыдущий CodeQL-анализ устаревшим. Default setup
+# не отменял такие прогоны, из-за чего несколько шестиминутных Rust-анализов
+# могли выполняться одновременно.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Анализ (${{ matrix.language }})
+    # Push feature-ветки не дублирует pull_request scan. На push анализируем
+    # только фактическую default branch, не зашивая её имя в workflow.
+    if: >-
+      github.event_name != 'push'
+      || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - rust
+
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Инициализировать CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          # Rust поддерживает анализ без полного cargo build. Для Actions это
+          # также естественный режим; default query suite используется
+          # автоматически, без security-extended.
+          build-mode: none
+
+      - name: Выполнить CodeQL-анализ
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: '/language:${{ matrix.language }}'
