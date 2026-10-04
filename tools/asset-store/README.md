@@ -298,7 +298,7 @@ cargo run --locked -p asset-store --bin jpdb_pitch_acceptance -- \
 
 Отчёт и доказательства каждого прогона сохраняются в одном проверенном ZIP;
 распакованный каталог отчёта не оставляется. По умолчанию ZIP записывается в
-`<std::env::temp_dir()>/anki-decks-evidence/jpdb_pitch_acceptance-<run-id>.zip`.
+`<std::env::temp_dir()>/anki-decks-evidence/jpdb_pitch_acceptance-run-<32 lowercase hexadecimal digits>.zip`.
 `--output <ZIP>` задаёт путь к новому ZIP-файлу с расширением `.zip`; относительный
 путь считается от текущего каталога. Родительский каталог должен существовать,
 файл — ещё не существовать, путь должен быть вне checkout и временного workspace.
@@ -605,7 +605,7 @@ cargo run --locked -p asset-store --bin yarxi_dark_acceptance -- \
 interstitial флагом `--allow-insecure-tls`. По умолчанию TLS exception выключен.
 Отчёт и доказательства каждого прогона сохраняются в одном проверенном ZIP;
 распакованный каталог отчёта не остаётся. По умолчанию ZIP записывается в
-`<std::env::temp_dir()>/anki-decks-evidence/yarxi_dark_acceptance-<run-id>.zip`.
+`<std::env::temp_dir()>/anki-decks-evidence/yarxi_dark_acceptance-run-<32 lowercase hexadecimal digits>.zip`.
 `--output <ZIP>` задаёт путь к новому ZIP-файлу с расширением `.zip`; относительный
 путь считается от текущего каталога. Родительский каталог должен существовать,
 файл — ещё не существовать, путь должен быть вне checkout и временного workspace.
@@ -628,7 +628,8 @@ session state не включаются в ZIP evidence.
 
 Оба acceptance бинарника используют общий `EvidenceRun` и `TempWorkspace`.
 Временные данные прогона хранятся в приватном каталоге
-`/tmp/anki-decks-work/run-<32 lowercase hex>` с правами `0700` и маркером
+`/tmp/anki-decks-<uid>/run-<32 lowercase hex>` с правами `0700`; namespace
+разделён по текущему UID. Каталог содержит маркер
 `.anki-decks-owner.json` (schema, repository, tool, PID, время создания, `run_id`
 и назначение). Новые маркеры schema 2 дополнительно содержат `boot_id` и
 `process_start_ticks` и публикуются атомарно. Старые schema-1 маркеры остаются
@@ -671,8 +672,8 @@ same-UID Chromium process всё ещё ссылаются на run, cleanup о�
 возраста; schema 1 по-прежнему требует TTL не менее 24 часов. Acceptance harness
 также сохраняет результаты начальной и итоговой очистки деревьев с маркером и
 старых каталогов. Очистка деревьев с маркером рассматривает только
-`/tmp/anki-decks-work/run-<32 lowercase hex>` с приватным каталогом
-и валидным marker текущего репозитория и инструмента; требует совпадения
+`/tmp/anki-decks-<uid>/run-<32 lowercase hex>` с приватным каталогом
+и валидным marker проекта и инструмента; требует совпадения
 `run_id`, UID и проверки process references. Для schema 2 несогласованный
 `boot_id`, отсутствующий PID или другой `process_start_ticks` доказывают смерть
 исходного owner; совпавшая идентичность означает live owner. Для schema 1

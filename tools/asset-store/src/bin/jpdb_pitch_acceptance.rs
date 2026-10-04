@@ -139,7 +139,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let result = run_body(&items, &plan_path, &run)
         .with_subscriber(log.dispatch())
         .await;
-    run.finish(result, log.finish())
+    tokio::task::block_in_place(|| run.finish(result, log.finish()))
 }
 
 async fn run_body(

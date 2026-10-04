@@ -59,6 +59,8 @@ impl EvidenceRun {
         let workspace = TempWorkspace::create(tool)?;
         let result = (|| {
             let output = resolve_output(output, checkout, workspace.path(), tool)?;
+            // Проверяем поддержку unnamed staging до запуска сетевого provider.
+            drop(Staging::create(&output)?);
             for name in [
                 "reports",
                 "logs",

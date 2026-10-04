@@ -379,20 +379,7 @@ pub struct JpdbPitchProvider;
 impl JpdbPitchProvider {
     /// Разрешает запрос и получает данные в новой изолированной сессии Chromium.
     pub async fn acquire(query: &JpdbPitchQuery) -> JpdbPitchOutcome {
-        let mut report = Self::acquire_many(std::slice::from_ref(query)).await;
-        if let Some(error) = report.session_failure.take() {
-            return failed(error);
-        }
-        report.outcomes.pop().unwrap_or_else(|| {
-            failed(
-                report
-                    .session_failure
-                    .unwrap_or(JpdbPitchFailure::BrowserSetup {
-                        stage: JpdbPitchStage::ConfigureBrowser,
-                        message: "Провайдер не вернул результат для элемента".into(),
-                    }),
-            )
-        })
+        single_item_outcome(Self::acquire_many(std::slice::from_ref(query)).await)
     }
 
     /// Последовательно разрешает запросы в одной изолированной сессии браузера.
@@ -412,7 +399,7 @@ impl JpdbPitchProvider {
             return JpdbPitchAcquisitionReport::default();
         }
 
-        Self::acquire_requests_owned(requests, None).await
+        Self::acquire_requests_owned(requests, None, false).await
     }
 
     /// Все временные browser profiles находятся внутри workspace запуска acceptance.
@@ -423,14 +410,15 @@ impl JpdbPitchProvider {
         if requests.is_empty() {
             return JpdbPitchAcquisitionReport::default();
         }
-        Self::acquire_requests_owned(requests, Some(workspace)).await
+        Self::acquire_requests_owned(requests, Some(workspace), true).await
     }
 
     async fn acquire_requests_owned(
         requests: &[JpdbPitchRequest],
         workspace: Option<&Path>,
+        keep_late_interrupt_handler: bool,
     ) -> JpdbPitchAcquisitionReport {
-        let mut interrupt = JpdbInterrupt(tokio::spawn(tokio::signal::ctrl_c()));
+        let mut interrupt = JpdbInterrupt::listen(keep_late_interrupt_handler);
         let runtime = pitch_browser_runtime_config();
         // Не отменяем launch по SIGINT: полученная owning Session явно закрывается.
         let launched = match workspace {
@@ -448,20 +436,19 @@ impl JpdbPitchProvider {
                 );
             }
         };
-        let mut report = match wait_jpdb_operation(configure_page(session.page()), &mut interrupt.0)
-            .await
-        {
-            Ok(Ok(())) => {
-                process_requests_with_interrupt(&session, requests, Some(&mut interrupt.0)).await
-            }
-            Ok(Err(error)) => JpdbPitchAcquisitionReport::from_session_failure(error),
-            Err(message) => {
-                JpdbPitchAcquisitionReport::from_session_failure(JpdbPitchFailure::SessionFailure {
-                    stage: JpdbPitchStage::ConfigureBrowser,
-                    message,
-                })
-            }
-        };
+        let mut report =
+            match wait_jpdb_operation(configure_page(session.page()), &mut interrupt).await {
+                Ok(Ok(())) => {
+                    process_requests_with_interrupt(&session, requests, Some(&mut interrupt)).await
+                }
+                Ok(Err(error)) => JpdbPitchAcquisitionReport::from_session_failure(error),
+                Err(message) => JpdbPitchAcquisitionReport::from_session_failure(
+                    JpdbPitchFailure::SessionFailure {
+                        stage: JpdbPitchStage::ConfigureBrowser,
+                        message,
+                    },
+                ),
+            };
         if let Err(message) = session.close().await {
             match &mut report.session_failure {
                 Some(
@@ -518,25 +505,93 @@ impl JpdbPitchProvider {
     }
 }
 
-struct JpdbInterrupt(tokio::task::JoinHandle<std::io::Result<()>>);
+struct JpdbInterrupt {
+    first_signal: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
+    listener: tokio::task::JoinHandle<()>,
+    signal_observed: bool,
+    keep_late_interrupt_handler: bool,
+}
+
+impl JpdbInterrupt {
+    fn listen(keep_late_interrupt_handler: bool) -> Self {
+        let (sender, first_signal) = tokio::sync::oneshot::channel();
+        let listener = tokio::spawn(async move {
+            let mut sender = Some(sender);
+            loop {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        if let Some(sender) = sender.take() {
+                            if sender.send(Ok(())).is_err() && keep_late_interrupt_handler {
+                                std::process::exit(130);
+                            }
+                        } else if keep_late_interrupt_handler {
+                            std::process::exit(130);
+                        } else {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(sender) = sender.take() {
+                            let _ = sender.send(Err(error));
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+        Self {
+            listener,
+            first_signal,
+            signal_observed: false,
+            keep_late_interrupt_handler,
+        }
+    }
+
+    #[cfg(test)]
+    fn injected(listener: impl Future<Output = std::io::Result<()>> + Send + 'static) -> Self {
+        let (sender, first_signal) = tokio::sync::oneshot::channel();
+        Self {
+            listener: tokio::spawn(async move {
+                let _ = sender.send(listener.await);
+            }),
+            first_signal,
+            signal_observed: false,
+            keep_late_interrupt_handler: false,
+        }
+    }
+}
 
 impl Drop for JpdbInterrupt {
     fn drop(&mut self) {
-        self.0.abort();
+        if self.keep_late_interrupt_handler {
+            // tokio::signal::ctrl_c replaces the process default handler. Keep
+            // this already-registered listener alive through ZIP publication.
+            if !self.signal_observed {
+                self.first_signal.close();
+                if matches!(self.first_signal.try_recv(), Ok(Ok(()))) {
+                    std::process::exit(130);
+                }
+            }
+        } else {
+            self.listener.abort();
+        }
     }
 }
 
 async fn wait_jpdb_operation<T>(
     operation: impl Future<Output = T>,
-    interrupt: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    interrupt: &mut JpdbInterrupt,
 ) -> Result<T, String> {
     tokio::select! {
         biased;
-        signal = interrupt => Err(match signal {
-            Ok(Ok(())) => "acquisition_interrupted: получен Ctrl+C".into(),
-            Ok(Err(error)) => format!("ctrl_c_listener_failed: {error}"),
-            Err(error) => format!("ctrl_c_listener_failed: {error}"),
-        }),
+        signal = &mut interrupt.first_signal => match signal {
+            Ok(Ok(())) => {
+                interrupt.signal_observed = true;
+                Err("acquisition_interrupted: получен Ctrl+C".into())
+            }
+            Ok(Err(error)) => Err(format!("ctrl_c_listener_failed: {error}")),
+            Err(error) => Err(format!("ctrl_c_listener_failed: {error}")),
+        },
         result = operation => Ok(result),
     }
 }
@@ -551,7 +606,7 @@ async fn process_requests_in_session(
 async fn process_requests_with_interrupt(
     session: &BrowserSession,
     requests: &[JpdbPitchRequest],
-    mut interrupt: Option<&mut tokio::task::JoinHandle<std::io::Result<()>>>,
+    mut interrupt: Option<&mut JpdbInterrupt>,
 ) -> JpdbPitchAcquisitionReport {
     let mut report = JpdbPitchAcquisitionReport {
         outcomes: Vec::with_capacity(requests.len()),
@@ -597,6 +652,24 @@ async fn process_requests_with_interrupt(
         }
     }
     report
+}
+
+fn single_item_outcome(mut report: JpdbPitchAcquisitionReport) -> JpdbPitchOutcome {
+    match (report.outcomes.pop(), report.session_failure) {
+        (Some(outcome), None) => outcome,
+        (
+            Some(outcome),
+            Some(JpdbPitchFailure::SessionFailure {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                ..
+            }),
+        ) => outcome,
+        (_, Some(error)) => failed(error),
+        (None, None) => failed(JpdbPitchFailure::BrowserSetup {
+            stage: JpdbPitchStage::ConfigureBrowser,
+            message: "Провайдер не вернул результат для элемента".into(),
+        }),
+    }
 }
 
 async fn configure_page(page: &Page) -> Result<(), JpdbPitchFailure> {
@@ -2733,22 +2806,22 @@ mod tests {
     #[tokio::test]
     async fn injected_interrupt_keeps_processed_prefix_without_tail_outcomes() {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        let mut interrupt = JpdbInterrupt(tokio::spawn(async {
+        let mut interrupt = JpdbInterrupt::injected(async {
             cancelled.await.map_err(std::io::Error::other)?;
             Ok(())
-        }));
+        });
         let mut report = JpdbPitchAcquisitionReport::default();
         let first = JpdbPitchOutcome::VocabularyNotFound {
             surface: "猫".into(),
             reading: None,
         };
-        let completed = wait_jpdb_operation(std::future::ready(first.clone()), &mut interrupt.0)
+        let completed = wait_jpdb_operation(std::future::ready(first.clone()), &mut interrupt)
             .await
             .unwrap();
         report.record_processed_outcome(completed, JpdbPitchStage::SearchResolution, false);
         cancel.send(()).unwrap();
         let interrupted =
-            wait_jpdb_operation(std::future::pending::<JpdbPitchOutcome>(), &mut interrupt.0)
+            wait_jpdb_operation(std::future::pending::<JpdbPitchOutcome>(), &mut interrupt)
                 .await
                 .unwrap_err();
         report.stop_with_session_failure(JpdbPitchStage::SearchNavigation, interrupted);
@@ -2760,10 +2833,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_interrupt_listener_is_a_typed_session_failure() {
-        let mut interrupt = JpdbInterrupt(tokio::spawn(async {
-            Err(std::io::Error::other("injected signal error"))
-        }));
-        let message = wait_jpdb_operation(std::future::pending::<()>(), &mut interrupt.0)
+        let mut interrupt =
+            JpdbInterrupt::injected(async { Err(std::io::Error::other("injected signal error")) });
+        let message = wait_jpdb_operation(std::future::pending::<()>(), &mut interrupt)
             .await
             .unwrap_err();
         let mut report = JpdbPitchAcquisitionReport::default();
@@ -2777,6 +2849,46 @@ mod tests {
                 .unwrap()
                 .starts_with("ctrl_c_listener_failed:")
         );
+    }
+
+    #[test]
+    fn single_item_result_survives_browser_close_failure() {
+        let outcome = JpdbPitchOutcome::VocabularyNotFound {
+            surface: "猫".into(),
+            reading: Some("ねこ".into()),
+        };
+        let report = JpdbPitchAcquisitionReport {
+            outcomes: vec![outcome.clone()],
+            session_failure: Some(JpdbPitchFailure::SessionFailure {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "ошибка закрытия сессии".into(),
+            }),
+        };
+        assert_eq!(single_item_outcome(report), outcome);
+    }
+
+    #[test]
+    fn single_item_result_does_not_hide_acquisition_session_failure() {
+        let outcome = JpdbPitchOutcome::VocabularyNotFound {
+            surface: "猫".into(),
+            reading: Some("ねこ".into()),
+        };
+        let report = JpdbPitchAcquisitionReport {
+            outcomes: vec![outcome],
+            session_failure: Some(JpdbPitchFailure::SessionFailure {
+                stage: JpdbPitchStage::PostCaptureVerification,
+                message: "monitor stopped".into(),
+            }),
+        };
+        assert!(matches!(
+            single_item_outcome(report),
+            JpdbPitchOutcome::Failed {
+                error: JpdbPitchFailure::SessionFailure {
+                    stage: JpdbPitchStage::PostCaptureVerification,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

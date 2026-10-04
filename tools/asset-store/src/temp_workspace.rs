@@ -21,9 +21,9 @@ use rustix::fs::{
 use serde::{Deserialize, Serialize};
 
 const TEMP_ROOT: &str = "/tmp";
-const NAMESPACE: &str = "anki-decks-work";
+const NAMESPACE_PREFIX: &str = "anki-decks";
 const MARKER: &str = ".anki-decks-owner.json";
-const REPOSITORY: &str = "AliceLiddell01/Anki-decks";
+const REPOSITORY: &str = "anki-decks";
 const TOOL: &str = "asset-store";
 const SCHEMA: u32 = 2;
 const LEGACY_SCHEMA: u32 = 1;
@@ -89,6 +89,7 @@ impl TempWorkspace {
         let boot_id = read_boot_id(Path::new("/proc/sys/kernel/random/boot_id"))?;
         let process_start_ticks = read_process_start_ticks(Path::new("/proc"), pid)?;
         let uid = current_uid()?;
+        let namespace_name = namespace_directory_name(uid);
         let parent = namespace(temp_root, uid, true)?
             .ok_or_else(|| io::Error::other("не удалось создать temp namespace"))?;
         let mut random = [0_u8; 16];
@@ -99,7 +100,7 @@ impl TempWorkspace {
                 Ok(()) => {
                     let directory = directory_at(&parent, OsStr::new(&run_id))?;
                     let owner = Self {
-                        path: temp_root.join(NAMESPACE).join(&run_id),
+                        path: temp_root.join(&namespace_name).join(&run_id),
                         run_id: run_id.clone(),
                         parent,
                         directory,
@@ -255,9 +256,10 @@ fn cleanup_under_with_sources(
     let Some(parent) = namespace(temp_root, uid, false)? else {
         return Ok(report);
     };
+    let namespace_name = namespace_directory_name(uid);
     let now = unix_ms()?;
     for name in names(&parent)? {
-        let path = temp_root.join(NAMESPACE).join(&name);
+        let path = temp_root.join(&namespace_name).join(&name);
         let result = inspect_orphan(
             &parent,
             &ProcessSources {
@@ -888,14 +890,15 @@ fn namespace(temp_root: &Path, uid: u32, create: bool) -> io::Result<Option<File
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
+    let namespace_name = namespace_directory_name(uid);
     if create {
-        match mkdirat(&temp, NAMESPACE, Mode::from_raw_mode(0o700)) {
+        match mkdirat(&temp, namespace_name.as_str(), Mode::from_raw_mode(0o700)) {
             Ok(()) => (),
             Err(error) if error == rustix::io::Errno::EXIST => (),
             Err(error) => return Err(error.into()),
         }
     }
-    let directory = match directory_at(&temp, OsStr::new(NAMESPACE)) {
+    let directory = match directory_at(&temp, OsStr::new(&namespace_name)) {
         Ok(directory) => directory,
         Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -909,7 +912,8 @@ fn namespace(temp_root: &Path, uid: u32, create: bool) -> io::Result<Option<File
         ));
     }
     // canonicalization не используется как доказательство: fd остаётся boundary.
-    if fs::canonicalize(temp_root.join(NAMESPACE))? != fs::canonicalize(temp_root)?.join(NAMESPACE)
+    if fs::canonicalize(temp_root.join(&namespace_name))?
+        != fs::canonicalize(temp_root)?.join(&namespace_name)
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -917,6 +921,10 @@ fn namespace(temp_root: &Path, uid: u32, create: bool) -> io::Result<Option<File
         ));
     }
     Ok(Some(directory))
+}
+
+fn namespace_directory_name(uid: u32) -> String {
+    format!("{NAMESPACE_PREFIX}-{uid}")
 }
 
 fn directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
@@ -1297,13 +1305,14 @@ pub fn snapshot() -> io::Result<TempSnapshot> {
 fn snapshot_under(root: &Path) -> io::Result<TempSnapshot> {
     let mut snapshot = TempSnapshot::default();
     let uid = current_uid()?;
+    let namespace_name = namespace_directory_name(uid);
     if let Some(parent) = namespace(root, uid, false)? {
         for name in names(&parent)? {
             if name.to_str().is_some_and(valid_run_id) {
                 measure_entry(
                     &parent,
                     &name,
-                    root.join(NAMESPACE).join(&name),
+                    root.join(&namespace_name).join(&name),
                     uid,
                     &mut snapshot,
                 )?;
@@ -1635,6 +1644,14 @@ mod tests {
             .unwrap();
         owner.closed = true; // Имитация SIGKILL без уничтожения тестового процесса.
         owner.path().to_path_buf()
+    }
+
+    #[test]
+    fn namespace_is_scoped_to_uid() {
+        assert_ne!(
+            namespace_directory_name(1000),
+            namespace_directory_name(1001)
+        );
     }
 
     const TEST_BOOT_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
@@ -2509,7 +2526,10 @@ mod tests {
             serde_json::from_slice(&fs::read(&foreign_marker_path).unwrap()).unwrap();
         marker.repository = "foreign".into();
         fs::write(foreign_marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-        let foreign_prefix = root.path().join(NAMESPACE).join("other-application");
+        let foreign_prefix = root
+            .path()
+            .join(namespace_directory_name(current_uid().unwrap()))
+            .join("other-application");
         fs::create_dir(&foreign_prefix).unwrap();
         let report = cleanup_under(root.path(), DEFAULT_ORPHAN_MIN_AGE).unwrap();
         assert_eq!(report.removed, 0);
@@ -2552,9 +2572,10 @@ mod tests {
         fs::write(target.path().join("keep"), b"keep").unwrap();
         let path = make_orphan(root.path(), Duration::from_secs(172800));
         symlink(target.path(), path.join("escape")).unwrap();
+        let namespace_name = namespace_directory_name(current_uid().unwrap());
         let link = root
             .path()
-            .join(NAMESPACE)
+            .join(&namespace_name)
             .join("run-11111111111111111111111111111111");
         symlink(target.path(), &link).unwrap();
         assert_eq!(
@@ -2563,7 +2584,7 @@ mod tests {
         );
         assert!(target.path().join("keep").exists());
         let escaped = sandbox();
-        symlink(target.path(), escaped.path().join(NAMESPACE)).unwrap();
+        symlink(target.path(), escaped.path().join(namespace_name)).unwrap();
         assert!(cleanup_under(escaped.path(), Duration::ZERO).is_err());
         assert!(target.path().join("keep").exists());
     }
