@@ -4,7 +4,7 @@
 //! экспортов, поэтому тесты фиксируют именно тот контракт, который видит
 //! агент: код возврата, JSON-схему результата и текст ошибки.
 
-mod common;
+use crate::common;
 
 use common::{
     TempDir, base_export, edit_request, run_cli, run_cli_in, run_cli_with_stdin_in,
