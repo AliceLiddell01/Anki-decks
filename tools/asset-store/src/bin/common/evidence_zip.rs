@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -560,7 +560,14 @@ pub fn resolve_output(
             .canonicalize()?
             .join("anki-decks-evidence");
         match fs::symlink_metadata(&parent) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                let effective_uid = fs::metadata("/proc/self")?.uid();
+                if !evidence_root_permissions_are_safe(&metadata, effective_uid) {
+                    return Err(
+                        "evidence root должен принадлежать текущему пользователю и не допускать записи группой или остальными".into(),
+                    );
+                }
+            }
             Ok(_) => return Err("evidence root должен быть обычным каталогом".into()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(&parent)?;
@@ -604,6 +611,10 @@ pub fn resolve_output(
         return Err("--output уже существует".into());
     }
     Ok(resolved)
+}
+
+fn evidence_root_permissions_are_safe(metadata: &fs::Metadata, effective_uid: u32) -> bool {
+    metadata.uid() == effective_uid && metadata.mode() & 0o022 == 0
 }
 
 fn now() -> u64 {
@@ -764,6 +775,32 @@ mod tests {
         )
         .unwrap();
         (output_owner, run, output)
+    }
+
+    #[test]
+    fn evidence_root_must_belong_to_effective_user_and_not_be_group_or_world_writable() {
+        let workspace = TempWorkspace::create("evidence-root-permissions").unwrap();
+        let root = workspace.path().join("evidence-root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner_uid = fs::metadata("/proc/self").unwrap().uid();
+
+        let metadata = fs::symlink_metadata(&root).unwrap();
+        assert!(evidence_root_permissions_are_safe(&metadata, owner_uid));
+        assert!(!evidence_root_permissions_are_safe(
+            &metadata,
+            owner_uid.wrapping_add(1)
+        ));
+
+        for mode in [0o770, 0o707] {
+            fs::set_permissions(&root, fs::Permissions::from_mode(mode)).unwrap();
+            let metadata = fs::symlink_metadata(&root).unwrap();
+            assert!(!evidence_root_permissions_are_safe(&metadata, owner_uid));
+        }
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::symlink_metadata(&root).unwrap();
+        assert!(evidence_root_permissions_are_safe(&metadata, owner_uid));
     }
 
     #[test]

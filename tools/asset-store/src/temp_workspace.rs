@@ -1820,11 +1820,7 @@ mod tests {
             let report =
                 cleanup_under_with_proc(root.path(), &proc_root, DEFAULT_ORPHAN_MIN_AGE * 2)
                     .unwrap();
-            assert_eq!(
-                report.removed, 1,
-                "{death}: removed={}, skipped={}, errors={}",
-                report.removed, report.skipped, report.errors
-            );
+            assert_eq!(report.removed, 1);
             assert!(!path.exists());
         }
     }
@@ -1879,16 +1875,8 @@ mod tests {
                 _ => unreachable!(),
             }
             let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
-            assert_eq!(
-                report.removed, 0,
-                "{failure}: removed={}, skipped={}, errors={}",
-                report.removed, report.skipped, report.errors
-            );
-            assert_eq!(
-                report.skipped, 1,
-                "{failure}: removed={}, skipped={}, errors={}",
-                report.removed, report.skipped, report.errors
-            );
+            assert_eq!(report.removed, 0);
+            assert_eq!(report.skipped, 1);
             assert!(path.exists());
         }
     }
@@ -1915,11 +1903,7 @@ mod tests {
             fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
             let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
             fs::set_permissions(&blocked, permissions).unwrap();
-            assert_eq!(
-                report.removed, 0,
-                "{failure}: removed={}, skipped={}, errors={}",
-                report.removed, report.skipped, report.errors
-            );
+            assert_eq!(report.removed, 0);
             assert_eq!(report.skipped, 1);
             assert!(path.exists());
         }
@@ -2019,11 +2003,7 @@ mod tests {
                 symlink(&profile, process.join("cwd")).unwrap();
             }
             let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
-            assert_eq!(
-                report.removed, 0,
-                "{reference}: removed={}, skipped={}, errors={}",
-                report.removed, report.skipped, report.errors
-            );
+            assert_eq!(report.removed, 0);
             assert!(path.exists());
             fs::remove_dir_all(process).unwrap();
             assert_eq!(
@@ -2144,11 +2124,7 @@ mod tests {
                 fs::remove_file(process.join(source)).unwrap();
             }
             let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
-            assert_eq!(
-                report.removed, 0,
-                "{source}: removed={}, skipped={}, errors={}",
-                report.removed, report.skipped, report.errors
-            );
+            assert_eq!(report.removed, 0);
             assert!(path.exists());
         }
     }
@@ -2218,11 +2194,7 @@ mod tests {
         fs::write(&zip, b"user ZIP").unwrap();
         let report =
             cleanup_under_with_proc(root.path(), &proc_root, DEFAULT_ORPHAN_MIN_AGE).unwrap();
-        assert_eq!(
-            report.removed, 1,
-            "cleanup report: removed={}, skipped={}, errors={}",
-            report.removed, report.skipped, report.errors
-        );
+        assert_eq!(report.removed, 1);
         assert!(!path.exists());
         assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"unrelated");
         assert_eq!(fs::read(zip).unwrap(), b"user ZIP");

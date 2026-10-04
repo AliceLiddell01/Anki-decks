@@ -279,11 +279,11 @@ fn run_body(
     }
 
     for item in &items[processed_count..] {
-        rows.push(item_row(
+        let codepoint = unicode_codepoint(&item.character)?;
+        rows.push(unstarted_item_row(
             item,
-            &unicode_codepoint(&item.character)?,
-            "not_started_session_failure",
-            json!({"session_failure_ref":"#/session_failure"}),
+            &codepoint,
+            session_failure.is_some(),
         ));
     }
     for row in &rows {
@@ -380,6 +380,19 @@ fn item_row(item: &PlanItem, codepoint: &str, outcome: &str, extra: Value) -> Va
         );
     }
     row
+}
+
+fn unstarted_item_row(item: &PlanItem, codepoint: &str, session_failed: bool) -> Value {
+    if session_failed {
+        item_row(
+            item,
+            codepoint,
+            "not_started_session_failure",
+            json!({"session_failure_ref":"#/session_failure"}),
+        )
+    } else {
+        item_row(item, codepoint, "provider_result_missing", json!({}))
+    }
 }
 
 fn checkout_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -604,14 +617,16 @@ small{color:#505960}
                     escape_html(&title)
                 ));
             } else {
-                if row.and_then(|row| row["outcome"].as_str())
-                    == Some("not_started_session_failure")
-                {
-                    html.push_str(
+                match row.and_then(|row| row["outcome"].as_str()) {
+                    Some("not_started_session_failure") => html.push_str(
                         "<p>Обработка не началась: сессия браузера завершилась ошибкой.</p>",
-                    );
-                } else {
-                    html.push_str("<p>PNG не сохранён: изображение получить не удалось.</p>");
+                    ),
+                    Some("provider_result_missing") => {
+                        html.push_str("<p>Провайдер не вернул результат для этого элемента.</p>");
+                    }
+                    _ => {
+                        html.push_str("<p>PNG не сохранён: изображение получить не удалось.</p>");
+                    }
                 }
             }
             if row
@@ -842,6 +857,19 @@ mod tests {
     }
 
     #[test]
+    fn unstarted_item_distinguishes_session_failure_from_missing_provider_result() {
+        let items = read_plan_items(&json!({ "items": [{ "character": "漢" }] })).unwrap();
+
+        let missing = unstarted_item_row(&items[0], "U+6F22", false);
+        assert_eq!(missing["outcome"], "provider_result_missing");
+        assert!(missing.get("session_failure_ref").is_none());
+
+        let stopped = unstarted_item_row(&items[0], "U+6F22", true);
+        assert_eq!(stopped["outcome"], "not_started_session_failure");
+        assert_eq!(stopped["session_failure_ref"], "#/session_failure");
+    }
+
+    #[test]
     fn zip_output_is_new_and_outside_checkout_and_run() {
         let checkout = checkout_root().unwrap();
         let workspace =
@@ -915,6 +943,21 @@ mod tests {
         assert!(html.contains("href=\"#session-failure\""));
         assert!(html.contains("Обработка не началась: сессия браузера завершилась ошибкой."));
         assert!(html.contains("browser failed &lt;after launch&gt;"));
+        assert!(!html.contains("PNG не сохранён: изображение получить не удалось."));
+    }
+
+    #[test]
+    fn html_identifies_missing_provider_result_without_session_link() {
+        let items = read_plan_items(&json!({ "items": [{ "character": "漢" }] })).unwrap();
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
+        let rows = [unstarted_item_row(&items[0], "U+6F22", false)];
+
+        save_html_report("verification_failed", &items, &rows, None, workspace.path()).unwrap();
+
+        let html = fs::read_to_string(workspace.path().join("index.html")).unwrap();
+        assert!(html.contains("Провайдер не вернул результат для этого элемента."));
+        assert!(!html.contains("href=\"#session-failure\""));
         assert!(!html.contains("PNG не сохранён: изображение получить не удалось."));
     }
 

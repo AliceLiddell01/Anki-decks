@@ -29,6 +29,25 @@ use crate::pitch_batch::{
 use crate::store::{AssetStore, StoreOptions, VerifiedIngestRequest};
 use crate::temp_workspace::TempWorkspace;
 
+#[test]
+fn human_output_does_not_append_a_second_diagnostic_log_path() {
+    for (stdout, stderr, exit_code) in [("завершено\n", "", 0), ("", "ошибка\n", 1)]
+    {
+        let output = super::attach_diagnostic_log(
+            super::PitchCliOutput {
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+                exit_code,
+            },
+            OutputFormat::Human,
+            Some("/tmp/diagnostic.jsonl"),
+        );
+
+        assert_eq!(output.stdout, stdout);
+        assert_eq!(output.stderr, stderr);
+    }
+}
+
 struct TemporaryRoot {
     workspace: TempWorkspace,
 }

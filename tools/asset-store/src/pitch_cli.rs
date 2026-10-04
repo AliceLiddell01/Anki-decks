@@ -2383,14 +2383,7 @@ fn attach_diagnostic_log(
                     .expect("ответ с путём диагностического файла сериализуется")
             );
         }
-        OutputFormat::Human => {
-            let line = format!("Диагностический журнал: {path}\n");
-            if output.exit_code == 0 || output.stderr.is_empty() {
-                output.stdout.push_str(&line);
-            } else {
-                output.stderr.push_str(&line);
-            }
-        }
+        OutputFormat::Human => {}
     }
     output
 }
