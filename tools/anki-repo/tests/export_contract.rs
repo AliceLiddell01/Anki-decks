@@ -11,7 +11,7 @@
 //! порядке `ord`. Поведение, которое случайно опиралось бы на форму конкретного
 //! экспорта, обязано разойтись именно на таких данных.
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
