@@ -9,6 +9,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "CLI для детерминированного анализа CrowdAnki-экспортов репозитория Anki-decks и точечной правки значений их полей"
 publish = false
+autotests = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -37,6 +38,10 @@ path = "src/lib.rs"
 name = "anki-repo"
 test = false
 path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints.rust]
 unsafe_code = "forbid"
