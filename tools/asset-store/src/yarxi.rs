@@ -5,6 +5,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer, runtime_snapshot_json};
 #[cfg(test)]
 use crate::browser_runtime::TrackedRequest;
 use crate::browser_runtime::{
@@ -663,6 +664,27 @@ impl SessionStopReason {
     }
 }
 
+fn session_stop_code(reason: &SessionStopReason) -> &'static str {
+    match reason {
+        SessionStopReason::Deadline => "session_deadline",
+        SessionStopReason::ItemTimeout => "item_timeout",
+        SessionStopReason::RetryRecoveryFailed(_) => "retry_recovery_failed",
+        SessionStopReason::Interrupted => "ctrl_c",
+        SessionStopReason::RuntimeFailure(_) => "runtime_failure",
+    }
+}
+
+fn terminal_failure_code<'a>(error: &'a str, stop: Option<&SessionStopReason>) -> &'a str {
+    match stop {
+        Some(SessionStopReason::Deadline) => "browser_session_deadline",
+        Some(SessionStopReason::ItemTimeout) => "browser_item_timeout",
+        Some(SessionStopReason::RetryRecoveryFailed(_)) => "browser_retry_recovery_failed",
+        Some(SessionStopReason::Interrupted) => "acquisition_interrupted",
+        Some(SessionStopReason::RuntimeFailure(_)) => "browser_network_runtime_failure",
+        None => acquisition_failure_code(error),
+    }
+}
+
 #[derive(Debug)]
 pub enum AcquisitionStreamError {
     Provider(String),
@@ -850,6 +872,47 @@ impl AcquisitionRun {
         characters: &[String],
         allow_insecure_tls: bool,
         target: AcquisitionTarget,
+        on_event: F,
+    ) -> Result<AcquisitionSummary, AcquisitionStreamError>
+    where
+        F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    {
+        self.acquire_with_target_and_generations(
+            characters,
+            allow_insecure_tls,
+            target,
+            None,
+            on_event,
+        )
+    }
+
+    /// Batch owner context accompanies each identity through session rotation so
+    /// item diagnostics can report the exact CAS generation that was acquired.
+    pub(crate) fn acquire_with_generations<F>(
+        &mut self,
+        characters: &[String],
+        allow_insecure_tls: bool,
+        generations: &[u32],
+        on_event: F,
+    ) -> Result<AcquisitionSummary, AcquisitionStreamError>
+    where
+        F: FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    {
+        self.acquire_with_target_and_generations(
+            characters,
+            allow_insecure_tls,
+            AcquisitionTarget::PreferredSource,
+            Some(generations),
+            on_event,
+        )
+    }
+
+    fn acquire_with_target_and_generations<F>(
+        &mut self,
+        characters: &[String],
+        allow_insecure_tls: bool,
+        target: AcquisitionTarget,
+        generations: Option<&[u32]>,
         mut on_event: F,
     ) -> Result<AcquisitionSummary, AcquisitionStreamError>
     where
@@ -857,6 +920,11 @@ impl AcquisitionRun {
     {
         if self.stopped {
             return Err(AcquisitionStreamError::Interrupted);
+        }
+        if generations.is_some_and(|values| values.len() != characters.len()) {
+            return Err(AcquisitionStreamError::Provider(
+                "browser_item_context_mismatch: число generation не совпадает с очередью".into(),
+            ));
         }
         for character in characters {
             crate::kanji_domain::parse_kanji_character(character).map_err(|error| {
@@ -881,6 +949,7 @@ impl AcquisitionRun {
                         allow_insecure_tls,
                         target,
                         workspace: &self.workspace,
+                        generations,
                     },
                     &mut on_event,
                     interrupt,
@@ -942,6 +1011,7 @@ struct SessionAcquisitionConfig<'a> {
     allow_insecure_tls: bool,
     target: AcquisitionTarget,
     workspace: &'a Path,
+    generations: Option<&'a [u32]>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1006,6 +1076,7 @@ async fn acquire_one_session(
         allow_insecure_tls,
         target,
         workspace,
+        generations,
     } = config;
     let session_deadline = Instant::now() + OPERATION_TIMEOUT;
     let device_metrics = DeviceMetrics::new(
@@ -1044,6 +1115,7 @@ async fn acquire_one_session(
     let evidence_monitor = BrowserEvidenceMonitor::new(session.telemetry().clone());
     let browser_runtime = session.provenance().clone();
 
+    let setup_started_at = Instant::now();
     let setup = run_setup_before_deadline(session_deadline, async {
         let page = session.page();
         let tls_exception = match page.goto(SITE_URL).await {
@@ -1104,10 +1176,37 @@ async fn acquire_one_session(
     let setup_result = match setup_result {
         Ok(Ok(setup)) => Ok(setup),
         Ok(Err(message)) => {
-            tracing::error!(session = session_number, stage = "browser_setup", code = "browser_session_setup_failed", message = %crate::diagnostics::safe_message(&message), "Не удалось подготовить страницу Yarxi");
+            tracing::error!(
+                provider = PROVIDER_ID,
+                session = session_number,
+                browser_session = session.diagnostic_session_id(),
+                stage = "browser_setup",
+                code = "browser_session_setup_failed",
+                failure_code = acquisition_failure_code(&message),
+                outcome = "failure",
+                retryable = false,
+                stage_duration_ms = setup_started_at.elapsed().as_millis() as u64,
+                runtime_snapshot = %runtime_snapshot_json(&evidence_monitor.telemetry.snapshot(0)),
+                "Не удалось подготовить страницу Yarxi"
+            );
             Err(AcquisitionStreamError::Provider(message))
         }
-        Err(signal) => Err(signal_error(signal)),
+        Err(signal) => {
+            tracing::info!(
+                provider = PROVIDER_ID,
+                session = session_number,
+                browser_session = session.diagnostic_session_id(),
+                stage = "browser_setup",
+                failure_code = "acquisition_interrupted",
+                outcome = "interrupted",
+                retryable = false,
+                stop_reason = "ctrl_c",
+                stage_duration_ms = setup_started_at.elapsed().as_millis() as u64,
+                runtime_snapshot = %runtime_snapshot_json(&evidence_monitor.telemetry.snapshot(0)),
+                "Подготовка страницы Yarxi прервана"
+            );
+            Err(signal_error(signal))
+        }
     };
     let tls_exception = match finish_session_setup(setup_result, session_number, on_event) {
         Ok(setup) => setup,
@@ -1132,6 +1231,7 @@ async fn acquire_one_session(
         session = session_number,
         stage = "browser_setup",
         code = "browser_session_started",
+        stage_duration_ms = setup_started_at.elapsed().as_millis() as u64,
         elapsed_ms = session_started_at.elapsed().as_millis() as u64,
         "Браузер и страница Yarxi подготовлены"
     );
@@ -1145,9 +1245,11 @@ async fn acquire_one_session(
             tls_exception: tls_exception.map(|approved| approved.provenance),
             session_deadline,
             session: session_number,
+            browser_session: session.diagnostic_session_id(),
             interrupt,
         },
         session: session_number,
+        generations,
     };
     let result = process_session_items(characters, base_index, &mut driver, on_event).await;
     evidence_monitor.abort();
@@ -1246,6 +1348,65 @@ async fn process_session_items(
 struct BrowserSessionItemDriver<'a> {
     context: RetryAcquisitionContext<'a>,
     session: u32,
+    generations: Option<&'a [u32]>,
+}
+
+/// Только смысловые границы текущего call path Yarxi.
+#[derive(Debug, Clone, Copy)]
+enum YarxiStage {
+    SearchSubmission,
+    InformationTab,
+    ArticleVerification,
+    MediaReadiness,
+    MediaSelection,
+    DarkTheme,
+    ResourceRead,
+    FontSampleCapture,
+    RetryBackoff,
+    RetryRecovery,
+}
+
+impl YarxiStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SearchSubmission => "search_submission",
+            Self::InformationTab => "information_tab",
+            Self::ArticleVerification => "article_verification",
+            Self::MediaReadiness => "media_readiness",
+            Self::MediaSelection => "media_selection",
+            Self::DarkTheme => "dark_theme",
+            Self::ResourceRead => "resource_read",
+            Self::FontSampleCapture => "font_sample_capture",
+            Self::RetryBackoff => "retry_backoff",
+            Self::RetryRecovery => "retry_recovery",
+        }
+    }
+}
+
+async fn diagnose_yarxi_stage<T>(
+    item: &BrowserItemTimer,
+    stage: YarxiStage,
+    monitor: &BrowserEvidenceMonitor,
+    epoch: u64,
+    operation: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let timing = item.stage(stage.name());
+    let result = operation.await;
+    match &result {
+        Ok(_) => timing.finish_success(),
+        Err(error) => timing.finish_failure(
+            acquisition_failure_code(error),
+            is_retryable_acquisition_error(error, monitor, epoch),
+            Some(&monitor.telemetry.snapshot(epoch)),
+        ),
+    }
+    result
+}
+
+struct YarxiAttemptDiagnostics<'a> {
+    timing: &'a BrowserItemTimer,
+    monitor: &'a BrowserEvidenceMonitor,
+    epoch: u64,
 }
 
 impl SessionItemDriver for BrowserSessionItemDriver<'_> {
@@ -1278,6 +1439,18 @@ impl SessionItemDriver for BrowserSessionItemDriver<'_> {
     ) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError>
     {
         let started_at = Instant::now();
+        let owner_generation = self
+            .generations
+            .and_then(|generations| generations.get(index))
+            .copied();
+        let item_context = match owner_generation {
+            Some(generation) => {
+                BrowserItemContext::new(PROVIDER_ID, character, 1, u64::from(generation))
+            }
+            None => BrowserItemContext::without_generation(PROVIDER_ID, character, 1),
+        }
+        .with_browser_session(self.context.browser_session);
+        let timing = BrowserItemTimer::new(item_context);
         tracing::info!(
             session = self.session,
             identity = character,
@@ -1296,13 +1469,42 @@ impl SessionItemDriver for BrowserSessionItemDriver<'_> {
                 tls_exception: self.context.tls_exception.clone(),
                 session_deadline: self.context.session_deadline,
                 session: self.session,
+                browser_session: self.context.browser_session,
                 interrupt: &mut *self.context.interrupt,
             },
             index,
             character,
             on_event,
+            &timing,
         )
         .await;
+        match &result {
+            Ok((Ok(_), _)) => timing.finish_success(),
+            Ok((Err(error), stop)) => {
+                if let Some(reason) = stop {
+                    timing.set_stop_reason(session_stop_code(reason));
+                }
+                let snapshot = self.context.evidence_monitor.telemetry.current_snapshot();
+                let retryable = stop.is_none() || *stop == Some(SessionStopReason::ItemTimeout);
+                timing.finish_failure(
+                    terminal_failure_code(error, stop.as_ref()),
+                    retryable
+                        && is_retryable_acquisition_error(
+                            error,
+                            self.context.evidence_monitor,
+                            snapshot.epoch,
+                        ),
+                    Some(&snapshot),
+                );
+            }
+            Err(AcquisitionStreamError::Interrupted) => timing.interrupt("ctrl_c", None),
+            Err(AcquisitionStreamError::Consumer(_)) => {
+                timing.interrupt("progress_consumer_failed", None)
+            }
+            Err(AcquisitionStreamError::Provider(error)) => {
+                timing.finish_failure(acquisition_failure_code(error), false, None)
+            }
+        }
         tracing::info!(
             session = self.session,
             identity = character,
@@ -1343,6 +1545,7 @@ struct RetryAcquisitionContext<'a> {
     tls_exception: Option<TlsExceptionProvenance>,
     session_deadline: Instant,
     session: u32,
+    browser_session: u64,
     interrupt: &'a mut CtrlCListener,
 }
 
@@ -1352,9 +1555,12 @@ async fn acquire_one_with_retries(
     index: usize,
     character: &str,
     on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+    timing: &BrowserItemTimer,
 ) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError> {
     for attempt in 1..=MAX_ACQUISITION_ATTEMPTS {
+        timing.set_attempt(u64::from(attempt));
         if let Some(reason) = monitor_stop_reason(context.evidence_monitor) {
+            timing.record_runtime_snapshot(&context.evidence_monitor.telemetry.snapshot(0));
             return Ok((Err(reason.summary()), Some(reason)));
         }
         if Instant::now() >= context.session_deadline {
@@ -1364,44 +1570,71 @@ async fn acquire_one_with_retries(
             ));
         }
         let epoch = context.evidence_monitor.begin_acquisition();
+        timing.record_runtime_snapshot(&context.evidence_monitor.telemetry.snapshot(epoch));
         let item_deadline = (Instant::now() + ITEM_TIMEOUT).min(context.session_deadline);
-        let acquisition = acquire_one(
-            context.page,
-            character,
-            context.target,
-            epoch,
-            context.evidence_monitor,
-            context.browser_runtime,
-            context.tls_exception.clone(),
-        );
-        tokio::pin!(acquisition);
-        let item_timeout = timeout_at(item_deadline, &mut acquisition);
-        tokio::pin!(item_timeout);
-        let mut heartbeat = tokio::time::interval(PROGRESS_HEARTBEAT);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        heartbeat.tick().await;
-        let acquisition = loop {
-            tokio::select! {
-                result = &mut item_timeout => break result,
-                _ = heartbeat.tick() => on_event(AcquisitionEvent::Heartbeat {
-                    index,
-                    attempt,
-                })?,
-                signal = &mut *context.interrupt => return Err(signal_error(signal)),
+        let (result, timed_out) = {
+            let acquisition = acquire_one(
+                context.page,
+                character,
+                context.target,
+                context.browser_runtime,
+                context.tls_exception.clone(),
+                YarxiAttemptDiagnostics {
+                    timing,
+                    monitor: context.evidence_monitor,
+                    epoch,
+                },
+            );
+            tokio::pin!(acquisition);
+            let item_timeout = timeout_at(item_deadline, &mut acquisition);
+            tokio::pin!(item_timeout);
+            let mut heartbeat = tokio::time::interval(PROGRESS_HEARTBEAT);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            heartbeat.tick().await;
+            let acquisition = loop {
+                tokio::select! {
+                    result = &mut item_timeout => break result,
+                    _ = heartbeat.tick() => {
+                        if let Err(error) = on_event(AcquisitionEvent::Heartbeat { index, attempt }) {
+                            timing.record_runtime_snapshot(&context.evidence_monitor.telemetry.snapshot(epoch));
+                            timing.set_interruption("progress_consumer_failed", "progress_consumer_failed", false);
+                            return Err(AcquisitionStreamError::Consumer(error));
+                        }
+                    },
+                    signal = &mut *context.interrupt => {
+                        timing.record_runtime_snapshot(&context.evidence_monitor.telemetry.snapshot(epoch));
+                        timing.set_interruption("ctrl_c", "acquisition_interrupted", false);
+                        return Err(signal_error(signal));
+                    },
+                }
+            };
+            timing.record_runtime_snapshot(&context.evidence_monitor.telemetry.snapshot(epoch));
+            match acquisition {
+                Ok(result) => (result, false),
+                Err(_) if Instant::now() >= context.session_deadline => {
+                    timing.set_interruption("session_deadline", "browser_session_deadline", false);
+                    return Ok((
+                        Err("browser_session_deadline: общий срок пакета истёк".into()),
+                        Some(SessionStopReason::Deadline),
+                    ));
+                }
+                Err(_) => {
+                    timing.set_interruption(
+                        "item_timeout",
+                        "browser_item_timeout",
+                        context
+                            .evidence_monitor
+                            .retryable_acquisition(epoch, RetryTrigger::ItemTimeout),
+                    );
+                    (
+                        Err(
+                            "browser_item_timeout: превышен ограниченный срок обработки символа"
+                                .into(),
+                        ),
+                        true,
+                    )
+                }
             }
-        };
-        let (result, timed_out) = match acquisition {
-            Ok(result) => (result, false),
-            Err(_) if Instant::now() >= context.session_deadline => {
-                return Ok((
-                    Err("browser_session_deadline: общий срок пакета истёк".into()),
-                    Some(SessionStopReason::Deadline),
-                ));
-            }
-            Err(_) => (
-                Err("browser_item_timeout: превышен ограниченный срок обработки символа".into()),
-                true,
-            ),
         };
 
         match result {
@@ -1413,25 +1646,46 @@ async fn acquire_one_with_retries(
                 let stop = monitor_stop_reason(context.evidence_monitor);
                 let retry_allowed = stop.is_none()
                     && should_retry_acquisition(&error, context.evidence_monitor, epoch, attempt);
-                tracing::warn!(session = context.session, identity = character, index, attempt, stage = "retry_decision", code = acquisition_failure_code(&error), message = %crate::diagnostics::safe_message(&error), retry_allowed, monitor_failed = stop.is_some(), "Ошибка получения; решение о повторной попытке");
+                tracing::warn!(
+                    session = context.session,
+                    identity = character,
+                    index,
+                    attempt,
+                    stage = "retry_decision",
+                    code = acquisition_failure_code(&error),
+                    retry_allowed,
+                    monitor_failed = stop.is_some(),
+                    "Ошибка получения; решение о повторной попытке"
+                );
                 if let Some(reason) = stop {
                     return Ok((Err(error), Some(reason)));
                 }
                 if retry_allowed {
+                    timing.set_attempt(u64::from(attempt + 1));
                     on_event(AcquisitionEvent::RetryStarted {
                         index,
                         attempt: attempt + 1,
                     })?;
+                    let backoff_timing = timing.stage(YarxiStage::RetryBackoff.name());
                     let backoff_complete = tokio::select! {
                         result = timeout_at(context.session_deadline, sleep(RETRY_BACKOFF)) => result.is_ok(),
-                        signal = &mut *context.interrupt => return Err(signal_error(signal)),
+                        signal = &mut *context.interrupt => {
+                            backoff_timing.interrupt("ctrl_c", Some(&context.evidence_monitor.telemetry.snapshot(epoch)));
+                            return Err(signal_error(signal));
+                        },
                     };
                     if !backoff_complete {
+                        backoff_timing.finish_failure(
+                            "browser_session_deadline",
+                            false,
+                            Some(&context.evidence_monitor.telemetry.snapshot(epoch)),
+                        );
                         return Ok((
                             Err("browser_session_deadline: общий срок пакета истёк".into()),
                             Some(SessionStopReason::Deadline),
                         ));
                     }
+                    backoff_timing.finish_success();
                     let recovery_deadline = (Instant::now()
                         + ITEM_TIMEOUT.min(Duration::from_secs(30)))
                     .min(context.session_deadline);
@@ -1448,6 +1702,13 @@ async fn acquire_one_with_retries(
                         index,
                         attempt: attempt + 1,
                     })?;
+                    let recovery_timing = timing.stage(YarxiStage::RetryRecovery.name());
+                    // Та же граница begin_epoch, что ранее находилась внутри recovery;
+                    // owner сохраняет её номер для точного evidence при отмене.
+                    let recovery_epoch = context.evidence_monitor.begin_acquisition();
+                    timing.record_runtime_snapshot(
+                        &context.evidence_monitor.telemetry.snapshot(recovery_epoch),
+                    );
                     let recovery = tokio::select! {
                         result = timeout_at(
                             recovery_deadline,
@@ -1456,19 +1717,35 @@ async fn acquire_one_with_retries(
                                 context.target,
                                 context.evidence_monitor,
                                 recovery_deadline,
+                                recovery_epoch,
                             ),
                         ) => result,
-                        signal = &mut *context.interrupt => return Err(signal_error(signal)),
+                        signal = &mut *context.interrupt => {
+                            recovery_timing.interrupt("ctrl_c", Some(&context.evidence_monitor.telemetry.snapshot(recovery_epoch)));
+                            return Err(signal_error(signal));
+                        },
                     };
+                    let recovery_snapshot =
+                        context.evidence_monitor.telemetry.snapshot(recovery_epoch);
                     match recovery {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => recovery_timing.finish_success(),
                         Err(_) if Instant::now() >= context.session_deadline => {
+                            recovery_timing.finish_failure(
+                                "browser_session_deadline",
+                                false,
+                                Some(&recovery_snapshot),
+                            );
                             return Ok((
                                 Err("browser_session_deadline: общий срок пакета истёк при восстановлении страницы".into()),
                                 Some(SessionStopReason::Deadline),
                             ));
                         }
                         Ok(Err(recovery_error)) => {
+                            recovery_timing.finish_failure(
+                                acquisition_failure_code(&recovery_error),
+                                false,
+                                Some(&recovery_snapshot),
+                            );
                             return Ok((
                                 Err(format!(
                                     "{error}; browser_retry_recovery_failed: {recovery_error}"
@@ -1477,6 +1754,11 @@ async fn acquire_one_with_retries(
                             ));
                         }
                         Err(_) => {
+                            recovery_timing.finish_failure(
+                                "browser_retry_recovery_timeout",
+                                false,
+                                Some(&recovery_snapshot),
+                            );
                             let error = "восстановление страницы превысило ограниченный срок";
                             return Ok((
                                 Err(format!("{error}; browser_retry_recovery_failed")),
@@ -1548,8 +1830,8 @@ async fn recover_page_for_retry(
     target: AcquisitionTarget,
     evidence_monitor: &BrowserEvidenceMonitor,
     recovery_deadline: Instant,
+    recovery_epoch: u64,
 ) -> Result<(), String> {
-    let recovery_epoch = evidence_monitor.begin_acquisition();
     page.goto("about:blank")
         .await
         .map_err(|error| format!("browser_retry_recovery_blank: {error}"))?;
@@ -1781,11 +2063,15 @@ async fn acquire_one(
     page: &Page,
     character: &str,
     target: AcquisitionTarget,
-    epoch: u64,
-    evidence_monitor: &BrowserEvidenceMonitor,
     browser_runtime: &BrowserRuntimeProvenance,
     tls_exception: Option<TlsExceptionProvenance>,
+    diagnostics: YarxiAttemptDiagnostics<'_>,
 ) -> Result<AcquiredMedia, String> {
+    let YarxiAttemptDiagnostics {
+        timing,
+        monitor: evidence_monitor,
+        epoch,
+    } = diagnostics;
     crate::kanji_domain::parse_kanji_character(character)
         .map_err(|error| format!("invalid_kanji_identity: {error}"))?;
     let character_json = serde_json::to_string(character)
@@ -1793,20 +2079,31 @@ async fn acquire_one(
     let search_script = format!(
         "() => {{ const visible = node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none'; const container = [...document.querySelectorAll('.kanji-search-form')].find(visible); const input = container && [...container.querySelectorAll('input[placeholder=\\\"Чтение\\\"]')].find(visible); if (!input) return false; const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; set.call(input, {character_json}); input.dispatchEvent(new Event('input', {{ bubbles: true }})); input.dispatchEvent(new Event('change', {{ bubbles: true }})); const button = [...container.querySelectorAll('button,[role=button],input[type=submit],input[type=button],a')].find(node => visible(node) && (node.innerText || node.value || node.getAttribute('aria-label') || '').trim() === 'Найти' && !node.disabled); if (button) {{ button.click(); return true; }} input.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }})); return true; }}"
     );
-    let submitted: bool = page
-        .evaluate(search_script)
-        .await
-        .map_err(|error| format!("yarxi_search_ui: {error}"))?
-        .into_value()
-        .map_err(|error| format!("yarxi_search_ui_result: {error}"))?;
-    if !submitted {
-        return Err("yarxi_search_ui: поле «Чтение» или кнопка «Найти» отсутствует".into());
-    }
+    diagnose_yarxi_stage(
+        timing,
+        YarxiStage::SearchSubmission,
+        evidence_monitor,
+        epoch,
+        async {
+            let submitted: bool = page
+                .evaluate(search_script)
+                .await
+                .map_err(|error| format!("yarxi_search_ui: {error}"))?
+                .into_value()
+                .map_err(|error| format!("yarxi_search_ui_result: {error}"))?;
+            if !submitted {
+                return Err("yarxi_search_ui: поле «Чтение» или кнопка «Найти» отсутствует".into());
+            }
+            Ok(())
+        },
+    )
+    .await?;
     let expected_code = character
         .chars()
         .next()
         .map(|ch| format!("{:X}", u32::from(ch)))
         .expect("выше проверен один символ");
+    diagnose_yarxi_stage(timing, YarxiStage::InformationTab, evidence_monitor, epoch, async {
     wait_until(page, Duration::from_secs(20), || {
         "Boolean([...document.querySelectorAll('button,[role=tab]')].find(node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden' && node.innerText.trim() === 'Информация'))"
     })
@@ -1822,42 +2119,88 @@ async fn acquire_one(
     if !info_tab {
         return Err("yarxi_information_tab: вкладка «Информация» отсутствует".into());
     }
-    let article = wait_for_article(page, &expected_code).await?;
-
-    let mut snapshot = wait_for_media_snapshot(
-        page,
-        character,
-        &expected_code,
-        epoch,
+    Ok(())
+    }).await?;
+    let article = diagnose_yarxi_stage(
+        timing,
+        YarxiStage::ArticleVerification,
         evidence_monitor,
-        target,
+        epoch,
+        wait_for_article(page, &expected_code),
     )
     .await?;
-    let mut choice = choose_media_source_for_target(
-        snapshot.primary.clone(),
-        &snapshot.font_samples,
-        character,
-        target,
-    )?;
-    if target == AcquisitionTarget::PreferredSource
-        && matches!(choice, MediaSourceChoice::RenderedFontSample { .. })
-    {
-        apply_dark_theme(page).await?;
-        snapshot = wait_for_media_snapshot(
+
+    let mut snapshot = diagnose_yarxi_stage(
+        timing,
+        YarxiStage::MediaReadiness,
+        evidence_monitor,
+        epoch,
+        wait_for_media_snapshot(
             page,
             character,
             &expected_code,
             epoch,
             evidence_monitor,
             target,
+        ),
+    )
+    .await?;
+    let mut choice = diagnose_yarxi_stage(
+        timing,
+        YarxiStage::MediaSelection,
+        evidence_monitor,
+        epoch,
+        async {
+            choose_media_source_for_target(
+                snapshot.primary.clone(),
+                &snapshot.font_samples,
+                character,
+                target,
+            )
+        },
+    )
+    .await?;
+    if target == AcquisitionTarget::PreferredSource
+        && matches!(choice, MediaSourceChoice::RenderedFontSample { .. })
+    {
+        diagnose_yarxi_stage(
+            timing,
+            YarxiStage::DarkTheme,
+            evidence_monitor,
+            epoch,
+            apply_dark_theme(page),
         )
         .await?;
-        choice = choose_media_source_for_target(
-            snapshot.primary.clone(),
-            &snapshot.font_samples,
-            character,
-            target,
-        )?;
+        snapshot = diagnose_yarxi_stage(
+            timing,
+            YarxiStage::MediaReadiness,
+            evidence_monitor,
+            epoch,
+            wait_for_media_snapshot(
+                page,
+                character,
+                &expected_code,
+                epoch,
+                evidence_monitor,
+                target,
+            ),
+        )
+        .await?;
+        choice = diagnose_yarxi_stage(
+            timing,
+            YarxiStage::MediaSelection,
+            evidence_monitor,
+            epoch,
+            async {
+                choose_media_source_for_target(
+                    snapshot.primary.clone(),
+                    &snapshot.font_samples,
+                    character,
+                    target,
+                )
+            },
+        )
+        .await?;
     }
     let (selection, source_url, absence_proof, rendered_font_sample, bytes) = match choice {
         MediaSourceChoice::Url {
@@ -1865,15 +2208,28 @@ async fn acquire_one(
             url,
             absence_proof,
         } => {
-            let bytes = resource_bytes(page, &url).await?;
+            let bytes = diagnose_yarxi_stage(
+                timing,
+                YarxiStage::ResourceRead,
+                evidence_monitor,
+                epoch,
+                resource_bytes(page, &url),
+            )
+            .await?;
             (selection, url, absence_proof, None, bytes)
         }
         MediaSourceChoice::RenderedFontSample {
             sample,
             absence_proof,
         } => {
-            let (bytes, evidence) =
-                render_font_sample_png(page, &sample, character, &expected_code).await?;
+            let (bytes, evidence) = diagnose_yarxi_stage(
+                timing,
+                YarxiStage::FontSampleCapture,
+                evidence_monitor,
+                epoch,
+                render_font_sample_png(page, &sample, character, &expected_code),
+            )
+            .await?;
             (
                 SelectionResult::RenderedFontSamplePng,
                 SITE_URL.to_owned(),
@@ -2703,6 +3059,186 @@ async fn run_setup_before_deadline<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct DiagnosticBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DiagnosticBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn browser_diagnostic_events(operation: impl FnOnce()) -> Vec<Value> {
+        let buffer = DiagnosticBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_writer(buffer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, operation);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn browser_stage_failure_preserves_identity_stage_and_current_epoch_without_dom() {
+        let monitor = BrowserEvidenceMonitor::new(CdpRuntimeMonitor::from_snapshot_for_test(
+            RuntimeSnapshot {
+                pending_requests: vec![
+                    TrackedRequest {
+                        request_id: "current".into(),
+                        url: "https://example.invalid/private?secret=value".into(),
+                        resource_type: ResourceType::Image,
+                        epoch: 2,
+                        is_top_level: false,
+                    },
+                    TrackedRequest {
+                        request_id: "old".into(),
+                        url: "https://old.invalid/secret".into(),
+                        resource_type: ResourceType::Script,
+                        epoch: 1,
+                        is_top_level: false,
+                    },
+                ],
+                ..RuntimeSnapshot::default()
+            },
+        ));
+        let events = browser_diagnostic_events(|| {
+            let item = BrowserItemTimer::new(
+                BrowserItemContext::new(PROVIDER_ID, "漢", 1, 0).with_browser_session(7),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(diagnose_yarxi_stage(
+                &item,
+                YarxiStage::ArticleVerification,
+                &monitor,
+                2,
+                async {
+                    Err::<(), _>("article_identity_mismatch: article_text=PRIVATE_DOM".into())
+                },
+            ));
+            assert!(result.is_err());
+            item.finish_failure("article_identity_mismatch", false, None);
+        });
+        assert_eq!(events.len(), 2);
+        let stage = &events[0]["fields"];
+        assert_eq!(stage["stage"], "article_verification");
+        assert_eq!(stage["provider"], PROVIDER_ID);
+        assert_eq!(stage["identity"], "漢");
+        assert_eq!(stage["browser_session"], 7);
+        assert_eq!(stage["failure_code"], "article_identity_mismatch");
+        assert_eq!(stage["retryable"], false);
+        assert!(
+            stage["item_duration_ms"].as_u64().unwrap()
+                >= stage["stage_duration_ms"].as_u64().unwrap()
+        );
+        let snapshot: Value =
+            serde_json::from_str(stage["runtime_snapshot"].as_str().unwrap()).unwrap();
+        assert_eq!(snapshot["epoch"], 2);
+        assert_eq!(snapshot["pending_request_count"], 1);
+        assert_eq!(snapshot["pending_requests"][0]["in_current_epoch"], true);
+        let serialized = serde_json::to_string(&events).unwrap();
+        for secret in [
+            "PRIVATE_DOM",
+            "example.invalid",
+            "old.invalid",
+            "secret=value",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn browser_outer_timeout_records_active_yarxi_stage_before_next_attempt() {
+        let monitor = monitor_with_failure(false);
+        let events = browser_diagnostic_events(|| {
+            let item = BrowserItemTimer::new(
+                BrowserItemContext::new(PROVIDER_ID, "漢", 1, 0).with_browser_session(8),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                // Первый poll входит в настоящий provider wrapper; затем
+                // воспроизводим границу timeout без ожидания и браузера.
+                let acquisition = diagnose_yarxi_stage(
+                    &item,
+                    YarxiStage::MediaReadiness,
+                    &monitor,
+                    1,
+                    std::future::pending::<Result<(), String>>(),
+                );
+                tokio::pin!(acquisition);
+                tokio::select! {
+                    biased;
+                    _ = &mut acquisition => unreachable!(),
+                    _ = std::future::ready(()) => {}
+                }
+                item.record_runtime_snapshot(&monitor.telemetry.snapshot(1));
+                item.set_interruption("item_timeout", "browser_item_timeout", true);
+            });
+            item.set_attempt(2);
+            item.stage(YarxiStage::SearchSubmission.name())
+                .finish_success();
+            item.finish_success();
+        });
+        assert_eq!(events.len(), 3);
+        let failure = &events[0]["fields"];
+        assert_eq!(failure["stage"], "media_readiness");
+        assert_eq!(failure["attempt"], 1);
+        assert_eq!(failure["failure_code"], "browser_item_timeout");
+        assert_eq!(failure["retryable"], true);
+        assert_eq!(failure["stop_reason"], "item_timeout");
+        assert!(failure["runtime_snapshot"].is_string());
+        let completed = &events[2]["fields"];
+        assert_eq!(completed["attempt"], 2);
+        assert_eq!(completed["outcome"], "success");
+        assert!(completed.get("stop_reason").is_none());
+    }
+
+    #[test]
+    fn browser_terminal_failure_code_keeps_session_stop_cause() {
+        assert_eq!(
+            terminal_failure_code("gif_unknown: pending", Some(&SessionStopReason::Deadline)),
+            "browser_session_deadline"
+        );
+        assert_eq!(
+            terminal_failure_code(
+                "gif_unknown: pending",
+                Some(&SessionStopReason::RetryRecoveryFailed(
+                    "private detail".into()
+                ))
+            ),
+            "browser_retry_recovery_failed"
+        );
+        assert_eq!(
+            terminal_failure_code("gif_unknown: pending", None),
+            "gif_unknown"
+        );
+    }
 
     #[test]
     fn borrowed_acquisition_workspace_survives_early_error_and_close() {

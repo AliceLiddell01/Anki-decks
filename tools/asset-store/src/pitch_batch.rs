@@ -2046,6 +2046,10 @@ pub fn is_retryable_failure(error: &JpdbPitchFailure) -> bool {
 }
 
 fn contains_retryable_network_error(message: &str) -> bool {
+    if is_observed_chromiumoxide_navigation_timeout(message) {
+        return true;
+    }
+
     let upper = message.to_ascii_uppercase();
     [
         "NET::ERR_TIMED_OUT",
@@ -2070,6 +2074,17 @@ fn contains_retryable_network_error(message: &str) -> bool {
     .iter()
     .any(|token| upper.contains(token))
         || contains_retryable_http_status(&upper)
+}
+
+fn is_observed_chromiumoxide_navigation_timeout(message: &str) -> bool {
+    const NAVIGATION_ERROR_PREFIX: &str = "Не удалось перейти на страницу JPDB: ";
+    const CHROMIUMOXIDE_TIMEOUT_DISPLAY: &str = "Request timed out.";
+
+    // navigate() добавляет этот префикс к chromiumoxide::CdpError::Timeout;
+    // Display в chromiumoxide 0.9.1 — ровно "Request timed out.".
+    message
+        .strip_prefix(NAVIGATION_ERROR_PREFIX)
+        .is_some_and(|cause| cause == CHROMIUMOXIDE_TIMEOUT_DISPLAY)
 }
 
 fn contains_retryable_http_status(message: &str) -> bool {

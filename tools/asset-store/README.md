@@ -979,12 +979,14 @@ JSON-ответ содержит `schema_version`, `operation`, `store`, `mode`,
 точки. При `--output json` `stdout` по-прежнему содержит один самостоятельный
 итоговый JSON-ответ команды; данные о ходе выполнения с ним не смешиваются.
 
-Каждый запуск получения создаёт отдельный подробный журнал в служебном каталоге
-пакета: `<store_root>/.runtime/batches/<batch_id>/logs/<run_id>.jsonl`. Каталог
-и файл создаёт `SafeBatchRuntime` относительно проверенной границы, без перехода
-по символическим ссылкам и без перезаписи журнала другого запуска. Путь
-возвращается как необязательное поле `diagnostic_log` в итоговом JSON, в том
-числе при ошибке; в человекочитаемом режиме он печатается в `stderr` при старте.
+Каждый запуск получения через `kanji-assets batch run` или pitch batch runner
+(`pitch-assets ensure`, `batch run` и `batch resume`) создаёт отдельный подробный
+журнал в служебном каталоге пакета:
+`<store_root>/.runtime/batches/<batch_id>/logs/<run_id>.jsonl`. Каталог и файл
+создаёт `SafeBatchRuntime` относительно проверенной границы, без перехода по
+символическим ссылкам и без перезаписи журнала другого запуска. Путь возвращается
+как необязательное поле `diagnostic_log` в итоговом JSON, в том числе при ошибке;
+в человекочитаемом режиме он печатается в `stderr` при старте.
 
 Журнал содержит JSON Lines с временными метками, уровнем, модулем и
 структурированными полями выполнения. В нём остаются безопасные сообщения
@@ -994,8 +996,79 @@ JSON-ответ содержит `schema_version`, `operation`, `store`, `mode`,
 поток JSONL с событиями прогресса без форматированных строк диагностики. Обычный
 режим может дополнительно показывать читаемые tracing-сообщения только в `stderr`;
 `stdout` остаётся выводом команды.
+События `browser_acquisition_*` имеют уровень DEBUG и остаются в файле: слой
+человекочитаемого вывода принимает только INFO, а при `--output json` этот слой
+отключён и `stderr` сохраняет отдельный поток JSONL-прогресса.
 Журнал создаётся до начала получения, а команда ждёт записи всех событий перед
 возвратом.
+
+В этом журнале общая схема фиксирует длительность элемента браузерного получения
+и его этапов отдельными DEBUG-событиями `browser_acquisition_item` и
+`browser_acquisition_stage` с `schema: "browser_acquisition_v1"` и
+`schema_version: 1`. У события элемента `stage` равен `item`; `stage_duration_ms`
+измеряет время текущего этапа, а `item_duration_ms` — накопленное время элемента
+с момента его запуска. У Yarxi таймер охватывает внутренние повторы и backoff;
+в pitch batch каждая назначенная попытка получает собственный таймер элемента.
+Длительности измеряются монотонными часами.
+
+В каждом событии есть `provider`, очищенная `identity`, `attempt`, `generation`,
+`worker`, `worker_session`, `browser_session`, `stage`, `stage_duration_ms`,
+`item_duration_ms`, `outcome`, `failure_code`, `retryable`, `stop_reason` и
+`runtime_snapshot`. Для JPDB `provider` равен `jpdb`, а для Yarxi —
+`yarxi-suu-browser`. В pitch batch runner значения `worker` и `worker_session`
+обозначают исполнителя и его локальную сессию браузера; поля могут быть пустыми в
+контекстах без исполнителя. `browser_session` — диагностический идентификатор
+браузерной сессии. `provider`, `outcome`, `failure_code` и `stop_reason` ограничены
+безопасными токенами; недопустимые значения заменяются на `redacted`. `identity`
+ограничена 256 байтами и очищается перед записью. `failure_code` и последний
+`runtime_snapshot` передаются при отказе или прерывании, если снимок доступен, а
+`stop_reason` отдельно объясняет остановку. `retryable` отражает решение
+провайдера о возможности повтора, а не сам факт повтора. `generation` равен
+owner generation в kanji batch и `null` в provider-only запуске без такого
+контекста; фиктивный ноль не используется. Если monitor/session failure возникает
+после предметного результата, item сохраняет свой исход, а `stop_reason` и свежий
+snapshot связывают его с остановкой очереди.
+
+Значения `stage` принадлежат фактическим границам провайдеров. JPDB использует
+`configure_browser`, `search_resolution`, `search_navigation`,
+`search_readiness`, `detail_navigation`, `detail_readiness`,
+`detail_verification`, `pitch_inspection`, `capture` и
+`post_capture_verification`; на пути перенаправления сразу к словарной странице
+`detail_navigation` может отсутствовать. Yarxi использует `search_submission`,
+`information_tab`, `article_verification`, `media_readiness`, `media_selection`,
+`dark_theme`, `resource_read`, `font_sample_capture`, `retry_backoff` и
+`retry_recovery`. Успешный этап имеет `outcome: "success"`; у элемента JPDB
+успешные исходы — `acquired`, `no_pitch_accent_on_source`,
+`ambiguous_vocabulary`, `vocabulary_not_found` и `empty_request_list`. Ошибки и
+прерывания отмечаются как `failure` и `interrupted`; их коды причин передаются в
+`failure_code`, а предметный исход элемента Yarxi при успехе — `success`.
+
+`runtime_snapshot` — JSON-проекция последней телеметрии CDP, вложенная как строка
+и ограниченная 32 КиБ. Она содержит `epoch`, счётчики `pending_request_count`,
+`network_failure_count` и `http_error_count`, до 16 примеров каждого вида в
+`pending_requests`, `network_failures` и `http_errors`, а также
+`javascript_exceptions` и `monitor_failed`. Stale epoch имеет отдельные
+`stale_pending_request_count`, `stale_network_failure_count`,
+`stale_http_error_count` и коллекции `stale_pending_requests`,
+`stale_network_failures`, `stale_http_errors`; JS exceptions разделены на
+текущую, bootstrap и stale группы. Каждая текущая и stale collection ограничена
+16 записями. Запись примера содержит
+`request_key`, тип ресурса, эпоху, признак текущей эпохи и верхнеуровневого
+запроса, возраст наблюдения, HTTP-статус и категорию сетевой ошибки; вместо сырых
+ID запросов используются SHA-256-ключи. URL, заголовки, cookie, DOM и исходные
+CDP-сообщения в снимок не попадают. Если он превышает лимит, остаётся компактный
+объект с `truncated: true`, текущими и stale счётчиками, разбивкой JavaScript-
+исключений и `monitor_failed`.
+
+Эти события описывают получение одного элемента и его этапы, а progress-события
+`browser_session_started`, `browser_session_ended` и `browser_session_rotated`
+остаются отдельными записями жизненного цикла сессии. Общий `browser_runtime`
+пишет lifecycle-события с `event: "browser_lifecycle"` для остановки transport,
+owned процесса, CDP handler, telemetry и удаления profile/temp. Transport outcome
+не подменяет postcondition: detached transport считается безвредным только при
+доказанной остановке процесса и успешном удалении принадлежащих каталогов. Ошибка
+этих postconditions остаётся `browser_cleanup_failed`; сбои внешнего run workspace
+сохраняют код `temp_workspace_cleanup_failed`.
 
 Пример выборки ошибок из одного запуска:
 

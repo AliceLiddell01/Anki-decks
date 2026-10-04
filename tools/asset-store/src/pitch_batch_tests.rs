@@ -406,6 +406,21 @@ fn navigation_retry_classifier_requires_error_or_http_context() {
     assert!(crate::pitch_batch::is_retryable_failure(&navigation(
         "temporary resolver failure: net::ERR_DNS_TIMED_OUT"
     )));
+    assert!(crate::pitch_batch::is_retryable_failure(&navigation(
+        "Не удалось перейти на страницу JPDB: Request timed out."
+    )));
+    assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
+        "Request timed out."
+    )));
+    assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
+        "Не удалось перейти на страницу JPDB: Request timed out. Дополнительные сведения"
+    )));
+    assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
+        "Не удалось перейти на страницу JPDB: request timed out."
+    )));
+    assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
+        "Другой сбой: Request timed out."
+    )));
     assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
         "request took 500 ms at https://jpdb.io/vocabulary/500/幽霊/ゆうれい"
     )));
@@ -424,6 +439,43 @@ fn navigation_retry_classifier_requires_error_or_http_context() {
     assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
         "DNS_PROBE_FINISHED_NXDOMAIN"
     )));
+
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::InvalidQuery {
+            stage: JpdbPitchStage::SearchNavigation,
+            message: "Invalid search query".into(),
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::PageContract {
+            stage: JpdbPitchStage::DetailVerification,
+            message: "Unexpected page contract".into(),
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::DetailIdentityMismatch {
+            stage: JpdbPitchStage::DetailVerification,
+            expected_surface: "幽霊".into(),
+            expected_reading: Some("ゆうれい".into()),
+            vocabulary_id: Some(123),
+            observed_surface_forms: vec!["亡霊".into()],
+            observed_readings: vec!["ぼうれい".into()],
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::InvalidSelection {
+            stage: JpdbPitchStage::SearchResolution,
+            message: "Invalid vocabulary selection".into(),
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::ExplicitSelectionMismatch {
+            stage: JpdbPitchStage::DetailVerification,
+            vocabulary_id: 123,
+            detail_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい".into(),
+            message: "The selected vocabulary does not match the request".into(),
+        }
+    ));
 }
 
 #[test]

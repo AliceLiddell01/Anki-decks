@@ -70,6 +70,10 @@ required-features = ["reference-generator"]
 name = "integration"
 path = "tests/integration.rs"
 
+[[test]]
+name = "browser_acquisition_diagnostics_contract"
+path = "tests/browser_acquisition_diagnostics_contract.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 

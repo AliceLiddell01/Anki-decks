@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::batch_runtime::SafeBatchRuntime;
+use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer};
 use crate::browser_runtime::BrowserSession;
 use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
 use crate::domain::AssetDomainPolicy;
@@ -1826,6 +1827,35 @@ trait PitchRunDriver {
         session: &Self::Session,
         request: &JpdbPitchRequest,
     ) -> JpdbPitchAcquisitionReport;
+    fn record_item_runtime_diagnostics(&self, _session: &Self::Session, _item: &BrowserItemTimer) {}
+
+    async fn acquire_diagnostic(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+        item: BrowserItemTimer,
+    ) -> JpdbPitchAcquisitionReport {
+        let report = self.acquire(session, request).await;
+        if let Some(failure) = &report.session_failure {
+            let value = serde_json::to_value(failure).expect("ошибка JPDB сериализуется");
+            item.finish_failure(
+                value["code"].as_str().unwrap_or("unknown"),
+                is_retryable_failure(failure),
+                None,
+            );
+        } else if let Some(JpdbPitchOutcome::Failed { error }) = report.outcomes.first() {
+            let value = serde_json::to_value(error).expect("ошибка JPDB сериализуется");
+            item.finish_failure(
+                value["code"].as_str().unwrap_or("unknown"),
+                is_retryable_failure(error),
+                None,
+            );
+        } else {
+            item.finish_success();
+        }
+        report
+    }
+
     async fn close(&mut self, session: Self::Session);
 
     async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
@@ -1870,6 +1900,25 @@ impl PitchRunDriver for JpdbRunDriver {
         request: &JpdbPitchRequest,
     ) -> JpdbPitchAcquisitionReport {
         JpdbPitchProvider::acquire_requests_in_session(session, std::slice::from_ref(request)).await
+    }
+
+    fn record_item_runtime_diagnostics(&self, session: &Self::Session, item: &BrowserItemTimer) {
+        item.set_browser_session(session.diagnostic_session_id());
+        item.record_runtime_snapshot(&session.telemetry().current_snapshot());
+    }
+
+    async fn acquire_diagnostic(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+        item: BrowserItemTimer,
+    ) -> JpdbPitchAcquisitionReport {
+        JpdbPitchProvider::acquire_requests_in_session_diagnostic(
+            session,
+            std::slice::from_ref(request),
+            item,
+        )
+        .await
     }
 
     async fn close(&mut self, session: Self::Session) {
@@ -2484,6 +2533,24 @@ struct PitchWorkerControl<'a> {
     policy: PitchRunPolicy,
 }
 
+fn pitch_worker_item_timer(
+    job: &PitchAcquisitionJob,
+    context: &PitchWorkerContext,
+) -> BrowserItemTimer {
+    BrowserItemTimer::new(
+        BrowserItemContext::new(
+            "jpdb",
+            &job.token.identity.key,
+            job.attempt as u64,
+            u64::from(job.token.generation),
+        )
+        .with_worker(
+            u64::from(context.worker),
+            u64::from(context.worker_session.unwrap_or_default()),
+        ),
+    )
+}
+
 fn pitch_worker_progress(
     sender: &mpsc::UnboundedSender<PitchWorkerEvent>,
     event: &'static str,
@@ -2568,6 +2635,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             }
             context.identity = Some(job.token.identity.clone());
             context.attempt = Some(job.attempt);
+            let mut diagnostic_item = None;
             if session.is_none() {
                 if control.cancellation.clone().now_or_never().is_some() {
                     stop_reason = Some("interrupted");
@@ -2591,13 +2659,24 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 pitch_worker_progress(&events, "heartbeat", &context, None)?;
                 // Запуск нельзя отменить до получения сессии во владение: внутри
                 // запускается обработчик CDP. Проверяем сигнал сразу после запуска.
+                let item = pitch_worker_item_timer(&job, &context);
+                item.set_interruption("acquisition_interrupted", "interrupted", false);
+                let configuration = item.stage("configure_browser");
                 let launched = AssertUnwindSafe(driver.launch().instrument(tracing::info_span!(
                     "pitch_worker_launch", worker = control.worker, worker_session,
                     session = context.session,
                 ))).catch_unwind().await;
                 session = Some(match launched {
-                    Ok(Ok(launched)) => launched,
+                    Ok(Ok(launched)) => {
+                        driver.record_item_runtime_diagnostics(&launched, &item);
+                        configuration.finish_success();
+                        diagnostic_item = Some(item);
+                        launched
+                    },
                     Ok(Err(message)) => {
+                        configuration.finish_failure("browser_setup", false, None);
+                        item.set_stop_reason("session_failure");
+                        item.finish_failure("browser_setup", false, None);
                         let failure = JpdbPitchFailure::BrowserSetup {
                             stage: JpdbPitchStage::ConfigureBrowser,
                             message,
@@ -2605,9 +2684,12 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                         trace_pitch_failure(&failure, context.progress(), true);
                         return Err(pitch_session_failure(failure));
                     }
-                    Err(payload) => return Err(pitch_run_stopped(
-                        "worker_panic", pitch_panic_message(payload),
-                    )),
+                    Err(payload) => {
+                        configuration.finish_failure("worker_panic", false, None);
+                        item.set_stop_reason("worker_panic");
+                        item.finish_failure("worker_panic", false, None);
+                        return Err(pitch_run_stopped("worker_panic", pitch_panic_message(payload)));
+                    },
                 });
                 session_started = Instant::now();
                 session_items = 0;
@@ -2623,9 +2705,13 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             if job.attempt > 1 {
                 pitch_worker_progress(&events, "retry_started", &context, None)?;
             }
+            let item = diagnostic_item.unwrap_or_else(|| pitch_worker_item_timer(&job, &context));
+            item.set_interruption("acquisition_interrupted", "interrupted", false);
             let acquired = {
                 let acquisition = AssertUnwindSafe(
-                    driver.acquire(session.as_ref().expect("сессия запущена"), &job.request)
+                    driver.acquire_diagnostic(
+                        session.as_ref().expect("сессия запущена"), &job.request, item,
+                    )
                         .instrument(tracing::info_span!(
                             "pitch_worker_acquisition", worker = control.worker, worker_session,
                             session = context.session, identity = %safe_message(&job.token.identity.key),

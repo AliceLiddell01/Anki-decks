@@ -10,6 +10,7 @@ compile_error!("asset-store currently supports Linux only");
 
 pub mod batch;
 pub mod batch_runtime;
+pub mod browser_diagnostics;
 pub mod browser_runtime;
 pub mod cli;
 pub mod diagnostics;

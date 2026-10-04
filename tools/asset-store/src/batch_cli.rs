@@ -270,6 +270,15 @@ struct BatchProgressReporter<'a> {
     run_completed: usize,
     batch_total: usize,
     last_identity: Option<AssetIdentity>,
+    // Контекст подробного журнала: публичные progress events сохраняют прежние поля.
+    browser_session: Option<u32>,
+    acquisition_attempt: Option<u8>,
+    generation: Option<u32>,
+    owner_attempt: Option<usize>,
+    item_pending_checkpoint: bool,
+    last_checkpointed_identity: Option<AssetIdentity>,
+    last_checkpoint_revision: Option<u64>,
+    run_stop_reason: Option<&'static str>,
 }
 
 impl BatchProgressReporter<'_> {
@@ -279,9 +288,19 @@ impl BatchProgressReporter<'_> {
         self.round_total = total;
     }
 
-    fn checkpointed(&mut self) {
+    fn begin_item(&mut self, generation: u32, prior_attempts: usize) {
+        self.acquisition_attempt = Some(1);
+        self.generation = Some(generation);
+        self.owner_attempt = Some(prior_attempts + 1);
+        self.item_pending_checkpoint = true;
+    }
+
+    fn checkpointed(&mut self, identity: &AssetIdentity, revision: u64) {
         self.round_completed += 1;
         self.run_completed += 1;
+        self.last_checkpointed_identity = Some(identity.clone());
+        self.last_checkpoint_revision = Some(revision);
+        self.item_pending_checkpoint = false;
     }
 
     fn emit(
@@ -296,10 +315,26 @@ impl BatchProgressReporter<'_> {
         if identity.is_some() {
             self.last_identity = identity.cloned();
         }
+        if let Some(session) = session {
+            self.browser_session = Some(session);
+        }
+        if let Some(attempt) = attempt {
+            self.acquisition_attempt = Some(attempt);
+        }
         let reason = reason.map(|reason| safe_message(&reason));
         tracing::info!(
+            diagnostic_schema = "kanji_batch_progress_v1",
+            provider = "yarxi", domain = "kanji",
             stage = event, batch_id = %self.batch_id,
-            identity = ?identity.map(|identity| identity.key.as_str()), session, attempt,
+            identity = identity.map(|identity| identity.key.as_str()), session, attempt,
+            browser_session = self.browser_session,
+            acquisition_attempt = self.acquisition_attempt,
+            generation = self.generation, owner_attempt = self.owner_attempt,
+            run_stop_reason = self.run_stop_reason,
+            last_checkpointed_identity = self.last_checkpointed_identity.as_ref().map(|identity| identity.key.as_str()),
+            last_checkpoint_revision = self.last_checkpoint_revision,
+            checkpointed_items = self.run_completed,
+            item_pending_checkpoint = self.item_pending_checkpoint,
             outcome = ?outcome, reason = ?reason,
             elapsed_ms = self.started.elapsed().as_millis() as u64,
             round = ?self.round, round_completed = self.round_completed,
@@ -961,14 +996,19 @@ fn execute_command_with_snapshots_and_progress(
                 store,
                 batch_id,
                 *rounds,
-                |characters, on_event| {
+                |characters, generations, on_event| {
                     if acquisition_run.is_none() {
                         acquisition_run = Some(AcquisitionRun::new()?);
                     }
                     acquisition_run
                         .as_mut()
                         .expect("среда получения создана")
-                        .acquire(characters, allow_insecure_tls, on_event)
+                        .acquire_with_generations(
+                            characters,
+                            allow_insecure_tls,
+                            generations,
+                            on_event,
+                        )
                         .map(|_| ())
                 },
                 reader,
@@ -1155,7 +1195,7 @@ where
         store,
         batch_id,
         rounds,
-        |characters, on_event| {
+        |characters, _generations, on_event| {
             let outcomes = acquire(characters).map_err(AcquisitionStreamError::Provider)?;
             for (index, outcome) in outcomes.into_iter().enumerate() {
                 on_event(AcquisitionEvent::ItemStarted { index })
@@ -1184,6 +1224,7 @@ fn run_batch_with_stream_and_progress<F>(
 where
     F: FnMut(
         &[String],
+        &[u32],
         &mut dyn FnMut(AcquisitionEvent) -> Result<(), AssetError>,
     ) -> Result<(), AcquisitionStreamError>,
 {
@@ -1231,6 +1272,14 @@ where
         run_completed: 0,
         batch_total,
         last_identity: None,
+        browser_session: None,
+        acquisition_attempt: None,
+        generation: None,
+        owner_attempt: None,
+        item_pending_checkpoint: false,
+        last_checkpointed_identity: None,
+        last_checkpoint_revision: None,
+        run_stop_reason: None,
     };
     progress.emit("run_started", None, None, None, None, None)?;
 
@@ -1252,6 +1301,10 @@ where
                     .expect("элемент границы обхода присутствует в состоянии");
                 (item.generation, item.attempts.len())
             })
+            .collect();
+        let owner_generations: Vec<_> = generations
+            .iter()
+            .map(|(generation, _)| *generation)
             .collect();
         let characters: Vec<_> = frontier
             .iter()
@@ -1303,6 +1356,7 @@ where
                     let identity = frontier.get(index).ok_or_else(|| {
                         invalid("поставщик сообщил индекс символа вне очереди раунда")
                     })?;
+                    progress.begin_item(generations[index].0, generations[index].1);
                     progress.emit("item_started", Some(identity), None, None, None, None)
                 }
                 AcquisitionEvent::RetryStarted { index, attempt } => {
@@ -1350,7 +1404,7 @@ where
                     )?;
                     state = latest;
                     if saved {
-                        progress.checkpointed();
+                        progress.checkpointed(identity, state.revision);
                         progress.emit(
                             "item_checkpointed",
                             Some(identity),
@@ -1360,6 +1414,7 @@ where
                             None,
                         )
                     } else {
+                        progress.item_pending_checkpoint = false;
                         progress.emit(
                             "item_discarded_stale",
                             Some(identity),
@@ -1371,9 +1426,14 @@ where
                     }
                 }
             };
-            acquire(&characters, &mut on_acquisition_event)
+            acquire(&characters, &owner_generations, &mut on_acquisition_event)
         };
         if let Err(error) = acquisition {
+            progress.run_stop_reason = Some(match &error {
+                AcquisitionStreamError::Provider(_) => "provider_failure",
+                AcquisitionStreamError::Consumer(_) => "consumer_failure",
+                AcquisitionStreamError::Interrupted => "interrupted",
+            });
             let reason = match &error {
                 AcquisitionStreamError::Provider(message) => message.clone(),
                 AcquisitionStreamError::Consumer(error) => error.to_string(),

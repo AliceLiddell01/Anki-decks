@@ -25,6 +25,7 @@ use tokio::time::{Instant, sleep, timeout};
 use tracing::Instrument;
 use url::Url;
 
+use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer, BrowserStageTimer};
 use crate::diagnostics::{safe_message, safe_route};
 
 use crate::browser_runtime::{
@@ -372,6 +373,164 @@ pub enum JpdbPitchStage {
     PostCaptureVerification,
 }
 
+impl JpdbPitchStage {
+    fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::ConfigureBrowser => "configure_browser",
+            Self::SearchNavigation => "search_navigation",
+            Self::SearchReadiness => "search_readiness",
+            Self::SearchResolution => "search_resolution",
+            Self::DetailNavigation => "detail_navigation",
+            Self::DetailReadiness => "detail_readiness",
+            Self::DetailVerification => "detail_verification",
+            Self::PitchInspection => "pitch_inspection",
+            Self::Capture => "capture",
+            Self::PostCaptureVerification => "post_capture_verification",
+        }
+    }
+}
+
+fn request_diagnostic_timer(request: &JpdbPitchRequest) -> BrowserItemTimer {
+    BrowserItemTimer::new(BrowserItemContext::new(
+        "jpdb",
+        &request.query.surface,
+        1,
+        0,
+    ))
+}
+
+/// Владеет только диагностикой: отмена Future сохраняет последний этап и свежий
+/// ограниченный снимок, не принимая предметных решений и не записывая checkpoint.
+struct JpdbItemDiagnostics<'a> {
+    telemetry: &'a CdpRuntimeMonitor,
+    item: Option<BrowserItemTimer>,
+    active: Option<BrowserStageTimer>,
+    stage: JpdbPitchStage,
+    epoch: Option<u64>,
+}
+
+impl<'a> JpdbItemDiagnostics<'a> {
+    fn new(session: &'a BrowserSession, item: BrowserItemTimer) -> Self {
+        item.set_browser_session(session.diagnostic_session_id());
+        Self::from_monitor(session.telemetry(), item)
+    }
+
+    fn from_monitor(telemetry: &'a CdpRuntimeMonitor, item: BrowserItemTimer) -> Self {
+        // До первой navigation этот item ещё не владеет epoch. Bootstrap
+        // evidence допустимо; evidence предыдущего item не приписываем новому.
+        item.record_runtime_snapshot(&telemetry.snapshot(0));
+        let active = item.stage(JpdbPitchStage::ConfigureBrowser.diagnostic_name());
+        Self {
+            telemetry,
+            item: Some(item),
+            active: Some(active),
+            stage: JpdbPitchStage::ConfigureBrowser,
+            epoch: None,
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeSnapshot {
+        self.telemetry.snapshot(self.epoch.unwrap_or(0))
+    }
+
+    fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = Some(epoch);
+        self.item
+            .as_ref()
+            .expect("диагностика элемента активна")
+            .record_runtime_snapshot(&self.snapshot());
+    }
+
+    fn record_current_snapshot(&self) {
+        self.item
+            .as_ref()
+            .expect("диагностика элемента активна")
+            .record_runtime_snapshot(&self.snapshot());
+    }
+
+    fn transition(&mut self, stage: JpdbPitchStage) {
+        if let Some(active) = self.active.take() {
+            active.finish_success();
+        }
+        self.stage = stage;
+        let item = self.item.as_ref().expect("диагностика элемента активна");
+        item.record_runtime_snapshot(&self.snapshot());
+        self.active = Some(item.stage(stage.diagnostic_name()));
+    }
+
+    fn finish_failure(mut self, failure: &JpdbPitchFailure) {
+        let value = serde_json::to_value(failure).expect("ошибка JPDB сериализуется");
+        let code = value["code"].as_str().unwrap_or("unknown");
+        let retryable = crate::pitch_batch::is_retryable_failure(failure);
+        let snapshot = self.snapshot();
+        if let Some(active) = self.active.take() {
+            active.finish_failure(code, retryable, Some(&snapshot));
+        }
+        self.item
+            .take()
+            .expect("диагностика элемента активна")
+            .finish_failure(code, retryable, Some(&snapshot));
+    }
+
+    fn finish_outcome(mut self, outcome: &JpdbPitchOutcome) {
+        if let JpdbPitchOutcome::Failed { error } = outcome {
+            self.finish_failure(error);
+            return;
+        }
+        let code = match outcome {
+            JpdbPitchOutcome::Acquired { .. } => "acquired",
+            JpdbPitchOutcome::NoPitchAccentOnSource { .. } => "no_pitch_accent_on_source",
+            JpdbPitchOutcome::AmbiguousVocabulary { .. } => "ambiguous_vocabulary",
+            JpdbPitchOutcome::VocabularyNotFound { .. } => "vocabulary_not_found",
+            JpdbPitchOutcome::Failed { .. } => unreachable!(),
+        };
+        if let Some(active) = self.active.take() {
+            active.finish_outcome(code);
+        }
+        self.item
+            .take()
+            .expect("диагностика элемента активна")
+            .finish_outcome(code);
+    }
+
+    fn interrupt(mut self, reason: &str) {
+        let snapshot = self.snapshot();
+        if let Some(active) = self.active.take() {
+            active.interrupt(reason, Some(&snapshot));
+        }
+        if let Some(item) = self.item.take() {
+            item.interrupt(reason, Some(&snapshot));
+        }
+    }
+}
+
+impl Drop for JpdbItemDiagnostics<'_> {
+    fn drop(&mut self) {
+        if self.item.is_some() {
+            let snapshot = self.snapshot();
+            if std::thread::panicking() {
+                self.item
+                    .as_ref()
+                    .expect("диагностика элемента активна")
+                    .set_stop_reason("worker_panic");
+                if let Some(active) = self.active.take() {
+                    active.finish_failure("worker_panic", false, Some(&snapshot));
+                }
+                if let Some(item) = self.item.take() {
+                    item.finish_failure("worker_panic", false, Some(&snapshot));
+                }
+            } else {
+                if let Some(active) = self.active.take() {
+                    active.interrupt("acquisition_interrupted", Some(&snapshot));
+                }
+                if let Some(item) = self.item.take() {
+                    item.interrupt("acquisition_interrupted", Some(&snapshot));
+                }
+            }
+        }
+    }
+}
+
 /// Провайдер для получения данных с публичных страниц словарных записей JPDB.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JpdbPitchProvider;
@@ -420,6 +579,8 @@ impl JpdbPitchProvider {
     ) -> JpdbPitchAcquisitionReport {
         let mut interrupt = JpdbInterrupt::listen(keep_late_interrupt_handler);
         let runtime = pitch_browser_runtime_config();
+        let item = request_diagnostic_timer(&requests[0]);
+        let configuration = item.stage(JpdbPitchStage::ConfigureBrowser.diagnostic_name());
         // Не отменяем launch по SIGINT: полученная owning Session явно закрывается.
         let launched = match workspace {
             Some(workspace) => BrowserSession::launch_in_workspace(runtime, workspace).await,
@@ -428,12 +589,13 @@ impl JpdbPitchProvider {
         let session = match launched {
             Ok(session) => session,
             Err(message) => {
-                let mut report = JpdbPitchAcquisitionReport::from_session_failure(
-                    JpdbPitchFailure::BrowserSetup {
-                        stage: JpdbPitchStage::ConfigureBrowser,
-                        message,
-                    },
-                );
+                let failure = JpdbPitchFailure::BrowserSetup {
+                    stage: JpdbPitchStage::ConfigureBrowser,
+                    message,
+                };
+                configuration.finish_failure("browser_setup", false, None);
+                item.finish_failure("browser_setup", false, None);
+                let mut report = JpdbPitchAcquisitionReport::from_session_failure(failure);
                 record_pending_interrupt(
                     &mut interrupt,
                     &mut report,
@@ -442,19 +604,38 @@ impl JpdbPitchProvider {
                 return report;
             }
         };
-        let mut report =
-            match wait_jpdb_operation(configure_page(session.page()), &mut interrupt).await {
-                Ok(Ok(())) => {
-                    process_requests_with_interrupt(&session, requests, Some(&mut interrupt)).await
-                }
-                Ok(Err(error)) => JpdbPitchAcquisitionReport::from_session_failure(error),
-                Err(message) => JpdbPitchAcquisitionReport::from_session_failure(
-                    JpdbPitchFailure::SessionFailure {
-                        stage: JpdbPitchStage::ConfigureBrowser,
-                        message,
-                    },
-                ),
-            };
+        item.set_browser_session(session.diagnostic_session_id());
+        item.record_runtime_snapshot(&session.telemetry().current_snapshot());
+        configuration.finish_success();
+        let diagnostics = JpdbItemDiagnostics::new(&session, item);
+        let mut report = match wait_jpdb_operation(configure_page(session.page()), &mut interrupt)
+            .await
+        {
+            Ok(Ok(())) => {
+                process_requests_with_interrupt(
+                    &session,
+                    requests,
+                    Some(&mut interrupt),
+                    Some(diagnostics),
+                )
+                .await
+            }
+            Ok(Err(error)) => {
+                diagnostics.finish_failure(&error);
+                JpdbPitchAcquisitionReport::from_session_failure(error)
+            }
+            Err(message) => {
+                diagnostics.interrupt(if interrupt.signal_observed {
+                    "acquisition_interrupted"
+                } else {
+                    "ctrl_c_listener_failed"
+                });
+                JpdbPitchAcquisitionReport::from_session_failure(JpdbPitchFailure::SessionFailure {
+                    stage: JpdbPitchStage::ConfigureBrowser,
+                    message,
+                })
+            }
+        };
         if let Err(message) = session.close().await {
             match &mut report.session_failure {
                 Some(
@@ -509,10 +690,30 @@ impl JpdbPitchProvider {
         if requests.is_empty() {
             return JpdbPitchAcquisitionReport::default();
         }
+        Self::acquire_requests_in_session_diagnostic(
+            session,
+            requests,
+            request_diagnostic_timer(&requests[0]),
+        )
+        .await
+    }
+
+    /// Продолжает общий timer исполнителя, включая уже измеренный запуск браузера.
+    pub(crate) async fn acquire_requests_in_session_diagnostic(
+        session: &BrowserSession,
+        requests: &[JpdbPitchRequest],
+        item: BrowserItemTimer,
+    ) -> JpdbPitchAcquisitionReport {
+        if requests.is_empty() {
+            item.finish_outcome("empty_request_list");
+            return JpdbPitchAcquisitionReport::default();
+        }
+        let diagnostics = JpdbItemDiagnostics::new(session, item);
         if let Err(error) = configure_page(session.page()).await {
+            diagnostics.finish_failure(&error);
             return JpdbPitchAcquisitionReport::from_session_failure(error);
         }
-        process_requests_in_session(session, requests).await
+        process_requests_with_interrupt(session, requests, None, Some(diagnostics)).await
     }
 }
 
@@ -649,17 +850,11 @@ async fn wait_jpdb_operation<T>(
     }
 }
 
-async fn process_requests_in_session(
-    session: &BrowserSession,
-    requests: &[JpdbPitchRequest],
-) -> JpdbPitchAcquisitionReport {
-    process_requests_with_interrupt(session, requests, None).await
-}
-
 async fn process_requests_with_interrupt(
     session: &BrowserSession,
     requests: &[JpdbPitchRequest],
     mut interrupt: Option<&mut JpdbInterrupt>,
+    mut first_diagnostics: Option<JpdbItemDiagnostics<'_>>,
 ) -> JpdbPitchAcquisitionReport {
     let mut report = JpdbPitchAcquisitionReport {
         outcomes: Vec::with_capacity(requests.len()),
@@ -670,9 +865,21 @@ async fn process_requests_with_interrupt(
             JpdbPitchStage::SearchNavigation,
             session.telemetry().monitor_failed(),
         ) {
+            if let Some(mut diagnostics) = first_diagnostics.take() {
+                diagnostics.transition(JpdbPitchStage::SearchNavigation);
+                diagnostics
+                    .item
+                    .as_ref()
+                    .expect("диагностика элемента активна")
+                    .set_stop_reason("session_failure");
+                diagnostics
+                    .finish_failure(report.session_failure.as_ref().expect("ошибка сохранена"));
+            }
             break;
         }
-        let mut stage = JpdbPitchStage::SearchNavigation;
+        let mut diagnostics = first_diagnostics.take().unwrap_or_else(|| {
+            JpdbItemDiagnostics::new(session, request_diagnostic_timer(request))
+        });
         let item_span =
             tracing::info_span!("jpdb_item", surface = %safe_message(&request.query.surface));
         let operation = timeout(
@@ -682,7 +889,7 @@ async fn process_requests_with_interrupt(
                 session.telemetry(),
                 session.provenance(),
                 request,
-                &mut stage,
+                &mut diagnostics,
             )
             .instrument(item_span.clone()),
         );
@@ -692,12 +899,28 @@ async fn process_requests_with_interrupt(
         };
         let outcome = match result {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => item_timeout(stage),
+            Ok(Err(_)) => item_timeout(diagnostics.stage),
             Err(message) => {
+                let stage = diagnostics.stage;
+                diagnostics.interrupt(if message.starts_with("acquisition_interrupted:") {
+                    "acquisition_interrupted"
+                } else {
+                    "ctrl_c_listener_failed"
+                });
                 report.stop_with_session_failure(stage, message);
                 break;
             }
         };
+        let stage = diagnostics.stage;
+        if session.telemetry().monitor_failed() {
+            diagnostics
+                .item
+                .as_ref()
+                .expect("диагностика элемента активна")
+                .set_stop_reason("session_failure");
+            diagnostics.record_current_snapshot();
+        }
+        diagnostics.finish_outcome(&outcome);
         if item_span.in_scope(|| {
             report.record_processed_outcome(outcome, stage, session.telemetry().monitor_failed())
         }) {
@@ -767,9 +990,10 @@ async fn acquire_one_in_session(
     telemetry: &CdpRuntimeMonitor,
     browser: &crate::browser_runtime::BrowserRuntimeProvenance,
     request: &JpdbPitchRequest,
-    stage: &mut JpdbPitchStage,
+    diagnostics: &mut JpdbItemDiagnostics<'_>,
 ) -> JpdbPitchOutcome {
     let query = &request.query;
+    diagnostics.transition(JpdbPitchStage::SearchResolution);
     if let Err(message) = query.validate() {
         return failed(JpdbPitchFailure::InvalidQuery {
             stage: JpdbPitchStage::SearchResolution,
@@ -796,17 +1020,20 @@ async fn acquire_one_in_session(
             });
         }
     };
-    *stage = JpdbPitchStage::SearchNavigation;
+    diagnostics.transition(JpdbPitchStage::SearchNavigation);
     let search_epoch = telemetry.begin_epoch();
-    if let Err(error) = navigate(page, &search_url, *stage).await {
+    diagnostics.set_epoch(search_epoch);
+    if let Err(error) = navigate(page, &search_url, diagnostics.stage).await {
         return failed(error);
     }
-    *stage = JpdbPitchStage::SearchReadiness;
-    if let Err(error) = wait_for_critical_readiness(page, telemetry, search_epoch, *stage).await {
+    diagnostics.transition(JpdbPitchStage::SearchReadiness);
+    if let Err(error) =
+        wait_for_critical_readiness(page, telemetry, search_epoch, diagnostics.stage).await
+    {
         return failed(error);
     }
-    *stage = JpdbPitchStage::SearchResolution;
-    let page_url = match current_url(page, *stage).await {
+    diagnostics.transition(JpdbPitchStage::SearchResolution);
+    let page_url = match current_url(page, diagnostics.stage).await {
         Ok(url) => url,
         Err(error) => return failed(error),
     };
@@ -856,17 +1083,19 @@ async fn acquire_one_in_session(
             });
         }
 
-        *stage = JpdbPitchStage::DetailNavigation;
+        diagnostics.transition(JpdbPitchStage::DetailNavigation);
         let detail_epoch = telemetry.begin_epoch();
-        if let Err(error) = navigate(page, &candidate.detail_url, *stage).await {
+        diagnostics.set_epoch(detail_epoch);
+        if let Err(error) = navigate(page, &candidate.detail_url, diagnostics.stage).await {
             return failed(error);
         }
-        *stage = JpdbPitchStage::DetailReadiness;
-        if let Err(error) = wait_for_critical_readiness(page, telemetry, detail_epoch, *stage).await
+        diagnostics.transition(JpdbPitchStage::DetailReadiness);
+        if let Err(error) =
+            wait_for_critical_readiness(page, telemetry, detail_epoch, diagnostics.stage).await
         {
             return failed(error);
         }
-        *stage = JpdbPitchStage::DetailVerification;
+        diagnostics.transition(JpdbPitchStage::DetailVerification);
         let snapshot = match wait_for_detail_snapshot(page, telemetry, detail_epoch).await {
             Ok(snapshot) => snapshot,
             Err(error) => return failed(error),
@@ -890,12 +1119,13 @@ async fn acquire_one_in_session(
         }
         (snapshot, detail_epoch)
     } else if let Some(redirected_route) = parse_detail_route(&page_url) {
-        *stage = JpdbPitchStage::DetailReadiness;
-        if let Err(error) = wait_for_critical_readiness(page, telemetry, search_epoch, *stage).await
+        diagnostics.transition(JpdbPitchStage::DetailReadiness);
+        if let Err(error) =
+            wait_for_critical_readiness(page, telemetry, search_epoch, diagnostics.stage).await
         {
             return failed(error);
         }
-        *stage = JpdbPitchStage::DetailVerification;
+        diagnostics.transition(JpdbPitchStage::DetailVerification);
         let snapshot = match wait_for_detail_snapshot(page, telemetry, search_epoch).await {
             Ok(snapshot) => snapshot,
             Err(error) => return failed(error),
@@ -929,7 +1159,7 @@ async fn acquire_one_in_session(
             network_epoch: detail_epoch,
         },
         snapshot,
-        stage,
+        diagnostics,
     )
     .await
     {
@@ -1938,7 +2168,7 @@ struct InspectionContext<'a> {
 async fn inspect_and_capture(
     context: InspectionContext<'_>,
     mut detail: DetailSnapshot,
-    stage: &mut JpdbPitchStage,
+    diagnostics: &mut JpdbItemDiagnostics<'_>,
 ) -> Result<JpdbPitchOutcome, JpdbPitchFailure> {
     let InspectionContext {
         page,
@@ -1953,7 +2183,7 @@ async fn inspect_and_capture(
         || !detail_matches_query(&detail, query)
     {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
-            stage: *stage,
+            stage: diagnostics.stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -1967,7 +2197,7 @@ async fn inspect_and_capture(
     let resolved = sorted_unique_forms(&detail.forms);
     let resolved_reading = resolve_query_reading(&resolved, query).ok_or_else(|| {
         JpdbPitchFailure::DetailIdentityMismatch {
-            stage: *stage,
+            stage: diagnostics.stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -1975,24 +2205,24 @@ async fn inspect_and_capture(
             observed_readings: unique_readings(&resolved),
         }
     })?;
-    *stage = JpdbPitchStage::PitchInspection;
-    wait_for_critical_readiness(page, telemetry, inspection_epoch, *stage).await?;
+    diagnostics.transition(JpdbPitchStage::PitchInspection);
+    wait_for_critical_readiness(page, telemetry, inspection_epoch, diagnostics.stage).await?;
     match classify_pitch_state(&detail)? {
         PitchDomState::Absent => {
-            wait_for_critical_network_idle(telemetry, inspection_epoch, *stage).await?;
+            wait_for_critical_network_idle(telemetry, inspection_epoch, diagnostics.stage).await?;
             let first_absence_snapshot = detail.clone();
             detail =
                 read_detail_snapshot(page, vocabulary_id, JpdbPitchStage::PitchInspection).await?;
             if detail != first_absence_snapshot {
                 return Err(JpdbPitchFailure::PageContract {
-                    stage: *stage,
+                    stage: diagnostics.stage,
                     message: "список секций страницы без графика акцентуации изменился после ожидания сетевого покоя".into(),
                 });
             }
             if let Some(message) = critical_telemetry_failure(&telemetry.snapshot(inspection_epoch))
             {
                 return Err(JpdbPitchFailure::Telemetry {
-                    stage: *stage,
+                    stage: diagnostics.stage,
                     message,
                 });
             }
@@ -2020,7 +2250,7 @@ async fn inspect_and_capture(
         PitchDomState::Present { graph_count } if graph_count == detail.graph_count => {}
         PitchDomState::Present { .. } => {
             return Err(JpdbPitchFailure::PageContract {
-                stage: *stage,
+                stage: diagnostics.stage,
                 message: "число распознанных графиков акцентуации изменилось при классификации"
                     .into(),
             });
@@ -2028,19 +2258,19 @@ async fn inspect_and_capture(
     }
     if detail.graph_count > MAX_GRAPH_COUNT {
         return Err(JpdbPitchFailure::PageContract {
-            stage: *stage,
+            stage: diagnostics.stage,
             message: "число графиков акцентуации превышает ограничение провайдера на снимок".into(),
         });
     }
 
-    *stage = JpdbPitchStage::Capture;
-    activate_dark_mode(page, *stage).await?;
-    let first = capture_snapshot(page, *stage).await?;
+    diagnostics.transition(JpdbPitchStage::Capture);
+    activate_dark_mode(page, diagnostics.stage).await?;
+    let first = capture_snapshot(page, diagnostics.stage).await?;
     sleep(GRAPH_STABILITY_INTERVAL).await;
-    let second = capture_snapshot(page, *stage).await?;
+    let second = capture_snapshot(page, diagnostics.stage).await?;
     if first != second {
         return Err(JpdbPitchFailure::CaptureContract {
-            stage: *stage,
+            stage: diagnostics.stage,
             message:
                 "DOM графиков, их геометрия или фактически отрисованная тема изменились до снимка"
                     .into(),
@@ -2052,7 +2282,7 @@ async fn inspect_and_capture(
         || detail.pitch_label.as_deref() != Some("Pitch accent")
     {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
-            stage: *stage,
+            stage: diagnostics.stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -2072,7 +2302,7 @@ async fn inspect_and_capture(
         .scale(1.0)
         .build()
         .map_err(|message| JpdbPitchFailure::CaptureContract {
-            stage: *stage,
+            stage: diagnostics.stage,
             message,
         })?;
     let params = CaptureScreenshotParams::builder()
@@ -2107,11 +2337,11 @@ async fn inspect_and_capture(
             message: "Нативный снимок браузера имеет нулевой размер".into(),
         });
     }
-    *stage = JpdbPitchStage::PostCaptureVerification;
-    let post_capture = capture_snapshot(page, *stage).await?;
+    diagnostics.transition(JpdbPitchStage::PostCaptureVerification);
+    let post_capture = capture_snapshot(page, diagnostics.stage).await?;
     if post_capture != second {
         return Err(JpdbPitchFailure::DarkThemeUnverified {
-            stage: *stage,
+            stage: diagnostics.stage,
             message: "Фактически отрисованная тема, DOM графиков или геометрия снимка изменились во время снимка экрана".into(),
         });
     }
@@ -2123,7 +2353,7 @@ async fn inspect_and_capture(
         || sorted_unique_forms(&post_capture_detail.forms) != resolved
     {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
-            stage: *stage,
+            stage: diagnostics.stage,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
             vocabulary_id: Some(vocabulary_id),
@@ -2191,13 +2421,13 @@ async fn inspect_and_capture(
     };
     validate_evidence_capture_geometry(&metadata.evidence.render).map_err(|failure| {
         JpdbPitchFailure::CaptureContract {
-            stage: *stage,
+            stage: diagnostics.stage,
             message: failure.into_message(),
         }
     })?;
     validate_evidence_capture_background(&metadata.evidence.render.dark_theme, &image).map_err(
         |failure| JpdbPitchFailure::DarkThemeUnverified {
-            stage: *stage,
+            stage: diagnostics.stage,
             message: failure.into_message(),
         },
     )?;
@@ -2855,6 +3085,220 @@ const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic_events(operation: impl FnOnce()) -> Vec<Value> {
+        let workspace =
+            crate::temp_workspace::TempWorkspace::create("jpdb-diagnostics-test").unwrap();
+        let path = workspace.path().join("diagnostics.jsonl");
+        let log = crate::diagnostics::RunLogGuard::new(
+            std::fs::File::create(&path).unwrap(),
+            crate::diagnostics::OutputMode::Json,
+        );
+        log.with_default(operation);
+        log.finish().unwrap();
+        let events = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        workspace.close().unwrap();
+        events
+    }
+
+    fn diagnostic_monitor(epoch: u64) -> CdpRuntimeMonitor {
+        use chromiumoxide::cdp::browser_protocol::network::ResourceType;
+        CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot {
+            pending_requests: vec![crate::browser_runtime::TrackedRequest {
+                request_id: "secret-request-id".into(),
+                resource_type: ResourceType::Image,
+                url: "https://example.invalid/image?cookie=secret-query".into(),
+                epoch,
+                is_top_level: false,
+            }],
+            ..RuntimeSnapshot::default()
+        })
+    }
+
+    #[test]
+    fn pitch_item_timeout_reports_exact_stage_and_scoped_runtime_evidence() {
+        let monitor = diagnostic_monitor(7);
+        let events = diagnostic_events(|| {
+            let timer = BrowserItemTimer::new(
+                BrowserItemContext::new("jpdb", "雨", 2, 3)
+                    .with_worker(4, 5)
+                    .with_browser_session(6),
+            );
+            let mut diagnostics = JpdbItemDiagnostics::from_monitor(&monitor, timer);
+            diagnostics.transition(JpdbPitchStage::PitchInspection);
+            diagnostics.set_epoch(7);
+            diagnostics.finish_outcome(&item_timeout(JpdbPitchStage::PitchInspection));
+        });
+        let failures = events
+            .iter()
+            .filter(|event| event["fields"]["outcome"] == "failure")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["fields"]["stage"], "pitch_inspection");
+        for event in failures {
+            let fields = &event["fields"];
+            assert_eq!(fields["failure_code"], "timeout");
+            assert_eq!(fields["retryable"], true);
+            assert_eq!(fields["attempt"], 2);
+            assert_eq!(fields["generation"], 3);
+            assert_eq!(fields["worker"], 4);
+            assert_eq!(fields["worker_session"], 5);
+            assert_eq!(fields["browser_session"], 6);
+            assert!(
+                fields["stage_duration_ms"].as_u64().unwrap()
+                    <= fields["item_duration_ms"].as_u64().unwrap()
+            );
+            let snapshot: Value =
+                serde_json::from_str(fields["runtime_snapshot"].as_str().unwrap()).unwrap();
+            assert_eq!(snapshot["epoch"], 7);
+            assert_eq!(snapshot["pending_request_count"], 1);
+            assert_eq!(snapshot["pending_requests"][0]["in_current_epoch"], true);
+            assert!(!fields.to_string().contains("secret-query"));
+            assert!(!fields.to_string().contains("secret-request-id"));
+        }
+    }
+
+    #[test]
+    fn completed_pitch_item_links_monitor_failure_to_fresh_runtime_snapshot() {
+        use chromiumoxide::cdp::browser_protocol::network::ResourceType;
+
+        let monitor = CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot {
+            epoch: 7,
+            pending_requests: vec![crate::browser_runtime::TrackedRequest {
+                request_id: "secret-request-id".into(),
+                resource_type: ResourceType::Image,
+                url: "https://example.invalid/image?cookie=secret-query".into(),
+                epoch: 7,
+                is_top_level: false,
+            }],
+            monitor_failed: true,
+            ..RuntimeSnapshot::default()
+        });
+        let events = diagnostic_events(|| {
+            let mut diagnostics = JpdbItemDiagnostics::from_monitor(
+                &monitor,
+                BrowserItemTimer::new(
+                    BrowserItemContext::new("jpdb", "雨", 1, 0).with_browser_session(6),
+                ),
+            );
+            diagnostics.transition(JpdbPitchStage::PitchInspection);
+            diagnostics.set_epoch(7);
+            diagnostics
+                .item
+                .as_ref()
+                .expect("диагностика элемента активна")
+                .set_stop_reason("session_failure");
+            diagnostics.record_current_snapshot();
+            diagnostics.finish_outcome(&JpdbPitchOutcome::VocabularyNotFound {
+                surface: "雨".into(),
+                reading: None,
+            });
+        });
+
+        let completed = events
+            .iter()
+            .filter(|event| event["fields"]["outcome"] == "vocabulary_not_found")
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 2);
+        for event in completed {
+            let fields = &event["fields"];
+            assert_eq!(fields["outcome"], "vocabulary_not_found");
+            assert_eq!(fields["stop_reason"], "session_failure");
+            let snapshot: Value =
+                serde_json::from_str(fields["runtime_snapshot"].as_str().unwrap()).unwrap();
+            assert_eq!(snapshot["epoch"], 7);
+            assert_eq!(snapshot["monitor_failed"], true);
+            assert_eq!(snapshot["pending_request_count"], 1);
+            assert!(!fields.to_string().contains("secret-query"));
+            assert!(!fields.to_string().contains("secret-request-id"));
+        }
+    }
+
+    #[test]
+    fn dropping_pitch_acquisition_preserves_interrupted_stage_and_item() {
+        let monitor = diagnostic_monitor(7);
+        let events = diagnostic_events(|| {
+            let mut diagnostics = JpdbItemDiagnostics::from_monitor(
+                &monitor,
+                request_diagnostic_timer(&JpdbPitchRequest::new(JpdbPitchQuery::new("雨", None))),
+            );
+            diagnostics.transition(JpdbPitchStage::SearchNavigation);
+            diagnostics.set_epoch(7);
+            drop(diagnostics);
+        });
+        let interrupted = events
+            .iter()
+            .filter(|event| event["fields"]["outcome"] == "interrupted")
+            .collect::<Vec<_>>();
+        assert_eq!(interrupted.len(), 2);
+        assert_eq!(interrupted[0]["fields"]["stage"], "search_navigation");
+        for event in interrupted {
+            let fields = &event["fields"];
+            assert_eq!(fields["stop_reason"], "acquisition_interrupted");
+            let snapshot: Value =
+                serde_json::from_str(fields["runtime_snapshot"].as_str().unwrap()).unwrap();
+            assert_eq!(snapshot["epoch"], 7);
+            assert_eq!(snapshot["pending_request_count"], 1);
+        }
+    }
+
+    #[test]
+    fn pitch_acquisition_panic_reports_failure_instead_of_cancellation() {
+        let monitor = diagnostic_monitor(7);
+        let events = diagnostic_events(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut diagnostics = JpdbItemDiagnostics::from_monitor(
+                    &monitor,
+                    request_diagnostic_timer(&JpdbPitchRequest::new(JpdbPitchQuery::new(
+                        "雨", None,
+                    ))),
+                );
+                diagnostics.transition(JpdbPitchStage::Capture);
+                diagnostics.set_epoch(7);
+                panic!("injected panic");
+            }));
+            assert!(result.is_err());
+        });
+        let failures = events
+            .iter()
+            .filter(|event| event["fields"]["outcome"] == "failure")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["fields"]["stage"], "capture");
+        for event in failures {
+            assert_eq!(event["fields"]["failure_code"], "worker_panic");
+            assert_eq!(event["fields"]["stop_reason"], "worker_panic");
+            assert_eq!(event["fields"]["retryable"], false);
+        }
+    }
+
+    #[test]
+    fn pitch_configuration_failure_does_not_attribute_previous_item_epoch() {
+        let monitor = diagnostic_monitor(9);
+        let events = diagnostic_events(|| {
+            let diagnostics = JpdbItemDiagnostics::from_monitor(
+                &monitor,
+                request_diagnostic_timer(&JpdbPitchRequest::new(JpdbPitchQuery::new("雨", None))),
+            );
+            diagnostics.finish_failure(&JpdbPitchFailure::BrowserConfiguration {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "injected configuration failure".into(),
+            });
+        });
+        assert_eq!(events.len(), 2);
+        for event in events {
+            let fields = &event["fields"];
+            assert_eq!(fields["failure_code"], "browser_configuration");
+            let snapshot: Value =
+                serde_json::from_str(fields["runtime_snapshot"].as_str().unwrap()).unwrap();
+            assert_eq!(snapshot["epoch"], 0);
+            assert_eq!(snapshot["pending_request_count"], 0);
+        }
+    }
 
     #[tokio::test]
     async fn pending_interrupt_after_launch_failure_is_preserved_for_acceptance_cleanup() {

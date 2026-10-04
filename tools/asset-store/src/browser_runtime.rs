@@ -6,6 +6,7 @@ use std::future::Future;
 use std::io::{self, Read};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,12 @@ const MAX_TRACKED_REQUESTS: usize = 256;
 const MAX_NETWORK_OUTCOMES: usize = 256;
 const MAX_NETWORK_DIAGNOSTIC_ITEMS: usize = 3;
 const MAX_NETWORK_DIAGNOSTIC_PATH_CHARS: usize = 160;
+/// Максимум записей каждой коллекции в диагностическом JSON.
+pub const MAX_RUNTIME_DIAGNOSTIC_ITEMS: usize = 16;
+const MAX_RUNTIME_REQUEST_ID_BYTES: usize = 1024;
+const MAX_RUNTIME_URL_BYTES: usize = 16 * 1024;
+const MAX_RUNTIME_REASON_BYTES: usize = 1024;
+static NEXT_BROWSER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Способ выбора исполняемого файла браузера без сохранения абсолютного пути.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,7 +255,17 @@ impl BrowserProfile {
         TempWorkspace::ensure_no_live_process_references(&self.workspace_path)?;
         let profile = remove_browser_directory(&self.path);
         let temp = remove_browser_directory(&self.temp_path);
-        profile.and(temp)
+        profile.and(temp)?;
+        ensure_directory_removed(&self.path)?;
+        ensure_directory_removed(&self.temp_path)
+    }
+}
+
+fn ensure_directory_removed(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::other("принадлежащий браузеру каталог не удалён")),
     }
 }
 
@@ -346,6 +363,7 @@ impl Drop for BrowserProfile {
 
 /// Ресурсы создаются до асинхронной настройки: её отмена также закрывает браузер.
 struct BrowserResources {
+    diagnostic_session_id: u64,
     browser: Option<Browser>,
     handler_task: Option<tokio::task::JoinHandle<()>>,
     profile: Option<BrowserProfile>,
@@ -401,21 +419,144 @@ async fn profile_launch_failure(profile: BrowserProfile, failure: BrowserSetupFa
     }
 }
 
-async fn stop_browser(browser: &mut Browser) -> Result<(), String> {
-    let close = timeout(Duration::from_secs(2), browser.close()).await;
-    let wait = timeout(Duration::from_secs(2), browser.wait()).await;
-    if matches!(wait, Ok(Ok(_))) {
-        return match close {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(format!("browser_close_failed: {error}")),
-            Err(_) => Err("browser_close_timeout".into()),
-        };
+/// Закрытие CDP transport и завершение owned процесса — независимые наблюдения.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserTransportStop {
+    Closed,
+    Detached,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserStopObservation {
+    transport: BrowserTransportStop,
+    process_stopped: bool,
+    process_failure: Option<String>,
+}
+
+fn transport_stop_result(
+    result: Result<(), chromiumoxide::error::CdpError>,
+) -> BrowserTransportStop {
+    match result {
+        Ok(()) => BrowserTransportStop::Closed,
+        // Типы означают отсутствие живого handler/response channel, а не ошибку
+        // предметного CDP command. Нефатальность определяется только после cleanup.
+        Err(
+            chromiumoxide::error::CdpError::ChannelSendError(_)
+            | chromiumoxide::error::CdpError::NoResponse,
+        ) => BrowserTransportStop::Detached,
+        Err(error) => BrowserTransportStop::Failed(format!(
+            "browser_close_failed: {}",
+            crate::diagnostics::safe_message(&error.to_string())
+        )),
     }
-    match browser.kill().await {
-        Some(Ok(())) | None => {
-            Err("browser_close_failed: потребовалось принудительное завершение".into())
+}
+
+async fn stop_browser(browser: &mut Browser, browser_session: u64) -> BrowserStopObservation {
+    let started = Instant::now();
+    let transport = match timeout(Duration::from_secs(2), browser.close()).await {
+        Ok(result) => transport_stop_result(result.map(|_| ())),
+        Err(_) => BrowserTransportStop::Failed("browser_close_timeout".into()),
+    };
+    let transport_outcome = match &transport {
+        BrowserTransportStop::Closed => "closed",
+        BrowserTransportStop::Detached => "detached",
+        BrowserTransportStop::Failed(_) => "failed",
+    };
+    let transport_code = match &transport {
+        BrowserTransportStop::Closed => "browser_transport_closed",
+        BrowserTransportStop::Detached => "browser_transport_detached",
+        BrowserTransportStop::Failed(error) if error == "browser_close_timeout" => {
+            "browser_close_timeout"
         }
-        Some(Err(error)) => Err(format!("browser_kill_failed: {error}")),
+        BrowserTransportStop::Failed(_) => "browser_close_failed",
+    };
+    tracing::info!(
+        event = "browser_lifecycle",
+        stage = "browser_transport_stop",
+        code = transport_code,
+        browser_session,
+        outcome = transport_outcome,
+        stage_duration_ms = duration_millis(started.elapsed()),
+        "Завершено наблюдение остановки CDP transport"
+    );
+    let started = Instant::now();
+    let wait = timeout(Duration::from_secs(2), browser.wait()).await;
+    let (process_stopped, process_failure, process_outcome) = if matches!(wait, Ok(Ok(_))) {
+        (true, None, "exited")
+    } else {
+        match timeout(Duration::from_secs(2), browser.kill()).await {
+            Ok(Some(Ok(()))) => {
+                let failure = if transport == BrowserTransportStop::Detached {
+                    None
+                } else {
+                    Some("browser_close_failed: потребовалось принудительное завершение".into())
+                };
+                (true, failure, "killed")
+            }
+            Ok(Some(Err(error))) => (
+                false,
+                Some(format!(
+                    "browser_kill_failed: {}",
+                    crate::diagnostics::safe_message(&error.to_string())
+                )),
+                "stop_failed",
+            ),
+            Ok(None) => (
+                false,
+                Some("browser_process_stop_unproven".into()),
+                "unproven",
+            ),
+            Err(_) => (false, Some("browser_kill_timeout".into()), "stop_failed"),
+        }
+    };
+    let process_code = match process_outcome {
+        "exited" => "browser_process_exited",
+        "killed" => "browser_process_killed",
+        "unproven" => "browser_process_stop_unproven",
+        _ if process_failure.as_deref() == Some("browser_kill_timeout") => "browser_kill_timeout",
+        _ => "browser_kill_failed",
+    };
+    tracing::info!(
+        event = "browser_lifecycle",
+        stage = "browser_process_stop",
+        code = process_code,
+        browser_session,
+        outcome = process_outcome,
+        process_stopped,
+        stage_duration_ms = duration_millis(started.elapsed()),
+        "Завершена проверка остановки принадлежащего браузера"
+    );
+    BrowserStopObservation {
+        transport,
+        process_stopped,
+        process_failure,
+    }
+}
+
+fn classify_browser_cleanup(
+    stopped: BrowserStopObservation,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    let stop = if let Some(failure) = stopped.process_failure {
+        Err(failure)
+    } else if !stopped.process_stopped {
+        Err("browser_process_stop_unproven".into())
+    } else {
+        match stopped.transport {
+            BrowserTransportStop::Closed | BrowserTransportStop::Detached => Ok(()),
+            BrowserTransportStop::Failed(error) => Err(error),
+        }
+    };
+    combine_browser_close_results(stop, cleanup)
+}
+
+async fn shutdown_handler(handler: tokio::task::JoinHandle<()>) -> Result<(), String> {
+    handler.abort();
+    match handler.await {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(_) => Err("browser_handler_shutdown_failed: паника обработчика CDP".into()),
     }
 }
 
@@ -440,23 +581,78 @@ impl BrowserResources {
     }
 
     async fn close(mut self) -> Result<(), String> {
-        let browser_result = match self.browser.as_mut() {
-            Some(browser) => stop_browser(browser).await,
+        let stopped = match self.browser.as_mut() {
+            Some(browser) => stop_browser(browser, self.diagnostic_session_id).await,
+            None => BrowserStopObservation {
+                transport: BrowserTransportStop::Closed,
+                process_stopped: true,
+                process_failure: None,
+            },
+        };
+        let started = Instant::now();
+        let handler_result = match self.handler_task.take() {
+            Some(handler) => shutdown_handler(handler).await,
             None => Ok(()),
         };
-        if let Some(handler) = self.handler_task.take() {
-            handler.abort();
-            let _ = handler.await;
-        }
+        tracing::info!(
+            event = "browser_lifecycle",
+            stage = "browser_handler_shutdown",
+            code = if handler_result.is_ok() {
+                "browser_handler_stopped"
+            } else {
+                "browser_handler_shutdown_failed"
+            },
+            browser_session = self.diagnostic_session_id,
+            outcome = if handler_result.is_ok() {
+                "stopped"
+            } else {
+                "failed"
+            },
+            stage_duration_ms = duration_millis(started.elapsed()),
+            "Завершена остановка обработчика CDP"
+        );
         drop(self.browser.take());
+        let started = Instant::now();
         let cleanup = match self.profile.take() {
-            Some(profile) => profile
-                .close_after_browser_stop()
-                .await
-                .map_err(|error| format!("browser_profile_cleanup_failed: {error}")),
+            Some(profile) => profile.close_after_browser_stop().await.map_err(|error| {
+                format!(
+                    "browser_profile_cleanup_failed: {}",
+                    crate::diagnostics::safe_message(&error.to_string())
+                )
+            }),
             None => Ok(()),
         };
-        let result = combine_browser_close_results(browser_result, cleanup);
+        tracing::info!(
+            event = "browser_lifecycle",
+            stage = "browser_profile_temp_cleanup",
+            code = if cleanup.is_ok() {
+                "browser_profile_temp_removed"
+            } else {
+                "browser_profile_cleanup_failed"
+            },
+            browser_session = self.diagnostic_session_id,
+            outcome = if cleanup.is_ok() { "removed" } else { "failed" },
+            owned_resources_removed = cleanup.is_ok(),
+            stage_duration_ms = duration_millis(started.elapsed()),
+            "Завершена проверка удаления профиля и временного каталога"
+        );
+        tracing::info!(
+            event = "browser_lifecycle",
+            stage = "browser_owned_resource_postconditions",
+            browser_session = self.diagnostic_session_id,
+            code = if stopped.process_stopped && cleanup.is_ok() {
+                "browser_owned_resources_removed"
+            } else {
+                "browser_owned_resources_unproven"
+            },
+            process_stopped = stopped.process_stopped,
+            profile_temp_removed = cleanup.is_ok(),
+            "Проверены postconditions принадлежащих процессов и каталогов"
+        );
+        let result = combine_browser_close_results(
+            classify_browser_cleanup(stopped, cleanup),
+            handler_result,
+        );
         if let Err(error) = &result {
             tracing::error!(stage = "temp_cleanup", code = "browser_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(error), "Ошибка закрытия браузера или очистки профиля");
         }
@@ -484,17 +680,15 @@ impl Drop for BrowserResources {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let diagnostic_session_id = self.diagnostic_session_id;
             runtime.spawn(async move {
-                let mut browser = browser;
-                if let Some(browser) = browser.as_mut() {
-                    let _ = stop_browser(browser).await;
-                }
-                if let Some(handler) = handler {
-                    handler.abort();
-                    let _ = handler.await;
-                }
-                drop(browser);
-                drop(profile);
+                let resources = BrowserResources {
+                    diagnostic_session_id,
+                    browser,
+                    handler_task: handler,
+                    profile,
+                };
+                let _ = resources.close().await;
             });
         } else {
             if let Some(handler) = handler {
@@ -508,6 +702,7 @@ impl Drop for BrowserResources {
 
 /// Изолированный Chromium-процесс, его начальная страница и CDP-монитор.
 pub struct BrowserSession {
+    diagnostic_session_id: u64,
     resources: Option<BrowserResources>,
     page: Page,
     provenance: BrowserRuntimeProvenance,
@@ -574,6 +769,7 @@ impl BrowserSession {
         });
 
         let mut resources = BrowserResources {
+            diagnostic_session_id: NEXT_BROWSER_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             browser: Some(browser),
             handler_task: Some(handler_task),
             profile: Some(profile),
@@ -621,12 +817,18 @@ impl BrowserSession {
         .await;
 
         let (resources, (page, provenance, telemetry)) = resources.finish_setup(setup).await?;
+        let diagnostic_session_id = resources.diagnostic_session_id;
         Ok(Self {
+            diagnostic_session_id,
             resources: Some(resources),
             page,
             provenance,
             telemetry,
         })
+    }
+
+    pub fn diagnostic_session_id(&self) -> u64 {
+        self.diagnostic_session_id
     }
 
     pub fn page(&self) -> &Page {
@@ -642,12 +844,32 @@ impl BrowserSession {
     }
 
     pub async fn close(mut self) -> Result<(), String> {
-        self.telemetry.abort();
-        self.resources
+        let started = Instant::now();
+        let telemetry_result = self.telemetry.shutdown().await;
+        tracing::info!(
+            event = "browser_lifecycle",
+            stage = "browser_telemetry_shutdown",
+            code = if telemetry_result.is_ok() {
+                "browser_telemetry_stopped"
+            } else {
+                "browser_telemetry_shutdown_timeout"
+            },
+            browser_session = self.diagnostic_session_id,
+            outcome = if telemetry_result.is_ok() {
+                "stopped"
+            } else {
+                "failed"
+            },
+            stage_duration_ms = duration_millis(started.elapsed()),
+            "Завершена остановка мониторинга CDP"
+        );
+        let cleanup = self
+            .resources
             .take()
             .expect("ресурсы сеанса доступны")
             .close()
-            .await
+            .await;
+        combine_browser_close_results(telemetry_result, cleanup)
     }
 }
 
@@ -680,11 +902,163 @@ pub struct NetworkOutcome {
 /// Неинтерпретированная провайдером телеметрия CDP одного этапа получения.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeSnapshot {
+    /// Epoch, для которой снято наблюдение; bootstrap epoch 0 остаётся явной.
+    pub epoch: u64,
+    /// Monotonic возраст реально наблюдавшихся pending requests.
+    pub pending_observations: Vec<PendingRequestObservation>,
     pub pending_requests: Vec<TrackedRequest>,
     pub network_failures: Vec<NetworkOutcome>,
     pub http_errors: Vec<NetworkOutcome>,
     pub javascript_exceptions: u32,
     pub monitor_failed: bool,
+    /// Evidence чужих epochs отделено от operational readiness snapshot.
+    pub stale_pending_requests: Vec<TrackedRequest>,
+    pub stale_network_failures: Vec<NetworkOutcome>,
+    pub stale_http_errors: Vec<NetworkOutcome>,
+    pub current_javascript_exceptions: u32,
+    pub bootstrap_javascript_exceptions: u32,
+    pub stale_javascript_exceptions: u32,
+}
+
+/// Возраст запроса CDP, а не длительность server-side обработки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRequestObservation {
+    pub request_id: String,
+    pub observed_ms: u64,
+}
+
+/// Ограниченное evidence для логов: URL и сырые идентификаторы не сериализуются.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeSnapshotDiagnostic {
+    pub epoch: u64,
+    pub pending_request_count: usize,
+    pub network_failure_count: usize,
+    pub http_error_count: usize,
+    pub pending_requests: Vec<RuntimeRequestDiagnostic>,
+    pub network_failures: Vec<RuntimeRequestDiagnostic>,
+    pub http_errors: Vec<RuntimeRequestDiagnostic>,
+    pub javascript_exceptions: u32,
+    pub monitor_failed: bool,
+    pub stale_pending_request_count: usize,
+    pub stale_network_failure_count: usize,
+    pub stale_http_error_count: usize,
+    pub stale_pending_requests: Vec<RuntimeRequestDiagnostic>,
+    pub stale_network_failures: Vec<RuntimeRequestDiagnostic>,
+    pub stale_http_errors: Vec<RuntimeRequestDiagnostic>,
+    pub current_javascript_exceptions: u32,
+    pub bootstrap_javascript_exceptions: u32,
+    pub stale_javascript_exceptions: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeRequestDiagnostic {
+    pub request_key: String,
+    pub resource_type: ResourceType,
+    pub epoch: u64,
+    pub in_current_epoch: bool,
+    pub is_top_level: bool,
+    pub observed_ms: Option<u64>,
+    pub status_code: Option<u16>,
+    pub failure_category: Option<String>,
+}
+
+impl RuntimeSnapshot {
+    pub fn diagnostic(&self) -> RuntimeSnapshotDiagnostic {
+        let pending = self
+            .pending_requests
+            .iter()
+            .filter(|request| request_in_scope(request.epoch, self.epoch));
+        let network = self
+            .network_failures
+            .iter()
+            .filter(|outcome| request_in_scope(outcome.epoch, self.epoch));
+        let http = self
+            .http_errors
+            .iter()
+            .filter(|outcome| request_in_scope(outcome.epoch, self.epoch));
+        let outcome = |outcome: &NetworkOutcome| RuntimeRequestDiagnostic {
+            request_key: crate::hashing::sha256_hex(&outcome.request_id),
+            resource_type: outcome.resource_type.clone(),
+            epoch: outcome.epoch,
+            in_current_epoch: outcome.epoch == self.epoch,
+            is_top_level: outcome.is_top_level,
+            observed_ms: None,
+            status_code: outcome.status_code,
+            failure_category: outcome
+                .failure_reason
+                .as_deref()
+                .map(sanitized_network_failure_reason),
+        };
+        let request = |request: &TrackedRequest| RuntimeRequestDiagnostic {
+            request_key: crate::hashing::sha256_hex(&request.request_id),
+            resource_type: request.resource_type.clone(),
+            epoch: request.epoch,
+            in_current_epoch: request.epoch == self.epoch,
+            is_top_level: request.is_top_level,
+            observed_ms: self
+                .pending_observations
+                .iter()
+                .find(|observation| observation.request_id == request.request_id)
+                .map(|observation| observation.observed_ms),
+            status_code: None,
+            failure_category: None,
+        };
+        // Защита от raw fixture со смешанными epochs: чужие записи не становятся
+        // текущими даже при сборке snapshot вне RuntimeState.
+        let stale_pending = self.stale_pending_requests.iter().chain(
+            self.pending_requests
+                .iter()
+                .filter(|request| !request_in_scope(request.epoch, self.epoch)),
+        );
+        let stale_network = self.stale_network_failures.iter().chain(
+            self.network_failures
+                .iter()
+                .filter(|outcome| !request_in_scope(outcome.epoch, self.epoch)),
+        );
+        let stale_http = self.stale_http_errors.iter().chain(
+            self.http_errors
+                .iter()
+                .filter(|outcome| !request_in_scope(outcome.epoch, self.epoch)),
+        );
+        RuntimeSnapshotDiagnostic {
+            epoch: self.epoch,
+            pending_request_count: pending.clone().count(),
+            network_failure_count: network.clone().count(),
+            http_error_count: http.clone().count(),
+            pending_requests: pending
+                .take(MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+                .map(request)
+                .collect(),
+            network_failures: network
+                .take(MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+                .map(outcome)
+                .collect(),
+            http_errors: http
+                .take(MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+                .map(outcome)
+                .collect(),
+            javascript_exceptions: self.javascript_exceptions,
+            monitor_failed: self.monitor_failed,
+            stale_pending_request_count: stale_pending.clone().count(),
+            stale_network_failure_count: stale_network.clone().count(),
+            stale_http_error_count: stale_http.clone().count(),
+            stale_pending_requests: stale_pending
+                .take(MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+                .map(request)
+                .collect(),
+            stale_network_failures: stale_network
+                .take(MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+                .map(outcome)
+                .collect(),
+            stale_http_errors: stale_http
+                .take(MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+                .map(outcome)
+                .collect(),
+            current_javascript_exceptions: self.current_javascript_exceptions,
+            bootstrap_javascript_exceptions: self.bootstrap_javascript_exceptions,
+            stale_javascript_exceptions: self.stale_javascript_exceptions,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -697,6 +1071,7 @@ pub(crate) enum RetryTrigger {
 #[derive(Debug, Default)]
 struct RuntimeState {
     relevant_requests: HashMap<String, TrackedRequest>,
+    request_observed_at: HashMap<String, Instant>,
     network_failures: Vec<NetworkOutcome>,
     http_errors: Vec<NetworkOutcome>,
     javascript_exceptions: HashMap<u64, u32>,
@@ -723,6 +1098,10 @@ impl RuntimeState {
         if !is_relevant_resource_type(&resource_type) {
             return;
         }
+        if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES || url.len() > MAX_RUNTIME_URL_BYTES {
+            self.monitor_failed = true;
+            return;
+        }
         if !self.relevant_requests.contains_key(&request_id)
             && self.relevant_requests.len() >= MAX_TRACKED_REQUESTS
         {
@@ -734,6 +1113,9 @@ impl RuntimeState {
             .get(&request_id)
             .map_or(self.active_epoch, |request| request.epoch);
         let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id);
+        self.request_observed_at
+            .entry(request_id.clone())
+            .or_insert_with(Instant::now);
         self.relevant_requests.insert(
             request_id.clone(),
             TrackedRequest {
@@ -753,6 +1135,13 @@ impl RuntimeState {
         failure_reason: String,
     ) {
         let tracked = self.relevant_requests.remove(&request_id);
+        self.request_observed_at.remove(&request_id);
+        if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES
+            || failure_reason.len() > MAX_RUNTIME_REASON_BYTES
+        {
+            self.monitor_failed = true;
+            return;
+        }
         if tracked.is_none() && !is_relevant_resource_type(&event_resource_type) {
             return;
         }
@@ -786,6 +1175,10 @@ impl RuntimeState {
         if !is_relevant_resource_type(&resource_type) || status_code < 400 {
             return;
         }
+        if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES || url.len() > MAX_RUNTIME_URL_BYTES {
+            self.monitor_failed = true;
+            return;
+        }
         if self.http_errors.len() >= MAX_NETWORK_OUTCOMES {
             self.monitor_failed = true;
             return;
@@ -803,6 +1196,12 @@ impl RuntimeState {
     }
 
     fn record_javascript_exception(&mut self) {
+        if !self.javascript_exceptions.contains_key(&self.active_epoch)
+            && self.javascript_exceptions.len() >= MAX_NETWORK_OUTCOMES
+        {
+            self.monitor_failed = true;
+            return;
+        }
         let current = self
             .javascript_exceptions
             .entry(self.active_epoch)
@@ -814,13 +1213,58 @@ impl RuntimeState {
     }
 
     fn snapshot(&self, epoch: u64) -> RuntimeSnapshot {
+        self.snapshot_at(epoch, Instant::now())
+    }
+
+    fn snapshot_at(&self, epoch: u64, now: Instant) -> RuntimeSnapshot {
+        let mut pending_requests = self.relevant_requests.values().cloned().collect::<Vec<_>>();
+        pending_requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        let pending_observations = pending_requests
+            .iter()
+            .filter_map(|request| {
+                self.request_observed_at
+                    .get(&request.request_id)
+                    .map(|observed| PendingRequestObservation {
+                        request_id: request.request_id.clone(),
+                        observed_ms: duration_millis(now.saturating_duration_since(*observed)),
+                    })
+            })
+            .collect();
+        let (pending_requests, stale_pending_requests) = pending_requests
+            .into_iter()
+            .partition(|request| request_in_scope(request.epoch, epoch));
         RuntimeSnapshot {
-            pending_requests: self
-                .relevant_requests
-                .values()
-                .filter(|request| request_in_scope(request.epoch, epoch))
+            epoch,
+            pending_observations,
+            pending_requests,
+            stale_pending_requests,
+            stale_network_failures: self
+                .network_failures
+                .iter()
+                .filter(|outcome| !request_in_scope(outcome.epoch, epoch))
                 .cloned()
                 .collect(),
+            stale_http_errors: self
+                .http_errors
+                .iter()
+                .filter(|outcome| !request_in_scope(outcome.epoch, epoch))
+                .cloned()
+                .collect(),
+            current_javascript_exceptions: self
+                .javascript_exceptions
+                .get(&epoch)
+                .copied()
+                .unwrap_or(0),
+            bootstrap_javascript_exceptions: if epoch == 0 {
+                0
+            } else {
+                self.javascript_exceptions.get(&0).copied().unwrap_or(0)
+            },
+            stale_javascript_exceptions: self
+                .javascript_exceptions
+                .iter()
+                .filter(|(recorded_epoch, _)| !request_in_scope(**recorded_epoch, epoch))
+                .fold(0_u32, |total, (_, count)| total.saturating_add(*count)),
             network_failures: self
                 .network_failures
                 .iter()
@@ -835,10 +1279,9 @@ impl RuntimeState {
                 .collect(),
             javascript_exceptions: self
                 .javascript_exceptions
-                .get(&0)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(self.javascript_exceptions.get(&epoch).copied().unwrap_or(0)),
+                .iter()
+                .filter(|(recorded_epoch, _)| request_in_scope(**recorded_epoch, epoch))
+                .fold(0_u32, |total, (_, count)| total.saturating_add(*count)),
             monitor_failed: self.monitor_failed,
         }
     }
@@ -921,9 +1364,9 @@ impl CdpRuntimeMonitor {
             tasks.push(tokio::spawn(async move {
                 let mut events = finished_events;
                 while let Some(event) = events.next().await {
-                    lock_state(&state)
-                        .relevant_requests
-                        .remove(event.request_id.as_ref());
+                    let mut state = lock_state(&state);
+                    state.relevant_requests.remove(event.request_id.as_ref());
+                    state.request_observed_at.remove(event.request_id.as_ref());
                 }
                 mark_monitor_failed(&state);
             }));
@@ -980,6 +1423,11 @@ impl CdpRuntimeMonitor {
 
     pub fn snapshot(&self, epoch: u64) -> RuntimeSnapshot {
         lock_state(&self.state).snapshot(epoch)
+    }
+
+    pub fn current_snapshot(&self) -> RuntimeSnapshot {
+        let state = lock_state(&self.state);
+        state.snapshot(state.active_epoch)
     }
 
     pub fn monitor_failed(&self) -> bool {
@@ -1067,6 +1515,17 @@ impl CdpRuntimeMonitor {
         }
     }
 
+    async fn shutdown(&self) -> Result<(), String> {
+        self.abort();
+        timeout(Duration::from_secs(2), async {
+            while self.tasks.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "browser_telemetry_shutdown_timeout".into())
+    }
+
     #[cfg(test)]
     pub(crate) fn from_snapshot_for_test(snapshot: RuntimeSnapshot) -> Self {
         let mut javascript_exceptions = HashMap::new();
@@ -1078,10 +1537,19 @@ impl CdpRuntimeMonitor {
                 relevant_requests: snapshot
                     .pending_requests
                     .into_iter()
+                    .chain(snapshot.stale_pending_requests)
                     .map(|request| (request.request_id.clone(), request))
                     .collect(),
-                network_failures: snapshot.network_failures,
-                http_errors: snapshot.http_errors,
+                network_failures: snapshot
+                    .network_failures
+                    .into_iter()
+                    .chain(snapshot.stale_network_failures)
+                    .collect(),
+                http_errors: snapshot
+                    .http_errors
+                    .into_iter()
+                    .chain(snapshot.stale_http_errors)
+                    .collect(),
                 javascript_exceptions,
                 monitor_failed: snapshot.monitor_failed,
                 ..RuntimeState::default()
@@ -1154,6 +1622,10 @@ pub fn format_network_failure_details(failures: &[NetworkOutcome]) -> String {
         ));
     }
     details.join("; ")
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn request_in_scope(request_epoch: u64, requested_epoch: u64) -> bool {
@@ -1247,6 +1719,9 @@ fn sanitized_network_location(raw_url: &str) -> String {
 }
 
 fn sanitized_network_failure_reason(raw_reason: &str) -> String {
+    if raw_reason.len() > 128 {
+        return "не классифицированная сетевая ошибка".into();
+    }
     let upper = raw_reason.trim().to_ascii_uppercase();
     let Some(suffix) = upper.strip_prefix("NET::ERR_") else {
         return "не классифицированная сетевая ошибка".into();
@@ -1557,6 +2032,7 @@ mod tests {
         });
         started_rx.await.unwrap();
         let resources = BrowserResources {
+            diagnostic_session_id: 0,
             browser: None,
             handler_task: Some(handler),
             profile: Some(profile),
@@ -1595,6 +2071,7 @@ mod tests {
         fs::remove_dir(&profile.path).unwrap();
         fs::write(&profile.path, "искусственно вызванный сбой очистки").unwrap();
         let resources = BrowserResources {
+            diagnostic_session_id: 0,
             browser: None,
             handler_task: None,
             profile: Some(profile),
@@ -1873,5 +2350,459 @@ mod tests {
         for secret in ["user", "password", "token", "secret", "hidden", "fragment"] {
             assert!(!details.contains(secret));
         }
+    }
+    #[test]
+    fn detached_transport_needs_process_and_directory_postconditions() {
+        let stopped = BrowserStopObservation {
+            transport: transport_stop_result(Err(chromiumoxide::error::CdpError::NoResponse)),
+            process_stopped: true,
+            process_failure: None,
+        };
+        assert_eq!(stopped.transport, BrowserTransportStop::Detached);
+        assert!(classify_browser_cleanup(stopped.clone(), Ok(())).is_ok());
+        let directory_error = "browser_profile_cleanup_failed: удаление не удалось".to_owned();
+        assert_eq!(
+            classify_browser_cleanup(stopped.clone(), Err(directory_error.clone())),
+            Err(directory_error),
+        );
+        assert_eq!(
+            classify_browser_cleanup(
+                BrowserStopObservation {
+                    process_stopped: false,
+                    ..stopped
+                },
+                Ok(())
+            ),
+            Err("browser_process_stop_unproven".into())
+        );
+        // Похожий текст в произвольной CDP command ошибке не означает detached channel.
+        let arbitrary =
+            transport_stop_result(Err(chromiumoxide::error::CdpError::msg("receiver is gone")));
+        assert!(matches!(arbitrary, BrowserTransportStop::Failed(_)));
+        assert!(
+            classify_browser_cleanup(
+                BrowserStopObservation {
+                    transport: arbitrary,
+                    process_stopped: true,
+                    process_failure: None,
+                },
+                Ok(())
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_response_channel_is_typed_detached_without_message_matching() {
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        drop(sender);
+        let error = chromiumoxide::error::CdpError::from(receiver.await.unwrap_err());
+        assert_eq!(
+            transport_stop_result(Err(error)),
+            BrowserTransportStop::Detached
+        );
+    }
+
+    #[test]
+    fn detached_transport_with_actual_profile_cleanup_failure_stays_fatal() {
+        let parent = TempWorkspace::create("browser-detached-real-cleanup-error-test").unwrap();
+        let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+        let temp_path = profile.temp_path.clone();
+        fs::remove_dir(&profile.path).unwrap();
+        fs::write(&profile.path, b"directory replaced with file").unwrap();
+        let cleanup = profile
+            .close()
+            .map_err(|error| format!("browser_profile_cleanup_failed: {error}"));
+        let error = classify_browser_cleanup(
+            BrowserStopObservation {
+                transport: BrowserTransportStop::Detached,
+                process_stopped: true,
+                process_failure: None,
+            },
+            cleanup,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("browser_profile_cleanup_failed:"));
+        assert!(!temp_path.exists());
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn pending_observation_preserves_request_start_across_redirects_and_filters_epochs() {
+        let mut state = RuntimeState::default();
+        let bootstrap_start = Instant::now();
+        state.record_request(
+            "bootstrap".into(),
+            ResourceType::Script,
+            "https://example.test/bootstrap".into(),
+            None,
+        );
+        state
+            .request_observed_at
+            .insert("bootstrap".into(), bootstrap_start);
+        let first_epoch = state.begin_epoch();
+        state.record_request(
+            "stale".into(),
+            ResourceType::Image,
+            "https://example.test/old".into(),
+            None,
+        );
+        state
+            .request_observed_at
+            .insert("stale".into(), bootstrap_start);
+        let current_epoch = state.begin_epoch();
+        state.record_request(
+            "current".into(),
+            ResourceType::Fetch,
+            "https://example.test/request".into(),
+            None,
+        );
+        let started = bootstrap_start + Duration::from_millis(10);
+        state.request_observed_at.insert("current".into(), started);
+        state.record_request(
+            "current".into(),
+            ResourceType::Fetch,
+            "https://example.test/redirect".into(),
+            None,
+        );
+        let snapshot =
+            state.snapshot_at(current_epoch, bootstrap_start + Duration::from_millis(45));
+        assert_eq!(snapshot.epoch, current_epoch);
+        assert_eq!(snapshot.pending_requests.len(), 2);
+        assert!(
+            snapshot
+                .pending_requests
+                .iter()
+                .all(|request| request.epoch != first_epoch)
+        );
+        let diagnostic = snapshot.diagnostic();
+        assert_eq!(diagnostic.stale_pending_request_count, 1);
+        assert_eq!(diagnostic.stale_pending_requests[0].observed_ms, Some(45));
+        assert_eq!(diagnostic.stale_pending_requests[0].epoch, first_epoch);
+        let current = diagnostic
+            .pending_requests
+            .iter()
+            .find(|request| request.in_current_epoch)
+            .unwrap();
+        assert_eq!(current.observed_ms, Some(35));
+        let bootstrap = diagnostic
+            .pending_requests
+            .iter()
+            .find(|request| !request.in_current_epoch)
+            .unwrap();
+        assert_eq!(bootstrap.epoch, 0);
+        assert_eq!(bootstrap.observed_ms, Some(45));
+        assert_eq!(
+            state
+                .snapshot_at(current_epoch, bootstrap_start)
+                .diagnostic()
+                .pending_requests
+                .iter()
+                .find(|request| request.in_current_epoch)
+                .unwrap()
+                .observed_ms,
+            Some(0)
+        );
+        state.record_network_failure(
+            "current".into(),
+            ResourceType::Fetch,
+            "net::ERR_TIMED_OUT".into(),
+        );
+        assert!(!state.request_observed_at.contains_key("current"));
+    }
+
+    #[test]
+    fn safe_snapshot_bounds_all_collections_and_excludes_raw_data() {
+        let mut snapshot = RuntimeSnapshot {
+            epoch: 2,
+            ..Default::default()
+        };
+        for index in 0..(MAX_RUNTIME_DIAGNOSTIC_ITEMS + 8) {
+            let id = format!("private-request-id-{index}");
+            snapshot.pending_requests.push(TrackedRequest {
+                request_id: id.clone(),
+                resource_type: ResourceType::Fetch,
+                url: "https://user:password@example.test/private?token=secret#fragment".into(),
+                epoch: 2,
+                is_top_level: true,
+            });
+            snapshot.network_failures.push(outcome(
+                ResourceType::Fetch,
+                Some("https://example.test/private?authorization=hidden"),
+                Some("raw cookies and body value secret"),
+                &id,
+                2,
+                None,
+            ));
+            snapshot.http_errors.push(outcome(
+                ResourceType::Fetch,
+                Some("https://example.test/response-body"),
+                None,
+                &id,
+                2,
+                Some(503),
+            ));
+        }
+        for index in 0..(MAX_RUNTIME_DIAGNOSTIC_ITEMS + 8) {
+            let id = format!("stale-private-{index}");
+            snapshot.stale_pending_requests.push(TrackedRequest {
+                request_id: id.clone(),
+                resource_type: ResourceType::Image,
+                url: "https://example.test/stale?secret=value".into(),
+                epoch: 1,
+                is_top_level: false,
+            });
+            snapshot.stale_network_failures.push(outcome(
+                ResourceType::Fetch,
+                Some("https://example.test/stale?secret=value"),
+                Some(&format!("net::ERR_{}", "X".repeat(119))),
+                &id,
+                1,
+                None,
+            ));
+            snapshot.stale_http_errors.push(outcome(
+                ResourceType::Fetch,
+                Some("https://example.test/stale?secret=value"),
+                None,
+                &id,
+                1,
+                Some(503),
+            ));
+        }
+        snapshot.pending_requests.push(TrackedRequest {
+            request_id: "stale-request".into(),
+            resource_type: ResourceType::Image,
+            url: "https://example.test/stale".into(),
+            epoch: 1,
+            is_top_level: false,
+        });
+        let diagnostic = snapshot.diagnostic();
+        assert_eq!(
+            diagnostic.pending_request_count,
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS + 8
+        );
+        assert_eq!(
+            diagnostic.network_failure_count,
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS + 8
+        );
+        assert_eq!(
+            diagnostic.http_error_count,
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS + 8
+        );
+        assert_eq!(
+            diagnostic.pending_requests.len(),
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS
+        );
+        assert_eq!(
+            diagnostic.network_failures.len(),
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS
+        );
+        assert_eq!(diagnostic.http_errors.len(), MAX_RUNTIME_DIAGNOSTIC_ITEMS);
+        assert_eq!(
+            diagnostic.stale_pending_request_count,
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS + 9
+        );
+        assert_eq!(
+            diagnostic.stale_network_failure_count,
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS + 8
+        );
+        assert_eq!(
+            diagnostic.stale_http_error_count,
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS + 8
+        );
+        assert_eq!(
+            diagnostic.stale_pending_requests.len(),
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS
+        );
+        assert_eq!(
+            diagnostic.stale_network_failures.len(),
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS
+        );
+        assert_eq!(
+            diagnostic.stale_http_errors.len(),
+            MAX_RUNTIME_DIAGNOSTIC_ITEMS
+        );
+        assert!(
+            diagnostic
+                .stale_pending_requests
+                .iter()
+                .all(|request| !request.in_current_epoch)
+        );
+        assert!(
+            diagnostic
+                .pending_requests
+                .iter()
+                .all(|request| request.observed_ms.is_none())
+        );
+        let encoded = serde_json::to_string(&diagnostic).unwrap();
+        assert!(encoded.len() < 32 * 1024);
+        for raw in [
+            "https://",
+            "example.test",
+            "private-request-id",
+            "password",
+            "secret",
+            "fragment",
+            "authorization",
+            "cookies",
+            "response-body",
+            "stale-request",
+        ] {
+            assert!(
+                !encoded.contains(raw),
+                "raw data escaped into diagnostics: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_state_bounds_observation_strings_and_javascript_epochs() {
+        let mut state = RuntimeState::default();
+        for index in 0..=MAX_TRACKED_REQUESTS {
+            state.record_request(
+                index.to_string(),
+                ResourceType::Fetch,
+                "https://example.test/".into(),
+                None,
+            );
+        }
+        assert_eq!(state.request_observed_at.len(), MAX_TRACKED_REQUESTS);
+        state.record_request(
+            "oversized-url".into(),
+            ResourceType::Fetch,
+            "x".repeat(MAX_RUNTIME_URL_BYTES + 1),
+            None,
+        );
+        assert!(!state.relevant_requests.contains_key("oversized-url"));
+        state.record_network_failure(
+            "long-reason".into(),
+            ResourceType::Fetch,
+            "x".repeat(MAX_RUNTIME_REASON_BYTES + 1),
+        );
+        assert!(state.network_failures.is_empty());
+        for _ in 0..=MAX_NETWORK_OUTCOMES {
+            state.begin_epoch();
+            state.record_javascript_exception();
+        }
+        assert_eq!(state.javascript_exceptions.len(), MAX_NETWORK_OUTCOMES);
+        assert!(state.monitor_failed);
+    }
+
+    #[test]
+    fn bootstrap_javascript_is_counted_once_and_new_monitor_has_no_previous_session_state() {
+        let mut state = RuntimeState::default();
+        state.record_javascript_exception();
+        assert_eq!(state.snapshot(0).javascript_exceptions, 1);
+        let epoch = state.begin_epoch();
+        state.record_javascript_exception();
+        state.record_request(
+            "old-session".into(),
+            ResourceType::Image,
+            "https://example.test/old".into(),
+            None,
+        );
+        assert_eq!(state.snapshot(epoch).javascript_exceptions, 2);
+        let old = CdpRuntimeMonitor {
+            state: Arc::new(Mutex::new(state)),
+            tasks: Arc::new(Vec::new()),
+        };
+        let fresh = CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot::default());
+        let fresh_epoch = fresh.begin_epoch();
+        assert_eq!(fresh_epoch, 1);
+        assert_eq!(old.current_snapshot().pending_requests.len(), 1);
+        assert_eq!(fresh.current_snapshot().epoch, fresh_epoch);
+        assert!(fresh.current_snapshot().pending_requests.is_empty());
+        assert_eq!(fresh.current_snapshot().javascript_exceptions, 0);
+        assert!(!fresh.current_snapshot().monitor_failed);
+    }
+
+    #[tokio::test]
+    async fn telemetry_shutdown_waits_for_shared_listener_task_completion() {
+        use std::sync::atomic::AtomicBool;
+        struct ListenerStopped(Arc<AtomicBool>);
+        impl Drop for ListenerStopped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&stopped);
+        let (started_tx, started_rx) = futures::channel::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = ListenerStopped(observed);
+            started_tx.send(()).unwrap();
+            futures::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let monitor = CdpRuntimeMonitor {
+            state: Arc::new(Mutex::new(RuntimeState::default())),
+            tasks: Arc::new(vec![task]),
+        };
+        let shared = monitor.clone();
+        monitor.shutdown().await.unwrap();
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(
+            shared
+                .tasks
+                .iter()
+                .all(tokio::task::JoinHandle::is_finished)
+        );
+    }
+    #[test]
+    fn snapshot_separates_current_bootstrap_and_stale_javascript_and_network_evidence() {
+        let mut state = RuntimeState::default();
+        state.record_javascript_exception();
+        let old_epoch = state.begin_epoch();
+        for _ in 0..3 {
+            state.record_javascript_exception();
+        }
+        state.record_request(
+            "old".into(),
+            ResourceType::Fetch,
+            "https://example.test/old".into(),
+            None,
+        );
+        state.record_http_error(
+            "old".into(),
+            ResourceType::Fetch,
+            "https://example.test/old".into(),
+            503,
+        );
+        state.record_network_failure(
+            "old".into(),
+            ResourceType::Fetch,
+            "net::ERR_TIMED_OUT".into(),
+        );
+        let epoch = state.begin_epoch();
+        for _ in 0..2 {
+            state.record_javascript_exception();
+        }
+        state.record_request(
+            "current".into(),
+            ResourceType::Fetch,
+            "https://example.test/current".into(),
+            None,
+        );
+        state.record_http_error(
+            "current".into(),
+            ResourceType::Fetch,
+            "https://example.test/current".into(),
+            404,
+        );
+        let snapshot = state.snapshot(epoch);
+        assert!(snapshot.network_failures.is_empty());
+        assert_eq!(snapshot.http_errors.len(), 1);
+        assert_eq!(snapshot.javascript_exceptions, 3);
+        let diagnostic = snapshot.diagnostic();
+        assert_eq!(diagnostic.current_javascript_exceptions, 2);
+        assert_eq!(diagnostic.bootstrap_javascript_exceptions, 1);
+        assert_eq!(diagnostic.stale_javascript_exceptions, 3);
+        assert_eq!(diagnostic.network_failure_count, 0);
+        assert_eq!(diagnostic.http_error_count, 1);
+        assert_eq!(diagnostic.stale_network_failure_count, 1);
+        assert_eq!(diagnostic.stale_http_error_count, 1);
+        assert_eq!(diagnostic.stale_network_failures[0].epoch, old_epoch);
+        assert!(!diagnostic.stale_network_failures[0].in_current_epoch);
+        assert!(diagnostic.http_errors[0].in_current_epoch);
     }
 }
