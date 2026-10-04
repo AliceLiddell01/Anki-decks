@@ -16,3 +16,9 @@ resolver = "3"
 rust-version = "1.88"
 edition = "2024"
 license = "MIT"
+
+# asset-store содержит CPU-тяжёлые проверки растровых эталонов кандзи.
+# Умеренная оптимизация test-profile сокращает время этих проверок, не
+# переводя весь workspace на более дорогую release-подобную компиляцию.
+[profile.test.package.asset-store]
+opt-level = 1
