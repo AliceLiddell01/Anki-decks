@@ -60,6 +60,7 @@ jobs:
       # hosted runners; rust-cache ниже остаётся слоем Cargo registry/target.
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     # Push в feature-ветку не дублирует прогон PR: на push job выполняется
     # только для default branch текущего репозитория.
     if: >-
@@ -74,6 +75,12 @@ jobs:
       - name: Установить стабильный Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
+      - name: Установить mold
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold
+          mold --version
+
       - name: Настроить sccache
         uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -84,7 +91,7 @@ jobs:
         with:
           # Весь code job использует один custom profile (test + cargo run),
           # поэтому держим отдельное поколение dependency cache.
-          key: unified-ci-v1
+          key: unified-ci-mold-v1
 
       - name: Собрать и выполнить тесты
         # В workspace нет feature-gated test-кода. Единственная feature
