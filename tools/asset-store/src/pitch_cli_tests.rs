@@ -63,7 +63,9 @@ fn panic_hook_subprocess_writes_sanitized_jsonl_to_real_stderr() {
         .iter()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("строка stderr — JSON"))
         .collect::<Vec<_>>();
+    assert_eq!(events[0]["schema_version"], 1);
     assert_eq!(events[0]["event"], "panic");
+    assert_eq!(events[0].as_object().unwrap().len(), 3);
     assert!(!stderr.contains("secret-value"));
 
     let stdout = String::from_utf8(output.stdout).expect("stdout дочернего процесса — UTF-8");

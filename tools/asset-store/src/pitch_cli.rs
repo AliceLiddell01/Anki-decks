@@ -207,7 +207,7 @@ pub fn install_safe_panic_hook(output: OutputFormat) {
             let message = match output {
                 OutputFormat::Human => "Внутренняя паника; подробности скрыты.\n",
                 OutputFormat::Json => {
-                    "{\"event\":\"panic\",\"message\":\"Внутренняя паника; подробности скрыты.\"}\n"
+                    "{\"schema_version\":1,\"event\":\"panic\",\"message\":\"Внутренняя паника; подробности скрыты.\"}\n"
                 }
             };
             // Ошибка записи не запускает повторную панику. Одна блокировка
