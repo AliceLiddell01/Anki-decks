@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Переиспользуемый lifecycle store для программно принадлежащих assets"
 publish = false
+autotests = false
 
 [dependencies]
 base64 = { version = "0.23", default-features = false, features = ["std"] }
@@ -63,6 +64,10 @@ required-features = ["reference-generator"]
 name = "build-yarxi-font-reference"
 path = "src/bin/build_yarxi_font_reference.rs"
 required-features = ["reference-generator"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints.rust]
 unsafe_code = "forbid"
