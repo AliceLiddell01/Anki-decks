@@ -26,8 +26,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  code:
-    name: Код и тесты
+  lint:
+    name: Форматирование и Clippy
     # Push в feature-ветку не дублирует прогон PR: на push job выполняется
     # только для default branch текущего репозитория.
     if: >-
@@ -44,21 +44,61 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Восстановить Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
       - name: Проверить форматирование
         run: cargo fmt --all --check
 
       - name: Проверить статику Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  code:
+    name: Код и тесты
+    env:
+      # sccache сохраняет результаты rustc для workspace library crates между
+      # hosted runners; rust-cache ниже остаётся слоем Cargo registry/target.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    # Push в feature-ветку не дублирует прогон PR: на push job выполняется
+    # только для default branch текущего репозитория.
+    if: >-
+      github.event_name != 'push'
+      || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Установить стабильный Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Настроить sccache
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      - name: Восстановить Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Весь code job использует один custom profile (test + cargo run),
+          # поэтому держим отдельное поколение dependency cache.
+          key: unified-ci-v1
+
       - name: Собрать и выполнить тесты
-        run: cargo test --workspace --all-features --locked
+        # В workspace нет feature-gated test-кода. Единственная feature
+        # reference-generator включает resvg только для двух служебных
+        # generator binaries; их all-features/all-targets сборку уже проверяют
+        # Clippy и MSRV jobs параллельно.
+        run: cargo test --workspace --locked --profile ci
 
       - name: Проверить verified-only kanji corpus
         # Ветка без tracked corpus допустима. Если store присутствует (в том числе
         # как symlink), read-only gate обязан подтвердить verified-only содержимое.
         run: |
           if [ -e .asset-store/kanji ] || [ -L .asset-store/kanji ]; then
-            cargo run --quiet --locked --bin kanji-corpus-gate
+            cargo run --quiet --locked --profile ci --bin kanji-corpus-gate
           else
             echo "Канонический kanji corpus отсутствует; проверка пропущена"
           fi
@@ -69,7 +109,7 @@ jobs:
         # все записи корпуса прошли обязательную автоматическую проверку.
         run: |
           if [ -e .asset-store/pitch-accent ] || [ -L .asset-store/pitch-accent ]; then
-            cargo run --quiet --locked --bin pitch-corpus-gate
+            cargo run --quiet --locked --profile ci --bin pitch-corpus-gate
           else
             echo "Канонический корпус pitch-accent отсутствует; проверка пропущена"
           fi
@@ -97,11 +137,15 @@ jobs:
               found=$((found + 1))
               export_dir=$(dirname "$deck_json")
               echo "Проверяю экспорт: $export_dir"
-              cargo run --quiet --locked --bin anki-repo -- validate "$export_dir" || status=1
+              cargo run --quiet --locked --profile ci --bin anki-repo -- validate "$export_dir" || status=1
             done < "$deck_list"
           fi
           echo "Найдено экспортов: $found"
           exit "$status"
+
+      - name: Показать статистику sccache
+        if: always()
+        run: sccache --show-stats
 
   msrv:
     name: Заявленная MSRV
@@ -134,6 +178,13 @@ jobs:
 
       - name: Установить Rust заявленной MSRV
         run: rustup toolchain install "${{ steps.msrv.outputs.toolchain }}" --profile minimal
+
+      - name: Восстановить Rust cache для MSRV
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.toolchain }}
+        with:
+          shared-key: msrv
 
       - name: Проверить сборку на заявленной MSRV
         run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --all-features --locked

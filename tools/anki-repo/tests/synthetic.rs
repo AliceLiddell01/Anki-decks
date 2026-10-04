@@ -3,7 +3,7 @@
 //! Fixtures строятся программно, поэтому тесты не зависят от содержимого
 //! канонических колод.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 
