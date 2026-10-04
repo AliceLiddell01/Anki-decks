@@ -36,18 +36,22 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "kanji-assets"
+test = false
 path = "src/main.rs"
 
 [[bin]]
 name = "kanji-corpus-gate"
+test = false
 path = "src/bin/kanji_corpus_gate.rs"
 
 [[bin]]
 name = "pitch-corpus-gate"
+test = false
 path = "src/bin/pitch_corpus_gate.rs"
 
 [[bin]]
 name = "pitch-assets"
+test = false
 path = "src/bin/pitch_assets.rs"
 
 [[bin]]
