@@ -7,9 +7,10 @@ use tracing::instrument::WithSubscriber;
 use super::{
     CorpusCommand, OutputFormat, PitchBatchCommand, PitchCli, PitchCommand, PitchPlanItem,
     StoreSummary, create_batch, execute, load_batch, reject_batch, run_batch,
-    validate_store_boundary,
+    temp_workspace_cleanup_error, validate_store_boundary,
 };
 use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
+use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
 use crate::jpdb::{
     JpdbPitchAcquired, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchQuery, JpdbPitchRequest,
@@ -61,6 +62,41 @@ fn workspace_root_does_not_require_decks_and_supports_git_worktree_file() {
     );
     fs::create_dir(root.join("decks")).unwrap();
     assert_eq!(super::find_workspace_root(&nested), Some(canonical));
+}
+
+#[test]
+fn workspace_cleanup_failure_keeps_a_completed_run_identifiable() {
+    let error = temp_workspace_cleanup_error(Ok(()), std::io::Error::other("cleanup denied"));
+
+    assert_eq!(error.code, ErrorCode::IoFailure);
+    assert!(error.message.contains("получение завершено"));
+    assert_eq!(error.details["run_completed"], true);
+    assert_eq!(error.details["original_error"], serde_json::Value::Null);
+    assert_eq!(error.details["cleanup_error"], "cleanup denied");
+}
+
+#[test]
+fn workspace_cleanup_failure_preserves_the_original_error_fields() {
+    let original = AssetError::with_details(
+        ErrorCode::InvalidIdentity,
+        "invalid original identity",
+        serde_json::json!({"field":"surface"}),
+    );
+
+    let error =
+        temp_workspace_cleanup_error::<()>(Err(original), std::io::Error::other("cleanup denied"));
+
+    assert_eq!(error.code, ErrorCode::IoFailure);
+    assert_eq!(error.details["run_completed"], false);
+    assert_eq!(error.details["original_error"]["code"], "invalid_identity");
+    assert_eq!(
+        error.details["original_error"]["message"],
+        "invalid original identity"
+    );
+    assert_eq!(
+        error.details["original_error"]["details"],
+        serde_json::json!({"field":"surface"})
+    );
 }
 
 fn temp_root() -> TemporaryRoot {

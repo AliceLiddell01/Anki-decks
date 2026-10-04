@@ -428,12 +428,18 @@ impl JpdbPitchProvider {
         let session = match launched {
             Ok(session) => session,
             Err(message) => {
-                return JpdbPitchAcquisitionReport::from_session_failure(
+                let mut report = JpdbPitchAcquisitionReport::from_session_failure(
                     JpdbPitchFailure::BrowserSetup {
                         stage: JpdbPitchStage::ConfigureBrowser,
                         message,
                     },
                 );
+                record_pending_interrupt(
+                    &mut interrupt,
+                    &mut report,
+                    JpdbPitchStage::ConfigureBrowser,
+                );
+                return report;
             }
         };
         let mut report =
@@ -473,6 +479,11 @@ impl JpdbPitchProvider {
                 None => report.stop_with_session_failure(JpdbPitchStage::ConfigureBrowser, message),
             }
         }
+        record_pending_interrupt(
+            &mut interrupt,
+            &mut report,
+            JpdbPitchStage::ConfigureBrowser,
+        );
         report
     }
 
@@ -559,6 +570,18 @@ impl JpdbInterrupt {
             keep_late_interrupt_handler: false,
         }
     }
+
+    fn observe_pending_signal(&mut self) -> bool {
+        if self.signal_observed {
+            return false;
+        }
+        if matches!(self.first_signal.try_recv(), Ok(Ok(()))) {
+            self.signal_observed = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for JpdbInterrupt {
@@ -576,6 +599,36 @@ impl Drop for JpdbInterrupt {
             self.listener.abort();
         }
     }
+}
+
+fn record_pending_interrupt(
+    interrupt: &mut JpdbInterrupt,
+    report: &mut JpdbPitchAcquisitionReport,
+    stage: JpdbPitchStage,
+) {
+    if !interrupt.observe_pending_signal() {
+        return;
+    }
+
+    let previous_failure = report.session_failure.take().map(|failure| {
+        let value = serde_json::to_value(&failure).expect("ошибка JPDB сериализуется");
+        let code = value["code"].as_str().unwrap_or("unknown");
+        let failure_stage = value["stage"].as_str().unwrap_or("unknown");
+        let message = value
+            .get("message")
+            .or_else(|| value.get("diagnostic"))
+            .and_then(serde_json::Value::as_str)
+            .map(safe_message)
+            .unwrap_or_else(|| "подробности отсутствуют".into());
+        format!("{code} на этапе {failure_stage}: {message}")
+    });
+    let message = previous_failure.map_or_else(
+        || "acquisition_interrupted: получен Ctrl+C".to_owned(),
+        |previous| {
+            format!("acquisition_interrupted: получен Ctrl+C; предшествующая ошибка: {previous}")
+        },
+    );
+    report.stop_with_session_failure(stage, message);
 }
 
 async fn wait_jpdb_operation<T>(
@@ -2802,6 +2855,57 @@ const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_interrupt_after_launch_failure_is_preserved_for_acceptance_cleanup() {
+        let mut interrupt = JpdbInterrupt::injected(async { Ok(()) });
+        (&mut interrupt.listener).await.unwrap();
+        let mut report =
+            JpdbPitchAcquisitionReport::from_session_failure(JpdbPitchFailure::BrowserSetup {
+                stage: JpdbPitchStage::ConfigureBrowser,
+                message: "injected launch failure".into(),
+            });
+
+        record_pending_interrupt(
+            &mut interrupt,
+            &mut report,
+            JpdbPitchStage::ConfigureBrowser,
+        );
+
+        assert!(interrupt.signal_observed);
+        assert!(matches!(
+            report.session_failure,
+            Some(JpdbPitchFailure::SessionFailure { message, .. })
+                if message.starts_with("acquisition_interrupted:")
+                    && message.contains("browser_setup на этапе configure_browser")
+                    && message.contains("injected launch failure")
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_interrupt_after_close_keeps_processed_outcomes_for_acceptance_cleanup() {
+        let mut interrupt = JpdbInterrupt::injected(async { Ok(()) });
+        (&mut interrupt.listener).await.unwrap();
+        let mut report = JpdbPitchAcquisitionReport::default();
+        report.outcomes.push(JpdbPitchOutcome::VocabularyNotFound {
+            surface: "猫".into(),
+            reading: None,
+        });
+
+        record_pending_interrupt(
+            &mut interrupt,
+            &mut report,
+            JpdbPitchStage::ConfigureBrowser,
+        );
+
+        assert!(interrupt.signal_observed);
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(matches!(
+            report.session_failure,
+            Some(JpdbPitchFailure::SessionFailure { message, .. })
+                if message.starts_with("acquisition_interrupted:")
+        ));
+    }
 
     #[tokio::test]
     async fn injected_interrupt_keeps_processed_prefix_without_tail_outcomes() {

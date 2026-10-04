@@ -295,14 +295,14 @@ fn run_body(
     } else {
         "verification_failed"
     };
-    save_evidence(run_status, plan_path, items, &rows, &report_dir)?;
-    let mut saved: Value = serde_json::from_slice(&fs::read(report_dir.join("evidence.json"))?)?;
-    saved["session_failure"] = session_failure.unwrap_or(Value::Null);
-    saved["processed_item_count"] = json!(processed_count);
-    evidence_zip::redact(&mut saved);
-    fs::write(
-        report_dir.join("evidence.json"),
-        serde_json::to_vec_pretty(&saved)?,
+    save_evidence(
+        run_status,
+        plan_path,
+        items,
+        &rows,
+        processed_count,
+        session_failure.as_ref(),
+        &report_dir,
     )?;
 
     let verified_count = rows
@@ -484,6 +484,8 @@ fn save_evidence(
     _plan_path: &Path,
     items: &[PlanItem],
     rows: &[Value],
+    processed_item_count: usize,
+    session_failure: Option<&Value>,
     report_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let groups = items
@@ -506,12 +508,14 @@ fn save_evidence(
         "validator": KanjiImageValidator::validator_identity(),
         "items": rows,
     });
+    report["session_failure"] = session_failure.cloned().unwrap_or(Value::Null);
+    report["processed_item_count"] = json!(processed_item_count);
     evidence_zip::redact(&mut report);
     fs::write(
         report_dir.join("evidence.json"),
         serde_json::to_vec_pretty(&report)?,
     )?;
-    save_html_report(run_status, items, &rows, report_dir)?;
+    save_html_report(run_status, items, &rows, session_failure, report_dir)?;
     Ok(())
 }
 
@@ -519,6 +523,7 @@ fn save_html_report(
     run_status: &str,
     items: &[PlanItem],
     rows: &[Value],
+    session_failure: Option<&Value>,
     report_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut html = String::from(
@@ -556,6 +561,14 @@ small{color:#505960}
     html = html
         .replace("__RUN_STATUS__", &escape_html(run_status))
         .replace("__ITEM_COUNT__", &items.len().to_string());
+    if let Some(session_failure) = session_failure {
+        let mut safe_failure = session_failure.clone();
+        evidence_zip::redact(&mut safe_failure);
+        html.push_str(&format!(
+            "<section class=\"summary\" id=\"session-failure\"><h2>Ошибка сессии браузера</h2><pre>{}</pre></section>",
+            escape_html(&serde_json::to_string_pretty(&safe_failure)?)
+        ));
+    }
 
     let groups: BTreeSet<Option<String>> = items.iter().map(|item| item.group.clone()).collect();
     for group_name in groups {
@@ -591,7 +604,23 @@ small{color:#505960}
                     escape_html(&title)
                 ));
             } else {
-                html.push_str("<p>PNG не сохранён: изображение получить не удалось.</p>");
+                if row.and_then(|row| row["outcome"].as_str())
+                    == Some("not_started_session_failure")
+                {
+                    html.push_str(
+                        "<p>Обработка не началась: сессия браузера завершилась ошибкой.</p>",
+                    );
+                } else {
+                    html.push_str("<p>PNG не сохранён: изображение получить не удалось.</p>");
+                }
+            }
+            if row
+                .and_then(|row| row["session_failure_ref"].as_str())
+                .is_some()
+            {
+                html.push_str(
+                    "<p><a href=\"#session-failure\">Причина остановки сессии браузера</a></p>",
+                );
             }
 
             let row = row.cloned().unwrap_or(Value::Null);
@@ -849,11 +878,44 @@ mod tests {
             asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
 
         let report_dir = workspace.path();
-        save_html_report("test", &items, &[], report_dir).unwrap();
+        save_html_report("test", &items, &[], None, report_dir).unwrap();
         let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
         assert!(html.contains("custom — 1 PNG"));
         assert!(html.contains("Без группы — 1 PNG"));
         assert!(!html.contains("50 тёмных PNG"));
+    }
+
+    #[test]
+    fn html_shows_session_failure_and_marks_unstarted_items_distinctly() {
+        let items = read_plan_items(&json!({ "items": [{ "character": "漢" }] })).unwrap();
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("acceptance-fixture").unwrap();
+        let report_dir = workspace.path();
+        let rows = [json!({
+            "character": "漢",
+            "outcome": "not_started_session_failure",
+            "session_failure_ref": "#/session_failure",
+        })];
+        let failure = json!({
+            "code": "acquisition_interrupted",
+            "message": "browser failed <after launch>",
+        });
+
+        save_html_report(
+            "verification_failed",
+            &items,
+            &rows,
+            Some(&failure),
+            report_dir,
+        )
+        .unwrap();
+
+        let html = fs::read_to_string(report_dir.join("index.html")).unwrap();
+        assert!(html.contains("id=\"session-failure\""));
+        assert!(html.contains("href=\"#session-failure\""));
+        assert!(html.contains("Обработка не началась: сессия браузера завершилась ошибкой."));
+        assert!(html.contains("browser failed &lt;after launch&gt;"));
+        assert!(!html.contains("PNG не сохранён: изображение получить не удалось."));
     }
 
     #[test]
@@ -878,6 +940,8 @@ mod tests {
             Path::new("external-plan.json"),
             &items,
             &rows,
+            items.len(),
+            None,
             report_dir,
         )
         .unwrap();

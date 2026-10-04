@@ -2146,18 +2146,44 @@ async fn run_batch(
         Ok(()) => result,
         Err(error) => {
             tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %safe_message(&error.to_string()), "Не удалось удалить временное дерево pitch");
-            Err(pitch_run_stopped(
-                "temp_workspace_cleanup_failed",
-                format!(
-                    "{}; temp cleanup: {error}",
-                    result.err().map_or_else(
-                        || "получение завершено".into(),
-                        |original| original.to_string()
-                    )
-                ),
-            ))
+            Err(temp_workspace_cleanup_error(result, error))
         }
     }
+}
+
+fn temp_workspace_cleanup_error<T>(
+    result: Result<T, AssetError>,
+    cleanup_error: io::Error,
+) -> AssetError {
+    let (run_completed, original_error) = match result {
+        Ok(_) => (true, serde_json::Value::Null),
+        Err(error) => (
+            false,
+            json!({
+                "code": error.code.as_str(),
+                "message": safe_message(&error.message),
+                "details": error.details,
+            }),
+        ),
+    };
+    let cleanup_message = safe_message(&cleanup_error.to_string());
+    AssetError::with_details(
+        ErrorCode::IoFailure,
+        if run_completed {
+            format!(
+                "получение завершено, но очистка временного дерева не удалась: {cleanup_message}"
+            )
+        } else {
+            format!(
+                "обработка завершилась ошибкой, и очистка временного дерева также не удалась: {cleanup_message}"
+            )
+        },
+        json!({
+            "run_completed": run_completed,
+            "cleanup_error": cleanup_message,
+            "original_error": original_error,
+        }),
+    )
 }
 
 async fn run_batch_in_workspace(
