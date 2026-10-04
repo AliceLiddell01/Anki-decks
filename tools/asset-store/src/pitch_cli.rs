@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -188,6 +189,31 @@ pub enum PitchBatchCommand {
 pub enum OutputFormat {
     Human,
     Json,
+}
+
+/// Устанавливает безопасную диагностику паник для всего процесса `pitch-assets`.
+///
+/// Вызывается CLI после разбора аргументов, до запуска получения ресурсов.
+/// Первая установка фиксирует формат на весь процесс: конкурентные операции
+/// не переключают глобальный hook. Библиотечные вызовы сами его не устанавливают,
+/// поэтому общий browser runtime не меняет диагностику других бинарников.
+pub fn install_safe_panic_hook(output: OutputFormat) {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        std::panic::set_hook(Box::new(move |_| {
+            // Не читаем payload, location или backtrace и не форматируем ошибку:
+            // hook выполняется до catch_unwind и не должен раскрывать её данные.
+            let message = match output {
+                OutputFormat::Human => "Внутренняя паника; подробности скрыты.\n",
+                OutputFormat::Json => {
+                    "{\"event\":\"panic\",\"message\":\"Внутренняя паника; подробности скрыты.\"}\n"
+                }
+            };
+            // Ошибка записи не запускает повторную панику. Один lock сохраняет
+            // целостность строки при одновременной диагностике разных workers.
+            let _ = io::stderr().lock().write_all(message.as_bytes());
+        }));
+    });
 }
 
 /// Строгая внешняя схема плана. Версия сохраняется вместе с запросами пакета.

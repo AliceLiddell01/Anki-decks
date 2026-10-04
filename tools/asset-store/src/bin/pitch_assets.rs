@@ -1,12 +1,14 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use asset_store::pitch_cli::{PitchCli, execute};
+use asset_store::pitch_cli::{PitchCli, execute, install_safe_panic_hook};
 use clap::Parser;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let output = execute(PitchCli::parse()).await;
+    let cli = PitchCli::parse();
+    install_safe_panic_hook(cli.output);
+    let output = execute(cli).await;
     if let Err(error) = io::stdout().lock().write_all(output.stdout.as_bytes())
         && error.kind() != io::ErrorKind::BrokenPipe
     {
