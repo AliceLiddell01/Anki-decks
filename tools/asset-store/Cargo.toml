@@ -34,6 +34,7 @@ reference-generator = ["dep:resvg"]
 [lib]
 name = "asset_store"
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "kanji-assets"
