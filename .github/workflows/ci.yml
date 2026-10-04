@@ -26,8 +26,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  code:
-    name: Код и тесты
+  lint:
+    name: Форматирование и Clippy
     # Push в feature-ветку не дублирует прогон PR: на push job выполняется
     # только для default branch текущего репозитория.
     if: >-
@@ -52,6 +52,25 @@ jobs:
 
       - name: Проверить статику Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  code:
+    name: Код и тесты
+    # Push в feature-ветку не дублирует прогон PR: на push job выполняется
+    # только для default branch текущего репозитория.
+    if: >-
+      github.event_name != 'push'
+      || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Установить стабильный Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Восстановить Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Собрать и выполнить тесты
         run: cargo test --workspace --all-features --locked
