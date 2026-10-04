@@ -8,10 +8,10 @@ use tracing::instrument::WithSubscriber;
 use super::{
     CorpusCommand, OutputFormat, PitchBatchCommand, PitchCli, PitchCommand, PitchPlanItem,
     StoreSummary, create_batch, execute, load_batch, reject_batch, run_batch,
-    temp_workspace_cleanup_error, validate_store_boundary,
+    validate_store_boundary,
 };
 use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
-use crate::error::{AssetError, ErrorCode};
+use crate::error::ErrorCode;
 use crate::hashing::sha256_hex;
 use crate::jpdb::{
     JpdbPitchAcquired, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchQuery, JpdbPitchRequest,
@@ -82,41 +82,6 @@ fn workspace_root_does_not_require_decks_and_supports_git_worktree_file() {
     );
     fs::create_dir(root.join("decks")).unwrap();
     assert_eq!(super::find_workspace_root(&nested), Some(canonical));
-}
-
-#[test]
-fn workspace_cleanup_failure_keeps_a_completed_run_identifiable() {
-    let error = temp_workspace_cleanup_error(Ok(()), std::io::Error::other("cleanup denied"));
-
-    assert_eq!(error.code, ErrorCode::IoFailure);
-    assert!(error.message.contains("получение завершено"));
-    assert_eq!(error.details["run_completed"], true);
-    assert_eq!(error.details["original_error"], serde_json::Value::Null);
-    assert_eq!(error.details["cleanup_error"], "cleanup denied");
-}
-
-#[test]
-fn workspace_cleanup_failure_preserves_the_original_error_fields() {
-    let original = AssetError::with_details(
-        ErrorCode::InvalidIdentity,
-        "invalid original identity",
-        serde_json::json!({"field":"surface"}),
-    );
-
-    let error =
-        temp_workspace_cleanup_error::<()>(Err(original), std::io::Error::other("cleanup denied"));
-
-    assert_eq!(error.code, ErrorCode::IoFailure);
-    assert_eq!(error.details["run_completed"], false);
-    assert_eq!(error.details["original_error"]["code"], "invalid_identity");
-    assert_eq!(
-        error.details["original_error"]["message"],
-        "invalid original identity"
-    );
-    assert_eq!(
-        error.details["original_error"]["details"],
-        serde_json::json!({"field":"surface"})
-    );
 }
 
 fn temp_root() -> TemporaryRoot {
@@ -2410,6 +2375,461 @@ async fn parallel_pitch_reports_worker_workspace_cleanup_failure_after_checkpoin
     );
     assert_eq!(trace.snapshot().closed.len(), 1);
     assert_parallel_workspaces_removed(&trace, 1);
+}
+
+// Эти тесты проверяют аварийные границы независимо от сценариев распределения
+// ParallelPitchDriver. Освобождение каждой сессии и запроса наблюдается через RAII.
+#[derive(Clone, Copy)]
+enum LifecyclePitchFault {
+    None,
+    ClosePanic,
+    CloseError,
+    FinishPanic,
+    FinishError,
+}
+
+enum LifecyclePitchAction {
+    Complete,
+    Gated {
+        started: futures::channel::oneshot::Sender<()>,
+        release: futures::channel::oneshot::Receiver<()>,
+        panic: bool,
+    },
+}
+
+#[derive(Default)]
+struct LifecyclePitchState {
+    opened: Vec<u32>,
+    released: Vec<u32>,
+    close_calls: Vec<u32>,
+    finished: Vec<u32>,
+    acquired: Vec<(u32, String)>,
+    active_acquisitions: std::collections::BTreeSet<u32>,
+    workspaces: Vec<PathBuf>,
+}
+
+type LifecyclePitchTrace = Arc<Mutex<LifecyclePitchState>>;
+
+struct LifecyclePitchSession {
+    worker: u32,
+    trace: LifecyclePitchTrace,
+}
+
+impl Drop for LifecyclePitchSession {
+    fn drop(&mut self) {
+        self.trace.lock().unwrap().released.push(self.worker);
+    }
+}
+
+struct LifecyclePitchAcquisition {
+    worker: u32,
+    trace: LifecyclePitchTrace,
+}
+
+impl Drop for LifecyclePitchAcquisition {
+    fn drop(&mut self) {
+        assert!(
+            self.trace
+                .lock()
+                .unwrap()
+                .active_acquisitions
+                .remove(&self.worker)
+        );
+    }
+}
+
+struct LifecyclePitchDriver {
+    worker: u32,
+    trace: LifecyclePitchTrace,
+    actions: std::collections::BTreeMap<String, LifecyclePitchAction>,
+    fault: LifecyclePitchFault,
+    workspace: Option<TempWorkspace>,
+    finished_signal: Option<futures::channel::oneshot::Sender<()>>,
+}
+
+impl LifecyclePitchDriver {
+    fn new(
+        worker: u32,
+        trace: LifecyclePitchTrace,
+        actions: impl IntoIterator<Item = (String, LifecyclePitchAction)>,
+        fault: LifecyclePitchFault,
+    ) -> Self {
+        let workspace = TempWorkspace::create("pitch-lifecycle-synthetic-worker").unwrap();
+        trace
+            .lock()
+            .unwrap()
+            .workspaces
+            .push(workspace.path().to_path_buf());
+        Self {
+            worker,
+            trace,
+            actions: actions.into_iter().collect(),
+            fault,
+            workspace: Some(workspace),
+            finished_signal: None,
+        }
+    }
+
+    fn complete_actions(surfaces: &[&str]) -> Vec<(String, LifecyclePitchAction)> {
+        surfaces
+            .iter()
+            .map(|surface| ((*surface).into(), LifecyclePitchAction::Complete))
+            .collect()
+    }
+}
+
+impl super::PitchRunDriver for LifecyclePitchDriver {
+    type Session = LifecyclePitchSession;
+
+    async fn launch(&mut self) -> Result<Self::Session, String> {
+        self.trace.lock().unwrap().opened.push(self.worker);
+        Ok(LifecyclePitchSession {
+            worker: self.worker,
+            trace: self.trace.clone(),
+        })
+    }
+
+    async fn acquire(
+        &mut self,
+        session: &Self::Session,
+        request: &JpdbPitchRequest,
+    ) -> crate::jpdb::JpdbPitchAcquisitionReport {
+        assert_eq!(session.worker, self.worker);
+        let action = self
+            .actions
+            .remove(&request.query.surface)
+            .unwrap_or_else(|| {
+                panic!(
+                    "worker {} получил неожиданную identity {}",
+                    self.worker, request.query.surface
+                )
+            });
+        {
+            let mut state = self.trace.lock().unwrap();
+            assert!(state.active_acquisitions.insert(self.worker));
+            state
+                .acquired
+                .push((self.worker, request.query.surface.clone()));
+        }
+        let _acquisition = LifecyclePitchAcquisition {
+            worker: self.worker,
+            trace: self.trace.clone(),
+        };
+        if let LifecyclePitchAction::Gated {
+            started,
+            release,
+            panic,
+        } = action
+        {
+            started.send(()).unwrap();
+            release.await.expect("тест должен освободить запрос");
+            assert!(!panic, "искусственная panic в acquire");
+        }
+        crate::jpdb::JpdbPitchAcquisitionReport {
+            outcomes: vec![JpdbPitchOutcome::VocabularyNotFound {
+                surface: request.query.surface.clone(),
+                reading: request.query.reading.clone(),
+            }],
+            session_failure: None,
+        }
+    }
+
+    async fn close(&mut self, session: Self::Session) {
+        assert_eq!(session.worker, self.worker);
+        self.trace.lock().unwrap().close_calls.push(self.worker);
+        drop(session);
+    }
+
+    async fn close_checked(&mut self, session: Self::Session) -> Result<(), String> {
+        assert_eq!(session.worker, self.worker);
+        self.trace.lock().unwrap().close_calls.push(self.worker);
+        // При panic или раннем Err принадлежащая драйверу сессия освобождается через Drop.
+        match self.fault {
+            LifecyclePitchFault::ClosePanic => panic!("искусственная panic close_checked"),
+            LifecyclePitchFault::CloseError => Err("искусственная ошибка close_checked".into()),
+            _ => {
+                drop(session);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.trace.lock().unwrap().finished.push(self.worker);
+        let workspace = self.workspace.take().expect("finish вызывается один раз");
+        // Локальный TempWorkspace проходит Drop даже при аварии в finish.
+        match self.fault {
+            LifecyclePitchFault::FinishPanic => panic!("искусственная panic finish"),
+            LifecyclePitchFault::FinishError => Err("искусственная ошибка finish".into()),
+            _ => {
+                workspace.close().unwrap();
+                if let Some(signal) = self.finished_signal.take() {
+                    signal.send(()).unwrap();
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn assert_lifecycle_pitch_cleanup(trace: &LifecyclePitchTrace, workers: usize) {
+    let state = trace.lock().unwrap();
+    assert!(state.active_acquisitions.is_empty());
+    assert_eq!(state.opened.len(), workers);
+    assert_eq!(state.released.len(), workers);
+    assert_eq!(state.close_calls.len(), workers);
+    assert_eq!(state.finished.len(), workers);
+    for worker in 1..=workers as u32 {
+        assert_eq!(
+            state
+                .opened
+                .iter()
+                .filter(|value| **value == worker)
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .released
+                .iter()
+                .filter(|value| **value == worker)
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .close_calls
+                .iter()
+                .filter(|value| **value == worker)
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .finished
+                .iter()
+                .filter(|value| **value == worker)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(state.workspaces.len(), workers);
+    assert!(state.workspaces.iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
+async fn parallel_pitch_acquire_panic_closes_and_joins_workers_without_fabricated_attempts() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    let batch_id = "acquire-panic-lifecycle";
+    offline_pitch_batch(&store, batch_id, &["一", "二", "三"]);
+    let trace = LifecyclePitchTrace::default();
+    let (panic_started_tx, mut panic_started_rx) = futures::channel::oneshot::channel();
+    let (panic_release_tx, panic_release_rx) = futures::channel::oneshot::channel();
+    let (neighbor_started_tx, mut neighbor_started_rx) = futures::channel::oneshot::channel();
+    let (neighbor_release_tx, neighbor_release_rx) = futures::channel::oneshot::channel();
+    let (finished_tx, mut finished_rx) = futures::channel::oneshot::channel();
+    let mut drivers = [
+        LifecyclePitchDriver::new(
+            1,
+            trace.clone(),
+            [(
+                "一".into(),
+                LifecyclePitchAction::Gated {
+                    started: panic_started_tx,
+                    release: panic_release_rx,
+                    panic: true,
+                },
+            )],
+            LifecyclePitchFault::None,
+        ),
+        LifecyclePitchDriver::new(
+            2,
+            trace.clone(),
+            [(
+                "二".into(),
+                LifecyclePitchAction::Gated {
+                    started: neighbor_started_tx,
+                    release: neighbor_release_rx,
+                    panic: false,
+                },
+            )],
+            LifecyclePitchFault::None,
+        ),
+    ];
+    drivers[0].finished_signal = Some(finished_tx);
+    let mut progress = CapturedPitchProgress::default();
+    let mut run = Box::pin(super::run_batch_with_drivers(
+        &store,
+        batch_id,
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    ));
+    wait_for_worker_signal(&mut run, &mut panic_started_rx).await;
+    wait_for_worker_signal(&mut run, &mut neighbor_started_rx).await;
+    panic_release_tx.send(()).unwrap();
+    wait_for_worker_signal(&mut run, &mut finished_rx).await;
+    assert!(
+        futures::poll!(run.as_mut()).is_pending(),
+        "запуск должен дождаться назначенного запроса соседнего worker"
+    );
+    {
+        let state = trace.lock().unwrap();
+        assert_eq!(state.acquired, [(1, "一".into()), (2, "二".into())]);
+        assert_eq!(state.finished, [1]);
+        assert_eq!(state.active_acquisitions, [2].into_iter().collect());
+    }
+    assert_untouched_pitch_tail(&load_batch(&store, batch_id).unwrap(), 0);
+    neighbor_release_tx.send(()).unwrap();
+    let error = run.await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::ValidatorFailure);
+    assert_eq!(error.details["run_stop_reason"], "worker_panic");
+    assert!(error.message.contains("искусственная panic в acquire"));
+    let saved = load_batch(&store, batch_id).unwrap();
+    assert_untouched_pitch_tail(&saved, 2);
+    assert_eq!(
+        saved.item("一").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert!(saved.item("一").unwrap().attempts.is_empty());
+    assert!(saved.item("一").unwrap().current_candidate_sha256.is_none());
+    assert_eq!(saved.item("二").unwrap().attempts.len(), 1);
+    assert_eq!(progress.events.last().unwrap().event, "run_stopped");
+    assert_eq!(progress.events.last().unwrap().run_completed, 1);
+    assert_eq!(progress.events.last().unwrap().in_flight, Some(0));
+    assert_lifecycle_pitch_cleanup(&trace, 2);
+}
+
+async fn assert_pitch_cleanup_fault_preserves_checkpoint_and_resume(fault: LifecyclePitchFault) {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    let batch_id = "cleanup-fault-lifecycle";
+    offline_pitch_batch(&store, batch_id, &["一", "二", "三"]);
+    let trace = LifecyclePitchTrace::default();
+    let mut drivers = [LifecyclePitchDriver::new(
+        1,
+        trace.clone(),
+        LifecyclePitchDriver::complete_actions(&["一"]),
+        fault,
+    )];
+    let finish_fault = matches!(
+        fault,
+        LifecyclePitchFault::FinishPanic | LifecyclePitchFault::FinishError
+    );
+    let (interrupt_tx, interrupt_rx) = futures::channel::oneshot::channel();
+    let mut interrupt_sender = Some(interrupt_tx);
+    let mut progress = CapturedPitchProgress::default();
+    if finish_fault {
+        // Сигнал возникает после устойчивого checkpoint и до выдачи следующей identity.
+        progress.interrupt_on_checkpoint = interrupt_sender.take();
+    }
+    let error = super::run_batch_with_drivers(
+        &store,
+        batch_id,
+        "batch_run",
+        &mut drivers,
+        &mut progress,
+        parallel_pitch_policy(1),
+        pitch_signal(interrupt_rx),
+    )
+    .await
+    .unwrap_err();
+    let expected_message = match fault {
+        LifecyclePitchFault::ClosePanic => "worker_close_panic",
+        LifecyclePitchFault::CloseError => "искусственная ошибка close_checked",
+        LifecyclePitchFault::FinishPanic => "worker_finish_panic",
+        LifecyclePitchFault::FinishError => "искусственная ошибка finish",
+        LifecyclePitchFault::None => unreachable!(),
+    };
+    if finish_fault {
+        assert_eq!(error.code, ErrorCode::InvalidTransition);
+        assert_eq!(error.details["run_stop_reason"], "interrupted");
+        let cleanup_errors = error.details["additional_errors"].as_array().unwrap();
+        assert!(cleanup_errors.iter().any(|error| {
+            error["code"] == "validator_failure"
+                && error["details"]["run_stop_reason"] == "browser_cleanup_failed"
+                && error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_message)
+        }));
+    } else {
+        assert_eq!(error.code, ErrorCode::ValidatorFailure);
+        assert_eq!(error.details["run_stop_reason"], "browser_cleanup_failed");
+        assert!(error.message.contains(expected_message));
+    }
+    let saved = load_batch(&store, batch_id).unwrap();
+    assert_eq!(saved.item("一").unwrap().attempts.len(), 1);
+    assert_untouched_pitch_tail(&saved, 1);
+    assert_eq!(trace.lock().unwrap().acquired, [(1, "一".into())]);
+    assert_eq!(progress.events.last().unwrap().event, "run_stopped");
+    assert_eq!(progress.events.last().unwrap().run_completed, 1);
+    assert_eq!(progress.events.last().unwrap().in_flight, Some(0));
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.event == "item_checkpointed")
+            .count(),
+        1
+    );
+    assert_lifecycle_pitch_cleanup(&trace, 1);
+
+    let resume_trace = LifecyclePitchTrace::default();
+    let mut resume_drivers = [LifecyclePitchDriver::new(
+        1,
+        resume_trace.clone(),
+        LifecyclePitchDriver::complete_actions(&["二", "三"]),
+        LifecyclePitchFault::None,
+    )];
+    let mut resume_progress = CapturedPitchProgress::default();
+    let (resumed, _) = super::run_batch_with_drivers(
+        &store,
+        batch_id,
+        "batch_resume",
+        &mut resume_drivers,
+        &mut resume_progress,
+        parallel_pitch_policy(8),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resume_trace.lock().unwrap().acquired,
+        [(1, "二".into()), (1, "三".into())]
+    );
+    assert_eq!(resumed.item("一"), saved.item("一"));
+    assert!(resumed.items.iter().all(|item| item.attempts.len() == 1));
+    assert_eq!(resume_progress.events[0].run_total, 2);
+    assert_eq!(resume_progress.events.last().unwrap().run_completed, 2);
+    assert_lifecycle_pitch_cleanup(&resume_trace, 1);
+}
+
+#[tokio::test]
+async fn parallel_pitch_close_panic_preserves_checkpoint_and_resume() {
+    assert_pitch_cleanup_fault_preserves_checkpoint_and_resume(LifecyclePitchFault::ClosePanic)
+        .await;
+}
+
+#[tokio::test]
+async fn parallel_pitch_close_error_preserves_checkpoint_and_resume() {
+    assert_pitch_cleanup_fault_preserves_checkpoint_and_resume(LifecyclePitchFault::CloseError)
+        .await;
+}
+
+#[tokio::test]
+async fn parallel_pitch_finish_panic_preserves_checkpoint_and_resume() {
+    assert_pitch_cleanup_fault_preserves_checkpoint_and_resume(LifecyclePitchFault::FinishPanic)
+        .await;
+}
+
+#[tokio::test]
+async fn parallel_pitch_finish_error_preserves_checkpoint_and_resume() {
+    assert_pitch_cleanup_fault_preserves_checkpoint_and_resume(LifecyclePitchFault::FinishError)
+        .await;
 }
 
 #[tokio::test]
