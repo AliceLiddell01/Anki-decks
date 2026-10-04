@@ -32,7 +32,7 @@ use crate::pitch_batch::{
     is_retryable_failure,
 };
 use crate::store::{AssetStore, HumanAttestationRequest, StoreOptions, VerifiedIngestRequest};
-use crate::temp_workspace::TempWorkspace;
+use crate::temp_workspace::{TempWorkspace, cleanup_orphans_on_startup};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::channel::{mpsc, oneshot};
 use futures::future::{FutureExt, LocalBoxFuture, Shared};
@@ -2199,51 +2199,11 @@ async fn run_batch(
     workers: usize,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
     validate_pitch_workers(workers)?;
-    let workspace = TempWorkspace::create("pitch-batch-run")
-        .map_err(|error| AssetError::io("создание временного дерева pitch", error))?;
-    let result = run_batch_workers(store, batch_id, output, operation, workers).await;
-    match workspace.close() {
-        Ok(()) => result,
-        Err(error) => {
-            tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %safe_message(&error.to_string()), "Не удалось удалить временное дерево pitch");
-            Err(temp_workspace_cleanup_error(result, error))
-        }
-    }
-}
-
-fn temp_workspace_cleanup_error<T>(
-    result: Result<T, AssetError>,
-    cleanup_error: io::Error,
-) -> AssetError {
-    let (run_completed, original_error) = match result {
-        Ok(_) => (true, serde_json::Value::Null),
-        Err(error) => (
-            false,
-            json!({
-                "code": error.code.as_str(),
-                "message": safe_message(&error.message),
-                "details": error.details,
-            }),
-        ),
-    };
-    let cleanup_message = safe_message(&cleanup_error.to_string());
-    AssetError::with_details(
-        ErrorCode::IoFailure,
-        if run_completed {
-            format!(
-                "получение завершено, но очистка временного дерева не удалась: {cleanup_message}"
-            )
-        } else {
-            format!(
-                "обработка завершилась ошибкой, и очистка временного дерева также не удалась: {cleanup_message}"
-            )
-        },
-        json!({
-            "run_completed": run_completed,
-            "cleanup_error": cleanup_message,
-            "original_error": original_error,
-        }),
-    )
+    // Уборка orphan runs принадлежит запуску пакета и нужна даже без новых workers.
+    // Временные деревья создают только workers, когда запускают браузер.
+    cleanup_orphans_on_startup()
+        .map_err(|error| AssetError::io("начальная уборка временных деревьев pitch", error))?;
+    run_batch_workers(store, batch_id, output, operation, workers).await
 }
 
 async fn run_batch_workers(
