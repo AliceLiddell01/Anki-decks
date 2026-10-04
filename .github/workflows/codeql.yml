@@ -72,7 +72,8 @@ jobs:
           languages: ${{ matrix.language }}
           # Rust поддерживает анализ без полного cargo build. Для Actions это
           # также естественный режим; default query suite используется
-          # автоматически, без security-extended.
+          # автоматически, без security-extended. Отдельный dependency cache
+          # здесь не включаем: он не ускоряет Rust CodeQL none-mode.
           build-mode: none
 
       - name: Выполнить CodeQL-анализ
