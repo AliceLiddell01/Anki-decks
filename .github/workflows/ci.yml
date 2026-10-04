@@ -71,13 +71,6 @@ jobs:
 
       - name: Восстановить Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Rust tooling меняется существенно реже, чем decks/**. Сохраняем
-          # test-артефакты workspace, чтобы deck-only PR не перелинковывал все
-          # test targets заново. Версия key отделяет этот расширенный cache от
-          # прежнего dependency-only cache.
-          cache-workspace-crates: true
-          key: workspace-tests-v1
 
       - name: Собрать и выполнить тесты
         run: cargo test --workspace --all-features --locked
