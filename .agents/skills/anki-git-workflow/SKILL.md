@@ -33,7 +33,8 @@ Skill не владеет:
 - CodeRabbit-specific логикой: provider invocation, findings, triage, iteration
   semantics, rate limit и clean-pass semantics принадлежат
   `anki-coderabbit-review`;
-- generic code review, содержательным суждением о карточках и правкой колод;
+- generic code review — им владеет `anki-code-review`; содержательным
+  суждением о карточках и правкой колод;
 - чужими PR и чужими ветками: skill обслуживает текущий work item.
 
 Соподчинённость владельцев:
@@ -43,6 +44,10 @@ anki-git-workflow
     └─ общая процедура Git/GitHub: branch / index / commit / push /
        exact remote verification / PR create+edit / structured PR body /
        Draft+Ready / разрешённый merge / conflicts / cleanup
+
+anki-code-review
+    └─ независимый read-only review: requirements / surrounding code /
+       findings; не выполняет Git/GitHub mutations
 
 anki-coderabbit-review
     └─ только CodeRabbit workflow: provider invocation / completion /
@@ -80,7 +85,7 @@ Skill **не требует** буквального имени skill или с�
 Skill **не активируется** для:
 
 - простого объяснения Git/GitHub без mutations;
-- generic code review;
+- generic code review — это `anki-code-review`;
 - CodeRabbit-specific review logic — это `anki-coderabbit-review`;
 - чтения истории, веток или PR только ради исследования, если Git lifecycle не
   выполняется;

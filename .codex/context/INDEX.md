@@ -21,10 +21,12 @@
 | `tools/asset-store/README.md` | единственный публичный контракт хранилища ресурсов, которыми управляет программа, и CLI `kanji-assets`: границы доступа к файловой системе, manifest и жизненный цикл, `new`/`full`, результаты JSON и ограничения реализации |
 | `.agents/skills/anki-card-create/` | процесс создания новых карточек и пакета карточек в существующей CrowdAnki-колоде: фактическая схема модели, настроенные обработчики, зависимости изображений кандзи, частичный прогресс, проверка человеком и отдельная публикация ресурсов |
 | `.agents/skills/anki-git-workflow/` | обычная процедура Git/GitHub: branch, staging, commit, push, проверка удалённого состояния, PR, merge |
+| `.agents/skills/anki-code-review/` | независимое read-only code review PR/текущего checkout без CodeRabbit |
 | `.agents/skills/anki-coderabbit-review/` | явно запрошенный CodeRabbit review cycle текущего checkout |
 
-Вопросы вне этого каталога — создание новых карточек, Git/GitHub lifecycle и
-CodeRabbit review — принадлежат repository skills из `.agents/skills/`:
+Вопросы вне этого каталога — создание новых карточек, Git/GitHub lifecycle,
+независимое code review и CodeRabbit review — принадлежат repository skills из
+`.agents/skills/`:
 маршрутизируй к ним, а не заводи здесь второго владельца их процедуры.
 
 ## Инструменты

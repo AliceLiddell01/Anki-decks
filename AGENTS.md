@@ -32,6 +32,7 @@
 - `tools/asset-store/README.md` — публичный контракт общего asset store и kanji CLI, filesystem ownership, lifecycle, `new`/`full` и machine-readable outcomes;
 - `.agents/skills/anki-card-create/` — агентский workflow создания новых карточек и batch kanji assets;
 - `.agents/skills/anki-git-workflow/` — обычная процедура Git/GitHub;
+- `.agents/skills/anki-code-review/` — независимое read-only code review без CodeRabbit;
 - `.agents/skills/anki-coderabbit-review/` — явно запрошенный CodeRabbit review cycle.
 
 Процедуру каждого workflow владеет сам его владелец. Не дублируй её здесь, не переноси в `.codex/context/` и не создавай второго владельца той же процедуры.
@@ -157,14 +158,21 @@ cargo test --workspace --locked
   push, PR, merge или cleanup, а также по явным просьбам «закоммить», «запушь»,
   «создай PR», «обнови PR», «слей PR». Не применяется к объяснению Git без
   mutations.
+- `anki-code-review` — независимое read-only code review PR/текущего checkout.
+  Маршрутизируй сюда обычные просьбы «сделай код-ревью», «проведи код-ревью»,
+  «сделай ревью PR» без явного CodeRabbit intent. Skill сам восстанавливает
+  требования, включая исходный prompt из Windows Downloads, проверяет diff в
+  контексте окружающего кода и не исправляет/не публикует изменения как
+  побочный эффект.
 - `anki-coderabbit-review` — явный CodeRabbit review cycle текущего checkout.
   Маршрутизируй сюда только явный CodeRabbit intent: «сделай ревью CodeRabbit»,
   «запусти CodeRabbit», «прогони кодрэббит», «сделай 5 итераций CodeRabbit»,
   «повтори CodeRabbit ещё 2 раза», продолжение уже начатого CodeRabbit-цикла.
   Default — 3 completed iterations, если пользователь не назвал своё
   положительное число. Merge не входит в этот cycle.
-- Обычное «ревью», generic code review без CodeRabbit intent и задачи по
-  изменению самих skills ни в один из этих трёх workflow не маршрутизируются.
+- Обычное «ревью» и generic code review без CodeRabbit intent маршрутизируются
+  в `anki-code-review`. Задача по изменению самого review-skill не является
+  просьбой запустить review.
 
 Процедуру каждого workflow владеет сам skill; не дублируй её здесь и не переноси
 в `.codex/context/`.

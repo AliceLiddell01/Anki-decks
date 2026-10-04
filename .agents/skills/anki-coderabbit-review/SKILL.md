@@ -31,8 +31,8 @@ iteration отдельным commit + push и обновление накопи�
 
 Skill не владеет:
 
-- обычной разработкой и generic code review;
-- generic self-review без внешнего reviewer;
+- обычной разработкой;
+- generic code review и независимым self-review — ими владеет `anki-code-review`;
 - подготовкой PR и обычным commit/push;
 - содержанием `.coderabbit.yaml` (это отдельная конфигурация репозитория);
 - репозиторной verification matrix — её владельцы перечислены в
@@ -82,9 +82,10 @@ Deep — **opt-in**, а не режим по умолчанию: обычный 
 early access, capability недоступна, CLI/server incompatible), это состояние
 сообщается, а не подменяется обычным review.
 
-Само слово «ревью» без указания CodeRabbit **не** включает внешний reviewer.
-Не активируй skill автоматически для обычной разработки, generic self-review,
-generic code review без CodeRabbit intent, подготовки PR, обычного commit/push,
+Само слово «ревью» без указания CodeRabbit **не** включает внешний reviewer:
+обычное code review маршрутизируется в `anki-code-review`. Не активируй этот
+skill автоматически для обычной разработки, generic self-review, generic code
+review без CodeRabbit intent, подготовки PR, обычного commit/push,
 проверки тестов, чтения CodeRabbit-документации и задачи по изменению самого
 skill. Реализация или правка этого skill не является запросом запустить
 CodeRabbit.
