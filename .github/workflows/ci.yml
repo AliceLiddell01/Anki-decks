@@ -55,6 +55,11 @@ jobs:
 
   code:
     name: Код и тесты
+    env:
+      # sccache сохраняет результаты rustc для workspace library crates между
+      # hosted runners; rust-cache ниже остаётся слоем Cargo registry/target.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     # Push в feature-ветку не дублирует прогон PR: на push job выполняется
     # только для default branch текущего репозитория.
     if: >-
@@ -68,6 +73,11 @@ jobs:
 
       - name: Установить стабильный Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Установить sccache
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        with:
+          tool: sccache@0.18.0
 
       - name: Восстановить Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -132,6 +142,10 @@ jobs:
           fi
           echo "Найдено экспортов: $found"
           exit "$status"
+
+      - name: Показать статистику sccache
+        if: always()
+        run: sccache --show-stats
 
   msrv:
     name: Заявленная MSRV
