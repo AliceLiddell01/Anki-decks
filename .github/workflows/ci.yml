@@ -72,23 +72,23 @@ jobs:
       - name: Восстановить Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # test profile отличается от dev-профиля lint job (debug=0), поэтому
-          # держим отдельное поколение dependency cache.
-          key: test-nodebug-v1
+          # Весь code job использует один custom profile (test + cargo run),
+          # поэтому держим отдельное поколение dependency cache.
+          key: unified-ci-v1
 
       - name: Собрать и выполнить тесты
         # В workspace нет feature-gated test-кода. Единственная feature
         # reference-generator включает resvg только для двух служебных
         # generator binaries; их all-features/all-targets сборку уже проверяют
         # Clippy и MSRV jobs параллельно.
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --profile ci
 
       - name: Проверить verified-only kanji corpus
         # Ветка без tracked corpus допустима. Если store присутствует (в том числе
         # как symlink), read-only gate обязан подтвердить verified-only содержимое.
         run: |
           if [ -e .asset-store/kanji ] || [ -L .asset-store/kanji ]; then
-            cargo run --quiet --locked --bin kanji-corpus-gate
+            cargo run --quiet --locked --profile ci --bin kanji-corpus-gate
           else
             echo "Канонический kanji corpus отсутствует; проверка пропущена"
           fi
@@ -99,7 +99,7 @@ jobs:
         # все записи корпуса прошли обязательную автоматическую проверку.
         run: |
           if [ -e .asset-store/pitch-accent ] || [ -L .asset-store/pitch-accent ]; then
-            cargo run --quiet --locked --bin pitch-corpus-gate
+            cargo run --quiet --locked --profile ci --bin pitch-corpus-gate
           else
             echo "Канонический корпус pitch-accent отсутствует; проверка пропущена"
           fi
@@ -127,7 +127,7 @@ jobs:
               found=$((found + 1))
               export_dir=$(dirname "$deck_json")
               echo "Проверяю экспорт: $export_dir"
-              cargo run --quiet --locked --bin anki-repo -- validate "$export_dir" || status=1
+              cargo run --quiet --locked --profile ci --bin anki-repo -- validate "$export_dir" || status=1
             done < "$deck_list"
           fi
           echo "Найдено экспортов: $found"
