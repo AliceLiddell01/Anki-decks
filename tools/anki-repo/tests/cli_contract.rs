@@ -11,7 +11,7 @@
 //! вспомогательные функции `common`. Пути в аргументах всегда абсолютны: `run_cli` запускает
 //! бинарь без задания рабочего каталога.
 
-mod common;
+use crate::common;
 
 #[cfg(target_os = "linux")]
 use std::fs::File;
