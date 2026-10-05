@@ -1,8 +1,8 @@
 # anki-repo
 
-`anki-repo` — небольшой toolkit для детерминированного анализа одного
-CrowdAnki-экспорта репозитория `Anki-decks` и строго ограниченных правок его
-содержимого. Он даёт агенту быстрый и предсказуемый доступ к структуре
+`anki-repo` — toolkit для детерминированного анализа CrowdAnki-экспортов,
+строго ограниченных правок их содержимого и сбора evidence для независимого
+ревью кода репозитория `Anki-decks`. Он даёт агенту быстрый и предсказуемый доступ к структуре
 `deck.json`, не требуя читать многомегабайтный JSON вручную.
 
 Девять команд — `inspect`, `find`, `stats`, `validate`, `qa`, `review`,
@@ -42,6 +42,12 @@ CrowdAnki-экспорта репозитория `Anki-decks` и строго �
 превью карточек по фактическим шаблонам модели. Для migration-ссылок есть узкая
 `migrate-media`: сначала она доказывает пару identity—legacy filename и
 инвентаризирует потребителей, затем переводит только доказанные ссылки.
+
+Отдельные пространства команд `code-review` и `language` работают с исходниками
+и локальными артефактами ревью. `code-review` собирает и сравнивает evidence;
+`language` сканирует человеческий текст и применяет явно утверждённые замены.
+Описанные выше четыре мутирующие команды относятся именно к CrowdAnki-экспорту;
+`language apply --apply` меняет исходные файлы по отдельному контракту ниже.
 
 ## Зачем
 
@@ -113,6 +119,170 @@ CrowdAnki-экспортом и не знает имён полей конкре
 текущих пользовательских колод только для наглядности и контрактом не являются.
 Имя поля всегда называет вызывающая сторона, а сверяется оно с фактическими
 `note_models[].flds[].name` того экспорта, с которым работает команда.
+
+### `code-review collect|verify|delta`
+
+Пространство `code-review` собирает детерминированные свидетельства для
+независимого ревью кода. Порядком самого ревью владеет
+[anki-code-review](../../.agents/skills/anki-code-review/SKILL.md).
+Карточочные `review` и `review-check` продолжают работать со своим доменом.
+
+В выводе различаются четыре понятия:
+
+- **evidence** — факты о диапазоне Git, файлах и результатах анализаторов;
+- **candidate** — сигнал детектора, который требует содержательной проверки;
+- **diagnostic** — структурированное сообщение Cargo/rustc/Clippy с уровнем,
+  кодом и привязкой к исходнику, если анализатор их предоставил;
+- **finding** — подтверждённое ревьюером нарушение с условиями и последствиями.
+  Tool не создаёт findings и не назначает семантическую оценку по одному сигналу.
+
+`collect` принимает обязательные `--base` и `--head`. Ссылки разрешаются в
+точные SHA; анализируется этот диапазон и полное содержимое релевантных
+затронутых файлов в проверяемом HEAD (post-image). Рабочая копия не
+переключается и не очищается. Незакоммиченные изменения не становятся частью
+committed snapshot только потому, что находятся в той же рабочей копии.
+
+`--out-dir DIR` задаёт каталог snapshot; без него каталог выбирается по SHA в
+`.anki-repo/review/<base-sha>-<head-sha>`. Там сохраняются полный `review.json`
+и компактный `review.txt`; `verify` дополнительно сохраняет `delta.json`.
+Каталог не скрыт через `.gitignore`, поэтому локальные artifacts видны в Git и
+могут быть включены в PR, когда это нужно для совместного просмотра. Команда
+сама не выполняет stage или commit. Каждый pack содержит точные SHA, а каталог
+не может находиться внутри `decks/**` или служебных каталогов Git.
+
+`verify --baseline PACK --head REF` повторно собирает evidence, используя base
+из baseline, и сравнивает с новым HEAD. Доступны `--out-dir DIR` и
+`--skip-clippy`. `delta --before PACK --after PACK` сравнивает уже сохранённые
+packs без повторного анализа; `--out PATH` сохраняет JSON-сравнение.
+Несовместимые repository/base snapshots не считаются одной итерацией ревью.
+
+Статусы сравнения относятся к detector signals: сигнал исчез, остался,
+изменился или появился. Исчезновение candidate не доказывает исправление
+подтверждённого finding; это устанавливает ревьюер по актуальному коду.
+
+```bash
+anki-repo code-review collect --base origin/main --head HEAD --skip-clippy
+anki-repo code-review collect --help
+anki-repo code-review verify --baseline "$BASELINE_PACK" --head HEAD
+anki-repo code-review delta --before "$BASELINE_PACK" --after "$CURRENT_PACK"
+```
+
+`BASELINE_PACK` и `CURRENT_PACK` в примерах — фактически полученные пути к
+`review.json`, а не заранее известные имена текущего прогона.
+
+#### Анализаторы и ограничения
+
+Clippy adapter запускает только уже установленный локальный инструмент в
+offline-режиме. Он не устанавливает компоненты и не скачивает зависимости.
+`--skip-clippy` явно отключает adapter. При недоступном анализаторе, отсутствующих
+локальных зависимостях или ошибке запуска pack содержит статус и причину
+ограничения; `unavailable` не означает успешную проверку без diagnostics.
+Сообщения Cargo/rustc/Clippy читаются из структурированного вывода, а не
+извлекаются из человекочитаемого stdout. Их наличие не превращает сбор
+evidence в блокирующий семантический reviewer.
+
+Детерминизм относится к нормализованному представлению одного snapshot и
+стабильной сортировке. Набор diagnostics зависит также от доступности и версии
+локального анализатора; этот статус нужно учитывать при сравнении.
+
+### `language scan|check|apply`
+
+`scan` извлекает человеческий текст с учётом формата файла. Он проверяет полные
+релевантные файлы, а не только добавленные строки: comments/doc comments и
+человеческие строки Rust, prose Markdown, подходящие значения конфигураций.
+Идентификаторы, машинные ключи, внешние литералы и технические токены требуют
+учёта контракта, а не механического перевода. Предметные данные `decks/**`
+не входят в обычную политику русского текста исходников.
+
+Источник выбирается явно: повторяемый `--path PATH` относительно `--root DIR`
+(по умолчанию `.`) либо `--pack PACK` с scope и post-image сохранённого
+review-pack. Требуется `--out PATH` для полного scan artifact. Для candidates
+сохраняется origin: внесено/изменено диапазоном или существовало до него.
+Содержательную классификацию и допустимость текста определяет ревьюер.
+
+`check --scan SCAN` перечитывает исходные пути после ручных правок относительно
+`--root DIR`; необязательный `--out PATH` сохраняет обновлённый scan artifact.
+Этот результат говорит о новых detector signals, а не о качестве перевода.
+
+`apply --decisions PATH` проверяет явно подготовленные решения. Без `--apply`
+выполняется только проверка предусловий; с ним применяются исключительно
+решения `replace`. Решение `allow` не меняет текст. Tool не переводит текст
+сам и не исправляет остальные code-review candidates.
+
+До первой записи проверяются все предусловия набора: допустимость путей,
+хеш исходного файла, точное ожидаемое содержимое и отсутствие пересекающихся
+замен. Устаревшее решение отклоняется целиком; его нельзя применять после
+изменения файла, молча пересчитав позиции. Повторный scan и новая семантическая
+проверка создают актуальные решения. Для поддерживаемых текстовых файлов
+сохраняются кодировка и окончания строк.
+
+```bash
+anki-repo language scan --pack "$CURRENT_PACK" --out "$SCAN_ARTIFACT"
+anki-repo language scan --path src/lib.rs --out "$SCAN_ARTIFACT"
+anki-repo language apply --decisions "$DECISIONS_ARTIFACT"
+# Запись — только после проверки решений и dry-run:
+anki-repo language apply --decisions "$DECISIONS_ARTIFACT" --apply
+anki-repo language check --scan "$SCAN_ARTIFACT"
+```
+
+Пути в примерах иллюстративны. Scan и decisions artifacts сохраняются по
+указанным путям вне `decks/**`; если они находятся в репозитории, то видны в
+Git и могут быть включены в PR вручную. Команда не публикует их автоматически.
+
+#### Машинный контракт
+
+Review-pack, language scan, decisions и delta — разные версионируемые
+JSON-документы. Нельзя подставлять один вместо другого или считать краткий
+stdout полным артефактом. При подготовке решений используй схему scan/decisions
+и точные идентичности candidates из соответствующего прогона; не угадывай
+поля по отображаемой строке. Общий JSON-конверт CLI описан в разделе
+«Режимы вывода», ошибки — в «Exit codes». Наличие candidates или diagnostics
+само по себе не равно ошибке команды или подтверждённому дефекту. Актуальные
+аргументы каждой подкоманды доступны через `--help`.
+
+#### Схемы artifacts версии 1
+
+`review.json` — объект `ReviewPack` со следующими верхнеуровневыми ключами:
+`schema_version`, `target`, `scope`, `diagnostics`, `candidates`, `language`,
+`dependencies`, `tests`, `suppressions`, `risk_surfaces`, `tool_runs`.
+`target` содержит `repository_id` (хеш локального Git common directory без
+самого пути), `base_sha`, `head_sha` и `merge_base_sha`. Имена refs в pack не
+сохраняются: разные имена, разрешающиеся в те же SHA, дают тот же snapshot.
+`scope` содержит `merge_base_sha`, `text_image_limit_bytes` и отсортированный
+`files`. Каждый элемент files описывает `path`, `previous_path`, `status`,
+`additions`, `deletions`, `category`, `surfaces`, `binary`, состояния и размеры
+base/post images, Git object ids и диапазоны изменённых строк.
+
+`diagnostics` — структурированные Cargo/rustc/Clippy messages со `severity`,
+`code`, `message`, `spans`, `children` и `source`. `candidates` — статические
+signals с ключами `id`, `detector`, `path`, `line`, `column`, `snippet`, `origin`,
+`signals`, `source` и `metadata`. Допустимые `origin`: `introduced_or_changed`,
+`pre_existing`, `unknown`. Detector types охватывают абсолютные пути, локальные
+endpoints, привязку к истории разработки, suppressions, error/unsafe paths,
+изменения тестов, зависимости, конфигурационные, generated, skill и security
+surfaces. Это навигационные candidates, не verdict.
+
+`language` использует собственную `schema_version` и содержит `files`,
+`candidates`, `skipped`. Candidate хранит `id`, путь и SHA исходного файла,
+байтовые `start`/`end`, `line`/`column`, `context`, точный `text` и `signals`.
+Decision artifact имеет `{ "schema_version": 1, "decisions": [...] }`; каждое
+решение содержит исходный `candidate`, `action` (`replace`, `allow`, `ignore`,
+`needs_review`), `replacement` и `reason`. `replace` требует непустые `reason`
+и `replacement`. Delta имеет `schema_version`, `before`, `after`, `candidates`,
+`diagnostics`, `tool_runs`; статусы `still_present`, `gone`, `changed`, `new`
+описывают только наблюдения detector-ов.
+
+Полные исходные файлы не копируются в `review.json`. Clippy запускается только
+когда checkout соответствует сохранённому `head_sha`, tracked working tree
+чист, а среди untracked файлов нет исходников workspace. Локальные данные
+`decks/**`, `.asset-store/**`, `.anki-repo/review/**` и `.codex/local/**` не
+влияют на это условие. Иначе в `tool_runs` записывается `skipped` с причиной.
+Статусы Clippy:
+`unavailable`, `failed`, `success_without_diagnostics`, `diagnostics`, `skipped`.
+Collector использует локальный `cargo clippy --workspace --all-targets --locked
+--offline --message-format=json`; unknown JSON fields и будущие уровни severity
+не ломают разбор. См. [формат JSON rustc](https://doc.rust-lang.org/rustc/json.html)
+и [Cargo external tools](https://doc.rust-lang.org/cargo/reference/external-tools.html).
 
 ### `inspect`
 
@@ -1828,7 +1998,7 @@ exit code.
 | `unknown_field` | 3 | Указанного поля нет ни в одной модели экспорта; для `edit` — также если поля нет в модели целевой заметки |
 | `unknown_deck` | 3 | Указанная колода не найдена |
 | `unknown_qa_code` | 3 | Указанного кода QA нет в реестре правил (`qa --code`, `review --qa-code`) |
-| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id`, чужая `schema_version`, пустой `guid` (`empty_guid`) или пустое имя поля (`empty_field`); `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large`, `duplicate_proposal_id`, `empty_guid` или `empty_field` |
+| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id`, чужая `schema_version`, пустой `guid` (`empty_guid`) или пустое имя поля (`empty_field`); `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large`, `duplicate_proposal_id`, `empty_guid` или `empty_field`; `code-review`/`language`: некорректный путь артефакта, включая путь внутри `decks/**` или служебных каталогов Git |
 | `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды (отдельный код, а не `details.reason` внутри `invalid_request`) |
 | `proposal_not_executable` (`details.reason`) | — | Не отдельный код: `review-check` сообщает о неисполнимом предложении статусом `invalid` внутри отчёта, а не ошибкой команды |
 | `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме; `review-check`: тот же блокер в `source_blockers`, запрос не выпущен |
@@ -1836,7 +2006,13 @@ exit code.
 | `export_not_mutable` | 6 | `edit`: в экспорте есть `conflicting_note_model_definition`; `review-check` — тот же блокер в `source_blockers` |
 | `expected_mismatch` | 7 | `edit`: текущее значение не совпало с `expected` |
 | `source_changed` | 7 | `edit`: `deck.json` изменился (или исчез) между чтением исходника и заменой файла; правка отменена, файл не тронут |
-| `write_failed` | 8 | `edit`: не удалось записать кандидат или заменить `deck.json` |
+| `review_artifact_conflict` | 7 | Snapshot или output path уже содержит другое содержимое; существующий artifact не перезаписывается |
+| `write_failed` | 8 | `edit`: не удалось записать кандидат или заменить `deck.json`; также сбой сохранения code-review artifact или публикации language replacements |
+| `invalid_git_ref` | 3 | `code-review collect`/`verify`: Git ref не разрешается в commit |
+| `git_evidence_failed` | 3 | `code-review`: Git scope недоступен или машинный ответ Git некорректен |
+| `review_artifact_invalid` | 3 | `code-review`/`language`: JSON, schema version либо лимит размера artifact не прошли проверку |
+| `baseline_mismatch` | 3 | `verify`/`delta`: repository identity, base SHA или merge-base отличаются от baseline |
+| `language_decision_invalid` | 3 | `language apply`: решение, anchor или ограничение замены не прошло preflight |
 | `not_found` | 4 | `find` и `review --guid`: нет совпадений по заданному критерию |
 | `note_not_found` | 4 | `edit`: в экспорте нет заметки с указанным `guid`; в отчёте `review-check` — код проблемы предложения (доменной ошибкой не является) |
 | `ambiguous` | 5 | `find --guid` и `review --guid`: `guid` не разрешается однозначно. Для `edit` и `review-check` эта ветка недостижима как *код возврата*: повтор `guid` отсекается раньше как `export_invalid` (6), а в отчёте `review-check` он остаётся статусом предложения `invalid`/`ambiguous_guid` |

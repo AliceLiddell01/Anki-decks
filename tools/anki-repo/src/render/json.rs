@@ -85,6 +85,11 @@ fn to_json<T: Serialize>(command: &'static str, result: T) -> String {
     text
 }
 
+/// JSON-конверт для дополнительных namespaced-команд с собственными DTO.
+pub fn generic_json<T: Serialize>(command: &'static str, result: T) -> String {
+    to_json(command, result)
+}
+
 /// JSON-представление доменной ошибки.
 pub fn error_json(command: &str, error: &DomainError) -> String {
     let envelope = FailureEnvelope {
