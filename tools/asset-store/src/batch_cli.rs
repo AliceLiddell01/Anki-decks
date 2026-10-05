@@ -270,6 +270,15 @@ struct BatchProgressReporter<'a> {
     run_completed: usize,
     batch_total: usize,
     last_identity: Option<AssetIdentity>,
+    // Контекст подробного журнала: публичные события прогресса сохраняют прежние поля.
+    browser_session: Option<u32>,
+    acquisition_attempt: Option<u8>,
+    generation: Option<u32>,
+    owner_attempt: Option<usize>,
+    item_pending_checkpoint: bool,
+    last_checkpointed_identity: Option<AssetIdentity>,
+    last_checkpoint_revision: Option<u64>,
+    run_stop_reason: Option<&'static str>,
 }
 
 impl BatchProgressReporter<'_> {
@@ -279,9 +288,19 @@ impl BatchProgressReporter<'_> {
         self.round_total = total;
     }
 
-    fn checkpointed(&mut self) {
+    fn begin_item(&mut self, generation: u32, prior_attempts: usize) {
+        self.acquisition_attempt = Some(1);
+        self.generation = Some(generation);
+        self.owner_attempt = Some(prior_attempts + 1);
+        self.item_pending_checkpoint = true;
+    }
+
+    fn checkpointed(&mut self, identity: &AssetIdentity, revision: u64) {
         self.round_completed += 1;
         self.run_completed += 1;
+        self.last_checkpointed_identity = Some(identity.clone());
+        self.last_checkpoint_revision = Some(revision);
+        self.item_pending_checkpoint = false;
     }
 
     fn emit(
@@ -296,10 +315,26 @@ impl BatchProgressReporter<'_> {
         if identity.is_some() {
             self.last_identity = identity.cloned();
         }
+        if let Some(session) = session {
+            self.browser_session = Some(session);
+        }
+        if let Some(attempt) = attempt {
+            self.acquisition_attempt = Some(attempt);
+        }
         let reason = reason.map(|reason| safe_message(&reason));
         tracing::info!(
+            diagnostic_schema = "kanji_batch_progress_v1",
+            provider = "yarxi", domain = "kanji",
             stage = event, batch_id = %self.batch_id,
-            identity = ?identity.map(|identity| identity.key.as_str()), session, attempt,
+            identity = identity.map(|identity| identity.key.as_str()), session, attempt,
+            browser_session = self.browser_session,
+            acquisition_attempt = self.acquisition_attempt,
+            generation = self.generation, owner_attempt = self.owner_attempt,
+            run_stop_reason = self.run_stop_reason,
+            last_checkpointed_identity = self.last_checkpointed_identity.as_ref().map(|identity| identity.key.as_str()),
+            last_checkpoint_revision = self.last_checkpoint_revision,
+            checkpointed_items = self.run_completed,
+            item_pending_checkpoint = self.item_pending_checkpoint,
             outcome = ?outcome, reason = ?reason,
             elapsed_ms = self.started.elapsed().as_millis() as u64,
             round = ?self.round, round_completed = self.round_completed,
@@ -474,7 +509,7 @@ fn execute_with_progress(
         let batch_id = command.id().expect("команда запуска содержит batch_id");
         let path = diagnostic_log
             .as_deref()
-            .expect("runtime вернул путь диагностического файла");
+            .expect("runtime вернул путь к диагностическому файлу");
         if matches!(output, OutputFormat::Human)
             && let Err(error) = io::stderr()
                 .lock()
@@ -961,21 +996,26 @@ fn execute_command_with_snapshots_and_progress(
                 store,
                 batch_id,
                 *rounds,
-                |characters, on_event| {
+                |characters, generations, on_event| {
                     if acquisition_run.is_none() {
                         acquisition_run = Some(AcquisitionRun::new()?);
                     }
                     acquisition_run
                         .as_mut()
                         .expect("среда получения создана")
-                        .acquire(characters, allow_insecure_tls, on_event)
+                        .acquire_with_generations(
+                            characters,
+                            allow_insecure_tls,
+                            generations,
+                            on_event,
+                        )
                         .map(|_| ())
                 },
                 reader,
                 progress,
             );
-            // Сессии закрыты acquire; owner всего временного run дерева закрывается
-            // при успехе, ошибке consumer/provider и обработанном Ctrl+C.
+            // Сессии закрыты после получения элементов; владелец всего временного
+            // дерева запуска закрывается при успехе, ошибке потребителя/поставщика и обработанном Ctrl+C.
             let cleanup = acquisition_run.take().map_or(Ok(()), AcquisitionRun::close);
             if let Err(error) = cleanup {
                 let message = match error {
@@ -1155,7 +1195,7 @@ where
         store,
         batch_id,
         rounds,
-        |characters, on_event| {
+        |characters, _generations, on_event| {
             let outcomes = acquire(characters).map_err(AcquisitionStreamError::Provider)?;
             for (index, outcome) in outcomes.into_iter().enumerate() {
                 on_event(AcquisitionEvent::ItemStarted { index })
@@ -1163,6 +1203,7 @@ where
                 on_event(AcquisitionEvent::ItemCompleted {
                     index,
                     outcome: Box::new(outcome),
+                    diagnostics: None,
                 })
                 .map_err(AcquisitionStreamError::Consumer)?;
             }
@@ -1184,6 +1225,7 @@ fn run_batch_with_stream_and_progress<F>(
 where
     F: FnMut(
         &[String],
+        &[u32],
         &mut dyn FnMut(AcquisitionEvent) -> Result<(), AssetError>,
     ) -> Result<(), AcquisitionStreamError>,
 {
@@ -1231,6 +1273,14 @@ where
         run_completed: 0,
         batch_total,
         last_identity: None,
+        browser_session: None,
+        acquisition_attempt: None,
+        generation: None,
+        owner_attempt: None,
+        item_pending_checkpoint: false,
+        last_checkpointed_identity: None,
+        last_checkpoint_revision: None,
+        run_stop_reason: None,
     };
     progress.emit("run_started", None, None, None, None, None)?;
 
@@ -1252,6 +1302,10 @@ where
                     .expect("элемент границы обхода присутствует в состоянии");
                 (item.generation, item.attempts.len())
             })
+            .collect();
+        let owner_generations: Vec<_> = generations
+            .iter()
+            .map(|(generation, _)| *generation)
             .collect();
         let characters: Vec<_> = frontier
             .iter()
@@ -1303,6 +1357,7 @@ where
                     let identity = frontier.get(index).ok_or_else(|| {
                         invalid("поставщик сообщил индекс символа вне очереди раунда")
                     })?;
+                    progress.begin_item(generations[index].0, generations[index].1);
                     progress.emit("item_started", Some(identity), None, None, None, None)
                 }
                 AcquisitionEvent::RetryStarted { index, attempt } => {
@@ -1337,7 +1392,11 @@ where
                         .ok_or_else(|| invalid("поставщик сообщил ожидание вне очереди раунда"))?;
                     progress.emit("heartbeat", Some(identity), None, Some(attempt), None, None)
                 }
-                AcquisitionEvent::ItemCompleted { index, outcome } => {
+                AcquisitionEvent::ItemCompleted {
+                    index,
+                    outcome,
+                    diagnostics,
+                } => {
                     let identity = frontier
                         .get(index)
                         .ok_or_else(|| invalid("поставщик сообщил результат вне очереди раунда"))?;
@@ -1346,11 +1405,12 @@ where
                         identity,
                         generations[index],
                         *outcome,
+                        diagnostics,
                         &mut issues,
                     )?;
                     state = latest;
                     if saved {
-                        progress.checkpointed();
+                        progress.checkpointed(identity, state.revision);
                         progress.emit(
                             "item_checkpointed",
                             Some(identity),
@@ -1360,6 +1420,7 @@ where
                             None,
                         )
                     } else {
+                        progress.item_pending_checkpoint = false;
                         progress.emit(
                             "item_discarded_stale",
                             Some(identity),
@@ -1371,9 +1432,14 @@ where
                     }
                 }
             };
-            acquire(&characters, &mut on_acquisition_event)
+            acquire(&characters, &owner_generations, &mut on_acquisition_event)
         };
         if let Err(error) = acquisition {
+            progress.run_stop_reason = Some(match &error {
+                AcquisitionStreamError::Provider(_) => "provider_failure",
+                AcquisitionStreamError::Consumer(_) => "consumer_failure",
+                AcquisitionStreamError::Interrupted => "interrupted",
+            });
             let reason = match &error {
                 AcquisitionStreamError::Provider(message) => message.clone(),
                 AcquisitionStreamError::Consumer(error) => error.to_string(),
@@ -1458,19 +1524,22 @@ fn checkpoint_acquisition_outcome(
     identity: &AssetIdentity,
     expected: (u32, usize),
     outcome: Result<AcquiredMedia, String>,
+    diagnostics: Option<crate::yarxi::AcquisitionItemDiagnostics>,
     issues: &mut Vec<BatchIssue>,
 ) -> Result<(KanjiBatch, bool, Option<String>), AssetError> {
-    let started = Instant::now();
+    let timing = diagnostics.as_ref().map(|diagnostics| &diagnostics.timing);
+    let checkpoint_timing = timing.map(|item| item.stage("checkpoint"));
     let _checkpoint_span = tracing::info_span!("kanji_checkpoint", identity = %identity.key,
         expected_generation = expected.0, expected_attempts = expected.1)
     .entered();
     tracing::info!(stage = "checkpoint_begin", "Начато сохранение результата");
-    runtime.reacquire_lock()?;
-    tracing::debug!(
-        stage = "lock_reacquired",
-        "Блокировка получена для сохранения результата"
-    );
+    let mut candidate_diagnostic_outcome = None;
     let checkpoint = (|| {
+        runtime.reacquire_lock()?;
+        tracing::debug!(
+            stage = "lock_reacquired",
+            "Блокировка получена для сохранения результата"
+        );
         let mut state = load_required_cached(runtime)?;
         tracing::debug!(
             stage = "state_reloaded",
@@ -1495,7 +1564,31 @@ fn checkpoint_acquisition_outcome(
             return Ok((state, false, None));
         }
         let input = match outcome {
-            Ok(media) => validated_candidate(runtime, identity, &media),
+            Ok(media) => {
+                let validation = timing.map(|item| item.stage("final_validation"));
+                let result = validated_candidate(runtime, identity, &media, timing);
+                if let Some(validation) = validation {
+                    match &result {
+                        Ok(BatchAttemptInput::Candidate { candidate }) => {
+                            let outcome = candidate_validation_outcome(candidate);
+                            match outcome {
+                                CandidateDiagnosticOutcome::Success => validation.finish_success(),
+                                CandidateDiagnosticOutcome::Uncertain => {
+                                    validation.finish_outcome("uncertain")
+                                }
+                                CandidateDiagnosticOutcome::Failure(code) => {
+                                    validation.finish_failure(code, false, None)
+                                }
+                            }
+                        }
+                        Ok(BatchAttemptInput::Failed { code, .. }) => {
+                            validation.finish_failure(code, false, None)
+                        }
+                        Err(error) => validation.finish_failure(error.code.as_str(), false, None),
+                    }
+                }
+                result
+            }
             Err(message) => {
                 tracing::warn!(stage = "acquisition", code = "acquisition_failed", message = %safe_message(&message),
                     "Поставщик вернул ошибку получения");
@@ -1511,13 +1604,16 @@ fn checkpoint_acquisition_outcome(
             Err(error) => return Err(error),
         };
         let outcome_code = match &input {
-            BatchAttemptInput::Candidate { .. } => "candidate_recorded".to_owned(),
+            BatchAttemptInput::Candidate { candidate } => {
+                candidate_diagnostic_outcome = Some(candidate_validation_outcome(candidate));
+                "candidate_recorded".to_owned()
+            }
             BatchAttemptInput::Failed { code, .. } => code.clone(),
         };
         state.record_attempt(identity, input)?;
         runtime.save(&state)?;
         tracing::info!(stage = "checkpoint_success", revision = state.revision,
-            outcome = %outcome_code, elapsed_ms = started.elapsed().as_millis() as u64,
+            outcome = %outcome_code,
             "Результат надёжно сохранён");
         Ok((state, true, Some(outcome_code)))
     })();
@@ -1527,16 +1623,72 @@ fn checkpoint_acquisition_outcome(
         released = release.is_ok(),
         "Завершено освобождение блокировки после сохранения"
     );
-    match checkpoint {
-        Ok(value) => {
-            release?;
-            Ok(value)
-        }
+    let result = match checkpoint {
+        Ok(value) => release.map(|()| value),
         Err(error) => {
             tracing::error!(stage = "checkpoint_failure", code = error.code.as_str(), message = %safe_message(&error.message),
-                elapsed_ms = started.elapsed().as_millis() as u64, "Не удалось сохранить результат");
+                "Не удалось сохранить результат");
             let _ = release;
             Err(error)
+        }
+    };
+    if let Some(checkpoint) = checkpoint_timing {
+        match &result {
+            Ok((_, false, _)) => checkpoint.finish_outcome("discarded_stale"),
+            Ok((_, true, Some(code))) if code == "candidate_recorded" => {
+                checkpoint.finish_success()
+            }
+            Ok(_) => checkpoint.finish_outcome("failure_recorded"),
+            Err(error) => checkpoint.finish_failure(error.code.as_str(), false, None),
+        }
+    }
+    if let Some(diagnostics) = diagnostics {
+        match &result {
+            Ok((_, false, _)) => diagnostics.timing.finish_outcome("discarded_stale"),
+            Ok((_, true, Some(code))) if code == "candidate_recorded" => {
+                match candidate_diagnostic_outcome.unwrap_or(CandidateDiagnosticOutcome::Failure(
+                    "checkpoint_outcome_invalid",
+                )) {
+                    CandidateDiagnosticOutcome::Success => diagnostics.timing.finish_success(),
+                    CandidateDiagnosticOutcome::Uncertain => {
+                        diagnostics.timing.finish_outcome("uncertain")
+                    }
+                    CandidateDiagnosticOutcome::Failure(code) => {
+                        diagnostics.timing.finish_failure(code, false, None)
+                    }
+                }
+            }
+            Ok((_, true, Some(code))) => diagnostics.finish_recorded_failure(code),
+            Ok(_) => diagnostics
+                .timing
+                .finish_failure("checkpoint_outcome_invalid", false, None),
+            Err(error) => diagnostics
+                .timing
+                .finish_failure(error.code.as_str(), false, None),
+        }
+    }
+    result
+}
+
+enum CandidateDiagnosticOutcome {
+    Success,
+    Uncertain,
+    Failure(&'static str),
+}
+
+fn candidate_validation_outcome(candidate: &BatchCandidate) -> CandidateDiagnosticOutcome {
+    if !candidate.technically_valid {
+        CandidateDiagnosticOutcome::Failure("media_validation_failed")
+    } else {
+        match candidate.automated.status {
+            SemanticStatus::Verified => CandidateDiagnosticOutcome::Success,
+            SemanticStatus::Uncertain => CandidateDiagnosticOutcome::Uncertain,
+            SemanticStatus::Rejected => {
+                CandidateDiagnosticOutcome::Failure("semantic_validation_rejected")
+            }
+            SemanticStatus::Corrupt => {
+                CandidateDiagnosticOutcome::Failure("media_validation_failed")
+            }
         }
     }
 }
@@ -1545,6 +1697,7 @@ fn validated_candidate(
     runtime: &BatchRuntime,
     identity: &AssetIdentity,
     media: &AcquiredMedia,
+    timing: Option<&crate::browser_diagnostics::BrowserItemTimer>,
 ) -> Result<BatchAttemptInput, AssetError> {
     // Свидетельства поставщика хранят Unicode статьи как шестнадцатеричную
     // кодовую точку, а идентичность — сам символ. Сравнивается точная кодовая точка
@@ -1571,9 +1724,26 @@ fn validated_candidate(
     let sha256 = sha256_hex(&media.bytes);
     let record = candidate_asset_record(identity, &media.bytes, Some(&media.evidence))?;
     let validator = KanjiImageValidator::new();
+    let semantic_validation = timing.map(|item| item.stage("semantic_validation"));
     let decision = validator
         .validate(&record, &mut Cursor::new(media.bytes.as_slice()))
-        .map_err(|failure| AssetError::new(ErrorCode::ValidatorFailure, failure.message))?;
+        .map_err(|failure| AssetError::new(ErrorCode::ValidatorFailure, failure.message));
+    if let Some(validation) = semantic_validation {
+        match &decision {
+            Ok(decision) => match decision.status {
+                SemanticStatus::Verified => validation.finish_success(),
+                SemanticStatus::Uncertain => validation.finish_outcome("uncertain"),
+                SemanticStatus::Rejected => {
+                    validation.finish_failure("semantic_validation_rejected", false, None)
+                }
+                SemanticStatus::Corrupt => {
+                    validation.finish_failure("media_validation_failed", false, None)
+                }
+            },
+            Err(error) => validation.finish_failure(error.code.as_str(), false, None),
+        }
+    }
+    let decision = decision?;
     let technically_valid =
         decision.status != SemanticStatus::Corrupt && validate_image_decode(&media.bytes).is_ok();
     let automated = ValidationRecord {

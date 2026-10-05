@@ -401,19 +401,19 @@ fn navigation_retry_classifier_requires_error_or_http_context() {
         message: message.into(),
     };
     assert!(crate::pitch_batch::is_retryable_failure(&navigation(
-        "navigation returned HTTP status 503"
+        "переход вернул HTTP status 503"
     )));
     assert!(crate::pitch_batch::is_retryable_failure(&navigation(
-        "temporary resolver failure: net::ERR_DNS_TIMED_OUT"
+        "временный сбой разрешения адреса: net::ERR_DNS_TIMED_OUT"
     )));
     assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
-        "request took 500 ms at https://jpdb.io/vocabulary/500/幽霊/ゆうれい"
+        "запрос занял 500 ms на https://jpdb.io/vocabulary/500/幽霊/ゆうれい"
     )));
     assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
-        "HTTP request took 500 ms"
+        "запрос через HTTP/1.1 занял 500 мс"
     )));
     assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
-        "HTTP status checked after 500 ms"
+        "статус HTTP/1.1 проверен через 500 мс"
     )));
     assert!(crate::pitch_batch::is_retryable_failure(&navigation(
         "HTTP status code 429"
@@ -424,6 +424,43 @@ fn navigation_retry_classifier_requires_error_or_http_context() {
     assert!(!crate::pitch_batch::is_retryable_failure(&navigation(
         "DNS_PROBE_FINISHED_NXDOMAIN"
     )));
+
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::InvalidQuery {
+            stage: JpdbPitchStage::SearchNavigation,
+            message: "Некорректный поисковый запрос".into(),
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::PageContract {
+            stage: JpdbPitchStage::DetailVerification,
+            message: "Неожиданный контракт страницы".into(),
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::DetailIdentityMismatch {
+            stage: JpdbPitchStage::DetailVerification,
+            expected_surface: "幽霊".into(),
+            expected_reading: Some("ゆうれい".into()),
+            vocabulary_id: Some(123),
+            observed_surface_forms: vec!["亡霊".into()],
+            observed_readings: vec!["ぼうれい".into()],
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::InvalidSelection {
+            stage: JpdbPitchStage::SearchResolution,
+            message: "Некорректный выбор словарной записи".into(),
+        }
+    ));
+    assert!(!crate::pitch_batch::is_retryable_failure(
+        &JpdbPitchFailure::ExplicitSelectionMismatch {
+            stage: JpdbPitchStage::DetailVerification,
+            vocabulary_id: 123,
+            detail_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい".into(),
+            message: "Выбранная словарная запись не соответствует запросу".into(),
+        }
+    ));
 }
 
 #[test]
@@ -688,7 +725,7 @@ fn publication_reconcile_recovers_crash_after_owner_publish_before_final_state_s
     runtime.save(&batch).unwrap();
     drop(runtime);
 
-    // Публикация владельца завершилась, затем процесс упал до обновления state.json.
+    // Публикация ресурса владельца завершилась, затем процесс упал до обновления state.json.
     let owner_record = verified_record("幽霊", false);
     assert_eq!(owner_record.sha256, sha);
     let snapshot = PitchBatchOwnerSnapshot::from_records(vec![owner_record]).unwrap();
@@ -752,7 +789,7 @@ fn same_sha_in_new_generation_publishes_metadata_from_exact_current_attempt() {
     batch
         .reacquire(
             "幽霊",
-            "refresh same bytes with current JPDB evidence".into(),
+            "повторно получить те же байты с текущим свидетельством JPDB".into(),
         )
         .unwrap();
     runtime.save(&batch).unwrap();
@@ -826,7 +863,10 @@ fn owner_sha_drift_after_refresh_blocks_stale_candidate_publication() {
         PitchBatchItemStatus::Conflict
     );
     batch
-        .reacquire("幽霊", "refresh stale owner".into())
+        .reacquire(
+            "幽霊",
+            "повторно получить ресурс после устаревшего состояния владельца".into(),
+        )
         .unwrap();
     assert_eq!(
         batch
@@ -862,7 +902,7 @@ fn owner_sha_drift_after_refresh_blocks_stale_candidate_publication() {
             .is_err()
     );
 
-    let adopted_reason = "review current owner SHA after external replacement";
+    let adopted_reason = "сверить текущий SHA владельца после внешней замены";
     batch.reacquire("幽霊", adopted_reason.into()).unwrap();
     assert_eq!(
         batch
@@ -940,7 +980,7 @@ fn publication_owner_drift_requires_reasoned_reacquire_with_new_cas_baseline() {
         Some(crate::pitch_batch::PitchBatchPublicationStatus::Conflict)
     );
 
-    let reason = "adopt fresh owner SHA after concurrent publication";
+    let reason = "принять новый SHA владельца после параллельной публикации";
     batch.reacquire("幽霊", reason.into()).unwrap();
     assert_eq!(
         batch
@@ -1006,7 +1046,11 @@ fn published_exact_sha_rejection_quarantines_and_reacquires_with_observed_cas() 
     );
 
     batch
-        .reject_candidate("幽霊", &published_sha, "visual mismatch".into())
+        .reject_candidate(
+            "幽霊",
+            &published_sha,
+            "изображение визуально не совпадает".into(),
+        )
         .unwrap();
     let rejected_item = batch.item("幽霊").unwrap();
     assert_eq!(rejected_item.status(), PitchBatchItemStatus::Conflict);
@@ -1033,7 +1077,10 @@ fn published_exact_sha_rejection_quarantines_and_reacquires_with_observed_cas() 
         "owner_rejected"
     );
     batch
-        .reacquire("幽霊", "replace rejected exact SHA".into())
+        .reacquire(
+            "幽霊",
+            "заменить точный SHA ранее отклонённого кандидата".into(),
+        )
         .unwrap();
     let item = batch.item("幽霊").unwrap();
     assert_eq!(item.status(), PitchBatchItemStatus::Pending);

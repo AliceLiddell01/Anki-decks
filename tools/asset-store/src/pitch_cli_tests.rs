@@ -481,7 +481,7 @@ fn reject_command_attests_the_exact_current_owner_sha_and_quarantines_it() {
         "reject-owner-sha",
         "幽霊",
         &expected_sha,
-        "visual inspection rejected this exact image".into(),
+        "при визуальной проверке отклонено это точное изображение".into(),
         summary,
         OutputFormat::Json,
     );
@@ -1283,6 +1283,15 @@ impl ScriptedPitchDriver {
 impl super::PitchRunDriver for ScriptedPitchDriver {
     type Session = usize;
 
+    fn record_item_runtime_diagnostics(
+        &self,
+        session: &Self::Session,
+        item: &crate::browser_diagnostics::BrowserItemTimer,
+    ) {
+        item.set_browser_session(*session as u64);
+        item.record_runtime_snapshot(&crate::browser_runtime::RuntimeSnapshot::default());
+    }
+
     async fn launch(&mut self) -> Result<Self::Session, String> {
         assert!(self.active.is_none(), "сессии не должны пересекаться");
         self.launches += 1;
@@ -1524,6 +1533,15 @@ impl ParallelPitchDriver {
 
 impl super::PitchRunDriver for ParallelPitchDriver {
     type Session = ParallelPitchSession;
+
+    fn record_item_runtime_diagnostics(
+        &self,
+        session: &Self::Session,
+        item: &crate::browser_diagnostics::BrowserItemTimer,
+    ) {
+        item.set_browser_session(u64::from(session.session));
+        item.record_runtime_snapshot(&crate::browser_runtime::RuntimeSnapshot::default());
+    }
 
     async fn launch(&mut self) -> Result<Self::Session, String> {
         assert!(
@@ -2580,6 +2598,15 @@ impl LifecyclePitchDriver {
 impl super::PitchRunDriver for LifecyclePitchDriver {
     type Session = LifecyclePitchSession;
 
+    fn record_item_runtime_diagnostics(
+        &self,
+        session: &Self::Session,
+        item: &crate::browser_diagnostics::BrowserItemTimer,
+    ) {
+        item.set_browser_session(u64::from(session.worker));
+        item.record_runtime_snapshot(&crate::browser_runtime::RuntimeSnapshot::default());
+    }
+
     async fn launch(&mut self) -> Result<Self::Session, String> {
         self.trace.lock().unwrap().opened.push(self.worker);
         Ok(LifecyclePitchSession {
@@ -3587,7 +3614,11 @@ async fn pitch_rotation_and_launch_heartbeat_have_explicit_session_context() {
             assert_eq!(event.attempt, Some(1));
             assert!(event.next_session.is_none());
         } else {
-            assert!(event.attempt.is_none(), "{} inherited attempt", event.event);
+            assert!(
+                event.attempt.is_none(),
+                "событие {} унаследовало попытку",
+                event.event
+            );
         }
     }
 }
@@ -3675,7 +3706,7 @@ async fn pitch_saved_typed_failure_is_available_in_status_and_error_json_summary
     for failure in [
         JpdbPitchFailure::PageContract {
             stage: JpdbPitchStage::SearchResolution,
-            message: "row contract: has_forms=false; 日本語\nточный diagnostic".into(),
+            message: "контракт строки: has_forms=false; 日本語\nточная диагностика".into(),
         },
         JpdbPitchFailure::Telemetry {
             stage: JpdbPitchStage::SearchReadiness,
@@ -3697,7 +3728,16 @@ async fn pitch_saved_typed_failure_is_available_in_status_and_error_json_summary
                 &token,
                 JpdbPitchOutcome::Failed {
                     error: failure.clone()
-                }
+                },
+                crate::browser_diagnostics::BrowserItemTimer::new(
+                    crate::browser_diagnostics::BrowserItemContext::new(
+                        "jpdb",
+                        "一",
+                        1,
+                        u64::from(token.generation)
+                    ),
+                ),
+                None,
             )
             .unwrap()
         );
@@ -3914,4 +3954,301 @@ async fn session_failure_log_records_real_prefix_and_leaves_tail_unstarted() {
     assert!(!events.iter().any(|event| {
         event["fields"]["code"] == "item_started" && event["fields"]["identity"] != "一"
     }));
+}
+
+fn read_browser_diagnostic_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["schema"] == "browser_acquisition_v1")
+        .map(|event| event["fields"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn pitch_worker_diagnostics_continue_into_real_checkpoint_and_keep_negative_outcomes() {
+    let (signal, interrupted) = futures::channel::oneshot::channel();
+    let cases = [
+        (
+            ScriptedPitchAction::Complete,
+            "vocabulary_not_found",
+            None,
+            None,
+        ),
+        (
+            ScriptedPitchAction::Reacquire,
+            "discarded_stale",
+            None,
+            None,
+        ),
+        (
+            ScriptedPitchAction::ItemFailure,
+            "failure",
+            Some("timeout"),
+            None,
+        ),
+        (
+            ScriptedPitchAction::SessionFailure {
+                after_outcome: true,
+            },
+            "vocabulary_not_found",
+            None,
+            Some("session_failure"),
+        ),
+        (
+            ScriptedPitchAction::SetupFailure,
+            "failure",
+            Some("browser_configuration"),
+            Some("session_failure"),
+        ),
+        (
+            ScriptedPitchAction::InterruptInFlight(signal),
+            "interrupted",
+            Some("interrupted"),
+            Some("acquisition_interrupted"),
+        ),
+    ];
+    let mut interrupted = Some(interrupted);
+    for (action, expected_outcome, failure_code, expected_stop_reason) in cases {
+        let workspace = temp_root();
+        let store = store_at(workspace.path());
+        let batch_id = "diagnostic-lifecycle";
+        offline_pitch_batch(&store, batch_id, &["雨"]);
+        // Реальное ненулевое generation исключает подмену контекста provider-only.
+        let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id).unwrap();
+        let mut batch = runtime.load().unwrap().unwrap();
+        batch
+            .reacquire("雨", "новое получение для проверки контекста".into())
+            .unwrap();
+        runtime.save(&batch).unwrap();
+        let generation = batch.item_token("雨").unwrap().generation;
+        drop(runtime);
+        let mut driver = ScriptedPitchDriver::new(&store, batch_id, vec![action]);
+        let mut progress = CapturedPitchProgress::default();
+        let path = workspace.path().join("diagnostics.jsonl");
+        let log = crate::diagnostics::RunLogGuard::new(
+            fs::File::create(&path).unwrap(),
+            crate::diagnostics::OutputMode::Json,
+        );
+        let interrupt: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> =
+            if expected_outcome == "interrupted" {
+                Box::pin(pitch_signal(interrupted.take().unwrap()))
+            } else {
+                Box::pin(no_pitch_interruption())
+            };
+        let result = super::run_batch_with_driver(
+            &store,
+            batch_id,
+            "batch_run",
+            &mut driver,
+            &mut progress,
+            offline_pitch_policy(8),
+            interrupt,
+        )
+        .with_subscriber(log.dispatch())
+        .await;
+        if expected_outcome == "interrupted"
+            || expected_stop_reason == Some("session_failure")
+            || failure_code == Some("browser_configuration")
+        {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
+        log.finish().unwrap();
+        let events = read_browser_diagnostic_events(&path);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|fields| fields["event"] == "browser_acquisition_item")
+                .count(),
+            1
+        );
+        let item = events
+            .iter()
+            .find(|fields| fields["event"] == "browser_acquisition_item")
+            .unwrap();
+        assert_eq!(item["outcome"], expected_outcome);
+        assert_eq!(item["failure_code"].as_str(), failure_code);
+        assert_eq!(item["stop_reason"].as_str(), expected_stop_reason);
+        assert_ne!(item["outcome"], "success");
+        assert_eq!(events[0]["stage"], "browser_launch");
+        for event in &events {
+            assert_eq!(event["identity"], "雨");
+            assert_eq!(event["attempt"], 1);
+            assert_eq!(event["generation"], generation);
+            assert_eq!(event["worker"], 1);
+            assert_eq!(event["worker_session"], 1);
+            assert_eq!(event["browser_session"], 1);
+        }
+        let checkpoint = events
+            .iter()
+            .position(|fields| fields["stage"] == "checkpoint");
+        let item_index = events
+            .iter()
+            .position(|fields| fields["event"] == "browser_acquisition_item")
+            .unwrap();
+        if matches!(expected_outcome, "interrupted")
+            || failure_code == Some("browser_configuration")
+        {
+            assert_eq!(checkpoint, None);
+            assert!(
+                load_batch(&store, batch_id).unwrap().items[0]
+                    .attempts
+                    .is_empty()
+            );
+        } else {
+            let checkpoint =
+                checkpoint.expect("полученный результат проходит рабочую контрольную точку CAS");
+            assert!(checkpoint < item_index);
+            assert!(
+                events[checkpoint]["item_duration_ms"].as_u64().unwrap()
+                    <= item["item_duration_ms"].as_u64().unwrap()
+            );
+            if expected_outcome == "discarded_stale" {
+                assert_eq!(events[checkpoint]["outcome"], "discarded_stale");
+                assert!(
+                    load_batch(&store, batch_id).unwrap().items[0]
+                        .attempts
+                        .is_empty()
+                );
+            } else {
+                assert!(
+                    events
+                        .iter()
+                        .any(|fields| fields["stage"] == "outcome_validation")
+                );
+                assert_eq!(
+                    load_batch(&store, batch_id).unwrap().items[0]
+                        .attempts
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pitch_candidate_validation_and_durable_failure_complete_the_original_item_timer() {
+    use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer};
+
+    for case in ["acquired", "invalid_outcome", "missing_batch"] {
+        let workspace = temp_root();
+        let store = store_at(workspace.path());
+        let batch_id = "diagnostic-final-validation";
+        create_batch(
+            &store,
+            batch_id,
+            &[PitchPlanItem {
+                surface: "幽霊".into(),
+                reading: Some("ゆうれい".into()),
+                selection: None,
+            }],
+            None,
+        )
+        .unwrap();
+        let token = load_batch(&store, batch_id)
+            .unwrap()
+            .item_token("幽霊")
+            .unwrap();
+        let path = workspace.path().join("diagnostics.jsonl");
+        let log = crate::diagnostics::RunLogGuard::new(
+            fs::File::create(&path).unwrap(),
+            crate::diagnostics::OutputMode::Json,
+        );
+        let bytes = png();
+        let result = log.with_default(|| {
+            let timer = BrowserItemTimer::new(
+                BrowserItemContext::new("jpdb", "幽霊", 2, u64::from(token.generation))
+                    .with_worker(3, 4)
+                    .with_browser_session(42),
+            );
+            timer.stage("post_capture_verification").finish_success();
+            // Проверяем время между провайдером и долговременным сохранением,
+            // включая промежуток после завершения этапов провайдера.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            super::record_one_outcome(
+                &store,
+                if case == "missing_batch" {
+                    "missing"
+                } else {
+                    batch_id
+                },
+                &token,
+                if case == "invalid_outcome" {
+                    JpdbPitchOutcome::VocabularyNotFound {
+                        surface: "別の語".into(),
+                        reading: None,
+                    }
+                } else {
+                    JpdbPitchOutcome::Acquired {
+                        asset: Box::new(JpdbPitchAcquired {
+                            bytes,
+                            metadata: metadata("幽霊", "ゆうれい", 123),
+                        }),
+                    }
+                },
+                timer,
+                None,
+            )
+        });
+        log.finish().unwrap();
+        let events = read_browser_diagnostic_events(&path);
+        let item = events.last().unwrap();
+        assert_eq!(item["event"], "browser_acquisition_item");
+        assert!(item["item_duration_ms"].as_u64().unwrap() >= 5);
+        assert!(
+            item["item_duration_ms"].as_u64().unwrap()
+                > events[0]["item_duration_ms"].as_u64().unwrap()
+        );
+        for event in &events {
+            assert_eq!(event["identity"], "幽霊");
+            assert_eq!(event["attempt"], 2);
+            assert_eq!(event["generation"], token.generation);
+            assert_eq!(event["worker"], 3);
+            assert_eq!(event["worker_session"], 4);
+            assert_eq!(event["browser_session"], 42);
+        }
+        let checkpoint = events
+            .iter()
+            .find(|fields| fields["stage"] == "checkpoint")
+            .unwrap();
+        if case != "acquired" {
+            assert!(result.is_err());
+            assert_eq!(checkpoint["outcome"], "failure");
+            assert_eq!(item["outcome"], "failure");
+            if case == "invalid_outcome" {
+                let validation = events
+                    .iter()
+                    .find(|fields| fields["stage"] == "outcome_validation")
+                    .unwrap();
+                assert_eq!(validation["outcome"], "failure");
+                assert_eq!(validation["failure_code"], "invalid_validation_evidence");
+            }
+            assert!(
+                load_batch(&store, batch_id).unwrap().items[0]
+                    .attempts
+                    .is_empty()
+            );
+        } else {
+            assert!(result.unwrap());
+            let names = events
+                .iter()
+                .map(|fields| fields["stage"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                [
+                    "post_capture_verification",
+                    "candidate_validation",
+                    "outcome_validation",
+                    "checkpoint",
+                    "item"
+                ]
+            );
+            assert_eq!(item["outcome"], "acquired");
+        }
+    }
 }

@@ -6,10 +6,11 @@
 //! владение хранилищем.
 
 #[cfg(not(target_os = "linux"))]
-compile_error!("asset-store currently supports Linux only");
+compile_error!("asset-store пока поддерживает только Linux");
 
 pub mod batch;
 pub mod batch_runtime;
+pub mod browser_diagnostics;
 pub mod browser_runtime;
 pub mod cli;
 pub mod diagnostics;

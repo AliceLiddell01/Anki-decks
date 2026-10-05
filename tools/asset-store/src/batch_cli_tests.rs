@@ -79,6 +79,7 @@ fn emit_stream_item(
     on_event(AcquisitionEvent::ItemCompleted {
         index,
         outcome: Box::new(outcome),
+        diagnostics: None,
     })
     .map_err(AcquisitionStreamError::Consumer)
 }
@@ -405,7 +406,7 @@ fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
         &fixture.store,
         "partial-checkpoint",
         1,
-        |characters, on_event| {
+        |characters, _generations, on_event| {
             assert_eq!(characters, ["元", "漢", "字"]);
             // Во время ожидания поставщика другой владелец может открыть среду пакета.
             let probe = BatchRuntime::open(fixture.store.root(), "partial-checkpoint").unwrap();
@@ -422,6 +423,7 @@ fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
             on_event(AcquisitionEvent::ItemCompleted {
                 index: 0,
                 outcome: Box::new(Ok(media("元", glyph('元')))),
+                diagnostics: None,
             })
             .map_err(AcquisitionStreamError::Consumer)?;
 
@@ -485,7 +487,7 @@ fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
         &fixture.store,
         "partial-checkpoint",
         1,
-        |characters, on_event| {
+        |characters, _generations, on_event| {
             resumed_requests.push(characters.to_vec());
             assert_eq!(characters, ["漢", "字"]);
             for (index, character) in characters.iter().enumerate() {
@@ -510,6 +512,51 @@ fn completed_identity_is_durable_before_provider_returns_and_resume_skips_it() {
 }
 
 #[test]
+fn owner_generation_is_passed_to_the_acquisition_stream() {
+    let fixture = Fixture::new();
+    fixture.start("generation-context", &['漢']);
+    {
+        let mut runtime = BatchRuntime::open(fixture.store.root(), "generation-context").unwrap();
+        let mut state = runtime.load().unwrap().unwrap();
+        for _ in 0..MAX_ACQUISITION_ROUNDS {
+            state
+                .record_attempt(
+                    &identity('漢'),
+                    BatchAttemptInput::Failed {
+                        code: "network".into(),
+                        message: "источник временно недоступен".into(),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(state.items[0].status, BatchItemStatus::AwaitingHuman);
+        state
+            .retry_acquisition(&identity('漢'), "повтор после временных отказов".into())
+            .unwrap();
+        assert_eq!(state.items[0].generation, 1);
+        runtime.save(&state).unwrap();
+    }
+
+    let mut observed_generations = Vec::new();
+    let mut progress = CapturedProgress::default();
+    let result = run_batch_with_stream_and_progress(
+        &fixture.store,
+        "generation-context",
+        1,
+        |characters, generations, on_event| {
+            assert_eq!(characters, ["漢"]);
+            observed_generations.extend_from_slice(generations);
+            emit_stream_item(on_event, 0, Err("синтетическая ошибка получения".into()))
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(observed_generations, [1]);
+}
+
+#[test]
 fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
     let fixture = Fixture::new();
     fixture.start("frontier-tail", &['元', '漢', '字']);
@@ -517,7 +564,7 @@ fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
         &fixture.store,
         "frontier-tail",
         1,
-        |_characters, on_event| {
+        |_characters, _generations, on_event| {
             emit_stream_item(on_event, 0, Ok(media("元", glyph('元'))))?;
             Err(AcquisitionStreamError::Provider(
                 "синтетическая остановка сессии".into(),
@@ -543,7 +590,7 @@ fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
         &fixture.store,
         "frontier-tail",
         1,
-        |characters, on_event| {
+        |characters, _generations, on_event| {
             resumed_requests.push(characters.to_vec());
             assert_eq!(characters, ["漢", "字"]);
             emit_stream_item(on_event, 0, Err("ошибка получения символа 漢".into()))?;
@@ -580,7 +627,7 @@ fn partial_checkpoint_error_response_reports_durable_change_and_saved_tail() {
             &fixture.store,
             batch_id,
             2,
-            |_characters, on_event| {
+            |_characters, _generations, on_event| {
                 emit_stream_item(
                     on_event,
                     0,
@@ -676,6 +723,125 @@ fn batch_error_without_durable_mutation_reports_unchanged_existing_state() {
 }
 
 #[test]
+fn interruption_diagnostics_link_session_attempt_and_durable_checkpoint_without_progress_changes() {
+    // Поставщик принимает отмену до элемента, во время него и после синхронного
+    // обратного вызова завершения. Только последний случай имеет надёжную контрольную точку.
+    for boundary in 0..3 {
+        let fixture = Fixture::new();
+        let batch_id = "interruption-evidence";
+        fixture.start(batch_id, &['漢', '字']);
+        let log_path = fixture.directory().join("interruption.jsonl");
+        let guard = RunLogGuard::new(
+            fs::File::create(&log_path).unwrap(),
+            DiagnosticOutputMode::Json,
+        );
+        let mut progress = CapturedProgress::default();
+        let error = guard
+            .with_default(|| {
+                run_batch_with_stream_and_progress(
+                    &fixture.store,
+                    batch_id,
+                    2,
+                    |_characters, _generations, on_event| {
+                        on_event(AcquisitionEvent::SessionStarted { session: 7 })
+                            .map_err(AcquisitionStreamError::Consumer)?;
+                        if boundary > 0 {
+                            on_event(AcquisitionEvent::ItemStarted { index: 0 })
+                                .map_err(AcquisitionStreamError::Consumer)?;
+                            on_event(AcquisitionEvent::RetryStarted {
+                                index: 0,
+                                attempt: 2,
+                            })
+                            .map_err(AcquisitionStreamError::Consumer)?;
+                        }
+                        if boundary == 2 {
+                            on_event(AcquisitionEvent::ItemCompleted {
+                                index: 0,
+                                outcome: Box::new(Err("сохранённый отказ поставщика".into())),
+                                diagnostics: None,
+                            })
+                            .map_err(AcquisitionStreamError::Consumer)?;
+                            assert_eq!(fixture.load(batch_id).items[0].attempts.len(), 1);
+                        }
+                        Err(AcquisitionStreamError::Interrupted)
+                    },
+                    &mut StoreSnapshotReader,
+                    &mut progress,
+                )
+            })
+            .unwrap_err();
+        assert!(error.message.contains("batch_interrupted"));
+        guard.finish().unwrap();
+        let events = fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let stop = &events
+            .iter()
+            .find(|event| {
+                event["fields"]["diagnostic_schema"] == "kanji_batch_progress_v1"
+                    && event["fields"]["stage"] == "run_stopped"
+            })
+            .unwrap()["fields"];
+        assert_eq!(stop["provider"], "yarxi");
+        assert_eq!(stop["domain"], "kanji");
+        assert_eq!(stop["browser_session"], 7);
+        assert_eq!(stop["run_stop_reason"], "interrupted");
+        assert_eq!(stop["checkpointed_items"], usize::from(boundary == 2));
+        assert_eq!(stop["item_pending_checkpoint"], boundary == 1);
+        let saved = fixture.load(batch_id);
+        assert_eq!(saved.items[0].attempts.len(), usize::from(boundary == 2));
+        assert!(saved.items[1].attempts.is_empty());
+        assert_eq!(saved.items[1].generation, 0);
+        if boundary > 0 {
+            assert_eq!(stop["identity"], "漢");
+            assert_eq!(stop["generation"], 0);
+            assert_eq!(stop["owner_attempt"], 1);
+            assert_eq!(stop["acquisition_attempt"], 2);
+            let started = progress
+                .events
+                .iter()
+                .find(|event| event.event == "item_started")
+                .unwrap();
+            assert!(started.session.is_none());
+            assert!(started.attempt.is_none());
+            let public = serde_json::to_value(started).unwrap();
+            assert!(public.get("diagnostic_schema").is_none());
+            assert!(public.get("browser_session").is_none());
+            assert!(public.get("last_checkpoint_revision").is_none());
+        } else {
+            assert!(stop.get("identity").is_none());
+            assert!(stop.get("acquisition_attempt").is_none());
+        }
+        if boundary == 2 {
+            assert_eq!(stop["last_checkpointed_identity"], "漢");
+            assert_eq!(stop["last_checkpoint_revision"], saved.revision);
+            assert_eq!(saved.next_round(), [identity('字')]);
+        } else {
+            assert!(stop.get("last_checkpointed_identity").is_none());
+            assert!(stop.get("last_checkpoint_revision").is_none());
+            assert_eq!(saved.next_round(), [identity('漢'), identity('字')]);
+        }
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| event.event == "round_started")
+                .count(),
+            1
+        );
+        assert!(
+            !progress
+                .events
+                .iter()
+                .any(|event| event.event == "run_finished")
+        );
+    }
+}
+
+#[test]
 fn signal_accepted_in_last_checkpoint_stops_before_second_round_acquisition() {
     use std::sync::atomic::AtomicBool;
     struct StopAtCheckpoint<'a> {
@@ -703,11 +869,11 @@ fn signal_accepted_in_last_checkpoint_stops_before_second_round_acquisition() {
         &fixture.store,
         "stop-round-boundary",
         2,
-        |characters, on_event| {
+        |characters, _generations, on_event| {
             acquisitions += 1;
             assert_eq!(characters, ["漢"]);
             emit_stream_item(on_event, 0, Err("ошибка получения первого раунда".into()))?;
-            // Сигнал принят из синхронного callback после надёжного сохранения.
+            // Сигнал принят из синхронного обратного вызова после надёжного сохранения.
             // Поставщик обязан проверить тот же флаг остановки до успешного возврата.
             assert_eq!(
                 fixture.load("stop-round-boundary").items[0].attempts.len(),
@@ -772,12 +938,7 @@ fn human_progress_localizes_event_and_outcome_without_changing_machine_values() 
     let human = String::from_utf8(human).unwrap();
     assert!(human.contains("сессия браузера запущена"));
     assert!(human.contains("кандидат сохранён"));
-    for machine in [
-        "browser_session_started",
-        "candidate_recorded",
-        "identity=",
-        "browser session",
-    ] {
+    for machine in ["browser_session_started", "candidate_recorded", "identity="] {
         assert!(!human.contains(machine));
     }
     let mut machine = Vec::new();
@@ -963,7 +1124,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
 fn confirm_of_exact_asset_without_valid_automated_evidence_does_not_approve_owner() {
     let fixture = Fixture::new();
     fixture.start("confirm-without-evidence", &['漢']);
-    let bytes = b"GIF89a bytes that do not encode an image";
+    let bytes = "GIF89a байты не содержат закодированное изображение".as_bytes();
     let hash = sha256_hex(bytes);
     let mut runtime = BatchRuntime::open(fixture.store.root(), "confirm-without-evidence").unwrap();
     let mut state = runtime.load().unwrap().unwrap();
@@ -1988,4 +2149,247 @@ fn successful_run_response_exposes_a_flushed_per_run_diagnostic_log() {
             && span["run_id"] == finished["fields"]["run_id"]
             && span["diagnostic_log"] == response["diagnostic_log"]
     }));
+}
+
+fn capture_browser_checkpoint_events(
+    fixture: &Fixture,
+    operation: impl FnOnce(),
+) -> Vec<serde_json::Value> {
+    let log_path = fixture.directory().join("browser-checkpoint.jsonl");
+    let guard = RunLogGuard::new(
+        fs::File::create(&log_path).unwrap(),
+        DiagnosticOutputMode::Json,
+    );
+    guard.with_default(operation);
+    guard.finish().unwrap();
+    fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["schema"] == "browser_acquisition_v1")
+        .map(|event| event["fields"].clone())
+        .collect()
+}
+
+fn checkpoint_diagnostics(generation: u32) -> crate::yarxi::AcquisitionItemDiagnostics {
+    use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer};
+    let timer = BrowserItemTimer::new(
+        BrowserItemContext::new("yarxi-suu-browser", "元", 1, u64::from(generation))
+            .with_browser_session(17),
+    );
+    timer.set_attempt(2);
+    crate::yarxi::AcquisitionItemDiagnostics::new(timer, None)
+}
+
+#[test]
+fn browser_item_keeps_context_and_duration_through_final_validation_and_durable_checkpoint() {
+    let fixture = Fixture::new();
+    let batch_id = "browser-checkpoint-context";
+    fixture.start(batch_id, &['元']);
+    {
+        let mut runtime = BatchRuntime::open(fixture.store.root(), batch_id).unwrap();
+        let mut state = runtime.load().unwrap().unwrap();
+        for _ in 0..MAX_ACQUISITION_ROUNDS {
+            state
+                .record_attempt(&identity('元'), failure("network", "временный отказ"))
+                .unwrap();
+        }
+        state
+            .retry_acquisition(&identity('元'), "новое получение".into())
+            .unwrap();
+        runtime.save(&state).unwrap();
+    }
+    let events = capture_browser_checkpoint_events(&fixture, || {
+        let mut progress = CapturedProgress::default();
+        run_batch_with_stream_and_progress(
+            &fixture.store,
+            batch_id,
+            1,
+            |characters, generations, on_event| {
+                assert_eq!(characters, ["元"]);
+                assert_eq!(generations, [1]);
+                on_event(AcquisitionEvent::ItemStarted { index: 0 })?;
+                let diagnostics = checkpoint_diagnostics(generations[0]);
+                diagnostics.timing.stage("resource_read").finish_success();
+                on_event(AcquisitionEvent::ItemCompleted {
+                    index: 0,
+                    outcome: Box::new(Ok(media("元", glyph('元')))),
+                    diagnostics: Some(diagnostics),
+                })?;
+                // Возврат из обратного вызова означает, что попытка того же поколения уже сохранена.
+                let state = fixture.load(batch_id);
+                let attempt = state.items[0].attempts.last().unwrap();
+                assert_eq!(attempt.generation, 1);
+                assert!(matches!(
+                    attempt.result,
+                    BatchAttemptInput::Candidate { .. }
+                ));
+                Ok(())
+            },
+            &mut StoreSnapshotReader,
+            &mut progress,
+        )
+        .unwrap();
+    });
+    let stages: Vec<_> = events
+        .iter()
+        .map(|event| event["stage"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            "resource_read",
+            "semantic_validation",
+            "final_validation",
+            "checkpoint",
+            "item"
+        ]
+    );
+    for event in &events {
+        assert_eq!(event["provider"], "yarxi-suu-browser");
+        assert_eq!(event["identity"], "元");
+        assert_eq!(event["attempt"], 2);
+        assert_eq!(event["generation"], 1);
+        assert_eq!(event["browser_session"], 17);
+    }
+    let checkpoint = &events[3];
+    let item = &events[4];
+    assert_eq!(checkpoint["outcome"], "success");
+    assert_eq!(item["outcome"], "success");
+    assert_eq!(item["event"], "browser_acquisition_item");
+    // Единственный элемент завершается после контрольной точки тем же монотонным таймером.
+    assert!(
+        item["item_duration_ms"].as_u64().unwrap()
+            >= checkpoint["item_duration_ms"].as_u64().unwrap()
+    );
+    assert!(
+        item["item_duration_ms"].as_u64().unwrap()
+            >= checkpoint["stage_duration_ms"].as_u64().unwrap()
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "browser_acquisition_item")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn browser_checkpoint_stale_recorded_failures_and_store_failure_never_emit_item_success() {
+    for scenario in ["stale", "acquisition", "validation", "semantic", "store"] {
+        let fixture = Fixture::new();
+        fixture.start(scenario, &['元']);
+        let mut runtime = BatchRuntime::open(fixture.store.root(), scenario).unwrap();
+        runtime.load().unwrap();
+        runtime.release_lock().unwrap();
+        let events = capture_browser_checkpoint_events(&fixture, || {
+            let diagnostics = checkpoint_diagnostics(0);
+            let diagnostics = if scenario == "acquisition" {
+                crate::yarxi::AcquisitionItemDiagnostics::new(
+                    diagnostics.timing,
+                    Some(("media_not_ready".into(), false)),
+                )
+            } else {
+                diagnostics
+            };
+            if scenario == "stale" {
+                let mut concurrent = BatchRuntime::open(fixture.store.root(), scenario).unwrap();
+                let mut state = concurrent.load().unwrap().unwrap();
+                state
+                    .record_attempt(
+                        &identity('元'),
+                        failure("network", "результат другого владельца"),
+                    )
+                    .unwrap();
+                concurrent.save(&state).unwrap();
+            } else if scenario == "store" {
+                let path = fixture
+                    .store
+                    .root()
+                    .join(".runtime/batches")
+                    .join(scenario)
+                    .join("state.json");
+                fs::write(path, b"{").unwrap();
+            }
+            let outcome = match scenario {
+                "acquisition" => Err("media_not_ready: синтетический отказ получения".into()),
+                "validation" => Ok(media("字", glyph('字'))),
+                "semantic" => Ok(media("元", glyph('字'))),
+                _ => Ok(media("元", glyph('元'))),
+            };
+            let result = checkpoint_acquisition_outcome(
+                &mut runtime,
+                &identity('元'),
+                (0, 0),
+                outcome,
+                Some(diagnostics),
+                &mut Vec::new(),
+            );
+            match scenario {
+                "stale" => assert!(!result.unwrap().1),
+                "store" => assert!(result.is_err()),
+                _ => assert!(result.unwrap().1),
+            }
+        });
+        let item = events
+            .iter()
+            .find(|event| event["event"] == "browser_acquisition_item")
+            .unwrap();
+        assert_ne!(
+            item["outcome"], "success",
+            "сценарий {scenario} не разрешает успех элемента"
+        );
+        assert_eq!(item["generation"], 0);
+        if scenario == "stale" {
+            assert_eq!(item["outcome"], "discarded_stale");
+            assert_eq!(events.len(), 2);
+            assert_eq!(fixture.load(scenario).items[0].attempts.len(), 1);
+        } else if scenario == "semantic" {
+            assert!(matches!(
+                item["outcome"].as_str(),
+                Some("failure" | "uncertain")
+            ));
+            assert!(matches!(
+                fixture.load(scenario).items[0].attempts[0].result,
+                BatchAttemptInput::Candidate { .. }
+            ));
+        } else {
+            assert_eq!(item["outcome"], "failure");
+            assert!(item["failure_code"].is_string());
+            if scenario == "acquisition" {
+                assert_eq!(item["failure_code"], "media_not_ready");
+            }
+            if scenario == "validation" {
+                assert_eq!(item["failure_code"], "source_identity_mismatch");
+                assert_eq!(events[0]["stage"], "final_validation");
+                assert_eq!(events[0]["outcome"], "failure");
+            }
+        }
+    }
+}
+
+#[test]
+fn browser_item_cancelled_before_checkpoint_remains_interrupted_and_resumable() {
+    let fixture = Fixture::new();
+    let batch_id = "browser-before-checkpoint-interrupted";
+    fixture.start(batch_id, &['元']);
+    let events = capture_browser_checkpoint_events(&fixture, || {
+        let diagnostics = checkpoint_diagnostics(0);
+        let stage = diagnostics.timing.stage("resource_read");
+        diagnostics
+            .timing
+            .set_interruption("ctrl_c", "acquisition_interrupted", false);
+        drop(stage);
+        drop(diagnostics);
+    });
+    assert_eq!(events.len(), 2);
+    for event in events {
+        assert_eq!(event["outcome"], "interrupted");
+        assert_eq!(event["failure_code"], "acquisition_interrupted");
+        assert_eq!(event["browser_session"], 17);
+        assert_eq!(event["generation"], 0);
+    }
+    assert!(fixture.load(batch_id).items[0].attempts.is_empty());
+    assert_eq!(fixture.load(batch_id).next_round(), [identity('元')]);
 }

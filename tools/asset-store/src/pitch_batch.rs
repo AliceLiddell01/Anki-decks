@@ -1,4 +1,4 @@
-//! Возобновляемое предметное состояние batch-получения pitch-accent.
+//! Возобновляемое предметное состояние пакетного получения pitch-accent.
 //!
 //! Файловые границы и неизменяемые файлы кандидатов обслуживает [`SafeBatchRuntime`].
 //! Этот модуль хранит только результаты pitch-accent, точную идентичность/SHA,
@@ -14,6 +14,7 @@ use crate::batch_runtime::{
     MAX_RUNTIME_STATE_BYTES, RuntimeBatchState, RuntimeBlobRef, SafeBatchRuntime,
     validate_batch_id, validate_hash,
 };
+use crate::browser_diagnostics::BrowserItemTimer;
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
@@ -32,7 +33,7 @@ use crate::pitch_accent::{
 };
 use crate::validation::SemanticValidator;
 
-/// Версия формата предметного состояния batch.
+/// Версия формата предметного состояния пакета.
 pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 2;
 /// Версия внешней схемы нормализованного плана pitch.
 pub const PITCH_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -110,7 +111,7 @@ impl PitchBatchPlanIdentity {
     }
 }
 
-/// Runtime-состояние одного batch. Порядок запросов сохраняется для воспроизводимого вывода CLI.
+/// Состояние среды выполнения одного пакета. Порядок запросов сохраняется для воспроизводимого вывода CLI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentBatch {
@@ -125,7 +126,7 @@ pub struct PitchAccentBatch {
     pub items: Vec<PitchBatchItem>,
 }
 
-/// Отдельное состояние для каждой точной `surface`; идентичность предметной области не содержит reading или vocabulary ID.
+/// Отдельное состояние для каждой точной `surface`; идентичность предметной области не содержит `reading` или ID словарной записи.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchItem {
@@ -168,7 +169,7 @@ pub struct PitchBatchAttempt {
     pub outcome: PitchBatchOutcome,
 }
 
-/// Полный типизированный результат провайдера. Полученные байты заменяются ссылкой на файл в runtime по SHA.
+/// Полный типизированный результат провайдера. Полученные байты заменяются ссылкой на файл среды выполнения по SHA.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PitchBatchOutcome {
@@ -201,7 +202,7 @@ pub struct PitchBatchCandidate {
     pub byte_length: u64,
     pub metadata: PitchAccentDomainMetadata,
     pub validation: ValidationRecord,
-    /// Контекст входит в runtime-кэш blob-объектов и меняется при изменении любого свидетельства.
+    /// Контекст входит в кэш среды выполнения для blob-объектов и меняется при изменении любого свидетельства.
     pub validation_context_sha256: String,
 }
 
@@ -236,7 +237,7 @@ pub enum PitchBatchPublicationStatus {
     Conflict,
 }
 
-/// Сохранённая причина расхождения снимка владельца с состоянием batch.
+/// Сохранённая причина расхождения снимка владельца с состоянием пакета.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PitchBatchConflict {
@@ -270,7 +271,7 @@ impl PitchBatchItemStatus {
     }
 }
 
-/// CAS token, который вызывающая сторона получает перед освобождением lock на время работы браузера.
+/// Токен CAS, получаемый вызывающей стороной перед освобождением блокировки на время работы браузера.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PitchBatchItemToken {
     pub identity: AssetIdentity,
@@ -306,7 +307,7 @@ impl PitchBatchOwnerSnapshot {
     }
 }
 
-/// Адаптер сохранённого pitch-состояния над общим безопасным runtime.
+/// Адаптер сохранённого pitch-состояния над общей безопасной средой выполнения.
 #[derive(Debug)]
 pub struct PitchAccentBatchRuntime {
     runtime: SafeBatchRuntime,
@@ -323,7 +324,7 @@ impl PitchAccentBatch {
         Self::new_inner(batch_id.into(), requests, validator, None)
     }
 
-    /// Создаёт batch с неизменяемой идентичностью плана с версией схемы, откуда пришли запросы.
+    /// Создаёт пакет с неизменяемой идентичностью плана с версией схемы, откуда пришли запросы.
     pub fn new_with_plan_identity(
         batch_id: impl Into<String>,
         requests: Vec<JpdbPitchRequest>,
@@ -443,7 +444,7 @@ impl PitchAccentBatch {
         self.items.iter().all(|item| item.status().is_resolved())
     }
 
-    /// Возвращает CAS token только для элемента, ожидающего получения в текущем поколении.
+    /// Возвращает токен CAS только для элемента, ожидающего получения в текущем поколении.
     pub fn item_token(&self, surface: &str) -> Result<PitchBatchItemToken, AssetError> {
         let item = self
             .item(surface)
@@ -565,7 +566,7 @@ impl PitchAccentBatch {
             ));
         }
         item.request.selection = Some(selection);
-        // Canonical asset с другим выбором словарной записи не считается доверенным для этого запроса.
+        // Канонический ресурс с другим выбором словарной записи не считается доверенным для этого запроса.
         item.canonical_sha256 = None;
         item.generation = item
             .generation
@@ -1301,7 +1302,7 @@ impl PitchAccentBatchRuntime {
         })
     }
 
-    /// Создаёт новое runtime-состояние и сохраняет его до возврата.
+    /// Создаёт новое состояние среды выполнения и сохраняет его до возврата.
     pub fn create(store_root: &Path, batch: &PitchAccentBatch) -> Result<Self, AssetError> {
         batch.validate()?;
         let mut runtime = Self::open(store_root, &batch.batch_id)?;
@@ -1321,13 +1322,23 @@ impl PitchAccentBatchRuntime {
         self.runtime.save(batch)
     }
 
-    /// Сохраняет результат одного элемента по token CAS. Возвращает `false`, если во время
-    /// получения у элемента изменились поколение, запрос или item revision.
+    /// Сохраняет результат одного элемента по токену CAS. Возвращает `false`, если во время
+    /// получения у элемента изменились поколение, запрос или ревизия элемента.
     pub fn record_outcome(
         &mut self,
         batch: &mut PitchAccentBatch,
         token: &PitchBatchItemToken,
         outcome: JpdbPitchOutcome,
+    ) -> Result<bool, AssetError> {
+        self.record_outcome_diagnostic(batch, token, outcome, None)
+    }
+
+    pub(crate) fn record_outcome_diagnostic(
+        &mut self,
+        batch: &mut PitchAccentBatch,
+        token: &PitchBatchItemToken,
+        outcome: JpdbPitchOutcome,
+        diagnostics: Option<&BrowserItemTimer>,
     ) -> Result<bool, AssetError> {
         if batch.batch_id != self.batch_id() {
             return Err(invalid("ID пакета не совпадает с каталогом runtime"));
@@ -1344,7 +1355,7 @@ impl PitchAccentBatchRuntime {
         }
         let stored = match outcome {
             JpdbPitchOutcome::Acquired { asset } => {
-                self.store_acquired(item, *asset, &batch.validator)?
+                self.store_acquired(item, *asset, &batch.validator, diagnostics)?
             }
             JpdbPitchOutcome::NoPitchAccentOnSource { evidence } => {
                 PitchBatchOutcome::NoPitchAccentOnSource { evidence }
@@ -1363,7 +1374,15 @@ impl PitchAccentBatchRuntime {
             }
             JpdbPitchOutcome::Failed { error } => PitchBatchOutcome::Failed { error },
         };
-        validate_outcome(&stored, &item.identity, &item.request, &batch.validator)?;
+        let validation = diagnostics.map(|item| item.stage("outcome_validation"));
+        let validated = validate_outcome(&stored, &item.identity, &item.request, &batch.validator);
+        if let Some(validation) = validation {
+            match &validated {
+                Ok(_) => validation.finish_success(),
+                Err(error) => validation.finish_failure(error.code.as_str(), false, None),
+            }
+        }
+        validated?;
         let item = batch
             .item_mut(&token.identity.key)
             .expect("идентичность токена проверена выше");
@@ -1415,7 +1434,7 @@ impl PitchAccentBatchRuntime {
         Ok(bytes)
     }
 
-    /// HTML-отчёт принадлежит `pitch_review`; runtime только безопасно записывает артефакт.
+    /// HTML-отчёт принадлежит `pitch_review`; среда выполнения только безопасно записывает артефакт.
     pub fn write_review(
         &self,
         batch: &PitchAccentBatch,
@@ -1437,6 +1456,7 @@ impl PitchAccentBatchRuntime {
         item: &PitchBatchItem,
         acquired: JpdbPitchAcquired,
         validator_identity: &ValidatorIdentity,
+        diagnostics: Option<&BrowserItemTimer>,
     ) -> Result<PitchBatchOutcome, AssetError> {
         validate_acquired_metadata(&item.identity, &item.request, &acquired.metadata).map_err(
             |message| {
@@ -1460,12 +1480,20 @@ impl PitchAccentBatchRuntime {
             "png",
             PITCH_ACCENT_MAX_ASSET_BYTES,
         )?;
+        let stage = diagnostics.map(|item| item.stage("candidate_validation"));
         let validation = validate_candidate(
             &item.identity,
             &acquired.metadata,
             &acquired.bytes,
             validator_identity,
-        )?;
+        );
+        if let Some(stage) = stage {
+            match &validation {
+                Ok(_) => stage.finish_success(),
+                Err(error) => stage.finish_failure(error.code.as_str(), false, None),
+            }
+        }
+        let validation = validation?;
         let candidate = PitchBatchCandidate {
             blob,
             sha256,
