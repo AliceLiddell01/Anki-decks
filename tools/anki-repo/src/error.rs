@@ -56,6 +56,18 @@ pub enum ErrorCode {
     UnknownQaCode,
     /// `visual-report`: before/after нельзя сравнить как один логический export.
     InvalidComparison,
+    /// Git-ссылка для пакета свидетельств ревью не разрешается в коммит.
+    InvalidGitRef,
+    /// Git не смог собрать воспроизводимый снимок свидетельств ревью кода.
+    GitEvidenceFailed,
+    /// Формат или версия локального пакета ревью не поддерживается.
+    ReviewArtifactInvalid,
+    /// Исходный пакет относится к другому репозиторию или несовместимой базе.
+    BaselineMismatch,
+    /// Путь пакета ревью занят несовместимым сохранённым содержимым.
+    ReviewArtifactConflict,
+    /// Решения для языковой проверки не прошли безопасную проверку предусловий.
+    LanguageDecisionInvalid,
     /// `find` по идентичности не нашёл ни одного совпадения.
     NotFound,
     /// `find` по идентичности нашёл больше одного совпадения.
@@ -107,6 +119,12 @@ impl ErrorCode {
             Self::DeckIdentityMismatch => "deck_identity_mismatch",
             Self::UnknownQaCode => "unknown_qa_code",
             Self::InvalidComparison => "invalid_comparison",
+            Self::InvalidGitRef => "invalid_git_ref",
+            Self::GitEvidenceFailed => "git_evidence_failed",
+            Self::ReviewArtifactInvalid => "review_artifact_invalid",
+            Self::BaselineMismatch => "baseline_mismatch",
+            Self::ReviewArtifactConflict => "review_artifact_conflict",
+            Self::LanguageDecisionInvalid => "language_decision_invalid",
             Self::NotFound => "not_found",
             Self::Ambiguous => "ambiguous",
             Self::SourceNotCanonical => "source_not_canonical",
@@ -140,6 +158,11 @@ impl ErrorCode {
             | Self::UnresolvedDeckIdentity
             | Self::DeckIdentityMismatch
             | Self::InvalidComparison
+            | Self::InvalidGitRef
+            | Self::GitEvidenceFailed
+            | Self::ReviewArtifactInvalid
+            | Self::BaselineMismatch
+            | Self::LanguageDecisionInvalid
             | Self::UnknownQaCode
             | Self::SourceNotCanonical
             | Self::InvalidRequest
@@ -153,6 +176,7 @@ impl ErrorCode {
             | Self::GuidConflict => 6,
             Self::ExpectedMismatch | Self::SourceChanged => 7,
             Self::WriteFailed => 8,
+            Self::ReviewArtifactConflict => 7,
             Self::Internal => 70,
         }
     }
@@ -229,6 +253,12 @@ mod tests {
         assert_eq!(ErrorCode::InvalidJson.exit_code(), 3);
         assert_eq!(ErrorCode::RootNotDeck.exit_code(), 3);
         assert_eq!(ErrorCode::SchemaInvalid.exit_code(), 3);
+        assert_eq!(ErrorCode::InvalidGitRef.exit_code(), 3);
+        assert_eq!(ErrorCode::GitEvidenceFailed.exit_code(), 3);
+        assert_eq!(ErrorCode::ReviewArtifactInvalid.exit_code(), 3);
+        assert_eq!(ErrorCode::BaselineMismatch.exit_code(), 3);
+        assert_eq!(ErrorCode::LanguageDecisionInvalid.exit_code(), 3);
+        assert_eq!(ErrorCode::ReviewArtifactConflict.exit_code(), 7);
         assert_eq!(ErrorCode::UnknownField.exit_code(), 3);
         assert_eq!(ErrorCode::UnknownDeck.exit_code(), 3);
         assert_eq!(ErrorCode::NotFound.exit_code(), 4);
@@ -318,6 +348,12 @@ mod tests {
             ErrorCode::DeckIdentityMismatch,
             ErrorCode::UnknownQaCode,
             ErrorCode::InvalidComparison,
+            ErrorCode::InvalidGitRef,
+            ErrorCode::GitEvidenceFailed,
+            ErrorCode::ReviewArtifactInvalid,
+            ErrorCode::BaselineMismatch,
+            ErrorCode::ReviewArtifactConflict,
+            ErrorCode::LanguageDecisionInvalid,
             ErrorCode::NotFound,
             ErrorCode::Ambiguous,
             ErrorCode::SourceNotCanonical,

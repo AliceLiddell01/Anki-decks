@@ -53,10 +53,14 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ, проверка и ограниченные изменения CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review, language, edit, models, create, retire, migrate-media, visual-report",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
-                  inspect, find, stats, validate, qa, review, review-check, models и\n\
-                  visual-report только читают.\n\
+                  inspect, find, stats, validate, qa, review, review-check, models,\n\
+                  visual-report и code-review collect/verify/delta только читают\n\
+                  зафиксированное состояние репозитория; code-review сохраняет локальные\n\
+                  артефакты с точной идентичностью Git-снимка.\n\
+                  language scan/check только читают. language apply требует\n\
+                  явного --apply и решений replace, подтверждённых человеком.\n\
                   edit меняет значения существующих полей существующих заметок.\n\
                   create добавляет заметки в существующие колоды и модели.\n\
                   retire помечает заметки тегом вместо физического удаления.\n\
@@ -99,6 +103,16 @@ impl Cli {
             Command::MigrateMedia { .. } => "migrate-media",
             Command::Retire { .. } => "retire",
             Command::VisualReport { .. } => "visual-report",
+            Command::CodeReview { command } => match command {
+                CodeReviewCommand::Collect { .. } => "code-review collect",
+                CodeReviewCommand::Verify { .. } => "code-review verify",
+                CodeReviewCommand::Delta { .. } => "code-review delta",
+            },
+            Command::Language { command } => match command {
+                LanguageCommand::Scan { .. } => "language scan",
+                LanguageCommand::Check { .. } => "language check",
+                LanguageCommand::Apply { .. } => "language apply",
+            },
         }
     }
 }
@@ -229,7 +243,7 @@ pub enum Command {
         #[arg(long = "match", value_enum)]
         match_mode: Option<MatchArg>,
 
-        /// Отобрать заметки с finding указанного кода QA.
+        /// Отобрать заметки с замечанием указанного кода QA.
         #[arg(long = "qa-code", value_name = "CODE")]
         qa_code: Option<String>,
 
@@ -465,5 +479,119 @@ pub enum Command {
         /// Проверенное хранилище pitch-accent; по умолчанию .asset-store/pitch-accent из репозитория экспорта.
         #[arg(long)]
         pitch_asset_store: Option<PathBuf>,
+    },
+
+    /// Детерминированные свидетельства для независимого ревью кода.
+    CodeReview {
+        #[command(subcommand)]
+        command: CodeReviewCommand,
+    },
+
+    /// Проверка и утверждённая правка человеческого текста.
+    Language {
+        #[command(subcommand)]
+        command: LanguageCommand,
+    },
+}
+
+/// Подкоманды сбора и сравнения свидетельств для ревью кода.
+#[derive(Debug, Subcommand)]
+pub enum CodeReviewCommand {
+    /// Собрать пакет свидетельств для явного диапазона Git.
+    Collect {
+        /// Базовая ссылка Git, например main или origin/main.
+        #[arg(long)]
+        base: String,
+        /// Верхняя ссылка Git; её SHA фиксируется в пакете.
+        #[arg(long)]
+        head: String,
+        /// Каталог локальных артефактов; по умолчанию вычисляется по SHA.
+        #[arg(long = "out-dir", value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+        /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
+        #[arg(long)]
+        run_clippy: bool,
+    },
+
+    /// Повторно собрать свидетельства для нового HEAD и сравнить с исходным пакетом.
+    Verify {
+        /// review.json предыдущего прогона.
+        #[arg(long, value_name = "PACK")]
+        baseline: PathBuf,
+        /// Новый HEAD для сравнения; базовый SHA берётся из исходного пакета.
+        #[arg(long)]
+        head: String,
+        /// Каталог нового снимка ревью; имя по умолчанию вычисляется по SHA.
+        #[arg(long = "out-dir", value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+        /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
+        #[arg(long)]
+        run_clippy: bool,
+    },
+
+    /// Сравнить два ранее сохранённых пакета ревью без повторного анализа.
+    Delta {
+        /// Исходный файл review.json.
+        #[arg(long, value_name = "PACK")]
+        before: PathBuf,
+        /// Более новый review.json.
+        #[arg(long, value_name = "PACK")]
+        after: PathBuf,
+        /// Необязательный путь JSON-отчёта delta.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+}
+
+/// Подкоманды языковой проверки.
+#[derive(Debug, Subcommand)]
+pub enum LanguageCommand {
+    /// Найти человекочитаемые фрагменты в заданных файлах или полных версиях файлов
+    /// из пакета ревью.
+    #[command(group(
+        clap::ArgGroup::new("scan_source")
+            .required(true)
+            .multiple(false)
+            .args(["paths", "pack"])
+    ))]
+    Scan {
+        /// Корень репозитория, относительно которого задаются пути.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Путь внутри корня репозитория; флаг можно повторять.
+        #[arg(long = "path", value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// Использовать область изменений и версии файлов после изменений из пакета ревью.
+        #[arg(long, value_name = "PACK")]
+        pack: Option<PathBuf>,
+        /// Сохранить полный артефакт сканирования для принятия решений.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+
+    /// Повторно проверить пути из артефакта сканирования после ручных правок.
+    Check {
+        /// Исходный артефакт команды `language scan`.
+        #[arg(long, value_name = "SCAN")]
+        scan: PathBuf,
+        /// Корень репозитория, в котором перечитываются текущие файлы.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Необязательный путь для обновлённого артефакта сканирования.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
+    /// Проверить и (только с --apply) применить явно утверждённые замены.
+    Apply {
+        /// Артефакт решений, полученный после смысловой проверки кандидатов.
+        #[arg(long, value_name = "PATH")]
+        decisions: PathBuf,
+        /// Корень репозитория.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Записать все замены после общей проверки предусловий.
+        #[arg(long)]
+        apply: bool,
     },
 }

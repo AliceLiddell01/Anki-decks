@@ -6,11 +6,16 @@
 //! без отдельного процесса. Единственное чтение из стандартного ввода —
 //! `edit --request -`.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::cli::{Cli, Command, MatchArg};
+use serde::Serialize;
+
+use crate::cli::{Cli, CodeReviewCommand, Command, LanguageCommand, MatchArg};
+use crate::code_review::model::CandidateStatus;
+use crate::code_review::workflow::{LanguageSummary, SnapshotSummary};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
 use crate::loader::load_export;
@@ -50,9 +55,146 @@ pub struct Rendered {
     pub exit: u8,
 }
 
+const LANGUAGE_CHECK_SAMPLE_LIMIT: usize = 20;
+
+#[derive(Serialize)]
+struct LanguageCheckOutput {
+    summary: Option<LanguageSummary>,
+    files_total: usize,
+    candidates_total: usize,
+    candidates_truncated: bool,
+    skipped_total: usize,
+    candidates: Vec<LanguageCandidateSummary>,
+}
+
+#[derive(Serialize)]
+struct LanguageCandidateSummary {
+    id: String,
+    path: String,
+    line: usize,
+    column: usize,
+    context: crate::code_review::language::TextContext,
+    text: String,
+    text_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct SnapshotOutput {
+    artifact_dir: String,
+    target: crate::code_review::scope::GitTarget,
+    files: usize,
+    candidates: usize,
+    diagnostics: usize,
+    tool_runs: Vec<crate::code_review::model::ToolRunEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<DeltaSummary>,
+}
+
+#[derive(Serialize)]
+struct DeltaSummary {
+    before: crate::code_review::model::SnapshotIdentity,
+    after: crate::code_review::model::SnapshotIdentity,
+    candidates_total: usize,
+    candidate_status_counts: BTreeMap<&'static str, usize>,
+    diagnostics_total: usize,
+    diagnostic_status_counts: BTreeMap<&'static str, usize>,
+    tool_runs: Vec<ToolRunDeltaSummary>,
+}
+
+#[derive(Serialize)]
+struct ToolRunDeltaSummary {
+    tool: String,
+    before_status: String,
+    after_status: String,
+    status_changed: bool,
+    before_diagnostics: usize,
+    after_diagnostics: usize,
+}
+
+fn snapshot_output(summary: &SnapshotSummary) -> SnapshotOutput {
+    let delta = summary.delta.as_ref().map(|delta| DeltaSummary {
+        before: delta.before.clone(),
+        after: delta.after.clone(),
+        candidates_total: delta.candidates.len(),
+        candidate_status_counts: status_counts(delta.candidates.iter().map(|change| change.status)),
+        diagnostics_total: delta.diagnostics.len(),
+        diagnostic_status_counts: status_counts(
+            delta.diagnostics.iter().map(|change| change.status),
+        ),
+        tool_runs: delta
+            .tool_runs
+            .iter()
+            .map(|run| ToolRunDeltaSummary {
+                tool: run.tool.clone(),
+                before_status: run.before_status.clone(),
+                after_status: run.after_status.clone(),
+                status_changed: run.status_changed,
+                before_diagnostics: run.before_diagnostics,
+                after_diagnostics: run.after_diagnostics,
+            })
+            .collect(),
+    });
+    SnapshotOutput {
+        artifact_dir: summary.artifact_dir.clone(),
+        target: summary.target.clone(),
+        files: summary.files,
+        candidates: summary.candidates,
+        diagnostics: summary.diagnostics,
+        tool_runs: summary.tool_runs.clone(),
+        delta,
+    }
+}
+
+fn status_counts(statuses: impl Iterator<Item = CandidateStatus>) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for status in statuses {
+        let name = match status {
+            CandidateStatus::StillPresent => "still_present",
+            CandidateStatus::Gone => "gone",
+            CandidateStatus::Changed => "changed",
+            CandidateStatus::New => "new",
+        };
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn language_check_output(
+    scan: crate::code_review::language::LanguageScan,
+    summary: Option<LanguageSummary>,
+) -> LanguageCheckOutput {
+    let candidates_total = scan.candidates.len();
+    let candidates = scan
+        .candidates
+        .iter()
+        .take(LANGUAGE_CHECK_SAMPLE_LIMIT)
+        .map(|candidate| LanguageCandidateSummary {
+            id: candidate.id.clone(),
+            path: candidate.path.clone(),
+            line: candidate.line,
+            column: candidate.column,
+            context: candidate.context,
+            text: crate::text::bounded_sample(&candidate.text),
+            text_truncated: candidate
+                .text
+                .chars()
+                .nth(crate::text::VALUE_SAMPLE_CHARS)
+                .is_some(),
+        })
+        .collect();
+    LanguageCheckOutput {
+        summary,
+        files_total: scan.files.len(),
+        candidates_total,
+        candidates_truncated: candidates_total > LANGUAGE_CHECK_SAMPLE_LIMIT,
+        skipped_total: scan.skipped.len(),
+        candidates,
+    }
+}
+
 /// Выполняет команду и готовит её вывод.
 ///
-/// # Errors
+/// # Ошибки
 ///
 /// Возвращает [`DomainError`] для любой доменной проблемы.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
@@ -382,6 +524,117 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
             })
         }
 
+        Command::CodeReview { command } => match command {
+            CodeReviewCommand::Collect {
+                base,
+                head,
+                out_dir,
+                run_clippy,
+            } => {
+                let result = crate::code_review::workflow::collect(
+                    base,
+                    head,
+                    out_dir.as_deref(),
+                    *run_clippy,
+                )?;
+                Ok(Rendered {
+                    command: "code-review collect",
+                    stdout: if cli.json {
+                        json::generic_json("code-review collect", snapshot_output(&result))
+                    } else {
+                        human_snapshot(&result)
+                    },
+                    exit: 0,
+                })
+            }
+            CodeReviewCommand::Verify {
+                baseline,
+                head,
+                out_dir,
+                run_clippy,
+            } => {
+                let result = crate::code_review::workflow::verify(
+                    baseline,
+                    head,
+                    out_dir.as_deref(),
+                    *run_clippy,
+                )?;
+                Ok(Rendered {
+                    command: "code-review verify",
+                    stdout: if cli.json {
+                        json::generic_json("code-review verify", snapshot_output(&result))
+                    } else {
+                        human_snapshot(&result)
+                    },
+                    exit: 0,
+                })
+            }
+            CodeReviewCommand::Delta { before, after, out } => {
+                let result =
+                    crate::code_review::workflow::compare_files(before, after, out.as_deref())?;
+                Ok(Rendered {
+                    command: "code-review delta",
+                    stdout: if cli.json {
+                        json::generic_json("code-review delta", result)
+                    } else {
+                        human_delta(&result)
+                    },
+                    exit: 0,
+                })
+            }
+        },
+
+        Command::Language { command } => match command {
+            LanguageCommand::Scan {
+                root,
+                paths,
+                pack,
+                out,
+            } => {
+                let result =
+                    crate::code_review::workflow::scan_language(root, paths, pack.as_deref(), out)?;
+                Ok(Rendered {
+                    command: "language scan",
+                    stdout: if cli.json {
+                        json::generic_json("language scan", result)
+                    } else {
+                        human_language_scan(&result)
+                    },
+                    exit: 0,
+                })
+            }
+            LanguageCommand::Check { scan, root, out } => {
+                let (result, summary) =
+                    crate::code_review::workflow::check_language(root, scan, out.as_deref())?;
+                let output = language_check_output(result, summary);
+                Ok(Rendered {
+                    command: "language check",
+                    stdout: if cli.json {
+                        json::generic_json("language check", output)
+                    } else {
+                        human_language_check(&output)
+                    },
+                    exit: 0,
+                })
+            }
+            LanguageCommand::Apply {
+                decisions,
+                root,
+                apply,
+            } => {
+                let result = crate::code_review::workflow::apply_language(root, decisions, *apply)?;
+                Ok(Rendered {
+                    command: "language apply",
+                    stdout: if cli.json {
+                        json::generic_json("language apply", result)
+                    } else {
+                        human_language_apply(&result)
+                    },
+                    exit: 0,
+                })
+            }
+        },
+
         Command::Edit {
             export_dir,
             request_file,
@@ -409,6 +662,184 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 exit: 0,
             })
         }
+    }
+}
+
+fn human_snapshot(result: &crate::code_review::workflow::SnapshotSummary) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let _ = writeln!(text, "Пакет свидетельств сохранён: {}", result.artifact_dir);
+    let _ = writeln!(text, "База: {}", result.target.base_sha);
+    let _ = writeln!(text, "HEAD: {}", result.target.head_sha);
+    let _ = writeln!(text, "Файлов: {}", result.files);
+    let _ = writeln!(
+        text,
+        "Кандидатов: {} (нужна семантическая проверка)",
+        result.candidates
+    );
+    let _ = writeln!(
+        text,
+        "Диагностик: {} (сами по себе не подтверждают дефект)",
+        result.diagnostics
+    );
+    for run in &result.tool_runs {
+        let _ = writeln!(text, "Анализатор {}: {}", run.tool, run.status);
+        if let Some(message) = &run.message {
+            let _ = writeln!(text, "  {message}");
+        }
+    }
+    if let Some(delta) = &result.delta {
+        let mut counts = std::collections::BTreeMap::new();
+        for change in &delta.candidates {
+            *counts.entry(change.status).or_insert(0usize) += 1;
+        }
+        let _ = writeln!(text, "Изменения кандидатов:");
+        for (status, count) in counts {
+            let _ = writeln!(text, "  {}: {count}", candidate_status_label(status));
+        }
+        let _ = writeln!(
+            text,
+            "Сравнение сигналов детекторов не подтверждает исправление дефекта."
+        );
+    }
+    text
+}
+
+fn human_delta(result: &crate::code_review::model::ReviewDelta) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "Сравнение сигналов детекторов: {} → {}",
+        result.before.head_sha, result.after.head_sha
+    );
+    let mut candidate_counts = std::collections::BTreeMap::new();
+    for change in &result.candidates {
+        *candidate_counts.entry(change.status).or_insert(0usize) += 1;
+    }
+    let _ = writeln!(text, "Изменения кандидатов:");
+    for (status, count) in candidate_counts {
+        let _ = writeln!(text, "  {}: {count}", candidate_status_label(status));
+    }
+    let mut diagnostic_counts = std::collections::BTreeMap::new();
+    for change in &result.diagnostics {
+        *diagnostic_counts.entry(change.status).or_insert(0usize) += 1;
+    }
+    let _ = writeln!(text, "Изменения диагностик:");
+    for (status, count) in diagnostic_counts {
+        let _ = writeln!(text, "  {}: {count}", candidate_status_label(status));
+    }
+    for run in &result.tool_runs {
+        let _ = writeln!(
+            text,
+            "Анализатор {}: {} → {} (диагностик: {} → {})",
+            run.tool,
+            run.before_status,
+            run.after_status,
+            run.before_diagnostics,
+            run.after_diagnostics
+        );
+        if let Some(message) = &run.after_message {
+            let _ = writeln!(text, "  {message}");
+        }
+    }
+    let _ = writeln!(
+        text,
+        "Сравнение описывает сигналы детекторов и не подтверждает состояние дефекта."
+    );
+    text
+}
+
+fn human_language_scan(result: &crate::code_review::workflow::LanguageSummary) -> String {
+    format!(
+        "Сканирование текста сохранено: {}\nФайлов: {}\nКандидатов: {}\nПропущено: {}\n",
+        result.artifact, result.files, result.candidates, result.skipped
+    )
+}
+
+fn human_language_check(result: &LanguageCheckOutput) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "Найдено кандидатов в тексте: {}",
+        result.candidates_total
+    );
+    let _ = writeln!(
+        text,
+        "Показано кандидатов: {} из {}",
+        result.candidates.len(),
+        result.candidates_total
+    );
+    let _ = writeln!(text, "Проверено файлов: {}", result.files_total);
+    let _ = writeln!(text, "Пропущено файлов: {}", result.skipped_total);
+    let _ = writeln!(
+        text,
+        "Выборка усечена: {}",
+        if result.candidates_truncated {
+            "да"
+        } else {
+            "нет"
+        }
+    );
+    if let Some(summary) = &result.summary {
+        let _ = writeln!(text, "Артефакт: {}", summary.artifact);
+    }
+    for candidate in &result.candidates {
+        let _ = writeln!(
+            text,
+            "  {}:{} {}: {}",
+            candidate.path,
+            candidate.line,
+            text_context_label(candidate.context),
+            candidate.text.replace('\n', "↵")
+        );
+    }
+    text
+}
+
+fn human_language_apply(result: &crate::code_review::workflow::LanguageApplySummary) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let mode = if result.applied {
+        "Записано"
+    } else {
+        "Проверка без записи"
+    };
+    let _ = writeln!(
+        text,
+        "{mode}: файлов {}, замен {}",
+        result.files, result.replacements
+    );
+    for file in &result.results {
+        let _ = writeln!(
+            text,
+            "  {}: замен {}, {} → {}",
+            file.path, file.replacements, file.before_sha256, file.after_sha256
+        );
+    }
+    text
+}
+
+fn candidate_status_label(status: crate::code_review::model::CandidateStatus) -> &'static str {
+    use crate::code_review::model::CandidateStatus;
+    match status {
+        CandidateStatus::StillPresent => "остался",
+        CandidateStatus::Gone => "исчез",
+        CandidateStatus::Changed => "изменился",
+        CandidateStatus::New => "появился",
+    }
+}
+
+fn text_context_label(context: crate::code_review::language::TextContext) -> &'static str {
+    use crate::code_review::language::TextContext;
+    match context {
+        TextContext::Comment => "комментарий",
+        TextContext::DocComment => "doc-комментарий",
+        TextContext::StringLiteral => "строковый литерал",
+        TextContext::MarkdownProse => "текст Markdown",
+        TextContext::ConfigurationValue => "значение конфигурации",
+        TextContext::ScriptOutput => "текст shell/script",
     }
 }
 

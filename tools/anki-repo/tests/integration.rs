@@ -8,6 +8,8 @@ mod common;
 
 #[path = "cli_contract.rs"]
 mod cli_contract;
+#[path = "code_review_contract.rs"]
+mod code_review_contract;
 #[path = "edit_contract.rs"]
 mod edit_contract;
 #[path = "edit_source_preservation.rs"]
