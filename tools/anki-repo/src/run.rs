@@ -60,7 +60,7 @@ struct LanguageCheckOutput {
 
 /// Выполняет команду и готовит её вывод.
 ///
-/// # Errors
+/// # Ошибки
 ///
 /// Возвращает [`DomainError`] для любой доменной проблемы.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
@@ -395,13 +395,13 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 base,
                 head,
                 out_dir,
-                skip_clippy,
+                run_clippy,
             } => {
                 let result = crate::code_review::workflow::collect(
                     base,
                     head,
                     out_dir.as_deref(),
-                    *skip_clippy,
+                    *run_clippy,
                 )?;
                 Ok(Rendered {
                     command: "code-review collect",
@@ -417,13 +417,13 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 baseline,
                 head,
                 out_dir,
-                skip_clippy,
+                run_clippy,
             } => {
                 let result = crate::code_review::workflow::verify(
                     baseline,
                     head,
                     out_dir.as_deref(),
-                    *skip_clippy,
+                    *run_clippy,
                 )?;
                 Ok(Rendered {
                     command: "code-review verify",
@@ -537,7 +537,7 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
 fn human_snapshot(result: &crate::code_review::workflow::SnapshotSummary) -> String {
     use std::fmt::Write as _;
     let mut text = String::new();
-    let _ = writeln!(text, "Evidence-pack сохранён: {}", result.artifact_dir);
+    let _ = writeln!(text, "Пакет свидетельств сохранён: {}", result.artifact_dir);
     let _ = writeln!(text, "База: {}", result.target.base_sha);
     let _ = writeln!(text, "HEAD: {}", result.target.head_sha);
     let _ = writeln!(text, "Файлов: {}", result.files);

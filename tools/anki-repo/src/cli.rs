@@ -53,7 +53,7 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki и evidence для code review: inspect, find, stats, validate, qa, review, review-check, code-review, language, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki и свидетельства для code review: inspect, find, stats, validate, qa, review, review-check, code-review, language, edit, models, create, retire, migrate-media, visual-report",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report и code-review collect/verify/delta только читают\n\
@@ -243,7 +243,7 @@ pub enum Command {
         #[arg(long = "match", value_enum)]
         match_mode: Option<MatchArg>,
 
-        /// Отобрать заметки с finding указанного кода QA.
+        /// Отобрать заметки с замечанием указанного кода QA.
         #[arg(long = "qa-code", value_name = "CODE")]
         qa_code: Option<String>,
 
@@ -481,7 +481,7 @@ pub enum Command {
         pitch_asset_store: Option<PathBuf>,
     },
 
-    /// Детерминированные evidence для независимого code review.
+    /// Детерминированные свидетельства для независимого code review.
     CodeReview {
         #[command(subcommand)]
         command: CodeReviewCommand,
@@ -494,7 +494,7 @@ pub enum Command {
     },
 }
 
-/// Подкоманды сбора и сравнения code-review evidence.
+/// Подкоманды сбора и сравнения свидетельств для code review.
 #[derive(Debug, Subcommand)]
 pub enum CodeReviewCommand {
     /// Собрать review-pack для явного диапазона Git.
@@ -508,30 +508,30 @@ pub enum CodeReviewCommand {
         /// Каталог локальных артефактов; по умолчанию вычисляется по SHA.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
-        /// Не запускать локальный offline Clippy adapter.
+        /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
-        skip_clippy: bool,
+        run_clippy: bool,
     },
 
-    /// Повторно собрать evidence для нового HEAD и сравнить с baseline.
+    /// Повторно собрать свидетельства для нового HEAD и сравнить с исходным пакетом.
     Verify {
         /// review.json предыдущего прогона.
         #[arg(long, value_name = "PACK")]
         baseline: PathBuf,
-        /// Новый HEAD для сравнения; базовый SHA берётся из baseline.
+        /// Новый HEAD для сравнения; базовый SHA берётся из исходного пакета.
         #[arg(long)]
         head: String,
-        /// Каталог нового review snapshot; по умолчанию вычисляется по SHA.
+        /// Каталог нового снимка ревью; имя по умолчанию вычисляется по SHA.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
-        /// Не запускать локальный offline Clippy adapter.
+        /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
-        skip_clippy: bool,
+        run_clippy: bool,
     },
 
     /// Сравнить два ранее сохранённых review-pack без повторного анализа.
     Delta {
-        /// Baseline review.json.
+        /// Исходный файл review.json.
         #[arg(long, value_name = "PACK")]
         before: PathBuf,
         /// Более новый review.json.
@@ -546,7 +546,8 @@ pub enum CodeReviewCommand {
 /// Подкоманды language-policy workflow.
 #[derive(Debug, Subcommand)]
 pub enum LanguageCommand {
-    /// Найти human-readable spans в заданных файлах или post-image review-pack.
+    /// Найти человекочитаемые фрагменты в заданных файлах или полных версиях файлов
+    /// из review-pack.
     #[command(group(
         clap::ArgGroup::new("scan_source")
             .required(true)
@@ -557,33 +558,33 @@ pub enum LanguageCommand {
         /// Корень репозитория, относительно которого задаются пути.
         #[arg(long, default_value = ".")]
         root: PathBuf,
-        /// Путь внутри root; флаг можно повторять.
+        /// Путь внутри корня репозитория; флаг можно повторять.
         #[arg(long = "path", value_name = "PATH")]
         paths: Vec<PathBuf>,
-        /// Использовать scope и post-image из сохранённого review-pack.
+        /// Использовать область изменений и версии файлов после изменений из review-pack.
         #[arg(long, value_name = "PACK")]
         pack: Option<PathBuf>,
-        /// Сохранить полный scan artifact для принятия решений.
+        /// Сохранить полный артефакт сканирования для принятия решений.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
 
-    /// Повторно проверить пути из scan artifact после ручных правок.
+    /// Повторно проверить пути из артефакта сканирования после ручных правок.
     Check {
-        /// Исходный language scan artifact.
+        /// Исходный артефакт команды `language scan`.
         #[arg(long, value_name = "SCAN")]
         scan: PathBuf,
         /// Корень репозитория, в котором перечитываются текущие файлы.
         #[arg(long, default_value = ".")]
         root: PathBuf,
-        /// Необязательный путь обновлённого scan artifact.
+        /// Необязательный путь для обновлённого артефакта сканирования.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
 
     /// Проверить и (только с --apply) применить явно утверждённые замены.
     Apply {
-        /// Артефакт решений, полученный после семантической проверки candidates.
+        /// Артефакт решений, полученный после смысловой проверки кандидатов.
         #[arg(long, value_name = "PATH")]
         decisions: PathBuf,
         /// Корень репозитория.

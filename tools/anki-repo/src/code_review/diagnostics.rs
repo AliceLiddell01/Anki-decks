@@ -1,8 +1,8 @@
-//! Машинный адаптер диагностик Cargo/rustc/Clippy для code-review evidence.
+//! Машинный адаптер диагностик Cargo/rustc/Clippy для свидетельств code-review.
 //!
-//! Парсер принимает только Cargo JSON messages и намеренно не разбирает
-//! человекочитаемый stdout/stderr. Диагностики сохраняются как evidence: их
-//! уровень сам по себе не превращает запись в подтверждённый review finding.
+//! Парсер принимает только JSON-сообщения Cargo и намеренно не разбирает
+//! человекочитаемый stdout/stderr. Диагностики сохраняются как свидетельства: их
+//! уровень сам по себе не превращает запись в подтверждённое замечание ревью.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
@@ -19,7 +19,7 @@ pub const STDERR_SUMMARY_MAX_CHARS: usize = 2_000;
 /// Известный или будущий уровень rustc-диагностики.
 ///
 /// Неизвестные значения сохраняются как строки, чтобы новая версия rustc не
-/// делала старый evidence collector непригодным.
+/// делала старый сборщик свидетельств непригодным.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
     Error,
@@ -113,7 +113,7 @@ pub struct DiagnosticCode {
     pub explanation: Option<String>,
 }
 
-/// Строка исходника и выделенный в ней диапазон из Cargo span.
+/// Строка исходника и выделенный в ней диапазон из диагностики Cargo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticSourceLine {
     pub text: String,
@@ -121,7 +121,7 @@ pub struct DiagnosticSourceLine {
     pub highlight_end: u64,
 }
 
-/// Локатор и исходный фрагмент одного rustc span.
+/// Локатор и исходный фрагмент одного диапазона rustc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticSpan {
     pub file_name: String,
@@ -141,7 +141,7 @@ pub struct DiagnosticSpan {
     pub source_lines: Vec<DiagnosticSourceLine>,
 }
 
-/// Происхождение сообщения в Cargo build graph.
+/// Происхождение сообщения в графе сборки Cargo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticSource {
     pub tool: DiagnosticTool,
@@ -151,7 +151,7 @@ pub struct DiagnosticSource {
     pub target_name: Option<String>,
 }
 
-/// Структурированная диагностика без verdict о корректности изменения.
+/// Структурированная диагностика без заключения о корректности изменения.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeReviewDiagnostic {
     pub severity: DiagnosticSeverity,
@@ -159,7 +159,7 @@ pub struct CodeReviewDiagnostic {
     pub code: Option<DiagnosticCode>,
     pub message: String,
     pub spans: Vec<DiagnosticSpan>,
-    /// Вложенные rustc notes/help, сохранённые вместе с исходной диагностикой.
+    /// Вложенные примечания и подсказки rustc, сохранённые вместе с исходной диагностикой.
     pub children: Vec<CodeReviewDiagnostic>,
     pub source: DiagnosticSource,
 }
@@ -168,15 +168,15 @@ pub struct CodeReviewDiagnostic {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoDiagnosticParse {
     pub diagnostics: Vec<CodeReviewDiagnostic>,
-    /// Непустые строки, которые не удалось разобрать как JSON или compiler message.
+    /// Непустые строки, которые не удалось разобрать как JSON или сообщение компилятора.
     pub malformed_lines: usize,
-    /// Валидные Cargo JSON records, не относящиеся к `compiler-message`.
+    /// Валидные JSON-записи Cargo, не относящиеся к `compiler-message`.
     pub ignored_records: usize,
 }
 
 /// Итог локального запуска анализатора.
 ///
-/// `diagnostics` остаются доступны и при неуспешном exit status. Outcome
+/// `diagnostics` остаются доступны и при ненулевом коде выхода. Результат
 /// определяется запуском процесса и целостностью JSON-потока, а не наличием
 /// `warning`/`error` или их количеством.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +194,7 @@ pub struct ToolRun {
     pub message: Option<String>,
 }
 
-/// Состояние внешнего analyzer run.
+/// Состояние запуска внешнего анализатора.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRunStatus {
@@ -208,7 +208,7 @@ pub enum ToolRunStatus {
     Diagnostics,
 }
 
-/// Сводка exit status, включая завершение по сигналу без числового кода.
+/// Сводка состояния завершения, включая завершение по сигналу без числового кода.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExitStatusSummary {
     pub success: bool,
@@ -225,7 +225,7 @@ impl From<ExitStatus> for ExitStatusSummary {
     }
 }
 
-/// Разбирает Cargo `--message-format=json` output; посторонние records
+/// Разбирает Cargo `--message-format=json`; посторонние записи
 /// игнорируются, неизвестные поля и уровни сохраняются/пропускаются безопасно.
 #[must_use]
 pub fn parse_cargo_json_output(output: &str, tool: DiagnosticTool) -> CargoDiagnosticParse {
@@ -236,11 +236,14 @@ pub fn parse_cargo_json_output(output: &str, tool: DiagnosticTool) -> CargoDiagn
     parsed
 }
 
-/// Запускает один локальный Clippy pipeline из корня workspace.
+/// Запускает один локальный анализ Clippy из корня рабочего пространства.
 ///
 /// `--offline` и `CARGO_NET_OFFLINE=true` запрещают Cargo обращаться в сеть;
 /// `RUSTUP_AUTO_INSTALL=0` не позволяет rustup автоматически скачивать
-/// недостающий toolchain. Никакой plugin или компонент не устанавливается.
+/// недостающий toolchain. Расширения и компоненты не устанавливаются.
+/// Эти параметры не изолируют проект: Cargo исполняет build.rs и proc-macro
+/// с правами текущего пользователя. Вызывающий код обязан получить явное
+/// разрешение на исполнение, прежде чем вызывать эту функцию.
 #[must_use]
 pub fn run_local_clippy(repo_root: &Path) -> ToolRun {
     if !repo_root.is_dir() {
@@ -258,6 +261,7 @@ pub fn run_local_clippy(repo_root: &Path) -> ToolRun {
         .arg("--all-targets")
         .arg("--locked")
         .arg("--offline")
+        .arg("--quiet")
         .arg("--message-format=json")
         .current_dir(repo_root)
         .env("CARGO_NET_OFFLINE", "true")
@@ -307,7 +311,9 @@ pub fn run_local_clippy(repo_root: &Path) -> ToolRun {
     let exit_status = match child.wait() {
         Ok(status) => Some(ExitStatusSummary::from(status)),
         Err(error) => {
-            stdout_error.get_or_insert_with(|| format!("не удалось получить exit status: {error}"));
+            stdout_error.get_or_insert_with(|| {
+                format!("не удалось получить состояние завершения: {error}")
+            });
             None
         }
     };
@@ -325,7 +331,7 @@ pub fn run_local_clippy(repo_root: &Path) -> ToolRun {
             stdout_error.as_deref().unwrap_or_default()
         )),
         ToolRunStatus::Failed if parsed.malformed_lines > 0 => Some(format!(
-            "Вывод Clippy содержит {} непонятных JSON-строк; evidence может быть неполным.",
+            "Вывод Clippy содержит {} непонятных JSON-строк; свидетельства могут быть неполными.",
             parsed.malformed_lines
         )),
         ToolRunStatus::Failed => Some("Clippy завершился с ненулевым кодом выхода.".to_owned()),
@@ -540,8 +546,9 @@ fn failed_run(
 fn read_bounded_stderr_summary(mut reader: impl Read) -> io::Result<Option<String>> {
     let mut bytes = [0_u8; 4_096];
     let mut summary = String::new();
-    let mut char_count = 0_usize;
-    let mut pending_space = false;
+    let mut line = String::new();
+    let mut line_chars = 0_usize;
+    let mut line_truncated = false;
     let mut truncated = false;
 
     loop {
@@ -551,25 +558,22 @@ fn read_bounded_stderr_summary(mut reader: impl Read) -> io::Result<Option<Strin
         }
         let text = String::from_utf8_lossy(&bytes[..count]);
         for character in text.chars() {
-            if character.is_whitespace() || character.is_control() {
-                pending_space = !summary.is_empty();
+            if character == '\n' {
+                append_stable_stderr_line(&mut summary, &line, line_truncated, &mut truncated);
+                line.clear();
+                line_chars = 0;
+                line_truncated = false;
                 continue;
             }
-
-            let additional = if pending_space { 2 } else { 1 };
-            if char_count + additional > STDERR_SUMMARY_MAX_CHARS {
-                truncated = true;
-                continue;
+            if line_chars <= STDERR_SUMMARY_MAX_CHARS {
+                line.push(character);
+                line_chars += 1;
+            } else {
+                line_truncated = true;
             }
-            if pending_space {
-                summary.push(' ');
-                char_count += 1;
-                pending_space = false;
-            }
-            summary.push(character);
-            char_count += 1;
         }
     }
+    append_stable_stderr_line(&mut summary, &line, line_truncated, &mut truncated);
 
     if truncated {
         summary.push('…');
@@ -578,6 +582,50 @@ fn read_bounded_stderr_summary(mut reader: impl Read) -> io::Result<Option<Strin
         Ok(None)
     } else {
         Ok(Some(summary))
+    }
+}
+
+fn append_stable_stderr_line(
+    summary: &mut String,
+    line: &str,
+    line_truncated: bool,
+    truncated: &mut bool,
+) {
+    // Даже при --quiet не сохраняем известные строки прогресса Cargo:
+    // время сборки и ожидания блокировок не являются фактами о Git-снимке.
+    let trimmed = line.trim();
+    if [
+        "Compiling ",
+        "Checking ",
+        "Finished ",
+        "Fresh ",
+        "Blocking ",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return;
+    }
+    *truncated |= line_truncated;
+    let mut chars = summary.chars().count();
+    let mut pending_space = !summary.is_empty();
+    for character in trimmed.chars() {
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !summary.is_empty();
+            continue;
+        }
+        let additional = if pending_space { 2 } else { 1 };
+        if chars + additional > STDERR_SUMMARY_MAX_CHARS {
+            *truncated = true;
+            break;
+        }
+        if pending_space {
+            summary.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        summary.push(character);
+        chars += 1;
     }
 }
 
@@ -718,5 +766,18 @@ mod tests {
         assert!(summary.starts_with("первое второе "));
         assert!(summary.ends_with('…'));
         assert!(!summary.contains('\n'));
+    }
+
+    #[test]
+    fn stderr_progress_is_excluded_but_useful_warnings_and_errors_remain() {
+        let first = "    Checking fixture v0.1.0\nwarning: полезное сообщение\n    Finished `dev` profile in 0.04s\nerror: полезная ошибка\n";
+        let second = "    Blocking waiting for file lock\nwarning: полезное сообщение\n    Finished `dev` profile in 12.90s\nerror: полезная ошибка\n";
+        let first = read_bounded_stderr_summary(Cursor::new(first)).unwrap();
+        let second = read_bounded_stderr_summary(Cursor::new(second)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.as_deref(),
+            Some("warning: полезное сообщение error: полезная ошибка")
+        );
     }
 }

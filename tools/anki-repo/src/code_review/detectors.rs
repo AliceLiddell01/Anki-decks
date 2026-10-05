@@ -1,12 +1,14 @@
-//! Детерминированные эвристики для подготовки evidence к независимому code review.
+//! Детерминированные эвристики для подготовки свидетельств к независимому code review.
 //!
-//! Результат этого модуля — только candidate/evidence. Он не подтверждает
-//! дефект и не создаёт finding: каждый сигнал требует проверки по требованиям,
+//! Результат этого модуля — только кандидаты и свидетельства. Он не подтверждает
+//! дефект и не создаёт замечание: каждый сигнал требует проверки по требованиям,
 //! контрактам и окружающему коду.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+
+use super::scope::LineRange;
 
 const SOURCE: &str = "anki_repo.code_review.detectors.v1";
 
@@ -20,27 +22,32 @@ pub enum FileStatus {
     Renamed,
     Copied,
     TypeChanged,
+    /// Поддерживается интерфейсом детектора для входов из неразрешённого индекса Git.
     Unmerged,
     Unknown,
 }
 
 /// Данные одного изменённого файла для локальных детекторов.
 ///
-/// Тексты — полные base- и post-image, а не hunks diff. Для добавленного или
+/// Тексты — полные версии базового и нового образа, а не фрагменты diff. Для добавленного или
 /// удалённого файла отсутствующее изображение задаётся через `None`. Сам
 /// модуль не читает файловую систему и не разрешает refs Git.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileInput {
-    /// Путь в post-image; для удаления вызывающая сторона может передать старый путь.
+    /// Путь в новой версии; для удаления вызывающая сторона может передать старый путь.
     pub path: String,
     /// Старый путь при rename/copy, если он известен.
     pub previous_path: Option<String>,
     /// Статус файла в диапазоне.
     pub status: FileStatus,
-    /// Полный текст файла на base, если файл там существовал и был текстовым.
+    /// Полный текст файла в базовом коммите, если файл там существовал и был текстовым.
     pub base_text: Option<String>,
-    /// Полный текст файла на head, если файл там существует и является текстовым.
+    /// Полный текст файла в новом коммите, если файл там существует и является текстовым.
     pub post_text: Option<String>,
+    /// Доказанные Git-диапазоны изменённых строк новой версии (верхняя граница исключена).
+    /// `None` означает, что позиционное сравнение не было выполнено.
+    #[serde(default)]
+    pub post_changed_lines: Option<Vec<LineRange>>,
 }
 
 /// Происхождение сигнала относительно проверяемого диапазона.
@@ -49,13 +56,13 @@ pub struct FileInput {
 pub enum CandidateOrigin {
     /// Текст сигнала добавлен или изменён этим диапазоном.
     IntroducedOrChanged,
-    /// Та же строка уже присутствовала в base-image.
+    /// Этот occurrence строки не пересекает доказанные изменённые диапазоны.
     PreExisting,
     /// По доступным изображениям или статусу нельзя доказать происхождение.
     Unknown,
 }
 
-/// Устойчивый тип evidence-кандидата.
+/// Устойчивый тип свидетельства-кандидата.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateType {
@@ -102,7 +109,7 @@ impl CandidateType {
     }
 }
 
-/// Машинно-читаемый candidate/evidence. Это не подтверждённый finding.
+/// Машинно-читаемые кандидат и свидетельство. Это не подтверждённое замечание.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
     /// Детерминированный идентификатор без случайного UUID.
@@ -110,17 +117,17 @@ pub struct Candidate {
     /// В JSON поле называется `type`.
     #[serde(rename = "type")]
     pub candidate_type: CandidateType,
-    /// Путь в post-image (либо старый путь удалённого файла).
+    /// Путь в новой версии (либо старый путь удалённого файла).
     pub path: String,
     /// Номер строки с единицы; для file-level surface отсутствует.
     pub line: Option<usize>,
     /// Короткая исходная строка или diff-свидетельство.
     pub snippet: Option<String>,
-    /// Происхождение сигнала относительно base-image.
+    /// Происхождение сигнала относительно исходного образа.
     pub origin: CandidateOrigin,
     /// Устойчивые машинные коды причин, отсортированные лексикографически.
     pub signals: Vec<String>,
-    /// Источник candidate detector'ов этой версии.
+    /// Источник кандидатов детекторов этой версии.
     pub source: String,
     /// Дополнительные сведения; BTreeMap обеспечивает стабильный порядок ключей.
     pub metadata: BTreeMap<String, String>,
@@ -134,16 +141,16 @@ struct CandidateAnnotations {
 
 /// Собирает кандидаты для списка изменённых файлов.
 ///
-/// Сканирование работает только с переданными base/post-image. Выход отсортирован
-/// по пути, типу, строке и идентификатору. Сигнал, строка которого уже
-/// встречалась в base-image, получает `pre_existing` и не приписывается диапазону.
+/// Сканирование работает только с переданными исходным и новым образами. Выход отсортирован
+/// по пути, типу, строке и идентификатору. `pre_existing` определяется по
+/// неизменённому вхождению строки, а не по совпадению текста где-либо в исходном образе.
 #[must_use]
 pub fn detect(inputs: &[FileInput]) -> Vec<Candidate> {
     let candidates = inputs.iter().flat_map(detect_file).collect::<Vec<_>>();
     sort_candidates(candidates)
 }
 
-/// Собирает ограниченные candidate-сигналы для одного изменённого файла.
+/// Собирает ограниченные сигналы-кандидаты для одного изменённого файла.
 #[must_use]
 pub fn detect_file(input: &FileInput) -> Vec<Candidate> {
     let output_path = display_path(input);
@@ -745,19 +752,14 @@ fn detect_test_delta(input: &FileInput, output_path: &str, candidates: &mut Vec<
     }
     let base_text = input.base_text.as_deref().unwrap_or_default();
     let post_text = input.post_text.as_deref().unwrap_or_default();
-    let base_tests = rust_test_functions(base_text);
-    let post_tests = rust_test_functions(post_text);
-    let is_test_surface = is_test_path(&input.path)
-        || input.previous_path.as_deref().is_some_and(is_test_path)
-        || !base_tests.is_empty()
-        || !post_tests.is_empty()
-        || base_text.contains("#[cfg(test)]")
-        || post_text.contains("#[cfg(test)]");
-    if !is_test_surface {
-        return;
-    }
+    let whole_file_is_test =
+        is_test_path(&input.path) || input.previous_path.as_deref().is_some_and(is_test_path);
+    let base_evidence = rust_test_evidence(base_text, whole_file_is_test);
+    let post_evidence = rust_test_evidence(post_text, whole_file_is_test);
+    let base_tests = &base_evidence.functions;
+    let post_tests = &post_evidence.functions;
 
-    for (name, definition) in &post_tests {
+    for (name, definition) in post_tests {
         if !base_tests.contains_key(name) {
             let mut metadata = BTreeMap::new();
             metadata.insert("test_name".to_owned(), name.clone());
@@ -775,7 +777,7 @@ fn detect_test_delta(input: &FileInput, output_path: &str, candidates: &mut Vec<
             );
         }
     }
-    for (name, definition) in &base_tests {
+    for (name, definition) in base_tests {
         if !post_tests.contains_key(name) {
             let mut metadata = BTreeMap::new();
             metadata.insert("test_name".to_owned(), name.clone());
@@ -794,50 +796,32 @@ fn detect_test_delta(input: &FileInput, output_path: &str, candidates: &mut Vec<
         }
     }
 
-    let base_assertions = assertion_sites(base_text);
-    let post_assertions = assertion_sites(post_text);
-    let decrease = base_assertions.len().saturating_sub(post_assertions.len());
+    let base_count = base_evidence.assertion_count;
+    let post_count = post_evidence.assertion_count;
+    let decrease = base_count.saturating_sub(post_count);
     if decrease > 0 {
-        let mut post_lines = BTreeMap::<(String, String), usize>::new();
-        for assertion in &post_assertions {
-            *post_lines
-                .entry((assertion.kind.clone(), assertion.line_text.clone()))
-                .or_default() += 1;
-        }
-        let mut removed = Vec::new();
-        for assertion in base_assertions {
-            let key = (assertion.kind.clone(), assertion.line_text.clone());
-            if let Some(count) = post_lines.get_mut(&key).filter(|count| **count > 0) {
-                *count -= 1;
-                continue;
-            }
-            removed.push(assertion);
-        }
-        removed.sort_by(|left, right| {
-            left.line_number
-                .cmp(&right.line_number)
-                .then(left.kind.cmp(&right.kind))
-        });
-        for assertion in removed.into_iter().take(decrease) {
-            let mut metadata = BTreeMap::new();
-            metadata.insert("assertion_macro".to_owned(), assertion.kind);
-            metadata.insert(
-                "total_assertion_count_delta".to_owned(),
-                format!("-{decrease}"),
-            );
-            push_candidate(
-                candidates,
-                CandidateType::AssertionRemoved,
-                output_path,
-                Some(assertion.line_number),
-                Some(assertion.line_text),
-                removed_text_origin(input),
-                CandidateAnnotations {
-                    signals: vec!["test_assertion_count_decreased".to_owned()],
-                    metadata,
-                },
-            );
-        }
+        // Изменённое выражение и удалённое выражение могут одновременно не иметь
+        // точного текстового соответствия. Счётчик доказывает только уменьшение
+        // числа assertions в test-контексте, но не конкретную удалённую строку.
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "total_assertion_count_delta".to_owned(),
+            format!("-{decrease}"),
+        );
+        metadata.insert("base_assertion_count".to_owned(), base_count.to_string());
+        metadata.insert("post_assertion_count".to_owned(), post_count.to_string());
+        push_candidate(
+            candidates,
+            CandidateType::AssertionRemoved,
+            output_path,
+            None,
+            None,
+            removed_text_origin(input),
+            CandidateAnnotations {
+                signals: vec!["test_assertion_count_decreased".to_owned()],
+                metadata,
+            },
+        );
     }
 }
 
@@ -847,81 +831,234 @@ struct TestFunction {
     signature: String,
 }
 
-fn rust_test_functions(text: &str) -> BTreeMap<String, TestFunction> {
+#[derive(Default)]
+struct RustTestEvidence {
+    functions: BTreeMap<String, TestFunction>,
+    assertion_count: usize,
+}
+
+/// Ограниченный лексический разбор: комментарии и литералы не являются элементами Rust.
+/// Контекст передаётся внутрь тела тестовой функции либо элемента с `#[cfg(test)]`.
+fn rust_test_evidence(text: &str, whole_file_is_test: bool) -> RustTestEvidence {
+    let tokens = rust_tokens(text);
     let lines = text.lines().collect::<Vec<_>>();
-    let mut tests = BTreeMap::new();
-    for (index, line) in lines.iter().enumerate() {
-        if !is_test_attribute(line) {
+    let mut evidence = RustTestEvidence::default();
+    let mut contexts = vec![whole_file_is_test];
+    let mut pending_test = false;
+    let mut pending_test_function = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].value;
+        if token == "#"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| token.value == "[")
+        {
+            let mut end = index + 2;
+            let mut depth = 1;
+            while end < tokens.len() && depth > 0 {
+                match tokens[end].value {
+                    "[" => depth += 1,
+                    "]" => depth -= 1,
+                    _ => {}
+                }
+                end += 1;
+            }
+            if depth == 0 {
+                let attribute = tokens[index + 2..end - 1]
+                    .iter()
+                    .map(|token| token.value)
+                    .collect::<String>();
+                let test_attribute = is_test_attribute(&format!("#[{attribute}]"));
+                pending_test_function |= test_attribute;
+                pending_test |= test_attribute || attribute == "cfg(test)";
+            }
+            index = end;
             continue;
         }
-        let end = (index + 12).min(lines.len());
-        for (function_index, function_line) in lines.iter().enumerate().take(end).skip(index) {
-            let Some(name) = rust_function_name(function_line) else {
-                if function_index > index && function_line.trim_start().starts_with("#[") {
-                    continue;
+        match token {
+            "fn" if pending_test_function => {
+                if let Some(name) = tokens.get(index + 1).filter(|token| {
+                    token
+                        .value
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+                }) {
+                    let line_index = tokens[index].line_number - 1;
+                    evidence
+                        .functions
+                        .entry(name.value.to_owned())
+                        .or_insert_with(|| TestFunction {
+                            name_line: line_index + 1,
+                            signature: lines.get(line_index).unwrap_or(&"").trim().to_owned(),
+                        });
                 }
-                continue;
-            };
-            tests.entry(name).or_insert_with(|| TestFunction {
-                name_line: function_index + 1,
-                signature: function_line.trim().to_owned(),
-            });
-            break;
+                pending_test_function = false;
+            }
+            "{" => {
+                contexts.push(*contexts.last().unwrap_or(&false) || pending_test);
+                pending_test = false;
+                pending_test_function = false;
+            }
+            "}" => {
+                if contexts.len() > 1 {
+                    contexts.pop();
+                }
+                pending_test = false;
+                pending_test_function = false;
+            }
+            ";" | "=" => {
+                pending_test = false;
+                pending_test_function = false;
+            }
+            _ => {}
         }
+        if *contexts.last().unwrap_or(&false)
+            && matches!(
+                token,
+                "assert"
+                    | "assert_eq"
+                    | "assert_ne"
+                    | "debug_assert"
+                    | "debug_assert_eq"
+                    | "debug_assert_ne"
+            )
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| token.value == "!")
+            && tokens
+                .get(index + 2)
+                .is_some_and(|token| matches!(token.value, "(" | "[" | "{"))
+        {
+            evidence.assertion_count += 1;
+        }
+        index += 1;
     }
-    tests
+    evidence
 }
 
 fn is_test_attribute(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("#[test]")
         || trimmed.starts_with("#[test(")
-        || trimmed.starts_with("#[tokio::test")
-        || trimmed.starts_with("#[async_std::test")
+        || trimmed.starts_with("#[tokio::test]")
+        || trimmed.starts_with("#[tokio::test(")
+        || trimmed.starts_with("#[async_std::test]")
+        || trimmed.starts_with("#[async_std::test(")
         || trimmed.starts_with("#[rstest]")
         || trimmed.starts_with("#[rstest(")
 }
 
-fn rust_function_name(line: &str) -> Option<String> {
-    let start = line.find("fn ")? + 3;
-    let suffix = &line[start..];
-    let name = suffix
-        .chars()
-        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-        .collect::<String>();
-    (!name.is_empty()).then_some(name)
-}
-
-#[derive(Debug)]
-struct AssertionSite {
+struct RustToken<'a> {
+    value: &'a str,
     line_number: usize,
-    line_text: String,
-    kind: String,
 }
 
-fn assertion_sites(text: &str) -> Vec<AssertionSite> {
-    let mut sites = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if !is_rust_code_line(line) {
-            continue;
-        }
-        for kind in [
-            "assert_eq",
-            "assert_ne",
-            "assert",
-            "debug_assert_eq",
-            "debug_assert",
-        ] {
-            for _ in 0..macro_invocation_count(line, kind) {
-                sites.push(AssertionSite {
-                    line_number: index + 1,
-                    line_text: line.trim().to_owned(),
-                    kind: kind.to_owned(),
+fn rust_tokens(text: &str) -> Vec<RustToken<'_>> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    let mut line_number = 1;
+    while index < bytes.len() {
+        let scanned_start = index;
+        if bytes[index..].starts_with(b"//") {
+            index = text[index..].find('\n').map_or(bytes.len(), |n| index + n);
+        } else if bytes[index..].starts_with(b"/*") {
+            let mut depth = 1;
+            index += 2;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+        } else if let Some(end) = rust_literal_end(text, index) {
+            index = end;
+        } else {
+            let start = index;
+            let first = text[index..].chars().next().expect("существующий символ");
+            index += first.len_utf8();
+            if first.is_alphabetic() || first == '_' {
+                while index < bytes.len() {
+                    let next = text[index..].chars().next().expect("существующий символ");
+                    if !next.is_alphanumeric() && next != '_' {
+                        break;
+                    }
+                    index += next.len_utf8();
+                }
+            }
+            if !first.is_whitespace() {
+                tokens.push(RustToken {
+                    value: &text[start..index],
+                    line_number,
                 });
             }
         }
+        line_number += bytes[scanned_start..index]
+            .iter()
+            .filter(|ch| **ch == b'\n')
+            .count();
     }
-    sites
+    tokens
+}
+
+fn rust_literal_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut opener = start;
+    if matches!(bytes[opener], b'b' | b'c') {
+        opener += 1;
+    }
+    if bytes.get(opener) == Some(&b'r') {
+        let hashes = opener + 1;
+        opener = hashes;
+        while bytes.get(opener) == Some(&b'#') {
+            opener += 1;
+        }
+        if bytes.get(opener) == Some(&b'"') {
+            let closer = format!("\"{}", "#".repeat(opener - hashes));
+            return Some(
+                text[opener + 1..]
+                    .find(&closer)
+                    .map_or(bytes.len(), |n| opener + 1 + n + closer.len()),
+            );
+        }
+        return None;
+    }
+    let quote = *bytes.get(opener)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    if quote == b'\'' {
+        // Lifetime (`'a`) не является literal. Char literal содержит один символ
+        // либо escape и завершающую одинарную кавычку.
+        let mut end = opener + 1;
+        if bytes.get(end) == Some(&b'\\') {
+            end += 2;
+            if bytes.get(end - 1) == Some(&b'u') && bytes.get(end) == Some(&b'{') {
+                end = text[end..].find('}').map_or(bytes.len(), |n| end + n + 1);
+            }
+        } else {
+            end += text.get(end..)?.chars().next()?.len_utf8();
+        }
+        return (bytes.get(end) == Some(&b'\'')).then_some(end + 1);
+    }
+    let mut end = opener + 1;
+    while end < bytes.len() {
+        if bytes[end] == b'\\' {
+            end = (end + 2).min(bytes.len());
+        } else if bytes[end] == quote {
+            return Some(end + 1);
+        } else {
+            end += 1;
+        }
+    }
+    Some(bytes.len())
 }
 
 fn has_macro_invocation(line: &str, name: &str) -> bool {
@@ -1570,22 +1707,29 @@ fn removed_text_origin(input: &FileInput) -> CandidateOrigin {
     }
 }
 
-fn origin_for_line(input: &FileInput, line: &str) -> CandidateOrigin {
-    let Some(base_text) = input.base_text.as_deref() else {
-        return match input.status {
-            FileStatus::Added => CandidateOrigin::IntroducedOrChanged,
-            _ => CandidateOrigin::Unknown,
-        };
+fn origin_for_line(input: &FileInput, line_number: usize) -> CandidateOrigin {
+    if matches!(input.status, FileStatus::Unknown | FileStatus::Unmerged) {
+        return CandidateOrigin::Unknown;
+    }
+    if input.status == FileStatus::Added {
+        return CandidateOrigin::IntroducedOrChanged;
+    }
+    if input.base_text.is_none() || input.post_text.is_none() {
+        return CandidateOrigin::Unknown;
+    }
+    if input.base_text == input.post_text {
+        return CandidateOrigin::PreExisting;
+    }
+    let Some(ranges) = &input.post_changed_lines else {
+        return CandidateOrigin::Unknown;
     };
-    if base_text
-        .lines()
-        .any(|base_line| base_line.trim() == line.trim())
+    if ranges
+        .iter()
+        .any(|range| range.start <= line_number as u64 && (line_number as u64) < range.end)
     {
-        CandidateOrigin::PreExisting
-    } else if input.status == FileStatus::Unknown || input.status == FileStatus::Unmerged {
-        CandidateOrigin::Unknown
-    } else {
         CandidateOrigin::IntroducedOrChanged
+    } else {
+        CandidateOrigin::PreExisting
     }
 }
 
@@ -1604,7 +1748,7 @@ fn add_line_candidate(
         path,
         Some(line_number),
         Some(line.trim().to_owned()),
-        origin_for_line(input, line),
+        origin_for_line(input, line_number),
         annotations,
     );
 }
@@ -1711,7 +1855,29 @@ mod tests {
             status: FileStatus::Modified,
             base_text: Some(base.to_owned()),
             post_text: Some(post.to_owned()),
+            post_changed_lines: Some(fixture_changed_lines(base, post)),
         }
+    }
+
+    // Для этих fixtures общий prefix/suffix однозначен; сложные occurrence
+    // регрессии ниже передают точные диапазоны отдельно.
+    fn fixture_changed_lines(base: &str, post: &str) -> Vec<LineRange> {
+        let base = base.lines().collect::<Vec<_>>();
+        let post = post.lines().collect::<Vec<_>>();
+        let prefix = base.iter().zip(&post).take_while(|(a, b)| a == b).count();
+        let suffix = base[prefix..]
+            .iter()
+            .rev()
+            .zip(post[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if prefix + suffix == post.len() {
+            return Vec::new();
+        }
+        vec![LineRange {
+            start: prefix as u64 + 1,
+            end: (post.len() - suffix) as u64 + 1,
+        }]
     }
 
     fn detect_one(input: FileInput) -> Vec<Candidate> {
@@ -1974,6 +2140,143 @@ mod tests {
         let candidates = detect(std::slice::from_ref(&data));
         let error_path = of_type(&candidates, CandidateType::ErrorPath)[0];
         assert_eq!(error_path.origin, CandidateOrigin::Unknown);
+    }
+
+    #[test]
+    fn duplicate_and_moved_lines_use_changed_occurrence_ranges() {
+        let line = "#[allow(dead_code)]";
+        let duplicated = detect_one(input("src/lib.rs", line, &format!("{line}\n{line}")));
+        let suppressions = of_type(&duplicated, CandidateType::RustSuppression);
+        assert_eq!(suppressions.len(), 2);
+        assert_eq!(suppressions[0].origin, CandidateOrigin::PreExisting);
+        assert_eq!(suppressions[1].origin, CandidateOrigin::IntroducedOrChanged);
+
+        let mut moved = input(
+            "src/lib.rs",
+            &format!("{line}\nfn original() {{}}"),
+            &format!("fn original() {{}}\n{line}"),
+        );
+        // Git доказывает удаление первого occurrence и вставку второго.
+        moved.post_changed_lines = Some(vec![LineRange { start: 2, end: 3 }]);
+        let candidates = detect_one(moved);
+        assert_eq!(
+            of_type(&candidates, CandidateType::RustSuppression)[0].origin,
+            CandidateOrigin::IntroducedOrChanged
+        );
+    }
+
+    #[test]
+    fn missing_positional_evidence_does_not_infer_origin_from_matching_text() {
+        let mut data = input(
+            "src/lib.rs",
+            "#[allow(dead_code)]",
+            "#[allow(dead_code)]\n#[allow(dead_code)]",
+        );
+        data.post_changed_lines = None;
+        assert!(
+            of_type(&detect_one(data), CandidateType::RustSuppression)
+                .iter()
+                .all(|candidate| candidate.origin == CandidateOrigin::Unknown)
+        );
+    }
+
+    #[test]
+    fn comments_and_literals_cannot_declare_test_functions() {
+        let old = r###"#[test]
+/// Checks fn old_doc_name parsing.
+/* fn block_comment() {} */
+fn actual_test() {
+    let ordinary = "#[test] fn string_test() {}";
+    let raw = r##"#[test] fn raw_test() {}"##;
+    let byte_string = b"#[test] fn byte_test() {}";
+}
+"###;
+        let post = old.replace("old_doc_name", "new_doc_name");
+        let candidates = detect_one(input("src/lib.rs", old, &post));
+        assert!(of_type(&candidates, CandidateType::TestAdded).is_empty());
+        assert!(of_type(&candidates, CandidateType::TestRemoved).is_empty());
+        assert_eq!(
+            rust_test_evidence(old, false)
+                .functions
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["actual_test"]
+        );
+        let prefix = "/* #[test] fn commented_test() {} */\n// #[test]\n";
+        assert!(rust_test_evidence(prefix, false).functions.is_empty());
+    }
+
+    #[test]
+    fn test_attribute_does_not_bind_to_next_unrelated_item() {
+        let source = "#[test]\nconst EXAMPLE: &str = \"fn fake_test() {}\";\nfn production() {}";
+        assert!(rust_test_evidence(source, false).functions.is_empty());
+        let source = "#[tokio::test(flavor = \"current_thread\")]\n#[ignore]\npub(crate) async fn actual_test() {}";
+        assert!(
+            rust_test_evidence(source, false)
+                .functions
+                .contains_key("actual_test")
+        );
+    }
+
+    #[test]
+    fn mixed_assertion_edit_and_removal_only_proves_a_count_delta() {
+        let candidates = detect_one(input(
+            "tests/flow.rs",
+            "#[test]\nfn value() {\nassert_eq!(actual, 1);\nassert!(other);\n}",
+            "#[test]\nfn value() {\nassert_eq!(actual, 2);\n}",
+        ));
+        let removed = of_type(&candidates, CandidateType::AssertionRemoved);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].line, None);
+        assert_eq!(removed[0].snippet, None);
+        assert_eq!(removed[0].metadata["total_assertion_count_delta"], "-1");
+        assert_eq!(removed[0].metadata["base_assertion_count"], "2");
+        assert_eq!(removed[0].metadata["post_assertion_count"], "1");
+    }
+
+    #[test]
+    fn production_assertions_are_not_test_evidence_in_a_mixed_file() {
+        let test_module = "#[cfg(test)]\nmod tests {\n#[test] fn value() { assert_eq!(1, 1); }\n}";
+        let base = format!("fn production() {{ assert!(valid); }}\n{test_module}");
+        let post = format!("fn production() {{}}\n{test_module}");
+        let candidates = detect_one(input("src/lib.rs", &base, &post));
+        assert!(of_type(&candidates, CandidateType::AssertionRemoved).is_empty());
+        let base = "#[test] fn value() { assert!(valid); }\nfn production() { assert!(valid); }";
+        let post = "#[test] fn value() { assert!(valid); }\nfn production() {}";
+        assert!(
+            of_type(
+                &detect_one(input("src/lib.rs", base, post)),
+                CandidateType::AssertionRemoved
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_module_helpers_and_test_functions_count_real_macros_only() {
+        let base = r###"fn production() { assert!(valid); }
+#[cfg(test)] mod checks {
+    fn helper() { assert!(valid); }
+    #[test] fn test_value() {
+        assert_eq!(1, 1);
+        let text = "assert!(fake)";
+        let raw = r##"assert!(fake)"##;
+        /* assert!(fake); */
+    }
+}
+"###;
+        let post = base.replace("assert!(valid); }\n    #[test]", "}\n    #[test]");
+        let candidates = detect_one(input("src/lib.rs", base, &post));
+        let removed = of_type(&candidates, CandidateType::AssertionRemoved);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].metadata["base_assertion_count"], "2");
+        assert_eq!(removed[0].metadata["post_assertion_count"], "1");
+    }
+
+    #[test]
+    fn configuration_paths_have_positive_surface_evidence() {
+        let candidates = detect_one(input("settings.toml", "enabled = false", "enabled = true"));
+        assert_eq!(of_type(&candidates, CandidateType::ConfigSurface).len(), 1);
     }
 
     #[test]

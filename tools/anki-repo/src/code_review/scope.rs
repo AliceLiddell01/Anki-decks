@@ -1,4 +1,4 @@
-//! Неизменяемый Git-снимок диапазона для механического evidence.
+//! Неизменяемый снимок Git-диапазона для сбора свидетельств.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,6 +17,8 @@ pub enum ScopeError {
     Io(#[from] std::io::Error),
     #[error("Git не смог выполнить {operation}: {detail}")]
     Git { operation: String, detail: String },
+    #[error("у Git-коммитов «{base_sha}» и «{head_sha}» нет общего предка")]
+    NoMergeBase { base_sha: String, head_sha: String },
     #[error("Недоступный Git ref «{reference}»: {detail}")]
     InvalidRef { reference: String, detail: String },
     #[error("Невозможно разобрать машинный ответ Git: {0}")]
@@ -25,7 +27,7 @@ pub enum ScopeError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitTarget {
-    /// Локальная идентичность репозитория без раскрытия путей и remote URL.
+    /// Переносимый идентификатор совместимости, привязанный к точному базовому коммиту.
     pub repository_id: String,
     pub base_sha: String,
     pub head_sha: String,
@@ -39,6 +41,7 @@ pub enum FileStatus {
     Modified,
     Deleted,
     Renamed,
+    /// Сохранён в схеме review-pack; текущий сборщик не включает поиск копий.
     Copied,
     TypeChanged,
 }
@@ -86,7 +89,7 @@ pub struct FileImage {
     pub size: u64,
     pub object_id: Option<String>,
     pub mode: Option<String>,
-    /// Полный текст доступен внутренним detectors, но не раздувает JSON pack.
+    /// Полный текст доступен внутренним детекторам, но не раздувает JSON-пакет.
     #[serde(skip)]
     pub text: Option<String>,
 }
@@ -123,7 +126,7 @@ pub struct ScopedFile {
     pub binary: bool,
     pub base_changed_lines: Vec<LineRange>,
     pub post_changed_lines: Vec<LineRange>,
-    /// Для rename образ берётся по previous_path из merge base.
+    /// При переименовании образ берётся по старому пути из общего предка.
     pub base: FileImage,
     pub post: FileImage,
 }
@@ -135,7 +138,7 @@ pub struct CollectedScope {
     pub files: Vec<ScopedFile>,
 }
 
-/// Собирает `base...head` только из Git objects; индекс и рабочие файлы не читает.
+/// Собирает `base...head` только из объектов Git; индекс и рабочие файлы не читает.
 pub fn collect_scope(
     repo_root: &Path,
     base_ref: &str,
@@ -143,16 +146,32 @@ pub fn collect_scope(
 ) -> Result<CollectedScope, ScopeError> {
     let base_sha = resolve_ref(repo_root, base_ref)?;
     let head_sha = resolve_ref(repo_root, head_ref)?;
-    let merge_base_sha = output_text(git(repo_root, &["merge-base", &base_sha, &head_sha])?)?;
-    let common_dir = output_text(git(
-        repo_root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?)?;
-    let common_dir = Path::new(&common_dir).canonicalize()?;
-    // Идентичность одна для всех worktree данного репозитория.
+    let merge_base = git_command(repo_root, &["merge-base", &base_sha, &head_sha]).output()?;
+    if !merge_base.status.success() {
+        let detail = String::from_utf8_lossy(&merge_base.stderr)
+            .trim()
+            .to_owned();
+        if merge_base.status.code() == Some(1) && merge_base.stdout.is_empty() && detail.is_empty()
+        {
+            return Err(ScopeError::NoMergeBase { base_sha, head_sha });
+        }
+        return Err(ScopeError::Git {
+            operation: "merge-base".to_owned(),
+            detail,
+        });
+    }
+    let merge_base_sha = output_text(merge_base)?;
+    if merge_base_sha.is_empty() {
+        return Err(ScopeError::InvalidOutput(
+            "Git не вернул SHA общего предка".to_owned(),
+        ));
+    }
+    // Совместимость определяется объектами Git, а не местом клона или remote URL.
+    // Точный базовый коммит общий для collect/verify/delta; head может меняться.
+    // Это якорь диапазона, а не удостоверение происхождения репозитория.
     let repository_id = format!(
         "{:x}",
-        Sha256::digest(common_dir.as_os_str().as_encoded_bytes())
+        Sha256::digest(format!("anki-repo:git-base:v1:{base_sha}"))
     );
     let target = GitTarget {
         repository_id,
@@ -240,6 +259,22 @@ fn changed_lines(
     base: &FileImage,
     post: &FileImage,
 ) -> Result<(Vec<LineRange>, Vec<LineRange>), ScopeError> {
+    // Pathspec каталога захватывает дочерние файлы. Для отсутствующего образа
+    // диапазон строится из единственного существующего файла, без рекурсии Git.
+    if base.state == ImageState::Missing || post.state == ImageState::Missing {
+        let full_range = |image: &FileImage| {
+            let count = image.text.as_deref().map_or(0, |text| text.lines().count());
+            if count == 0 {
+                Vec::new()
+            } else {
+                vec![LineRange {
+                    start: 1,
+                    end: count as u64 + 1,
+                }]
+            }
+        };
+        return Ok((full_range(base), full_range(post)));
+    }
     let mut args = vec![
         "diff",
         "--no-ext-diff",
@@ -448,9 +483,14 @@ fn image(repo_root: &Path, sha: &str, path: &str) -> Result<FileImage, ScopeErro
     let mut parts = metadata.split(' ');
     let mode = parts.next().unwrap_or_default().to_owned();
     let object_type = parts.next().unwrap_or_default();
-    let object_id = parts
-        .next()
-        .ok_or_else(|| ScopeError::InvalidOutput("нет object id ls-tree".to_owned()))?;
+    let object_id = parts.next().ok_or_else(|| {
+        ScopeError::InvalidOutput("нет идентификатора объекта ls-tree".to_owned())
+    })?;
+    // При замене файла каталогом и обратно путь существует как tree, но образа файла
+    // на этой стороне диапазона нет. Для дочерних файлов есть отдельные записи области изменений.
+    if object_type == "tree" {
+        return Ok(FileImage::missing());
+    }
     let mut image = FileImage {
         state: ImageState::Gitlink,
         size: 0,
@@ -677,6 +717,102 @@ mod tests {
             .expect_err("несуществующий ref отклоняется");
         assert!(matches!(error, ScopeError::InvalidRef { .. }));
         assert!(error.to_string().contains("Недоступный Git ref"));
+    }
+
+    #[test]
+    fn unrelated_git_histories_report_missing_merge_base() {
+        let repo = Repo::new();
+        let base = repo.commit();
+        repo.run(&["checkout", "--orphan", "unrelated"]);
+        repo.run(&["rm", "-rf", "."]);
+        repo.write("separate.rs", b"fn unrelated() {}\n");
+        let head = repo.commit();
+        let error = collect_scope(repo.dir.path(), &base, &head).unwrap_err();
+        assert!(matches!(error, ScopeError::NoMergeBase { .. }));
+        assert!(error.to_string().contains("нет общего предка"));
+    }
+
+    #[test]
+    fn snapshot_identity_and_scope_are_portable_between_clones() {
+        let repo = Repo::new();
+        repo.write("src/lib.rs", b"fn before() {}\n");
+        let base = repo.commit();
+        repo.write("src/lib.rs", b"fn after() {}\n");
+        let head = repo.commit();
+        let expected = repo.scope(&base, &head);
+        let clone = TempDir::new("code-review-clone");
+        let clone_root = clone.path().join("repo");
+        let output = Command::new("git")
+            .args(["clone", "--no-hardlinks", "--quiet"])
+            .arg(repo.dir.path())
+            .arg(&clone_root)
+            .output()
+            .expect("Git clone запускается");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual = collect_scope(&clone_root, &base, &head).expect("клон совместим");
+        assert_ne!(repo.dir.path(), clone_root);
+        assert_eq!(expected, actual);
+        assert_eq!(
+            serde_json::to_vec(&expected).unwrap(),
+            serde_json::to_vec(&actual).unwrap()
+        );
+        repo.write("src/lib.rs", b"fn later() {}\n");
+        let later = repo.commit();
+        assert_eq!(
+            expected.target.repository_id,
+            repo.scope(&base, &later).target.repository_id
+        );
+        assert_ne!(
+            expected.target.repository_id,
+            repo.scope(&head, &later).target.repository_id
+        );
+    }
+
+    #[test]
+    fn file_directory_transitions_keep_each_file_image_and_range_separate() {
+        let repo = Repo::new();
+        repo.write("foo", b"old file\nsecond line\n");
+        let base = repo.commit();
+        fs::remove_file(repo.dir.path().join("foo")).unwrap();
+        repo.write("foo/child.rs", b"fn child() {}\n");
+        let head = repo.commit();
+        let forward = repo.scope(&base, &head);
+        assert_eq!(forward.files.len(), 2);
+        assert_eq!(forward.files[0].path, "foo");
+        assert_eq!(forward.files[0].status, FileStatus::Deleted);
+        assert_eq!(forward.files[0].post.state, ImageState::Missing);
+        assert_eq!(
+            forward.files[0].base_changed_lines,
+            vec![LineRange { start: 1, end: 3 }]
+        );
+        assert!(forward.files[0].post_changed_lines.is_empty());
+        assert_eq!(forward.files[1].path, "foo/child.rs");
+        assert_eq!(forward.files[1].base.state, ImageState::Missing);
+        assert_eq!(
+            forward.files[1].post_changed_lines,
+            vec![LineRange { start: 1, end: 2 }]
+        );
+        fs::remove_dir_all(repo.dir.path().join("foo")).unwrap();
+        repo.write("foo", b"replacement file\n");
+        let later = repo.commit();
+        let reverse = repo.scope(&head, &later);
+        assert_eq!(reverse.files.len(), 2);
+        assert_eq!(reverse.files[0].path, "foo");
+        assert_eq!(reverse.files[0].status, FileStatus::Added);
+        assert_eq!(reverse.files[0].base.state, ImageState::Missing);
+        assert!(reverse.files[0].base_changed_lines.is_empty());
+        assert_eq!(
+            reverse.files[0].post_changed_lines,
+            vec![LineRange { start: 1, end: 2 }]
+        );
+        assert_eq!(reverse.files[1].path, "foo/child.rs");
+        assert_eq!(reverse.files[1].status, FileStatus::Deleted);
+        assert_eq!(reverse.files[1].post.state, ImageState::Missing);
+        assert!(reverse.files[1].post_changed_lines.is_empty());
     }
 
     #[test]

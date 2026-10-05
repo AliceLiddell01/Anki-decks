@@ -1,4 +1,4 @@
-//! Версионируемый публичный формат evidence-pack для независимого code review.
+//! Версионируемый публичный формат пакета свидетельств для независимого code review.
 
 use std::collections::BTreeMap;
 
@@ -12,20 +12,20 @@ use super::scope::{FileCategory, FileStatus, FileSurface, GitTarget, ImageState,
 /// Текущая версия JSON-контракта review-pack и delta.
 pub const REVIEW_SCHEMA_VERSION: u32 = 1;
 
-/// Неизменяемая цель собранного review evidence.
+/// Неизменяемая цель собранного пакета свидетельств ревью.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewPack {
     /// Версия внешнего JSON-контракта.
     pub schema_version: u32,
-    /// Разрешённые Git refs и object ids.
+    /// Разрешённые ссылки Git и идентификаторы объектов.
     pub target: GitTarget,
-    /// Фактический scope и машинные диапазоны изменённых строк.
+    /// Фактическая область изменений и машинные диапазоны изменённых строк.
     pub scope: ReviewScope,
-    /// Машинные диагностики Cargo/rustc/Clippy; сами по себе они не findings.
+    /// Машинные диагностики Cargo/rustc/Clippy; сами по себе они не подтверждённые замечания.
     pub diagnostics: Vec<CodeReviewDiagnostic>,
-    /// Эвристические кандидаты; ни один не является подтверждённым finding.
+    /// Эвристические кандидаты; ни один не является подтверждённым замечанием.
     pub candidates: Vec<CandidateEvidence>,
-    /// Format-aware кандидаты остаточного иностранного человеческого текста.
+    /// Кандидаты на остаточный иноязычный человеческий текст, найденные с учётом формата.
     pub language: LanguageScan,
     /// Ссылки на кандидаты соответствующих направлений.
     pub dependencies: Vec<String>,
@@ -39,21 +39,21 @@ pub struct ReviewPack {
     pub tool_runs: Vec<ToolRunEvidence>,
 }
 
-/// Машинное описание изменённых файлов без полного содержимого.
+/// Машинное описание изменённых файлов без полного текста.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewScope {
-    /// Общий предок resolved base/head.
+    /// Общий предок разрешённых ссылок base/head.
     pub merge_base_sha: String,
-    /// Предел текстового образа, используемый collector.
+    /// Предел размера текста, используемый сборщиком.
     pub text_image_limit_bytes: u64,
     /// Сортированный список путей из base...head.
     pub files: Vec<ReviewFile>,
 }
 
-/// Краткая информация о post-image и base-image одного пути.
+/// Краткая информация об исходной и новой версиях одного пути.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewFile {
-    /// Путь в head snapshot.
+    /// Путь в снимке HEAD.
     pub path: String,
     /// Старый путь при rename/copy.
     pub previous_path: Option<String>,
@@ -67,52 +67,52 @@ pub struct ReviewFile {
     pub category: FileCategory,
     /// Релевантные поверхности для маршрутизации ревью.
     pub surfaces: Vec<FileSurface>,
-    /// Является ли хотя бы один image бинарным.
+    /// Есть ли среди версий файла хотя бы один бинарный образ.
     pub binary: bool,
-    /// Состояние файла в base snapshot.
+    /// Состояние файла в снимке базового коммита.
     pub base_state: ImageState,
-    /// Размер base-image в байтах.
+    /// Размер исходного образа в байтах.
     pub base_size: u64,
-    /// Git object id base-image, если есть.
+    /// Идентификатор Git-объекта исходного образа, если он есть.
     pub base_object_id: Option<String>,
-    /// Изменённые в диапазоне строки base-image (начало включительно, конец нет).
+    /// Строки исходного образа, изменённые в диапазоне (начало включено, конец нет).
     pub base_changed_lines: Vec<LineRange>,
-    /// Состояние файла в head snapshot.
+    /// Состояние файла в снимке HEAD.
     pub post_state: ImageState,
-    /// Размер post-image в байтах.
+    /// Размер нового образа в байтах.
     pub post_size: u64,
-    /// Git object id post-image, если есть.
+    /// Идентификатор Git-объекта нового образа, если он есть.
     pub post_object_id: Option<String>,
-    /// Изменённые в диапазоне строки post-image (начало включительно, конец нет).
+    /// Строки нового образа, изменённые в диапазоне (начало включено, конец нет).
     pub post_changed_lines: Vec<LineRange>,
 }
 
-/// Candidate/evidence одной детерминированной эвристики.
+/// Свидетельство о кандидате одной детерминированной эвристики.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateEvidence {
-    /// Стабильный id detector-а.
+    /// Стабильный идентификатор детектора.
     pub id: String,
     /// Стабильный тип эвристики.
     pub detector: String,
     /// Путь в снимке; для удалённого места это base-путь.
     pub path: String,
-    /// Строка, если detector может её локализовать.
+    /// Строка, если детектор может её локализовать.
     pub line: Option<usize>,
-    /// Колонка, если detector может её локализовать.
+    /// Колонка, если детектор может её локализовать.
     pub column: Option<usize>,
     /// Короткий фрагмент, достаточный для перехода к исходнику.
     pub snippet: Option<String>,
     /// Происхождение сигнала относительно рассматриваемого диапазона.
     pub origin: CandidateOrigin,
-    /// Короткие машинные причины, сформировавшие candidate.
+    /// Краткие машинные причины, по которым сформирован кандидат.
     pub signals: Vec<String>,
-    /// Источник: имя detector-а или policy subsystem.
+    /// Источник: имя детектора или подсистемы правил.
     pub source: String,
     /// Типизированные дополнительные сведения, стабильные для schema version.
     pub metadata: BTreeMap<String, Value>,
 }
 
-/// Происхождение candidate в изменённом файле.
+/// Происхождение кандидата в изменённом файле.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateOrigin {
@@ -120,24 +120,24 @@ pub enum CandidateOrigin {
     IntroducedOrChanged,
     /// Сигнал уже присутствовал в затронутом файле до рассматриваемого диапазона.
     PreExisting,
-    /// Detector не смог доказать происхождение.
+    /// Детектор не смог установить происхождение.
     Unknown,
 }
 
-/// Итог анализатора без дублирования его diagnostics, которые лежат рядом в pack.
+/// Итог анализатора без дублирования диагностик, которые хранятся рядом в review-pack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRunEvidence {
-    /// Имя analyzer-а.
+    /// Имя анализатора.
     pub tool: String,
     /// success, diagnostics, skipped, unavailable или failed.
     pub status: String,
-    /// Process exit status, если процесс запускался.
+    /// Состояние завершения процесса, если его запускали.
     pub exit_status: Option<ExitStatusSummary>,
-    /// Количество структурированных diagnostics в общем разделе pack.
+    /// Количество структурированных диагностик в общем разделе review-pack.
     pub diagnostic_count: usize,
     /// Число непонятных JSON-строк.
     pub malformed_lines: usize,
-    /// Число валидных, но не относящихся к diagnostics Cargo records.
+    /// Число корректных записей Cargo, не относящихся к диагностикам.
     pub ignored_records: usize,
     /// Ограниченная сводка stderr, если она есть.
     pub stderr_summary: Option<String>,
@@ -145,27 +145,27 @@ pub struct ToolRunEvidence {
     pub message: Option<String>,
 }
 
-/// Scope и detector-level status для сравнения двух evidence snapshots.
+/// Область изменений и состояния детекторов для сравнения двух пакетов свидетельств.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewDelta {
     /// Версия JSON-контракта.
     pub schema_version: u32,
-    /// Идентичность baseline pack.
+    /// Идентичность исходного пакета.
     pub before: SnapshotIdentity,
     /// Идентичность нового pack.
     pub after: SnapshotIdentity,
-    /// Статусы сигналов; здесь не утверждается, что semantic finding исправлен.
+    /// Статусы сигналов; сами по себе они не подтверждают, что замечание исправлено.
     pub candidates: Vec<CandidateChange>,
-    /// Статусы structured diagnostics по всему tool run.
+    /// Статусы структурированных диагностик по всему запуску инструмента.
     pub diagnostics: Vec<DiagnosticChange>,
     /// Изменение доступности/результата внешних анализаторов.
     pub tool_runs: Vec<ToolRunChange>,
 }
 
-/// Минимальная identity snapshot, нужная для проверки совместимости baseline.
+/// Минимальная идентичность снимка, необходимая для проверки совместимости с исходным пакетом.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotIdentity {
-    /// Локальная identity общего Git object store без пути и remote URL.
+    /// Переносимый идентификатор совместимости точной базовой Git-ревизии.
     pub repository_id: String,
     /// Полный base commit.
     pub base_sha: String,
@@ -173,18 +173,18 @@ pub struct SnapshotIdentity {
     pub head_sha: String,
 }
 
-/// Detector-level status одного candidate.
+/// Статус одного кандидата на уровне детектора.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateChange {
-    /// Статус candidate в новом снимке.
+    /// Статус кандидата в новом снимке.
     pub status: CandidateStatus,
-    /// Candidate в baseline, если есть.
+    /// Кандидат в исходном пакете, если есть.
     pub before: Option<CandidateEvidence>,
-    /// Candidate в новом snapshot, если есть.
+    /// Кандидат в новом снимке, если есть.
     pub after: Option<CandidateEvidence>,
 }
 
-/// Состояние эвристического сигнала между snapshots.
+/// Состояние эвристического сигнала между снимками.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateStatus {
@@ -194,7 +194,7 @@ pub enum CandidateStatus {
     New,
 }
 
-/// Изменение структурированной диагностики между snapshots.
+/// Изменение структурированной диагностики между снимками.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticChange {
     /// Статус диагностики в новом снимке.
@@ -205,16 +205,16 @@ pub struct DiagnosticChange {
     pub after: Option<CodeReviewDiagnostic>,
 }
 
-/// Изменение состояния отдельного analyzer-а.
+/// Изменение состояния отдельного анализатора.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRunChange {
     /// Стабильное имя внешнего инструмента.
     pub tool: String,
-    /// Состояние инструмента в baseline.
+    /// Состояние инструмента в исходном пакете.
     pub before_status: String,
     /// Состояние инструмента в новом прогоне.
     pub after_status: String,
-    /// Отличается ли исход диагностики без сравнения с semantic finding.
+    /// Отличается ли исход диагностики без оценки самого замечания.
     pub status_changed: bool,
     /// Число диагностик до и после.
     pub before_diagnostics: usize,
@@ -225,7 +225,7 @@ pub struct ToolRunChange {
 }
 
 impl ReviewPack {
-    /// Возвращает все candidates в одном детерминированном списке.
+    /// Возвращает всех кандидатов одним детерминированным списком.
     #[must_use]
     pub fn all_candidates(&self) -> Vec<CandidateEvidence> {
         let mut candidates = self.candidates.clone();
@@ -247,13 +247,32 @@ impl ReviewPack {
                 .iter()
                 .find(|file| file.path == candidate.path)
                 .map_or(CandidateOrigin::Unknown, |file| {
-                    if file.post_changed_lines.iter().any(|range| {
-                        u64::try_from(candidate.line)
-                            .is_ok_and(|line| range.start <= line && line < range.end)
-                    }) {
+                    let Ok(start) = u64::try_from(candidate.line) else {
+                        return CandidateOrigin::Unknown;
+                    };
+                    let Ok(newlines) =
+                        u64::try_from(candidate.text.bytes().filter(|byte| *byte == b'\n').count())
+                    else {
+                        return CandidateOrigin::Unknown;
+                    };
+                    let Some(end) = start
+                        .checked_add(newlines)
+                        .and_then(|line| line.checked_add(1))
+                    else {
+                        return CandidateOrigin::Unknown;
+                    };
+                    // Байтовый span может занимать несколько строк: изменение
+                    // внутри комментария/литерала относится к тому же вхождению.
+                    if file
+                        .post_changed_lines
+                        .iter()
+                        .any(|range| range.start < end && start < range.end)
+                    {
                         CandidateOrigin::IntroducedOrChanged
-                    } else {
+                    } else if file.base_state == ImageState::Text {
                         CandidateOrigin::PreExisting
+                    } else {
+                        CandidateOrigin::Unknown
                     }
                 });
             CandidateEvidence {
@@ -273,5 +292,116 @@ impl ReviewPack {
             (&a.path, &a.detector, a.line, &a.id).cmp(&(&b.path, &b.detector, b.line, &b.id))
         });
         candidates
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::code_review::language::{self, SourceFile};
+    use crate::code_review::scope::FileStatus;
+
+    fn language_pack(text: &str, changed: Vec<LineRange>) -> ReviewPack {
+        let language = language::scan(&[SourceFile {
+            path: "src/lib.rs".into(),
+            content: text.into(),
+        }]);
+        assert!(
+            !language.candidates.is_empty(),
+            "fixture содержит человеческий текст"
+        );
+        ReviewPack {
+            schema_version: REVIEW_SCHEMA_VERSION,
+            target: GitTarget {
+                repository_id: "fixture-repo".into(),
+                base_sha: "base".into(),
+                head_sha: "head".into(),
+                merge_base_sha: "base".into(),
+            },
+            scope: ReviewScope {
+                merge_base_sha: "base".into(),
+                text_image_limit_bytes: 1024,
+                files: vec![ReviewFile {
+                    path: "src/lib.rs".into(),
+                    previous_path: None,
+                    status: FileStatus::Modified,
+                    additions: None,
+                    deletions: None,
+                    category: FileCategory::Rust,
+                    surfaces: Vec::new(),
+                    binary: false,
+                    base_state: ImageState::Text,
+                    base_size: 0,
+                    base_object_id: None,
+                    base_changed_lines: Vec::new(),
+                    post_state: ImageState::Text,
+                    post_size: text.len() as u64,
+                    post_object_id: None,
+                    post_changed_lines: changed,
+                }],
+            },
+            diagnostics: Vec::new(),
+            candidates: Vec::new(),
+            language,
+            dependencies: Vec::new(),
+            tests: Vec::new(),
+            suppressions: Vec::new(),
+            risk_surfaces: Vec::new(),
+            tool_runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn language_origin_covers_middle_and_last_lines_of_multiline_spans() {
+        for text in [
+            "/* Existing English opening\nChanged English middle\nExisting English closing */\n",
+            "const MESSAGE: &str = r#\"Existing English opening\nChanged English middle\nExisting English closing\"#;\n",
+        ] {
+            for changed_line in [2, 3] {
+                let pack = language_pack(
+                    text,
+                    vec![LineRange {
+                        start: changed_line,
+                        end: changed_line + 1,
+                    }],
+                );
+                assert_eq!(pack.language.candidates.len(), 1);
+                assert_eq!(pack.language.candidates[0].line, 1);
+                let candidates = pack.all_candidates();
+                assert_eq!(candidates[0].origin, CandidateOrigin::IntroducedOrChanged);
+            }
+        }
+    }
+
+    #[test]
+    fn language_origin_uses_each_occurrence_and_preserves_unchanged_text() {
+        let pack = language_pack(
+            "// Existing English explanation\n// Existing English explanation\n",
+            vec![LineRange { start: 2, end: 3 }],
+        );
+        let candidates = pack.all_candidates();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].origin, CandidateOrigin::PreExisting);
+        assert_eq!(candidates[1].origin, CandidateOrigin::IntroducedOrChanged);
+        assert_eq!(candidates[0].snippet, candidates[1].snippet);
+        assert_ne!(candidates[0].id, candidates[1].id);
+
+        let unchanged = language_pack(
+            "/* Existing English opening\nExisting English middle\nExisting English closing */\nfn changed() {}\n",
+            vec![LineRange { start: 4, end: 5 }],
+        );
+        assert_eq!(
+            unchanged.all_candidates()[0].origin,
+            CandidateOrigin::PreExisting
+        );
+    }
+
+    #[test]
+    fn language_origin_is_unknown_without_textual_baseline_or_matching_scope() {
+        let mut pack = language_pack("// Existing English explanation\n", Vec::new());
+        pack.scope.files[0].base_state = ImageState::InvalidUtf8;
+        assert_eq!(pack.all_candidates()[0].origin, CandidateOrigin::Unknown);
+        pack.scope.files.clear();
+        assert_eq!(pack.all_candidates()[0].origin, CandidateOrigin::Unknown);
     }
 }

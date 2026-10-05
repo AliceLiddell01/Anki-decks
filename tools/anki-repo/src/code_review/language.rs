@@ -94,7 +94,7 @@ pub struct LanguageDecisions {
 }
 
 impl LanguageDecisions {
-    /// Заготовка требует явной классификации каждого кандидата агентом.
+    /// Создаёт документ решений, в котором каждый кандидат ожидает явной классификации.
     #[must_use]
     pub fn pending(scan: &LanguageScan) -> Self {
         Self {
@@ -181,7 +181,7 @@ pub fn is_eligible_path(path: &str) -> bool {
             .all(|part| matches!(part, Component::Normal(_)))
         && !components.iter().any(|part| {
             matches!(part, Component::Normal(name)
-            if *name == ".git" || *name == "target")
+            if *name == ".git" || *name == "target" || *name == "media")
         })
         && path.split('/').next().is_none_or(|part| part != "decks")
         && !path.starts_with(".anki-repo/review/")
@@ -199,7 +199,7 @@ fn candidate_id(path: &str, context: TextContext, text: &str, occurrence: usize)
     format!("language:{}", source_sha256(&key))
 }
 
-/// Полные исходники предоставляются вызывающим владельцем Git snapshot.
+/// Полные исходные тексты предоставляет вызывающий код, отвечающий за снимок Git.
 /// `decks/**`, медиа и неподдерживаемые форматы исключаются явно.
 #[must_use]
 pub fn scan(files: &[SourceFile]) -> LanguageScan {
@@ -500,10 +500,28 @@ fn skip_identifier(bytes: &[u8], mut index: usize) -> usize {
 
 fn markdown_spans(text: &str) -> Vec<Span> {
     let mut result = Vec::new();
+    // Начальный YAML-блок метаданных задаёт машинный контракт документа.
+    // Консервативно исключаем весь блок, включая значения-идентификаторы.
+    // Незакрытый блок тоже не делаем доступным для замены обычного текста.
     let mut offset = 0;
+    let mut lines = text.split_inclusive('\n');
+    if let Some(first) = lines.next()
+        && first
+            .trim_end_matches(['\r', '\n'])
+            .trim_start_matches('\u{feff}')
+            == "---"
+    {
+        offset = first.len();
+        for line in lines {
+            offset += line.len();
+            if matches!(line.trim_end_matches(['\r', '\n']), "---" | "...") {
+                break;
+            }
+        }
+    }
     let mut fence: Option<(u8, usize)> = None;
     let mut inline_ticks = 0;
-    for line in text.split_inclusive('\n') {
+    for line in text[offset..].split_inclusive('\n') {
         let left = line.trim_start_matches(' ');
         let indentation = line.len() - left.len();
         let marker = left.as_bytes().first().copied().unwrap_or(0);
@@ -772,13 +790,106 @@ fn config_spans(text: &str, yaml: bool) -> Vec<Span> {
     result
 }
 
+/// Читает слово-разделитель shell here-doc с удалением кавычек/экранирования.
+/// Содержимое here-doc может быть машинными данными и не является shell prose.
+fn heredoc_delimiter(text: &str, start: usize) -> Option<(String, bool, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = start + 2;
+    let strip_tabs = bytes.get(index) == Some(&b'-');
+    index += usize::from(strip_tabs);
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        index += 1;
+    }
+    let mut delimiter = Vec::new();
+    while let Some(&byte) = bytes.get(index) {
+        if byte.is_ascii_whitespace() || b";|&<>()".contains(&byte) {
+            break;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            let quote = byte;
+            index += 1;
+            while bytes.get(index) != Some(&quote) {
+                let &byte = bytes.get(index)?;
+                if byte == b'\n' {
+                    return None;
+                }
+                if quote == b'"'
+                    && byte == b'\\'
+                    && bytes
+                        .get(index + 1)
+                        .is_some_and(|next| b"$`\"\\".contains(next))
+                {
+                    index += 1;
+                }
+                delimiter.push(*bytes.get(index)?);
+                index += 1;
+            }
+            index += 1;
+        } else if byte == b'\\' {
+            index += 1;
+            let &escaped = bytes.get(index)?;
+            if escaped == b'\n' {
+                return None;
+            }
+            delimiter.push(escaped);
+            index += 1;
+        } else {
+            delimiter.push(byte);
+            index += 1;
+        }
+    }
+    if delimiter.is_empty() {
+        return None;
+    }
+    Some((String::from_utf8(delimiter).ok()?, strip_tabs, index))
+}
+
 fn script_spans(text: &str, powershell: bool) -> Vec<Span> {
     let mut result = Vec::new();
+    let mut opaque_ranges = Vec::new();
+    let mut heredocs = Vec::new();
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if powershell && bytes[index..].starts_with(b"<#") {
+        if !powershell && bytes[index..].starts_with(b"<<<") {
+            // Here-string не открывает многострочный блок.
+            index += 3;
+        } else if !powershell && bytes[index..].starts_with(b"<<") {
+            if let Some((delimiter, strip_tabs, next)) = heredoc_delimiter(text, index) {
+                heredocs.push((delimiter, strip_tabs));
+                index = next;
+            } else {
+                // Неоднозначный opener: не предлагаем заменять остаток файла.
+                opaque_ranges.push((index, bytes.len()));
+                break;
+            }
+        } else if !powershell && bytes[index] == b'\n' && !heredocs.is_empty() {
+            index += 1;
+            let start = index;
+            for (delimiter, strip_tabs) in heredocs.drain(..) {
+                while index < bytes.len() {
+                    let end = text[index..]
+                        .find('\n')
+                        .map_or(bytes.len(), |at| index + at + 1);
+                    let line = text[index..end].trim_end_matches(['\r', '\n']);
+                    let line = if strip_tabs {
+                        line.trim_start_matches('\t')
+                    } else {
+                        line
+                    };
+                    index = end;
+                    if line == delimiter {
+                        break;
+                    }
+                }
+            }
+            opaque_ranges.push((start, index));
+        } else if powershell && bytes[index..].starts_with(b"<#") {
             if let Some(end) = text[index + 2..].find("#>") {
+                opaque_ranges.push((index, index + end + 4));
                 push_trimmed(
                     &mut result,
                     text,
@@ -805,6 +916,7 @@ fn script_spans(text: &str, powershell: bool) -> Vec<Span> {
         } else if bytes[index] == b'"' || bytes[index] == b'\'' {
             let (start, end, next) = quoted(text, index, bytes[index], powershell);
             push_trimmed(&mut result, text, start, end, TextContext::StringLiteral);
+            opaque_ranges.push((index, next));
             index = next;
         } else if bytes[index] == b'\\' && !powershell || bytes[index] == b'`' && powershell {
             index = (index + 2).min(bytes.len());
@@ -835,13 +947,14 @@ fn script_spans(text: &str, powershell: bool) -> Vec<Span> {
                 let end = arguments.find('#').unwrap_or(arguments.len());
                 let lead = line.len() - left.len() + command_end + left[command_end..].len()
                     - left[command_end..].trim_start().len();
-                push_trimmed(
-                    &mut result,
-                    text,
-                    offset + lead,
-                    offset + lead + end,
-                    TextContext::ScriptOutput,
-                );
+                let start = offset + lead;
+                let end = start + end;
+                if !opaque_ranges
+                    .iter()
+                    .any(|&(left, right)| start < right && left < end)
+                {
+                    push_trimmed(&mut result, text, start, end, TextContext::ScriptOutput);
+                }
             }
         }
         offset += line.len();
@@ -1142,6 +1255,36 @@ mod tests {
     }
 
     #[test]
+    fn markdown_frontmatter_is_a_machine_surface_with_original_body_offsets() {
+        for (opener, closer) in [("---\n", "---\n"), ("\u{feff}---\r\n", "...\r\n")] {
+            let metadata = "name: english-skill\ndescription: >-\n  Human description\nwhenToUse: Human trigger\ncustomKey: machineIdentifier\n";
+            let source = format!("{opener}{metadata}{closer}Human prose\n");
+            let found = candidates(".agents/skills/example/SKILL.md", &source);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].text, "Human prose");
+            assert_eq!(found[0].context, TextContext::MarkdownProse);
+            assert_eq!(found[0].start, opener.len() + metadata.len() + closer.len());
+            assert_eq!(found[0].line, 8);
+            assert_eq!(found[0].column, 1);
+        }
+        assert!(candidates("a.md", "---\nname: english-skill\nHuman description\n").is_empty());
+        assert!(!candidates("a.md", "Human prose\n---\nAnother paragraph\n").is_empty());
+    }
+
+    #[test]
+    fn markdown_body_translation_preserves_frontmatter_contract() {
+        let temp = TempDir::new("language-frontmatter");
+        let source = "---\nname: english-skill\ndescription: Human description\n---\nHuman prose\n";
+        fs::write(temp.path().join("a.md"), source).unwrap();
+        let approved = decisions(vec![replacement("a.md", source, "Русский текст")]);
+        apply(temp.path(), &approved, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.md")).unwrap(),
+            "---\nname: english-skill\ndescription: Human description\n---\nРусский текст\n"
+        );
+    }
+
+    #[test]
     fn configurations_distinguish_keys_values_and_machine_tokens() {
         assert_eq!(candidates("a.json", r#"{"foreign key":"Human message","url":"https://example.invalid","technical":"API"}"#).len(), 1);
         assert_eq!(
@@ -1187,6 +1330,67 @@ mod tests {
             )
             .len(),
             2
+        );
+    }
+
+    #[test]
+    fn shell_heredoc_data_and_delimiters_are_not_replaceable_prose() {
+        let source = "# Human comment\ncat <<'DATA' <<-\\OTHER\necho Human machine data\n# Machine comment\n\"Machine string\"\nDATA\n\tprintf Another machine value\n\tOTHER\necho Human output\n";
+        let found = candidates("a.sh", source);
+        assert_eq!(
+            found
+                .iter()
+                .map(|candidate| candidate.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Human comment", "Human output"]
+        );
+        assert!(candidates("a.sh", "cat <<DATA\necho Machine data\n").is_empty());
+        assert_eq!(candidates("a.sh", "cat <<< 'Human string'\n").len(), 1);
+        assert_eq!(
+            candidates("a.sh", "echo '<<DATA'\necho Human output\n").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn output_inside_multiline_strings_and_comments_has_one_lexical_context() {
+        for (path, source) in [
+            ("a.sh", "echo \"Human output\necho Another line\"\n"),
+            (
+                "a.ps1",
+                "Write-Host \"Human output\nWrite-Host Another line\"\n",
+            ),
+            ("a.ps1", "<# Human comment\nWrite-Host Another line\n#>\n"),
+        ] {
+            let found = candidates(path, source);
+            assert_eq!(found.len(), 1, "{path}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn existing_media_files_are_rejected_by_surface_policy() {
+        let temp = TempDir::new("language-media-policy");
+        fs::create_dir(temp.path().join("media")).unwrap();
+        let source = "// Human comment\n";
+        fs::write(temp.path().join("media/a.rs"), source).unwrap();
+        assert!(!is_eligible_path("media/a.rs"));
+        assert!(!is_eligible_path("assets/media/metadata.json"));
+        let scanned = scan(&[SourceFile {
+            path: "media/a.rs".into(),
+            content: source.into(),
+        }]);
+        assert!(scanned.files.is_empty());
+        assert!(scanned.candidates.is_empty());
+        assert_eq!(scanned.skipped.len(), 1);
+        let mut proposed = replacement("a.rs", source, "Комментарий");
+        proposed.candidate.path = "media/a.rs".into();
+        let error = apply(temp.path(), &decisions(vec![proposed]), true).unwrap_err();
+        assert!(
+            matches!(error, LanguageError::Preconditions(ref message) if message == "запрещённый путь: media/a.rs")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("media/a.rs")).unwrap(),
+            source
         );
     }
 
@@ -1263,25 +1467,87 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stale_anchor_overlap_traversal_and_syntax_changes() {
+    fn rejects_duplicate_candidate_ids() {
         let temp = TempDir::new("language-refusal");
         let source = "let value = \"Human message\";\n";
         fs::write(temp.path().join("a.rs"), source).unwrap();
         let valid = replacement("a.rs", source, "Сообщение");
-        let mut stale = valid.clone();
-        stale.candidate.source_sha256 = "0".repeat(64);
-        assert!(apply(temp.path(), &decisions(vec![stale]), true).is_err());
-        let mut anchor = valid.clone();
-        anchor.candidate.text = "Changed message".into();
-        assert!(apply(temp.path(), &decisions(vec![anchor]), true).is_err());
+        let error = apply(temp.path(), &decisions(vec![valid.clone(), valid]), true).unwrap_err();
         assert!(
-            apply(
-                temp.path(),
-                &decisions(vec![valid.clone(), valid.clone()]),
-                true
-            )
-            .is_err()
+            matches!(error, LanguageError::Preconditions(ref message) if message == "повторное решение для одного кандидата")
         );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.rs")).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_ranges_with_distinct_ids_and_matching_source_anchors() {
+        let temp = TempDir::new("language-overlap");
+        let source = "let value = \"Human message\";\n";
+        fs::write(temp.path().join("a.rs"), source).unwrap();
+        let full = replacement("a.rs", source, "Сообщение");
+        let mut nested = full.clone();
+        nested.candidate.start += "Human ".len();
+        nested.candidate.column += "Human ".len();
+        nested.candidate.text = "message".into();
+        nested.candidate.id = candidate_id("a.rs", TextContext::StringLiteral, "message", 0);
+        assert_ne!(full.candidate.id, nested.candidate.id);
+        assert_eq!(
+            &source[nested.candidate.start..nested.candidate.end],
+            nested.candidate.text
+        );
+        let error = apply(temp.path(), &decisions(vec![full, nested]), true).unwrap_err();
+        assert!(
+            matches!(error, LanguageError::Preconditions(ref message) if message == "перекрывающиеся диапазоны: a.rs")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.rs")).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn rejects_stale_source_digest() {
+        let temp = TempDir::new("language-stale-source");
+        let source = "// Human comment\n";
+        fs::write(temp.path().join("a.rs"), source).unwrap();
+        let mut stale = replacement("a.rs", source, "Комментарий");
+        stale.candidate.source_sha256 = "0".repeat(64);
+        let error = apply(temp.path(), &decisions(vec![stale]), true).unwrap_err();
+        assert!(
+            matches!(error, LanguageError::Preconditions(ref message) if message == "устаревший SHA-256: a.rs")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.rs")).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn rejects_source_anchor_changes_even_with_current_digest() {
+        let temp = TempDir::new("language-stale-anchor");
+        let source = "let value = \"Human message\";\n";
+        fs::write(temp.path().join("a.rs"), source).unwrap();
+        let mut anchor = replacement("a.rs", source, "Сообщение");
+        anchor.candidate.text = "Changed message".into();
+        let error = apply(temp.path(), &decisions(vec![anchor]), true).unwrap_err();
+        assert!(
+            matches!(error, LanguageError::Preconditions(ref message) if message == "исходный текст изменился: a.rs")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.rs")).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn rejects_path_traversal_before_reading_files() {
+        let temp = TempDir::new("language-path-refusal");
+        let source = "let value = \"Human message\";\n";
+        fs::write(temp.path().join("a.rs"), source).unwrap();
+        let valid = replacement("a.rs", source, "Сообщение");
         for path in [
             "../a.rs",
             "/a.rs",
@@ -1292,11 +1558,28 @@ mod tests {
         ] {
             let mut escape = valid.clone();
             escape.candidate.path = path.into();
-            assert!(apply(temp.path(), &decisions(vec![escape]), true).is_err());
+            let error = apply(temp.path(), &decisions(vec![escape]), true).unwrap_err();
+            assert!(
+                matches!(error, LanguageError::Preconditions(ref message) if message == &format!("запрещённый путь: {path}"))
+            );
         }
-        let mut injection = valid;
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.rs")).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn rejects_lexical_structure_changes() {
+        let temp = TempDir::new("language-syntax-refusal");
+        let source = "let value = \"Human message\";\n";
+        fs::write(temp.path().join("a.rs"), source).unwrap();
+        let mut injection = replacement("a.rs", source, "Сообщение");
         injection.replacement = Some("\"; panic!(\"Сообщение".into());
-        assert!(apply(temp.path(), &decisions(vec![injection]), true).is_err());
+        let error = apply(temp.path(), &decisions(vec![injection]), true).unwrap_err();
+        assert!(
+            matches!(error, LanguageError::Preconditions(ref message) if message == "замена меняет лексическую структуру: a.rs")
+        );
         assert_eq!(
             fs::read_to_string(temp.path().join("a.rs")).unwrap(),
             source
@@ -1311,22 +1594,28 @@ mod tests {
         let source = "// Human comment\n";
         fs::write(temp.path().join("real.rs"), source).unwrap();
         symlink(temp.path().join("real.rs"), temp.path().join("a.rs")).unwrap();
+        let error = apply(
+            temp.path(),
+            &decisions(vec![replacement("a.rs", source, "Комментарий")]),
+            true,
+        )
+        .unwrap_err();
         assert!(
-            apply(
-                temp.path(),
-                &decisions(vec![replacement("a.rs", source, "Комментарий")]),
-                true
-            )
-            .is_err()
+            matches!(error, LanguageError::Preconditions(ref message) if message == "символическая ссылка: a.rs")
         );
         symlink(temp.path(), temp.path().join("nested")).unwrap();
+        let error = apply(
+            temp.path(),
+            &decisions(vec![replacement("nested/real.rs", source, "Комментарий")]),
+            true,
+        )
+        .unwrap_err();
         assert!(
-            apply(
-                temp.path(),
-                &decisions(vec![replacement("nested/real.rs", source, "Комментарий")]),
-                true
-            )
-            .is_err()
+            matches!(error, LanguageError::Preconditions(ref message) if message == "символическая ссылка: nested/real.rs")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("real.rs")).unwrap(),
+            source
         );
     }
 }

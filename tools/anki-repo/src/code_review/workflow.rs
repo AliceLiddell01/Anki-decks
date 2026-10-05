@@ -1,4 +1,4 @@
-//! CLI-сценарии для неизменяемых code-review evidence и language policy.
+//! CLI-сценарии для неизменяемых свидетельств code-review и языковой политики.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -26,12 +26,12 @@ use super::scope::{
     self, CollectedScope, FileStatus, GitTarget, ImageState, ScopeError, ScopedFile,
 };
 
-/// Верхняя граница читаемого review artifact.
+/// Верхняя граница читаемого артефакта ревью.
 pub const MAX_REVIEW_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
-/// Верхняя граница language artifact.
+/// Верхняя граница языкового артефакта.
 pub const MAX_LANGUAGE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Краткий результат создания pack для CLI.
+/// Краткий результат создания пакета для CLI.
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotSummary {
     pub artifact_dir: String,
@@ -63,7 +63,7 @@ pub struct LanguageApplySummary {
     pub results: Vec<AppliedFileSummary>,
 }
 
-/// Результат публикации одного файла language workflow.
+/// Результат публикации одного файла языкового процесса.
 #[derive(Debug, Clone, Serialize)]
 pub struct AppliedFileSummary {
     pub path: String,
@@ -72,31 +72,31 @@ pub struct AppliedFileSummary {
     pub replacements: usize,
 }
 
-/// Сопоставляет Git snapshots и создаёт immutable evidence directory.
+/// Сопоставляет Git-снимки и создаёт неизменяемый каталог свидетельств.
 pub fn collect(
     base: &str,
     head: &str,
     out_dir: Option<&Path>,
-    skip_clippy: bool,
+    run_clippy: bool,
 ) -> Result<SnapshotSummary, DomainError> {
     let root = repository_root(Path::new("."))?;
     let collected = scope::collect_scope(&root, base, head).map_err(scope_error)?;
-    let pack = build_pack(&root, collected, skip_clippy);
+    let pack = build_pack(&root, collected, run_clippy);
     save_snapshot(&root, out_dir, &pack, None)
 }
 
-/// Пересобирает evidence от зафиксированной base и создаёт detector-level delta.
+/// Пересобирает свидетельства от зафиксированной base и создаёт дельту детекторов.
 pub fn verify(
     baseline_path: &Path,
     head: &str,
     out_dir: Option<&Path>,
-    skip_clippy: bool,
+    run_clippy: bool,
 ) -> Result<SnapshotSummary, DomainError> {
     let root = repository_root(Path::new("."))?;
     let baseline: ReviewPack = read_json(
         baseline_path,
         MAX_REVIEW_ARTIFACT_BYTES,
-        "baseline review-pack",
+        "исходный review-pack",
     )?;
     delta::validate_review_pack(&baseline)?;
     let collected =
@@ -105,9 +105,10 @@ pub fn verify(
         || collected.target.base_sha != baseline.target.base_sha
         || collected.target.merge_base_sha != baseline.target.merge_base_sha
     {
+        // Проверяем до build_pack: он может явно запускать Clippy.
         return Err(DomainError::with_details(
             ErrorCode::BaselineMismatch,
-            "новый snapshot не имеет ту же репозиторию и merge-base, что baseline",
+            "новый снимок относится к другому репозиторию или merge-base относительно исходного пакета",
             crate::details! {
                 "baseline_base_sha" => baseline.target.base_sha,
                 "new_base_sha" => collected.target.base_sha,
@@ -116,12 +117,12 @@ pub fn verify(
             },
         ));
     }
-    let pack = build_pack(&root, collected, skip_clippy);
+    let pack = build_pack(&root, collected, run_clippy);
     let changes = delta::compare(&baseline, &pack)?;
     save_snapshot(&root, out_dir, &pack, Some(changes))
 }
 
-/// Сравнивает сохранённые snapshots; опциональный JSON пишется без перезаписи.
+/// Сравнивает сохранённые снимки; опциональный JSON пишется без перезаписи.
 pub fn compare_files(
     before_path: &Path,
     after_path: &Path,
@@ -130,7 +131,7 @@ pub fn compare_files(
     let before: ReviewPack = read_json(
         before_path,
         MAX_REVIEW_ARTIFACT_BYTES,
-        "baseline review-pack",
+        "исходный review-pack",
     )?;
     let after: ReviewPack = read_json(after_path, MAX_REVIEW_ARTIFACT_BYTES, "новый review-pack")?;
     let changes = delta::compare(&before, &after)?;
@@ -143,7 +144,7 @@ pub fn compare_files(
     Ok(changes)
 }
 
-/// Сканирует явные repository-relative пути или полные post-images review-pack.
+/// Сканирует явные пути относительно репозитория или полные новые версии файлов review-pack.
 pub fn scan_language(
     root_arg: &Path,
     paths: &[PathBuf],
@@ -162,7 +163,7 @@ pub fn scan_language(
         {
             return Err(DomainError::new(
                 ErrorCode::BaselineMismatch,
-                "review-pack относится к другому репозиторию или Git snapshot",
+                "review-pack относится к другому репозиторию или Git-снимку",
             ));
         }
         sources_from_scope(&collected)
@@ -184,7 +185,7 @@ pub fn scan_language(
     Ok(language_summary(&output, &scan))
 }
 
-/// Повторно сканирует тот же список исходников из language artifact.
+/// Повторно сканирует тот же список исходников из языкового артефакта.
 pub fn check_language(
     root_arg: &Path,
     scan_path: &Path,
@@ -239,7 +240,7 @@ pub fn apply_language(
     Ok(apply_summary(result))
 }
 
-/// Готовит summary и локальные artifacts pack-а и, при verify, delta.
+/// Готовит сводку и локальные артефакты пакета и, при verify, дельту.
 fn save_snapshot(
     root: &Path,
     out_dir: Option<&Path>,
@@ -252,7 +253,7 @@ fn save_snapshot(
                 .join("review")
                 .join(format!("{}-{}", pack.target.base_sha, pack.target.head_sha))
         },
-        absolute_from_cwd,
+        Path::to_path_buf,
     );
     let directory = safe_output_path(root, &directory, true)?;
     let mut documents = BTreeMap::new();
@@ -274,7 +275,7 @@ fn save_snapshot(
     })
 }
 
-fn build_pack(root: &Path, collected: CollectedScope, skip_clippy: bool) -> ReviewPack {
+fn build_pack(root: &Path, collected: CollectedScope, run_clippy: bool) -> ReviewPack {
     let inputs: Vec<_> = collected
         .files
         .iter()
@@ -284,10 +285,11 @@ fn build_pack(root: &Path, collected: CollectedScope, skip_clippy: bool) -> Revi
             status: detector_status(&file.status),
             base_text: file.base.text.clone(),
             post_text: file.post.text.clone(),
+            post_changed_lines: Some(file.post_changed_lines.clone()),
         })
         .collect();
     let static_candidates = detectors::detect(&inputs);
-    let (diagnostics, tool_runs) = if skip_clippy {
+    let (diagnostics, tool_runs) = if !run_clippy {
         (
             Vec::new(),
             vec![ToolRunEvidence {
@@ -298,7 +300,10 @@ fn build_pack(root: &Path, collected: CollectedScope, skip_clippy: bool) -> Revi
                 malformed_lines: 0,
                 ignored_records: 0,
                 stderr_summary: None,
-                message: Some("Clippy отключён флагом --skip-clippy.".into()),
+                message: Some(
+                    "Clippy не запускался: исполнение кода проекта требует явного --run-clippy."
+                        .into(),
+                ),
             }],
         )
     } else if !working_tree_matches(&collected.target, root) {
@@ -313,7 +318,7 @@ fn build_pack(root: &Path, collected: CollectedScope, skip_clippy: bool) -> Revi
                 ignored_records: 0,
                 stderr_summary: None,
                 message: Some(
-                    "Clippy пропущен: рабочая копия отличается от зафиксированного head snapshot."
+                    "Clippy пропущен: рабочая копия отличается от зафиксированного снимка head."
                         .into(),
                 ),
             }],
@@ -499,7 +504,7 @@ fn has_untracked_workspace_sources(root: &Path) -> bool {
         if path.is_empty() {
             return false;
         }
-        ![
+        if [
             b"decks/".as_slice(),
             b".asset-store/".as_slice(),
             b".anki-repo/review/".as_slice(),
@@ -507,6 +512,24 @@ fn has_untracked_workspace_sources(root: &Path) -> bool {
         ]
         .iter()
         .any(|prefix| path.starts_with(prefix))
+        {
+            return false;
+        }
+        // Это проверка известных входов Cargo, а не изоляция произвольного
+        // build.rs: он может читать любые файлы после явного --run-clippy.
+        let Ok(path) = std::str::from_utf8(path) else {
+            return true;
+        };
+        let name = path.rsplit('/').next().unwrap_or(path);
+        path.ends_with(".rs")
+            || matches!(
+                name,
+                "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml"
+            )
+            || path == ".cargo/config"
+            || path == ".cargo/config.toml"
+            || path.ends_with("/.cargo/config")
+            || path.ends_with("/.cargo/config.toml")
     })
 }
 
@@ -590,19 +613,19 @@ fn sources_from_scope(collected: &CollectedScope) -> (Vec<SourceFile>, Vec<Skipp
             }
             (ImageState::Missing, _) => skipped.push(SkippedFile {
                 path: file.path.clone(),
-                reason: "post-image отсутствует (файл удалён)".into(),
+                reason: "версия после изменений отсутствует (файл удалён)".into(),
             }),
             (ImageState::Oversized, _) => skipped.push(SkippedFile {
                 path: file.path.clone(),
-                reason: "post-image превышает лимит полного текстового образа".into(),
+                reason: "версия после изменений превышает лимит полного текстового образа".into(),
             }),
             (ImageState::Binary, _) => skipped.push(SkippedFile {
                 path: file.path.clone(),
-                reason: "бинарный post-image".into(),
+                reason: "бинарная версия после изменений".into(),
             }),
             (ImageState::InvalidUtf8, _) => skipped.push(SkippedFile {
                 path: file.path.clone(),
-                reason: "post-image не является UTF-8".into(),
+                reason: "версия после изменений не является текстом UTF-8".into(),
             }),
             (ImageState::Gitlink, _) => skipped.push(SkippedFile {
                 path: file.path.clone(),
@@ -610,7 +633,7 @@ fn sources_from_scope(collected: &CollectedScope) -> (Vec<SourceFile>, Vec<Skipp
             }),
             (ImageState::Text, None) => skipped.push(SkippedFile {
                 path: file.path.clone(),
-                reason: "полное содержимое post-image недоступно".into(),
+                reason: "полный текст версии после изменений недоступен".into(),
             }),
         }
     }
@@ -646,14 +669,16 @@ fn read_language_paths(
         let metadata = fs::metadata(&absolute).map_err(|error| {
             DomainError::with_details(
                 ErrorCode::InputUnreadable,
-                format!("не удалось прочитать language source «{relative}»: {error}"),
+                format!(
+                    "не удалось прочитать исходник для языковой проверки «{relative}»: {error}"
+                ),
                 crate::details! { "path" => relative },
             )
         })?;
         if !metadata.is_file() {
             return Err(DomainError::new(
                 ErrorCode::InputUnreadable,
-                format!("language source «{relative}» не является обычным файлом"),
+                format!("исходник для языковой проверки «{relative}» не является обычным файлом"),
             ));
         }
         if metadata.len() > scope::MAX_TEXT_BYTES {
@@ -666,7 +691,7 @@ fn read_language_paths(
         let bytes = fs::read(&absolute).map_err(|error| {
             DomainError::new(
                 ErrorCode::InputUnreadable,
-                format!("не удалось прочитать language source: {error}"),
+                format!("не удалось прочитать исходник для языковой проверки: {error}"),
             )
         })?;
         match String::from_utf8(bytes) {
@@ -719,7 +744,7 @@ fn apply_summary(result: ApplyResult) -> LanguageApplySummary {
 fn human_summary(pack: &ReviewPack) -> String {
     use std::fmt::Write as _;
     let mut text = String::new();
-    let _ = writeln!(text, "Снимок evidence v{}", pack.schema_version);
+    let _ = writeln!(text, "Снимок пакета свидетельств v{}", pack.schema_version);
     let _ = writeln!(text, "База: {}", pack.target.base_sha);
     let _ = writeln!(text, "HEAD: {}", pack.target.head_sha);
     let _ = writeln!(
@@ -775,7 +800,7 @@ fn human_summary(pack: &ReviewPack) -> String {
     }
     let _ = writeln!(
         text,
-        "Диагностик: {} (сами по себе не подтверждают findings)",
+        "Диагностик: {} (сами по себе не являются подтверждёнными замечаниями)",
         pack.diagnostics.len()
     );
     for diagnostic in &pack.diagnostics {
@@ -881,7 +906,7 @@ fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, DomainError> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
         DomainError::new(
             ErrorCode::Internal,
-            format!("не удалось сериализовать artifact: {error}"),
+            format!("не удалось сериализовать артефакт: {error}"),
         )
     })?;
     bytes.push(b'\n');
@@ -979,6 +1004,12 @@ fn safe_output_path(
     requested: &Path,
     directory: bool,
 ) -> Result<PathBuf, DomainError> {
+    if requested.as_os_str().is_empty() {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "путь артефакта не может быть пустым",
+        ));
+    }
     let requested = lexical_absolute(requested);
     reject_decks_path(root, &requested)?;
     if requested.exists()
@@ -1024,7 +1055,7 @@ fn safe_output_path(
     if resolved.starts_with(decks) {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "code-review artifacts нельзя сохранять под decks/**",
+            "артефакты code-review нельзя сохранять под decks/**",
         ));
     }
     Ok(resolved)
@@ -1036,20 +1067,20 @@ fn reject_git_metadata_path(root: &Path, candidate: &Path) -> Result<(), DomainE
             .map_err(|error| {
                 DomainError::new(
                     ErrorCode::GitEvidenceFailed,
-                    format!("не удалось определить каталог Git metadata: {error}"),
+                    format!("не удалось определить каталог служебных данных Git: {error}"),
                 )
             })?;
         let metadata_path = String::from_utf8_lossy(&output);
         let metadata_path = fs::canonicalize(metadata_path.trim()).map_err(|error| {
             DomainError::new(
                 ErrorCode::GitEvidenceFailed,
-                format!("не удалось разрешить каталог Git metadata: {error}"),
+                format!("не удалось разрешить каталог служебных данных Git: {error}"),
             )
         })?;
         if candidate.starts_with(&metadata_path) {
             return Err(DomainError::new(
                 ErrorCode::InvalidRequest,
-                "code-review artifacts нельзя сохранять внутри служебных каталогов Git",
+                "артефакты code-review нельзя сохранять внутри служебных каталогов Git",
             ));
         }
     }
@@ -1063,14 +1094,14 @@ fn resolve_future_path(path: &Path) -> Result<PathBuf, DomainError> {
         let Some(name) = ancestor.file_name() else {
             return Err(DomainError::new(
                 ErrorCode::InvalidRequest,
-                "не удалось разрешить путь artifact относительно существующего каталога",
+                "не удалось разрешить путь артефакта относительно существующего каталога",
             ));
         };
         missing.push(name.to_os_string());
         if !ancestor.pop() {
             return Err(DomainError::new(
                 ErrorCode::InvalidRequest,
-                "не удалось разрешить путь artifact относительно существующего каталога",
+                "не удалось разрешить путь артефакта относительно существующего каталога",
             ));
         }
     }
@@ -1093,22 +1124,14 @@ fn reject_decks_path(root: &Path, candidate: &Path) -> Result<(), DomainError> {
     if candidate.starts_with(decks) {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "code-review artifacts нельзя сохранять под decks/**",
+            "артефакты code-review нельзя сохранять под decks/**",
         ));
     }
     Ok(())
 }
 
 fn output_path(root: &Path, path: &Path) -> Result<PathBuf, DomainError> {
-    safe_output_path(root, &absolute_from_cwd(path), false)
-}
-
-fn absolute_from_cwd(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        lexical_absolute(path)
-    } else {
-        lexical_absolute(&std::env::current_dir().unwrap_or_default().join(path))
-    }
+    safe_output_path(root, path, false)
 }
 
 fn lexical_absolute(path: &Path) -> PathBuf {
@@ -1208,7 +1231,7 @@ fn repository_root(start: &Path) -> Result<PathBuf, DomainError> {
     let start = fs::canonicalize(start).map_err(|error| {
         DomainError::new(
             ErrorCode::InputUnreadable,
-            format!("не удалось открыть repository root: {error}"),
+            format!("не удалось открыть корень репозитория: {error}"),
         )
     })?;
     let output = Command::new("git")
@@ -1294,7 +1317,7 @@ fn language_error(error: language::LanguageError) -> DomainError {
         }
         language::LanguageError::Read { path, source } => DomainError::new(
             ErrorCode::InputUnreadable,
-            format!("не удалось прочитать language source «{path}»: {source}"),
+            format!("не удалось прочитать исходник для языковой проверки «{path}»: {source}"),
         ),
         language::LanguageError::Publication { message, written } => DomainError::with_details(
             ErrorCode::WriteFailed,
@@ -1307,7 +1330,7 @@ fn language_error(error: language::LanguageError) -> DomainError {
 fn artifact_conflict(path: &Path) -> DomainError {
     DomainError::with_details(
         ErrorCode::ReviewArtifactConflict,
-        "путь уже содержит другой artifact; выберите новое имя, чтобы сохранить оба snapshot",
+        "путь уже содержит другой артефакт; выберите новое имя, чтобы сохранить оба снимка",
         crate::details! { "path" => path.display().to_string() },
     )
 }
@@ -1315,7 +1338,7 @@ fn artifact_conflict(path: &Path) -> DomainError {
 fn artifact_write_error(path: &Path, error: &std::io::Error) -> DomainError {
     DomainError::with_details(
         ErrorCode::WriteFailed,
-        format!("не удалось сохранить code-review artifact: {error}"),
+        format!("не удалось сохранить артефакт code-review: {error}"),
         crate::details! { "path" => path.display().to_string() },
     )
 }
@@ -1341,6 +1364,8 @@ mod tests {
             git_ok(&path, &["init", "-q"]);
             git_ok(&path, &["config", "user.email", "test@example.invalid"]);
             git_ok(&path, &["config", "user.name", "Test"]);
+            git_ok(&path, &["config", "commit.gpgsign", "false"]);
+            git_ok(&path, &["config", "core.autocrlf", "false"]);
             fs::create_dir_all(path.join("src")).unwrap();
             fs::write(path.join("src/lib.rs"), "pub fn run() { let _ = 1; }\n").unwrap();
             git_ok(&path, &["add", "."]);
@@ -1381,9 +1406,9 @@ mod tests {
             .trim()
             .to_owned();
         let first = scope::collect_scope(&repo.0, &base, &head).unwrap();
-        let pack_a = build_pack(&repo.0, first, true);
+        let pack_a = build_pack(&repo.0, first, false);
         let second = scope::collect_scope(&repo.0, &base, &head).unwrap();
-        let pack_b = build_pack(&repo.0, second, true);
+        let pack_b = build_pack(&repo.0, second, false);
         assert_eq!(json_bytes(&pack_a).unwrap(), json_bytes(&pack_b).unwrap());
         assert_eq!(human_summary(&pack_a), human_summary(&pack_b));
         assert!(
@@ -1414,6 +1439,8 @@ mod tests {
             ".asset-store/cache.json",
             ".anki-repo/review/run/review.json",
             ".codex/local/run.json",
+            "notes.txt",
+            "custom-output/review.json",
         ] {
             let path = repo.0.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1423,6 +1450,83 @@ mod tests {
 
         fs::write(repo.0.join("src/untracked.rs"), "pub fn new_source() {}\n").unwrap();
         assert!(!working_tree_matches(&target, &repo.0));
+        fs::remove_file(repo.0.join("src/untracked.rs")).unwrap();
+        fs::create_dir_all(repo.0.join(".cargo")).unwrap();
+        fs::write(repo.0.join(".cargo/config.toml"), "[build]\n").unwrap();
+        assert!(!working_tree_matches(&target, &repo.0));
+    }
+
+    fn synthetic_cargo_repo(label: &str) -> GitFixture {
+        let repo = GitFixture::new(label);
+        fs::write(
+            repo.0.join("Cargo.toml"),
+            "[package]\nname = \"review_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.0.join("Cargo.lock"),
+            "version = 3\n\n[[package]]\nname = \"review_fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(repo.0.join(".gitignore"), "/target/\n").unwrap();
+        repo.add_head("pub fn run() {}\n");
+        repo
+    }
+
+    #[test]
+    fn ordinary_collection_never_executes_reviewed_build_script() {
+        let repo = synthetic_cargo_repo("execution-boundary");
+        let marker = repo.0.parent().unwrap().join(format!(
+            "{}-execution-marker",
+            repo.0.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!marker.exists());
+        fs::write(
+            repo.0.join("build.rs"),
+            format!(
+                "fn main() {{ std::fs::write({:?}, b\"executed\").unwrap(); }}\n",
+                marker.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        repo.add_head("pub fn run() { let _ = 2; }\n");
+        let scope = scope::collect_scope(&repo.0, "HEAD~1", "HEAD").unwrap();
+        assert!(working_tree_matches(&scope.target, &repo.0));
+        let pack = build_pack(&repo.0, scope, false);
+        assert_eq!(pack.tool_runs[0].status, "skipped");
+        assert!(
+            pack.tool_runs[0]
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("--run-clippy")
+        );
+        assert!(
+            !marker.exists(),
+            "обычный сбор не должен исполнять build.rs"
+        );
+        assert!(!repo.0.join("target").exists());
+    }
+
+    #[test]
+    fn real_clippy_pack_is_stable_and_republication_is_idempotent() {
+        // Только доверенная синтетическая программа без зависимостей и build.rs.
+        let repo = synthetic_cargo_repo("clippy-stability");
+        repo.add_head("pub fn run() { let _ = vec![1].len() == 0; }\n");
+        let first = scope::collect_scope(&repo.0, "HEAD~1", "HEAD").unwrap();
+        let pack_a = build_pack(&repo.0, first, true);
+        assert!(pack_a.tool_runs[0].exit_status.unwrap().success);
+        assert_eq!(pack_a.tool_runs[0].status, "diagnostics");
+        assert!(!pack_a.diagnostics.is_empty());
+        let output = repo.0.join(".anki-repo/review/stable");
+        save_snapshot(&repo.0, Some(&output), &pack_a, None).unwrap();
+        let second = scope::collect_scope(&repo.0, "HEAD~1", "HEAD").unwrap();
+        let pack_b = build_pack(&repo.0, second, true);
+        assert!(pack_b.tool_runs[0].exit_status.unwrap().success);
+        assert_eq!(json_bytes(&pack_a).unwrap(), json_bytes(&pack_b).unwrap());
+        assert_eq!(human_summary(&pack_a), human_summary(&pack_b));
+        save_snapshot(&repo.0, Some(&output), &pack_b, None).unwrap();
+        assert!(working_tree_matches(&pack_b.target, &repo.0));
     }
 
     #[test]
@@ -1430,9 +1534,18 @@ mod tests {
         let repo = GitFixture::new("git-metadata-output");
         let requested = repo.0.join(".git/review-artifacts");
         let error = safe_output_path(&repo.0, &requested, true)
-            .expect_err("каталог Git не принимает локальные review artifacts");
+            .expect_err("каталог Git не принимает локальные артефакты ревью");
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert!(!requested.exists());
+    }
+
+    #[test]
+    fn empty_artifact_path_is_rejected_before_path_resolution() {
+        let repo = GitFixture::new("empty-artifact-path");
+        let error = safe_output_path(&repo.0, Path::new(""), true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("не может быть пустым"));
+        assert!(!repo.0.join("review.json").exists());
     }
 
     #[test]
