@@ -364,7 +364,7 @@ fn snapshot_diagnostic_separates_current_and_stale_epoch_entries() {
     ] {
         assert!(
             !diagnostic_json.contains(secret),
-            "не утекло значение {secret}"
+            "runtime snapshot exposed a test fixture value"
         );
     }
     assert!(diagnostic_json.contains(&sha256_hex("bootstrap-network")));
@@ -467,7 +467,10 @@ fn bounded_snapshot_and_identity_are_sanitized_in_serialized_jsonl() {
         "network-secret-",
         "http-secret-",
     ] {
-        assert!(!entire_log.contains(secret), "не утекло значение {secret}");
+        assert!(
+            !entire_log.contains(secret),
+            "diagnostic JSONL exposed a test fixture value"
+        );
     }
 }
 
