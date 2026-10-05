@@ -14,6 +14,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::error::{DomainError, ErrorCode};
+
 pub const LANGUAGE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,15 +136,26 @@ pub struct ApplyResult {
 pub enum LanguageError {
     #[error("решения языка отклонены: {0}")]
     Preconditions(String),
+    #[error("устаревший SHA-256: {path}")]
+    StaleDigest { path: String },
+    #[error("исходный текст изменился: {path}")]
+    StaleAnchor { path: String },
+    #[error("исходник изменился при публикации: {source}; уже записаны: {written:?}")]
+    SourceChanged {
+        #[source]
+        source: DomainError,
+        written: Vec<String>,
+    },
     #[error("не удалось прочитать {path}: {source}")]
     Read {
         path: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("публикация языка завершилась ошибкой: {message}; уже записаны: {written:?}")]
+    #[error("публикация языка завершилась ошибкой: {source}; уже записаны: {written:?}")]
     Publication {
-        message: String,
+        #[source]
+        source: DomainError,
         written: Vec<String>,
     },
 }
@@ -967,6 +980,14 @@ fn reject(message: impl Into<String>) -> LanguageError {
     LanguageError::Preconditions(message.into())
 }
 
+fn publication_error(source: DomainError, written: Vec<String>) -> LanguageError {
+    if source.code == ErrorCode::SourceChanged {
+        LanguageError::SourceChanged { source, written }
+    } else {
+        LanguageError::Publication { source, written }
+    }
+}
+
 fn safe_path(root: &Path, relative: &str) -> Result<PathBuf, LanguageError> {
     if !is_eligible_path(relative) {
         return Err(reject(format!("запрещённый путь: {relative}")));
@@ -1072,12 +1093,8 @@ pub fn apply(
     let mut guards = BTreeMap::new();
     if apply_changes {
         for parent in parents {
-            let guard = crate::write::ExportLock::acquire(&parent).map_err(|error| {
-                LanguageError::Publication {
-                    message: error.to_string(),
-                    written: Vec::new(),
-                }
-            })?;
+            let guard = crate::write::ExportLock::acquire(&parent)
+                .map_err(|error| publication_error(error, Vec::new()))?;
             guards.insert(parent, guard);
         }
     }
@@ -1104,13 +1121,17 @@ pub fn apply(
         for decision in &replacements {
             let candidate = &decision.candidate;
             if candidate.source_sha256 != digest {
-                return Err(reject(format!("устаревший SHA-256: {relative}")));
+                return Err(LanguageError::StaleDigest {
+                    path: relative.into(),
+                });
             }
             if candidate.start < previous_end || candidate.start >= candidate.end {
                 return Err(reject(format!("перекрывающиеся диапазоны: {relative}")));
             }
             if before.get(candidate.start..candidate.end) != Some(candidate.text.as_str()) {
-                return Err(reject(format!("исходный текст изменился: {relative}")));
+                return Err(LanguageError::StaleAnchor {
+                    path: relative.into(),
+                });
             }
             if !scanned.candidates.contains(candidate) {
                 return Err(reject(format!(
@@ -1169,10 +1190,7 @@ pub fn apply(
                 .ok_or_else(|| reject("отсутствует родитель цели"))?];
             guard
                 .check_source(&path, file.before.as_bytes())
-                .map_err(|error| LanguageError::Publication {
-                    message: error.to_string(),
-                    written: Vec::new(),
-                })?;
+                .map_err(|source| publication_error(source, Vec::new()))?;
         }
         let mut written = Vec::new();
         for file in &result.files {
@@ -1182,10 +1200,7 @@ pub fn apply(
                 .ok_or_else(|| reject("отсутствует родитель цели"))?];
             guard
                 .replace(&path, file.before.as_bytes(), file.after.as_bytes())
-                .map_err(|error| LanguageError::Publication {
-                    message: error.to_string(),
-                    written: written.clone(),
-                })?;
+                .map_err(|source| publication_error(source, written.clone()))?;
             written.push(file.path.clone());
         }
     }
@@ -1516,13 +1531,23 @@ mod tests {
         let mut stale = replacement("a.rs", source, "Комментарий");
         stale.candidate.source_sha256 = "0".repeat(64);
         let error = apply(temp.path(), &decisions(vec![stale]), true).unwrap_err();
-        assert!(
-            matches!(error, LanguageError::Preconditions(ref message) if message == "устаревший SHA-256: a.rs")
-        );
+        assert!(matches!(error, LanguageError::StaleDigest { ref path } if path == "a.rs"));
         assert_eq!(
             fs::read_to_string(temp.path().join("a.rs")).unwrap(),
             source
         );
+    }
+
+    #[test]
+    fn publication_source_change_keeps_a_typed_language_error() {
+        let error = publication_error(
+            DomainError::new(ErrorCode::SourceChanged, "исходник изменился"),
+            vec!["a.rs".into()],
+        );
+        assert!(matches!(
+            error,
+            LanguageError::SourceChanged { written, .. } if written == ["a.rs"]
+        ));
     }
 
     #[test]
@@ -1533,9 +1558,7 @@ mod tests {
         let mut anchor = replacement("a.rs", source, "Сообщение");
         anchor.candidate.text = "Changed message".into();
         let error = apply(temp.path(), &decisions(vec![anchor]), true).unwrap_err();
-        assert!(
-            matches!(error, LanguageError::Preconditions(ref message) if message == "исходный текст изменился: a.rs")
-        );
+        assert!(matches!(error, LanguageError::StaleAnchor { ref path } if path == "a.rs"));
         assert_eq!(
             fs::read_to_string(temp.path().join("a.rs")).unwrap(),
             source

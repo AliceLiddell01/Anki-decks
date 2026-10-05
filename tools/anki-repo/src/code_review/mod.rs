@@ -1,7 +1,7 @@
-//! Evidence для независимого code review: snapshot scope, diagnostics,
-//! candidates, language policy и detector-level delta.
+//! Свидетельства для независимого ревью кода: охват снимка, диагностики,
+//! кандидаты, языковая политика и дельта на уровне детекторов.
 //!
-//! Ни один элемент evidence или candidate автоматически не становится finding.
+//! Ни одно свидетельство или кандидат автоматически не становится замечанием.
 
 pub mod delta;
 pub mod detectors;

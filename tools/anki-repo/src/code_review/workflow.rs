@@ -247,12 +247,15 @@ fn save_snapshot(
     pack: &ReviewPack,
     changes: Option<ReviewDelta>,
 ) -> Result<SnapshotSummary, DomainError> {
+    let default_name = match changes.as_ref() {
+        Some(delta) => format!(
+            "{}-{}-{}",
+            delta.before.head_sha, pack.target.base_sha, pack.target.head_sha
+        ),
+        None => format!("{}-{}", pack.target.base_sha, pack.target.head_sha),
+    };
     let directory = out_dir.map_or_else(
-        || {
-            root.join(".anki-repo")
-                .join("review")
-                .join(format!("{}-{}", pack.target.base_sha, pack.target.head_sha))
-        },
+        || root.join(".anki-repo").join("review").join(default_name),
         Path::to_path_buf,
     );
     let directory = safe_output_path(root, &directory, true)?;
@@ -1304,27 +1307,39 @@ fn scope_error(error: ScopeError) -> DomainError {
 fn language_error(error: language::LanguageError) -> DomainError {
     match error {
         language::LanguageError::Preconditions(message) => {
-            let stale =
-                message.contains("устаревший") || message.contains("исходный текст изменился");
-            DomainError::new(
-                if stale {
-                    ErrorCode::SourceChanged
-                } else {
-                    ErrorCode::LanguageDecisionInvalid
-                },
-                message,
-            )
+            DomainError::new(ErrorCode::LanguageDecisionInvalid, message)
         }
+        language::LanguageError::StaleDigest { path } => DomainError::new(
+            ErrorCode::SourceChanged,
+            format!("устаревший SHA-256: {path}"),
+        ),
+        language::LanguageError::StaleAnchor { path } => DomainError::new(
+            ErrorCode::SourceChanged,
+            format!("исходный текст изменился: {path}"),
+        ),
         language::LanguageError::Read { path, source } => DomainError::new(
             ErrorCode::InputUnreadable,
             format!("не удалось прочитать исходник для языковой проверки «{path}»: {source}"),
         ),
-        language::LanguageError::Publication { message, written } => DomainError::with_details(
-            ErrorCode::WriteFailed,
-            message,
-            crate::details! { "written" => written },
-        ),
+        language::LanguageError::SourceChanged { source, written }
+        | language::LanguageError::Publication { source, written } => {
+            language_publication_error(source, written)
+        }
     }
+}
+
+fn language_publication_error(source: DomainError, written: Vec<String>) -> DomainError {
+    let DomainError {
+        code,
+        message,
+        mut details,
+    } = source;
+    if let Value::Object(object) = &mut details {
+        object.insert("written".into(), serde_json::json!(written));
+    } else {
+        details = serde_json::json!({"source_details": details, "written": written});
+    }
+    DomainError::with_details(code, message, details)
 }
 
 fn artifact_conflict(path: &Path) -> DomainError {
@@ -1396,6 +1411,49 @@ mod tests {
     }
 
     #[test]
+    fn language_stale_and_publication_errors_keep_domain_codes() {
+        for error in [
+            language::LanguageError::StaleDigest {
+                path: "src/lib.rs".into(),
+            },
+            language::LanguageError::StaleAnchor {
+                path: "src/lib.rs".into(),
+            },
+        ] {
+            assert_eq!(language_error(error).code, ErrorCode::SourceChanged);
+        }
+
+        let source = DomainError::with_details(
+            ErrorCode::SourceChanged,
+            "исходник изменился перед записью",
+            serde_json::json!({"reason": "source_modified"}),
+        );
+        let mapped = language_error(language::LanguageError::SourceChanged {
+            source,
+            written: vec!["src/lib.rs".into()],
+        });
+        assert_eq!(mapped.code, ErrorCode::SourceChanged);
+        assert_eq!(
+            mapped.details["reason"],
+            serde_json::json!("source_modified")
+        );
+        assert_eq!(mapped.details["written"], serde_json::json!(["src/lib.rs"]));
+
+        let source = DomainError::with_details(
+            ErrorCode::WriteFailed,
+            "не удалось сохранить исходник",
+            serde_json::json!({"operation": "replace"}),
+        );
+        let mapped = language_error(language::LanguageError::Publication {
+            source,
+            written: vec!["src/lib.rs".into()],
+        });
+        assert_eq!(mapped.code, ErrorCode::WriteFailed);
+        assert_eq!(mapped.details["operation"], serde_json::json!("replace"));
+        assert_eq!(mapped.details["written"], serde_json::json!(["src/lib.rs"]));
+    }
+
+    #[test]
     fn pack_bytes_and_summary_are_deterministic_for_same_snapshot() {
         let repo = GitFixture::new("stable");
         let base = git_output(&repo.0, &["rev-parse", "HEAD"]).unwrap();
@@ -1416,6 +1474,54 @@ mod tests {
                 .candidates
                 .iter()
                 .any(|candidate| candidate.detector == "error_path")
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_path_includes_baseline_head() {
+        let repo = GitFixture::new("verify-baseline-path");
+        let base = String::from_utf8(git_output(&repo.0, &["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        repo.add_head("pub fn run() { panic!(\"example\"); }\n");
+        let head = String::from_utf8(git_output(&repo.0, &["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        let collected = scope::collect_scope(&repo.0, &base, &head).unwrap();
+        let pack = build_pack(&repo.0, collected, false);
+
+        let mut baseline_a = pack.clone();
+        baseline_a.target.head_sha = base.clone();
+        let changes_a = delta::compare(&baseline_a, &pack).unwrap();
+        let result_a = save_snapshot(&repo.0, None, &pack, Some(changes_a)).unwrap();
+
+        let mut baseline_b = pack.clone();
+        baseline_b.target.head_sha = head.clone();
+        let changes_b = delta::compare(&baseline_b, &pack).unwrap();
+        let result_b = save_snapshot(&repo.0, None, &pack, Some(changes_b)).unwrap();
+
+        assert_eq!(
+            result_a.artifact_dir,
+            format!(".anki-repo/review/{base}-{base}-{head}")
+        );
+        assert_eq!(
+            result_b.artifact_dir,
+            format!(".anki-repo/review/{head}-{base}-{head}")
+        );
+        assert_ne!(result_a.artifact_dir, result_b.artifact_dir);
+        assert!(
+            repo.0
+                .join(&result_a.artifact_dir)
+                .join("delta.json")
+                .exists()
+        );
+        assert!(
+            repo.0
+                .join(&result_b.artifact_dir)
+                .join("delta.json")
+                .exists()
         );
     }
 

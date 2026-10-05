@@ -16,6 +16,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Максимальная длина однострочной сводки stderr.
 pub const STDERR_SUMMARY_MAX_CHARS: usize = 2_000;
 
+const STDERR_LINE_MAX_BYTES: usize = (STDERR_SUMMARY_MAX_CHARS + 1) * 4 + 3;
+
 /// Известный или будущий уровень rustc-диагностики.
 ///
 /// Неизвестные значения сохраняются как строки, чтобы новая версия rustc не
@@ -546,8 +548,7 @@ fn failed_run(
 fn read_bounded_stderr_summary(mut reader: impl Read) -> io::Result<Option<String>> {
     let mut bytes = [0_u8; 4_096];
     let mut summary = String::new();
-    let mut line = String::new();
-    let mut line_chars = 0_usize;
+    let mut line_bytes = Vec::with_capacity(STDERR_LINE_MAX_BYTES);
     let mut line_truncated = false;
     let mut truncated = false;
 
@@ -556,24 +557,28 @@ fn read_bounded_stderr_summary(mut reader: impl Read) -> io::Result<Option<Strin
         if count == 0 {
             break;
         }
-        let text = String::from_utf8_lossy(&bytes[..count]);
-        for character in text.chars() {
-            if character == '\n' {
-                append_stable_stderr_line(&mut summary, &line, line_truncated, &mut truncated);
-                line.clear();
-                line_chars = 0;
+        let mut start = 0;
+        for (index, byte) in bytes[..count].iter().enumerate() {
+            if *byte == b'\n' {
+                append_bounded_stderr_bytes(
+                    &mut line_bytes,
+                    &bytes[start..index],
+                    &mut line_truncated,
+                );
+                append_bounded_stderr_line(
+                    &mut summary,
+                    &line_bytes,
+                    line_truncated,
+                    &mut truncated,
+                );
+                line_bytes.clear();
                 line_truncated = false;
-                continue;
-            }
-            if line_chars <= STDERR_SUMMARY_MAX_CHARS {
-                line.push(character);
-                line_chars += 1;
-            } else {
-                line_truncated = true;
+                start = index + 1;
             }
         }
+        append_bounded_stderr_bytes(&mut line_bytes, &bytes[start..count], &mut line_truncated);
     }
-    append_stable_stderr_line(&mut summary, &line, line_truncated, &mut truncated);
+    append_bounded_stderr_line(&mut summary, &line_bytes, line_truncated, &mut truncated);
 
     if truncated {
         summary.push('…');
@@ -583,6 +588,29 @@ fn read_bounded_stderr_summary(mut reader: impl Read) -> io::Result<Option<Strin
     } else {
         Ok(Some(summary))
     }
+}
+
+fn append_bounded_stderr_bytes(line: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
+    let available = STDERR_LINE_MAX_BYTES.saturating_sub(line.len());
+    let count = bytes.len().min(available);
+    line.extend_from_slice(&bytes[..count]);
+    *truncated |= count < bytes.len();
+}
+
+fn append_bounded_stderr_line(
+    summary: &mut String,
+    bytes: &[u8],
+    bytes_truncated: bool,
+    truncated: &mut bool,
+) {
+    let text = String::from_utf8_lossy(bytes);
+    let mut characters = text.chars();
+    let line: String = characters
+        .by_ref()
+        .take(STDERR_SUMMARY_MAX_CHARS + 1)
+        .collect();
+    let line_truncated = bytes_truncated || characters.next().is_some();
+    append_stable_stderr_line(summary, &line, line_truncated, truncated);
 }
 
 fn append_stable_stderr_line(
@@ -766,6 +794,19 @@ mod tests {
         assert!(summary.starts_with("первое второе "));
         assert!(summary.ends_with('…'));
         assert!(!summary.contains('\n'));
+    }
+
+    #[test]
+    fn stderr_utf8_is_decoded_after_chunk_boundaries() {
+        let line = format!("{}{}{}", "é".repeat(1_951), "😀".repeat(48), "界");
+        assert_eq!(line.len(), 4_097);
+        assert_eq!(line.chars().count(), 2_000);
+        let mut stderr = line.as_bytes().to_vec();
+        stderr.push(b'\n');
+
+        let summary = read_bounded_stderr_summary(Cursor::new(stderr)).unwrap();
+
+        assert_eq!(summary.as_deref(), Some(line.as_str()));
     }
 
     #[test]

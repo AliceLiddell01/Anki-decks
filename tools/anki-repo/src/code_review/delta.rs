@@ -1,4 +1,4 @@
-//! Detector-level сравнение evidence snapshots без semantic verdict.
+//! Сравнение снимков свидетельств на уровне детекторов без смысловой оценки.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,10 +9,10 @@ use super::model::{
     REVIEW_SCHEMA_VERSION, ReviewDelta, ReviewPack, SnapshotIdentity, ToolRunChange,
 };
 
-/// Сравнивает два pack одной репозитории и одной базовой ревизии.
+/// Сравнивает два пакета одного репозитория и одной базовой ревизии.
 ///
-/// Удаление candidate означает только, что detector больше не видит сигнал.
-/// Оно не подтверждает исправление semantic finding.
+/// Удаление кандидата означает только, что детектор больше не видит сигнал.
+/// Оно не подтверждает исправление замечания по существу.
 pub fn compare(before: &ReviewPack, after: &ReviewPack) -> Result<ReviewDelta, DomainError> {
     validate_review_pack(before)?;
     validate_review_pack(after)?;
@@ -22,7 +22,7 @@ pub fn compare(before: &ReviewPack, after: &ReviewPack) -> Result<ReviewDelta, D
     {
         return Err(DomainError::with_details(
             ErrorCode::BaselineMismatch,
-            "review-pack относятся к разным репозиториям или базовым коммитам",
+            "пакеты относятся к разным репозиториям или базовым коммитам",
             crate::details! {
                 "before_repository_id" => before.target.repository_id,
                 "after_repository_id" => after.target.repository_id,
@@ -504,7 +504,7 @@ mod tests {
                 "target_name": "lib"
             }
         }))
-        .expect("fixture diagnostic разбирается")
+        .expect("тестовая диагностика разбирается")
     }
 
     fn pack(
@@ -627,7 +627,7 @@ mod tests {
         unrelated.target.repository_id = "another-repo".into();
         assert_eq!(
             compare(&before, &unrelated)
-                .expect_err("другая репозитория отклоняется")
+                .expect_err("пакет из другого репозитория отклоняется")
                 .code,
             ErrorCode::BaselineMismatch
         );
