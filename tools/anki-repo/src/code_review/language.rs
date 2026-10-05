@@ -546,11 +546,7 @@ fn markdown_spans(text: &str) -> Vec<Span> {
             config_spans(frontmatter, true)
                 .into_iter()
                 .map(|(start, end, context)| {
-                    (
-                        frontmatter_start + start,
-                        frontmatter_start + end,
-                        context,
-                    )
+                    (frontmatter_start + start, frontmatter_start + end, context)
                 }),
         );
         offset = body_start;
