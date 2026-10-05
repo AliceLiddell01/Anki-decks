@@ -503,37 +503,76 @@ fn has_untracked_workspace_sources(root: &Path) -> bool {
     let Ok(output) = git_output(root, &["ls-files", "--others", "--exclude-standard", "-z"]) else {
         return true;
     };
+    if output
+        .split(|byte| *byte == 0)
+        .any(is_untracked_workspace_source)
+    {
+        return true;
+    }
+    has_ignored_untracked_workspace_inputs(root)
+}
+
+fn is_untracked_workspace_source(path: &[u8]) -> bool {
+    if path.is_empty() || is_local_data_path(path) {
+        return false;
+    }
+    // Это проверка известных входов Cargo, а не изоляция произвольного
+    // build.rs: он может читать любые файлы после явного --run-clippy.
+    let Ok(path) = std::str::from_utf8(path) else {
+        return true;
+    };
+    let name = path.rsplit('/').next().unwrap_or(path);
+    path.ends_with(".rs")
+        || matches!(
+            name,
+            "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml"
+        )
+        || path == ".cargo/config"
+        || path == ".cargo/config.toml"
+        || path.ends_with("/.cargo/config")
+        || path.ends_with("/.cargo/config.toml")
+}
+
+fn has_ignored_untracked_workspace_inputs(root: &Path) -> bool {
+    let mut args = vec![
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+        "--",
+    ];
+    args.extend([
+        ":(glob)**/*.rs",
+        ":(glob)**/Cargo.toml",
+        ":(glob)**/Cargo.lock",
+        ":(glob)**/rust-toolchain",
+        ":(glob)**/rust-toolchain.toml",
+        ":(glob)**/.cargo/config",
+        ":(glob)**/.cargo/config.toml",
+        ":(exclude,glob)**/target/**",
+    ]);
+    let Ok(output) = git_output(root, &args) else {
+        return true;
+    };
     output.split(|byte| *byte == 0).any(|path| {
-        if path.is_empty() {
-            return false;
-        }
-        if [
-            b"decks/".as_slice(),
-            b".asset-store/".as_slice(),
-            b".anki-repo/review/".as_slice(),
-            b".codex/local/".as_slice(),
-        ]
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
-        {
-            return false;
-        }
-        // Это проверка известных входов Cargo, а не изоляция произвольного
-        // build.rs: он может читать любые файлы после явного --run-clippy.
-        let Ok(path) = std::str::from_utf8(path) else {
-            return true;
-        };
-        let name = path.rsplit('/').next().unwrap_or(path);
-        path.ends_with(".rs")
-            || matches!(
-                name,
-                "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml"
-            )
-            || path == ".cargo/config"
-            || path == ".cargo/config.toml"
-            || path.ends_with("/.cargo/config")
-            || path.ends_with("/.cargo/config.toml")
+        !path.is_empty()
+            && !is_local_data_path(path)
+            && !path
+                .split(|byte| *byte == b'/')
+                .any(|part| part == b"target")
     })
+}
+
+fn is_local_data_path(path: &[u8]) -> bool {
+    [
+        b"decks/".as_slice(),
+        b".asset-store/".as_slice(),
+        b".anki-repo/review/".as_slice(),
+        b".codex/local/".as_slice(),
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
 }
 
 fn detector_status(status: &FileStatus) -> detectors::FileStatus {
@@ -920,7 +959,7 @@ fn write_directory_once(
     directory: &Path,
     documents: &BTreeMap<&str, Vec<u8>>,
 ) -> Result<(), DomainError> {
-    if directory.exists() {
+    let created_directory = if directory.exists() {
         if directory.is_symlink() || !directory.is_dir() {
             return Err(artifact_conflict(directory));
         }
@@ -948,17 +987,22 @@ fn write_directory_once(
         if names.len() == documents.len() {
             return Ok(());
         }
-        return Err(artifact_conflict(directory));
-    }
-    let parent = directory.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| artifact_write_error(parent, &error))?;
-    fs::create_dir(directory).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            artifact_conflict(directory)
-        } else {
-            artifact_write_error(directory, &error)
+        if !names.is_empty() {
+            return Err(artifact_conflict(directory));
         }
-    })?;
+        false
+    } else {
+        let parent = directory.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|error| artifact_write_error(parent, &error))?;
+        fs::create_dir(directory).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                artifact_conflict(directory)
+            } else {
+                artifact_write_error(directory, &error)
+            }
+        })?;
+        true
+    };
     let mut written = Vec::new();
     for (name, bytes) in documents {
         let path = directory.join(name);
@@ -966,7 +1010,9 @@ fn write_directory_once(
             for written_path in written {
                 let _ = fs::remove_file(written_path);
             }
-            let _ = fs::remove_dir(directory);
+            if created_directory {
+                let _ = fs::remove_dir(directory);
+            }
             return Err(artifact_write_error(&path, &error));
         }
         written.push(path);
@@ -1560,6 +1606,51 @@ mod tests {
         fs::create_dir_all(repo.0.join(".cargo")).unwrap();
         fs::write(repo.0.join(".cargo/config.toml"), "[build]\n").unwrap();
         assert!(!working_tree_matches(&target, &repo.0));
+        fs::remove_file(repo.0.join(".cargo/config.toml")).unwrap();
+
+        fs::write(
+            repo.0.join(".gitignore"),
+            "Cargo.toml\nCargo.lock\nrust-toolchain\nrust-toolchain.toml\n.cargo/\ntarget/\n*.rs\nignored.txt\n",
+        )
+        .unwrap();
+        assert!(working_tree_matches(&target, &repo.0));
+        for relative in [
+            "Cargo.toml",
+            "nested/Cargo.toml",
+            "Cargo.lock",
+            "nested/rust-toolchain",
+            "rust-toolchain.toml",
+            ".cargo/config",
+            "workspace/.cargo/config.toml",
+            "src/ignored.rs",
+        ] {
+            let path = repo.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"ignored Cargo input").unwrap();
+            assert!(
+                !working_tree_matches(&target, &repo.0),
+                "ignored Cargo input {relative} must prevent running Clippy"
+            );
+            fs::remove_file(path).unwrap();
+        }
+        for relative in [
+            "ignored.txt",
+            "target/generated.rs",
+            "target/Cargo.toml",
+            "decks/module/Cargo.toml",
+            ".asset-store/module/Cargo.toml",
+            ".anki-repo/review/run/Cargo.toml",
+            ".codex/local/run/Cargo.toml",
+        ] {
+            let path = repo.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"ignored local data").unwrap();
+            assert!(
+                working_tree_matches(&target, &repo.0),
+                "ignored local data {relative} must not prevent running Clippy"
+            );
+            fs::remove_file(path).unwrap();
+        }
     }
 
     fn synthetic_cargo_repo(label: &str) -> GitFixture {
@@ -1662,12 +1753,37 @@ mod tests {
         let first = BTreeMap::from([("review.json", b"{}\n".to_vec())]);
         let second = BTreeMap::from([("review.json", b"{\"different\":true}\n".to_vec())]);
         let directory = temp.join("snapshot");
+        fs::create_dir(&directory).unwrap();
         write_directory_once(&directory, &first).unwrap();
         write_directory_once(&directory, &first).unwrap();
         assert_eq!(
             write_directory_once(&directory, &second).unwrap_err().code,
             ErrorCode::ReviewArtifactConflict
         );
+
+        let failing_documents = BTreeMap::from([
+            ("a", b"written before failure".to_vec()),
+            ("nested/file", b"write failure".to_vec()),
+        ]);
+        let existing_empty = temp.join("existing-empty");
+        fs::create_dir(&existing_empty).unwrap();
+        assert_eq!(
+            write_directory_once(&existing_empty, &failing_documents)
+                .unwrap_err()
+                .code,
+            ErrorCode::WriteFailed
+        );
+        assert!(existing_empty.is_dir());
+        assert_eq!(fs::read_dir(&existing_empty).unwrap().count(), 0);
+
+        let newly_created = temp.join("newly-created");
+        assert_eq!(
+            write_directory_once(&newly_created, &failing_documents)
+                .unwrap_err()
+                .code,
+            ErrorCode::WriteFailed
+        );
+        assert!(!newly_created.exists());
         fs::remove_dir_all(temp).unwrap();
     }
 
