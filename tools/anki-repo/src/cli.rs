@@ -53,7 +53,7 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki и свидетельства для code review: inspect, find, stats, validate, qa, review, review-check, code-review, language, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review, language, edit, models, create, retire, migrate-media, visual-report",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report и code-review collect/verify/delta только читают\n\
@@ -481,7 +481,7 @@ pub enum Command {
         pitch_asset_store: Option<PathBuf>,
     },
 
-    /// Детерминированные свидетельства для независимого code review.
+    /// Детерминированные свидетельства для независимого ревью кода.
     CodeReview {
         #[command(subcommand)]
         command: CodeReviewCommand,
@@ -494,15 +494,15 @@ pub enum Command {
     },
 }
 
-/// Подкоманды сбора и сравнения свидетельств для code review.
+/// Подкоманды сбора и сравнения свидетельств для ревью кода.
 #[derive(Debug, Subcommand)]
 pub enum CodeReviewCommand {
-    /// Собрать review-pack для явного диапазона Git.
+    /// Собрать пакет свидетельств для явного диапазона Git.
     Collect {
         /// Базовая ссылка Git, например main или origin/main.
         #[arg(long)]
         base: String,
-        /// Верхняя ссылка Git; её SHA фиксируется в pack.
+        /// Верхняя ссылка Git; её SHA фиксируется в пакете.
         #[arg(long)]
         head: String,
         /// Каталог локальных артефактов; по умолчанию вычисляется по SHA.
@@ -529,7 +529,7 @@ pub enum CodeReviewCommand {
         run_clippy: bool,
     },
 
-    /// Сравнить два ранее сохранённых review-pack без повторного анализа.
+    /// Сравнить два ранее сохранённых пакета ревью без повторного анализа.
     Delta {
         /// Исходный файл review.json.
         #[arg(long, value_name = "PACK")]
@@ -543,11 +543,11 @@ pub enum CodeReviewCommand {
     },
 }
 
-/// Подкоманды language-policy workflow.
+/// Подкоманды языковой проверки.
 #[derive(Debug, Subcommand)]
 pub enum LanguageCommand {
     /// Найти человекочитаемые фрагменты в заданных файлах или полных версиях файлов
-    /// из review-pack.
+    /// из пакета ревью.
     #[command(group(
         clap::ArgGroup::new("scan_source")
             .required(true)
@@ -561,7 +561,7 @@ pub enum LanguageCommand {
         /// Путь внутри корня репозитория; флаг можно повторять.
         #[arg(long = "path", value_name = "PATH")]
         paths: Vec<PathBuf>,
-        /// Использовать область изменений и версии файлов после изменений из review-pack.
+        /// Использовать область изменений и версии файлов после изменений из пакета ревью.
         #[arg(long, value_name = "PACK")]
         pack: Option<PathBuf>,
         /// Сохранить полный артефакт сканирования для принятия решений.

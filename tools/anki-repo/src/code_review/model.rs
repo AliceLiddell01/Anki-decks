@@ -247,6 +247,9 @@ impl ReviewPack {
                 .iter()
                 .find(|file| file.path == candidate.path)
                 .map_or(CandidateOrigin::Unknown, |file| {
+                    if file.binary {
+                        return CandidateOrigin::Unknown;
+                    }
                     let Ok(start) = u64::try_from(candidate.line) else {
                         return CandidateOrigin::Unknown;
                     };
@@ -402,6 +405,15 @@ mod tests {
         pack.scope.files[0].base_state = ImageState::InvalidUtf8;
         assert_eq!(pack.all_candidates()[0].origin, CandidateOrigin::Unknown);
         pack.scope.files.clear();
+        assert_eq!(pack.all_candidates()[0].origin, CandidateOrigin::Unknown);
+    }
+
+    #[test]
+    fn language_origin_is_unknown_for_binary_scope_files() {
+        let mut pack = language_pack("// Existing English explanation\n", Vec::new());
+        let file = &mut pack.scope.files[0];
+        file.binary = true;
+        file.post_state = ImageState::Binary;
         assert_eq!(pack.all_candidates()[0].origin, CandidateOrigin::Unknown);
     }
 }

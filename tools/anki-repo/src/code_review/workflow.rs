@@ -288,7 +288,7 @@ fn build_pack(root: &Path, collected: CollectedScope, run_clippy: bool) -> Revie
             status: detector_status(&file.status),
             base_text: file.base.text.clone(),
             post_text: file.post.text.clone(),
-            post_changed_lines: Some(file.post_changed_lines.clone()),
+            post_changed_lines: (!file.binary).then(|| file.post_changed_lines.clone()),
         })
         .collect();
     let static_candidates = detectors::detect(&inputs);

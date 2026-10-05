@@ -52,7 +52,7 @@ pub(crate) fn validate_review_pack(pack: &ReviewPack) -> Result<(), DomainError>
         return Err(DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
             format!(
-                "неподдерживаемая версия review-pack: {}",
+                "неподдерживаемая версия пакета ревью: {}",
                 pack.schema_version
             ),
         ));
@@ -63,7 +63,7 @@ pub(crate) fn validate_review_pack(pack: &ReviewPack) -> Result<(), DomainError>
     {
         return Err(DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
-            "review-pack не содержит полную snapshot identity",
+            "пакет ревью не содержит полные сведения об идентичности снимка",
         ));
     }
     Ok(())

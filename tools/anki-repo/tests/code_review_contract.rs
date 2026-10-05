@@ -12,11 +12,11 @@ fn git(root: &Path, args: &[&str]) -> String {
         .current_dir(root)
         .args(args)
         .output()
-        .unwrap_or_else(|error| panic!("git {args:?}: {error}"));
+        .unwrap_or_else(|_| panic!("не удалось запустить тестовую команду Git"));
     assert!(
         output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "тестовая команда Git завершилась с кодом {:?}",
+        output.status.code()
     );
     String::from_utf8(output.stdout)
         .expect("вывод синтетического Git-репозитория должен быть UTF-8")
@@ -224,7 +224,16 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
     assert_eq!(verified["target"]["base_sha"], json!(base_sha));
     assert_eq!(verified["target"]["head_sha"], json!(fixed_sha));
     assert!(
-        verified["delta"]["candidates"]
+        verified["delta"]["candidate_status_counts"]["gone"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(verified["delta"].get("candidates").is_none());
+    let saved_verify_delta: Value =
+        serde_json::from_slice(&fs::read(verified_dir.join("delta.json")).unwrap()).unwrap();
+    assert!(
+        saved_verify_delta["candidates"]
             .as_array()
             .unwrap()
             .iter()
@@ -685,6 +694,118 @@ fn language_scan_dry_run_apply_and_check_are_end_to_end() {
     );
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let result = parse_json(&stdout)["result"].clone();
-    assert_eq!(result["scan"]["candidates"], json!([]));
-    assert_eq!(result["scan"]["files"][0]["path"], json!("src/message.rs"));
+    assert_eq!(result["candidates"], json!([]));
+    assert_eq!(result["candidates_total"], json!(0));
+    assert_eq!(result["files_total"], json!(1));
+    assert!(result.get("scan").is_none());
+}
+
+#[test]
+fn language_check_bounds_stdout_and_keeps_full_scan_in_requested_artifact() {
+    let temp = TempDir::new("language-check-bounded-output");
+    init_repo(&temp);
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    let root_arg = temp.path().to_string_lossy().into_owned();
+    let source_path = temp.path().join("src/messages.rs");
+    let source = (0..25)
+        .map(|index| {
+            if index == 0 {
+                format!(
+                    "// Human message number {index:02} {}\n",
+                    "additional ".repeat(80)
+                )
+            } else {
+                format!("// Human message number {index:02}\n")
+            }
+        })
+        .collect::<String>();
+    fs::write(&source_path, source).unwrap();
+
+    let scan_path = temp.path().join("language-scan.json");
+    let scan_path_arg = scan_path.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run_cli_in(
+        Some(temp.path()),
+        &[
+            "--json",
+            "language",
+            "scan",
+            "--root",
+            &root_arg,
+            "--path",
+            "src/messages.rs",
+            "--out",
+            &scan_path_arg,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let scan: Value = serde_json::from_slice(&fs::read(&scan_path).unwrap()).unwrap();
+    assert_eq!(scan["candidates"].as_array().unwrap().len(), 25);
+
+    let (code, stdout, stderr) = run_cli_in(
+        Some(temp.path()),
+        &[
+            "--json",
+            "language",
+            "check",
+            "--root",
+            &root_arg,
+            "--scan",
+            &scan_path_arg,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let result = parse_json(&stdout)["result"].clone();
+    assert_eq!(result["files_total"], json!(1));
+    assert_eq!(result["candidates_total"], json!(25));
+    assert_eq!(result["candidates_truncated"], json!(true));
+    assert_eq!(result["candidates"].as_array().unwrap().len(), 20);
+    assert!(result.get("scan").is_none());
+    assert!(result.get("files").is_none());
+    assert!(result.get("skipped").is_none());
+    assert!(
+        result["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["text"].as_str().unwrap().chars().count() <= 121)
+    );
+    assert_eq!(result["candidates"][0]["text_truncated"], json!(true));
+
+    let human = run_cli_in(
+        Some(temp.path()),
+        &[
+            "language",
+            "check",
+            "--root",
+            &root_arg,
+            "--scan",
+            &scan_path_arg,
+        ],
+    );
+    assert_eq!(human.0, 0, "stdout: {}\nstderr: {}", human.1, human.2);
+    assert!(human.1.contains("Показано кандидатов: 20 из 25"));
+    assert!(human.1.contains("Выборка усечена: да"));
+    assert!(!human.1.contains("Human message number 24"));
+
+    let updated_path = temp.path().join("language-check.json");
+    let updated_path_arg = updated_path.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run_cli_in(
+        Some(temp.path()),
+        &[
+            "--json",
+            "language",
+            "check",
+            "--root",
+            &root_arg,
+            "--scan",
+            &scan_path_arg,
+            "--out",
+            &updated_path_arg,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let bounded_stdout = parse_json(&stdout)["result"].clone();
+    assert_eq!(bounded_stdout["candidates"].as_array().unwrap().len(), 20);
+    let full_scan: Value = serde_json::from_slice(&fs::read(updated_path).unwrap()).unwrap();
+    assert_eq!(full_scan["candidates"].as_array().unwrap().len(), 25);
 }
