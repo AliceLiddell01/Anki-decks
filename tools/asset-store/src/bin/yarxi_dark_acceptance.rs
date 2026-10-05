@@ -34,8 +34,8 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     plan: PathBuf,
 
-    /// Новый ZIP вне checkout и run workspace; parent должен существовать.
-    /// По умолчанию: системный temp root/anki-decks-evidence/<уникальный run>.zip.
+    /// Новый ZIP вне checkout и рабочего каталога запуска; родительский каталог должен существовать.
+    /// По умолчанию: системный корень временных файлов/anki-decks-evidence/<уникальный запуск>.zip.
     #[arg(long, value_name = "ZIP")]
     output: Option<PathBuf>,
 
@@ -43,7 +43,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     transcript: Option<PathBuf>,
 
-    /// JSON результатов fault injection; отдельная безопасная копия в ZIP.
+    /// JSON с результатами внедрения отказов; отдельная безопасная копия в ZIP.
     #[arg(long, value_name = "PATH")]
     fault_evidence: Option<PathBuf>,
 
@@ -138,7 +138,11 @@ fn run_body(
                 AcquisitionEvent::Heartbeat { index, attempt } => {
                     json!({"event":"heartbeat","index":index,"attempt":attempt})
                 }
-                AcquisitionEvent::ItemCompleted { index, outcome } => {
+                AcquisitionEvent::ItemCompleted {
+                    index,
+                    outcome,
+                    diagnostics,
+                } => {
                     if index != acquisitions.len() || index >= items.len() {
                         return Err(asset_store::error::AssetError::new(
                             asset_store::error::ErrorCode::InvalidTransition,
@@ -153,6 +157,9 @@ fn run_body(
                             json!({"failure":{"stage":"acquisition","code":"provider_item_failed","message":error,"diagnostic":null}})
                         }
                     };
+                    if let Some(diagnostics) = diagnostics {
+                        diagnostics.finish_acquisition(&outcome);
+                    }
                     acquisitions.push(*outcome);
                     json!({"event":"item_completed","index":index,"result":evidence})
                 }
@@ -210,7 +217,7 @@ fn run_body(
         let provisional = AssetRecord {
             identity: AssetIdentity::new("kanji", item.character.clone())?,
             // Валидатор использует только identity и фактический формат; запись не сохраняется,
-            // поэтому здесь нет утверждения о storage path или имени для consumer.
+            // поэтому здесь нет утверждения о пути хранения или имени для потребителя.
             storage_path: String::new(),
             consumer_filename: String::new(),
             sha256: sha256.clone(),
@@ -318,7 +325,7 @@ fn run_body(
     }
 
     println!(
-        "Автоматическая проверка прошла для {verified_count} PNG; проверьте изображения вручную в ZIP evidence."
+        "Автоматическая проверка прошла для {verified_count} PNG; проверьте изображения вручную в ZIP-архиве с данными проверки."
     );
     Ok(())
 }
@@ -926,7 +933,7 @@ mod tests {
         })];
         let failure = json!({
             "code": "acquisition_interrupted",
-            "message": "browser failed <after launch>",
+            "message": "браузер завершился ошибкой <после запуска>",
         });
 
         save_html_report(
@@ -942,7 +949,7 @@ mod tests {
         assert!(html.contains("id=\"session-failure\""));
         assert!(html.contains("href=\"#session-failure\""));
         assert!(html.contains("Обработка не началась: сессия браузера завершилась ошибкой."));
-        assert!(html.contains("browser failed &lt;after launch&gt;"));
+        assert!(html.contains("браузер завершился ошибкой &lt;после запуска&gt;"));
         assert!(!html.contains("PNG не сохранён: изображение получить не удалось."));
     }
 

@@ -22,7 +22,7 @@ use chromiumoxide::{
     },
     cdp::js_protocol::runtime::{EnableParams as RuntimeEnableParams, EventExceptionThrown},
 };
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use url::Url;
@@ -419,7 +419,7 @@ async fn profile_launch_failure(profile: BrowserProfile, failure: BrowserSetupFa
     }
 }
 
-/// Закрытие CDP transport и завершение owned процесса — независимые наблюдения.
+/// Закрытие транспорта CDP и завершение принадлежащего сессии процесса — независимые наблюдения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrowserTransportStop {
     Closed,
@@ -439,8 +439,8 @@ fn transport_stop_result(
 ) -> BrowserTransportStop {
     match result {
         Ok(()) => BrowserTransportStop::Closed,
-        // Типы означают отсутствие живого handler/response channel, а не ошибку
-        // предметного CDP command. Нефатальность определяется только после cleanup.
+        // Типы означают отсутствие живого обработчика или канала ответа, а не ошибку
+        // самой команды CDP. Нефатальность определяется только после очистки ресурсов.
         Err(
             chromiumoxide::error::CdpError::ChannelSendError(_)
             | chromiumoxide::error::CdpError::NoResponse,
@@ -478,7 +478,7 @@ async fn stop_browser(browser: &mut Browser, browser_session: u64) -> BrowserSto
         browser_session,
         outcome = transport_outcome,
         stage_duration_ms = duration_millis(started.elapsed()),
-        "Завершено наблюдение остановки CDP transport"
+        "Завершено наблюдение остановки транспорта CDP"
     );
     let started = Instant::now();
     let wait = timeout(Duration::from_secs(2), browser.wait()).await;
@@ -902,16 +902,16 @@ pub struct NetworkOutcome {
 /// Неинтерпретированная провайдером телеметрия CDP одного этапа получения.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeSnapshot {
-    /// Epoch, для которой снято наблюдение; bootstrap epoch 0 остаётся явной.
+    /// Эпоха, для которой снято наблюдение; начальная эпоха 0 остаётся явной.
     pub epoch: u64,
-    /// Monotonic возраст реально наблюдавшихся pending requests.
+    /// Монотонный возраст реально наблюдавшихся ожидающих запросов.
     pub pending_observations: Vec<PendingRequestObservation>,
     pub pending_requests: Vec<TrackedRequest>,
     pub network_failures: Vec<NetworkOutcome>,
     pub http_errors: Vec<NetworkOutcome>,
     pub javascript_exceptions: u32,
     pub monitor_failed: bool,
-    /// Evidence чужих epochs отделено от operational readiness snapshot.
+    /// Свидетельства чужих эпох отделены от рабочего снимка готовности.
     pub stale_pending_requests: Vec<TrackedRequest>,
     pub stale_network_failures: Vec<NetworkOutcome>,
     pub stale_http_errors: Vec<NetworkOutcome>,
@@ -927,7 +927,7 @@ pub struct PendingRequestObservation {
     pub observed_ms: u64,
 }
 
-/// Ограниченное evidence для логов: URL и сырые идентификаторы не сериализуются.
+/// Ограниченные сведения для журналов: URL и сырые идентификаторы не сериализуются.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeSnapshotDiagnostic {
     pub epoch: u64,
@@ -1003,8 +1003,8 @@ impl RuntimeSnapshot {
             status_code: None,
             failure_category: None,
         };
-        // Защита от raw fixture со смешанными epochs: чужие записи не становятся
-        // текущими даже при сборке snapshot вне RuntimeState.
+        // Защита от исходных тестовых данных со смешанными эпохами: чужие записи не становятся
+        // текущими даже при сборке снимка вне RuntimeState.
         let stale_pending = self.stale_pending_requests.iter().chain(
             self.pending_requests
                 .iter()
@@ -1334,6 +1334,26 @@ impl CdpRuntimeMonitor {
             .await
             .map_err(|error| format!("CDP Runtime.enable: {error}"))?;
 
+        Ok(Self::from_event_streams(
+            main_frame_id,
+            request_events,
+            finished_events,
+            failed_events,
+            response_events,
+            exception_events,
+        ))
+    }
+
+    // Каждая BrowserSession получает собственное состояние и собственные задачи:
+    // старые слушатели и их поздние события остаются у прежнего монитора.
+    fn from_event_streams(
+        main_frame_id: String,
+        request_events: impl Stream<Item = Arc<EventRequestWillBeSent>> + Send + Unpin + 'static,
+        finished_events: impl Stream<Item = Arc<EventLoadingFinished>> + Send + Unpin + 'static,
+        failed_events: impl Stream<Item = Arc<EventLoadingFailed>> + Send + Unpin + 'static,
+        response_events: impl Stream<Item = Arc<EventResponseReceived>> + Send + Unpin + 'static,
+        exception_events: impl Stream<Item = Arc<EventExceptionThrown>> + Send + Unpin + 'static,
+    ) -> Self {
         let state = Arc::new(Mutex::new(RuntimeState {
             main_frame_id,
             ..RuntimeState::default()
@@ -1411,10 +1431,10 @@ impl CdpRuntimeMonitor {
             }));
         }
 
-        Ok(Self {
+        Self {
             state,
             tasks: Arc::new(tasks),
-        })
+        }
     }
 
     pub fn begin_epoch(&self) -> u64 {
@@ -1754,7 +1774,7 @@ mod tests {
             path = profile.path.clone();
             temp_path = profile.temp_path.clone();
             fs::write(path.join("data"), "browser").unwrap();
-            fs::write(temp_path.join("data"), "browser temp").unwrap();
+            fs::write(temp_path.join("data"), "временные данные браузера").unwrap();
         }
         assert!(!path.exists());
         assert!(!temp_path.exists());
@@ -1770,7 +1790,7 @@ mod tests {
         let profile = BrowserProfile::standalone().unwrap();
         let root = profile.workspace.as_ref().unwrap().path().to_path_buf();
         fs::write(profile.path.join("data"), "browser").unwrap();
-        fs::write(profile.temp_path.join("data"), "browser temp").unwrap();
+        fs::write(profile.temp_path.join("data"), "временные данные браузера").unwrap();
         let profile_path = profile.path.clone();
         let temp_path = profile.temp_path.clone();
         profile.close().unwrap();
@@ -1785,7 +1805,7 @@ mod tests {
             let profile = BrowserProfile::standalone()?;
             *observed_root = profile.workspace.as_ref().unwrap().path().to_path_buf();
             fs::write(profile.path.join("data"), "browser")?;
-            fs::write(profile.temp_path.join("data"), "browser temp")?;
+            fs::write(profile.temp_path.join("data"), "временные данные браузера")?;
             Err(io::Error::other("искусственно вызванный сбой настройки"))
         }
         let mut root = PathBuf::new();
@@ -2339,7 +2359,7 @@ mod tests {
             outcome(
                 ResourceType::Fetch,
                 Some("https://example.test/private?secret=hidden"),
-                Some("connection details include secret"),
+                Some("сведения о соединении содержат секрет"),
                 "two",
                 1,
                 None,
@@ -2375,7 +2395,7 @@ mod tests {
             ),
             Err("browser_process_stop_unproven".into())
         );
-        // Похожий текст в произвольной CDP command ошибке не означает detached channel.
+        // Похожий текст в произвольной ошибке команды CDP не означает отсоединённый канал.
         let arbitrary =
             transport_stop_result(Err(chromiumoxide::error::CdpError::msg("receiver is gone")));
         assert!(matches!(arbitrary, BrowserTransportStop::Failed(_)));
@@ -2409,7 +2429,7 @@ mod tests {
         let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
         let temp_path = profile.temp_path.clone();
         fs::remove_dir(&profile.path).unwrap();
-        fs::write(&profile.path, b"directory replaced with file").unwrap();
+        fs::write(&profile.path, "каталог заменён файлом").unwrap();
         let cleanup = profile
             .close()
             .map_err(|error| format!("browser_profile_cleanup_failed: {error}"));
@@ -2529,7 +2549,7 @@ mod tests {
             snapshot.network_failures.push(outcome(
                 ResourceType::Fetch,
                 Some("https://example.test/private?authorization=hidden"),
-                Some("raw cookies and body value secret"),
+                Some("сырые куки и тело содержат секрет"),
                 &id,
                 2,
                 None,
@@ -2650,7 +2670,7 @@ mod tests {
         ] {
             assert!(
                 !encoded.contains(raw),
-                "raw data escaped into diagnostics: {raw}"
+                "сырые данные попали в диагностику: {raw}"
             );
         }
     }
@@ -2689,31 +2709,111 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_javascript_is_counted_once_and_new_monitor_has_no_previous_session_state() {
+    fn bootstrap_javascript_is_counted_once_across_epochs() {
         let mut state = RuntimeState::default();
         state.record_javascript_exception();
         assert_eq!(state.snapshot(0).javascript_exceptions, 1);
         let epoch = state.begin_epoch();
         state.record_javascript_exception();
-        state.record_request(
-            "old-session".into(),
-            ResourceType::Image,
-            "https://example.test/old".into(),
-            None,
-        );
         assert_eq!(state.snapshot(epoch).javascript_exceptions, 2);
-        let old = CdpRuntimeMonitor {
-            state: Arc::new(Mutex::new(state)),
-            tasks: Arc::new(Vec::new()),
+        assert_eq!(state.snapshot(epoch).bootstrap_javascript_exceptions, 1);
+        assert_eq!(state.snapshot(epoch).current_javascript_exceptions, 1);
+        let next_epoch = state.begin_epoch();
+        assert_eq!(state.snapshot(next_epoch).javascript_exceptions, 1);
+        assert_eq!(state.snapshot(next_epoch).stale_javascript_exceptions, 1);
+    }
+
+    #[tokio::test]
+    async fn session_telemetry_rotation_isolates_evidence_and_listener_ownership() {
+        // Та же граница создания состояния и задач слушателей, что и в start(),
+        // вызываемом BrowserSession::launch_with_profile; CDP заменён каналами.
+        let (old_requests, old_request_events) = futures::channel::mpsc::unbounded();
+        let old = CdpRuntimeMonitor::from_event_streams(
+            "old-frame".into(),
+            old_request_events,
+            futures::stream::pending(),
+            futures::stream::pending(),
+            futures::stream::pending(),
+            futures::stream::pending(),
+        );
+        let retained = old.clone();
+        {
+            let mut state = lock_state(&old.state);
+            state.record_javascript_exception();
+            let old_epoch = state.begin_epoch();
+            state.record_javascript_exception();
+            state.record_request(
+                "old-pending".into(),
+                ResourceType::Image,
+                "https://example.test/old".into(),
+                Some("old-frame"),
+            );
+            state.record_network_failure(
+                "old-failed".into(),
+                ResourceType::Fetch,
+                "net::ERR_TIMED_OUT".into(),
+            );
+            state.record_http_error(
+                "old-http".into(),
+                ResourceType::Fetch,
+                "https://example.test/old-http".into(),
+                503,
+            );
+            assert_eq!(state.snapshot(old_epoch).javascript_exceptions, 2);
+            state.begin_epoch();
+        }
+        let before_rotation = old.current_snapshot();
+        assert_eq!(before_rotation.stale_pending_requests.len(), 1);
+        assert_eq!(before_rotation.stale_network_failures.len(), 1);
+        assert_eq!(before_rotation.stale_http_errors.len(), 1);
+        assert_eq!(before_rotation.stale_javascript_exceptions, 1);
+
+        let fresh = CdpRuntimeMonitor::from_event_streams(
+            "new-frame".into(),
+            futures::stream::pending(),
+            futures::stream::pending(),
+            futures::stream::pending(),
+            futures::stream::pending(),
+            futures::stream::pending(),
+        );
+        assert!(!Arc::ptr_eq(&old.state, &fresh.state));
+        assert!(!Arc::ptr_eq(&old.tasks, &fresh.tasks));
+        assert_eq!(fresh.current_snapshot(), RuntimeSnapshot::default());
+        assert_eq!(fresh.begin_epoch(), 1);
+        let expected = RuntimeSnapshot {
+            epoch: 1,
+            ..RuntimeSnapshot::default()
         };
-        let fresh = CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot::default());
-        let fresh_epoch = fresh.begin_epoch();
-        assert_eq!(fresh_epoch, 1);
-        assert_eq!(old.current_snapshot().pending_requests.len(), 1);
-        assert_eq!(fresh.current_snapshot().epoch, fresh_epoch);
-        assert!(fresh.current_snapshot().pending_requests.is_empty());
-        assert_eq!(fresh.current_snapshot().javascript_exceptions, 0);
-        assert!(!fresh.current_snapshot().monitor_failed);
+
+        // Завершение старого потока после создания нового монитора должно
+        // пометить отказавшимся только прежнее состояние. Ждём задачу слушателя,
+        // поэтому проверка не зависит от scheduling или задержек по времени.
+        drop(old_requests);
+        while !old.tasks[0].is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(retained.monitor_failed());
+        assert_eq!(fresh.current_snapshot(), expected);
+        old.shutdown().await.unwrap();
+        assert!(
+            retained
+                .tasks
+                .iter()
+                .all(tokio::task::JoinHandle::is_finished)
+        );
+        assert!(fresh.tasks.iter().all(|task| !task.is_finished()));
+        assert_eq!(fresh.current_snapshot(), expected);
+
+        lock_state(&fresh.state).record_request(
+            "new-pending".into(),
+            ResourceType::Document,
+            "https://example.test/new".into(),
+            Some("new-frame"),
+        );
+        assert!(fresh.current_snapshot().pending_requests[0].is_top_level);
+        assert_eq!(retained.current_snapshot().pending_requests.len(), 0);
+        assert_eq!(retained.current_snapshot().stale_pending_requests.len(), 1);
+        fresh.shutdown().await.unwrap();
     }
 
     #[tokio::test]

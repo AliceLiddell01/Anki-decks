@@ -386,9 +386,10 @@ fn classify_primary_state(
         }
         return PrimaryGifState::Unknown {
             reason: if image.complete {
-                "элемент primary GIF есть, но загрузка завершилась без естественных размеров".into()
+                "элемент основного GIF есть, но загрузка завершилась без естественных размеров"
+                    .into()
             } else {
-                "элемент primary GIF существует, загрузка ещё не завершена".into()
+                "элемент основного GIF существует, загрузка ещё не завершена".into()
             },
         };
     }
@@ -484,7 +485,7 @@ fn choose_media_source_for_target(
             })
         }
         PrimaryGifState::PresentLoaded { .. } => {
-            unreachable!("ветка для primary GIF обработана выше")
+            unreachable!("ветка для основного GIF обработана выше")
         }
         PrimaryGifState::AbsentConfirmed { proof } => {
             let sample = choose_font_sample(font_samples, expected_character)?;
@@ -501,7 +502,8 @@ fn choose_media_source_for_target(
                 )?;
                 if parsed.host_str().is_some_and(is_kakijun_host) {
                     return Err(
-                        "kakijun_source_forbidden: kakijun.jp не является PNG fallback".into(),
+                        "kakijun_source_forbidden: kakijun.jp не является резервным источником PNG"
+                            .into(),
                     );
                 }
                 return Ok(MediaSourceChoice::Url {
@@ -576,19 +578,28 @@ pub fn acquire_many_with_target(
     }
     let mut outcomes = vec![None; characters.len()];
     acquire_many_stream_with_target(characters, allow_insecure_tls, target, |event| {
-        if let AcquisitionEvent::ItemCompleted { index, outcome } = event {
+        if let AcquisitionEvent::ItemCompleted {
+            index,
+            outcome,
+            diagnostics,
+        } = event
+        {
             let slot = outcomes.get_mut(index).ok_or_else(|| {
                 AssetError::new(
                     crate::error::ErrorCode::InvalidTransition,
                     "провайдер выдал индекс вне исходного набора",
                 )
             })?;
-            if slot.replace(*outcome).is_some() {
+            if slot.is_some() {
                 return Err(AssetError::new(
                     crate::error::ErrorCode::InvalidTransition,
                     "провайдер повторно выдал идентичность в одном наборе",
                 ));
             }
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.finish_acquisition(&outcome);
+            }
+            *slot = Some(*outcome);
         }
         Ok(())
     })
@@ -636,7 +647,46 @@ pub enum AcquisitionEvent {
     ItemCompleted {
         index: usize,
         outcome: Box<Result<AcquiredMedia, String>>,
+        diagnostics: Option<AcquisitionItemDiagnostics>,
     },
+}
+
+/// Передаёт единственный таймер элемента от браузера к потребителю результата.
+/// Пакет завершает его после проверки и надёжного checkpoint; самостоятельный
+/// потребитель — после приёма результата получения.
+pub struct AcquisitionItemDiagnostics {
+    pub(crate) timing: BrowserItemTimer,
+    acquisition_failure: Option<(String, bool)>,
+}
+
+impl std::fmt::Debug for AcquisitionItemDiagnostics {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AcquisitionItemDiagnostics")
+    }
+}
+
+impl AcquisitionItemDiagnostics {
+    pub(crate) fn new(timing: BrowserItemTimer, failure: Option<(String, bool)>) -> Self {
+        Self {
+            timing,
+            acquisition_failure: failure,
+        }
+    }
+
+    pub fn finish_acquisition(self, outcome: &Result<AcquiredMedia, String>) {
+        match outcome {
+            Ok(_) => self.timing.finish_success(),
+            Err(error) => self.finish_recorded_failure(acquisition_failure_code(error)),
+        }
+    }
+
+    pub(crate) fn finish_recorded_failure(self, code: &str) {
+        if let Some((failure, retryable)) = self.acquisition_failure {
+            self.timing.finish_failure(&failure, retryable, None);
+        } else {
+            self.timing.finish_failure(code, false, None);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -837,7 +887,7 @@ impl AcquisitionRun {
         })
     }
 
-    /// Все сессии уже закрыты acquire; borrowed parent остаётся у вызывающего кода.
+    /// Все сессии уже закрыты при получении; заимствованный владелец остаётся у вызывающего кода.
     pub fn close(mut self) -> Result<(), AcquisitionStreamError> {
         self.interrupt.abort();
         self.owned_workspace.take().map_or(Ok(()), TempWorkspace::close).map_err(|error| {
@@ -886,8 +936,8 @@ impl AcquisitionRun {
         )
     }
 
-    /// Batch owner context accompanies each identity through session rotation so
-    /// item diagnostics can report the exact CAS generation that was acquired.
+    /// Контекст владельца пакета сопровождает идентичность при смене сеансов,
+    /// чтобы диагностика элемента сохраняла точное поколение полученного CAS.
     pub(crate) fn acquire_with_generations<F>(
         &mut self,
         characters: &[String],
@@ -1085,7 +1135,7 @@ async fn acquire_one_session(
         CAPTURE_DEVICE_SCALE_FACTOR,
     )
     .map_err(|error| {
-        AcquisitionStreamError::Provider(format!("настройка viewport Yarxi: {error}"))
+        AcquisitionStreamError::Provider(format!("настройка области просмотра Yarxi: {error}"))
     })?;
     let runtime_config = BrowserRuntimeConfig {
         device_metrics: Some(device_metrics),
@@ -1099,7 +1149,7 @@ async fn acquire_one_session(
         code = "browser_session_starting",
         "Запуск и подготовка браузера Yarxi"
     );
-    // Launch имеет собственные таймауты; получаем owner до проверки deadline,
+    // Запуск имеет собственные таймауты; получаем владельца до проверки срока,
     // чтобы отмена не опередила явное завершение процесса и уборку профиля.
     let session = match BrowserSession::launch_in_workspace(runtime_config, workspace).await {
         Ok(session) => session,
@@ -1148,9 +1198,9 @@ async fn acquire_one_session(
         let site_host: bool = page
             .evaluate(format!("location.hostname === {SITE_HOST:?}"))
             .await
-            .map_err(|error| format!("проверка host Yarxi: {error}"))?
+            .map_err(|error| format!("проверка узла Yarxi: {error}"))?
             .into_value()
-            .map_err(|error| format!("ответ проверки host Yarxi: {error}"))?;
+            .map_err(|error| format!("ответ проверки узла Yarxi: {error}"))?;
         if !site_host {
             return Err("provider_host_mismatch: загрузка ушла с www.yarxi.su".into());
         }
@@ -1250,6 +1300,7 @@ async fn acquire_one_session(
         },
         session: session_number,
         generations,
+        diagnostics: None,
     };
     let result = process_session_items(characters, base_index, &mut driver, on_event).await;
     evidence_monitor.abort();
@@ -1292,6 +1343,9 @@ trait SessionItemDriver {
         character: &str,
         on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
     ) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError>;
+    fn take_diagnostics(&mut self) -> Option<AcquisitionItemDiagnostics> {
+        None
+    }
     async fn after_checkpoint(
         &mut self,
     ) -> Result<Option<SessionStopReason>, AcquisitionStreamError>;
@@ -1320,6 +1374,7 @@ async fn process_session_items(
             on_event(AcquisitionEvent::ItemCompleted {
                 index: absolute_index,
                 outcome: Box::new(outcome),
+                diagnostics: driver.take_diagnostics(),
             })?;
             processed += 1;
             // Сначала потребитель фиксирует готовый результат, затем признаём stop.
@@ -1349,9 +1404,10 @@ struct BrowserSessionItemDriver<'a> {
     context: RetryAcquisitionContext<'a>,
     session: u32,
     generations: Option<&'a [u32]>,
+    diagnostics: Option<AcquisitionItemDiagnostics>,
 }
 
-/// Только смысловые границы текущего call path Yarxi.
+/// Только смысловые границы текущего пути вызовов Yarxi.
 #[derive(Debug, Clone, Copy)]
 enum YarxiStage {
     SearchSubmission,
@@ -1438,7 +1494,6 @@ impl SessionItemDriver for BrowserSessionItemDriver<'_> {
         on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
     ) -> Result<(Result<AcquiredMedia, String>, Option<SessionStopReason>), AcquisitionStreamError>
     {
-        let started_at = Instant::now();
         let owner_generation = self
             .generations
             .and_then(|generations| generations.get(index))
@@ -1479,23 +1534,26 @@ impl SessionItemDriver for BrowserSessionItemDriver<'_> {
         )
         .await;
         match &result {
-            Ok((Ok(_), _)) => timing.finish_success(),
+            Ok((Ok(_), _)) => {
+                self.diagnostics = Some(AcquisitionItemDiagnostics::new(timing, None));
+            }
             Ok((Err(error), stop)) => {
                 if let Some(reason) = stop {
                     timing.set_stop_reason(session_stop_code(reason));
                 }
                 let snapshot = self.context.evidence_monitor.telemetry.current_snapshot();
                 let retryable = stop.is_none() || *stop == Some(SessionStopReason::ItemTimeout);
-                timing.finish_failure(
-                    terminal_failure_code(error, stop.as_ref()),
+                timing.record_runtime_snapshot(&snapshot);
+                let failure = (
+                    terminal_failure_code(error, stop.as_ref()).to_owned(),
                     retryable
                         && is_retryable_acquisition_error(
                             error,
                             self.context.evidence_monitor,
                             snapshot.epoch,
                         ),
-                    Some(&snapshot),
                 );
+                self.diagnostics = Some(AcquisitionItemDiagnostics::new(timing, Some(failure)));
             }
             Err(AcquisitionStreamError::Interrupted) => timing.interrupt("ctrl_c", None),
             Err(AcquisitionStreamError::Consumer(_)) => {
@@ -1505,16 +1563,11 @@ impl SessionItemDriver for BrowserSessionItemDriver<'_> {
                 timing.finish_failure(acquisition_failure_code(error), false, None)
             }
         }
-        tracing::info!(
-            session = self.session,
-            identity = character,
-            index,
-            stage = "acquisition",
-            code = "item_acquisition_finished",
-            elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "Получение кандзи завершено"
-        );
         result
+    }
+
+    fn take_diagnostics(&mut self) -> Option<AcquisitionItemDiagnostics> {
+        self.diagnostics.take()
     }
 
     async fn after_checkpoint(
@@ -1703,8 +1756,8 @@ async fn acquire_one_with_retries(
                         attempt: attempt + 1,
                     })?;
                     let recovery_timing = timing.stage(YarxiStage::RetryRecovery.name());
-                    // Та же граница begin_epoch, что ранее находилась внутри recovery;
-                    // owner сохраняет её номер для точного evidence при отмене.
+                    // Та же граница begin_epoch, что ранее находилась внутри восстановления;
+                    // владелец сохраняет её номер для точных свидетельств при отмене.
                     let recovery_epoch = context.evidence_monitor.begin_acquisition();
                     timing.record_runtime_snapshot(
                         &context.evidence_monitor.telemetry.snapshot(recovery_epoch),
@@ -1973,15 +2026,14 @@ async fn async_error_or_tls_interstitial(
             "() => ({ code: document.querySelector('#error-code')?.textContent?.trim(), proceed: Boolean(document.querySelector('#proceed-link')) })",
         )
         .await
-        .map_err(|error| format!("не удалось проверить TLS interstitial: {error}"))?
+        .map_err(|error| format!("не удалось проверить страницу-предупреждение TLS: {error}"))?
         .into_value()
-        .map_err(|error| format!("TLS interstitial вернул некорректный ответ: {error}"))?;
+        .map_err(|error| format!("страница-предупреждение TLS вернула некорректный ответ: {error}"))?;
     let code = interstitial["code"].as_str().unwrap_or_default();
     let failed_request = wait_for_tls_navigation_failure(evidence_monitor).await?;
-    let blocked_url = failed_request
-        .url
-        .as_deref()
-        .ok_or_else(|| "TLS interstitial не связан с URL ошибочного Document request".to_owned())?;
+    let blocked_url = failed_request.url.as_deref().ok_or_else(|| {
+        "страница-предупреждение TLS не связана с URL ошибочного запроса Document".to_owned()
+    })?;
     if let Err(reason) = check_tls_exception(
         allow_insecure_tls,
         blocked_url,
@@ -1990,10 +2042,10 @@ async fn async_error_or_tls_interstitial(
         interstitial["proceed"].as_bool().unwrap_or(false),
     ) {
         return Err(format!(
-            "TLS exception отклонён: {reason}; original={original}; interstitial={interstitial}"
+            "исключение TLS отклонено: {reason}; исходная ошибка={original}; страница-предупреждение={interstitial}"
         ));
     }
-    // Переход Chrome interstitial действует только для origin; глобальный
+    // Переход по странице-предупреждению Chrome действует только для origin; глобальный
     // ignore-certificate-errors для процесса браузера не включён.
     page.evaluate("() => document.querySelector('#proceed-link').click()")
         .await
@@ -2022,7 +2074,7 @@ async fn wait_for_tls_navigation_failure(
         }
         if Instant::now() >= deadline {
             return Err(
-                "TLS interstitial не связан с ошибкой top-level Document event Yarxi".into(),
+                "страница-предупреждение TLS не связана с ошибкой верхнеуровневого события Document Yarxi".into(),
             );
         }
         sleep(Duration::from_millis(20)).await;
@@ -2054,7 +2106,7 @@ fn check_tls_exception(
         return Err("разрешена только ERR_CERT_AUTHORITY_INVALID".into());
     }
     if !proceed_link_present {
-        return Err("interstitial Chrome не предоставляет ссылку перехода".into());
+        return Err("страница-предупреждение Chrome не предоставляет ссылку перехода".into());
     }
     Ok(())
 }
@@ -2539,7 +2591,7 @@ async fn wait_for_media_snapshot(
             let reason = runtime_failure_reason(evidence_monitor.readiness(epoch, None));
             if primary.as_ref().is_some_and(|image| !image.complete) {
                 return Err(format!(
-                    "gif_pending: загрузка primary GIF не завершилась; {reason}"
+                    "gif_pending: загрузка основного GIF не завершилась; {reason}"
                 ));
             }
             return Err(format!(
@@ -2572,7 +2624,7 @@ async fn resource_bytes(page: &Page, resource_url: &str) -> Result<Vec<u8>, Stri
             .map_err(|error| format!("декодирование base64 для ресурса браузера: {error}"));
     }
     let url =
-        Url::parse(resource_url).map_err(|error| format!("некорректный media URL: {error}"))?;
+        Url::parse(resource_url).map_err(|error| format!("некорректный URL ресурса: {error}"))?;
     if url.scheme() != "https"
         || url.host_str().is_none()
         || url.host_str().is_some_and(is_kakijun_host)
@@ -2605,11 +2657,11 @@ async fn render_font_sample_png(
     let expected_json = serde_json::to_string(expected_character)
         .map_err(|error| format!("сериализация символа font-sample: {error}"))?;
     let expected_code_json = serde_json::to_string(expected_code)
-        .map_err(|error| format!("сериализация Unicode font-sample: {error}"))?;
+        .map_err(|error| format!("сериализация образца шрифта Unicode: {error}"))?;
     let expected_class_json = serde_json::to_string(&sample.class_name)
         .map_err(|error| format!("сериализация класса font-sample: {error}"))?;
     let expected_title_json = serde_json::to_string(&sample.title)
-        .map_err(|error| format!("сериализация title font-sample: {error}"))?;
+        .map_err(|error| format!("сериализация заголовка образца шрифта: {error}"))?;
     let expected_text_json = serde_json::to_string(&sample.text)
         .map_err(|error| format!("сериализация текста font-sample: {error}"))?;
     let script = r#"() => {
@@ -2776,7 +2828,7 @@ async fn render_font_sample_png(
         .await
         .map_err(|error| format!("font_sample_png_capture: {error}"))?;
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err("font_sample_png_invalid: снимок элемента не вернул PNG bytes".into());
+        return Err("font_sample_png_invalid: снимок элемента не вернул байты PNG".into());
     }
     let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
         .map_err(|error| format!("font_sample_png_decode: {error}"))?;
@@ -2821,7 +2873,7 @@ async fn render_font_sample_png(
             .unwrap_or_default()
             .to_owned(),
         font_size: initial["font_size"].as_str().unwrap_or_default().to_owned(),
-        capture: "Снимок Chromium самого отрендеренного элемента .font-sample без изменений при Yarxi data-theme=dark".into(),
+        capture: "Снимок Chromium элемента .font-sample без изменений при Yarxi data-theme=dark".into(),
         css_rect: serde_json::from_value(initial["css_rect"].clone())
             .map_err(|error| format!("font_sample_css_rect: {error}"))?,
         pixel_width,
@@ -2889,7 +2941,7 @@ fn validate_capture_dimensions(width: u32, height: u32) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "font_sample_scale_out_of_bounds: capture is {width}x{height}px; expected {CAPTURE_MIN_EDGE_PX}–{CAPTURE_MAX_EDGE_PX}px per edge"
+            "font_sample_scale_out_of_bounds: размер снимка {width}×{height} px вне диапазона {CAPTURE_MIN_EDGE_PX}–{CAPTURE_MAX_EDGE_PX} px по каждой стороне"
         ))
     }
 }
@@ -3182,8 +3234,8 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                // Первый poll входит в настоящий provider wrapper; затем
-                // воспроизводим границу timeout без ожидания и браузера.
+                // Первый опрос входит в настоящую оболочку провайдера; затем
+                // воспроизводим границу тайм-аута без ожидания и браузера.
                 let acquisition = diagnose_yarxi_stage(
                     &item,
                     YarxiStage::MediaReadiness,
@@ -3229,7 +3281,7 @@ mod tests {
             terminal_failure_code(
                 "gif_unknown: pending",
                 Some(&SessionStopReason::RetryRecoveryFailed(
-                    "private detail".into()
+                    "закрытые сведения".into()
                 ))
             ),
             "browser_retry_recovery_failed"
@@ -3684,7 +3736,7 @@ mod tests {
         let summary = process_session_items(&characters, 0, &mut driver, &mut |event| {
             match event {
                 AcquisitionEvent::ItemStarted { index } => started.push(index),
-                AcquisitionEvent::ItemCompleted { index, outcome } => {
+                AcquisitionEvent::ItemCompleted { index, outcome, .. } => {
                     assert!(outcome.is_err());
                     attempts[index] += 1;
                 }
@@ -4234,7 +4286,7 @@ mod tests {
                 resource_type: ResourceType::Fetch,
                 url: Some(format!("https://example.test/api/{index}?secret=hidden")),
                 failure_reason: Some(if index == 0 {
-                    "connection details include a secret".into()
+                    "сведения о соединении содержат секрет".into()
                 } else {
                     "net::ERR_FAILED".into()
                 }),
@@ -4256,6 +4308,7 @@ mod tests {
         assert!(details.contains("не классифицированная сетевая ошибка"));
         assert!(!details.contains("secret"));
         assert!(!details.contains("hidden"));
+        assert!(!details.contains("сведения о соединении"));
     }
 
     #[test]

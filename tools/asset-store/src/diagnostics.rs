@@ -1,7 +1,7 @@
 //! Структурированная диагностика долгих пакетных операций.
 //!
 //! Модуль принимает уже безопасно открытый runtime-файл. Путь и namespace
-//! принадлежат `SafeBatchRuntime`; здесь настраиваются только tracing layers,
+//! принадлежат `SafeBatchRuntime`; здесь настраиваются только слои `tracing`,
 //! формат и гарантированное завершение записи.
 
 use std::fs::File;
@@ -29,7 +29,7 @@ pub enum OutputMode {
     Json,
 }
 
-/// Сохраняет dispatcher и worker до конца одного batch run.
+/// Сохраняет диспетчер и рабочий поток до конца одного пакетного запуска.
 #[must_use = "guard должен жить до конца run, чтобы сбросить диагностический файл"]
 pub struct RunLogGuard {
     dispatch: Option<Dispatch>,
@@ -39,7 +39,7 @@ pub struct RunLogGuard {
 }
 
 impl RunLogGuard {
-    /// Настраивает NDJSON file layer поверх уже открытого безопасным runtime файла.
+    /// Настраивает файловый слой NDJSON поверх файла, безопасно открытого runtime.
     pub fn new(file: File, mode: OutputMode) -> Self {
         Self::with_buffered_lines_and_terminal_writer(
             file,
@@ -265,7 +265,8 @@ impl Write for CheckedFileWriter {
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let result = self.file.write_all(bytes);
+        let normalized = nullable_generation_event(bytes);
+        let result = self.file.write_all(normalized.as_deref().unwrap_or(bytes));
         self.progress.record_processed(&result);
         result
     }
@@ -275,6 +276,30 @@ impl Write for CheckedFileWriter {
         self.progress.record_flush(&result);
         result
     }
+}
+
+/// `tracing` опускает поле `Option::None`; для схемы получения сохраняем
+/// явное `null` в необязательном поле `generation` JSONL-файла.
+fn nullable_generation_event(line: &[u8]) -> Option<Vec<u8>> {
+    const SCHEMA: &[u8] = b"browser_acquisition_v1";
+    if !line.windows(SCHEMA.len()).any(|window| window == SCHEMA) {
+        return None;
+    }
+
+    let mut event: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let fields = event.get_mut("fields")?.as_object_mut()?;
+    if fields.get("schema")?.as_str()? != "browser_acquisition_v1"
+        || fields.contains_key("generation")
+    {
+        return None;
+    }
+    fields.insert("generation".to_owned(), serde_json::Value::Null);
+
+    let mut normalized = serde_json::to_vec(&event).ok()?;
+    if line.ends_with(b"\n") {
+        normalized.push(b'\n');
+    }
+    Some(normalized)
 }
 
 /// Удаляет credentials, query/fragment и управляющие символы из URL/маршрута.
@@ -300,7 +325,7 @@ pub fn safe_route(value: &str) -> String {
 }
 
 /// Возвращает ограниченный и очищенный текст ошибки для безопасного лога.
-/// Сохранённое typed failure при этом не меняется: очищается только его копия в логе.
+/// Сохранённая типизированная ошибка не меняется: очищается только её копия в журнале.
 pub fn safe_message(message: &str) -> String {
     let without_ansi = strip_ansi(message);
     let without_controls = strip_controls(&without_ansi);
@@ -619,7 +644,7 @@ mod tests {
                     batch_id = "synthetic",
                     run_id = "synthetic-run",
                     event_index,
-                    "checkpoint completed"
+                    "контрольная точка завершена"
                 );
             }
         });
@@ -659,14 +684,14 @@ mod tests {
     #[test]
     fn safe_message_bounds_and_redacts_secrets_and_markup() {
         let message = safe_message(
-            "request failed at https://user:secret@jpdb.io/search?token=hidden#x Authorization: Bearer credential",
+            "запрос завершился ошибкой на https://user:secret@jpdb.io/search?token=hidden#x Authorization: Bearer credential",
         );
         assert!(!message.contains("secret"));
         assert!(!message.contains("hidden"));
         assert!(!message.contains("credential"));
         assert!(message.contains("https://jpdb.io/search"));
         assert!(
-            !safe_message("<html><body>private content</body></html>").contains("private content")
+            !safe_message("<html><body>закрытые данные</body></html>").contains("закрытые данные")
         );
         assert!(safe_message(&"日".repeat(5000)).len() <= 4096);
     }
@@ -679,7 +704,8 @@ mod tests {
         assert!(!message.contains("token-secret"));
         assert!(message.contains("[СКРЫТО]"));
 
-        let cookie = safe_message("request failed Cookie: first=hidden; second=also-hidden");
+        let cookie =
+            safe_message("запрос завершился ошибкой Cookie: first=hidden; second=also-hidden");
         assert!(!cookie.contains("first=hidden"));
         assert!(!cookie.contains("second=also-hidden"));
     }
@@ -696,10 +722,10 @@ mod tests {
             16,
             stderr.clone(),
         );
-        logger.with_default(|| tracing::info!(event = "terminal_probe", "stderr probe"));
+        logger.with_default(|| tracing::info!(event = "terminal_probe", "проверка вывода ошибок"));
         logger.finish().unwrap();
         let terminal = String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap();
-        assert!(terminal.contains("stderr probe"));
+        assert!(terminal.contains("проверка вывода ошибок"));
         assert!(stdout.0.lock().unwrap().is_empty());
 
         let json_stderr = SharedBuffer::default();
@@ -710,7 +736,7 @@ mod tests {
             16,
             json_stderr.clone(),
         );
-        logger.with_default(|| tracing::info!(event = "file_only_probe", "file only"));
+        logger.with_default(|| tracing::info!(event = "file_only_probe", "только в файл"));
         logger.finish().unwrap();
         assert!(json_stderr.0.lock().unwrap().is_empty());
     }

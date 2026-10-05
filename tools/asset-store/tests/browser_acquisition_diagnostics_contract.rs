@@ -1,75 +1,39 @@
-use std::fs;
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
-
 use asset_store::browser_diagnostics::{
     BrowserItemContext, BrowserItemTimer, MAX_DIAGNOSTIC_TOKEN_BYTES, MAX_IDENTITY_BYTES,
-    MAX_RUNTIME_SNAPSHOT_BYTES,
+    MAX_RUNTIME_SNAPSHOT_BYTES, runtime_snapshot_json,
 };
 use asset_store::browser_runtime::{
     MAX_RUNTIME_DIAGNOSTIC_ITEMS, NetworkOutcome, PendingRequestObservation, RuntimeSnapshot,
     TrackedRequest,
 };
+use asset_store::diagnostics::{OutputMode, RunLogGuard};
 use asset_store::hashing::sha256_hex;
 use asset_store::temp_workspace::TempWorkspace;
 use chromiumoxide::cdp::browser_protocol::network::ResourceType;
 use serde_json::Value;
-use tracing_subscriber::fmt::MakeWriter;
 
-#[derive(Clone, Default)]
-struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Buffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Buffer {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// Логи проходят через JSONL-файл в принадлежащем тесту temp workspace.
+/// Логи проходят через JSONL-файл во временном рабочем каталоге теста.
 /// Тесты не открывают `.asset-store` и не читают `decks/**`.
 fn jsonl_events(operation: impl FnOnce()) -> Vec<Value> {
     let workspace = TempWorkspace::create("browser-acquisition-diagnostics-contract")
-        .expect("изолированный temp workspace создаётся");
-    let buffer = Buffer::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .with_writer(buffer.clone())
-        .finish();
-
-    tracing::subscriber::with_default(subscriber, operation);
-
+        .expect("изолированный временный рабочий каталог создаётся");
     let path = workspace.path().join("browser-acquisition.jsonl");
-    let bytes = buffer
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    fs::write(&path, bytes).expect("synthetic JSONL записывается в temp workspace");
-    let contents = fs::read_to_string(path).expect("JSONL читается из temp workspace");
+    let log = RunLogGuard::new(
+        std::fs::File::create(&path).expect("JSONL-файл создаётся во временном рабочем каталоге"),
+        OutputMode::Json,
+    );
+    log.with_default(operation);
+    log.finish().expect("JSONL полностью записан");
+    let contents =
+        std::fs::read_to_string(path).expect("JSONL читается из временного рабочего каталога");
     let events = contents
         .lines()
         .map(|line| serde_json::from_str(line).expect("каждая строка является JSON"))
         .collect();
 
-    workspace.close().expect("temp workspace удаляется");
+    workspace
+        .close()
+        .expect("временный рабочий каталог удаляется");
     events
 }
 
@@ -181,7 +145,7 @@ fn unavailable_generation_stays_null_and_owner_generation_is_preserved() {
             .finish_success();
     });
 
-    assert_eq!(fields(&events[0])["generation"], Value::Null);
+    assert_eq!(fields(&events[0]).get("generation"), Some(&Value::Null));
     assert_eq!(fields(&events[0])["identity"], "漢");
     assert_eq!(fields(&events[1])["generation"], 7);
     assert_eq!(fields(&events[1])["identity"], "語");
@@ -249,7 +213,7 @@ fn snapshot_diagnostic_separates_current_and_stale_epoch_entries() {
     };
 
     let diagnostic = snapshot.diagnostic();
-    let serialized = serde_json::to_value(&diagnostic).expect("diagnostic сериализуется");
+    let serialized = serde_json::to_value(&diagnostic).expect("диагностика сериализуется");
 
     assert_eq!(serialized["epoch"], 6);
     assert_eq!(serialized["pending_request_count"], 2);
@@ -364,7 +328,7 @@ fn snapshot_diagnostic_separates_current_and_stale_epoch_entries() {
     ] {
         assert!(
             !diagnostic_json.contains(secret),
-            "runtime snapshot exposed a test fixture value"
+            "снимок runtime раскрыл значение тестового примера"
         );
     }
     assert!(diagnostic_json.contains(&sha256_hex("bootstrap-network")));
@@ -440,7 +404,7 @@ fn bounded_snapshot_and_identity_are_sanitized_in_serialized_jsonl() {
     let runtime_snapshot = item["runtime_snapshot"].as_str().unwrap();
     assert!(runtime_snapshot.len() <= MAX_RUNTIME_SNAPSHOT_BYTES);
     let diagnostic: Value = serde_json::from_str(runtime_snapshot)
-        .expect("runtime snapshot остаётся валидным JSON внутри JSONL");
+        .expect("снимок среды выполнения остаётся допустимым JSON внутри JSONL");
     assert_eq!(diagnostic["pending_request_count"], 1000);
     assert_eq!(diagnostic["network_failure_count"], 1000);
     assert_eq!(diagnostic["http_error_count"], 1000);
@@ -469,7 +433,7 @@ fn bounded_snapshot_and_identity_are_sanitized_in_serialized_jsonl() {
     ] {
         assert!(
             !entire_log.contains(secret),
-            "diagnostic JSONL exposed a test fixture value"
+            "диагностический JSONL раскрыл значение тестового примера"
         );
     }
 }
@@ -511,7 +475,7 @@ fn concurrent_item_contexts_keep_browser_session_evidence_isolated() {
     assert_eq!(events.len(), 2);
     let item_b = fields(&events[0]);
     let evidence_b: Value = serde_json::from_str(item_b["runtime_snapshot"].as_str().unwrap())
-        .expect("evidence сеанса B сериализована");
+        .expect("данные сеанса B сериализованы");
     assert_eq!(item_b["browser_session"], 82);
     assert_eq!(item_b["identity"], "item-b");
     assert_eq!(evidence_b["epoch"], 9);
@@ -528,7 +492,7 @@ fn concurrent_item_contexts_keep_browser_session_evidence_isolated() {
 
     let item_a = fields(&events[1]);
     let evidence_a: Value = serde_json::from_str(item_a["runtime_snapshot"].as_str().unwrap())
-        .expect("evidence сеанса A сериализована");
+        .expect("данные сеанса A сериализованы");
     assert_eq!(item_a["browser_session"], 71);
     assert_eq!(item_a["identity"], "item-a");
     assert_eq!(evidence_a["epoch"], 3);
@@ -560,4 +524,117 @@ fn concurrent_item_contexts_keep_browser_session_evidence_isolated() {
         );
     }
     assert!(!serialized_events.contains("private.example"));
+}
+
+#[test]
+fn oversized_safe_projection_reaches_truncation_and_preserves_scope_counts() {
+    // Максимальные числа и допустимая длинная категория дают доказуемо большой
+    // безопасный JSON после ограничения: ниже измеряется именно готовая проекция.
+    let epoch = u64::MAX;
+    let stale_epoch = epoch - 1;
+    let reason = format!("NET::ERR_{}", "X".repeat(119));
+    let pending = |scope, prefix: &str| {
+        (0..MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+            .map(|index| {
+                tracked_request(
+                    &format!("{prefix}-secret-{index}"),
+                    scope,
+                    ResourceType::CspViolationReport,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let outcomes = |scope, prefix: &str| {
+        (0..MAX_RUNTIME_DIAGNOSTIC_ITEMS)
+            .map(|index| {
+                network_outcome_of_type(
+                    &format!("{prefix}-secret-{index}"),
+                    scope,
+                    ResourceType::CspViolationReport,
+                    Some(&reason),
+                    Some(u16::MAX),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut snapshot = RuntimeSnapshot {
+        epoch,
+        pending_requests: pending(epoch, "current-pending"),
+        network_failures: outcomes(epoch, "current-network"),
+        http_errors: outcomes(epoch, "current-http"),
+        stale_pending_requests: pending(stale_epoch, "stale-pending"),
+        stale_network_failures: outcomes(stale_epoch, "stale-network"),
+        stale_http_errors: outcomes(stale_epoch, "stale-http"),
+        javascript_exceptions: u32::MAX,
+        current_javascript_exceptions: 21,
+        bootstrap_javascript_exceptions: 34,
+        stale_javascript_exceptions: 55,
+        monitor_failed: true,
+        ..RuntimeSnapshot::default()
+    };
+    snapshot.pending_observations = snapshot
+        .pending_requests
+        .iter()
+        .chain(&snapshot.stale_pending_requests)
+        .map(|request| PendingRequestObservation {
+            request_id: request.request_id.clone(),
+            observed_ms: u64::MAX,
+        })
+        .collect();
+    // Смешанные исходные эпохи не должны исказить счётчики в запасном варианте.
+    snapshot
+        .pending_requests
+        .push(snapshot.stale_pending_requests.remove(0));
+    snapshot
+        .network_failures
+        .push(snapshot.stale_network_failures.remove(0));
+    snapshot
+        .http_errors
+        .push(snapshot.stale_http_errors.remove(0));
+    let projection = serde_json::to_string(&snapshot.diagnostic()).unwrap();
+    assert!(
+        projection.len() > MAX_RUNTIME_SNAPSHOT_BYTES,
+        "готовая проекция должна превысить заданный предел до вызова запасного варианта"
+    );
+
+    let serialized = runtime_snapshot_json(&snapshot);
+    assert!(serialized.len() <= MAX_RUNTIME_SNAPSHOT_BYTES);
+    let fallback: Value =
+        serde_json::from_str(&serialized).expect("запасной вариант остаётся допустимым JSON");
+    assert_eq!(fallback["truncated"], true);
+    assert_eq!(fallback["epoch"], epoch);
+    for key in [
+        "pending_request_count",
+        "network_failure_count",
+        "http_error_count",
+        "stale_pending_request_count",
+        "stale_network_failure_count",
+        "stale_http_error_count",
+    ] {
+        assert_eq!(fallback[key], MAX_RUNTIME_DIAGNOSTIC_ITEMS);
+    }
+    assert_eq!(fallback["javascript_exceptions"], u32::MAX);
+    assert_eq!(fallback["current_javascript_exceptions"], 21);
+    assert_eq!(fallback["bootstrap_javascript_exceptions"], 34);
+    assert_eq!(fallback["stale_javascript_exceptions"], 55);
+    assert_eq!(fallback["monitor_failed"], true);
+    for secret in [
+        "private.example",
+        "secret-query",
+        "secret-",
+        "Authorization",
+        "Bearer",
+        "Cookie",
+        "request_id",
+        "url",
+        "headers",
+        "failure_reason",
+        "DOM",
+        "CDP",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "fallback раскрыл сырое значение тестового примера"
+        );
+    }
 }

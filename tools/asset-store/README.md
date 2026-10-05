@@ -979,7 +979,7 @@ JSON-ответ содержит `schema_version`, `operation`, `store`, `mode`,
 точки. При `--output json` `stdout` по-прежнему содержит один самостоятельный
 итоговый JSON-ответ команды; данные о ходе выполнения с ним не смешиваются.
 
-Каждый запуск получения через `kanji-assets batch run` или pitch batch runner
+Каждый запуск получения через `kanji-assets batch run` или исполнитель пакета pitch
 (`pitch-assets ensure`, `batch run` и `batch resume`) создаёт отдельный подробный
 журнал в служебном каталоге пакета:
 `<store_root>/.runtime/batches/<batch_id>/logs/<run_id>.jsonl`. Каталог и файл
@@ -1007,39 +1007,54 @@ JSON-ответ содержит `schema_version`, `operation`, `store`, `mode`,
 `browser_acquisition_stage` с `schema: "browser_acquisition_v1"` и
 `schema_version: 1`. У события элемента `stage` равен `item`; `stage_duration_ms`
 измеряет время текущего этапа, а `item_duration_ms` — накопленное время элемента
-с момента его запуска. У Yarxi таймер охватывает внутренние повторы и backoff;
-в pitch batch каждая назначенная попытка получает собственный таймер элемента.
-Длительности измеряются монотонными часами.
+с момента его запуска. В пакете pitch каждая назначенная попытка получает
+собственный таймер, который передаётся от исполнителя через провайдер и координатор до
+сохранения исхода с CAS. У Yarxi таймер охватывает внутренние повторы и паузы между
+ними, проверку кандидата и контрольную точку CAS. Итоговая длительность элемента
+включает получение, итоговую проверку и сохранение результата. При запуске только
+провайдера JPDB таймер завершается на границе получения, поскольку у него нет
+контрольной точки владельца. Длительности измеряются монотонными часами.
 
-В каждом событии есть `provider`, очищенная `identity`, `attempt`, `generation`,
-`worker`, `worker_session`, `browser_session`, `stage`, `stage_duration_ms`,
-`item_duration_ms`, `outcome`, `failure_code`, `retryable`, `stop_reason` и
-`runtime_snapshot`. Для JPDB `provider` равен `jpdb`, а для Yarxi —
-`yarxi-suu-browser`. В pitch batch runner значения `worker` и `worker_session`
-обозначают исполнителя и его локальную сессию браузера; поля могут быть пустыми в
-контекстах без исполнителя. `browser_session` — диагностический идентификатор
-браузерной сессии. `provider`, `outcome`, `failure_code` и `stop_reason` ограничены
-безопасными токенами; недопустимые значения заменяются на `redacted`. `identity`
-ограничена 256 байтами и очищается перед записью. `failure_code` и последний
-`runtime_snapshot` передаются при отказе или прерывании, если снимок доступен, а
-`stop_reason` отдельно объясняет остановку. `retryable` отражает решение
-провайдера о возможности повтора, а не сам факт повтора. `generation` равен
-owner generation в kanji batch и `null` в provider-only запуске без такого
-контекста; фиктивный ноль не используется. Если monitor/session failure возникает
-после предметного результата, item сохраняет свой исход, а `stop_reason` и свежий
-snapshot связывают его с остановкой очереди.
+Обязательные поля каждого события: `event`, `schema`, `schema_version`, `provider`,
+очищенная `identity`, `attempt`, `generation`, `stage`, `stage_duration_ms`,
+`item_duration_ms`, `outcome` и `retryable`. Поля `worker`, `worker_session`,
+`browser_session`, `failure_code`, `stop_reason` и `runtime_snapshot` записываются,
+когда для них есть значение. Для JPDB `provider` равен `jpdb`, а для Yarxi —
+`yarxi-suu-browser`. В исполнителе пакета pitch значения `worker` и `worker_session`
+обозначают исполнителя и его локальную сессию браузера; в других контекстах они
+могут отсутствовать. `browser_session` — диагностический идентификатор браузерной
+сессии. `provider`, `outcome`, `failure_code` и `stop_reason` ограничены безопасными
+токенами; недопустимые значения заменяются на `redacted`. `identity` ограничена
+256 байтами и очищается перед записью. `failure_code` и последний `runtime_snapshot`
+передаются при отказе или прерывании, если снимок доступен, а `stop_reason` отдельно
+объясняет остановку. `retryable` отражает решение провайдера о возможности повтора,
+а не сам факт повтора. `generation` равен
+поколению владельца в пакете kanji и `null` при запуске только провайдера без такого
+контекста; фиктивный ноль не используется. Если после предметного результата
+возникает сбой монитора или сессии, элемент сохраняет свой исход, а `stop_reason` и
+свежий снимок связывают его с остановкой очереди.
 
-Значения `stage` принадлежат фактическим границам провайдеров. JPDB использует
-`configure_browser`, `search_resolution`, `search_navigation`,
-`search_readiness`, `detail_navigation`, `detail_readiness`,
-`detail_verification`, `pitch_inspection`, `capture` и
-`post_capture_verification`; на пути перенаправления сразу к словарной странице
-`detail_navigation` может отсутствовать. Yarxi использует `search_submission`,
-`information_tab`, `article_verification`, `media_readiness`, `media_selection`,
-`dark_theme`, `resource_read`, `font_sample_capture`, `retry_backoff` и
-`retry_recovery`. Успешный этап имеет `outcome: "success"`; у элемента JPDB
+Значения `stage` принадлежат фактическим границам выполнения. JPDB использует
+`browser_launch`, `configure_browser`, `request_validation`, `search_resolution`,
+`search_navigation`, `search_readiness`, `detail_navigation`, `detail_readiness`,
+`detail_verification`, `pitch_inspection`, `capture`,
+`post_capture_verification`, `candidate_validation`, `outcome_validation` и
+`checkpoint`. Последние три стадии относятся к проверке результата и сохранению
+исхода пакета pitch; `checkpoint` включает повторное получение блокировки,
+перечитывание состояния, CAS и сохранение. На пути перенаправления сразу к
+словарной странице `detail_navigation` может отсутствовать. Если альтернативный
+`PitchRunDriver` использует реализацию по умолчанию, полное получение отмечается
+стадией `provider_acquisition`; рабочий драйвер JPDB фиксирует конкретные стадии
+провайдера. Yarxi использует `search_submission`, `information_tab`,
+`article_verification`, `media_readiness`, `media_selection`, `dark_theme`,
+`resource_read`, `font_sample_capture`, `retry_backoff`, `retry_recovery`,
+`semantic_validation`, `final_validation` и `checkpoint`. Последние три стадии
+охватывают семантическую проверку изображения, итоговую проверку кандидата и
+контрольную точку CAS соответственно. Вложенные и параллельные длительности могут
+перекрываться, поэтому их нельзя складывать как последовательные интервалы.
+Успешный этап имеет `outcome: "success"`; у элемента JPDB
 успешные исходы — `acquired`, `no_pitch_accent_on_source`,
-`ambiguous_vocabulary`, `vocabulary_not_found` и `empty_request_list`. Ошибки и
+`ambiguous_vocabulary` и `vocabulary_not_found`. Ошибки и
 прерывания отмечаются как `failure` и `interrupted`; их коды причин передаются в
 `failure_code`, а предметный исход элемента Yarxi при успехе — `success`.
 
@@ -1047,27 +1062,29 @@ snapshot связывают его с остановкой очереди.
 и ограниченная 32 КиБ. Она содержит `epoch`, счётчики `pending_request_count`,
 `network_failure_count` и `http_error_count`, до 16 примеров каждого вида в
 `pending_requests`, `network_failures` и `http_errors`, а также
-`javascript_exceptions` и `monitor_failed`. Stale epoch имеет отдельные
+`javascript_exceptions` и `monitor_failed`. Устаревшая эпоха имеет отдельные
 `stale_pending_request_count`, `stale_network_failure_count`,
 `stale_http_error_count` и коллекции `stale_pending_requests`,
-`stale_network_failures`, `stale_http_errors`; JS exceptions разделены на
-текущую, bootstrap и stale группы. Каждая текущая и stale collection ограничена
+`stale_network_failures`, `stale_http_errors`; исключения JavaScript разделены на
+текущую, начальную и устаревшую группы. Каждая текущая и устаревшая коллекция ограничена
 16 записями. Запись примера содержит
 `request_key`, тип ресурса, эпоху, признак текущей эпохи и верхнеуровневого
 запроса, возраст наблюдения, HTTP-статус и категорию сетевой ошибки; вместо сырых
 ID запросов используются SHA-256-ключи. URL, заголовки, cookie, DOM и исходные
 CDP-сообщения в снимок не попадают. Если он превышает лимит, остаётся компактный
-объект с `truncated: true`, текущими и stale счётчиками, разбивкой JavaScript-
-исключений и `monitor_failed`.
+объект с `truncated: true`, текущей `epoch`, текущими и stale счётчиками,
+разбивкой JavaScript-исключений и `monitor_failed`; счётчики берутся из той же
+диагностической проекции, что и обычный снимок.
 
-Эти события описывают получение одного элемента и его этапы, а progress-события
+Эти события описывают получение одного элемента и его этапы, а события прогресса
 `browser_session_started`, `browser_session_ended` и `browser_session_rotated`
 остаются отдельными записями жизненного цикла сессии. Общий `browser_runtime`
-пишет lifecycle-события с `event: "browser_lifecycle"` для остановки transport,
-owned процесса, CDP handler, telemetry и удаления profile/temp. Transport outcome
-не подменяет postcondition: detached transport считается безвредным только при
-доказанной остановке процесса и успешном удалении принадлежащих каталогов. Ошибка
-этих postconditions остаётся `browser_cleanup_failed`; сбои внешнего run workspace
+пишет события с `event: "browser_lifecycle"` для остановки транспорта,
+принадлежащего процессу, обработчиков CDP, телеметрии и удаления профиля или
+временного каталога. Исход транспорта не подменяет итоговые условия очистки:
+отсоединённый транспорт считается безвредным только при доказанной остановке
+процесса и успешном удалении принадлежащих ему каталогов. Нарушение этих условий
+остаётся `browser_cleanup_failed`; сбои внешнего рабочего каталога запуска
 сохраняют код `temp_workspace_cleanup_failed`.
 
 Пример выборки ошибок из одного запуска:

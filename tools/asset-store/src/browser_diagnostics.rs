@@ -2,7 +2,7 @@
 //!
 //! События `browser_acquisition_item` и `browser_acquisition_stage` имеют схему
 //! `browser_acquisition_v1`. Время измеряется только монотонными `Instant`.
-//! Контекст, причины и runtime evidence проходят ограничение до сериализации;
+//! Контекст, причины и данные времени выполнения ограничиваются до сериализации;
 //! произвольные сообщения и сырые данные CDP этот API не принимает.
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -16,7 +16,7 @@ pub const MAX_IDENTITY_BYTES: usize = 256;
 pub const MAX_DIAGNOSTIC_TOKEN_BYTES: usize = 96;
 pub const MAX_RUNTIME_SNAPSHOT_BYTES: usize = 32 * 1024;
 
-/// Ограниченный контекст одного элемента. Поля закрыты, чтобы emitter не мог
+/// Ограниченный контекст одного элемента. Поля закрыты, чтобы вызывающий код не мог
 /// случайно принять URL или произвольный текст вместо идентичности/кода.
 #[derive(Debug, Clone)]
 pub struct BrowserItemContext {
@@ -34,7 +34,7 @@ impl BrowserItemContext {
         Self::with_optional_generation(provider, identity, attempt, Some(generation))
     }
 
-    /// Для провайдерских запусков без owner generation. Не подменяем неизвестное
+    /// Для провайдерских запусков без поколения владельца. Не подменяем неизвестное
     /// состояние фиктивным числом `0`.
     pub fn without_generation(provider: &str, identity: &str, attempt: u64) -> Self {
         Self::with_optional_generation(provider, identity, attempt, None)
@@ -79,8 +79,8 @@ struct ItemState {
     interruption_retryable: bool,
 }
 
-/// Владелец времени всего элемента, включая повторы и backoff.
-/// Drop незавершённого таймера фиксирует прерывание future.
+/// Владелец времени всего элемента, включая повторы и паузы перед ними.
+/// Drop незавершённого таймера фиксирует прерывание Future.
 #[must_use = "таймер должен жить до завершения элемента"]
 pub struct BrowserItemTimer {
     state: Arc<Mutex<ItemState>>,
@@ -106,7 +106,7 @@ impl BrowserItemTimer {
         }
     }
 
-    /// Этап владеет своим guard и может пережить временное заимствование item.
+    /// Этап владеет собственным защитным объектом и может пережить временное заимствование элемента.
     pub fn stage(&self, stage: &str) -> BrowserStageTimer {
         BrowserStageTimer {
             state: Arc::clone(&self.state),
@@ -138,7 +138,7 @@ impl BrowserItemTimer {
     }
 
     /// Координатор задаёт причину перед Drop отменяемого future: активный этап
-    /// получает точный timeout/cancellation code вместе с последней evidence.
+    /// получает точный код тайм-аута или отмены вместе с последним снимком.
     pub fn set_interruption(&self, reason: &str, failure_code: &str, retryable: bool) {
         let mut state = lock(&self.state);
         state.interruption_reason = Some(safe_token(reason));
@@ -146,7 +146,7 @@ impl BrowserItemTimer {
         state.interruption_retryable = retryable;
     }
 
-    /// Все этапы видят последнюю безопасную evidence, в том числе при Drop.
+    /// Все этапы видят последние безопасные данные, в том числе при Drop.
     pub fn record_runtime_snapshot(&self, snapshot: &RuntimeSnapshot) {
         record_snapshot(&self.state, snapshot);
     }
@@ -315,8 +315,8 @@ fn record_snapshot(state: &Mutex<ItemState>, snapshot: &RuntimeSnapshot) {
     lock(state).runtime_snapshot = Some(serialized);
 }
 
-/// Безопасная bounded JSON evidence для отказа сеанса до запуска первого item.
-/// Содержит только diagnostic-проекцию, никогда сырые URL/headers/messages CDP.
+/// Безопасные ограниченные данные JSON для отказа сеанса до запуска первого элемента.
+/// Содержит только диагностическую проекцию без сырых URL, заголовков и сообщений CDP.
 pub fn runtime_snapshot_json(snapshot: &RuntimeSnapshot) -> String {
     // Сырой RuntimeSnapshot никогда не проходит через Serialize.
     let diagnostic = snapshot.diagnostic();
@@ -327,12 +327,13 @@ pub fn runtime_snapshot_json(snapshot: &RuntimeSnapshot) -> String {
     } else {
         serde_json::json!({
             "truncated": true,
-            "pending_request_count": snapshot.pending_requests.len(),
-            "network_failure_count": snapshot.network_failures.len(),
-            "http_error_count": snapshot.http_errors.len(),
-            "stale_pending_request_count": snapshot.stale_pending_requests.len(),
-            "stale_network_failure_count": snapshot.stale_network_failures.len(),
-            "stale_http_error_count": snapshot.stale_http_errors.len(),
+            "epoch": diagnostic.epoch,
+            "pending_request_count": diagnostic.pending_request_count,
+            "network_failure_count": diagnostic.network_failure_count,
+            "http_error_count": diagnostic.http_error_count,
+            "stale_pending_request_count": diagnostic.stale_pending_request_count,
+            "stale_network_failure_count": diagnostic.stale_network_failure_count,
+            "stale_http_error_count": diagnostic.stale_http_error_count,
             "javascript_exceptions": snapshot.javascript_exceptions,
             "current_javascript_exceptions": snapshot.current_javascript_exceptions,
             "bootstrap_javascript_exceptions": snapshot.bootstrap_javascript_exceptions,
@@ -366,7 +367,7 @@ fn emit(event: Event<'_>) {
     let runtime_snapshot = (event.failure.is_some() || state.stop_reason.is_some())
         .then_some(state.runtime_snapshot.as_deref())
         .flatten();
-    // Debug сохраняет эти подробности в JSONL, не расширяя обычный human progress.
+    // Уровень Debug сохраняет эти подробности в JSONL, не расширяя обычный вывод прогресса.
     tracing::dispatcher::with_default(event.dispatch, || {
         tracing::debug!(
             event = event.event,
