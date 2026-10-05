@@ -513,12 +513,12 @@ fn skip_identifier(bytes: &[u8], mut index: usize) -> usize {
 
 fn markdown_spans(text: &str) -> Vec<Span> {
     let mut result = Vec::new();
-    // Начальный YAML frontmatter остаётся машинным контейнером, но его значения
-    // могут быть человекочитаемым текстом (например, description/whenToUse в
-    // repository skills). Поэтому ключи и delimiters не становятся prose, а
-    // содержимое закрытого блока проходит через тот же YAML-extractor, что и
-    // самостоятельные .yaml/.yml. Незакрытый frontmatter не делаем доступным
-    // для замены: невозможно надёжно отделить metadata от тела документа.
+    // Начальный YAML-блок метаданных остаётся машинным контейнером, но его значения
+    // могут быть человекочитаемым текстом (например, `description`/`whenToUse` в
+    // skill репозитория). Поэтому ключи и разделители не становятся обычным текстом,
+    // а содержимое закрытого блока проходит через тот же обработчик YAML, что и
+    // самостоятельные `.yaml`/`.yml`. Незакрытый блок метаданных не делаем доступным
+    // для замены: невозможно надёжно отделить метаданные от тела документа.
     let mut offset = 0;
     let mut lines = text.split_inclusive('\n');
     if let Some(first) = lines.next()
@@ -1334,7 +1334,7 @@ mod tests {
                 candidate: frontmatter,
                 action: LanguageAction::Replace,
                 replacement: Some("Русское описание".into()),
-                reason: "подтверждён перевод описания skill".into(),
+                reason: "подтверждён перевод описания навыка".into(),
             },
             LanguageDecision {
                 candidate: body,
