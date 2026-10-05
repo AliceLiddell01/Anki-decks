@@ -513,9 +513,12 @@ fn skip_identifier(bytes: &[u8], mut index: usize) -> usize {
 
 fn markdown_spans(text: &str) -> Vec<Span> {
     let mut result = Vec::new();
-    // Начальный YAML-блок метаданных задаёт машинный контракт документа.
-    // Консервативно исключаем весь блок, включая значения-идентификаторы.
-    // Незакрытый блок тоже не делаем доступным для замены обычного текста.
+    // Начальный YAML frontmatter остаётся машинным контейнером, но его значения
+    // могут быть человекочитаемым текстом (например, description/whenToUse в
+    // repository skills). Поэтому ключи и delimiters не становятся prose, а
+    // содержимое закрытого блока проходит через тот же YAML-extractor, что и
+    // самостоятельные .yaml/.yml. Незакрытый frontmatter не делаем доступным
+    // для замены: невозможно надёжно отделить metadata от тела документа.
     let mut offset = 0;
     let mut lines = text.split_inclusive('\n');
     if let Some(first) = lines.next()
@@ -524,13 +527,33 @@ fn markdown_spans(text: &str) -> Vec<Span> {
             .trim_start_matches('\u{feff}')
             == "---"
     {
-        offset = first.len();
+        let frontmatter_start = first.len();
+        let mut cursor = frontmatter_start;
+        let mut closed = None;
         for line in lines {
-            offset += line.len();
+            let next = cursor + line.len();
             if matches!(line.trim_end_matches(['\r', '\n']), "---" | "...") {
+                closed = Some((cursor, next));
                 break;
             }
+            cursor = next;
         }
+        let Some((frontmatter_end, body_start)) = closed else {
+            return result;
+        };
+        let frontmatter = &text[frontmatter_start..frontmatter_end];
+        result.extend(
+            config_spans(frontmatter, true)
+                .into_iter()
+                .map(|(start, end, context)| {
+                    (
+                        frontmatter_start + start,
+                        frontmatter_start + end,
+                        context,
+                    )
+                }),
+        );
+        offset = body_start;
     }
     let mut fence: Option<(u8, usize)> = None;
     let mut inline_ticks = 0;
@@ -1270,32 +1293,64 @@ mod tests {
     }
 
     #[test]
-    fn markdown_frontmatter_is_a_machine_surface_with_original_body_offsets() {
+    fn markdown_frontmatter_scans_human_values_and_preserves_body_offsets() {
         for (opener, closer) in [("---\n", "---\n"), ("\u{feff}---\r\n", "...\r\n")] {
-            let metadata = "name: english-skill\ndescription: >-\n  Human description\nwhenToUse: Human trigger\ncustomKey: machineIdentifier\n";
+            let metadata = "name: skill_identifier\ndescription: >-\n  Human description\nwhenToUse: Human trigger\ncustomKey: machine_identifier\n";
             let source = format!("{opener}{metadata}{closer}Human prose\n");
             let found = candidates(".agents/skills/example/SKILL.md", &source);
-            assert_eq!(found.len(), 1);
-            assert_eq!(found[0].text, "Human prose");
-            assert_eq!(found[0].context, TextContext::MarkdownProse);
-            assert_eq!(found[0].start, opener.len() + metadata.len() + closer.len());
-            assert_eq!(found[0].line, 8);
-            assert_eq!(found[0].column, 1);
+            assert_eq!(found.len(), 3);
+            assert_eq!(found[0].text, "Human description");
+            assert_eq!(found[0].context, TextContext::ConfigurationValue);
+            assert_eq!(found[0].line, 4);
+            assert_eq!(found[1].text, "Human trigger");
+            assert_eq!(found[1].context, TextContext::ConfigurationValue);
+            assert_eq!(found[1].line, 5);
+            assert_eq!(found[2].text, "Human prose");
+            assert_eq!(found[2].context, TextContext::MarkdownProse);
+            assert_eq!(found[2].start, opener.len() + metadata.len() + closer.len());
+            assert_eq!(found[2].line, 8);
+            assert_eq!(found[2].column, 1);
         }
         assert!(candidates("a.md", "---\nname: english-skill\nHuman description\n").is_empty());
         assert!(!candidates("a.md", "Human prose\n---\nAnother paragraph\n").is_empty());
     }
 
     #[test]
-    fn markdown_body_translation_preserves_frontmatter_contract() {
+    fn markdown_frontmatter_translation_preserves_yaml_structure_and_body() {
         let temp = TempDir::new("language-frontmatter");
-        let source = "---\nname: english-skill\ndescription: Human description\n---\nHuman prose\n";
+        let source =
+            "---\nname: skill_identifier\ndescription: Human description\n---\nHuman prose\n";
         fs::write(temp.path().join("a.md"), source).unwrap();
-        let approved = decisions(vec![replacement("a.md", source, "Русский текст")]);
+
+        let found = candidates("a.md", source);
+        let frontmatter = found
+            .iter()
+            .find(|candidate| candidate.text == "Human description")
+            .unwrap()
+            .clone();
+        let body = found
+            .iter()
+            .find(|candidate| candidate.text == "Human prose")
+            .unwrap()
+            .clone();
+        let approved = decisions(vec![
+            LanguageDecision {
+                candidate: frontmatter,
+                action: LanguageAction::Replace,
+                replacement: Some("Русское описание".into()),
+                reason: "подтверждён перевод описания skill".into(),
+            },
+            LanguageDecision {
+                candidate: body,
+                action: LanguageAction::Replace,
+                replacement: Some("Русский текст".into()),
+                reason: "подтверждён перевод текста документа".into(),
+            },
+        ]);
         apply(temp.path(), &approved, true).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join("a.md")).unwrap(),
-            "---\nname: english-skill\ndescription: Human description\n---\nРусский текст\n"
+            "---\nname: skill_identifier\ndescription: Русское описание\n---\nРусский текст\n"
         );
     }
 
