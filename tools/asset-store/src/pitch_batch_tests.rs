@@ -35,6 +35,36 @@ fn batch(batch_id: &str, surface: &str, reading: Option<&str>) -> PitchAccentBat
     .unwrap()
 }
 
+fn assert_retry_selection_matches_targeted_retry(batch: &PitchAccentBatch) {
+    batch.validate().unwrap();
+    let reason = "Проверка общего критерия повтора";
+    let allowed: Vec<_> = batch
+        .items
+        .iter()
+        .filter(|item| {
+            let mut targeted = batch.clone();
+            targeted.retry(&item.identity.key, reason.into()).is_ok()
+        })
+        .map(|item| item.identity.key.clone())
+        .collect();
+    assert_eq!(batch.retryable_failure_surfaces(), allowed);
+
+    let mut targeted = batch.clone();
+    for surface in &allowed {
+        targeted.retry(surface, reason.into()).unwrap();
+    }
+    let mut wide = batch.clone();
+    assert_eq!(
+        wide.retry_retryable_failures(reason.into()).unwrap(),
+        allowed
+    );
+    assert_eq!(
+        serde_json::to_value(wide).unwrap(),
+        serde_json::to_value(targeted).unwrap(),
+        "пакетный повтор должен совпадать с адресными повторами в порядке пакета"
+    );
+}
+
 struct TemporaryStore {
     workspace: TempWorkspace,
 }
@@ -1141,4 +1171,541 @@ fn current_verified_owner_is_reused_without_acquisition() {
         Some(record.sha256.as_str())
     );
     assert!(batch.item_token("幽霊").is_err());
+}
+
+/// Пакетный перевод в новое поколение обязан выбрать ровно текущие устранимые
+/// технические сбои и не тронуть ни один другой элемент.
+#[test]
+fn batch_wide_retry_selects_only_current_retryable_technical_failures() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let surfaces = ["一", "二", "三", "四", "五", "六"];
+    let requests = surfaces
+        .iter()
+        .map(|surface| request(surface, Some("よみ")))
+        .collect();
+    let mut batch = PitchAccentBatch::new(
+        "batch-wide-retry",
+        requests,
+        PitchAccentImageValidator::validator_identity(),
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+
+    let mut record = |batch: &mut PitchAccentBatch, surface: &str, outcome: JpdbPitchOutcome| {
+        let cas = batch.item_token(surface).unwrap();
+        assert!(runtime.record_outcome(batch, &cas, outcome).unwrap());
+    };
+    // Устранимый технический сбой: единственный кандидат на пакетный повтор.
+    record(
+        &mut batch,
+        "一",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::DetailReadiness,
+                diagnostic: Some("Истёк лимит запроса".into()),
+            },
+        },
+    );
+    // Неустранимый технический сбой: повтор не поможет и остаётся как есть.
+    record(
+        &mut batch,
+        "二",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::PageContract {
+                stage: JpdbPitchStage::DetailReadiness,
+                message: "Страница не соответствует контракту".into(),
+            },
+        },
+    );
+    record(
+        &mut batch,
+        "三",
+        JpdbPitchOutcome::NoPitchAccentOnSource {
+            evidence: JpdbPitchAbsenceEvidence {
+                surface: "三".into(),
+                reading: "よみ".into(),
+                jpdb_vocabulary_id: 123,
+                source_url: "https://jpdb.io/vocabulary/123/三/よみ".into(),
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: "三".into(),
+                    reading: "よみ".into(),
+                }],
+                section_inventory: vec!["Meanings".into(), "Forms".into()],
+                base_page_contract_valid: true,
+                pitch_section_present: false,
+                pitch_marker_count: 0,
+                browser: browser(),
+            },
+        },
+    );
+    record(
+        &mut batch,
+        "四",
+        JpdbPitchOutcome::VocabularyNotFound {
+            surface: "四".into(),
+            reading: Some("よみ".into()),
+        },
+    );
+    record(
+        &mut batch,
+        "五",
+        JpdbPitchOutcome::AmbiguousVocabulary {
+            surface: "五".into(),
+            reading: Some("よみ".into()),
+            candidates: vec![JpdbVocabularyCandidate {
+                vocabulary_id: 123,
+                surface_forms: vec!["五".into()],
+                readings: vec!["よみ".into()],
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: "五".into(),
+                    reading: "よみ".into(),
+                }],
+                part_of_speech: vec!["noun".into()],
+                meanings: vec!["five".into()],
+                detail_url: "https://jpdb.io/vocabulary/123/五/よみ".into(),
+            }],
+        },
+    );
+    // «六» остаётся нетронутым ожидающим элементом.
+
+    assert_eq!(
+        batch.item("一").unwrap().status(),
+        PitchBatchItemStatus::TechnicalFailure
+    );
+    assert_eq!(
+        batch.item("二").unwrap().status(),
+        PitchBatchItemStatus::TechnicalFailure
+    );
+    assert_eq!(
+        batch.retryable_failure_surfaces(),
+        vec!["一".to_owned()],
+        "пакетный выбор обязан совпадать с классификатором устранимости"
+    );
+
+    assert_retry_selection_matches_targeted_retry(&batch);
+
+    let before = batch.clone();
+    let selected = batch
+        .retry_retryable_failures("Пакетный повтор временных сбоев".into())
+        .unwrap();
+    assert_eq!(selected, vec!["一".to_owned()]);
+    assert_eq!(
+        batch.item("一").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert_eq!(batch.item("一").unwrap().generation, 1);
+    assert_eq!(batch.item("一").unwrap().attempts.len(), 1);
+    // Все прочие элементы остаются байт-в-байт прежними.
+    for surface in ["二", "三", "四", "五", "六"] {
+        assert_eq!(
+            serde_json::to_value(batch.item(surface).unwrap()).unwrap(),
+            serde_json::to_value(before.item(surface).unwrap()).unwrap(),
+            "элемент {surface} не должен меняться"
+        );
+    }
+    // Повтор операции идемпотентен: уже переведённые элементы не выбираются.
+    let after = batch.clone();
+    assert!(batch.retryable_failure_surfaces().is_empty());
+    assert!(
+        batch
+            .retry_retryable_failures("Повтор без выбранных элементов".into())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        serde_json::to_value(&batch).unwrap(),
+        serde_json::to_value(&after).unwrap(),
+        "пустой выбор не меняет сохранённое состояние"
+    );
+}
+
+#[test]
+fn batch_wide_retry_rejects_invalid_reason_without_changes() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let mut batch = batch("batch-wide-atomic", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let cas = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(
+                &mut batch,
+                &cas,
+                JpdbPitchOutcome::Failed {
+                    error: JpdbPitchFailure::Timeout {
+                        stage: JpdbPitchStage::DetailReadiness,
+                        diagnostic: Some("Истёк лимит запроса".into()),
+                    },
+                },
+            )
+            .unwrap()
+    );
+    let before = serde_json::to_value(&batch).unwrap();
+    // Отказ валидации причины обязан оставить пакет без единого изменения.
+    assert!(batch.retry_retryable_failures("  ".into()).is_err());
+    assert_eq!(serde_json::to_value(&batch).unwrap(), before);
+    assert_eq!(
+        batch.item("幽霊").unwrap().status(),
+        PitchBatchItemStatus::TechnicalFailure
+    );
+}
+
+#[test]
+fn batch_wide_retry_rolls_back_after_first_item_changes_and_second_overflows() {
+    let temporary = temp_store();
+    let mut batch = PitchAccentBatch::new(
+        "batch-wide-overflow",
+        vec![request("一", None), request("二", None)],
+        PitchAccentImageValidator::validator_identity(),
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    for surface in ["一", "二"] {
+        record_provider_outcome(
+            &mut runtime,
+            &mut batch,
+            surface,
+            JpdbPitchOutcome::Failed {
+                error: JpdbPitchFailure::Timeout {
+                    stage: JpdbPitchStage::DetailReadiness,
+                    diagnostic: None,
+                },
+            },
+        );
+    }
+    batch.item_mut("二").unwrap().item_revision = u64::MAX;
+    // Граница счётчика допустима в сохранённом состоянии, а следующий повтор — нет.
+    batch.validate().unwrap();
+    assert_eq!(batch.retryable_failure_surfaces(), vec!["一", "二"]);
+    runtime.save(&batch).unwrap();
+    assert_eq!(runtime.load().unwrap().unwrap(), batch);
+
+    let reason = "Повтор с проверкой атомарности";
+    let mut partial = batch.clone();
+    partial.retry("一", reason.into()).unwrap();
+    assert_eq!(partial.item("一").unwrap().generation, 1);
+    assert_eq!(
+        partial.item("一").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert_ne!(partial, batch);
+    let error = partial.retry("二", reason.into()).unwrap_err();
+    assert_eq!(error.message, "превышен номер изменения элемента");
+    assert_eq!(partial.item("二").unwrap().generation, 1);
+
+    let before = serde_json::to_vec(&batch).unwrap();
+    let error = batch.retry_retryable_failures(reason.into()).unwrap_err();
+    assert_eq!(error.message, "превышен номер изменения элемента");
+    assert_eq!(serde_json::to_vec(&batch).unwrap(), before);
+    assert_eq!(runtime.load().unwrap().unwrap(), batch);
+}
+
+#[test]
+fn batch_wide_retry_and_runtime_load_reject_corrupt_attempt_history() {
+    let temporary = temp_store();
+    let mut batch = batch("batch-wide-invalid-history", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    record_provider_outcome(
+        &mut runtime,
+        &mut batch,
+        "幽霊",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::DetailReadiness,
+                diagnostic: None,
+            },
+        },
+    );
+    batch.item_mut("幽霊").unwrap().attempts[0].index = 0;
+    assert!(batch.validate().is_err());
+    assert_eq!(batch.retryable_failure_surfaces(), vec!["幽霊"]);
+    let before = serde_json::to_vec(&batch).unwrap();
+    assert!(
+        batch
+            .retry_retryable_failures("Повтор повреждённой истории".into())
+            .is_err()
+    );
+    assert_eq!(serde_json::to_vec(&batch).unwrap(), before);
+    assert!(runtime.save(&batch).is_err());
+    drop(runtime);
+
+    let state_path = temporary
+        .path()
+        .join(".runtime/batches/batch-wide-invalid-history/state.json");
+    std::fs::write(&state_path, &before).unwrap();
+    let mut reopened = PitchAccentBatchRuntime::open(temporary.path(), &batch.batch_id).unwrap();
+    assert!(reopened.load().is_err());
+    assert_eq!(std::fs::read(state_path).unwrap(), before);
+}
+
+/// Пакетный повтор не трогает ни один элемент, который не является текущим
+/// устранимым техническим сбоем, включая опубликованные и конфликтные.
+#[test]
+fn batch_wide_retry_leaves_published_conflict_and_pending_items_untouched() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let surfaces = ["一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    let requests = surfaces
+        .iter()
+        .map(|surface| request(surface, Some("ゆうれい")))
+        .collect();
+    let mut batch = PitchAccentBatch::new(
+        "batch-wide-statuses",
+        requests,
+        PitchAccentImageValidator::validator_identity(),
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+
+    macro_rules! record {
+        ($surface:expr, $outcome:expr) => {{
+            let cas = batch.item_token($surface).unwrap();
+            assert!(runtime.record_outcome(&mut batch, &cas, $outcome).unwrap());
+        }};
+    }
+
+    // «一» — устранимый технический сбой: единственный кандидат на пакетный повтор.
+    record!(
+        "一",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::DetailReadiness,
+                diagnostic: Some("Истёк лимит запроса".into()),
+            },
+        }
+    );
+    // «二» — неустранимый технический сбой.
+    record!(
+        "二",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::PageContract {
+                stage: JpdbPitchStage::DetailReadiness,
+                message: "Страница не соответствует контракту".into(),
+            },
+        }
+    );
+    // «三» — опубликованный элемент.
+    let published_sha =
+        record_provider_outcome(&mut runtime, &mut batch, "三", acquired("三", false));
+    batch.begin_publication("三", &published_sha, None).unwrap();
+    // «四» — конфликт с текущим состоянием владельца.
+    record!(
+        "四",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::DetailReadiness,
+                diagnostic: None,
+            },
+        }
+    );
+    let conflict_owner = rejected_owner(verified_record("四", false));
+    // «五» — незавершённое намерение публикации.
+    let pending_sha =
+        record_provider_outcome(&mut runtime, &mut batch, "五", acquired("五", false));
+    batch.begin_publication("五", &pending_sha, None).unwrap();
+    batch
+        .reconcile_owner(
+            &PitchBatchOwnerSnapshot::from_records(vec![
+                verified_record("三", false),
+                conflict_owner.clone(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    record!(
+        "六",
+        JpdbPitchOutcome::NoPitchAccentOnSource {
+            evidence: JpdbPitchAbsenceEvidence {
+                surface: "六".into(),
+                reading: "ゆうれい".into(),
+                jpdb_vocabulary_id: 123,
+                source_url: "https://jpdb.io/vocabulary/123/六/ゆうれい".into(),
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: "六".into(),
+                    reading: "ゆうれい".into(),
+                }],
+                section_inventory: vec!["Meanings".into(), "Forms".into()],
+                base_page_contract_valid: true,
+                pitch_section_present: false,
+                pitch_marker_count: 0,
+                browser: browser(),
+            },
+        }
+    );
+    record!(
+        "七",
+        JpdbPitchOutcome::AmbiguousVocabulary {
+            surface: "七".into(),
+            reading: Some("ゆうれい".into()),
+            candidates: vec![JpdbVocabularyCandidate {
+                vocabulary_id: 123,
+                surface_forms: vec!["七".into()],
+                readings: vec!["ゆうれい".into()],
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: "七".into(),
+                    reading: "ゆうれい".into(),
+                }],
+                part_of_speech: vec!["noun".into()],
+                meanings: vec!["seven".into()],
+                detail_url: "https://jpdb.io/vocabulary/123/七/ゆうれい".into(),
+            }],
+        }
+    );
+    record!(
+        "八",
+        JpdbPitchOutcome::VocabularyNotFound {
+            surface: "八".into(),
+            reading: Some("ゆうれい".into()),
+        }
+    );
+    // «九» остаётся ожидающим элементом.
+
+    assert_eq!(
+        batch.item("三").unwrap().status(),
+        PitchBatchItemStatus::Published
+    );
+    assert_eq!(
+        batch.item("四").unwrap().status(),
+        PitchBatchItemStatus::Conflict
+    );
+    assert_eq!(
+        batch.item("五").unwrap().status(),
+        PitchBatchItemStatus::PublicationPending
+    );
+    assert_eq!(
+        batch.item("六").unwrap().status(),
+        PitchBatchItemStatus::NoPitchAccentOnSource
+    );
+    assert_eq!(
+        batch.item("七").unwrap().status(),
+        PitchBatchItemStatus::AmbiguousVocabulary
+    );
+    assert_eq!(
+        batch.item("八").unwrap().status(),
+        PitchBatchItemStatus::VocabularyNotFound
+    );
+    assert_eq!(
+        batch.item("九").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert_eq!(batch.retryable_failure_surfaces(), vec!["一".to_owned()]);
+
+    assert_retry_selection_matches_targeted_retry(&batch);
+
+    let before = batch.clone();
+    let selected = batch
+        .retry_retryable_failures("Пакетный повтор временных сбоев".into())
+        .unwrap();
+    assert_eq!(selected, vec!["一".to_owned()]);
+    for surface in ["二", "三", "四", "五", "六", "七", "八", "九"] {
+        assert_eq!(
+            serde_json::to_value(batch.item(surface).unwrap()).unwrap(),
+            serde_json::to_value(before.item(surface).unwrap()).unwrap(),
+            "элемент {surface} не должен меняться"
+        );
+    }
+    // Конфликт владельца и опубликованный SHA остаются в силе после пакетного повтора.
+    assert_eq!(
+        batch.item("四").unwrap().owner_current_sha256.as_deref(),
+        Some(conflict_owner.sha256.as_str())
+    );
+    assert_eq!(
+        batch.item("三").unwrap().published_sha256.as_deref(),
+        Some(published_sha.as_str())
+    );
+}
+
+#[test]
+fn batch_wide_retry_matches_targeted_retry_after_owner_reconciliation() {
+    let temporary = temp_store();
+    let requests = ["一", "二", "三"]
+        .iter()
+        .map(|surface| request(surface, Some("ゆうれい")))
+        .collect();
+    let mut batch = PitchAccentBatch::new(
+        "retry-reconciled-owner",
+        requests,
+        PitchAccentImageValidator::validator_identity(),
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    for surface in ["一", "二", "三"] {
+        let token = batch.item_token(surface).unwrap();
+        assert!(
+            runtime
+                .record_outcome(
+                    &mut batch,
+                    &token,
+                    JpdbPitchOutcome::Failed {
+                        error: JpdbPitchFailure::Timeout {
+                            stage: JpdbPitchStage::DetailReadiness,
+                            diagnostic: None,
+                        },
+                    },
+                )
+                .unwrap()
+        );
+    }
+
+    let owner = verified_record("二", false);
+    batch
+        .reconcile_owner(
+            &PitchBatchOwnerSnapshot::from_records(vec![
+                owner.clone(),
+                rejected_owner(verified_record("三", false)),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    let reconciled = batch.item("二").unwrap();
+    assert_eq!(reconciled.status(), PitchBatchItemStatus::ExistingVerified);
+    assert!(matches!(
+        reconciled.current_outcome(),
+        Some(crate::pitch_batch::PitchBatchOutcome::Failed {
+            error: JpdbPitchFailure::Timeout { .. }
+        })
+    ));
+    assert!(reconciled.owner_conflict.is_none());
+    assert_eq!(
+        batch.item("三").unwrap().status(),
+        PitchBatchItemStatus::Conflict
+    );
+    assert_eq!(
+        batch.retryable_failure_surfaces(),
+        vec!["一".to_owned(), "二".to_owned()],
+        "VERIFIED владельца не отменяет явный повтор сохранённого сбоя"
+    );
+    assert_retry_selection_matches_targeted_retry(&batch);
+
+    let previous_generation = reconciled.generation;
+    let before = batch.clone();
+    assert_eq!(
+        batch
+            .retry_retryable_failures("Повтор после сверки владельца".into())
+            .unwrap(),
+        vec!["一".to_owned(), "二".to_owned()]
+    );
+    let retried = batch.item("二").unwrap();
+    assert_eq!(retried.status(), PitchBatchItemStatus::Pending);
+    assert_eq!(retried.generation, previous_generation + 1);
+    assert_eq!(retried.attempts.len(), 1);
+    assert_eq!(
+        retried.owner_current_sha256.as_deref(),
+        Some(owner.sha256.as_str())
+    );
+    assert_eq!(
+        retried.refresh_expected_sha256.as_deref(),
+        Some(owner.sha256.as_str())
+    );
+    assert_eq!(
+        serde_json::to_value(batch.item("三").unwrap()).unwrap(),
+        serde_json::to_value(before.item("三").unwrap()).unwrap()
+    );
 }

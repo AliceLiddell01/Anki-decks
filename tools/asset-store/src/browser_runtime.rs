@@ -169,22 +169,91 @@ struct BrowserProfile {
     closed: bool,
 }
 
+/// Ошибка запуска сохраняет доказанность очистки до владельца восстановления.
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserLaunchError {
+    #[error("{0}")]
+    Setup(String),
+    #[error("{original}; {cleanup}")]
+    CleanupFailed { original: String, cleanup: String },
+    #[error("{0}")]
+    Panic(String),
+}
+
+impl BrowserLaunchError {
+    pub(crate) fn workspace_creation(error: io::Error, code: &str) -> Self {
+        let original = format!("{code}: {error}");
+        if let Some(cleanup_failure) = error.get_ref().and_then(|error| {
+            error.downcast_ref::<crate::temp_workspace::WorkspaceCreationCleanupFailure>()
+        }) {
+            Self::CleanupFailed {
+                original: format!("{code}: {}", cleanup_failure.original),
+                cleanup: format!("temp_workspace_cleanup_failed: {}", cleanup_failure.cleanup),
+            }
+        } else {
+            Self::Setup(original)
+        }
+    }
+
+    fn with_cleanup(self, cleanup: Result<(), String>) -> Self {
+        match cleanup {
+            Ok(()) => self,
+            Err(cleanup) => Self::CleanupFailed {
+                original: self.to_string(),
+                cleanup: crate::diagnostics::safe_message(&cleanup),
+            },
+        }
+    }
+}
+
+impl From<io::Error> for BrowserLaunchError {
+    fn from(error: io::Error) -> Self {
+        Self::workspace_creation(error, "browser_profile_create_failed")
+    }
+}
+
+fn profile_creation_failure(error: io::Error, paths: &[&Path]) -> BrowserLaunchError {
+    let mut cleanup = Ok(());
+    for path in paths {
+        let removed = remove_browser_directory(path)
+            .and_then(|()| ensure_directory_removed(path))
+            .map_err(|error| format!("browser_profile_cleanup_failed: {error}"));
+        cleanup = combine_browser_close_results(cleanup, removed);
+    }
+    BrowserLaunchError::from(error).with_cleanup(cleanup)
+}
+
 impl BrowserProfile {
-    fn standalone() -> io::Result<Self> {
+    fn standalone() -> Result<Self, BrowserLaunchError> {
         let workspace = TempWorkspace::create("browser-session")?;
         let parent = workspace.path().to_path_buf();
         Self::create(&parent, Some(workspace))
     }
 
-    fn in_workspace(workspace: &Path) -> io::Result<Self> {
+    fn in_workspace(workspace: &Path) -> Result<Self, BrowserLaunchError> {
         Self::create(workspace, None)
     }
 
-    fn create(parent: &Path, workspace: Option<TempWorkspace>) -> io::Result<Self> {
+    fn create(parent: &Path, workspace: Option<TempWorkspace>) -> Result<Self, BrowserLaunchError> {
+        let result = Self::create_directories(parent);
+        match result {
+            Ok(mut profile) => {
+                profile.workspace = workspace;
+                Ok(profile)
+            }
+            Err(error) => Err(error.with_cleanup(
+                workspace
+                    .map_or(Ok(()), TempWorkspace::close)
+                    .map_err(|error| format!("browser_workspace_cleanup_failed: {error}")),
+            )),
+        }
+    }
+
+    fn create_directories(parent: &Path) -> Result<Self, BrowserLaunchError> {
         if !fs::symlink_metadata(parent)?.is_dir() {
-            return Err(io::Error::other(
-                "путь для профиля браузера должен указывать на каталог",
-            ));
+            return Err(
+                io::Error::other("путь для профиля браузера должен указывать на каталог").into(),
+            );
         }
         let parent = fs::canonicalize(parent)?;
         let mut random = [0_u8; 18];
@@ -197,43 +266,41 @@ impl BrowserProfile {
             match fs::create_dir(&path) {
                 Ok(()) => {
                     if let Err(error) = set_private_directory(&path) {
-                        let _ = fs::remove_dir(&path);
-                        return Err(error);
+                        return Err(profile_creation_failure(error, &[&path]));
                     }
                     let temp_path =
                         parent.join(format!("t{:x}{:02x}", random[16] & 0x0f, random[17]));
                     match fs::create_dir(&temp_path) {
                         Ok(()) => {
                             if let Err(error) = set_private_directory(&temp_path) {
-                                let _ = fs::remove_dir(&temp_path);
-                                let _ = fs::remove_dir(&path);
-                                return Err(error);
+                                return Err(profile_creation_failure(error, &[&temp_path, &path]));
                             }
                             return Ok(Self {
                                 path,
                                 temp_path,
                                 workspace_path: parent,
-                                workspace,
+                                workspace: None,
                                 closed: false,
                             });
                         }
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                            fs::remove_dir(&path)?;
+                            if let Err(cleanup) = fs::remove_dir(&path) {
+                                return Err(BrowserLaunchError::from(error).with_cleanup(Err(
+                                    format!("browser_profile_cleanup_failed: {cleanup}"),
+                                )));
+                            }
                             continue;
                         }
                         Err(error) => {
-                            let _ = fs::remove_dir(&path);
-                            return Err(error);
+                            return Err(profile_creation_failure(error, &[&path]));
                         }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
-        Err(io::Error::other(
-            "не удалось создать уникальный профиль браузера",
-        ))
+        Err(io::Error::other("не удалось создать уникальный профиль браузера").into())
     }
 
     fn close(mut self) -> io::Result<()> {
@@ -335,12 +402,13 @@ fn build_browser_config(
         .map_err(|error| format!("настройка браузера: {error}"))
 }
 
-fn profile_setup_failure(profile: BrowserProfile, message: String) -> String {
+fn profile_setup_failure(profile: BrowserProfile, message: String) -> BrowserLaunchError {
     match profile.close() {
-        Ok(()) => message,
+        Ok(()) => BrowserLaunchError::Setup(message),
         Err(error) => {
             tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %crate::diagnostics::safe_message(&error.to_string()), "Ошибка очистки после отказа запуска браузера");
-            format!("{message}; browser_profile_cleanup_failed: {error}")
+            BrowserLaunchError::Setup(message)
+                .with_cleanup(Err(format!("browser_profile_cleanup_failed: {error}")))
         }
     }
 }
@@ -376,8 +444,13 @@ enum BrowserSetupFailure {
 }
 
 impl BrowserSetupFailure {
-    fn message(self) -> String {
-        self.message_with_panic_code("browser_setup_panicked")
+    fn launch_error(self, panic_code: &str) -> BrowserLaunchError {
+        match self {
+            Self::Error(message) => BrowserLaunchError::Setup(message),
+            failure @ Self::Panic(_) => {
+                BrowserLaunchError::Panic(failure.message_with_panic_code(panic_code))
+            }
+        }
     }
 
     fn message_with_panic_code(self, panic_code: &str) -> String {
@@ -407,14 +480,17 @@ async fn catch_browser_setup<T>(
     }
 }
 
-async fn profile_launch_failure(profile: BrowserProfile, failure: BrowserSetupFailure) -> String {
-    let original = failure.message_with_panic_code("browser_launch_panicked");
+async fn profile_launch_failure(
+    profile: BrowserProfile,
+    failure: BrowserSetupFailure,
+) -> BrowserLaunchError {
+    let original = failure.launch_error("browser_launch_panicked");
     match profile.close_after_browser_stop().await {
         Ok(()) => original,
         Err(error) => {
             let cleanup = crate::diagnostics::safe_message(&error.to_string());
             tracing::error!(stage = "temp_cleanup", code = "browser_profile_cleanup_failed", path_category = "browser_workspace", message = %cleanup, "Ошибка очистки после отказа или паники при запуске браузера");
-            format!("{original}; browser_profile_cleanup_failed: {cleanup}")
+            original.with_cleanup(Err(format!("browser_profile_cleanup_failed: {cleanup}")))
         }
     }
 }
@@ -564,18 +640,12 @@ impl BrowserResources {
     async fn finish_setup<T>(
         self,
         setup: Result<T, BrowserSetupFailure>,
-    ) -> Result<(Self, T), String> {
+    ) -> Result<(Self, T), BrowserLaunchError> {
         match setup {
             Ok(value) => Ok((self, value)),
             Err(failure) => {
-                let original = failure.message();
-                match self.close().await {
-                    Ok(()) => Err(original),
-                    Err(cleanup) => Err(format!(
-                        "{original}; {}",
-                        crate::diagnostics::safe_message(&cleanup)
-                    )),
-                }
+                let original = failure.launch_error("browser_setup_panicked");
+                Err(original.with_cleanup(self.close().await))
             }
         }
     }
@@ -710,10 +780,9 @@ pub struct BrowserSession {
 }
 
 impl BrowserSession {
-    pub async fn launch(config: BrowserRuntimeConfig) -> Result<Self, String> {
-        config.validate()?;
-        let profile = BrowserProfile::standalone()
-            .map_err(|error| format!("browser_profile_create_failed: {error}"))?;
+    pub async fn launch(config: BrowserRuntimeConfig) -> Result<Self, BrowserLaunchError> {
+        config.validate().map_err(BrowserLaunchError::Setup)?;
+        let profile = BrowserProfile::standalone()?;
         Self::launch_with_profile(config, profile).await
     }
 
@@ -721,17 +790,16 @@ impl BrowserSession {
     pub async fn launch_in_workspace(
         config: BrowserRuntimeConfig,
         workspace: &Path,
-    ) -> Result<Self, String> {
-        config.validate()?;
-        let profile = BrowserProfile::in_workspace(workspace)
-            .map_err(|error| format!("browser_profile_create_failed: {error}"))?;
+    ) -> Result<Self, BrowserLaunchError> {
+        config.validate().map_err(BrowserLaunchError::Setup)?;
+        let profile = BrowserProfile::in_workspace(workspace)?;
         Self::launch_with_profile(config, profile).await
     }
 
     async fn launch_with_profile(
         config: BrowserRuntimeConfig,
         profile: BrowserProfile,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BrowserLaunchError> {
         let executable = find_browser_executable();
         let executable_source = executable
             .as_ref()
@@ -1801,12 +1869,12 @@ mod tests {
 
     #[test]
     fn standalone_profile_is_cleaned_after_early_error() {
-        fn failing_setup(observed_root: &mut PathBuf) -> io::Result<()> {
+        fn failing_setup(observed_root: &mut PathBuf) -> Result<(), BrowserLaunchError> {
             let profile = BrowserProfile::standalone()?;
             *observed_root = profile.workspace.as_ref().unwrap().path().to_path_buf();
             fs::write(profile.path.join("data"), "browser")?;
             fs::write(profile.temp_path.join("data"), "временные данные браузера")?;
-            Err(io::Error::other("искусственно вызванный сбой настройки"))
+            Err(io::Error::other("искусственно вызванный сбой настройки").into())
         }
         let mut root = PathBuf::new();
         assert!(failing_setup(&mut root).is_err());
@@ -2009,6 +2077,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn profile_creation_failure_preserves_cleanup_classification() {
+        let parent = TempWorkspace::create("browser-profile-creation-failure-test").unwrap();
+        let path = parent.path().join("owned-profile");
+        fs::create_dir(&path).unwrap();
+        let recoverable = profile_creation_failure(io::Error::other("сбой создания"), &[&path]);
+        assert!(matches!(recoverable, BrowserLaunchError::Setup(_)));
+        assert!(!path.exists());
+        fs::write(&path, "каталог подменён файлом").unwrap();
+        let fatal = profile_creation_failure(io::Error::other("сбой создания"), &[&path]);
+        assert!(matches!(fatal, BrowserLaunchError::CleanupFailed { .. }));
+        assert!(path.exists());
+        parent.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_and_setup_errors_preserve_cleanup_classification() {
+        for stage in ["config", "launch", "setup"] {
+            for fail_cleanup in [false, true] {
+                let parent = TempWorkspace::create("browser-launch-setup-failure-test").unwrap();
+                let profile = BrowserProfile::in_workspace(parent.path()).unwrap();
+                let path = profile.path.clone();
+                if fail_cleanup {
+                    fs::remove_dir(&path).unwrap();
+                    fs::write(&path, "каталог подменён файлом").unwrap();
+                }
+                let failure = BrowserSetupFailure::Error("искусственный сбой настройки".into());
+                let error = if stage == "setup" {
+                    let resources = BrowserResources {
+                        diagnostic_session_id: 0,
+                        browser: None,
+                        handler_task: None,
+                        profile: Some(profile),
+                    };
+                    match resources.finish_setup::<()>(Err(failure)).await {
+                        Err(error) => error,
+                        Ok(_) => panic!("ошибка настройки должна сохраниться"),
+                    }
+                } else if stage == "launch" {
+                    profile_launch_failure(profile, failure).await
+                } else {
+                    profile_setup_failure(profile, "искусственный сбой настройки".into())
+                };
+                assert_eq!(
+                    matches!(error, BrowserLaunchError::CleanupFailed { .. }),
+                    fail_cleanup
+                );
+                assert_eq!(matches!(error, BrowserLaunchError::Setup(_)), !fail_cleanup);
+                assert_eq!(path.exists(), fail_cleanup);
+                parent.close().unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn launch_panic_failure_waits_for_profile_cleanup_and_keeps_its_error() {
         let parent = TempWorkspace::create("browser-launch-panic-cleanup-error-test").unwrap();
@@ -2021,8 +2143,17 @@ mod tests {
             BrowserSetupFailure::Panic(Box::new("искусственная паника при запуске")),
         )
         .await;
-        assert!(error.starts_with("browser_launch_panicked: искусственная паника при запуске;"));
-        assert!(error.contains("browser_profile_cleanup_failed:"));
+        assert!(matches!(error, BrowserLaunchError::CleanupFailed { .. }));
+        assert!(
+            error
+                .to_string()
+                .starts_with("browser_launch_panicked: искусственная паника при запуске;")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("browser_profile_cleanup_failed:")
+        );
         assert!(!temp_path.exists());
         parent.close().unwrap();
     }
@@ -2071,8 +2202,9 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("паника при настройке должна вернуть ошибку"),
         };
+        assert!(matches!(error, BrowserLaunchError::Panic(_)));
         assert_eq!(
-            error,
+            error.to_string(),
             "browser_setup_panicked: искусственная паника при настройке браузера"
         );
         // Эти утверждения выполняются до передачи управления: фоновая очистка из `Drop` их не заменит.
@@ -2108,9 +2240,18 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("паника при настройке должна вернуть ошибку"),
         };
-        assert!(error.contains("browser_setup_panicked: искусственная паника настройки"));
-        assert!(error.contains("browser_profile_cleanup_failed:"));
-        assert!(!error.contains("secret-value"));
+        assert!(matches!(error, BrowserLaunchError::CleanupFailed { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("browser_setup_panicked: искусственная паника настройки")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("browser_profile_cleanup_failed:")
+        );
+        assert!(!error.to_string().contains("secret-value"));
         assert!(!temp_path.exists());
         assert!(parent.path().is_dir());
         parent.close().unwrap();
@@ -2129,7 +2270,7 @@ mod tests {
             Ok(_) => panic!("паника при настройке должна вернуть ошибку"),
         };
         assert_eq!(
-            failure.message(),
+            failure.message_with_panic_code("browser_setup_panicked"),
             "browser_setup_panicked: паника с нетекстовым содержимым"
         );
     }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::batch_runtime::SafeBatchRuntime;
 use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer};
-use crate::browser_runtime::BrowserSession;
+use crate::browser_runtime::{BrowserLaunchError, BrowserSession};
 use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
@@ -164,6 +164,13 @@ pub enum PitchBatchCommand {
         #[arg(long, required = true)]
         reason: String,
     },
+    /// Переводит в новое поколение сразу все текущие устранимые технические сбои пакета.
+    RetryTechnical {
+        #[arg(long, required = true)]
+        batch_id: String,
+        #[arg(long, required = true)]
+        reason: String,
+    },
     /// Повторно получает точную идентичность после явного решения пользователя.
     Reacquire {
         #[arg(long, required = true)]
@@ -303,6 +310,13 @@ struct ItemSummary {
     owner_conflict: Option<crate::pitch_batch::PitchBatchConflict>,
 }
 
+/// Что именно изменила команда обновления пакета: словоформы, переведённые в новое
+/// поколение. Команды, которые поколение не меняют, возвращают пустой набор.
+#[derive(Debug, Default)]
+struct BatchUpdate {
+    retried_identities: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct Response {
     schema_version: u32,
@@ -317,6 +331,9 @@ struct Response {
     items: Vec<ItemSummary>,
     records: Vec<AssetRecord>,
     blockers: Vec<String>,
+    /// Словоформы, переведённые командой в новое поколение, в порядке элементов пакета.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    retried_identities: Vec<String>,
     artifact: Option<String>,
     error: Option<ErrorSummary>,
 }
@@ -498,6 +515,11 @@ fn prevalidate_command(
                 validate_reason(reason)?;
                 Ok((None, None))
             }
+            PitchBatchCommand::RetryTechnical { batch_id, reason } => {
+                crate::batch_runtime::validate_batch_id(batch_id)?;
+                validate_reason(reason)?;
+                Ok((None, None))
+            }
             PitchBatchCommand::Run { batch_id, workers }
             | PitchBatchCommand::Resume { batch_id, workers } => {
                 crate::batch_runtime::validate_batch_id(batch_id)?;
@@ -616,6 +638,7 @@ fn operation_name(command: &PitchCommand) -> &'static str {
             PitchBatchCommand::Review { .. } => "batch_review",
             PitchBatchCommand::Select { .. } => "batch_select",
             PitchBatchCommand::Retry { .. } => "batch_retry",
+            PitchBatchCommand::RetryTechnical { .. } => "batch_retry_technical",
             PitchBatchCommand::Reacquire { .. } => "batch_reacquire",
             PitchBatchCommand::Reject { .. } => "batch_reject",
         },
@@ -821,6 +844,7 @@ fn check_corpus(
                 items: Vec::new(),
                 records: Vec::new(),
                 blockers: Vec::new(),
+                retried_identities: Vec::new(),
                 artifact: None,
                 error: None,
             },
@@ -860,6 +884,7 @@ fn list_corpus(
                 items: Vec::new(),
                 records,
                 blockers: Vec::new(),
+                retried_identities: Vec::new(),
                 artifact: None,
                 error: None,
             },
@@ -1022,6 +1047,7 @@ fn human_operation_name(operation: &str) -> &str {
         "batch_review" => "подготовка проверки",
         "batch_select" => "выбор записи JPDB",
         "batch_retry" => "повтор элемента",
+        "batch_retry_technical" => "пакетный повтор технических сбоев",
         "batch_reacquire" => "повторное получение",
         "batch_reject" => "отклонение кандидата",
         _ => operation,
@@ -1161,6 +1187,7 @@ fn render_error(
             items: Vec::new(),
             records: Vec::new(),
             blockers: Vec::new(),
+            retried_identities: Vec::new(),
             artifact: None,
             error: Some(ErrorSummary {
                 code: error.code.as_str().to_owned(),
@@ -1213,6 +1240,7 @@ fn render_batch_error(
             items: Vec::new(),
             records: Vec::new(),
             blockers: Vec::new(),
+            retried_identities: Vec::new(),
             artifact: None,
             error: Some(error),
         },
@@ -1474,7 +1502,10 @@ async fn execute_batch(
             output,
             summary,
             store_changed,
-            |batch| batch.select_candidate(&surface, vocabulary_id, detail_url),
+            |batch| {
+                batch.select_candidate(&surface, vocabulary_id, detail_url)?;
+                Ok(BatchUpdate::default())
+            },
         ),
         PitchBatchCommand::Retry {
             batch_id,
@@ -1487,7 +1518,25 @@ async fn execute_batch(
             output,
             summary,
             store_changed,
-            |batch| batch.retry(&surface, reason),
+            |batch| {
+                batch.retry(&surface, reason)?;
+                Ok(BatchUpdate {
+                    retried_identities: vec![surface.clone()],
+                })
+            },
+        ),
+        PitchBatchCommand::RetryTechnical { batch_id, reason } => update_batch(
+            store,
+            &batch_id,
+            "batch_retry_technical",
+            output,
+            summary,
+            store_changed,
+            |batch| {
+                Ok(BatchUpdate {
+                    retried_identities: batch.retry_retryable_failures(reason)?,
+                })
+            },
         ),
         PitchBatchCommand::Reacquire {
             batch_id,
@@ -1500,7 +1549,10 @@ async fn execute_batch(
             output,
             summary,
             store_changed,
-            |batch| batch.reacquire(&surface, reason),
+            |batch| {
+                batch.reacquire(&surface, reason)?;
+                Ok(BatchUpdate::default())
+            },
         ),
         PitchBatchCommand::Reject {
             batch_id,
@@ -1562,7 +1614,7 @@ fn update_batch(
     output: OutputFormat,
     summary: StoreSummary,
     store_changed: bool,
-    update: impl FnOnce(&mut PitchAccentBatch) -> Result<(), AssetError>,
+    update: impl FnOnce(&mut PitchAccentBatch) -> Result<BatchUpdate, AssetError>,
 ) -> PitchCliOutput {
     let before_revision = batch_state_revision(store, batch_id).unwrap_or(None);
     let result = (|| {
@@ -1573,22 +1625,25 @@ fn update_batch(
         let before = batch.clone();
         let owner = owner_snapshot(store)?;
         batch.reconcile_owner(&owner)?;
-        let reconciliation_changed = batch != before;
-        if let Err(error) = update(&mut batch) {
-            if reconciliation_changed {
-                runtime.save(&batch)?;
+        let reconciled_batch = (batch != before).then(|| batch.clone());
+        let update = match update(&mut batch) {
+            Ok(update) => update,
+            Err(error) => {
+                if let Some(reconciled_batch) = &reconciled_batch {
+                    runtime.save(reconciled_batch)?;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         let changed = batch != before;
         if changed {
             runtime.save(&batch)?;
         }
-        Ok((batch, changed))
+        Ok((batch, changed, update))
     })();
     match result {
-        Ok((batch, changed)) => render_response(
-            batch_response(
+        Ok((batch, changed, update)) => {
+            let mut response = batch_response(
                 operation,
                 "updated",
                 store_changed || changed,
@@ -1596,10 +1651,10 @@ fn update_batch(
                 &batch,
                 batch_blockers(&batch),
                 None,
-            ),
-            output,
-            0,
-        ),
+            );
+            response.retried_identities = update.retried_identities;
+            render_response(response, output, 0)
+        }
         Err(error) => render_batch_error(
             store,
             summary,
@@ -1788,6 +1843,12 @@ const PITCH_SESSION_MAX_AGE: Duration = Duration::from_secs(20 * 60);
 const PITCH_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
 const PITCH_DEFAULT_WORKERS: u8 = 4;
 const PITCH_MAX_WORKERS: usize = 4;
+// Бюджет последовательных восстановлений сессии без доказанного здорового прогресса.
+// Значение задаёт число последовательных сбоев сессии/запуска, после которого
+// исполнитель выводится из пула. Это позволяет пережить кратковременные сбои и не
+// допустить бесконечного цикла при неисправной среде. Плановая ротация по
+// возрасту/лимиту записей и `Ctrl+C` бюджет не расходуют.
+const PITCH_SESSION_RECOVERY_BUDGET: u32 = 3;
 
 fn validate_pitch_workers(workers: usize) -> Result<(), AssetError> {
     if !(1..=PITCH_MAX_WORKERS).contains(&workers) {
@@ -1821,7 +1882,7 @@ impl Default for PitchRunPolicy {
 trait PitchRunDriver {
     type Session;
 
-    async fn launch(&mut self) -> Result<Self::Session, String>;
+    async fn launch(&mut self) -> Result<Self::Session, BrowserLaunchError>;
     async fn acquire(
         &mut self,
         session: &Self::Session,
@@ -1880,12 +1941,13 @@ struct JpdbRunDriver {
 impl PitchRunDriver for JpdbRunDriver {
     type Session = BrowserSession;
 
-    async fn launch(&mut self) -> Result<Self::Session, String> {
+    async fn launch(&mut self) -> Result<Self::Session, BrowserLaunchError> {
         if self.workspace.is_none() {
-            self.workspace = Some(
-                TempWorkspace::create("pitch-batch-worker")
-                    .map_err(|error| format!("worker_workspace_create_failed: {error}"))?,
-            );
+            self.workspace = Some(TempWorkspace::create("pitch-batch-worker").map_err(
+                |error| {
+                    BrowserLaunchError::workspace_creation(error, "worker_workspace_create_failed")
+                },
+            )?);
         }
         BrowserSession::launch_in_workspace(
             pitch_browser_runtime_config(),
@@ -1968,6 +2030,9 @@ struct PitchProgressEvent {
     next_session: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt: Option<usize>,
+    /// Число последовательных восстановлений сессии без доказанного здорового прогресса.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1995,7 +2060,7 @@ fn write_pitch_progress(
         OutputFormat::Json => serde_json::to_string(event)
             .map_err(|error| invalid_plan(format!("сериализация прогресса: {error}")))?,
         OutputFormat::Human => format!(
-            "Прогресс: {} · сохранено {}/{} · всего {} · активно {} · исполнителей {} · {:.1} с · запись={} · исполнитель={} · сессия={} · сессия исполнителя={} · результат={} {}",
+            "Прогресс: {} · сохранено {}/{} · всего {} · активно {} · исполнителей {} · {:.1} с · запись={} · исполнитель={} · сессия={} · сессия исполнителя={} · восстановление={} · результат={} {}",
             human_pitch_progress_event(event.event),
             event.run_completed,
             event.run_total,
@@ -2021,6 +2086,9 @@ fn write_pitch_progress(
             event
                 .worker_session
                 .map_or_else(|| "-".into(), |session| session.to_string()),
+            event
+                .recovery
+                .map_or_else(|| "-".into(), |recovery| recovery.to_string()),
             event
                 .outcome
                 .as_deref()
@@ -2048,11 +2116,14 @@ fn human_pitch_progress_event(event: &str) -> &'static str {
         "browser_session_started" => "сессия браузера запущена",
         "browser_session_ended" => "сессия браузера закрыта",
         "browser_session_rotated" => "смена сессии браузера",
+        "browser_session_recovered" => "сессия браузера пересоздана после сбоя",
         "item_started" => "получение записи начато",
         "retry_started" => "повторная попытка начата",
         "heartbeat" => "ожидание браузера",
         "item_checkpointed" => "результат записи сохранён",
+        "item_requeued" => "запись возвращена в очередь",
         "item_discarded_stale" => "устаревший результат отброшен",
+        "worker_recovery_exhausted" => "исполнитель выведен из пула",
         _ => "событие получения",
     }
 }
@@ -2080,6 +2151,7 @@ fn human_pitch_progress_reason(reason: &str) -> &'static str {
         "age_limit" => "достигнут лимит времени сессии",
         "interrupted" => "получен Ctrl+C",
         "session_failure" => "ошибка сессии браузера",
+        "session_recovery_exhausted" => "исчерпан бюджет восстановления сессии",
         "ctrl_c_listener_failed" => "ошибка обработчика Ctrl+C",
         "invalid_provider_report" => "некорректный ответ провайдера",
         "worker_panic" => "сбой исполнителя браузера",
@@ -2120,6 +2192,7 @@ impl PitchProgressReporter<'_> {
         context: PitchProgressContext<'_>,
         outcome: Option<String>,
         reason: Option<String>,
+        recovery: Option<u32>,
     ) -> Result<(), AssetError> {
         let reason = reason.map(|reason| safe_message(&reason));
         tracing::info!(
@@ -2135,6 +2208,7 @@ impl PitchProgressReporter<'_> {
                 .identity
                 .map(|identity| safe_message(identity.key.as_str())),
             attempt = context.attempt,
+            recovery,
             outcome = outcome.as_deref(),
             reason = ?reason,
             elapsed_ms = self.started.elapsed().as_millis() as u64,
@@ -2162,6 +2236,7 @@ impl PitchProgressReporter<'_> {
             session: context.session,
             next_session: context.next_session,
             attempt: context.attempt,
+            recovery,
             outcome,
             reason,
         })
@@ -2188,6 +2263,21 @@ fn pitch_run_stopped(reason: &str, message: impl Into<String>) -> AssetError {
     )
 }
 
+/// Останавливает запуск, когда доступный пул исполнителей исчерпан, а очередь ещё
+/// не пуста. Последний отказ сессии сохраняется в деталях для диагностики.
+fn pitch_recovery_exhausted(
+    reason: &'static str,
+    message: &'static str,
+    last_failure: Option<&JpdbPitchFailure>,
+) -> AssetError {
+    let mut details = json!({"run_stop_reason": reason});
+    if let Some(failure) = last_failure {
+        details["session_failure"] =
+            serde_json::to_value(failure).expect("ошибка JPDB сериализуется");
+    }
+    AssetError::with_details(ErrorCode::ValidatorFailure, message, details)
+}
+
 fn trace_pitch_failure(
     failure: &JpdbPitchFailure,
     context: PitchProgressContext<'_>,
@@ -2210,14 +2300,6 @@ fn trace_pitch_failure(
         session_failure,
         retryable = is_retryable_failure(failure),
     );
-}
-
-fn pitch_session_failure(failure: JpdbPitchFailure) -> AssetError {
-    AssetError::with_details(
-        ErrorCode::ValidatorFailure,
-        "получение остановлено из-за ошибки сессии браузера; незавершённые элементы можно продолжить командой `batch resume`",
-        json!({"run_stop_reason": "session_failure", "session_failure": failure}),
-    )
 }
 
 fn interruption_result(result: Result<(), String>) -> AssetError {
@@ -2503,12 +2585,25 @@ enum PitchWorkerEvent {
         event: &'static str,
         context: PitchWorkerContext,
         reason: Option<String>,
+        recovery: Option<u32>,
     },
     Report {
         context: PitchWorkerContext,
         job: Box<PitchAcquisitionJob>,
         report: Box<JpdbPitchAcquisitionReport>,
         item: BrowserItemTimer,
+        /// Длина текущей серии сбоев сессии, которая и решает судьбу исполнителя.
+        consecutive_failures: u32,
+        continuation: PitchWorkerContinuation,
+    },
+    /// Назначенное задание не получило терминального результата: координатор обязан вернуть
+    /// его в очередь текущего запуска, не создавая попытку и не меняя поколение.
+    SessionFailure {
+        context: PitchWorkerContext,
+        job: Box<PitchAcquisitionJob>,
+        failure: Box<JpdbPitchFailure>,
+        consecutive_failures: u32,
+        continuation: PitchWorkerContinuation,
     },
     Cancelled {
         context: PitchWorkerContext,
@@ -2520,6 +2615,44 @@ enum PitchWorkerEvent {
     Stopped {
         worker: u32,
     },
+}
+
+/// Готовность исполнителя принять следующую задачу после отправленного события.
+///
+/// Решение принимается исполнителем до отправки события, поэтому координатор не
+/// может выдать задачу тому, кто уже вышел из пула.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PitchWorkerContinuation {
+    /// Исполнитель примет следующую задачу: канал остаётся открытым.
+    Accepting,
+    /// Исполнитель исчерпал бюджет восстановления и выходит из пула.
+    Retired,
+}
+
+/// Классификация отчёта провайдера для одного назначенного задания.
+///
+/// Различает локальный отказ сессии, который восстанавливается пересозданием сессии
+/// этого исполнителя, и нарушение инварианта протокола, которое остаётся fail-closed
+/// на уровне всего запуска.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PitchReportClass {
+    /// Получен ровно один терминальный результат, сессию можно продолжать.
+    Terminal,
+    /// Получен ровно один терминальный результат, но сессия непригодна и требует пересоздания.
+    TerminalWithSessionFailure,
+    /// Терминальный результат отсутствует, сессия непригодна: задание возвращается в очередь.
+    SessionFailure,
+    /// Нарушение инварианта протокола провайдера: запуск останавливается.
+    Invalid,
+}
+
+fn classify_pitch_report(report: &JpdbPitchAcquisitionReport) -> PitchReportClass {
+    match (report.outcomes.len(), report.session_failure.is_some()) {
+        (1, false) => PitchReportClass::Terminal,
+        (1, true) => PitchReportClass::TerminalWithSessionFailure,
+        (0, true) => PitchReportClass::SessionFailure,
+        _ => PitchReportClass::Invalid,
+    }
 }
 
 struct PitchWorkerExit {
@@ -2561,11 +2694,22 @@ fn pitch_worker_progress(
     context: &PitchWorkerContext,
     reason: Option<&str>,
 ) -> Result<(), AssetError> {
+    pitch_worker_progress_with_recovery(sender, event, context, reason, None)
+}
+
+fn pitch_worker_progress_with_recovery(
+    sender: &mpsc::UnboundedSender<PitchWorkerEvent>,
+    event: &'static str,
+    context: &PitchWorkerContext,
+    reason: Option<&str>,
+    recovery: Option<u32>,
+) -> Result<(), AssetError> {
     sender
         .unbounded_send(PitchWorkerEvent::Progress {
             event,
             context: context.clone(),
             reason: reason.map(str::to_owned),
+            recovery,
         })
         .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))
 }
@@ -2593,6 +2737,12 @@ async fn run_pitch_worker<D: PitchRunDriver>(
     let mut session_items = 0_usize;
     let mut worker_session = 0_u32;
     let mut stop_reason = None;
+    // Последовательная серия сбоев сессии/запуска без доказанного здорового
+    // прогресса. Плановая ротация по возрасту или лимиту записей и `Ctrl+C` её не
+    // увеличивают.
+    let mut consecutive_recovery_failures = 0_u32;
+    // Следующая сессия создаётся после аварийного восстановления, а не по плану.
+    let mut recovering = false;
     let mut context = PitchWorkerContext {
         worker: control.worker,
         ..PitchWorkerContext::default()
@@ -2677,7 +2827,19 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                         diagnostic_item = Some(item);
                         launched
                     },
-                    Ok(Err(message)) => {
+                    Ok(Err(error @ BrowserLaunchError::CleanupFailed { .. })) => {
+                        configuration.finish_failure("browser_cleanup_failed", false, None);
+                        item.set_stop_reason("browser_cleanup_failed");
+                        item.finish_failure("browser_cleanup_failed", false, None);
+                        return Err(pitch_run_stopped("browser_cleanup_failed", error.to_string()));
+                    }
+                    Ok(Err(BrowserLaunchError::Panic(message))) => {
+                        configuration.finish_failure("worker_panic", false, None);
+                        item.set_stop_reason("worker_panic");
+                        item.finish_failure("worker_panic", false, None);
+                        return Err(pitch_run_stopped("worker_panic", message));
+                    }
+                    Ok(Err(BrowserLaunchError::Setup(message))) => {
                         configuration.finish_failure("browser_setup", false, None);
                         item.set_stop_reason("session_failure");
                         item.finish_failure("browser_setup", false, None);
@@ -2685,8 +2847,28 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                             stage: JpdbPitchStage::ConfigureBrowser,
                             message,
                         };
-                        trace_pitch_failure(&failure, context.progress(), true);
-                        return Err(pitch_session_failure(failure));
+                        // Запуск не дал сессии: закрывать нечего, но задание обязано
+                        // вернуться в очередь без попытки и без смены поколения.
+                        consecutive_recovery_failures += 1;
+                        let retired =
+                            consecutive_recovery_failures >= PITCH_SESSION_RECOVERY_BUDGET;
+                        events.unbounded_send(PitchWorkerEvent::SessionFailure {
+                            context: context.clone(),
+                            job: Box::new(job),
+                            failure: Box::new(failure),
+                            consecutive_failures: consecutive_recovery_failures,
+                            continuation: if retired {
+                                PitchWorkerContinuation::Retired
+                            } else {
+                                PitchWorkerContinuation::Accepting
+                            },
+                        }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
+                        if retired {
+                            stop_reason = Some("session_recovery_exhausted");
+                            break;
+                        }
+                        recovering = true;
+                        continue;
                     }
                     Err(payload) => {
                         configuration.finish_failure("worker_panic", false, None);
@@ -2697,7 +2879,18 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 });
                 session_started = Instant::now();
                 session_items = 0;
-                pitch_worker_progress(&events, "browser_session_started", &context, None)?;
+                let recovered = std::mem::take(&mut recovering);
+                pitch_worker_progress_with_recovery(
+                    &events,
+                    if recovered {
+                        "browser_session_recovered"
+                    } else {
+                        "browser_session_started"
+                    },
+                    &context,
+                    recovered.then_some("session_failure"),
+                    recovered.then_some(consecutive_recovery_failures),
+                )?;
                 if control.cancellation.clone().now_or_never().is_some() {
                     stop_reason = Some("interrupted");
                     events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
@@ -2744,27 +2937,95 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                     break;
                 }
             };
-            let fatal = report.session_failure.is_some()
-                || report.outcomes.len() > 1
-                || report.outcomes.is_empty();
-            if fatal {
-                stop_reason = Some(if report.session_failure.is_some() {
-                    "session_failure"
-                } else {
-                    "invalid_provider_report"
-                });
-                let reason = stop_reason.expect("причина остановки задана");
-                item.set_stop_reason(reason);
-                item.set_interruption(reason, reason, false);
-                // Останавливаем выдачу новых задач до доставки результата: более
-                // ранний отчёт другого исполнителя не запустит ещё не начатый хвост.
-                control.dispatch_stopped.store(true, Ordering::Release);
+            let class = classify_pitch_report(&report);
+            if class == PitchReportClass::Invalid {
+                // Нарушение инварианта протокола провайдера остаётся fail-closed на
+                // уровне запуска: локальное восстановление сессии его не скрывает.
+                stop_reason = Some("invalid_provider_report");
+                item.set_stop_reason("invalid_provider_report");
+                item.set_interruption(
+                    "invalid_provider_report",
+                    "invalid_provider_report",
+                    false,
+                );
+                return Err(pitch_run_stopped(
+                    "invalid_provider_report",
+                    "Провайдер JPDB вернул недопустимое число результатов при отсутствии отказа сессии",
+                ));
             }
             session_items += report.outcomes.len();
-            events.unbounded_send(PitchWorkerEvent::Report {
-                context: context.clone(), job: Box::new(job), report: Box::new(report), item,
-            }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
-            if fatal {
+            let session_failure = report.session_failure.clone();
+            if session_failure.is_some() {
+                item.set_stop_reason("session_failure");
+            }
+            // Настоящий терминальный результат доказывает, что сессия работала: серия
+            // последовательных восстановлений прерывается.
+            if class != PitchReportClass::SessionFailure {
+                consecutive_recovery_failures = 0;
+            }
+            // Каждая непригодная сессия требует восстановления и расходует бюджет,
+            // включая случай, когда результат уже получен и сохранён.
+            if session_failure.is_some() {
+                consecutive_recovery_failures += 1;
+            }
+            let retired = session_failure.is_some()
+                && consecutive_recovery_failures >= PITCH_SESSION_RECOVERY_BUDGET;
+            let continuation = if retired {
+                PitchWorkerContinuation::Retired
+            } else {
+                PitchWorkerContinuation::Accepting
+            };
+            match class {
+                PitchReportClass::SessionFailure => {
+                    let failure = session_failure
+                        .as_ref()
+                        .expect("класс требует отказа сессии");
+                    let value = serde_json::to_value(failure).expect("ошибка JPDB сериализуется");
+                    item.finish_failure(
+                        value["code"].as_str().unwrap_or("unknown"),
+                        is_retryable_failure(failure),
+                        None,
+                    );
+                    events.unbounded_send(PitchWorkerEvent::SessionFailure {
+                        context: context.clone(),
+                        job: Box::new(job),
+                        failure: Box::new(failure.clone()),
+                        consecutive_failures: consecutive_recovery_failures,
+                        continuation,
+                    }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
+                }
+                _ => {
+                    events.unbounded_send(PitchWorkerEvent::Report {
+                        context: context.clone(),
+                        job: Box::new(job),
+                        report: Box::new(report),
+                        item,
+                        consecutive_failures: consecutive_recovery_failures,
+                        continuation,
+                    }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
+                }
+            }
+            if session_failure.is_some() {
+                // Испорченная сессия явно закрывается до пересоздания. Очистка обязана
+                // быть доказана, иначе запуск останавливается fail-closed.
+                recovering = true;
+                let active = session.take().expect("сессия запущена до получения");
+                checked_pitch_worker_close(driver, active)
+                    .await
+                    .map_err(|message| pitch_run_stopped("browser_cleanup_failed", message))?;
+                pitch_worker_progress_with_recovery(
+                    &events,
+                    "browser_session_ended",
+                    &context,
+                    Some("session_failure"),
+                    Some(consecutive_recovery_failures),
+                )?;
+                context.session = None;
+            }
+            if retired {
+                // Единственное событие выхода из пула публикует координатор: он
+                // владеет решением о том, что бюджет восстановления исчерпан.
+                stop_reason = Some("session_recovery_exhausted");
                 break;
             }
             // Координатор назначит следующую задачу только после сохранения CAS
@@ -2898,26 +3159,46 @@ fn stop_pitch_dispatch(
     }
 }
 
-fn dispatch_pitch_job(
-    worker: usize,
-    commands: &[Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
+/// Выдаёт ожидающие задачи свободным исполнителям в порядке их номеров.
+///
+/// Исполнитель, вышедший из пула, теряет свой канал: он не получает новых задач.
+/// Если очередь опустела, свободные каналы остаются открытыми, пока выполняется хотя
+/// бы одно задание: после отказа соседа его задание вернётся в очередь. Когда все
+/// задания завершены и очередь пуста, свободные каналы закрываются.
+fn dispatch_pending_jobs(
+    commands: &mut [Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
     pending: &mut VecDeque<PitchAcquisitionJob>,
     active: &mut [Option<PitchAcquisitionJob>],
 ) -> Result<(), AssetError> {
-    if let Some(job) = pending.pop_front() {
-        commands[worker]
-            .as_ref()
-            .ok_or_else(|| {
-                pitch_run_stopped("worker_channel_closed", "канал задач исполнителя закрыт")
-            })?
-            .unbounded_send(job.clone())
-            .map_err(|_| {
-                pitch_run_stopped(
-                    "worker_channel_closed",
-                    "исполнитель больше не принимает задачи",
-                )
-            })?;
-        active[worker] = Some(job);
+    for index in 0..commands.len() {
+        if active[index].is_some() {
+            continue;
+        }
+        // Выведенный из пула исполнитель больше не принимает задач: его канал уже
+        // закрыт координатором, и это не ошибка, а завершённое восстановление.
+        let Some(command) = commands[index].as_ref() else {
+            continue;
+        };
+        let Some(job) = pending.pop_front() else {
+            break;
+        };
+        command.unbounded_send(job.clone()).map_err(|_| {
+            pitch_run_stopped(
+                "worker_channel_closed",
+                "исполнитель больше не принимает задачи",
+            )
+        })?;
+        active[index] = Some(job);
+    }
+    // Пока у запуска есть активные задания, свободный исполнитель остаётся в
+    // пуле: отказ сессии соседа возвращает его задание в очередь, и кому-то
+    // нужно его принять. Пул закрывается только когда работы больше не осталось.
+    if pending.is_empty() && active.iter().all(Option::is_none) {
+        for index in 0..commands.len() {
+            if active[index].is_none() {
+                commands[index].take();
+            }
+        }
     }
     Ok(())
 }
@@ -2929,11 +3210,12 @@ fn emit_pitch_coordinator_progress(
     context: PitchProgressContext<'_>,
     outcome: Option<String>,
     reason: Option<String>,
+    recovery: Option<u32>,
 ) -> Result<(), AssetError> {
     if !*enabled {
         return Ok(());
     }
-    let result = progress.emit(event, context, outcome, reason);
+    let result = progress.emit(event, context, outcome, reason, recovery);
     if result.is_err() {
         *enabled = false;
     }
@@ -3036,7 +3318,13 @@ async fn run_batch_with_drivers(
         workers: drivers.len(),
         in_flight: 0,
     };
-    progress.emit("run_started", PitchProgressContext::default(), None, None)?;
+    progress.emit(
+        "run_started",
+        PitchProgressContext::default(),
+        None,
+        None,
+        None,
+    )?;
     tokio::pin!(interruption);
     let mut stop_error = None;
     let mut interruption_seen = false;
@@ -3078,6 +3366,10 @@ async fn run_batch_with_drivers(
     drop(event_sender);
     let mut live_workers = commands.len();
     let mut active = vec![None; commands.len()];
+    // Исполнители, исчерпавшие бюджет восстановления и выведенные из пула.
+    let mut retired_workers: Vec<u32> = Vec::new();
+    // Последний отказ сессии остаётся в деталях итоговой ошибки исчерпания пула.
+    let mut last_session_failure: Option<JpdbPitchFailure> = None;
     let mut contexts = (1..=commands.len())
         .map(|worker| PitchWorkerContext {
             worker: worker as u32,
@@ -3092,16 +3384,10 @@ async fn run_batch_with_drivers(
             let _ = sender.send(());
         }
     }
-    if stop_error.is_none() {
-        for worker in 0..commands.len() {
-            if let Err(error) = dispatch_pitch_job(worker, &commands, &mut pending, &mut active) {
-                retain_pitch_run_error(&mut stop_error, error);
-                break;
-            }
-            if active[worker].is_none() {
-                commands[worker].take();
-            }
-        }
+    if stop_error.is_none()
+        && let Err(error) = dispatch_pending_jobs(&mut commands, &mut pending, &mut active)
+    {
+        retain_pitch_run_error(&mut stop_error, error);
     }
     if stop_error.is_some() {
         stop_pitch_dispatch(&mut commands, &dispatch_stopped);
@@ -3116,17 +3402,17 @@ async fn run_batch_with_drivers(
             biased;
             event = events.next(), if !events_closed => {
                 let Some(event) = event else { events_closed = true; continue; };
-                let mut refill = None;
+                let mut refill = false;
                 let handled = (|| -> Result<(), AssetError> {
                     match event {
-                        PitchWorkerEvent::Progress { event, context, reason } => {
+                        PitchWorkerEvent::Progress { event, context, reason, recovery } => {
                             let index = context.worker as usize - 1;
                             contexts[index] = context.clone();
                             progress.in_flight = active.iter().filter(|job| job.is_some()).count();
                             emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
-                                event, context.progress(), None, reason)?;
+                                event, context.progress(), None, reason, recovery)?;
                         }
-                        PitchWorkerEvent::Report { context, job, report, item } => {
+                        PitchWorkerEvent::Report { context, job, report, item, consecutive_failures, continuation } => {
                             let job = *job;
                             let mut report = *report;
                             let checkpoint = tracing::info_span!(
@@ -3139,12 +3425,17 @@ async fn run_batch_with_drivers(
                             let expected = active[index].take();
                             progress.in_flight = active.iter().filter(|job| job.is_some()).count();
                             if expected.as_ref() != Some(&job) {
-                                return Err(pitch_run_stopped("invalid_provider_report", "отчёт не соответствует назначенным identity, token и запросу"));
+                                return Err(pitch_run_stopped("invalid_provider_report", "отчёт не соответствует назначенным идентичности, токену и запросу"));
                             }
                             if report.outcomes.len() > 1
                                 || (report.outcomes.is_empty() && report.session_failure.is_none())
                             {
                                 return Err(pitch_run_stopped("invalid_provider_report", "Провайдер JPDB вернул неверное число результатов"));
+                            }
+                            // Координатор владеет диагностикой принятого отказа:
+                            // ошибка контрольной точки не должна потерять отказ сессии.
+                            if let Some(failure) = &report.session_failure {
+                                trace_pitch_failure(failure, context.progress(), true);
                             }
                             // Проверяем CAS и сохраняем байты до следующего ожидания.
                             if let Some(outcome) = report.outcomes.pop() {
@@ -3157,26 +3448,53 @@ async fn run_batch_with_drivers(
                                     let status = saved.items.iter().find(|item| item.identity == job.token.identity)
                                         .map(|item| status_name(item.status()).to_owned());
                                     let emitted = emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
-                                        "item_checkpointed", context.progress(), status, None);
+                                        "item_checkpointed", context.progress(), status, None, None);
                                     // Ошибка записи в stderr не отменяет уже сохранённый результат.
                                     publish_ready(store, batch_id)?;
                                     emitted?;
                                 } else {
                                     emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
-                                        "item_discarded_stale", context.progress(), None, Some("item_token_changed".into()))?;
+                                        "item_discarded_stale", context.progress(), None, Some("item_token_changed".into()), None)?;
                                 }
                             }
-                            else if let Some(failure) = &report.session_failure {
-                                let value = serde_json::to_value(failure).expect("ошибка JPDB сериализуется");
-                                item.set_stop_reason("session_failure");
-                                item.finish_failure(value["code"].as_str().unwrap_or("unknown"),
-                                    is_retryable_failure(failure), None);
+                            // Отказ сессии после настоящего результата не отменяет уже
+                            // сохранённый результат: исполнитель закрывает испорченную
+                            // сессию сам, а запуск продолжается остальными.
+                            if let Some(failure) = &report.session_failure {
+                                last_session_failure = Some(failure.clone());
                             }
-                            if let Some(failure) = report.session_failure {
-                                trace_pitch_failure(&failure, context.progress(), true);
-                                return Err(pitch_session_failure(failure));
+                            if continuation == PitchWorkerContinuation::Accepting {
+                                refill = true;
+                            } else {
+                                retire_pitch_worker(&mut commands, &mut retired_workers, &mut progress, &mut progress_enabled, index, &context, consecutive_failures)?;
+                                // Возвращённое задание должен успеть принять
+                                // свободный сосед, иначе оно останется в очереди зря.
+                                refill = true;
                             }
-                            refill = Some(index);
+                        }
+                        PitchWorkerEvent::SessionFailure { context, job, failure, consecutive_failures, continuation } => {
+                            let job = *job;
+                            let index = context.worker as usize - 1;
+                            contexts[index] = context.clone();
+                            let expected = active[index].take();
+                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            if expected.as_ref() != Some(&job) {
+                                return Err(pitch_run_stopped("invalid_provider_report", "отказ сессии не соответствует назначенным идентичности, токену и запросу"));
+                            }
+                            // Задание не получило терминального результата: оно возвращается в
+                            // очередь без попытки, без смены поколения и без
+                            // синтетического `technical_failure`.
+                            trace_pitch_failure(&failure, context.progress(), true);
+                            last_session_failure = Some((*failure).clone());
+                            emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
+                                "item_requeued", context.progress(), None, Some("session_failure".into()), Some(consecutive_failures))?;
+                            pending.push_back(job);
+                            if continuation == PitchWorkerContinuation::Retired {
+                                retire_pitch_worker(&mut commands, &mut retired_workers, &mut progress, &mut progress_enabled, index, &context, consecutive_failures)?;
+                            }
+                            // Задание снова в очереди: его обязан принять свободный
+                            // исполнитель, включая случай вывода соседа из пула.
+                            refill = true;
                         }
                         PitchWorkerEvent::Cancelled { context } => {
                             let index = context.worker as usize - 1;
@@ -3201,7 +3519,7 @@ async fn run_batch_with_drivers(
                 if let Err(error) = handled { retain_pitch_run_error(&mut stop_error, error); }
                 // После сохранения контрольной точки проверяем сигнал до выдачи
                 // следующей задачи.
-                if refill.is_some()
+                if refill
                     && !interruption_seen
                     && let Err(error) = check_pitch_interruption(interruption.as_mut()).await
                 {
@@ -3211,12 +3529,11 @@ async fn run_batch_with_drivers(
                 }
                 if stop_error.is_some() || dispatch_stopped.load(Ordering::Acquire) {
                     stop_pitch_dispatch(&mut commands, &dispatch_stopped);
-                } else if let Some(index) = refill {
-                    if let Err(error) = dispatch_pitch_job(index, &commands, &mut pending, &mut active) {
+                } else if refill {
+                    if let Err(error) = dispatch_pending_jobs(&mut commands, &mut pending, &mut active) {
                         retain_pitch_run_error(&mut stop_error, error);
                         stop_pitch_dispatch(&mut commands, &dispatch_stopped);
                     }
-                    if active[index].is_none() { commands[index].take(); }
                     progress.in_flight = active.iter().filter(|job| job.is_some()).count();
                 }
             }
@@ -3239,7 +3556,7 @@ async fn run_batch_with_drivers(
             _ = heartbeat.tick() => {
                 let result = if active.iter().all(Option::is_none) {
                     emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
-                        "heartbeat", PitchProgressContext::default(), None, None)
+                        "heartbeat", PitchProgressContext::default(), None, None, None)
                 } else {
                     let mut result = Ok(());
                         for (index, job) in active.iter().enumerate() {
@@ -3258,7 +3575,7 @@ async fn run_batch_with_drivers(
                                     context.next_session = None;
                                 }
                                 if let Err(error) = emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
-                                "heartbeat", context.progress(), None, None) {
+                                "heartbeat", context.progress(), None, None, None) {
                                 result = Err(error);
                                 break;
                             }
@@ -3277,6 +3594,17 @@ async fn run_batch_with_drivers(
     // временных деревьев дождались выполнения.
     let result = if let Some(error) = stop_error {
         Err(error)
+    } else if !pending.is_empty() {
+        // Невыданный хвост остаётся `pending` без синтетических ошибок и попыток.
+        Err(pitch_recovery_exhausted(
+            if retired_workers.is_empty() {
+                "dispatch_incomplete"
+            } else {
+                "session_recovery_exhausted"
+            },
+            "получение остановлено: доступный пул исполнителей исчерпан, незавершённые элементы можно продолжить командой `batch resume`",
+            last_session_failure.as_ref(),
+        ))
     } else {
         reconcile_loaded_batch(store, batch_id).map(|(batch, _)| {
             let changed = batch.revision != initial_revision;
@@ -3302,8 +3630,44 @@ async fn run_batch_with_drivers(
         PitchProgressContext::default(),
         None,
         reason,
+        None,
     )?;
     result
+}
+
+/// Выводит исполнителя из рабочего пула: он больше не получает задач, а его
+/// результат и уже сохранённые контрольные точки остаются в силе.
+fn retire_pitch_worker(
+    commands: &mut [Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
+    retired_workers: &mut Vec<u32>,
+    progress: &mut PitchProgressReporter<'_>,
+    progress_enabled: &mut bool,
+    index: usize,
+    context: &PitchWorkerContext,
+    consecutive_failures: u32,
+) -> Result<(), AssetError> {
+    commands[index].take();
+    let worker = index as u32 + 1;
+    if !retired_workers.contains(&worker) {
+        retired_workers.push(worker);
+    }
+    tracing::warn!(
+        stage = "pitch_runtime",
+        code = "worker_retired",
+        worker,
+        worker_session = context.worker_session,
+        session = context.session,
+        "исполнитель выведен из пула после исчерпания бюджета восстановления"
+    );
+    emit_pitch_coordinator_progress(
+        progress,
+        progress_enabled,
+        "worker_recovery_exhausted",
+        context.progress(),
+        None,
+        Some("session_recovery_exhausted".into()),
+        Some(consecutive_failures),
+    )
 }
 
 fn record_one_outcome(
@@ -3561,7 +3925,7 @@ fn candidate_identity(
     batch
         .item(surface)
         .map(|item| item.identity.clone())
-        .ok_or_else(|| invalid_plan("identity отсутствует в batch"))
+        .ok_or_else(|| invalid_plan("идентичность отсутствует в пакете"))
 }
 
 fn reconcile_batch(store: &AssetStore, batch: &mut PitchAccentBatch) -> Result<(), AssetError> {
@@ -3675,6 +4039,7 @@ fn batch_response(
             .collect(),
         records: Vec::new(),
         blockers,
+        retried_identities: Vec::new(),
         artifact,
         error: None,
     }
