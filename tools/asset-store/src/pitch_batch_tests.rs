@@ -1320,3 +1320,170 @@ fn batch_wide_retry_is_atomic_and_rejects_invalid_reason_without_changes() {
         PitchBatchItemStatus::TechnicalFailure
     );
 }
+
+/// Пакетный повтор не трогает ни один элемент, который не является текущим
+/// устранимым техническим сбоем, включая опубликованные и конфликтные.
+#[test]
+fn batch_wide_retry_leaves_published_conflict_and_pending_items_untouched() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let surfaces = ["一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    let requests = surfaces
+        .iter()
+        .map(|surface| request(surface, Some("ゆうれい")))
+        .collect();
+    let mut batch = PitchAccentBatch::new(
+        "batch-wide-statuses",
+        requests,
+        PitchAccentImageValidator::validator_identity(),
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+
+    macro_rules! record {
+        ($surface:expr, $outcome:expr) => {{
+            let cas = batch.item_token($surface).unwrap();
+            assert!(runtime.record_outcome(&mut batch, &cas, $outcome).unwrap());
+        }};
+    }
+
+    // «一» — устранимый технический сбой: единственный кандидат на пакетный повтор.
+    record!(
+        "一",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::Timeout {
+                stage: JpdbPitchStage::DetailReadiness,
+                diagnostic: Some("Истёк лимит запроса".into()),
+            },
+        }
+    );
+    // «二» — неустранимый технический сбой.
+    record!(
+        "二",
+        JpdbPitchOutcome::Failed {
+            error: JpdbPitchFailure::PageContract {
+                stage: JpdbPitchStage::DetailReadiness,
+                message: "Страница не соответствует контракту".into(),
+            },
+        }
+    );
+    // «三» — опубликованный элемент.
+    let published_sha =
+        record_provider_outcome(&mut runtime, &mut batch, "三", acquired("三", false));
+    batch.begin_publication("三", &published_sha, None).unwrap();
+    // «四» — конфликт с текущим состоянием владельца.
+    let conflict_owner = rejected_owner(verified_record("四", false));
+    // «五» — незавершённое намерение публикации.
+    let pending_sha =
+        record_provider_outcome(&mut runtime, &mut batch, "五", acquired("五", false));
+    batch.begin_publication("五", &pending_sha, None).unwrap();
+    batch
+        .reconcile_owner(
+            &PitchBatchOwnerSnapshot::from_records(vec![
+                verified_record("三", false),
+                conflict_owner.clone(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    record!(
+        "六",
+        JpdbPitchOutcome::NoPitchAccentOnSource {
+            evidence: JpdbPitchAbsenceEvidence {
+                surface: "六".into(),
+                reading: "ゆうれい".into(),
+                jpdb_vocabulary_id: 123,
+                source_url: "https://jpdb.io/vocabulary/123/六/ゆうれい".into(),
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: "六".into(),
+                    reading: "ゆうれい".into(),
+                }],
+                section_inventory: vec!["Meanings".into(), "Forms".into()],
+                base_page_contract_valid: true,
+                pitch_section_present: false,
+                pitch_marker_count: 0,
+                browser: browser(),
+            },
+        }
+    );
+    record!(
+        "七",
+        JpdbPitchOutcome::AmbiguousVocabulary {
+            surface: "七".into(),
+            reading: Some("ゆうれい".into()),
+            candidates: vec![JpdbVocabularyCandidate {
+                vocabulary_id: 123,
+                surface_forms: vec!["七".into()],
+                readings: vec!["ゆうれい".into()],
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: "七".into(),
+                    reading: "ゆうれい".into(),
+                }],
+                part_of_speech: vec!["noun".into()],
+                meanings: vec!["seven".into()],
+                detail_url: "https://jpdb.io/vocabulary/123/七/ゆうれい".into(),
+            }],
+        }
+    );
+    record!(
+        "八",
+        JpdbPitchOutcome::VocabularyNotFound {
+            surface: "八".into(),
+            reading: Some("ゆうれい".into()),
+        }
+    );
+    // «九» остаётся ожидающим элементом.
+
+    assert_eq!(
+        batch.item("三").unwrap().status(),
+        PitchBatchItemStatus::Published
+    );
+    assert_eq!(
+        batch.item("四").unwrap().status(),
+        PitchBatchItemStatus::Conflict
+    );
+    assert_eq!(
+        batch.item("五").unwrap().status(),
+        PitchBatchItemStatus::PublicationPending
+    );
+    assert_eq!(
+        batch.item("六").unwrap().status(),
+        PitchBatchItemStatus::NoPitchAccentOnSource
+    );
+    assert_eq!(
+        batch.item("七").unwrap().status(),
+        PitchBatchItemStatus::AmbiguousVocabulary
+    );
+    assert_eq!(
+        batch.item("八").unwrap().status(),
+        PitchBatchItemStatus::VocabularyNotFound
+    );
+    assert_eq!(
+        batch.item("九").unwrap().status(),
+        PitchBatchItemStatus::Pending
+    );
+    assert_eq!(batch.retryable_failure_surfaces(), vec!["一".to_owned()]);
+
+    let before = batch.clone();
+    let selected = batch
+        .retry_retryable_failures("Пакетный повтор временных сбоев".into())
+        .unwrap();
+    assert_eq!(selected, vec!["一".to_owned()]);
+    for surface in ["二", "三", "四", "五", "六", "七", "八", "九"] {
+        assert_eq!(
+            serde_json::to_value(batch.item(surface).unwrap()).unwrap(),
+            serde_json::to_value(before.item(surface).unwrap()).unwrap(),
+            "элемент {surface} не должен меняться"
+        );
+    }
+    // Конфликт владельца и опубликованный SHA остаются в силе после пакетного повтора.
+    assert_eq!(
+        batch.item("四").unwrap().owner_current_sha256.as_deref(),
+        Some(conflict_owner.sha256.as_str())
+    );
+    assert_eq!(
+        batch.item("三").unwrap().published_sha256.as_deref(),
+        Some(published_sha.as_str())
+    );
+}
