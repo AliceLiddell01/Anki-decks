@@ -3,6 +3,8 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read, Write};
+#[cfg(feature = "session-rotation-acceptance")]
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use crate::batch::{
@@ -33,6 +35,10 @@ pub enum BatchCommand {
         batch_id: String,
         #[arg(long, default_value_t = MAX_ACQUISITION_ROUNDS)]
         rounds: u32,
+        /// Только в приёмочной сборке: менять сессию браузера после N сохранённых элементов.
+        #[cfg(feature = "session-rotation-acceptance")]
+        #[arg(long, value_name = "N")]
+        acceptance_rotate_after_items: Option<NonZeroUsize>,
     },
     /// Возвращает состояние и свидетельства, не запускает получение или публикацию.
     Status {
@@ -990,7 +996,15 @@ fn execute_command_with_snapshots_and_progress(
                 0,
             ))
         }
-        BatchCommand::Run { batch_id, rounds } => {
+        BatchCommand::Run {
+            batch_id,
+            rounds,
+            #[cfg(feature = "session-rotation-acceptance")]
+            acceptance_rotate_after_items,
+            ..
+        } => {
+            #[cfg(feature = "session-rotation-acceptance")]
+            let acceptance_rotate_after_items = *acceptance_rotate_after_items;
             let mut acquisition_run = None;
             let result = run_batch_with_stream_and_progress(
                 store,
@@ -998,7 +1012,16 @@ fn execute_command_with_snapshots_and_progress(
                 *rounds,
                 |characters, generations, on_event| {
                     if acquisition_run.is_none() {
-                        acquisition_run = Some(AcquisitionRun::new()?);
+                        #[cfg(feature = "session-rotation-acceptance")]
+                        let new_run = match acceptance_rotate_after_items {
+                            Some(limit) => {
+                                AcquisitionRun::new_for_acceptance_rotation(limit.get())?
+                            }
+                            None => AcquisitionRun::new()?,
+                        };
+                        #[cfg(not(feature = "session-rotation-acceptance"))]
+                        let new_run = AcquisitionRun::new()?;
+                        acquisition_run = Some(new_run);
                     }
                     acquisition_run
                         .as_mut()

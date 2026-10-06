@@ -47,8 +47,16 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     fault_evidence: Option<PathBuf>,
 
-    /// Разрешить обработку промежуточной страницы TLS-предупреждения только для www.yarxi.su.
-    #[arg(long)]
+    /// По умолчанию разрешает пройти страницу TLS-предупреждения только для www.yarxi.su.
+    /// Значение `false` отключает это исключение и требует действительный сертификат.
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        action = clap::ArgAction::Set
+    )]
     allow_insecure_tls: bool,
 }
 
@@ -848,11 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn cli_tls_is_opt_in_and_plan_is_required() {
+    fn cli_tls_exception_is_enabled_by_default_and_plan_is_required() {
         assert!(Args::try_parse_from(["yarxi_dark_acceptance"]).is_err());
         let default_args =
             Args::try_parse_from(["yarxi_dark_acceptance", "--plan", "plan.json"]).unwrap();
-        assert!(!default_args.allow_insecure_tls);
+        assert!(default_args.allow_insecure_tls);
         let opted_in = Args::try_parse_from([
             "yarxi_dark_acceptance",
             "--plan",
@@ -861,6 +869,14 @@ mod tests {
         ])
         .unwrap();
         assert!(opted_in.allow_insecure_tls);
+        let strict_tls = Args::try_parse_from([
+            "yarxi_dark_acceptance",
+            "--plan",
+            "plan.json",
+            "--allow-insecure-tls=false",
+        ])
+        .unwrap();
+        assert!(!strict_tls.allow_insecure_tls);
     }
 
     #[test]

@@ -43,8 +43,17 @@ pub struct Cli {
     /// Формат вывода.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
     pub output: OutputFormat,
-    /// Разрешает пройти ожидаемый TLS interstitial только для www.yarxi.su.
-    #[arg(long, global = true)]
+    /// По умолчанию разрешает пройти страницу TLS-предупреждения только для www.yarxi.su.
+    /// Значение `false` отключает это исключение и требует действительный сертификат.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        action = clap::ArgAction::Set
+    )]
     pub allow_insecure_tls: bool,
     #[command(subcommand)]
     pub command: Command,

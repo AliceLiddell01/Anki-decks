@@ -217,6 +217,7 @@ fn cli_parser_supports_structured_batch_actions_and_rejects_free_text() {
     );
     let default_run =
         Cli::try_parse_from(["kanji-assets", "batch", "run", "--batch-id", "fixture"]).unwrap();
+    assert!(default_run.allow_insecure_tls);
     let Command::Batch { command } = &default_run.command else {
         panic!("команда пакета должна разбираться как batch");
     };
@@ -228,6 +229,76 @@ fn cli_parser_supports_structured_batch_actions_and_rejects_free_text() {
         }
     ));
     assert!(prevalidate(command).is_ok());
+
+    let explicit_default = Cli::try_parse_from([
+        "kanji-assets",
+        "--allow-insecure-tls",
+        "batch",
+        "run",
+        "--batch-id",
+        "fixture",
+    ])
+    .unwrap();
+    assert!(explicit_default.allow_insecure_tls);
+    let strict_tls = Cli::try_parse_from([
+        "kanji-assets",
+        "--allow-insecure-tls=false",
+        "batch",
+        "run",
+        "--batch-id",
+        "fixture",
+    ])
+    .unwrap();
+    assert!(!strict_tls.allow_insecure_tls);
+
+    #[cfg(feature = "session-rotation-acceptance")]
+    {
+        let forced = Cli::try_parse_from([
+            "kanji-assets",
+            "batch",
+            "run",
+            "--batch-id",
+            "fixture",
+            "--acceptance-rotate-after-items",
+            "2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            forced.command,
+            Command::Batch {
+                command: BatchCommand::Run {
+                    acceptance_rotate_after_items: Some(limit),
+                    ..
+                }
+            } if limit.get() == 2
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "kanji-assets",
+                "batch",
+                "run",
+                "--batch-id",
+                "fixture",
+                "--acceptance-rotate-after-items",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(not(feature = "session-rotation-acceptance"))]
+    assert!(
+        Cli::try_parse_from([
+            "kanji-assets",
+            "batch",
+            "run",
+            "--batch-id",
+            "fixture",
+            "--acceptance-rotate-after-items",
+            "2",
+        ])
+        .is_err()
+    );
 
     let too_many = Cli::try_parse_from([
         "kanji-assets",
@@ -2075,6 +2146,8 @@ fn run_error_response_exposes_a_flushed_per_run_diagnostic_log() {
     let command = BatchCommand::Run {
         batch_id: "diagnostic-missing-batch".into(),
         rounds: 1,
+        #[cfg(feature = "session-rotation-acceptance")]
+        acceptance_rotate_after_items: None,
     };
     let output = execute_with_progress(
         &fixture.store,
@@ -2121,6 +2194,8 @@ fn successful_run_response_exposes_a_flushed_per_run_diagnostic_log() {
     let command = BatchCommand::Run {
         batch_id: "diagnostic-success".into(),
         rounds: 1,
+        #[cfg(feature = "session-rotation-acceptance")]
+        acceptance_rotate_after_items: None,
     };
     let output = execute_with_progress(
         &fixture.store,
