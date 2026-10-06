@@ -34,8 +34,16 @@ const PROVIDER_VERSION: &str = "7";
 const SITE_URL: &str = "https://www.yarxi.su/";
 const SITE_HOST: &str = "www.yarxi.su";
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const SESSION_SETUP_READINESS_TIMEOUT: Duration = Duration::from_secs(20);
+const SESSION_SETUP_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_SESSION_SETUP_RECREATIONS: u8 = 2;
 const BROWSER_SETUP_TIMEOUT_MESSAGE: &str =
     "browser_setup_timeout: истёк срок подготовки сеанса браузера";
+const SESSION_SETUP_RUNTIME_FAILURE_PREFIX: &str = "browser_session_setup_runtime_unhealthy:";
+
+fn next_session_setup_recreation(current: u8) -> Option<u8> {
+    (current < MAX_SESSION_SETUP_RECREATIONS).then(|| current + 1)
+}
 const ITEM_TIMEOUT: Duration = Duration::from_secs(90);
 const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(15);
 const TLS_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -424,6 +432,55 @@ fn runtime_is_clean(runtime: RuntimeReadiness) -> bool {
         && runtime.javascript_exceptions == 0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSetupRuntimeState {
+    Clean,
+    PendingOnly,
+    Failed,
+}
+
+fn session_setup_runtime_state(runtime: RuntimeReadiness) -> SessionSetupRuntimeState {
+    if runtime_is_clean(runtime) {
+        SessionSetupRuntimeState::Clean
+    } else if runtime.pending_relevant_requests > 0
+        && runtime.network_failures == 0
+        && runtime.http_errors == 0
+        && runtime.javascript_exceptions == 0
+        && !runtime.monitor_failed
+    {
+        SessionSetupRuntimeState::PendingOnly
+    } else {
+        SessionSetupRuntimeState::Failed
+    }
+}
+
+async fn wait_for_session_setup_readiness(
+    evidence_monitor: &BrowserEvidenceMonitor,
+) -> Result<(), String> {
+    let deadline = Instant::now() + SESSION_SETUP_READINESS_TIMEOUT;
+    loop {
+        let readiness = evidence_monitor.readiness(0, None);
+        match session_setup_runtime_state(readiness) {
+            SessionSetupRuntimeState::Clean => return Ok(()),
+            SessionSetupRuntimeState::Failed => {
+                return Err(format!(
+                    "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} {}",
+                    runtime_failure_reason(readiness)
+                ));
+            }
+            SessionSetupRuntimeState::PendingOnly if Instant::now() >= deadline => {
+                return Err(format!(
+                    "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} истёк срок чистого startup runtime: {}",
+                    runtime_failure_reason(readiness)
+                ));
+            }
+            SessionSetupRuntimeState::PendingOnly => {
+                sleep(SESSION_SETUP_READINESS_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
 fn runtime_failure_reason(runtime: RuntimeReadiness) -> String {
     format!(
         "сетевая среда выполнения не чиста (monitor_failed={}, ожидают={}, сетевых ошибок={}, HTTP-ошибок={}, JS-исключений={})",
@@ -694,6 +751,8 @@ pub enum SessionStopReason {
     Deadline,
     ItemTimeout,
     RetryRecoveryFailed(String),
+    #[cfg(feature = "session-rotation-acceptance")]
+    ItemLimitReached,
     Interrupted,
     RuntimeFailure(String),
 }
@@ -708,6 +767,10 @@ impl SessionStopReason {
             Self::RetryRecoveryFailed(error) => {
                 format!("не удалось восстановить страницу: {error}")
             }
+            #[cfg(feature = "session-rotation-acceptance")]
+            Self::ItemLimitReached => {
+                "достигнут предел элементов в приёмочном сеансе браузера".into()
+            }
             Self::Interrupted => "получен Ctrl+C; сеанс браузера закрыт".into(),
             Self::RuntimeFailure(message) => format!("отказ среды сеанса браузера: {message}"),
         }
@@ -719,6 +782,8 @@ fn session_stop_code(reason: &SessionStopReason) -> &'static str {
         SessionStopReason::Deadline => "session_deadline",
         SessionStopReason::ItemTimeout => "item_timeout",
         SessionStopReason::RetryRecoveryFailed(_) => "retry_recovery_failed",
+        #[cfg(feature = "session-rotation-acceptance")]
+        SessionStopReason::ItemLimitReached => "session_item_limit",
         SessionStopReason::Interrupted => "ctrl_c",
         SessionStopReason::RuntimeFailure(_) => "runtime_failure",
     }
@@ -729,6 +794,8 @@ fn terminal_failure_code<'a>(error: &'a str, stop: Option<&SessionStopReason>) -
         Some(SessionStopReason::Deadline) => "browser_session_deadline",
         Some(SessionStopReason::ItemTimeout) => "browser_item_timeout",
         Some(SessionStopReason::RetryRecoveryFailed(_)) => "browser_retry_recovery_failed",
+        #[cfg(feature = "session-rotation-acceptance")]
+        Some(SessionStopReason::ItemLimitReached) => "browser_session_item_limit",
         Some(SessionStopReason::Interrupted) => "acquisition_interrupted",
         Some(SessionStopReason::RuntimeFailure(_)) => "browser_network_runtime_failure",
         None => acquisition_failure_code(error),
@@ -853,6 +920,7 @@ pub struct AcquisitionRun {
     stopped: bool,
     workspace: PathBuf,
     owned_workspace: Option<TempWorkspace>,
+    acceptance_rotate_after_items: Option<usize>,
 }
 
 impl AcquisitionRun {
@@ -867,9 +935,31 @@ impl AcquisitionRun {
         Self::with_workspace(workspace.to_path_buf(), None)
     }
 
+    #[cfg(feature = "session-rotation-acceptance")]
+    pub(crate) fn new_for_acceptance_rotation(
+        max_items: usize,
+    ) -> Result<Self, AcquisitionStreamError> {
+        let workspace = TempWorkspace::create("yarxi-acquisition").map_err(|error| {
+            AcquisitionStreamError::Provider(format!("temp_workspace_create_failed: {error}"))
+        })?;
+        Self::with_workspace_and_rotation_limit(
+            workspace.path().to_path_buf(),
+            Some(workspace),
+            Some(max_items),
+        )
+    }
+
     fn with_workspace(
         workspace: PathBuf,
         owned_workspace: Option<TempWorkspace>,
+    ) -> Result<Self, AcquisitionStreamError> {
+        Self::with_workspace_and_rotation_limit(workspace, owned_workspace, None)
+    }
+
+    fn with_workspace_and_rotation_limit(
+        workspace: PathBuf,
+        owned_workspace: Option<TempWorkspace>,
+        acceptance_rotate_after_items: Option<usize>,
     ) -> Result<Self, AcquisitionStreamError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -884,6 +974,7 @@ impl AcquisitionRun {
             stopped: false,
             workspace,
             owned_workspace,
+            acceptance_rotate_after_items,
         })
     }
 
@@ -988,14 +1079,16 @@ impl AcquisitionRun {
             }
             let mut offset = 0;
             let mut sessions = 0_u32;
+            let mut setup_recreations = 0_u8;
             while offset < characters.len() {
                 let session_start = offset;
                 sessions = sessions.saturating_add(1);
-                let session_result = acquire_one_session(
+                let session_result = match acquire_one_session(
                     SessionAcquisitionConfig {
                         characters: &characters[offset..],
                         base_index: offset,
                         session_number: sessions,
+                        acceptance_rotate_after_items: self.acceptance_rotate_after_items,
                         allow_insecure_tls,
                         target,
                         workspace: &self.workspace,
@@ -1004,7 +1097,36 @@ impl AcquisitionRun {
                     &mut on_event,
                     interrupt,
                 )
-                .await?;
+                .await
+                {
+                    Ok(summary) => {
+                        setup_recreations = 0;
+                        summary
+                    }
+                    Err(AcquisitionStreamError::Provider(message))
+                        if message.starts_with(SESSION_SETUP_RUNTIME_FAILURE_PREFIX) =>
+                    {
+                        let Some(next_recreation) =
+                            next_session_setup_recreation(setup_recreations)
+                        else {
+                            return Err(AcquisitionStreamError::Provider(format!(
+                                "browser_session_setup_recovery_exhausted: после {MAX_SESSION_SETUP_RECREATIONS} пересозданий незатронутая часть очереди не изменилась; последняя причина: {message}"
+                            )));
+                        };
+                        setup_recreations = next_recreation;
+                        tracing::warn!(
+                            session = sessions,
+                            recreation = setup_recreations,
+                            max_recreations = MAX_SESSION_SETUP_RECREATIONS,
+                            code = "browser_session_setup_recreated",
+                            reason = %crate::diagnostics::safe_message(&message),
+                            pending = characters.len() - offset,
+                            "Новая сессия браузера не прошла проверку готовности; очередь сохранена для повторной подготовки"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 tracing::info!(session = sessions, processed = session_result.processed, pending = characters.len() - offset - session_result.processed, stage = "session_stop", code = "browser_session_ended", reason = %session_result.stop_reason.as_ref().map_or_else(|| "complete".to_owned(), |reason| crate::diagnostics::safe_message(&reason.summary())), "Сеанс завершён; счётчики отражают только реальные результаты");
                 on_event(AcquisitionEvent::SessionEnded {
                     session: sessions,
@@ -1058,6 +1180,7 @@ struct SessionAcquisitionConfig<'a> {
     characters: &'a [String],
     base_index: usize,
     session_number: u32,
+    acceptance_rotate_after_items: Option<usize>,
     allow_insecure_tls: bool,
     target: AcquisitionTarget,
     workspace: &'a Path,
@@ -1123,6 +1246,7 @@ async fn acquire_one_session(
         characters,
         base_index,
         session_number,
+        acceptance_rotate_after_items,
         allow_insecure_tls,
         target,
         workspace,
@@ -1217,6 +1341,7 @@ async fn acquire_one_session(
         if target == AcquisitionTarget::RenderedFontSamplePng {
             apply_dark_theme(page).await?;
         }
+        wait_for_session_setup_readiness(&evidence_monitor).await?;
         Ok::<_, String>(tls_exception)
     });
     let setup_result = tokio::select! {
@@ -1234,7 +1359,7 @@ async fn acquire_one_session(
                 code = "browser_session_setup_failed",
                 failure_code = acquisition_failure_code(&message),
                 outcome = "failure",
-                retryable = false,
+                retryable = message.starts_with(SESSION_SETUP_RUNTIME_FAILURE_PREFIX),
                 stage_duration_ms = setup_started_at.elapsed().as_millis() as u64,
                 runtime_snapshot = %runtime_snapshot_json(&evidence_monitor.telemetry.snapshot(0)),
                 "Не удалось подготовить страницу Yarxi"
@@ -1262,17 +1387,35 @@ async fn acquire_one_session(
         Ok(setup) => setup,
         Err(error) => {
             let cleanup = session.close().await;
-            tracing::info!(
-                session = session_number,
-                stage = "browser_close",
-                code = "browser_session_closed",
-                elapsed_ms = session_started_at.elapsed().as_millis() as u64,
-                "Браузер закрыт после отказа подготовки"
-            );
+            match &cleanup {
+                Ok(()) => tracing::info!(
+                    session = session_number,
+                    stage = "browser_close",
+                    code = "browser_session_closed",
+                    elapsed_ms = session_started_at.elapsed().as_millis() as u64,
+                    "Браузер закрыт после отказа подготовки"
+                ),
+                Err(cleanup_error) => tracing::error!(
+                    session = session_number,
+                    stage = "browser_close",
+                    code = "browser_session_close_failed",
+                    outcome = "failure",
+                    error = %crate::diagnostics::safe_message(cleanup_error),
+                    elapsed_ms = session_started_at.elapsed().as_millis() as u64,
+                    "Не удалось закрыть браузер после отказа подготовки"
+                ),
+            }
             return Err(match cleanup {
                 Ok(()) => error,
                 Err(cleanup) => {
-                    AcquisitionStreamError::Provider(format!("{}; {cleanup}", error.into_message()))
+                    let message = error.into_message();
+                    if message.starts_with(SESSION_SETUP_RUNTIME_FAILURE_PREFIX) {
+                        AcquisitionStreamError::Provider(format!(
+                            "browser_session_setup_cleanup_failed: {message}; {cleanup}"
+                        ))
+                    } else {
+                        AcquisitionStreamError::Provider(format!("{message}; {cleanup}"))
+                    }
                 }
             });
         }
@@ -1302,16 +1445,34 @@ async fn acquire_one_session(
         generations,
         diagnostics: None,
     };
-    let result = process_session_items(characters, base_index, &mut driver, on_event).await;
+    let result = process_session_items(
+        characters,
+        base_index,
+        acceptance_rotate_after_items,
+        &mut driver,
+        on_event,
+    )
+    .await;
     evidence_monitor.abort();
     let cleanup = session.close().await;
-    tracing::info!(
-        session = session_number,
-        stage = "browser_close",
-        code = "browser_session_closed",
-        elapsed_ms = session_started_at.elapsed().as_millis() as u64,
-        "Браузер Yarxi закрыт"
-    );
+    match &cleanup {
+        Ok(()) => tracing::info!(
+            session = session_number,
+            stage = "browser_close",
+            code = "browser_session_closed",
+            elapsed_ms = session_started_at.elapsed().as_millis() as u64,
+            "Браузер Yarxi закрыт"
+        ),
+        Err(cleanup_error) => tracing::error!(
+            session = session_number,
+            stage = "browser_close",
+            code = "browser_session_close_failed",
+            outcome = "failure",
+            error = %crate::diagnostics::safe_message(cleanup_error),
+            elapsed_ms = session_started_at.elapsed().as_millis() as u64,
+            "Не удалось закрыть браузер Yarxi"
+        ),
+    }
     match cleanup {
         Ok(()) => result,
         Err(cleanup) => Err(AcquisitionStreamError::Provider(match result {
@@ -1354,9 +1515,12 @@ trait SessionItemDriver {
 async fn process_session_items(
     characters: &[String],
     base_index: usize,
+    acceptance_rotate_after_items: Option<usize>,
     driver: &mut impl SessionItemDriver,
     on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
 ) -> Result<SessionAcquisitionSummary, AcquisitionStreamError> {
+    #[cfg(not(feature = "session-rotation-acceptance"))]
+    let _ = acceptance_rotate_after_items;
     let mut processed = 0;
     let mut stop_reason = None;
     let result = async {
@@ -1381,6 +1545,13 @@ async fn process_session_items(
             let checkpoint_stop = driver.after_checkpoint().await?;
             if checkpoint_stop.is_some() || item_stop_reason.is_some() {
                 stop_reason = checkpoint_stop.or(item_stop_reason);
+                break;
+            }
+            #[cfg(feature = "session-rotation-acceptance")]
+            if index + 1 < characters.len()
+                && acceptance_rotate_after_items.is_some_and(|limit| processed >= limit)
+            {
+                stop_reason = Some(SessionStopReason::ItemLimitReached);
                 break;
             }
         }
@@ -2018,7 +2189,7 @@ async fn async_error_or_tls_interstitial(
 ) -> Result<ApprovedTlsException, String> {
     if !allow_insecure_tls {
         return Err(format!(
-            "TLS-сертификат Yarxi отклонён браузером: {original}; повторите только после явного --allow-insecure-tls"
+            "TLS-сертификат Yarxi отклонён браузером: {original}; TLS-исключение отключено через --allow-insecure-tls=false"
         ));
     }
     let interstitial: Value = page
@@ -2082,14 +2253,14 @@ async fn wait_for_tls_navigation_failure(
 }
 
 fn check_tls_exception(
-    explicitly_allowed: bool,
+    allowed_by_policy: bool,
     blocked_url: &str,
     interstitial_code: &str,
     original_error: &str,
     proceed_link_present: bool,
 ) -> Result<(), String> {
-    if !explicitly_allowed {
-        return Err("нужен явный --allow-insecure-tls".into());
+    if !allowed_by_policy {
+        return Err("TLS-исключение Yarxi отключено через --allow-insecure-tls=false".into());
     }
     let parsed_blocked_url =
         Url::parse(blocked_url).map_err(|_| "URL ошибочного Document некорректен")?;
@@ -3708,7 +3879,7 @@ mod tests {
             stop_at_checkpoint: None,
         };
         let mut events = Vec::new();
-        let summary = process_session_items(&characters, 0, &mut driver, &mut |event| {
+        let summary = process_session_items(&characters, 0, None, &mut driver, &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -3733,7 +3904,7 @@ mod tests {
             acquisitions: 0,
             stop_at_checkpoint: None,
         };
-        let summary = process_session_items(&characters, 0, &mut driver, &mut |event| {
+        let summary = process_session_items(&characters, 0, None, &mut driver, &mut |event| {
             match event {
                 AcquisitionEvent::ItemStarted { index } => started.push(index),
                 AcquisitionEvent::ItemCompleted { index, outcome, .. } => {
@@ -3765,6 +3936,7 @@ mod tests {
         let resumed_summary = process_session_items(
             &characters[first_pending..],
             first_pending,
+            None,
             &mut resumed,
             &mut |event| {
                 match event {
@@ -3780,6 +3952,120 @@ mod tests {
         assert_eq!(resumed_summary.processed, 2);
         assert_eq!(started, vec![0, 1, 2]);
         assert_eq!(attempts, [1, 1, 1]);
+    }
+
+    #[cfg(feature = "session-rotation-acceptance")]
+    struct ItemFailureSession {
+        monitor: BrowserEvidenceMonitor,
+        acquisitions: usize,
+    }
+
+    #[cfg(feature = "session-rotation-acceptance")]
+    impl SessionItemDriver for ItemFailureSession {
+        async fn before_item(
+            &mut self,
+            _: usize,
+        ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+            Ok(monitor_stop_reason(&self.monitor))
+        }
+
+        async fn acquire(
+            &mut self,
+            _: usize,
+            _: &str,
+            _: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+        ) -> Result<
+            (Result<AcquiredMedia, String>, Option<SessionStopReason>),
+            AcquisitionStreamError,
+        > {
+            self.acquisitions += 1;
+            Ok((
+                Err("gif_unknown: незавершённый ресурс элемента".into()),
+                None,
+            ))
+        }
+
+        async fn after_checkpoint(
+            &mut self,
+        ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+            Ok(monitor_stop_reason(&self.monitor))
+        }
+    }
+
+    #[cfg(feature = "session-rotation-acceptance")]
+    #[tokio::test]
+    async fn acceptance_rotation_checkpoints_each_prefix_and_keeps_item_failures_local() {
+        let characters = [
+            "漢".into(),
+            "字".into(),
+            "語".into(),
+            "音".into(),
+            "鳥".into(),
+        ];
+        let mut checkpointed = Vec::new();
+        let mut started = Vec::new();
+        let mut offset = 0;
+        let mut session_count = 0;
+        while offset < characters.len() {
+            session_count += 1;
+            let mut driver = ItemFailureSession {
+                monitor: monitor_with_failure(false),
+                acquisitions: 0,
+            };
+            let summary = process_session_items(
+                &characters[offset..],
+                offset,
+                Some(2),
+                &mut driver,
+                &mut |event| {
+                    match event {
+                        AcquisitionEvent::ItemStarted { index } => started.push(index),
+                        AcquisitionEvent::ItemCompleted { index, outcome, .. } => {
+                            assert!(matches!(outcome.as_ref(), Err(message) if message.starts_with("gif_unknown:")));
+                            checkpointed.push(index);
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(summary.processed, driver.acquisitions);
+
+            match session_action(offset, characters.len(), &summary).unwrap() {
+                SessionAction::Rotate {
+                    next_offset,
+                    reason: SessionStopReason::ItemLimitReached,
+                } => {
+                    assert_eq!(next_offset, offset + 2);
+                    assert_eq!(checkpointed.len(), next_offset);
+                    offset = next_offset;
+                }
+                SessionAction::Complete => {
+                    assert_eq!(summary.processed, characters.len() - offset);
+                    offset = characters.len();
+                }
+                other => panic!("неожиданный результат принудительной ротации: {other:?}"),
+            }
+        }
+
+        assert_eq!(session_count, 3);
+        assert_eq!(started, (0..characters.len()).collect::<Vec<_>>());
+        assert_eq!(checkpointed, (0..characters.len()).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "session-rotation-acceptance")]
+    #[test]
+    fn acceptance_rotation_is_opt_in_and_keeps_production_limits() {
+        let ordinary = AcquisitionRun::new().unwrap();
+        assert_eq!(ordinary.acceptance_rotate_after_items, None);
+        let forced = AcquisitionRun::new_for_acceptance_rotation(2).unwrap();
+        assert_eq!(forced.acceptance_rotate_after_items, Some(2));
+        assert_eq!(OPERATION_TIMEOUT, Duration::from_secs(20 * 60));
+        assert_eq!(ITEM_TIMEOUT, Duration::from_secs(90));
+        assert_eq!(BATCH_PACING, Duration::from_millis(900));
+        assert_eq!(MAX_ACQUISITION_ATTEMPTS, 2);
     }
 
     #[test]
@@ -3802,6 +4088,7 @@ mod tests {
         for message in [
             "launch_failure: нет браузера",
             "setup_failure: отказ страницы",
+            "browser_session_setup_runtime_unhealthy: ожидает Image",
         ] {
             let mut events = Vec::new();
             let result = finish_session_setup::<()>(
@@ -3827,6 +4114,13 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn setup_readiness_recreation_is_bounded() {
+        assert_eq!(next_session_setup_recreation(0), Some(1));
+        assert_eq!(next_session_setup_recreation(1), Some(2));
+        assert_eq!(next_session_setup_recreation(2), None);
+    }
+
     #[tokio::test]
     async fn interrupt_during_last_checkpoint_is_acknowledged_after_durable_outcome() {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3838,7 +4132,7 @@ mod tests {
             acquisitions: 0,
             stop_at_checkpoint: Some(stop.clone()),
         };
-        let summary = process_session_items(&characters, 0, &mut driver, &mut |event| {
+        let summary = process_session_items(&characters, 0, None, &mut driver, &mut |event| {
             if matches!(event, AcquisitionEvent::ItemCompleted { .. }) {
                 checkpoints += 1;
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4336,10 +4630,32 @@ mod tests {
             },
         ];
         for runtime in dirty_states {
+            assert_ne!(
+                session_setup_runtime_state(runtime),
+                SessionSetupRuntimeState::Clean
+            );
             let state = classify_primary_state(None, true, true, true, runtime);
             assert!(matches!(state, PrimaryGifState::Unknown { .. }));
             assert!(choose_media_source(state, &[], "柘").is_err());
         }
+        assert_eq!(
+            session_setup_runtime_state(RuntimeReadiness {
+                pending_relevant_requests: 1,
+                ..clean_runtime()
+            }),
+            SessionSetupRuntimeState::PendingOnly
+        );
+        assert_eq!(
+            session_setup_runtime_state(RuntimeReadiness {
+                network_failures: 1,
+                ..clean_runtime()
+            }),
+            SessionSetupRuntimeState::Failed
+        );
+        assert_eq!(
+            session_setup_runtime_state(clean_runtime()),
+            SessionSetupRuntimeState::Clean
+        );
         assert!(matches!(
             classify_primary_state(None, true, true, true, clean_runtime()),
             PrimaryGifState::AbsentConfirmed { .. }
@@ -4424,7 +4740,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_exception_requires_explicit_flag_exact_failed_url_and_exact_error() {
+    fn tls_exception_respects_strict_mode_and_requires_exact_failed_url_and_error() {
         let expected_error = "net::ERR_CERT_AUTHORITY_INVALID";
         assert!(
             check_tls_exception(
