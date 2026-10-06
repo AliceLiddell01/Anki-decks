@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::batch_runtime::SafeBatchRuntime;
 use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer};
-use crate::browser_runtime::BrowserSession;
+use crate::browser_runtime::{BrowserLaunchError, BrowserSession};
 use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
@@ -1047,6 +1047,7 @@ fn human_operation_name(operation: &str) -> &str {
         "batch_review" => "подготовка проверки",
         "batch_select" => "выбор записи JPDB",
         "batch_retry" => "повтор элемента",
+        "batch_retry_technical" => "пакетный повтор технических сбоев",
         "batch_reacquire" => "повторное получение",
         "batch_reject" => "отклонение кандидата",
         _ => operation,
@@ -1843,9 +1844,9 @@ const PITCH_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
 const PITCH_DEFAULT_WORKERS: u8 = 4;
 const PITCH_MAX_WORKERS: usize = 4;
 // Бюджет последовательных восстановлений сессии без доказанного здорового прогресса.
-// Значение ограничивает серию `launch → session failure → launch` четырьмя запусками
-// на исполнителя: короткий транзиентный сбой среды переживается, а сломанная среда
-// выводит исполнителя из пула вместо бесконечного цикла. Плановая ротация по
+// Значение задаёт число последовательных сбоев сессии/запуска, после которого
+// исполнитель выводится из пула. Это позволяет пережить кратковременные сбои и не
+// допустить бесконечного цикла при неисправной среде. Плановая ротация по
 // возрасту/лимиту записей и `Ctrl+C` бюджет не расходуют.
 const PITCH_SESSION_RECOVERY_BUDGET: u32 = 3;
 
@@ -1881,7 +1882,7 @@ impl Default for PitchRunPolicy {
 trait PitchRunDriver {
     type Session;
 
-    async fn launch(&mut self) -> Result<Self::Session, String>;
+    async fn launch(&mut self) -> Result<Self::Session, BrowserLaunchError>;
     async fn acquire(
         &mut self,
         session: &Self::Session,
@@ -1940,12 +1941,13 @@ struct JpdbRunDriver {
 impl PitchRunDriver for JpdbRunDriver {
     type Session = BrowserSession;
 
-    async fn launch(&mut self) -> Result<Self::Session, String> {
+    async fn launch(&mut self) -> Result<Self::Session, BrowserLaunchError> {
         if self.workspace.is_none() {
-            self.workspace = Some(
-                TempWorkspace::create("pitch-batch-worker")
-                    .map_err(|error| format!("worker_workspace_create_failed: {error}"))?,
-            );
+            self.workspace = Some(TempWorkspace::create("pitch-batch-worker").map_err(
+                |error| {
+                    BrowserLaunchError::workspace_creation(error, "worker_workspace_create_failed")
+                },
+            )?);
         }
         BrowserSession::launch_in_workspace(
             pitch_browser_runtime_config(),
@@ -2594,7 +2596,7 @@ enum PitchWorkerEvent {
         consecutive_failures: u32,
         continuation: PitchWorkerContinuation,
     },
-    /// Назначенное задание не получило terminal outcome: координатор обязан вернуть
+    /// Назначенное задание не получило терминального результата: координатор обязан вернуть
     /// его в очередь текущего запуска, не создавая попытку и не меняя поколение.
     SessionFailure {
         context: PitchWorkerContext,
@@ -2630,17 +2632,17 @@ enum PitchWorkerContinuation {
 /// Классификация отчёта провайдера для одного назначенного задания.
 ///
 /// Различает локальный отказ сессии, который восстанавливается пересозданием сессии
-/// этого исполнителя, и нарушение protocol invariant, которое остаётся fail-closed
+/// этого исполнителя, и нарушение инварианта протокола, которое остаётся fail-closed
 /// на уровне всего запуска.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PitchReportClass {
-    /// Ровно один terminal outcome, сессию можно продолжать.
+    /// Получен ровно один терминальный результат, сессию можно продолжать.
     Terminal,
-    /// Ровно один terminal outcome, но сессия непригодна и требует пересоздания.
+    /// Получен ровно один терминальный результат, но сессия непригодна и требует пересоздания.
     TerminalWithSessionFailure,
-    /// Terminal outcome отсутствует, сессия непригодна: задание возвращается в очередь.
+    /// Терминальный результат отсутствует, сессия непригодна: задание возвращается в очередь.
     SessionFailure,
-    /// Нарушение protocol invariant провайдера: запуск останавливается.
+    /// Нарушение инварианта протокола провайдера: запуск останавливается.
     Invalid,
 }
 
@@ -2735,7 +2737,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
     let mut session_items = 0_usize;
     let mut worker_session = 0_u32;
     let mut stop_reason = None;
-    // Последовательная серия session/startup failures без доказанного здорового
+    // Последовательная серия сбоев сессии/запуска без доказанного здорового
     // прогресса. Плановая ротация по возрасту или лимиту записей и `Ctrl+C` её не
     // увеличивают.
     let mut consecutive_recovery_failures = 0_u32;
@@ -2825,7 +2827,19 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                         diagnostic_item = Some(item);
                         launched
                     },
-                    Ok(Err(message)) => {
+                    Ok(Err(error @ BrowserLaunchError::CleanupFailed { .. })) => {
+                        configuration.finish_failure("browser_cleanup_failed", false, None);
+                        item.set_stop_reason("browser_cleanup_failed");
+                        item.finish_failure("browser_cleanup_failed", false, None);
+                        return Err(pitch_run_stopped("browser_cleanup_failed", error.to_string()));
+                    }
+                    Ok(Err(BrowserLaunchError::Panic(message))) => {
+                        configuration.finish_failure("worker_panic", false, None);
+                        item.set_stop_reason("worker_panic");
+                        item.finish_failure("worker_panic", false, None);
+                        return Err(pitch_run_stopped("worker_panic", message));
+                    }
+                    Ok(Err(BrowserLaunchError::Setup(message))) => {
                         configuration.finish_failure("browser_setup", false, None);
                         item.set_stop_reason("session_failure");
                         item.finish_failure("browser_setup", false, None);
@@ -2833,7 +2847,6 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                             stage: JpdbPitchStage::ConfigureBrowser,
                             message,
                         };
-                        trace_pitch_failure(&failure, context.progress(), true);
                         // Запуск не дал сессии: закрывать нечего, но задание обязано
                         // вернуться в очередь без попытки и без смены поколения.
                         consecutive_recovery_failures += 1;
@@ -2926,7 +2939,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             };
             let class = classify_pitch_report(&report);
             if class == PitchReportClass::Invalid {
-                // Нарушение protocol invariant провайдера остаётся fail-closed на
+                // Нарушение инварианта протокола провайдера остаётся fail-closed на
                 // уровне запуска: локальное восстановление сессии его не скрывает.
                 stop_reason = Some("invalid_provider_report");
                 item.set_stop_reason("invalid_provider_report");
@@ -2945,13 +2958,13 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             if session_failure.is_some() {
                 item.set_stop_reason("session_failure");
             }
-            // Настоящий terminal outcome доказывает, что сессия работала: серия
+            // Настоящий терминальный результат доказывает, что сессия работала: серия
             // последовательных восстановлений прерывается.
             if class != PitchReportClass::SessionFailure {
                 consecutive_recovery_failures = 0;
             }
             // Каждая непригодная сессия требует восстановления и расходует бюджет,
-            // включая случай, когда outcome уже получен и сохранён.
+            // включая случай, когда результат уже получен и сохранён.
             if session_failure.is_some() {
                 consecutive_recovery_failures += 1;
             }
@@ -2967,7 +2980,6 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                     let failure = session_failure
                         .as_ref()
                         .expect("класс требует отказа сессии");
-                    trace_pitch_failure(failure, context.progress(), true);
                     let value = serde_json::to_value(failure).expect("ошибка JPDB сериализуется");
                     item.finish_failure(
                         value["code"].as_str().unwrap_or("unknown"),
@@ -2994,14 +3006,13 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                 }
             }
             if session_failure.is_some() {
-                // Испорченная сессия явно закрывается до пересоздания. Cleanup обязан
-                // быть доказан, иначе запуск останавливается fail-closed.
+                // Испорченная сессия явно закрывается до пересоздания. Очистка обязана
+                // быть доказана, иначе запуск останавливается fail-closed.
                 recovering = true;
                 let active = session.take().expect("сессия запущена до получения");
                 checked_pitch_worker_close(driver, active)
                     .await
                     .map_err(|message| pitch_run_stopped("browser_cleanup_failed", message))?;
-                context.session = None;
                 pitch_worker_progress_with_recovery(
                     &events,
                     "browser_session_ended",
@@ -3009,6 +3020,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                     Some("session_failure"),
                     Some(consecutive_recovery_failures),
                 )?;
+                context.session = None;
             }
             if retired {
                 // Единственное событие выхода из пула публикует координатор: он
@@ -3150,9 +3162,9 @@ fn stop_pitch_dispatch(
 /// Выдаёт ожидающие задачи свободным исполнителям в порядке их номеров.
 ///
 /// Исполнитель, вышедший из пула, теряет свой канал: он не получает новых задач.
-/// Если очередь опустела, свободные каналы закрываются, потому что больше задач не
-/// будет; вернувшаяся позже задача снова найдёт свободный открытый канал того
-/// исполнителя, который её вернул.
+/// Если очередь опустела, свободные каналы остаются открытыми, пока выполняется хотя
+/// бы одно задание: после отказа соседа его задание вернётся в очередь. Когда все
+/// задания завершены и очередь пуста, свободные каналы закрываются.
 fn dispatch_pending_jobs(
     commands: &mut [Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
     pending: &mut VecDeque<PitchAcquisitionJob>,
@@ -3413,12 +3425,17 @@ async fn run_batch_with_drivers(
                             let expected = active[index].take();
                             progress.in_flight = active.iter().filter(|job| job.is_some()).count();
                             if expected.as_ref() != Some(&job) {
-                                return Err(pitch_run_stopped("invalid_provider_report", "отчёт не соответствует назначенным identity, token и запросу"));
+                                return Err(pitch_run_stopped("invalid_provider_report", "отчёт не соответствует назначенным идентичности, токену и запросу"));
                             }
                             if report.outcomes.len() > 1
                                 || (report.outcomes.is_empty() && report.session_failure.is_none())
                             {
                                 return Err(pitch_run_stopped("invalid_provider_report", "Провайдер JPDB вернул неверное число результатов"));
+                            }
+                            // Координатор владеет диагностикой принятого отказа:
+                            // ошибка контрольной точки не должна потерять отказ сессии.
+                            if let Some(failure) = &report.session_failure {
+                                trace_pitch_failure(failure, context.progress(), true);
                             }
                             // Проверяем CAS и сохраняем байты до следующего ожидания.
                             if let Some(outcome) = report.outcomes.pop() {
@@ -3440,11 +3457,10 @@ async fn run_batch_with_drivers(
                                         "item_discarded_stale", context.progress(), None, Some("item_token_changed".into()), None)?;
                                 }
                             }
-                            // Отказ сессии после настоящего outcome не отменяет уже
+                            // Отказ сессии после настоящего результата не отменяет уже
                             // сохранённый результат: исполнитель закрывает испорченную
                             // сессию сам, а запуск продолжается остальными.
                             if let Some(failure) = &report.session_failure {
-                                trace_pitch_failure(failure, context.progress(), true);
                                 last_session_failure = Some(failure.clone());
                             }
                             if continuation == PitchWorkerContinuation::Accepting {
@@ -3463,9 +3479,9 @@ async fn run_batch_with_drivers(
                             let expected = active[index].take();
                             progress.in_flight = active.iter().filter(|job| job.is_some()).count();
                             if expected.as_ref() != Some(&job) {
-                                return Err(pitch_run_stopped("invalid_provider_report", "отказ сессии не соответствует назначенной identity, token и запросу"));
+                                return Err(pitch_run_stopped("invalid_provider_report", "отказ сессии не соответствует назначенным идентичности, токену и запросу"));
                             }
-                            // Задание не получило terminal outcome: оно возвращается в
+                            // Задание не получило терминального результата: оно возвращается в
                             // очередь без попытки, без смены поколения и без
                             // синтетического `technical_failure`.
                             trace_pitch_failure(&failure, context.progress(), true);
@@ -3909,7 +3925,7 @@ fn candidate_identity(
     batch
         .item(surface)
         .map(|item| item.identity.clone())
-        .ok_or_else(|| invalid_plan("identity отсутствует в batch"))
+        .ok_or_else(|| invalid_plan("идентичность отсутствует в пакете"))
 }
 
 fn reconcile_batch(store: &AssetStore, batch: &mut PitchAccentBatch) -> Result<(), AssetError> {

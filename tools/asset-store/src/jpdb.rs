@@ -635,7 +635,7 @@ impl JpdbPitchProvider {
             Err(message) => {
                 let failure = JpdbPitchFailure::BrowserSetup {
                     stage: JpdbPitchStage::ConfigureBrowser,
-                    message,
+                    message: message.to_string(),
                 };
                 configuration.finish_failure("browser_setup", false, None);
                 item.finish_failure("browser_setup", false, None);

@@ -57,6 +57,21 @@ pub struct TempWorkspace {
     closed: bool,
 }
 
+/// Ошибка создания, при которой очистка уже созданного дерева не доказана.
+#[derive(Debug, thiserror::Error)]
+#[error("{original}; temp_workspace_cleanup_failed: {cleanup}")]
+pub(crate) struct WorkspaceCreationCleanupFailure {
+    pub(crate) original: io::Error,
+    pub(crate) cleanup: io::Error,
+}
+
+fn creation_cleanup_failure(original: io::Error, cleanup: io::Error) -> io::Error {
+    io::Error::new(
+        original.kind(),
+        WorkspaceCreationCleanupFailure { original, cleanup },
+    )
+}
+
 /// Один раз за время жизни процесса удаляет осиротевшие запуски перед работой с временными данными.
 /// Вызывающий запуск может выполнить уборку без создания нового временного дерева.
 pub(crate) fn cleanup_orphans_on_startup() -> io::Result<()> {
@@ -105,7 +120,11 @@ impl TempWorkspace {
             let run_id = format!("run-{}", crate::hashing::encode_lower_hex(random));
             match mkdirat(&parent, run_id.as_str(), Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
-                    let directory = directory_at(&parent, OsStr::new(&run_id))?;
+                    let directory = directory_at(&parent, OsStr::new(&run_id)).map_err(|error| {
+                        creation_cleanup_failure(error, io::Error::other(
+                            "не удалось подтвердить владение уже созданным временным каталогом",
+                        ))
+                    })?;
                     let owner = Self {
                         path: temp_root.join(&namespace_name).join(&run_id),
                         run_id: run_id.clone(),
@@ -113,40 +132,43 @@ impl TempWorkspace {
                         directory,
                         closed: false,
                     };
-                    let marker = OwnershipMarker {
-                        schema: SCHEMA,
-                        repository: REPOSITORY.into(),
-                        tool: TOOL.into(),
-                        pid,
-                        boot_id: Some(boot_id),
-                        process_start_ticks: Some(process_start_ticks),
-                        created_unix_ms: unix_ms()?,
-                        run_id,
-                        purpose: purpose.into(),
-                    };
-                    let fd = openat(
-                        &owner.directory,
-                        ".anki-decks-owner.tmp",
-                        OFlags::WRONLY
-                            | OFlags::CREATE
-                            | OFlags::EXCL
-                            | OFlags::NOFOLLOW
-                            | OFlags::CLOEXEC,
-                        Mode::from_raw_mode(0o600),
-                    )?;
-                    let mut file = File::from(fd);
-                    serde_json::to_writer(&mut file, &marker).map_err(io::Error::other)?;
-                    file.write_all(b"\n")?;
-                    file.sync_all()?;
-                    renameat_with(
-                        &owner.directory,
-                        ".anki-decks-owner.tmp",
-                        &owner.directory,
-                        MARKER,
-                        RenameFlags::NOREPLACE,
-                    )?;
-                    owner.directory.sync_all()?;
-                    return Ok(owner);
+                    let initialized = (|| {
+                        let marker = OwnershipMarker {
+                            schema: SCHEMA,
+                            repository: REPOSITORY.into(),
+                            tool: TOOL.into(),
+                            pid,
+                            boot_id: Some(boot_id),
+                            process_start_ticks: Some(process_start_ticks),
+                            created_unix_ms: unix_ms()?,
+                            run_id,
+                            purpose: purpose.into(),
+                        };
+                        let fd = openat(
+                            &owner.directory,
+                            ".anki-decks-owner.tmp",
+                            OFlags::WRONLY
+                                | OFlags::CREATE
+                                | OFlags::EXCL
+                                | OFlags::NOFOLLOW
+                                | OFlags::CLOEXEC,
+                            Mode::from_raw_mode(0o600),
+                        )?;
+                        let mut file = File::from(fd);
+                        serde_json::to_writer(&mut file, &marker).map_err(io::Error::other)?;
+                        file.write_all(b"\n")?;
+                        file.sync_all()?;
+                        renameat_with(
+                            &owner.directory,
+                            ".anki-decks-owner.tmp",
+                            &owner.directory,
+                            MARKER,
+                            RenameFlags::NOREPLACE,
+                        )?;
+                        owner.directory.sync_all()?;
+                        Ok(())
+                    })();
+                    return owner.finish_creation(initialized);
                 }
                 Err(error) if error == rustix::io::Errno::EXIST => continue,
                 Err(error) => return Err(error.into()),
@@ -156,6 +178,16 @@ impl TempWorkspace {
             io::ErrorKind::AlreadyExists,
             "исчерпаны попытки создания temp run",
         ))
+    }
+
+    fn finish_creation(self, initialized: io::Result<()>) -> io::Result<Self> {
+        match initialized {
+            Ok(()) => Ok(self),
+            Err(original) => match self.close() {
+                Ok(()) => Err(original),
+                Err(cleanup) => Err(creation_cleanup_failure(original, cleanup)),
+            },
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -1651,6 +1683,62 @@ mod tests {
             .unwrap();
         owner.closed = true; // Имитация SIGKILL без уничтожения тестового процесса.
         owner.path().to_path_buf()
+    }
+
+    #[test]
+    fn partial_creation_failure_reports_unproven_cleanup_and_preserves_replacement() {
+        let owner =
+            TempWorkspace::create_under(Path::new(TEMP_ROOT), "partial-create-error").unwrap();
+        let owned_path = owner.path().to_path_buf();
+        let moved_path = owned_path.with_extension("moved");
+        fs::rename(&owned_path, &moved_path).unwrap();
+        fs::create_dir(&owned_path).unwrap();
+        let error = owner
+            .finish_creation(Err(io::Error::other("сбой записи маркера")))
+            .unwrap_err();
+        let typed = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<WorkspaceCreationCleanupFailure>()
+            .unwrap();
+        assert_eq!(typed.original.to_string(), "сбой записи маркера");
+        assert!(typed.cleanup.to_string().contains("подменён"));
+        assert!(matches!(
+            crate::browser_runtime::BrowserLaunchError::workspace_creation(
+                error,
+                "worker_workspace_create_failed"
+            ),
+            crate::browser_runtime::BrowserLaunchError::CleanupFailed { .. }
+        ));
+        assert!(owned_path.is_dir());
+        assert!(moved_path.is_dir());
+        fs::remove_dir(&owned_path).unwrap();
+        fs::remove_dir_all(&moved_path).unwrap();
+    }
+
+    #[test]
+    fn partial_creation_failure_with_proven_cleanup_remains_regular_io_error() {
+        let owner =
+            TempWorkspace::create_under(Path::new(TEMP_ROOT), "partial-create-error").unwrap();
+        let path = owner.path().to_path_buf();
+        let error = owner
+            .finish_creation(Err(io::Error::other("сбой записи маркера")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "сбой записи маркера");
+        assert!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<WorkspaceCreationCleanupFailure>())
+                .is_none()
+        );
+        assert!(!path.exists());
+        assert!(matches!(
+            crate::browser_runtime::BrowserLaunchError::workspace_creation(
+                error,
+                "worker_workspace_create_failed"
+            ),
+            crate::browser_runtime::BrowserLaunchError::Setup(_)
+        ));
     }
 
     #[test]

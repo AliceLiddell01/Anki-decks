@@ -593,40 +593,7 @@ impl PitchAccentBatch {
         let item = self
             .item_mut(surface)
             .ok_or_else(|| invalid("`surface` отсутствует в пакете pitch-accent"))?;
-        if item.owner_conflict.is_some()
-            || item
-                .publication
-                .as_ref()
-                .is_some_and(|intent| intent.status == PitchBatchPublicationStatus::Pending)
-        {
-            return Err(invalid(
-                "сначала разрешите конфликт владельца или завершите намерение публикации",
-            ));
-        }
-        let Some(PitchBatchOutcome::Failed { error }) = item.current_outcome() else {
-            return Err(invalid(
-                "точечный повтор разрешён только после технического сбоя",
-            ));
-        };
-        if !is_retryable_failure(error) {
-            return Err(invalid(
-                "сбой источника, входных данных или выбора нельзя исправить повтором получения",
-            ));
-        }
-        item.generation = item
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("превышен номер поколения"))?;
-        item.current_candidate_sha256 = None;
-        item.current_candidate_attempt_index = None;
-        item.refresh_expected_sha256 = item.owner_current_sha256.clone();
-        item.existing_verified_sha256 = None;
-        item.archive_publication()?;
-        item.last_action_reason = Some(reason);
-        item.item_revision = item
-            .item_revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
+        item.retry_failure(reason)?;
         self.bump_revision()?;
         self.validate()
     }
@@ -642,32 +609,35 @@ impl PitchAccentBatch {
     /// наблюдаемым даже при отказе на одном из элементов.
     pub fn retry_retryable_failures(&mut self, reason: String) -> Result<Vec<String>, AssetError> {
         validate_reason(&reason)?;
-        let surfaces = self.retryable_failure_surfaces();
+        let mut candidate = self.clone();
+        let mut surfaces = Vec::new();
+        for item in &mut candidate.items {
+            if item.ensure_retryable_failure().is_ok() {
+                item.apply_retry_failure(reason.clone())?;
+                candidate.revision = candidate
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("превышен номер изменения пакета pitch-accent"))?;
+                surfaces.push(item.identity.key.clone());
+            }
+        }
         if surfaces.is_empty() {
             return Ok(Vec::new());
         }
-        let mut candidate = self.clone();
-        for surface in &surfaces {
-            candidate.retry(surface, reason.clone())?;
-        }
+        candidate.validate()?;
         *self = candidate;
         Ok(surfaces)
     }
 
     /// Перечисляет словоформы, текущий результат которых — устранимый технический сбой.
     ///
-    /// Отбор совпадает с условиями точечного `retry`: технический сбой без конфликта
-    /// владельца и без незавершённого намерения публикации.
+    /// Отбор совпадает с условиями точечного `retry`: сохранённый технический сбой
+    /// без конфликта владельца и без незавершённого намерения публикации. Наличие
+    /// подходящей VERIFIED-записи владельца не отменяет явный повтор этого сбоя.
     pub fn retryable_failure_surfaces(&self) -> Vec<String> {
         self.items
             .iter()
-            .filter(|item| {
-                item.status() == PitchBatchItemStatus::TechnicalFailure
-                    && matches!(
-                        item.current_outcome(),
-                        Some(PitchBatchOutcome::Failed { error }) if is_retryable_failure(error)
-                    )
-            })
+            .filter(|item| item.ensure_retryable_failure().is_ok())
             .map(|item| item.identity.key.clone())
             .collect()
     }
@@ -1074,6 +1044,55 @@ impl PitchAccentBatch {
 }
 
 impl PitchBatchItem {
+    /// Единый критерий разрешённости адресного и пакетного повтора.
+    fn ensure_retryable_failure(&self) -> Result<(), AssetError> {
+        if self.owner_conflict.is_some()
+            || self
+                .publication
+                .as_ref()
+                .is_some_and(|intent| intent.status == PitchBatchPublicationStatus::Pending)
+        {
+            return Err(invalid(
+                "сначала разрешите конфликт владельца или завершите намерение публикации",
+            ));
+        }
+        let Some(PitchBatchOutcome::Failed { error }) = self.current_outcome() else {
+            return Err(invalid(
+                "точечный повтор разрешён только после технического сбоя",
+            ));
+        };
+        if !is_retryable_failure(error) {
+            return Err(invalid(
+                "сбой источника, входных данных или выбора нельзя исправить повтором получения",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Переводит разрешённый сбой в новое поколение без проверки всего пакета.
+    fn retry_failure(&mut self, reason: String) -> Result<(), AssetError> {
+        self.ensure_retryable_failure()?;
+        self.apply_retry_failure(reason)
+    }
+
+    fn apply_retry_failure(&mut self, reason: String) -> Result<(), AssetError> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("превышен номер поколения"))?;
+        self.current_candidate_sha256 = None;
+        self.current_candidate_attempt_index = None;
+        self.refresh_expected_sha256 = self.owner_current_sha256.clone();
+        self.existing_verified_sha256 = None;
+        self.archive_publication()?;
+        self.last_action_reason = Some(reason);
+        self.item_revision = self
+            .item_revision
+            .checked_add(1)
+            .ok_or_else(|| invalid("превышен номер изменения элемента"))?;
+        Ok(())
+    }
+
     fn reconcile_owner_record(
         &mut self,
         current: Option<&AssetRecord>,

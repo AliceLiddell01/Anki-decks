@@ -1239,12 +1239,13 @@ enum ScriptedPitchAction {
     },
     SetupFailure,
     ItemFailure,
-    /// Нарушение protocol invariant: два результата на одно задание.
+    ItemFailureWithSessionFailure,
+    /// Нарушение инварианта протокола: два результата на одно задание.
     InvalidReport,
     Reacquire,
-    /// Портит сохранённое состояние batch прямо перед отдачей результата.
+    /// Портит сохранённое состояние пакета прямо перед отдачей результата.
     CorruptRuntime,
-    /// Устаревший token вместе с отказом сессии в одном отчёте.
+    /// Устаревший токен вместе с отказом сессии в одном отчёте.
     ReacquireSessionFailure,
 }
 
@@ -1260,6 +1261,7 @@ impl Clone for ScriptedPitchAction {
             },
             Self::SetupFailure => Self::SetupFailure,
             Self::ItemFailure => Self::ItemFailure,
+            Self::ItemFailureWithSessionFailure => Self::ItemFailureWithSessionFailure,
             Self::InvalidReport => Self::InvalidReport,
             Self::Reacquire => Self::Reacquire,
             Self::CorruptRuntime => Self::CorruptRuntime,
@@ -1274,6 +1276,7 @@ struct ScriptedPitchDriver {
     actions: std::collections::VecDeque<ScriptedPitchAction>,
     launches: usize,
     fail_launch_on: Option<usize>,
+    launch_error: Option<super::BrowserLaunchError>,
     /// Все запуски с номером не больше указанного терпят сбой.
     fail_launch_until: Option<usize>,
     /// Сессии с указанным номером не удаётся закрыть.
@@ -1294,6 +1297,7 @@ impl ScriptedPitchDriver {
             actions: actions.into(),
             launches: 0,
             fail_launch_on: None,
+            launch_error: None,
             fail_launch_until: None,
             fail_close_on: None,
             slow_launch: None,
@@ -1326,7 +1330,7 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
         item.record_runtime_snapshot(&crate::browser_runtime::RuntimeSnapshot::default());
     }
 
-    async fn launch(&mut self) -> Result<Self::Session, String> {
+    async fn launch(&mut self) -> Result<Self::Session, super::BrowserLaunchError> {
         assert!(self.active.is_none(), "сессии не должны пересекаться");
         self.launches += 1;
         if self
@@ -1343,12 +1347,17 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
             tokio::task::yield_now().await;
             tokio::task::yield_now().await;
         }
+        if let Some(error) = self.launch_error.take() {
+            return Err(error);
+        }
         if self.fail_launch_on == Some(self.launches)
             || self
                 .fail_launch_until
                 .is_some_and(|limit| self.launches <= limit)
         {
-            return Err("сбой запуска в автономном сценарии".into());
+            return Err(super::BrowserLaunchError::Setup(
+                "сбой запуска в автономном сценарии".into(),
+            ));
         }
         self.active = Some(self.launches);
         Ok(self.launches)
@@ -1381,7 +1390,8 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
                 std::future::pending::<()>().await;
             }
             ScriptedPitchAction::ReadyWithSignal(signal) => signal.send(()).unwrap(),
-            ScriptedPitchAction::ItemFailure => {
+            ScriptedPitchAction::ItemFailure
+            | ScriptedPitchAction::ItemFailureWithSessionFailure => {
                 return crate::jpdb::JpdbPitchAcquisitionReport {
                     outcomes: vec![JpdbPitchOutcome::Failed {
                         error: JpdbPitchFailure::Timeout {
@@ -1389,7 +1399,14 @@ impl super::PitchRunDriver for ScriptedPitchDriver {
                             diagnostic: Some("тайм-аут элемента в автономной проверке".into()),
                         },
                     }],
-                    session_failure: None,
+                    session_failure: matches!(
+                        action,
+                        ScriptedPitchAction::ItemFailureWithSessionFailure
+                    )
+                    .then(|| JpdbPitchFailure::SessionFailure {
+                        stage: JpdbPitchStage::SearchNavigation,
+                        message: "отказ сессии после сбоя элемента в автономной проверке".into(),
+                    }),
                 };
             }
             ScriptedPitchAction::SetupFailure => {
@@ -1553,7 +1570,7 @@ struct ParallelPitchTraceStateSnapshot {
 
 enum ParallelPitchAction {
     Complete,
-    /// Ровно `failures` последовательных отказов сессии на этой identity, затем успех.
+    /// Ровно `failures` последовательных отказов сессии на этом элементе, затем успех.
     SessionFailureTimes {
         failures: usize,
         started: Option<futures::channel::oneshot::Sender<()>>,
@@ -1569,7 +1586,7 @@ enum ParallelPitchAction {
     },
 }
 
-/// Повторное получение из автономного сценария: делает выданный token устаревшим.
+/// Повторное получение в автономном сценарии: делает выданный токен устаревшим.
 fn reacquire_for_test(store_root: &std::path::Path, batch_id: &str, surface: &str) {
     let mut runtime = PitchAccentBatchRuntime::open(store_root, batch_id).unwrap();
     let mut batch = runtime.load().unwrap().unwrap();
@@ -1636,7 +1653,7 @@ impl super::PitchRunDriver for ParallelPitchDriver {
         item.record_runtime_snapshot(&crate::browser_runtime::RuntimeSnapshot::default());
     }
 
-    async fn launch(&mut self) -> Result<Self::Session, String> {
+    async fn launch(&mut self) -> Result<Self::Session, super::BrowserLaunchError> {
         assert!(
             self.active_session.is_none(),
             "у исполнителя не может быть двух сессий"
@@ -1647,7 +1664,9 @@ impl super::PitchRunDriver for ParallelPitchDriver {
             .fail_launch_until
             .is_some_and(|limit| self.worker_session_count as usize <= limit)
         {
-            return Err("сбой запуска в параллельном сценарии".into());
+            return Err(super::BrowserLaunchError::Setup(
+                "сбой запуска в параллельном сценарии".into(),
+            ));
         }
         let session = self.trace.launch();
         self.active_session = Some(worker_session);
@@ -1674,7 +1693,7 @@ impl super::PitchRunDriver for ParallelPitchDriver {
         });
         let action = self.actions.remove(&surface).unwrap_or_else(|| {
             panic!(
-                "исполнитель {} получил неожиданную identity {:?}; действие не задано в сценарии",
+                "исполнитель {} получил неожиданную идентичность {:?}; действие не задано в сценарии",
                 self.worker, surface
             )
         });
@@ -1684,7 +1703,7 @@ impl super::PitchRunDriver for ParallelPitchDriver {
                 if let Some(started) = started {
                     let _ = started.send(());
                 }
-                // Повторные запросы той же identity получают отказ ровно `failures`
+                // Повторные запросы того же элемента получают отказ ровно `failures`
                 // раз, дальше она завершается обычным путём.
                 self.actions.insert(
                     surface.clone(),
@@ -2379,9 +2398,9 @@ async fn parallel_pitch_session_failure_recovers_locally_and_keeps_neighbor_disp
         .unwrap();
     assert_eq!(requeued.identity.as_ref().unwrap().key, "一");
     assert_eq!(requeued.worker, Some(1));
-    // Упавшая identity не получила попытку и выполнена ровно один раз.
+    // Упавший элемент не получил попытку и был выполнен ровно один раз.
     for item in &batch.items {
-        assert_eq!(item.attempts.len(), 1, "identity {}", item.identity.key);
+        assert_eq!(item.attempts.len(), 1, "элемент {}", item.identity.key);
     }
     assert_eq!(batch.item("一").unwrap().attempts.len(), 1);
     let snapshot = trace.snapshot();
@@ -2468,13 +2487,12 @@ async fn parallel_pitch_two_workers_recover_independently() {
         .filter(|event| event.event == "browser_session_recovered")
         .collect::<Vec<_>>();
     assert_eq!(recovered.len(), 2);
-    assert_eq!(
-        recovered
-            .iter()
-            .map(|event| event.worker)
-            .collect::<Vec<_>>(),
-        vec![Some(1), Some(2)]
-    );
+    let mut recovered_workers = recovered
+        .iter()
+        .map(|event| event.worker)
+        .collect::<Vec<_>>();
+    recovered_workers.sort_unstable();
+    assert_eq!(recovered_workers, vec![Some(1), Some(2)]);
     assert!(recovered.iter().all(|event| event.recovery == Some(1)));
     assert_eq!(
         progress
@@ -2491,7 +2509,7 @@ async fn parallel_pitch_two_workers_recover_independently() {
             .all(|event| event.event != "worker_recovery_exhausted")
     );
     for item in &batch.items {
-        assert_eq!(item.attempts.len(), 1, "identity {}", item.identity.key);
+        assert_eq!(item.attempts.len(), 1, "элемент {}", item.identity.key);
         assert_eq!(item.status(), PitchBatchItemStatus::VocabularyNotFound);
     }
     let snapshot = trace.snapshot();
@@ -2530,7 +2548,7 @@ async fn parallel_pitch_exhausted_worker_retires_and_healthy_peer_finishes_front
         ),
     ];
     // Первый исполнитель не может запустить браузер вообще: он обязан выйти из
-    // пула, не утащив за собой ни одну identity.
+    // пула, не утащив за собой ни один элемент.
     drivers[0].fail_launch_until = Some(super::PITCH_SESSION_RECOVERY_BUDGET as usize);
     let mut progress = CapturedPitchProgress::default();
     let (batch, _) = super::run_batch_with_drivers(
@@ -2570,9 +2588,9 @@ async fn parallel_pitch_exhausted_worker_retires_and_healthy_peer_finishes_front
             .count(),
         super::PITCH_SESSION_RECOVERY_BUDGET as usize
     );
-    // Все identity доведены до результата здоровым соседом.
+    // Все элементы доведены до результата здоровым соседом.
     for item in &batch.items {
-        assert_eq!(item.attempts.len(), 1, "identity {}", item.identity.key);
+        assert_eq!(item.attempts.len(), 1, "элемент {}", item.identity.key);
         assert_eq!(item.status(), PitchBatchItemStatus::VocabularyNotFound);
     }
     let snapshot = trace.snapshot();
@@ -3036,7 +3054,7 @@ impl super::PitchRunDriver for LifecyclePitchDriver {
         item.record_runtime_snapshot(&crate::browser_runtime::RuntimeSnapshot::default());
     }
 
-    async fn launch(&mut self) -> Result<Self::Session, String> {
+    async fn launch(&mut self) -> Result<Self::Session, super::BrowserLaunchError> {
         self.trace.lock().unwrap().opened.push(self.worker);
         Ok(LifecyclePitchSession {
             worker: self.worker,
@@ -3055,7 +3073,7 @@ impl super::PitchRunDriver for LifecyclePitchDriver {
             .remove(&request.query.surface)
             .unwrap_or_else(|| {
                 panic!(
-                    "исполнитель {} получил неожиданную identity {}",
+                    "исполнитель {} получил неожиданную идентичность {}",
                     self.worker, request.query.surface
                 )
             });
@@ -3392,6 +3410,100 @@ async fn parallel_pitch_finish_error_preserves_checkpoint_and_resume() {
 }
 
 #[tokio::test]
+async fn pitch_launch_cleanup_failures_stop_without_recovery_or_batch_mutation() {
+    for stage in ["profile_create", "browser_launch", "browser_setup"] {
+        let workspace = temp_root();
+        let store = store_at(workspace.path());
+        offline_pitch_batch(&store, "launch-cleanup-failure", &["一", "二"]);
+        let before = load_batch(&store, "launch-cleanup-failure").unwrap();
+        let mut driver = ScriptedPitchDriver::new(
+            &store,
+            "launch-cleanup-failure",
+            vec![ScriptedPitchAction::Complete, ScriptedPitchAction::Complete],
+        );
+        driver.launch_error = Some(if stage == "profile_create" {
+            super::BrowserLaunchError::workspace_creation(
+                std::io::Error::other(crate::temp_workspace::WorkspaceCreationCleanupFailure {
+                    original: std::io::Error::other(
+                        "искусственный сбой создания временного дерева",
+                    ),
+                    cleanup: std::io::Error::other("принадлежащие ресурсы не удалось удалить"),
+                }),
+                "worker_workspace_create_failed",
+            )
+        } else {
+            super::BrowserLaunchError::CleanupFailed {
+                original: format!("{stage}: искусственный сбой запуска"),
+                cleanup: "принадлежащие ресурсы не удалось удалить".into(),
+            }
+        });
+        let mut progress = CapturedPitchProgress::default();
+        let error = super::run_batch_with_driver(
+            &store,
+            "launch-cleanup-failure",
+            "batch_run",
+            &mut driver,
+            &mut progress,
+            offline_pitch_policy(8),
+            no_pitch_interruption(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.details["run_stop_reason"], "browser_cleanup_failed",
+            "{stage}"
+        );
+        assert_eq!(
+            load_batch(&store, "launch-cleanup-failure").unwrap(),
+            before,
+            "{stage}"
+        );
+        assert_eq!(driver.launches, 1, "{stage}");
+        assert!(driver.seen.is_empty(), "{stage}");
+        assert!(driver.closed.is_empty(), "сессия не была создана: {stage}");
+        assert_eq!(
+            driver.actions.len(),
+            2,
+            "после отказа новые задания не выполняются: {stage}"
+        );
+        assert!(progress.events.iter().all(|event|
+            event.event != "browser_session_recovered" && event.recovery.is_none()
+        ), "ошибка очистки не должна расходовать бюджет восстановления: {stage}");
+    }
+}
+
+#[tokio::test]
+async fn pitch_launch_panic_with_proven_cleanup_remains_fail_closed() {
+    let workspace = temp_root();
+    let store = store_at(workspace.path());
+    offline_pitch_batch(&store, "launch-panic", &["一", "二"]);
+    let before = load_batch(&store, "launch-panic").unwrap();
+    let mut driver =
+        ScriptedPitchDriver::new(&store, "launch-panic", vec![ScriptedPitchAction::Complete]);
+    driver.launch_error = Some(super::BrowserLaunchError::Panic(
+        "browser_setup_panicked: искусственная паника".into(),
+    ));
+    let mut progress = CapturedPitchProgress::default();
+    let error = super::run_batch_with_driver(
+        &store,
+        "launch-panic",
+        "batch_run",
+        &mut driver,
+        &mut progress,
+        offline_pitch_policy(8),
+        no_pitch_interruption(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.details["run_stop_reason"], "worker_panic");
+    assert_eq!(driver.launches, 1);
+    assert!(driver.seen.is_empty());
+    assert_eq!(load_batch(&store, "launch-panic").unwrap(), before);
+    assert!(progress.events.iter().all(|event| event.recovery.is_none()));
+}
+
+#[tokio::test]
 async fn pitch_launch_failure_recovers_locally_and_completes_frontier() {
     let workspace = temp_root();
     let root = workspace.path();
@@ -3481,7 +3593,7 @@ async fn pitch_recovery_budget_exhaustion_retires_worker_and_leaves_frontier_pen
     );
     assert!(driver.seen.is_empty());
     assert!(driver.closed.is_empty());
-    // Ни одна identity не получила попытку: отказ сессии не синтезирует результат.
+    // Ни один элемент не получил попытку: отказ сессии не синтезирует результат.
     assert_eq!(load_batch(&store, "launch-exhausted").unwrap(), before);
     let exhausted = progress
         .events
@@ -3540,7 +3652,7 @@ async fn pitch_session_failure_without_outcome_requeues_without_attempt() {
     .await
     .unwrap();
 
-    // Отказ сессии без результата не создаёт попытку, а назначенная identity
+    // Отказ сессии без результата не создаёт попытку, а назначенный элемент
     // возвращается в очередь и выполняется ровно один раз после восстановления.
     let requeued = progress
         .events
@@ -3551,12 +3663,27 @@ async fn pitch_session_failure_without_outcome_requeues_without_attempt() {
     assert_eq!(requeued[0].identity.as_ref().unwrap().key, "一");
     assert_eq!(requeued[0].reason.as_deref(), Some("session_failure"));
     assert_eq!(requeued[0].recovery, Some(1));
+    let ended = progress
+        .events
+        .iter()
+        .filter(|event| {
+            event.event == "browser_session_ended"
+                && event.reason.as_deref() == Some("session_failure")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ended.len(), 1);
+    assert!(ended[0].session.is_some());
+    assert_eq!(ended[0].session, requeued[0].session);
+    assert_eq!(ended[0].worker, requeued[0].worker);
+    assert_eq!(ended[0].worker_session, requeued[0].worker_session);
+    assert_eq!(ended[0].identity, requeued[0].identity);
+    assert_eq!(ended[0].recovery, requeued[0].recovery);
     assert_eq!(driver.seen.len(), 4);
     assert_eq!(driver.seen[0], (1, "一".into()));
     assert_eq!(driver.seen[1], (2, "二".into()));
     assert_eq!(driver.seen[3], (2, "一".into()));
     for item in &batch.items {
-        assert_eq!(item.attempts.len(), 1, "identity {}", item.identity.key);
+        assert_eq!(item.attempts.len(), 1, "элемент {}", item.identity.key);
     }
     assert!(
         progress
@@ -3605,7 +3732,7 @@ async fn pitch_session_failure_after_real_outcome_checkpoints_once_then_rotates_
     assert_eq!(driver.closed, vec![1, 2]);
     assert_eq!(batch.item("一").unwrap().attempts.len(), 1);
     for item in &batch.items {
-        assert_eq!(item.attempts.len(), 1, "identity {}", item.identity.key);
+        assert_eq!(item.attempts.len(), 1, "элемент {}", item.identity.key);
     }
     assert_eq!(
         progress
@@ -3684,7 +3811,7 @@ async fn pitch_recovery_budget_resets_after_healthy_progress() {
         vec![Some(2), Some(1)]
     );
     for item in &batch.items {
-        assert_eq!(item.attempts.len(), 1, "identity {}", item.identity.key);
+        assert_eq!(item.attempts.len(), 1, "элемент {}", item.identity.key);
     }
     assert!(
         progress
@@ -3719,7 +3846,7 @@ async fn pitch_invalid_provider_report_stops_run_without_attempts() {
     .await
     .unwrap_err();
 
-    // Нарушение protocol invariant провайдера остаётся fail-closed и не
+    // Нарушение инварианта протокола провайдера остаётся fail-closed и не
     // понижается до локального восстановления сессии.
     assert_eq!(error.details["run_stop_reason"], "invalid_provider_report");
     assert_eq!(load_batch(&store, "invalid-report").unwrap(), before);
@@ -3802,7 +3929,7 @@ async fn pitch_checkpoint_failure_is_not_hidden_by_local_session_recovery() {
     .await
     .unwrap_err();
 
-    // Граница durable checkpoint остаётся fail-closed: локальное восстановление
+    // Граница надёжно сохранённой контрольной точки остаётся fail-closed: локальное восстановление
     // сессии не имеет права скрыть сбой хранилища.
     assert_ne!(
         error
@@ -3861,7 +3988,7 @@ async fn pitch_stale_token_outcome_is_discarded_and_recovery_adds_no_duplicate()
     .await
     .unwrap();
 
-    // Устаревший token отвергается CAS, и отказ сессии в том же отчёте не
+    // Устаревший токен отвергается CAS, и отказ сессии в том же отчёте не
     // превращает отвергнутый результат во вторую контрольную точку.
     assert!(
         progress
@@ -3949,7 +4076,7 @@ async fn parallel_pitch_interruption_during_recovery_stops_dispatch_and_leaves_r
         pitch_signal(interrupt_rx),
     ));
     // Прерывание приходит ровно в момент, когда один исполнитель уже закрыл
-    // испорченную сессию, а второй держит назначенную identity.
+    // испорченную сессию, а второй держит назначенный элемент.
     wait_for_worker_signal(&mut run, &mut start_a_rx).await;
     wait_for_worker_signal(&mut run, &mut session_end_rx).await;
     interrupt_tx.send(()).unwrap();
@@ -3965,12 +4092,12 @@ async fn parallel_pitch_interruption_during_recovery_stops_dispatch_and_leaves_r
     );
     assert_parallel_workspaces_removed(&trace, 2);
 
-    // Незавершённые identity остаются доступными для `batch resume`.
+    // Незавершённые элементы остаются доступными для `batch resume`.
     let batch = load_batch(&store, "parallel-recovery-interrupted").unwrap();
     for item in &batch.items {
         assert!(
             item.attempts.is_empty(),
-            "identity {} не должна получить попытку",
+            "элемент {} не должен получить попытку",
             item.identity.key
         );
         assert_eq!(item.status(), PitchBatchItemStatus::Pending);
@@ -4047,8 +4174,8 @@ async fn pitch_configuration_and_telemetry_failures_do_not_fabricate_tail_attemp
                 error.details["run_stop_reason"],
                 "session_recovery_exhausted"
             );
-            // Ни одна identity не получила попытку: отказ сессии без результата не
-            // синтезирует terminal failure.
+            // Ни один элемент не получил попытку: отказ сессии без результата не
+            // синтезирует терминальный сбой.
             assert_untouched_pitch_tail(&batch, 0);
             assert_eq!(progress.events.last().unwrap().run_completed, 0);
             assert_eq!(
@@ -4071,9 +4198,9 @@ async fn pitch_configuration_and_telemetry_failures_do_not_fabricate_tail_attemp
         } else {
             outcome.unwrap();
             // Настоящий результат до отказа сессии сохраняется ровно один раз для
-            // каждой identity, и ни одна попытка не выдумана.
+            // каждого элемента, и ни одна попытка не выдумана.
             for item in &batch.items {
-                assert_eq!(item.attempts.len(), 1, "identity {}", item.identity.key);
+                assert_eq!(item.attempts.len(), 1, "элемент {}", item.identity.key);
             }
             assert!(
                 progress
@@ -4431,7 +4558,7 @@ async fn pitch_rotation_launch_failure_recovers_without_counting_planned_rotatio
 
     assert_eq!(driver.launches, 4);
     assert_eq!(driver.closed, vec![1, 3, 4]);
-    // Возвращённая заданием identity встаёт в конец очереди и выполняется последней.
+    // Возвращённый элемент встаёт в конец очереди и выполняется последним.
     assert_eq!(
         driver.seen,
         vec![(1, "一".into()), (3, "三".into()), (4, "二".into())]
@@ -4918,7 +5045,118 @@ async fn json_batch_response_exposes_flushed_log_on_success_and_failure() {
 }
 
 #[tokio::test]
-async fn session_failure_log_records_real_prefix_and_leaves_tail_unstarted() {
+async fn pitch_failure_diagnostics_log_each_accepted_failure_once() {
+    let cases = [
+        (ScriptedPitchAction::Complete, false, 0, 0, 0),
+        (
+            ScriptedPitchAction::SessionFailure {
+                after_outcome: false,
+            },
+            false,
+            1,
+            0,
+            0,
+        ),
+        (ScriptedPitchAction::Complete, true, 0, 1, 0),
+        (
+            ScriptedPitchAction::SessionFailure {
+                after_outcome: true,
+            },
+            false,
+            1,
+            0,
+            0,
+        ),
+        (ScriptedPitchAction::ItemFailure, false, 0, 0, 1),
+        (
+            ScriptedPitchAction::ItemFailureWithSessionFailure,
+            false,
+            1,
+            0,
+            1,
+        ),
+    ];
+    for (action, launch_failure, session_failures, setup_failures, item_failures) in cases {
+        let workspace = temp_root();
+        let store = store_at(workspace.path());
+        let batch_id = "diagnostic-failure-count";
+        offline_pitch_batch(&store, batch_id, &["雨"]);
+        let requeued = matches!(
+            action,
+            ScriptedPitchAction::SessionFailure {
+                after_outcome: false
+            }
+        );
+        let mut actions = vec![action];
+        if requeued {
+            actions.push(ScriptedPitchAction::Complete);
+        }
+        let mut driver = ScriptedPitchDriver::new(&store, batch_id, actions);
+        driver.fail_launch_on = launch_failure.then_some(1);
+        let mut progress = CapturedPitchProgress::default();
+        let path = workspace.path().join("diagnostics.jsonl");
+        let log = crate::diagnostics::RunLogGuard::new(
+            fs::File::create(&path).unwrap(),
+            crate::diagnostics::OutputMode::Json,
+        );
+        super::run_batch_with_driver(
+            &store,
+            batch_id,
+            "batch_run",
+            &mut driver,
+            &mut progress,
+            offline_pitch_policy(8),
+            no_pitch_interruption(),
+        )
+        .with_subscriber(log.dispatch())
+        .await
+        .unwrap();
+        log.finish().unwrap();
+
+        let events = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let failures = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "pitch_failure")
+            .map(|event| &event["fields"])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            session_failures + setup_failures + item_failures
+        );
+        for (code, expected, session_failure) in [
+            ("session_failure", session_failures, true),
+            ("browser_setup", setup_failures, true),
+            ("timeout", item_failures, false),
+        ] {
+            let matching = failures
+                .iter()
+                .filter(|fields| fields["code"] == code)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), expected, "код {code}");
+            for fields in matching {
+                assert_eq!(fields["session_failure"], session_failure);
+                assert_eq!(fields["identity"], "雨");
+                assert_eq!(fields["worker"], 1);
+                assert_eq!(fields["worker_session"], 1);
+                assert_eq!(fields["session"], 1);
+                assert_eq!(fields["attempt"], 1);
+            }
+        }
+        assert_eq!(
+            load_batch(&store, batch_id).unwrap().items[0]
+                .attempts
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_failure_log_records_checkpointed_prefix_before_recovery_exhaustion() {
     let workspace = temp_root();
     let root = workspace.path();
     let store = store_at(root);
@@ -4932,8 +5170,8 @@ async fn session_failure_log_records_real_prefix_and_leaves_tail_unstarted() {
     let log_path = run_log.path.display().to_string();
     let guard =
         crate::diagnostics::RunLogGuard::new(run_log.file, crate::diagnostics::OutputMode::Json);
-    // Настоящий результат для «一», затем серия отказов сессии на «二»: бюджет
-    // восстановления исчерпан, «三» так и не начат.
+    // Настоящий результат для «一», затем серия отказов сессии на «二»:
+    // бюджет восстановления исчерпан без фиктивных попыток для хвоста.
     let mut actions = vec![ScriptedPitchAction::Complete];
     for _ in 0..super::PITCH_SESSION_RECOVERY_BUDGET {
         actions.push(ScriptedPitchAction::SessionFailure {
@@ -5009,10 +5247,20 @@ async fn session_failure_log_records_real_prefix_and_leaves_tail_unstarted() {
         .map(serde_json::from_str::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let failure = events
+    let failures = events
         .iter()
-        .find(|event| event["fields"]["event"] == "pitch_failure")
-        .unwrap();
+        .filter(|event| event["fields"]["event"] == "pitch_failure")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failures.len(),
+        super::PITCH_SESSION_RECOVERY_BUDGET as usize
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|event| event["fields"]["code"] == "session_failure")
+    );
+    let failure = failures[0];
     assert_eq!(failure["fields"]["code"], "session_failure");
     assert_eq!(failure["fields"]["identity"], "二");
     assert_eq!(failure["fields"]["worker"], 1);
@@ -5033,14 +5281,20 @@ async fn session_failure_log_records_real_prefix_and_leaves_tail_unstarted() {
                 .iter()
                 .any(|span| span["name"] == "pitch_batch_run" && span["run_id"] == run_id)
     }));
-    // Успешная identity не оставляет в журнале ни одного отказа.
-    assert!(!events.iter().any(|event| {
-        event["fields"]["event"] == "pitch_failure" && event["fields"]["identity"] == "一"
-    }));
+    // Успешный элемент не оставляет в журнале ни одного отказа.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event["fields"]["event"] == "pitch_failure" && event["fields"]["identity"] == "一"
+            })
+            .count(),
+        0
+    );
 }
 
-/// Сбой подготовки страницы не превращается в обычный перезапуск: первая же
-/// неудачная сессия описывается в диагностике, а identity остаётся без попытки.
+/// Каждая неудачная подготовка страницы описывается в диагностике; после
+/// исчерпания бюджета восстановления элемент остаётся без попытки.
 #[tokio::test]
 async fn pitch_setup_failure_records_diagnostics_without_fabricating_attempt() {
     let workspace = temp_root();
@@ -5391,7 +5645,7 @@ fn pitch_candidate_validation_and_durable_failure_complete_the_original_item_tim
 }
 
 /// Машинный результат пакетного повтора обязан точно перечислять выбранные
-/// identity и оставаться идемпотентным при повторном запуске.
+/// элементы и оставаться идемпотентным при повторном запуске.
 #[tokio::test]
 async fn batch_retry_technical_reports_exact_selection_and_is_idempotent() {
     let workspace = temp_root();
@@ -5466,7 +5720,7 @@ async fn batch_retry_technical_reports_exact_selection_and_is_idempotent() {
         ))
     };
 
-    // Адресный повтор по-прежнему перечисляет ровно одну identity.
+    // Адресный повтор по-прежнему перечисляет ровно один элемент.
     let single = retry_one("六", "Адресный повтор временного сбоя").await;
     assert_eq!(single.exit_code, 0, "{}", single.stdout);
     let response: serde_json::Value = serde_json::from_str(&single.stdout).unwrap();
@@ -5500,4 +5754,135 @@ async fn batch_retry_technical_reports_exact_selection_and_is_idempotent() {
     assert_ne!(blocked.exit_code, 0);
     let response: serde_json::Value = serde_json::from_str(&blocked.stdout).unwrap();
     assert_eq!(response["error"]["code"], "invalid_transition");
+}
+
+#[tokio::test]
+async fn batch_retry_technical_uses_a_russian_human_operation_name() {
+    let workspace = temp_root();
+    let root = workspace.path();
+    let store = store_at(root);
+    offline_pitch_batch(&store, "human-retry-technical", &["幽霊"]);
+    {
+        let mut runtime =
+            PitchAccentBatchRuntime::open(store.root(), "human-retry-technical").unwrap();
+        let mut batch = runtime.load().unwrap().unwrap();
+        let token = batch.item_token("幽霊").unwrap();
+        assert!(
+            runtime
+                .record_outcome(
+                    &mut batch,
+                    &token,
+                    JpdbPitchOutcome::Failed {
+                        error: JpdbPitchFailure::Timeout {
+                            stage: JpdbPitchStage::DetailReadiness,
+                            diagnostic: Some("Истёк лимит запроса".into()),
+                        },
+                    },
+                )
+                .unwrap()
+        );
+    }
+
+    let output = execute(cli(
+        store.root().to_path_buf(),
+        root.to_path_buf(),
+        OutputFormat::Human,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::RetryTechnical {
+                batch_id: "human-retry-technical".into(),
+                reason: "Повтор технического сбоя".into(),
+            },
+        },
+    ))
+    .await;
+
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert!(
+        output
+            .stdout
+            .contains("Операция: пакетный повтор технических сбоев")
+    );
+    assert!(!output.stdout.contains("batch_retry_technical"));
+}
+
+#[tokio::test]
+async fn batch_retry_technical_empty_selection_reports_owner_reconciliation_change() {
+    let workspace = temp_root();
+    let root = workspace.path();
+    let store = store_at(root);
+    let store_root = store.root().to_path_buf();
+    offline_pitch_batch(&store, "retry-technical-owner-change", &["幽霊"]);
+    let previous = {
+        let mut runtime =
+            PitchAccentBatchRuntime::open(&store_root, "retry-technical-owner-change").unwrap();
+        let batch = runtime.load().unwrap().unwrap();
+        batch.item("幽霊").unwrap().clone()
+    };
+    assert_eq!(previous.status(), PitchBatchItemStatus::Pending);
+    drop(store);
+    let owner_store = AssetStore::open_existing_with_policy(
+        StoreOptions::new(&store_root),
+        PitchAccentDomainPolicy,
+    )
+    .unwrap();
+    owner_store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+                bytes: png(),
+                provenance: Provenance {
+                    source_kind: "jpdb_browser_capture".into(),
+                    source_name: "jpdb-vocabulary-123.png".into(),
+                },
+                domain_metadata: Some(
+                    serde_json::to_value(metadata("幽霊", "ゆうれい", 123)).unwrap(),
+                ),
+                replace_expected_sha256: None,
+            },
+            &PitchAccentImageValidator,
+        )
+        .unwrap();
+    drop(owner_store);
+
+    let output = execute(cli(
+        store_root.to_path_buf(),
+        root.to_path_buf(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::RetryTechnical {
+                batch_id: "retry-technical-owner-change".into(),
+                reason: "Повтор после сверки владельца".into(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(response["changed"], true);
+    assert!(response.get("retried_identities").is_none());
+    assert_eq!(response["items"][0]["status"], "existing_verified");
+    let after = &response["batch"]["items"][0];
+    assert_eq!(after["generation"], previous.generation);
+    assert_eq!(
+        after["attempts"].as_array().unwrap().len(),
+        previous.attempts.len()
+    );
+
+    let repeated = execute(cli(
+        store_root,
+        root.to_path_buf(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::RetryTechnical {
+                batch_id: "retry-technical-owner-change".into(),
+                reason: "Повтор без выбранных элементов".into(),
+            },
+        },
+    ))
+    .await;
+    assert_eq!(repeated.exit_code, 0, "{}", repeated.stderr);
+    let response: serde_json::Value = serde_json::from_str(&repeated.stdout).unwrap();
+    assert_eq!(response["changed"], false);
+    assert!(response.get("retried_identities").is_none());
 }

@@ -1348,7 +1348,8 @@ async fn acquire_one_session(
     // чтобы отмена не опередила явное завершение процесса и уборку профиля.
     let session = match BrowserSession::launch_in_workspace(runtime_config, workspace).await {
         Ok(session) => session,
-        Err(message) => {
+        Err(error) => {
+            let message = error.to_string();
             tracing::error!(session = session_number, stage = "browser_launch", code = "browser_session_launch_failed", message = %crate::diagnostics::safe_message(&message), elapsed_ms = session_started_at.elapsed().as_millis() as u64, "Не удалось запустить браузер");
             return finish_session_setup(
                 Err(AcquisitionStreamError::Provider(message)),
