@@ -1625,12 +1625,12 @@ fn update_batch(
         let before = batch.clone();
         let owner = owner_snapshot(store)?;
         batch.reconcile_owner(&owner)?;
-        let reconciliation_changed = batch != before;
+        let reconciled_batch = (batch != before).then(|| batch.clone());
         let update = match update(&mut batch) {
             Ok(update) => update,
             Err(error) => {
-                if reconciliation_changed {
-                    runtime.save(&batch)?;
+                if let Some(reconciled_batch) = &reconciled_batch {
+                    runtime.save(reconciled_batch)?;
                 }
                 return Err(error);
             }

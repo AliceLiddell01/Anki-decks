@@ -5807,6 +5807,102 @@ async fn batch_retry_technical_uses_a_russian_human_operation_name() {
 }
 
 #[tokio::test]
+async fn batch_retry_error_persists_only_owner_reconciliation() {
+    let workspace = temp_root();
+    let root = workspace.path();
+    let store = store_at(root);
+    let store_root = store.root().to_path_buf();
+    let batch_id = "retry-update-reconcile-error";
+    offline_pitch_batch(&store, batch_id, &["幽霊"]);
+    {
+        let mut runtime = PitchAccentBatchRuntime::open(&store_root, batch_id).unwrap();
+        let mut batch = runtime.load().unwrap().unwrap();
+        let token = batch.item_token("幽霊").unwrap();
+        assert!(
+            runtime
+                .record_outcome(
+                    &mut batch,
+                    &token,
+                    JpdbPitchOutcome::Failed {
+                        error: JpdbPitchFailure::Timeout {
+                            stage: JpdbPitchStage::DetailReadiness,
+                            diagnostic: Some("Истёк лимит запроса".into()),
+                        },
+                    },
+                )
+                .unwrap()
+        );
+        batch
+            .items
+            .iter_mut()
+            .find(|item| item.identity.key == "幽霊")
+            .unwrap()
+            .item_revision = u64::MAX - 1;
+        runtime.save(&batch).unwrap();
+    }
+
+    store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+                bytes: png(),
+                provenance: Provenance {
+                    source_kind: "jpdb_browser_capture".into(),
+                    source_name: "jpdb-vocabulary-123.png".into(),
+                },
+                domain_metadata: Some(
+                    serde_json::to_value(metadata("幽霊", "ゆうれい", 123)).unwrap(),
+                ),
+                replace_expected_sha256: None,
+            },
+            &PitchAccentImageValidator,
+        )
+        .unwrap();
+
+    let expected = {
+        let owner =
+            PitchBatchOwnerSnapshot::from_records(store.verify_integrity().unwrap()).unwrap();
+        let mut runtime = PitchAccentBatchRuntime::open(&store_root, batch_id).unwrap();
+        let mut batch = runtime.load().unwrap().unwrap();
+        batch.reconcile_owner(&owner).unwrap();
+        batch
+    };
+    let expected_item = expected.item("幽霊").unwrap();
+    assert_eq!(expected_item.item_revision, u64::MAX);
+    assert_eq!(
+        expected_item.status(),
+        PitchBatchItemStatus::ExistingVerified
+    );
+
+    let output = execute(cli(
+        store_root.clone(),
+        root.to_path_buf(),
+        OutputFormat::Json,
+        PitchCommand::Batch {
+            command: PitchBatchCommand::Retry {
+                batch_id: batch_id.into(),
+                surface: "幽霊".into(),
+                reason: "Повтор после сверки владельца".into(),
+            },
+        },
+    ))
+    .await;
+    assert_ne!(
+        output.exit_code, 0,
+        "повтор должен отказать при переполнении"
+    );
+    let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "invalid_transition");
+
+    let mut runtime = PitchAccentBatchRuntime::open(&store_root, batch_id).unwrap();
+    let actual = runtime.load().unwrap().unwrap();
+    assert_eq!(
+        actual, expected,
+        "ошибка повтора должна сохранить только сверку владельца, без частичной мутации"
+    );
+}
+
+#[tokio::test]
 async fn batch_retry_technical_empty_selection_reports_owner_reconciliation_change() {
     let workspace = temp_root();
     let root = workspace.path();
