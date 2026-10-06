@@ -119,7 +119,8 @@ fn one_acquisition_attempt() -> u8 {
     1
 }
 
-/// Принятое по явному флагу TLS-исключение для точного имени узла.
+/// След использования TLS-исключения, допускаемого политикой только для точного
+/// имени узла Yarxi.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsExceptionProvenance {
@@ -611,8 +612,9 @@ fn choose_font_sample(
         })
 }
 
-/// Выполняет изолированный пакет браузера. Страницу-предупреждение TLS можно
-/// пропустить только с явным флагом и только для точного имени узла Yarxi.
+/// Выполняет изолированный пакет браузера. Параметр `allow_insecure_tls` разрешает
+/// пройти страницу-предупреждение только для точного имени узла Yarxi; CLI включает
+/// это разрешение по умолчанию.
 pub fn acquire_many(
     characters: &[String],
     allow_insecure_tls: bool,
@@ -4196,10 +4198,10 @@ mod tests {
         let mut run = AcquisitionRun::new().unwrap();
         run.test_session_attempts = Some(VecDeque::from([
             ScriptedSessionAttempt::SetupFailure(format!(
-                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} ожидающий запрос типа Image"
             )),
             ScriptedSessionAttempt::SetupFailure(format!(
-                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} ожидающий запрос типа Image"
             )),
             ScriptedSessionAttempt::Processed {
                 count: 1,
@@ -4270,7 +4272,7 @@ mod tests {
         let mut cleanup_failure = AcquisitionRun::new().unwrap();
         cleanup_failure.test_session_attempts = Some(VecDeque::from([
             ScriptedSessionAttempt::SetupFailure(
-                "browser_session_setup_cleanup_failed: cleanup failure".into(),
+                "browser_session_setup_cleanup_failed: ошибка очистки сессии".into(),
             ),
             ScriptedSessionAttempt::Processed {
                 count: 1,
@@ -4301,13 +4303,13 @@ mod tests {
         let mut exhausted = AcquisitionRun::new().unwrap();
         exhausted.test_session_attempts = Some(VecDeque::from([
             ScriptedSessionAttempt::SetupFailure(format!(
-                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} ожидающий запрос типа Image"
             )),
             ScriptedSessionAttempt::SetupFailure(format!(
-                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} ожидающий запрос типа Image"
             )),
             ScriptedSessionAttempt::SetupFailure(format!(
-                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} ожидающий запрос типа Image"
             )),
         ]));
         let mut exhausted_events = Vec::new();
