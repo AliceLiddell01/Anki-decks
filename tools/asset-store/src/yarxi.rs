@@ -1,6 +1,8 @@
 //! Провайдер браузера для динамических статей Yarxi и изображений слева от них.
 
 use std::collections::HashSet;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -470,7 +472,7 @@ async fn wait_for_session_setup_readiness(
             }
             SessionSetupRuntimeState::PendingOnly if Instant::now() >= deadline => {
                 return Err(format!(
-                    "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} истёк срок чистого startup runtime: {}",
+                    "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} истёк срок ожидания чистого состояния среды выполнения при запуске: {}",
                     runtime_failure_reason(readiness)
                 ));
             }
@@ -921,6 +923,8 @@ pub struct AcquisitionRun {
     workspace: PathBuf,
     owned_workspace: Option<TempWorkspace>,
     acceptance_rotate_after_items: Option<usize>,
+    #[cfg(test)]
+    test_session_attempts: Option<VecDeque<ScriptedSessionAttempt>>,
 }
 
 impl AcquisitionRun {
@@ -975,6 +979,8 @@ impl AcquisitionRun {
             workspace,
             owned_workspace,
             acceptance_rotate_after_items,
+            #[cfg(test)]
+            test_session_attempts: None,
         })
     }
 
@@ -1072,8 +1078,13 @@ impl AcquisitionRun {
                 AcquisitionStreamError::Provider(format!("invalid_kanji_identity: {error}"))
             })?;
         }
+        let runtime = &self.runtime;
+        let workspace = self.workspace.as_path();
+        let acceptance_rotate_after_items = self.acceptance_rotate_after_items;
         let interrupt = &mut self.interrupt;
-        let result = self.runtime.block_on(async {
+        #[cfg(test)]
+        let test_session_attempts = &mut self.test_session_attempts;
+        let result = runtime.block_on(async {
             if interrupt.is_finished() {
                 return Err(signal_error((&mut *interrupt).await));
             }
@@ -1083,22 +1094,32 @@ impl AcquisitionRun {
             while offset < characters.len() {
                 let session_start = offset;
                 sessions = sessions.saturating_add(1);
-                let session_result = match acquire_one_session(
-                    SessionAcquisitionConfig {
-                        characters: &characters[offset..],
-                        base_index: offset,
-                        session_number: sessions,
-                        acceptance_rotate_after_items: self.acceptance_rotate_after_items,
-                        allow_insecure_tls,
-                        target,
-                        workspace: &self.workspace,
-                        generations,
-                    },
-                    &mut on_event,
-                    interrupt,
-                )
-                .await
-                {
+                let session_config = SessionAcquisitionConfig {
+                    characters: &characters[offset..],
+                    base_index: offset,
+                    session_number: sessions,
+                    acceptance_rotate_after_items,
+                    allow_insecure_tls,
+                    target,
+                    workspace,
+                    generations,
+                };
+                #[cfg(test)]
+                let session_result = match test_session_attempts.as_mut() {
+                    Some(attempts) => run_scripted_session_attempt(
+                        attempts,
+                        &session_config,
+                        &mut on_event,
+                    ),
+                    None => {
+                        acquire_one_session(session_config, &mut on_event, interrupt).await
+                    }
+                };
+                #[cfg(not(test))]
+                let session_result =
+                    acquire_one_session(session_config, &mut on_event, interrupt).await;
+
+                let session_result = match session_result {
                     Ok(summary) => {
                         setup_recreations = 0;
                         summary
@@ -1185,6 +1206,54 @@ struct SessionAcquisitionConfig<'a> {
     target: AcquisitionTarget,
     workspace: &'a Path,
     generations: Option<&'a [u32]>,
+}
+
+#[cfg(test)]
+enum ScriptedSessionAttempt {
+    SetupFailure(String),
+    Processed {
+        count: usize,
+        stop_reason: Option<SessionStopReason>,
+    },
+}
+
+#[cfg(test)]
+fn run_scripted_session_attempt(
+    attempts: &mut VecDeque<ScriptedSessionAttempt>,
+    config: &SessionAcquisitionConfig<'_>,
+    on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
+) -> Result<SessionAcquisitionSummary, AcquisitionStreamError> {
+    match attempts
+        .pop_front()
+        .ok_or_else(|| AcquisitionStreamError::Provider("test_session_attempts_exhausted".into()))?
+    {
+        ScriptedSessionAttempt::SetupFailure(message) => {
+            Err(AcquisitionStreamError::Provider(message))
+        }
+        ScriptedSessionAttempt::Processed { count, stop_reason } => {
+            if count > config.characters.len() {
+                return Err(AcquisitionStreamError::Provider(
+                    "test_session_processed_count_exceeds_frontier".into(),
+                ));
+            }
+            on_event(AcquisitionEvent::SessionStarted {
+                session: config.session_number,
+            })?;
+            for offset in 0..count {
+                let index = config.base_index + offset;
+                on_event(AcquisitionEvent::ItemStarted { index })?;
+                on_event(AcquisitionEvent::ItemCompleted {
+                    index,
+                    outcome: Box::new(Err("gif_unknown: тестовый исход".into())),
+                    diagnostics: None,
+                })?;
+            }
+            Ok(SessionAcquisitionSummary {
+                processed: count,
+                stop_reason,
+            })
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4119,6 +4188,141 @@ mod tests {
         assert_eq!(next_session_setup_recreation(0), Some(1));
         assert_eq!(next_session_setup_recreation(1), Some(2));
         assert_eq!(next_session_setup_recreation(2), None);
+    }
+
+    #[test]
+    fn setup_failures_keep_frontier_until_recreated_session_processes_it() {
+        let characters = vec!["漢".into(), "字".into(), "語".into()];
+        let mut run = AcquisitionRun::new().unwrap();
+        run.test_session_attempts = Some(VecDeque::from([
+            ScriptedSessionAttempt::SetupFailure(format!(
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+            )),
+            ScriptedSessionAttempt::SetupFailure(format!(
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+            )),
+            ScriptedSessionAttempt::Processed {
+                count: 1,
+                stop_reason: Some(SessionStopReason::Deadline),
+            },
+            ScriptedSessionAttempt::Processed {
+                count: 2,
+                stop_reason: None,
+            },
+        ]));
+        let mut started_sessions = Vec::new();
+        let mut ended_sessions = Vec::new();
+        let mut rotated_to = Vec::new();
+        let mut started_items = Vec::new();
+        let mut checkpointed_items = Vec::new();
+
+        let summary = run
+            .acquire(&characters, false, |event| {
+                match event {
+                    AcquisitionEvent::SessionStarted { session } => {
+                        started_sessions.push(session);
+                    }
+                    AcquisitionEvent::SessionEnded {
+                        session,
+                        processed,
+                        stop_reason,
+                    } => ended_sessions.push((session, processed, stop_reason)),
+                    AcquisitionEvent::SessionRotated { next_session, .. } => {
+                        rotated_to.push(next_session);
+                    }
+                    AcquisitionEvent::ItemStarted { index } => started_items.push(index),
+                    AcquisitionEvent::ItemCompleted { index, outcome, .. } => {
+                        assert!(matches!(outcome.as_ref(), Err(message) if message.starts_with("gif_unknown:")));
+                        checkpointed_items.push(index);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            summary,
+            AcquisitionSummary {
+                processed: 3,
+                sessions: 4
+            }
+        );
+        assert_eq!(started_sessions, [3, 4]);
+        assert_eq!(ended_sessions.len(), 2);
+        assert_eq!(ended_sessions[0].0, 3);
+        assert_eq!(ended_sessions[0].1, 1);
+        assert_eq!(ended_sessions[0].2, Some(SessionStopReason::Deadline));
+        assert_eq!(ended_sessions[1].0, 4);
+        assert_eq!(ended_sessions[1].1, 2);
+        assert_eq!(ended_sessions[1].2, None);
+        assert_eq!(rotated_to, [4]);
+        assert_eq!(started_items, [0, 1, 2]);
+        assert_eq!(checkpointed_items, [0, 1, 2]);
+        assert!(run.test_session_attempts.as_ref().unwrap().is_empty());
+        run.close().unwrap();
+    }
+
+    #[test]
+    fn setup_cleanup_failure_is_not_retried_and_unhealthy_setup_exhaustion_keeps_tail_unstarted() {
+        let characters = vec!["漢".into()];
+
+        let mut cleanup_failure = AcquisitionRun::new().unwrap();
+        cleanup_failure.test_session_attempts = Some(VecDeque::from([
+            ScriptedSessionAttempt::SetupFailure(
+                "browser_session_setup_cleanup_failed: cleanup failure".into(),
+            ),
+            ScriptedSessionAttempt::Processed {
+                count: 1,
+                stop_reason: None,
+            },
+        ]));
+        let mut cleanup_events = Vec::new();
+        let cleanup_result = cleanup_failure.acquire(&characters, false, |event| {
+            cleanup_events.push(event);
+            Ok(())
+        });
+        assert!(matches!(
+            cleanup_result,
+            Err(AcquisitionStreamError::Provider(message))
+                if message.starts_with("browser_session_setup_cleanup_failed:")
+        ));
+        assert!(cleanup_events.is_empty());
+        assert_eq!(
+            cleanup_failure
+                .test_session_attempts
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+        cleanup_failure.close().unwrap();
+
+        let mut exhausted = AcquisitionRun::new().unwrap();
+        exhausted.test_session_attempts = Some(VecDeque::from([
+            ScriptedSessionAttempt::SetupFailure(format!(
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+            )),
+            ScriptedSessionAttempt::SetupFailure(format!(
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+            )),
+            ScriptedSessionAttempt::SetupFailure(format!(
+                "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} pending Image"
+            )),
+        ]));
+        let mut exhausted_events = Vec::new();
+        let exhausted_result = exhausted.acquire(&characters, false, |event| {
+            exhausted_events.push(event);
+            Ok(())
+        });
+        assert!(matches!(
+            exhausted_result,
+            Err(AcquisitionStreamError::Provider(message))
+                if message.starts_with("browser_session_setup_recovery_exhausted:")
+        ));
+        assert!(exhausted_events.is_empty());
+        assert!(exhausted.test_session_attempts.as_ref().unwrap().is_empty());
+        exhausted.close().unwrap();
     }
 
     #[tokio::test]
