@@ -631,6 +631,47 @@ impl PitchAccentBatch {
         self.validate()
     }
 
+    /// Переводит в новое поколение все текущие устранимые технические сбои пакета.
+    ///
+    /// Возвращает словоформы, у которых поколение действительно сменилось, в порядке
+    /// элементов пакета. Пустой список — допустимый результат: в пакете уже нет
+    /// устранимых технических сбоев, и это не ошибка.
+    ///
+    /// Пакет меняется целиком или не меняется вовсе: промежуточное состояние, в
+    /// котором часть сбоев уже переведена в новое поколение, не становится
+    /// наблюдаемым даже при отказе на одном из элементов.
+    pub fn retry_retryable_failures(&mut self, reason: String) -> Result<Vec<String>, AssetError> {
+        validate_reason(&reason)?;
+        let surfaces = self.retryable_failure_surfaces();
+        if surfaces.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut candidate = self.clone();
+        for surface in &surfaces {
+            candidate.retry(surface, reason.clone())?;
+        }
+        *self = candidate;
+        Ok(surfaces)
+    }
+
+    /// Перечисляет словоформы, текущий результат которых — устранимый технический сбой.
+    ///
+    /// Отбор совпадает с условиями точечного `retry`: технический сбой без конфликта
+    /// владельца и без незавершённого намерения публикации.
+    pub fn retryable_failure_surfaces(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter(|item| {
+                item.status() == PitchBatchItemStatus::TechnicalFailure
+                    && matches!(
+                        item.current_outcome(),
+                        Some(PitchBatchOutcome::Failed { error }) if is_retryable_failure(error)
+                    )
+            })
+            .map(|item| item.identity.key.clone())
+            .collect()
+    }
+
     /// Отмечает ровно один SHA кандидата как отклонённый владельцем.
     pub fn reject_candidate(
         &mut self,
