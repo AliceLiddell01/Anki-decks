@@ -997,16 +997,14 @@ fn execute_command_with_snapshots_and_progress(
             ))
         }
         BatchCommand::Run {
-            batch_id, rounds, ..
+            batch_id,
+            rounds,
+            #[cfg(feature = "session-rotation-acceptance")]
+            acceptance_rotate_after_items,
+            ..
         } => {
             #[cfg(feature = "session-rotation-acceptance")]
-            let acceptance_rotate_after_items = match command {
-                BatchCommand::Run {
-                    acceptance_rotate_after_items,
-                    ..
-                } => *acceptance_rotate_after_items,
-                _ => None,
-            };
+            let acceptance_rotate_after_items = *acceptance_rotate_after_items;
             let mut acquisition_run = None;
             let result = run_batch_with_stream_and_progress(
                 store,
