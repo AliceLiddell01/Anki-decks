@@ -100,7 +100,10 @@ impl TempWorkspace {
         Self::create_under(Path::new(TEMP_ROOT), purpose)
     }
 
-    fn create_under(temp_root: &Path, purpose: &str) -> io::Result<Self> {
+    /// Создаёт такое же приватное owned tree под выбранным временным root.
+    /// Root должен существовать и не быть symlink; API поддерживает изолированные
+    /// sandbox и не ослабляет marker, UID, mount или process проверки.
+    pub fn create_under(temp_root: &Path, purpose: &str) -> io::Result<Self> {
         if purpose.is_empty() || purpose.len() > 4096 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -257,29 +260,64 @@ pub struct GcEntry {
     pub outcome: String,
     pub reason: String,
     pub bytes: u64,
+    pub ownership: String,
+    pub live: Option<bool>,
 }
 
 /// Удаляет подтверждённые marker orphan runs доказанно мёртвых владельцев.
 /// Schema 1 дополнительно требует TTL; schema 2 использует точную process identity.
 /// Ошибки отдельных деревьев отражены в `errors` и `entries`, затем GC продолжается.
 pub fn cleanup_orphans(min_age: Duration) -> io::Result<GcReport> {
-    cleanup_under(Path::new(TEMP_ROOT), min_age)
+    cleanup_orphans_under(Path::new(TEMP_ROOT), min_age)
 }
 
+/// Строит dry-run для marker-owned workspace, не меняя файловую систему.
+/// Каждый кандидат повторно проверяется при последующем `cleanup_orphans`.
+pub fn plan_orphans(min_age: Duration) -> io::Result<GcReport> {
+    plan_orphans_under(Path::new(TEMP_ROOT), min_age)
+}
+
+/// Тот же marker/identity GC для явно выбранного temp root.
+/// Публичный root override нужен для sandbox и не ослабляет проверки ownership.
+pub fn cleanup_orphans_under(root: &Path, min_age: Duration) -> io::Result<GcReport> {
+    cleanup_under_mode(root, min_age, true)
+}
+
+/// Строит dry-run для явно выбранного temp root без изменения файловой системы.
+pub fn plan_orphans_under(root: &Path, min_age: Duration) -> io::Result<GcReport> {
+    cleanup_under_mode(root, min_age, false)
+}
+
+#[cfg(test)]
 fn cleanup_under(temp_root: &Path, min_age: Duration) -> io::Result<GcReport> {
-    cleanup_under_with_proc(temp_root, Path::new("/proc"), min_age)
+    cleanup_under_mode(temp_root, min_age, true)
 }
 
+fn cleanup_under_mode(temp_root: &Path, min_age: Duration, apply: bool) -> io::Result<GcReport> {
+    cleanup_under_with_proc_mode(temp_root, Path::new("/proc"), min_age, apply)
+}
+
+#[cfg(test)]
 fn cleanup_under_with_proc(
     temp_root: &Path,
     proc_root: &Path,
     min_age: Duration,
+) -> io::Result<GcReport> {
+    cleanup_under_with_proc_mode(temp_root, proc_root, min_age, true)
+}
+
+fn cleanup_under_with_proc_mode(
+    temp_root: &Path,
+    proc_root: &Path,
+    min_age: Duration,
+    apply: bool,
 ) -> io::Result<GcReport> {
     cleanup_under_with_sources(
         temp_root,
         proc_root,
         &proc_root.join("sys/kernel/random/boot_id"),
         min_age,
+        apply,
     )
 }
 
@@ -288,6 +326,7 @@ fn cleanup_under_with_sources(
     proc_root: &Path,
     boot_id_path: &Path,
     min_age: Duration,
+    apply: bool,
 ) -> io::Result<GcReport> {
     let min_age = min_age.max(DEFAULT_ORPHAN_MIN_AGE);
     let mut report = GcReport::default();
@@ -311,47 +350,69 @@ fn cleanup_under_with_sources(
             now,
             min_age,
         );
-        let (outcome, reason, bytes) = match result {
-            Ok(Inspection::Skip(reason)) => {
+        let (outcome, reason, bytes, ownership, live) = match result {
+            Ok(Inspection::Skip(reason, ownership, live)) => {
                 report.skipped += 1;
-                ("skipped", reason, 0)
+                ("deferred", reason, 0, ownership, live)
             }
             Ok(Inspection::Delete(directory, bytes, reference_policy)) => {
-                match remove_inspected_orphan(
-                    &parent,
-                    proc_root,
-                    &name,
-                    &path,
-                    &directory,
-                    uid,
-                    reference_policy,
-                ) {
-                    Ok(()) => {
-                        report.removed += 1;
-                        report.removed_bytes = report.removed_bytes.saturating_add(bytes);
-                        ("removed", "owned orphan мёртвого владельца".into(), bytes)
-                    }
-                    Err(DeleteFailure::Skip(reason)) => {
-                        report.skipped += 1;
-                        ("skipped", reason.into(), 0)
-                    }
-                    Err(DeleteFailure::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                        report.skipped += 1;
-                        (
-                            "skipped",
-                            "дерево уже удалено параллельной уборкой".into(),
-                            0,
-                        )
-                    }
-                    Err(DeleteFailure::Io(error)) => {
-                        report.errors += 1;
-                        ("error", error.to_string(), 0)
+                if !apply {
+                    (
+                        "delete",
+                        "marker подтверждает stale project-owned workspace".into(),
+                        bytes,
+                        "project-owned",
+                        Some(false),
+                    )
+                } else {
+                    match remove_inspected_orphan(
+                        &parent,
+                        proc_root,
+                        &name,
+                        &path,
+                        &directory,
+                        uid,
+                        reference_policy,
+                    ) {
+                        Ok(()) => {
+                            report.removed += 1;
+                            report.removed_bytes = report.removed_bytes.saturating_add(bytes);
+                            (
+                                "removed",
+                                "owned orphan мёртвого владельца".into(),
+                                bytes,
+                                "project-owned",
+                                Some(false),
+                            )
+                        }
+                        Err(DeleteFailure::Skip(reason)) => {
+                            report.skipped += 1;
+                            let live =
+                                (reason == "живой process использует workspace").then_some(true);
+                            ("deferred", reason.into(), 0, "project-owned", live)
+                        }
+                        Err(DeleteFailure::Io(error))
+                            if error.kind() == io::ErrorKind::NotFound =>
+                        {
+                            report.skipped += 1;
+                            (
+                                "deferred",
+                                "дерево уже удалено параллельной уборкой".into(),
+                                0,
+                                "project-owned",
+                                None,
+                            )
+                        }
+                        Err(DeleteFailure::Io(error)) => {
+                            report.errors += 1;
+                            ("error", error.to_string(), 0, "project-owned", None)
+                        }
                     }
                 }
             }
             Err(error) => {
                 report.skipped += 1;
-                ("skipped", error.to_string(), 0)
+                ("deferred", error.to_string(), 0, "unknown", None)
             }
         };
         tracing::debug!(path = %path.display(), outcome, %reason, bytes, "orphan temp cleanup");
@@ -360,14 +421,24 @@ fn cleanup_under_with_sources(
             outcome: outcome.into(),
             reason,
             bytes,
+            ownership: ownership.into(),
+            live,
         });
     }
     Ok(report)
 }
 
 enum Inspection {
-    Skip(String),
+    Skip(String, &'static str, Option<bool>),
     Delete(File, u64, ProcessReferencePolicy),
+}
+
+fn unknown_workspace(reason: impl Into<String>) -> Inspection {
+    Inspection::Skip(reason.into(), "unknown", None)
+}
+
+fn owned_workspace(reason: impl Into<String>, live: Option<bool>) -> Inspection {
+    Inspection::Skip(reason.into(), "project-owned", live)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -429,13 +500,13 @@ fn inspect_orphan(
     min_age: Duration,
 ) -> io::Result<Inspection> {
     let Some(run_id) = name.to_str().filter(|name| valid_run_id(name)) else {
-        return Ok(Inspection::Skip("чужой run prefix".into()));
+        return Ok(unknown_workspace("чужой run prefix"));
     };
     let directory = directory_at(parent, name)?;
     let metadata = directory.metadata()?;
     same_mount(parent, &directory)?;
     if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-        return Ok(Inspection::Skip("чужой UID или неприватный каталог".into()));
+        return Ok(unknown_workspace("чужой UID или неприватный каталог"));
     }
     let fd = openat(
         &directory,
@@ -451,7 +522,7 @@ fn inspect_orphan(
         || marker_metadata.nlink() != 1
         || marker_metadata.mode() & 0o022 != 0
     {
-        return Ok(Inspection::Skip("небезопасный ownership marker".into()));
+        return Ok(unknown_workspace("небезопасный ownership marker"));
     }
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
@@ -465,14 +536,15 @@ fn inspect_orphan(
         || marker.purpose.is_empty()
         || marker.pid == 0
     {
-        return Ok(Inspection::Skip("чужой или неподдерживаемый marker".into()));
+        return Ok(unknown_workspace("чужой или неподдерживаемый marker"));
     }
     match owner_is_dead(&marker, sources) {
         Ok(true) => (),
-        Ok(false) => return Ok(Inspection::Skip("original owner жив".into())),
+        Ok(false) => return Ok(owned_workspace("original owner жив", Some(true))),
         Err(_) => {
-            return Ok(Inspection::Skip(
-                "нельзя доказать смерть original owner".into(),
+            return Ok(owned_workspace(
+                "нельзя доказать смерть original owner",
+                None,
             ));
         }
     }
@@ -493,14 +565,16 @@ fn inspect_orphan(
             &[directory.as_raw_fd(), file.as_raw_fd()],
         ) {
             Ok(true) => {
-                return Ok(Inspection::Skip(
-                    "живой process использует workspace".into(),
+                return Ok(owned_workspace(
+                    "живой process использует workspace",
+                    Some(true),
                 ));
             }
             Ok(false) => (),
             Err(_) => {
-                return Ok(Inspection::Skip(
-                    "нельзя доказать отсутствие process references".into(),
+                return Ok(owned_workspace(
+                    "нельзя доказать отсутствие process references",
+                    None,
                 ));
             }
         }
@@ -511,7 +585,7 @@ fn inspect_orphan(
         .map_err(io::Error::other)?
         .as_millis();
     if marker.created_unix_ms > now || modified > u128::from(now) {
-        return Ok(Inspection::Skip("время run в будущем".into()));
+        return Ok(owned_workspace("время run в будущем", Some(false)));
     }
     // Schema 2 обходит только TTL: остальные проверки остаются обязательными.
     if marker.schema == LEGACY_SCHEMA {
@@ -519,7 +593,7 @@ fn inspect_orphan(
         if now - marker.created_unix_ms < age_ms
             || modified > u128::from(now.saturating_sub(age_ms))
         {
-            return Ok(Inspection::Skip("свежий schema 1 run".into()));
+            return Ok(owned_workspace("свежий schema 1 run", Some(false)));
         }
     }
     let size = inspect_orphan_tree(&directory, uid, run_path)?;
@@ -1399,10 +1473,20 @@ fn measure_entry(
 /// Вызывается явно: fixture startup GC не удаляет legacy trees автоматически.
 /// Для legacy TTL всегда не меньше 24 часов; известный живой PID блокирует удаление.
 pub fn cleanup_legacy_orphans(min_age: Duration) -> io::Result<GcReport> {
-    cleanup_legacy_under(Path::new(TEMP_ROOT), min_age.max(DEFAULT_ORPHAN_MIN_AGE))
+    cleanup_legacy_orphans_under(Path::new(TEMP_ROOT), min_age)
 }
 
-fn cleanup_legacy_under(root: &Path, min_age: Duration) -> io::Result<GcReport> {
+/// Удаляет только разрешённые legacy формы внутри явно выбранного root.
+pub fn cleanup_legacy_orphans_under(root: &Path, min_age: Duration) -> io::Result<GcReport> {
+    cleanup_legacy_under(root, min_age.max(DEFAULT_ORPHAN_MIN_AGE), true)
+}
+
+/// Строит dry-run для строго распознанных legacy orphan paths.
+pub fn plan_legacy_orphans_under(root: &Path, min_age: Duration) -> io::Result<GcReport> {
+    cleanup_legacy_under(root, min_age.max(DEFAULT_ORPHAN_MIN_AGE), false)
+}
+
+fn cleanup_legacy_under(root: &Path, min_age: Duration, apply: bool) -> io::Result<GcReport> {
     let uid = current_uid()?;
     let parent = root_directory(root)?;
     let mut report = GcReport::default();
@@ -1434,38 +1518,52 @@ fn cleanup_legacy_under(root: &Path, min_age: Duration) -> io::Result<GcReport> 
             let bytes = inspect_tree(&directory, uid)?;
             Ok((directory, bytes))
         })();
-        let (outcome, reason, bytes) = match inspection {
+        let (outcome, reason, bytes, ownership, live) = match inspection {
             Err(error) => {
                 report.skipped += 1;
-                ("skipped", error.to_string(), 0)
+                ("deferred", error.to_string(), 0, "unknown", None)
             }
             Ok((directory, bytes)) => {
-                match verify_identity(&parent, &name, &directory)
-                    .and_then(|()| remove_contents(&directory))
-                    .and_then(|()| verify_identity(&parent, &name, &directory))
-                    .and_then(|()| {
-                        unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)
-                    }) {
-                    Ok(()) => {
-                        report.removed += 1;
-                        report.removed_bytes = report.removed_bytes.saturating_add(bytes);
-                        (
-                            "removed",
-                            "старое подтверждённое legacy basename".into(),
-                            bytes,
-                        )
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        report.skipped += 1;
-                        (
-                            "skipped",
-                            "дерево уже удалено параллельной уборкой".into(),
-                            0,
-                        )
-                    }
-                    Err(error) => {
-                        report.errors += 1;
-                        ("error", error.to_string(), 0)
+                if !apply {
+                    (
+                        "delete",
+                        "legacy basename, UID, возраст и отсутствие живого PID подтверждены".into(),
+                        bytes,
+                        "legacy-project-owned",
+                        Some(false),
+                    )
+                } else {
+                    match verify_identity(&parent, &name, &directory)
+                        .and_then(|()| remove_contents(&directory))
+                        .and_then(|()| verify_identity(&parent, &name, &directory))
+                        .and_then(|()| {
+                            unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+                        }) {
+                        Ok(()) => {
+                            report.removed += 1;
+                            report.removed_bytes = report.removed_bytes.saturating_add(bytes);
+                            (
+                                "removed",
+                                "старое подтверждённое legacy basename".into(),
+                                bytes,
+                                "legacy-project-owned",
+                                Some(false),
+                            )
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            report.skipped += 1;
+                            (
+                                "deferred",
+                                "дерево уже удалено параллельной уборкой".into(),
+                                0,
+                                "legacy-project-owned",
+                                None,
+                            )
+                        }
+                        Err(error) => {
+                            report.errors += 1;
+                            ("error", error.to_string(), 0, "legacy-project-owned", None)
+                        }
                     }
                 }
             }
@@ -1476,6 +1574,8 @@ fn cleanup_legacy_under(root: &Path, min_age: Duration) -> io::Result<GcReport> 
             outcome: outcome.into(),
             reason,
             bytes,
+            ownership: ownership.into(),
+            live,
         });
     }
     tracing::info!(
@@ -2483,6 +2583,33 @@ mod tests {
     }
 
     #[test]
+    fn orphan_gc_dry_run_reports_stale_tree_without_mutating_it() {
+        let root = sandbox();
+        let path = make_orphan(root.path(), Duration::from_secs(172800));
+        fs::write(path.join("data"), b"payload").unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(172800)),
+            )
+            .unwrap();
+
+        let report = plan_orphans_under(root.path(), DEFAULT_ORPHAN_MIN_AGE).unwrap();
+
+        assert_eq!(report.removed, 0);
+        assert!(path.join("data").exists());
+        let candidate = report
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap();
+        assert_eq!(candidate.outcome, "delete");
+        assert_eq!(candidate.ownership, "project-owned");
+        assert_eq!(candidate.live, Some(false));
+        assert!(candidate.bytes > 0);
+    }
+
+    #[test]
     fn orphan_gc_removes_only_allowlisted_browser_temp_objects() {
         let root = sandbox();
         let orphan = make_orphan(root.path(), Duration::from_secs(172800));
@@ -2776,7 +2903,7 @@ mod tests {
                 FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(172800)),
             )
             .unwrap();
-        let report = cleanup_legacy_under(root.path(), DEFAULT_ORPHAN_MIN_AGE).unwrap();
+        let report = cleanup_legacy_under(root.path(), DEFAULT_ORPHAN_MIN_AGE, true).unwrap();
         assert_eq!(report.removed, 1);
         assert_eq!(report.removed_bytes, 11);
         assert_eq!(report.skipped, 4);
@@ -2786,7 +2913,7 @@ mod tests {
             assert!(path.exists());
         }
         assert_eq!(
-            cleanup_legacy_under(root.path(), DEFAULT_ORPHAN_MIN_AGE)
+            cleanup_legacy_under(root.path(), DEFAULT_ORPHAN_MIN_AGE, true)
                 .unwrap()
                 .removed,
             0

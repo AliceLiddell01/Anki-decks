@@ -1,0 +1,6 @@
+[Unit]
+Description=Безопасная очистка артефактов Anki-decks
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/anki-repository-maintenance clean --apply --installed-root

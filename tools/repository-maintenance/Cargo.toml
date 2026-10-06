@@ -1,0 +1,26 @@
+[package]
+name = "repository-maintenance"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Безопасная инвентаризация и очистка артефактов Anki-decks"
+publish = false
+
+[dependencies]
+asset-store = { path = "../asset-store" }
+clap = { version = "4.5", features = ["derive"] }
+rustix = { version = "1.1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+toml = "0.8"
+
+[[bin]]
+name = "anki-repository-maintenance"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

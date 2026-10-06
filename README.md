@@ -105,6 +105,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 
 - [`anki-repo` — анализ, QA, ограниченные изменения и визуальный отчёт](tools/anki-repo/README.md)
 - [`asset-store` и `kanji-assets` — жизненный цикл ресурсов и валидация](tools/asset-store/README.md)
+- [`repository-maintenance` — инвентаризация диска и безопасный GC](tools/repository-maintenance/README.md)
 
 ## Инструменты
 
@@ -128,6 +129,15 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 Все изменяющие команды по умолчанию выполняют dry-run, а запись делают только с явным `--apply` после проверок. `edit` и `retire` меняют только `deck.json`. `create` может разместить в `media/` только проверенные файлы из настроенных доменов и добавить нужные объявления `media_files`. `migrate-media` может переписать доказанные ссылки существующих заметок, разместить канонический файл и удалить освобождённый legacy-файл после публикации `deck.json`.
 
 [Полный контракт `anki-repo` →](tools/anki-repo/README.md)
+
+### `repository-maintenance`
+
+Отдельный Linux/WSL инструмент для учёта Cargo targets, project-owned внешних
+build caches и всего `/tmp`. `scan` только измеряет, `clean` по умолчанию
+показывает dry-run, а запись требует `--apply`. Чужие и неизвестные записи
+временного каталога отображаются, но не удаляются.
+
+[Политика, аудит источников, команды и ограничения →](tools/repository-maintenance/README.md)
 
 ### `asset-store` / `kanji-assets`
 
@@ -229,7 +239,8 @@ GitHub Actions дополнительно:
 ├── decks/                    # версионируемые CrowdAnki-экспорты
 ├── tools/
 │   ├── anki-repo/            # анализ, QA, ограниченные изменения, визуальный отчёт
-│   └── asset-store/          # библиотека ресурсов и kanji-assets
+│   ├── asset-store/          # библиотека ресурсов и kanji-assets
+│   └── repository-maintenance/ # инвентаризация и безопасный GC
 ├── .asset-store/             # ресурсы, которыми управляет программа, если присутствуют
 ├── .agents/
 │   └── skills/               # repository workflows для агентов

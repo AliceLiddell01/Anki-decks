@@ -1,0 +1,9 @@
+# Канонические значения repository maintenance GC. Допускается переопределение
+# копией этого файла через --policy для диагностики и тестовых сценариев.
+target_warning_gib = 12
+target_hard_limit_gib = 20
+external_cache_hard_limit_gib = 10
+external_cache_goal_gib = 5
+external_cache_min_age_days = 7
+orphan_min_age_hours = 24
+tmp_top_entries = 20

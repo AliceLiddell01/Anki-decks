@@ -1407,21 +1407,15 @@ fn artifact_write_error(path: &Path, error: &std::io::Error) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use asset_store::temp_workspace::TempWorkspace;
 
-    struct GitFixture(PathBuf);
+    struct GitFixture(PathBuf, #[allow(dead_code)] TempWorkspace);
 
     impl GitFixture {
         fn new(label: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "anki-review-{label}-{}-{nonce}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).unwrap();
+            let workspace = TempWorkspace::create(&format!("anki-review-{label}"))
+                .expect("проектный temp workspace должен создаваться");
+            let path = workspace.path().to_path_buf();
             git_ok(&path, &["init", "-q"]);
             git_ok(&path, &["config", "user.email", "test@example.invalid"]);
             git_ok(&path, &["config", "user.name", "Test"]);
@@ -1431,19 +1425,13 @@ mod tests {
             fs::write(path.join("src/lib.rs"), "pub fn run() { let _ = 1; }\n").unwrap();
             git_ok(&path, &["add", "."]);
             git_ok(&path, &["commit", "-qm", "base"]);
-            Self(path)
+            Self(path, workspace)
         }
 
         fn add_head(&self, content: &str) {
             fs::write(self.0.join("src/lib.rs"), content).unwrap();
             git_ok(&self.0, &["add", "."]);
             git_ok(&self.0, &["commit", "-qm", "head"]);
-        }
-    }
-
-    impl Drop for GitFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -1747,9 +1735,9 @@ mod tests {
 
     #[test]
     fn artifacts_are_idempotent_but_never_silently_overwritten() {
-        let temp = std::env::temp_dir().join(format!("anki-artifact-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).unwrap();
+        let owner = TempWorkspace::create("anki-artifact-write-test")
+            .expect("проектный temp workspace должен создаваться");
+        let temp = owner.path().to_path_buf();
         let first = BTreeMap::from([("review.json", b"{}\n".to_vec())]);
         let second = BTreeMap::from([("review.json", b"{\"different\":true}\n".to_vec())]);
         let directory = temp.join("snapshot");
@@ -1784,7 +1772,6 @@ mod tests {
             ErrorCode::WriteFailed
         );
         assert!(!newly_created.exists());
-        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
