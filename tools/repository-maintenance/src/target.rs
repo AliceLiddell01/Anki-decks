@@ -291,11 +291,7 @@ pub fn inspect_target(
         && ownership_safe
         && matches!(safety, ProcessCheck::Clear)
         && marker_error.is_none();
-    let reason = if decision == ThresholdDecision::Keep {
-        "размер ниже порога предупреждения".into()
-    } else if decision == ThresholdDecision::Warn {
-        "размер выше порога предупреждения; очистка не запускается".into()
-    } else if !errors.is_empty() {
+    let reason = if !errors.is_empty() {
         format!(
             "нельзя безопасно измерить каталог `target`: {}",
             errors.join("; ")
@@ -303,6 +299,10 @@ pub fn inspect_target(
     } else if mount_boundaries != 0 {
         "обнаружена вложенная точка монтирования; очистка всего каталога Cargo `target` отложена"
             .into()
+    } else if decision == ThresholdDecision::Keep {
+        "размер ниже порога предупреждения".into()
+    } else if decision == ThresholdDecision::Warn {
+        "размер выше порога предупреждения; очистка не запускается".into()
     } else if !ownership_safe {
         "каталог `target` или `build-dir` находится вне корня рабочей области и не имеет маркера владения проекта; очистка отложена".into()
     } else if let Some(error) = &marker_error {
@@ -324,7 +324,9 @@ pub fn inspect_target(
     } else {
         "каталог `target` превысил жёсткий предел и подтверждён Cargo".into()
     };
-    let blocker = if decision != ThresholdDecision::Clean || safe_to_clean {
+    let blocker = if !errors.is_empty() || mount_boundaries != 0 {
+        Some(TargetBlocker::Unsafe(reason.clone()))
+    } else if decision != ThresholdDecision::Clean || safe_to_clean {
         None
     } else if errors.is_empty()
         && mount_boundaries == 0
@@ -564,6 +566,32 @@ mod tests {
         assert!(!measurement.ownership_safe);
         assert!(!measurement.safe_to_clean);
         assert!(measurement.reason.contains("корня рабочей области"));
+    }
+
+    #[test]
+    fn incomplete_target_measurement_is_unsafe_below_threshold() {
+        let owner = TempWorkspace::create("repository-maintenance-incomplete-target-test").unwrap();
+        let root = owner.path().join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target-file");
+        fs::write(&target, b"not a directory").unwrap();
+        let workspace = CargoWorkspace {
+            root,
+            manifest: owner.path().join("checkout/Cargo.toml"),
+            target_dir: target.clone(),
+            build_dir: None,
+            measured_dirs: vec![target],
+        };
+
+        let measurement = inspect_target(&workspace, 1, 2);
+
+        assert_eq!(measurement.decision, ThresholdDecision::Keep);
+        assert!(!measurement.safe_to_clean);
+        assert!(matches!(
+            measurement.blocker,
+            Some(TargetBlocker::Unsafe(_))
+        ));
+        assert!(measurement.reason.contains("нельзя безопасно измерить"));
     }
 
     #[test]

@@ -180,6 +180,50 @@ fn cli_clean_reports_invalid_target_marker_as_fatal_and_preserves_target() {
 }
 
 #[test]
+fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
+    let fixture = CacheFixture::new();
+    let target_file = fixture.owner.path().join("target-is-a-file");
+    fs::write(&target_file, b"target contents must be preserved").unwrap();
+    let runtime = private_runtime(&fixture.cache_home);
+    let output = Command::new(BINARY)
+        .args([
+            "clean",
+            "--workspace-root",
+            fixture.root.to_str().unwrap(),
+            "--policy",
+            fixture.policy.to_str().unwrap(),
+            "--temp-root",
+            fixture.temp_root.to_str().unwrap(),
+            "--json",
+            "--apply",
+        ])
+        .env("CARGO_TARGET_DIR", &target_file)
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .env("XDG_CACHE_HOME", &fixture.cache_home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("TMPDIR", &fixture.temp_root)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", json(&output));
+    let report = json(&output);
+    assert_eq!(report["cargo_target"]["bytes_before"], 0);
+    assert_eq!(report["cargo_target"]["action"], "error", "{report}");
+    assert_eq!(report["cargo_target"]["result"], "failed", "{report}");
+    assert_eq!(report["fatal_errors"], 1, "{report}");
+    assert!(
+        report["cargo_target"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("не является каталогом")
+    );
+    assert_eq!(
+        fs::read(&target_file).unwrap(),
+        b"target contents must be preserved"
+    );
+}
+
+#[test]
 fn cli_preserves_live_unknown_and_unverifiable_tmp_entries() {
     let owner = TempWorkspace::create("repository-maintenance-cli-temp-smoke").unwrap();
     let root = owner.path().join("checkout");
