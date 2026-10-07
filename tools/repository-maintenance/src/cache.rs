@@ -17,6 +17,7 @@ const MARKER_LIMIT: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalCacheInventory {
+    #[serde(serialize_with = "crate::serialize_report_path")]
     pub root: PathBuf,
     pub allocated_bytes: u64,
     pub managed_entries: usize,
@@ -27,7 +28,9 @@ pub struct ExternalCacheInventory {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalCacheCandidate {
     pub id: String,
+    #[serde(serialize_with = "crate::serialize_report_path")]
     pub path: PathBuf,
+    #[serde(serialize_with = "crate::serialize_optional_report_path")]
     pub target_dir: Option<PathBuf>,
     pub allocated_bytes: u64,
     pub bytes_after: Option<u64>,

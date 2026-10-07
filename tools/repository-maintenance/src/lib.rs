@@ -8,7 +8,7 @@ pub mod timer;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asset_store::temp_workspace::{
@@ -17,14 +17,61 @@ use asset_store::temp_workspace::{
 };
 use inventory::{OwnershipEvidence, TmpInventory, scan_tmp};
 use policy::Policy;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use target::{CargoTargetMeasurement, CargoWorkspace, TargetBlocker, ThresholdDecision};
 
 const REPORT_SCHEMA: u32 = 1;
+// TempWorkspace uses `anki-decks-{uid}` as its private namespace directory.
+const TEMP_NAMESPACE_PREFIX: &str = "anki-decks-";
+
+pub(crate) fn serialize_report_path<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&redact_temp_namespace_uid(path).to_string_lossy())
+}
+
+pub(crate) fn serialize_optional_report_path<S>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match path {
+        Some(path) => serializer.serialize_some(&redact_temp_namespace_uid(path).to_string_lossy()),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn redact_temp_namespace_uid(path: &Path) -> PathBuf {
+    let mut redacted = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) if is_temp_namespace_with_uid(name) => {
+                redacted.push("anki-decks-<uid>");
+            }
+            component => redacted.push(component.as_os_str()),
+        }
+    }
+    redacted
+}
+
+fn is_temp_namespace_with_uid(component: &std::ffi::OsStr) -> bool {
+    component
+        .to_str()
+        .and_then(|name| name.strip_prefix(TEMP_NAMESPACE_PREFIX))
+        .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn display_report_path(path: &Path) -> String {
+    redact_temp_namespace_uid(path).display().to_string()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Candidate {
     pub category: &'static str,
+    #[serde(serialize_with = "serialize_report_path")]
     pub path: PathBuf,
     pub ownership: String,
     pub bytes_before: u64,
@@ -49,6 +96,7 @@ pub struct Report {
     pub schema_version: u32,
     pub mode: &'static str,
     pub generated_unix_seconds: u64,
+    #[serde(serialize_with = "serialize_report_path")]
     pub workspace_root: PathBuf,
     pub scan_elapsed_ms: u128,
     pub cleanup_elapsed_ms: u128,
@@ -781,7 +829,11 @@ pub fn render_text(report: &Report) -> String {
     let mut text = String::new();
     use std::fmt::Write as _;
     let _ = writeln!(text, "Режим: {}", report.mode);
-    let _ = writeln!(text, "Рабочая область: {}", report.workspace_root.display());
+    let _ = writeln!(
+        text,
+        "Рабочая область: {}",
+        display_report_path(&report.workspace_root)
+    );
     let _ = writeln!(
         text,
         "Время: проверка {} мс, очистка {} мс, всего {} мс",
@@ -790,7 +842,7 @@ pub fn render_text(report: &Report) -> String {
     let _ = writeln!(
         text,
         "Каталог Cargo `target`: {} — {} ({}, владение {}, освобождено {} байт)",
-        report.cargo_target.path.display(),
+        display_report_path(&report.cargo_target.path),
         human_bytes(report.cargo_target.bytes_before),
         report.cargo_target.action,
         report.cargo_target.ownership,
@@ -812,7 +864,7 @@ pub fn render_text(report: &Report) -> String {
         let _ = writeln!(
             text,
             "  {} — {} байт до, {} после, освобождено {}; {}, {}: {}",
-            candidate.path.display(),
+            display_report_path(&candidate.path),
             candidate.allocated_bytes,
             candidate
                 .bytes_after
@@ -835,7 +887,7 @@ pub fn render_text(report: &Report) -> String {
         let _ = writeln!(
             text,
             "  {} — {} байт, владение {}, {} / {}: {}",
-            candidate.path.display(),
+            display_report_path(&candidate.path),
             candidate.bytes_before,
             candidate.ownership,
             candidate.action,
@@ -847,7 +899,7 @@ pub fn render_text(report: &Report) -> String {
         let _ = writeln!(
             text,
             "/tmp {}: {}, {} записей верхнего уровня, {} границ точек монтирования, {} ошибок проверки; обход {}",
-            inventory.root.display(),
+            display_report_path(&inventory.root),
             human_bytes(inventory.allocated_bytes),
             inventory.top_level_entries,
             inventory.mount_boundaries,
@@ -859,19 +911,15 @@ pub fn render_text(report: &Report) -> String {
             }
         );
         for entry in &inventory.largest {
-            let owner = entry
-                .owner_uid
-                .map_or_else(|| "смешанный/неизвестный".into(), |uid| uid.to_string());
             let age = entry
                 .age_seconds
                 .map_or_else(|| "?".into(), |age| format!("{}с", age));
             let _ = writeln!(
                 text,
-                "  {} — {}, {}, UID {}, {}, возраст {}, {}",
-                entry.path.display(),
+                "  {} — {}, {}, {}, возраст {}, {}",
+                display_report_path(&entry.path),
                 human_bytes(entry.allocated_bytes),
                 entry.kind,
-                owner,
                 entry.ownership,
                 age,
                 entry.action
@@ -1050,10 +1098,10 @@ mod tests {
     }
 
     #[test]
-    fn json_report_has_stable_schema_and_explicit_decisions() {
+    fn reports_hide_temp_namespace_uids_and_keep_decisions() {
         let candidate = Candidate {
             category: "cargo-target",
-            path: PathBuf::from("/tmp/test/target"),
+            path: PathBuf::from("/tmp/anki-decks-424242/target"),
             ownership: "project-owned".into(),
             bytes_before: 12,
             bytes_after: None,
@@ -1068,7 +1116,7 @@ mod tests {
             schema_version: REPORT_SCHEMA,
             mode: "dry-run",
             generated_unix_seconds: 1,
-            workspace_root: PathBuf::from("/work"),
+            workspace_root: PathBuf::from("/work/anki-decks-424242/checkout"),
             scan_elapsed_ms: 2,
             cleanup_elapsed_ms: 0,
             elapsed_ms: 2,
@@ -1077,9 +1125,75 @@ mod tests {
             external_cache_bytes_freed: 0,
             external_cache_unknown_entries: 0,
             cargo_target: candidate,
-            external_build_caches: Vec::new(),
-            project_temp: Vec::new(),
-            tmp: Vec::new(),
+            external_build_caches: vec![
+                cache::ExternalCacheCandidate {
+                    id: "cache".into(),
+                    path: PathBuf::from("/tmp/anki-decks-424242/cache"),
+                    target_dir: Some(PathBuf::from("/tmp/anki-decks-424242/cache/target")),
+                    allocated_bytes: 12,
+                    bytes_after: None,
+                    bytes_freed: 0,
+                    last_used_unix_seconds: None,
+                    age_seconds: None,
+                    ownership: "project-owned",
+                    live: None,
+                    action: "keep",
+                    reason: "проверенный кэш".into(),
+                    error: None,
+                    measurement: None,
+                },
+                cache::ExternalCacheCandidate {
+                    id: "unknown".into(),
+                    path: PathBuf::from("/tmp/unknown-cache"),
+                    target_dir: None,
+                    allocated_bytes: 0,
+                    bytes_after: None,
+                    bytes_freed: 0,
+                    last_used_unix_seconds: None,
+                    age_seconds: None,
+                    ownership: "unknown",
+                    live: None,
+                    action: "keep",
+                    reason: "неизвестный кэш".into(),
+                    error: None,
+                    measurement: None,
+                },
+            ],
+            project_temp: vec![Candidate {
+                category: "temp-workspace",
+                path: PathBuf::from("/tmp/anki-decks-424242/legacy-run"),
+                ownership: "project-owned".into(),
+                bytes_before: 12,
+                bytes_after: Some(12),
+                bytes_freed: 0,
+                reason: "проверенный временный каталог".into(),
+                action: "keep",
+                result: "skipped",
+                live: None,
+                error: None,
+            }],
+            tmp: vec![TmpInventory {
+                root: PathBuf::from("/tmp/anki-decks-424242"),
+                allocated_bytes: 12,
+                top_level_entries: 1,
+                mount_boundaries: 0,
+                errors: 0,
+                complete: true,
+                largest: vec![inventory::TmpEntry {
+                    path: PathBuf::from("/tmp/anki-decks-424242/foreign-entry"),
+                    kind: "file",
+                    allocated_bytes: 12,
+                    apparent_bytes: 12,
+                    modified_unix_seconds: Some(1),
+                    age_seconds: Some(2),
+                    owner_uid: Some(424_242),
+                    ownership: "foreign",
+                    live: None,
+                    action: "foreign",
+                    reason: "объект принадлежит другому UID".into(),
+                    error: None,
+                }],
+            }],
             system_tmpfiles: SystemTmpfilesStatus {
                 available: false,
                 timer_state: "unknown".into(),
@@ -1092,6 +1206,31 @@ mod tests {
         let json = render_json(&report).unwrap();
         assert!(json.contains("\"schema_version\": 1"));
         assert!(json.contains("\"action\": \"keep\""));
+        assert!(json.contains("\"ownership\": \"foreign\""));
+        assert!(!json.contains("owner_uid"));
+        assert!(!json.contains("424242"));
+        assert!(json.contains("/tmp/anki-decks-<uid>/cache/target"));
+        assert!(json.contains("/tmp/anki-decks-<uid>/foreign-entry"));
+        assert!(json.contains("\"target_dir\": null"));
         assert_eq!(json, render_json(&report).unwrap());
+
+        let text = render_text(&report);
+        assert!(text.contains("/tmp/anki-decks-<uid>/foreign-entry"));
+        assert!(text.contains("/tmp/anki-decks-<uid>/cache"));
+        assert!(text.contains("file, foreign, возраст"));
+        assert!(!text.contains("424242"));
+        assert!(text.contains("/work/anki-decks-<uid>/checkout"));
+    }
+
+    #[test]
+    fn report_path_redaction_leaves_other_components_unchanged() {
+        assert_eq!(
+            display_report_path(Path::new("/tmp/anki-decks-123abc/entry-42")),
+            "/tmp/anki-decks-123abc/entry-42"
+        );
+        assert_eq!(
+            display_report_path(Path::new("/tmp/not-anki-decks-123/entry")),
+            "/tmp/not-anki-decks-123/entry"
+        );
     }
 }

@@ -68,11 +68,12 @@ fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
     assert_eq!(scan_json["cargo_target"]["action"], "warn");
     assert_eq!(scan_json["mode"], "scan");
     assert_eq!(scan_json["cargo_target"]["result"], "not_needed");
+    let displayed_temp_root = displayed_temp_path(&temp_root);
     let temp_inventory = scan_json["tmp"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|inventory| inventory["root"] == temp_root.to_str().unwrap())
+        .find(|inventory| inventory["root"] == displayed_temp_root)
         .unwrap();
     assert_eq!(temp_inventory["largest"].as_array().unwrap().len(), 1);
     assert!(target.join("synthetic-artifact").exists());
@@ -831,15 +832,14 @@ fn cli_partial_tmp_inventory_is_reported_without_fatal_exit() {
     assert!(output.status.success(), "{}", json(&output));
     let report = json(&output);
     assert_eq!(report["fatal_errors"], 0);
+    let displayed_temp_root = displayed_temp_path(&fixture.temp_root);
     assert!(
         report["tmp"]
             .as_array()
             .unwrap()
             .iter()
-            .any(
-                |inventory| inventory["root"] == fixture.temp_root.to_str().unwrap()
-                    && inventory["complete"] == false
-            )
+            .any(|inventory| inventory["root"] == displayed_temp_root
+                && inventory["complete"] == false)
     );
     assert!(unreadable.join("hidden").exists());
 }
@@ -1031,4 +1031,10 @@ fn directory_entry_names(path: &Path) -> Vec<OsString> {
 fn uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     fs::metadata("/proc/self").unwrap().uid()
+}
+
+fn displayed_temp_path(path: &Path) -> String {
+    let namespace = format!("anki-decks-{}", uid());
+    path.to_string_lossy()
+        .replace(&namespace, "anki-decks-<uid>")
 }

@@ -13,6 +13,7 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmpInventory {
+    #[serde(serialize_with = "crate::serialize_report_path")]
     pub root: PathBuf,
     pub allocated_bytes: u64,
     pub top_level_entries: usize,
@@ -24,12 +25,14 @@ pub struct TmpInventory {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmpEntry {
+    #[serde(serialize_with = "crate::serialize_report_path")]
     pub path: PathBuf,
     pub kind: &'static str,
     pub allocated_bytes: u64,
     pub apparent_bytes: u64,
     pub modified_unix_seconds: Option<u64>,
     pub age_seconds: Option<u64>,
+    #[serde(skip_serializing)]
     pub owner_uid: Option<u32>,
     pub ownership: &'static str,
     pub live: Option<bool>,
