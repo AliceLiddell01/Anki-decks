@@ -366,7 +366,7 @@ fn derived_overwrite_rejects_source_collisions_and_unsafe_existing_paths() {
 
 #[cfg(unix)]
 #[test]
-fn derived_overwrite_rejects_live_dangling_and_parent_symlinks() {
+fn derived_overwrite_rejects_live_dangling_and_protected_parent_symlinks() {
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::new();
@@ -399,6 +399,14 @@ fn derived_overwrite_rejects_live_dangling_and_parent_symlinks() {
         failure(fixture.report(&fixture.triage, &output), "invalid_request");
         assert_eq!(fs::read(target).unwrap(), b"protected bytes");
     }
+
+    let safe_parent = fixture.artifacts.path().join("safe-parent");
+    fs::create_dir(&safe_parent).unwrap();
+    let safe_alias = fixture.artifacts.path().join("safe-alias");
+    symlink(&safe_parent, &safe_alias).unwrap();
+    let output = safe_alias.join("nested/canonical.json");
+    success(fixture.canonicalize(&output));
+    assert!(safe_parent.join("nested/canonical.json").is_file());
 }
 
 #[test]

@@ -1191,15 +1191,6 @@ fn replace_derived_document(
     bytes: &[u8],
     source_paths: &[&Path],
 ) -> Result<PathBuf, DomainError> {
-    let requested_absolute = lexical_absolute(requested);
-    for component in requested_absolute.ancestors() {
-        if component.is_symlink() {
-            return Err(DomainError::new(
-                ErrorCode::InvalidRequest,
-                "символьная ссылка в пути производного артефакта запрещена",
-            ));
-        }
-    }
     let output = output_path(root, requested)?;
     for source in source_paths {
         let source = fs::canonicalize(source).map_err(|error| {
