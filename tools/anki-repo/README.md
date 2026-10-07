@@ -295,6 +295,8 @@ Git-репозитория; `summary` и `report` сверяют triage с те�
 массива `findings` содержит `id`, `severity`, `title`, `description`,
 `provenance` и `candidate_ids`. В `unreviewed_candidate_ids` перечислены исходные
 кандидаты, для которых ещё нет индивидуального или группового решения.
+В Markdown-отчёте `description` выводится как блок цитаты с экранированием
+Markdown-символов, чтобы содержимое замечания не меняло структуру отчёта.
 
 Допустимые значения `disposition`: `confirmed`, `acceptable`, `false_positive`,
 `not_applicable`, `uncertain`. Состояние «не рассмотрен» задаётся только

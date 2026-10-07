@@ -607,6 +607,25 @@ fn markdown_cell(value: &str) -> String {
         .replace(['\n', '\r'], " ")
 }
 
+fn markdown_blockquote(value: &str) -> String {
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(|line| {
+            let mut escaped = String::with_capacity(line.len());
+            for character in line.chars() {
+                if character.is_ascii_punctuation() {
+                    escaped.push('\\');
+                }
+                escaped.push(character);
+            }
+            format!("> {escaped}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Компактный детерминированный отчёт: агрегаты вместо списка всех кандидатов.
 /// Вызывающая сторона сначала проверяет документ по исходному пакету.
 #[must_use]
@@ -753,14 +772,15 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
     for finding in findings {
         let _ = writeln!(
             output,
-            "\n### [{}] {}\n\nID: {}; происхождение: {}; связанных кандидатов: {}.\n\n{}\n",
+            "\n### [{}] {}\n\nID: {}; происхождение: {}; связанных кандидатов: {}.\n\n",
             finding.severity.as_str(),
             markdown_cell(&finding.title),
             markdown_cell(&finding.id),
             finding.provenance.as_str(),
-            finding.candidate_ids.len(),
-            finding.description
+            finding.candidate_ids.len()
         );
+        output.push_str(&markdown_blockquote(&finding.description));
+        output.push('\n');
     }
     output
         .push_str("\nПолные связи решений, групп, представителей и замечаний сохранены в JSON.\n");
@@ -1193,6 +1213,28 @@ mod tests {
             .push(b.unreviewed_candidate_ids[0].clone());
         canonicalize(&mut b);
         assert_invalid(&b, &pack);
+    }
+
+    #[test]
+    fn finding_description_cannot_inject_markdown_structure() {
+        let pack = pack();
+        let mut triage = initialize(&pack, DIGEST);
+        let mut finding = finding(Vec::new(), FindingProvenance::Independent);
+        finding.description =
+            "# Заголовок\n\n| Поле | Значение |\n| --- | --- |\n- пункт\n<script>alert(1)</script>"
+                .into();
+        triage.findings.push(finding);
+
+        validate(&triage, &pack, DIGEST).unwrap();
+        let report = render_markdown(&triage, &pack);
+
+        assert!(report.contains("> \\# Заголовок\n>"));
+        assert!(report.contains("> \\| Поле \\| Значение \\|"));
+        assert!(report.contains("> \\- пункт"));
+        assert!(report.contains("> \\<script\\>alert\\(1\\)\\<\\/script\\>"));
+        assert!(!report.contains("\n# Заголовок"));
+        assert!(!report.contains("\n| Поле |"));
+        assert!(!report.contains("\n<script>"));
     }
 
     #[test]
