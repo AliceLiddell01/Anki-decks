@@ -402,7 +402,7 @@ impl ContextVisitor {
         context.enclosing_item = Some(name.to_owned());
         context.call_context = None;
         context.code_role = match context.execution {
-            RustExecutionContext::Test if attrs.iter().any(|attr| attr.path().is_ident("test")) => {
+            RustExecutionContext::Test if attrs.iter().any(is_test_attribute) => {
                 RustCodeRole::TestSetup
             }
             RustExecutionContext::Test => RustCodeRole::TestHelper,
@@ -630,6 +630,7 @@ fn path_string(path: &syn::Path) -> String {
 
 /// Только доступная AST-форма: переменные с неизвестным типом и произвольные
 /// функции не получают I/O роль по одному имени `send`, `open` или `output`.
+/// Сокращённые имена типов также не доказывают принадлежность внешнему API.
 /// Разрешение imports и фактическая семантика API остаются задачей reviewer.
 fn is_boundary_result(expression: &syn::Expr) -> bool {
     match expression {
@@ -657,24 +658,15 @@ fn is_boundary_result(expression: &syn::Expr) -> bool {
                     | "std::fs::rename"
                     | "std::fs::File::open"
                     | "std::fs::File::create"
-                    | "File::open"
-                    | "File::create"
                     | "std::net::TcpStream::connect"
-                    | "TcpStream::connect"
                     | "std::net::TcpListener::bind"
-                    | "TcpListener::bind"
                     | "std::net::UdpSocket::bind"
-                    | "UdpSocket::bind"
             )
         }
         syn::Expr::MethodCall(call) => match call.method.to_string().as_str() {
             "output" | "status" | "spawn" => constructed_chain(
                 &call.receiver,
-                &[
-                    "std::process::Command::new",
-                    "Command::new",
-                    "tokio::process::Command::new",
-                ],
+                &["std::process::Command::new", "tokio::process::Command::new"],
                 &[
                     "arg",
                     "args",
@@ -764,14 +756,24 @@ fn constructed_chain(
     }
 }
 
+/// Пути известных атрибутов тестовых функций. Суффикс `test` сам по себе
+/// не доказывает семантику произвольного процедурного макроса.
+fn is_test_attribute(attr: &syn::Attribute) -> bool {
+    matches!(
+        path_string(attr.path()).as_str(),
+        "test" | "tokio::test" | "async_std::test"
+    )
+}
+
 fn apply_test_attributes(context: &mut RustContext, attrs: &[syn::Attribute]) {
-    if attrs.iter().any(|attr| {
-        attr.path().is_ident("test")
+    let proven_test = attrs.iter().any(|attr| {
+        is_test_attribute(attr)
             || (attr.path().is_ident("cfg")
                 && attr
                     .parse_args::<syn::Meta>()
                     .is_ok_and(|meta| requires_test(&meta)))
-    }) {
+    });
+    if proven_test {
         context.execution = RustExecutionContext::Test;
         if matches!(
             context.code_role,
@@ -779,6 +781,16 @@ fn apply_test_attributes(context: &mut RustContext, attrs: &[syn::Attribute]) {
         ) {
             context.code_role = RustCodeRole::TestSetup;
         }
+    } else if context.execution != RustExecutionContext::Test
+        && attrs.iter().any(|attr| {
+            attr.path()
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "test")
+        })
+    {
+        context.execution = RustExecutionContext::Unknown;
+        context.code_role = RustCodeRole::Unknown;
     }
 }
 
@@ -1017,15 +1029,111 @@ fn runtime() { open().unwrap(); }
     }
 
     #[test]
+    fn recognized_test_attributes_mark_setup_and_assertions_in_production_files() {
+        for attribute in ["test", "tokio::test", "async_std::test"] {
+            let source = format!(
+                "#[{attribute}] async fn check() {{\n    std::fs::read(path).unwrap();\n    assert!(std::fs::read(path).expect(\"fixture\").is_empty());\n}}"
+            );
+            let index = index(&source);
+            let setup = at_text(&index, &source, "unwrap");
+            assert_eq!(setup.execution, RustExecutionContext::Test, "{attribute}");
+            assert_eq!(setup.code_role, RustCodeRole::TestSetup, "{attribute}");
+            let assertion = at_text(&index, &source, "expect");
+            assert_eq!(
+                assertion.execution,
+                RustExecutionContext::Test,
+                "{attribute}"
+            );
+            assert_eq!(
+                assertion.code_role,
+                RustCodeRole::TestAssertion,
+                "{attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_test_attribute_does_not_claim_test_or_production_execution() {
+        let source = r#"
+#[foo::test] fn uncertain() { std::fs::read(path).unwrap(); }
+#[tokio::main] async fn main() { std::fs::write(path, data).expect("diagnostic"); }
+#[cfg(test)] mod checks {
+    #[foo::test] fn scoped() { fixture().unwrap(); }
+}
+"#;
+        let index = index(source);
+        let uncertain = at_text(&index, source, "std::fs::read(path).unwrap");
+        assert_eq!(uncertain.execution, RustExecutionContext::Unknown);
+        assert_eq!(uncertain.code_role, RustCodeRole::Unknown);
+        let runtime = at_text(&index, source, "expect");
+        assert_eq!(runtime.execution, RustExecutionContext::Runtime);
+        assert_eq!(runtime.code_role, RustCodeRole::RuntimeBoundary);
+        let scoped = at_text(&index, source, "fixture()");
+        assert_eq!(scoped.execution, RustExecutionContext::Test);
+        assert_eq!(scoped.code_role, RustCodeRole::TestHelper);
+    }
+
+    #[test]
+    fn local_types_with_io_method_names_do_not_prove_a_boundary() {
+        let source = r#"
+struct File;
+impl File { fn open(_: &str) -> Result<Self, ()> { Ok(Self) } }
+fn custom() { File::open("fixture").unwrap(); }
+fn standard() { std::fs::File::open("fixture").expect("diagnostic"); }
+"#;
+        let index = index(source);
+        let custom = at_text(&index, source, "unwrap");
+        assert_eq!(custom.execution, RustExecutionContext::Runtime);
+        assert_eq!(custom.code_role, RustCodeRole::Runtime);
+        let standard = at_text(&index, source, "expect");
+        assert_eq!(standard.execution, RustExecutionContext::Runtime);
+        assert_eq!(standard.code_role, RustCodeRole::RuntimeBoundary);
+    }
+
+    #[test]
+    fn nested_modules_and_methods_preserve_test_attribute_and_cfg_proofs() {
+        let source = r#"
+#[cfg(all(feature = "fixtures", any(test, all(test, feature = "extra"))))]
+mod outer {
+    mod inner {
+        struct Harness;
+        impl Harness {
+            #[tokio::test] async fn method() { prepare().unwrap(); }
+            fn helper() { helper_value().unwrap(); }
+        }
+        trait Checks {
+            #[async_std::test] async fn method() { verify().expect("fixture"); }
+        }
+    }
+}
+#[cfg(any(test, feature = "runtime"))] mod shared {
+    fn runtime() { std::fs::read(path).unwrap(); }
+}
+"#;
+        let index = index(source);
+        for text in ["prepare()", "verify()"] {
+            let context = at_text(&index, source, text);
+            assert_eq!(context.execution, RustExecutionContext::Test, "{text}");
+            assert_eq!(context.code_role, RustCodeRole::TestSetup, "{text}");
+        }
+        let helper = at_text(&index, source, "helper_value()");
+        assert_eq!(helper.execution, RustExecutionContext::Test);
+        assert_eq!(helper.code_role, RustCodeRole::TestHelper);
+        let shared = at_text(&index, source, "std::fs::read(path)");
+        assert_eq!(shared.execution, RustExecutionContext::Runtime);
+        assert_eq!(shared.code_role, RustCodeRole::Runtime);
+    }
+
+    #[test]
     fn runtime_unwrap_and_expect_recognize_syntactic_io_boundaries() {
         for expression in [
             "std::fs::read(path).unwrap()",
             "std::fs::File::open(path).unwrap()",
-            "File::create(path).unwrap()",
+            "std::fs::File::create(path).unwrap()",
             "std::process::Command::new(cmd).arg(flag).output().unwrap()",
-            "Command::new(cmd).current_dir(dir).status().unwrap()",
+            "std::process::Command::new(cmd).current_dir(dir).status().unwrap()",
             "std::net::TcpStream::connect(address).unwrap()",
-            "UdpSocket::bind(address).unwrap()",
+            "std::net::UdpSocket::bind(address).unwrap()",
             "reqwest::blocking::Client::new().get(url).header(key, value).send().unwrap()",
             "reqwest::Client::new().post(url).send().await.unwrap()",
             "std::fs::write(path, data).expect(\"diagnostic\")",
@@ -1086,6 +1194,12 @@ fn runtime() { open().unwrap(); }
         for expression in [
             "some_result.unwrap()",
             "custom::open(path).unwrap()",
+            "File::open(path).unwrap()",
+            "File::create(path).unwrap()",
+            "TcpStream::connect(address).unwrap()",
+            "TcpListener::bind(address).unwrap()",
+            "UdpSocket::bind(address).unwrap()",
+            "Command::new(cmd).arg(flag).output().unwrap()",
             "process.output().unwrap()",
             "client.get(url).send().unwrap()",
             "std::fs::read(resolve_path().unwrap()).expect(\"diagnostic\")",

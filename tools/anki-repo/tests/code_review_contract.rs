@@ -1,5 +1,6 @@
 //! Сквозные проверки контрактов CLI на синтетических Git-репозиториях.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -588,10 +589,10 @@ fn human_review_summary_preserves_snapshot_and_evidence_meaning() {
         format!("HEAD: {head}"),
         format!("Общий предок (merge-base): {base}"),
         "Статусы файлов: изменён: 1".into(),
-        format!("Raw candidates: {}", result["candidates"]),
+        format!("Сырых кандидатов: {}", result["candidates"]),
         "review-queue.json".into(),
-        "Полные evidence: review.json".into(),
-        "Диагностик: 0 (сами по себе не являются подтверждёнными замечаниями)".into(),
+        "Полные свидетельства: review.json".into(),
+        "Диагностик: 0".into(),
         "Анализатор clippy: skipped".into(),
     ] {
         assert!(
@@ -770,6 +771,25 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         queue["summary"]["raw_candidates"]
     );
 
+    let (_, page) = queue_list_page(
+        repo.path(),
+        &pack_path,
+        &queue_path,
+        &["--limit", "200", "--detector", "error_path"],
+    );
+    let listed_group = page["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["id"] == group["id"])
+        .unwrap();
+    assert_eq!(listed_group["candidate_id"], Value::Null);
+    assert_eq!(listed_group["candidate_count"], 1_200);
+    assert_eq!(
+        listed_group["representative_candidate_ids"],
+        group["members"]["representative_candidate_ids"]
+    );
+
     let group_id = group["id"].as_str().unwrap();
     let (code, stdout, stderr) = run_cli_in(
         Some(repo.path()),
@@ -821,6 +841,28 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         candidate_id
     );
 
+    for (subcommand, id, label) in [
+        ("group", group_id, "Группа"),
+        ("candidate", candidate_id, "Кандидат"),
+    ] {
+        let (code, stdout, stderr) = run_cli_in(
+            Some(repo.path()),
+            &[
+                "code-review",
+                "queue",
+                subcommand,
+                "--pack",
+                &pack_arg,
+                "--queue",
+                &queue_arg,
+                "--id",
+                id,
+            ],
+        );
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains(label) && stdout.contains(id), "{stdout}");
+    }
+
     let individual_id = queue["units"]
         .as_array()
         .unwrap()
@@ -862,6 +904,28 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         );
     }
 
+    for subcommand in ["group", "candidate"] {
+        let (code, stdout, stderr) = run_cli_in(
+            Some(repo.path()),
+            &[
+                "code-review",
+                "queue",
+                subcommand,
+                "--pack",
+                &pack_arg,
+                "--queue",
+                &queue_arg,
+                "--id",
+                "missing-id",
+            ],
+        );
+        assert_eq!(code, 4, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            !stderr.is_empty(),
+            "human ошибка должна быть доступна в stderr"
+        );
+    }
+
     let tampered_pack_path = artifacts.path().join("review-with-whitespace.json");
     let mut tampered = pack_bytes;
     tampered.push(b' ');
@@ -885,6 +949,751 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         parse_json(&stdout)["error"]["code"],
         "review_artifact_invalid"
     );
+}
+
+fn queue_list_page(root: &Path, pack: &Path, queue: &Path, options: &[&str]) -> (String, Value) {
+    let mut args = vec![
+        "--json",
+        "code-review",
+        "queue",
+        "list",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--queue",
+        queue.to_str().unwrap(),
+    ];
+    args.extend_from_slice(options);
+    let (code, stdout, stderr) = run_cli_in(Some(root), &args);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let result = parse_json(&stdout)["result"].clone();
+    (stdout, result)
+}
+
+fn listed_unit_ids(root: &Path, pack: &Path, queue: &Path, filters: &[&str]) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut offset = 0;
+    loop {
+        let offset_arg = offset.to_string();
+        let mut options = filters.to_vec();
+        options.extend_from_slice(&["--limit", "17", "--offset", &offset_arg]);
+        let (stdout, page) = queue_list_page(root, pack, queue, &options);
+        let (repeated_stdout, _) = queue_list_page(root, pack, queue, &options);
+        assert_eq!(
+            stdout, repeated_stdout,
+            "страница должна сериализоваться детерминированно"
+        );
+        let rows = page["units"].as_array().unwrap();
+        assert_eq!(page["offset"], offset);
+        assert_eq!(page["limit"], 17);
+        assert_eq!(page["returned_units"], rows.len());
+        for row in rows {
+            ids.push(row["id"].as_str().unwrap().to_owned());
+        }
+        offset += rows.len();
+        assert_eq!(
+            page["has_more"],
+            offset < page["matched_units"].as_u64().unwrap() as usize
+        );
+        if page["has_more"] == false {
+            assert_eq!(offset, page["matched_units"].as_u64().unwrap() as usize);
+            break;
+        }
+        assert!(
+            !rows.is_empty(),
+            "пустая страница не должна обещать продолжение"
+        );
+    }
+    assert_eq!(
+        ids.len(),
+        ids.iter().collect::<BTreeSet<_>>().len(),
+        "страницы повторили ID"
+    );
+    ids
+}
+
+#[test]
+fn queue_list_pages_all_high_and_unknown_units_without_losing_raw_identity() {
+    let repo = TempDir::new("review-queue-navigation");
+    let artifacts = TempDir::new("review-queue-navigation-artifacts");
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    commit(repo.path(), "база");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    let mut production = String::new();
+    let mut ambiguous = String::new();
+    for index in 0..64 {
+        production.push_str(&format!(
+            "// Human explanation for boundary {index}\npub fn boundary_{index}(path: &str) {{ let _ = std::fs::read(path).unwrap(); }}\n"
+        ));
+        ambiguous.push_str(&format!(
+            "const RUNTIME_{index}: i32 = todo!(); #[cfg(test)] mod test_{index} {{ const TEST: i32 = todo!(); }}\n"
+        ));
+    }
+    fs::write(repo.path().join("src/lib.rs"), production).unwrap();
+    fs::write(repo.path().join("src/ambiguous.rs"), ambiguous).unwrap();
+    commit(
+        repo.path(),
+        "добавить много отдельных доказанных и неизвестных контекстов",
+    );
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let output = artifacts.path().join("collected");
+    let collected = collect_pack(repo.path(), &base, &head, &output, false);
+    let pack_path = output.join("review.json");
+    let queue_path = output.join("review-queue.json");
+    let pack_bytes = fs::read(&pack_path).unwrap();
+    let queue_bytes = fs::read(&queue_path).unwrap();
+    let pack: Value = serde_json::from_slice(&pack_bytes).unwrap();
+    let queue: Value = serde_json::from_slice(&queue_bytes).unwrap();
+    let units = queue["units"].as_array().unwrap();
+    assert!(!pack["candidates"].as_array().unwrap().is_empty());
+    assert!(
+        !pack["language"]["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let raw_ids: BTreeSet<_> = pack["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(pack["language"]["candidates"].as_array().unwrap())
+        .map(|candidate| candidate["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        raw_ids.len(),
+        collected["candidates"].as_u64().unwrap() as usize
+    );
+    let ordered: Vec<_> = units
+        .iter()
+        .map(|unit| {
+            let rank = match unit["priority"].as_str().unwrap() {
+                "high" => 0,
+                "normal" => 1,
+                "low" => 2,
+                other => panic!("неизвестный приоритет {other}"),
+            };
+            (rank, unit["id"].as_str().unwrap())
+        })
+        .collect();
+    assert!(
+        ordered.windows(2).all(|pair| pair[0] < pair[1]),
+        "порядок очереди должен зависеть от приоритета и ID"
+    );
+    let mut represented = Vec::new();
+    for unit in units {
+        let members = &unit["members"];
+        if members["kind"] == "individual" {
+            represented.push(members["candidate_id"].as_str().unwrap());
+        } else {
+            represented.extend(
+                members["candidate_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| id.as_str().unwrap()),
+            );
+        }
+    }
+    assert_eq!(represented.len(), raw_ids.len());
+    assert_eq!(represented.into_iter().collect::<BTreeSet<_>>(), raw_ids);
+    let expected_ids: Vec<_> = units
+        .iter()
+        .map(|unit| unit["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        listed_unit_ids(repo.path(), &pack_path, &queue_path, &[]),
+        expected_ids
+    );
+
+    let (_, first_page) = queue_list_page(repo.path(), &pack_path, &queue_path, &[]);
+    assert_eq!(first_page["total_units"], units.len());
+    assert_eq!(first_page["matched_units"], units.len());
+    assert_eq!(first_page["limit"], 50);
+    assert_eq!(first_page["offset"], 0);
+    assert_eq!(first_page["returned_units"], 50);
+    assert_eq!(first_page["has_more"], true);
+    let page_fields: BTreeSet<_> = first_page
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        page_fields,
+        BTreeSet::from([
+            "total_units",
+            "matched_units",
+            "offset",
+            "limit",
+            "returned_units",
+            "has_more",
+            "units"
+        ])
+    );
+    for row in first_page["units"].as_array().unwrap() {
+        let fields: BTreeSet<_> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "id",
+                "kind",
+                "priority",
+                "classification",
+                "detector",
+                "candidate_count",
+                "candidate_id",
+                "representative_candidate_ids"
+            ])
+        );
+        assert!(row.get("snippet").is_none());
+        assert!(row["classification"].is_object());
+        let unit = units.iter().find(|unit| unit["id"] == row["id"]).unwrap();
+        assert_eq!(row["classification"], unit["signature"]["classification"]);
+        assert_eq!(row["detector"], unit["signature"]["detector"]);
+        assert_eq!(row["kind"], unit["members"]["kind"]);
+        let members = &unit["members"];
+        assert_eq!(
+            row["candidate_id"],
+            if members["kind"] == "individual" {
+                members["candidate_id"].clone()
+            } else {
+                Value::Null
+            }
+        );
+        let expected_representatives = if members["kind"] == "individual" {
+            json!([])
+        } else {
+            members["representative_candidate_ids"].clone()
+        };
+        let expected_count = if members["kind"] == "individual" {
+            1
+        } else {
+            members["candidate_ids"].as_array().unwrap().len()
+        };
+        assert_eq!(row["candidate_count"], expected_count);
+        assert_eq!(
+            row["representative_candidate_ids"],
+            expected_representatives
+        );
+        assert!(
+            row["representative_candidate_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|id| raw_ids.contains(id.as_str().unwrap()))
+        );
+    }
+
+    let filter_cases: &[(&[&str], &str, &str)] = &[
+        (&["--priority", "high"], "priority", "high"),
+        (&["--priority", "normal"], "priority", "normal"),
+        (&["--priority", "low"], "priority", "low"),
+        (&["--detector", "error_path"], "detector", "error_path"),
+        (&["--surface", "production"], "surfaces", "production"),
+        (&["--execution", "production"], "execution", "production"),
+        (&["--role", "error_path"], "role", "error_path"),
+        (
+            &["--text-role", "human_comment"],
+            "text_role",
+            "human_comment",
+        ),
+        (
+            &["--code-role", "runtime_boundary"],
+            "code_role",
+            "runtime_boundary",
+        ),
+    ];
+    for (options, dimension, expected) in filter_cases {
+        let expected_filtered: Vec<_> = units
+            .iter()
+            .filter(|unit| match *dimension {
+                "priority" => unit["priority"] == *expected,
+                "detector" => unit["signature"]["detector"] == *expected,
+                "surfaces" => unit["signature"]["classification"]["surfaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|surface| surface == expected),
+                _ => unit["signature"]["classification"][dimension] == *expected,
+            })
+            .map(|unit| unit["id"].as_str().unwrap().to_owned())
+            .collect();
+        if *expected == "high" {
+            assert!(
+                expected_filtered.len() > 50,
+                "high должен занимать больше одной стандартной страницы"
+            );
+        }
+        assert_eq!(
+            listed_unit_ids(repo.path(), &pack_path, &queue_path, options),
+            expected_filtered,
+            "фильтр {options:?}"
+        );
+    }
+    let unknown_ids: Vec<_> = units
+        .iter()
+        .filter(|unit| {
+            let class: anki_repo::code_review::review_queue::StructuralClassification =
+                serde_json::from_value(unit["signature"]["classification"].clone()).unwrap();
+            class.is_unknown()
+        })
+        .map(|unit| unit["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        unknown_ids.len() > 50,
+        "unknown должен занимать больше одной стандартной страницы"
+    );
+    assert_eq!(
+        listed_unit_ids(repo.path(), &pack_path, &queue_path, &["--unknown"]),
+        unknown_ids
+    );
+    let combined: Vec<_> = units
+        .iter()
+        .filter(|unit| {
+            unit["priority"] == "high"
+                && unit["signature"]["detector"] == "error_path"
+                && unit["signature"]["classification"]["execution"] == "production"
+                && unit["signature"]["classification"]["code_role"] == "runtime_boundary"
+        })
+        .map(|unit| unit["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        listed_unit_ids(
+            repo.path(),
+            &pack_path,
+            &queue_path,
+            &[
+                "--priority",
+                "high",
+                "--detector",
+                "error_path",
+                "--execution",
+                "production",
+                "--code-role",
+                "runtime_boundary"
+            ]
+        ),
+        combined
+    );
+    let (_, empty) = queue_list_page(
+        repo.path(),
+        &pack_path,
+        &queue_path,
+        &["--detector", "missing_detector"],
+    );
+    assert_eq!(empty["total_units"], units.len());
+    assert_eq!(empty["matched_units"], 0);
+    assert_eq!(empty["returned_units"], 0);
+    assert_eq!(empty["has_more"], false);
+    let beyond = (units.len() + 1).to_string();
+    let (_, empty) = queue_list_page(repo.path(), &pack_path, &queue_path, &["--offset", &beyond]);
+    assert_eq!(empty["matched_units"], units.len());
+    assert_eq!(empty["returned_units"], 0);
+    assert_eq!(empty["has_more"], false);
+
+    let text = fs::read_to_string(output.join("review.txt")).unwrap();
+    assert!(
+        text.lines().count() < 150,
+        "сводка должна оставаться компактной"
+    );
+    assert!(
+        text.contains("queue list"),
+        "сводка должна указывать путь к остальным страницам"
+    );
+    assert!(
+        expected_ids.iter().any(|id| !text.contains(id)),
+        "fixture должен воспроизводить обрезку сводки"
+    );
+    for subcommand in ["validate", "summary", "list"] {
+        let (code, stdout, stderr) = run_cli_in(
+            Some(repo.path()),
+            &[
+                "code-review",
+                "queue",
+                subcommand,
+                "--pack",
+                pack_path.to_str().unwrap(),
+                "--queue",
+                queue_path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        if subcommand == "list" {
+            assert!(
+                stdout.contains("Всего единиц")
+                    && stdout.contains("совпало")
+                    && stdout.contains("показано")
+                    && stdout.contains("следующая страница"),
+                "{stdout}"
+            );
+            let individual_id = first_page["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|unit| unit["kind"] == "individual")
+                .unwrap()["candidate_id"]
+                .as_str()
+                .unwrap();
+            assert!(stdout.contains("Исходный ID кандидата"));
+            assert!(stdout.contains(individual_id), "{stdout}");
+        } else {
+            assert!(
+                stdout.contains("очеред") || stdout.contains("Очеред"),
+                "{stdout}"
+            );
+        }
+        for untranslated in [
+            "Raw candidates:",
+            "Grouped candidates:",
+            "Execution:",
+            "Classification и priority",
+            "Candidates:",
+        ] {
+            assert!(!stdout.contains(untranslated), "{stdout}");
+        }
+    }
+    let candidate_id = first_page["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["kind"] == "individual")
+        .unwrap()["candidate_id"]
+        .as_str()
+        .unwrap();
+    let (_, raw_detail, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "candidate",
+            "--pack",
+            pack_path.to_str().unwrap(),
+            "--queue",
+            queue_path.to_str().unwrap(),
+            "--id",
+            candidate_id,
+        ],
+    );
+    assert!(stderr.is_empty());
+    let detail = parse_json(&raw_detail)["result"].clone();
+    assert_eq!(detail["candidate"]["id"], candidate_id);
+    if let Some(raw) = pack["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["id"] == candidate_id)
+    {
+        assert_eq!(
+            detail["candidate"], *raw,
+            "queue candidate сохраняет полные исходные свидетельства"
+        );
+    }
+
+    let triage_path = artifacts.path().join("semantic-triage.json");
+    for json_mode in [true, false] {
+        let initialized = artifacts.path().join(if json_mode {
+            "init-json.json"
+        } else {
+            "init-human.json"
+        });
+        let mut args = vec![
+            "code-review",
+            "triage",
+            "init",
+            "--pack",
+            pack_path.to_str().unwrap(),
+            "--out",
+            initialized.to_str().unwrap(),
+        ];
+        if json_mode {
+            args.insert(0, "--json");
+        }
+        let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &args);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        let initial: Value = serde_json::from_slice(&fs::read(&initialized).unwrap()).unwrap();
+        assert_eq!(initial["individual_decisions"], json!([]));
+        assert_eq!(initial["group_decisions"], json!([]));
+        assert_eq!(
+            initial["unreviewed_candidate_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            raw_ids
+        );
+        let mut decided = initial;
+        decided["unreviewed_candidate_ids"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|id| id != candidate_id);
+        decided["individual_decisions"] = json!([{
+            "candidate_id": candidate_id, "disposition": "uncertain", "reason_code": "insufficient_evidence",
+            "explanation": "Синтетическое решение сохранено по исходному ID; требуется семантическое ревью.", "finding_ids": []
+        }]);
+        fs::write(&triage_path, serde_json::to_vec_pretty(&decided).unwrap()).unwrap();
+        let mut args = vec![
+            "code-review",
+            "triage",
+            "validate",
+            "--pack",
+            pack_path.to_str().unwrap(),
+            "--triage",
+            triage_path.to_str().unwrap(),
+        ];
+        if json_mode {
+            args.insert(0, "--json");
+        }
+        let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &args);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        if json_mode {
+            let summary = parse_json(&stdout)["result"]["summary"].clone();
+            assert_eq!(summary["reviewed_candidates"], 1);
+            assert_eq!(summary["unreviewed_candidates"], raw_ids.len() - 1);
+        }
+    }
+    let canonical_a = artifacts.path().join("triage-canonical-a.json");
+    let canonical_b = artifacts.path().join("triage-canonical-b.json");
+    for canonical in [&canonical_a, &canonical_b] {
+        let (code, stdout, stderr) = run_cli_in(
+            Some(repo.path()),
+            &[
+                "--json",
+                "code-review",
+                "triage",
+                "validate",
+                "--pack",
+                pack_path.to_str().unwrap(),
+                "--triage",
+                triage_path.to_str().unwrap(),
+                "--canonical-out",
+                canonical.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    }
+    assert_eq!(
+        fs::read(&canonical_a).unwrap(),
+        fs::read(&canonical_b).unwrap(),
+        "канонический triage должен быть детерминирован"
+    );
+    collect_pack(repo.path(), &base, &head, &output, false);
+    assert_eq!(fs::read(&pack_path).unwrap(), pack_bytes);
+    assert_eq!(fs::read(&queue_path).unwrap(), queue_bytes);
+
+    let tampered_path = artifacts.path().join("changed-review.json");
+    let mut tampered = pack_bytes;
+    tampered.push(b' ');
+    fs::write(&tampered_path, tampered).unwrap();
+    for json_mode in [true, false] {
+        let mut args = vec![
+            "code-review",
+            "queue",
+            "list",
+            "--pack",
+            tampered_path.to_str().unwrap(),
+            "--queue",
+            queue_path.to_str().unwrap(),
+            "--detector",
+            "missing_detector",
+            "--offset",
+            &beyond,
+        ];
+        if json_mode {
+            args.insert(0, "--json");
+        }
+        let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &args);
+        assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+        if json_mode {
+            let envelope = parse_json(&stdout);
+            assert_eq!(envelope["error"]["code"], "review_artifact_invalid");
+            assert!(envelope.get("result").is_none());
+            assert!(stderr.is_empty());
+        } else {
+            assert!(
+                stdout.is_empty(),
+                "human-ошибка не должна содержать страницу: {stdout}"
+            );
+            assert!(!stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn queue_list_help_explains_filters_and_rejects_invalid_pages() {
+    let (code, help, stderr) = run_cli(&["code-review", "queue", "list", "--help"]);
+    assert_eq!(code, 0, "{stderr}");
+    for flag in [
+        "--pack",
+        "--queue",
+        "--limit",
+        "--offset",
+        "--priority",
+        "--unknown",
+        "--detector",
+        "--surface",
+        "--execution",
+        "--role",
+        "--text-role",
+        "--code-role",
+    ] {
+        assert!(help.contains(flag), "отсутствует {flag}: {help}");
+    }
+    assert!(help.contains("review.json") && help.contains("review-queue.json"));
+    assert!(help.contains("Путь к исходному пакету"));
+    assert!(help.contains("Путь к структурной очереди"));
+    assert!(help.contains("страниц") && help.contains("Смещ"));
+    for (subcommand, description) in [
+        ("group", "Точный ID группы"),
+        ("candidate", "Точный ID candidate"),
+    ] {
+        let (code, detail_help, stderr) = run_cli(&["code-review", "queue", subcommand, "--help"]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(detail_help.contains("Путь к исходному пакету"));
+        assert!(detail_help.contains("Путь к структурной очереди"));
+        assert!(detail_help.contains(description), "{detail_help}");
+    }
+    for limit in ["0", "201"] {
+        let (code, _, stderr) = run_cli(&[
+            "code-review",
+            "queue",
+            "list",
+            "--pack",
+            "review.json",
+            "--queue",
+            "review-queue.json",
+            "--limit",
+            limit,
+        ]);
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("--limit"));
+    }
+}
+
+#[test]
+fn rust_text_roles_remain_orthogonal_to_execution_and_grouping() {
+    let repo = TempDir::new("rust-text-role-separation");
+    let artifacts = TempDir::new("rust-text-role-separation-artifacts");
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    commit(repo.path(), "база");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    let source = r#"
+fn production_log_a() { println!("Shared log phrase"); }
+fn production_log_b() { eprintln!("Shared log phrase"); }
+#[test] fn test_log_a() { println!("Shared log phrase"); }
+#[test] fn test_log_b() { eprintln!("Shared log phrase"); }
+fn production_json_a() { let _ = serde_json::json!({"message": "Shared machine phrase"}); }
+fn production_json_b() { let _ = serde_json::json!({"message": "Shared machine phrase"}); }
+#[test] fn test_json_a() { let _ = serde_json::json!({"message": "Shared machine phrase"}); }
+#[test] fn test_json_b() { let _ = serde_json::json!({"message": "Shared machine phrase"}); }
+#[test] fn fixture() { let _ = include_str!("fixtures/input.json"); assert_eq!(1, 1, "Fixture phrase"); }
+#[test] fn unknown_context() { user_macro!("Unclassified phrase"); }
+"#;
+    fs::write(repo.path().join("src/lib.rs"), source).unwrap();
+    commit(repo.path(), "добавить строки разных ролей и контекстов");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let output = artifacts.path().join("collected");
+    collect_pack(repo.path(), &base, &head, &output, false);
+    let pack: Value =
+        serde_json::from_slice(&fs::read(output.join("review.json")).unwrap()).unwrap();
+    let queue: Value =
+        serde_json::from_slice(&fs::read(output.join("review-queue.json")).unwrap()).unwrap();
+    let candidates = pack["language"]["candidates"].as_array().unwrap();
+    let ids_for_text = |text: &str| -> Vec<String> {
+        candidates
+            .iter()
+            .filter(|candidate| candidate["text"] == text)
+            .map(|candidate| candidate["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let log_ids = ids_for_text("Shared log phrase");
+    assert_eq!(log_ids.len(), 4);
+    let mut log_executions = BTreeSet::new();
+    for id in &log_ids {
+        let classification = &queue["classifications"][id];
+        assert_eq!(classification["text_role"], "human_log");
+        log_executions.insert(classification["execution"].as_str().unwrap());
+        let unit = queue["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|unit| {
+                unit["members"]["candidate_id"].as_str() == Some(id.as_str())
+                    || unit["members"]["candidate_ids"]
+                        .as_array()
+                        .is_some_and(|members| members.iter().any(|member| member == id))
+            })
+            .unwrap();
+        assert_eq!(unit["members"]["kind"], "individual");
+    }
+    assert_eq!(log_executions, BTreeSet::from(["production", "tests"]));
+
+    let machine_ids = ids_for_text("Shared machine phrase");
+    assert_eq!(machine_ids.len(), 4);
+    let machine_units: Vec<_> = machine_ids
+        .iter()
+        .map(|id| {
+            let classification = &queue["classifications"][id];
+            assert_eq!(classification["text_role"], "machine_contract");
+            queue["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|unit| {
+                    unit["members"]["candidate_ids"]
+                        .as_array()
+                        .is_some_and(|members| members.iter().any(|member| member == id))
+                })
+                .unwrap()
+        })
+        .collect();
+    let mut grouped_ids = BTreeSet::new();
+    let mut execution_groups = BTreeSet::new();
+    for unit in &machine_units {
+        assert_eq!(unit["members"]["kind"], "group");
+        let group_execution = unit["signature"]["classification"]["execution"]
+            .as_str()
+            .unwrap();
+        let members = unit["members"]["candidate_ids"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        for id in members {
+            let classification = &queue["classifications"][id.as_str().unwrap()];
+            assert_eq!(classification["execution"], group_execution);
+        }
+        grouped_ids.insert(unit["id"].as_str().unwrap());
+        execution_groups.insert(group_execution);
+    }
+    assert_eq!(grouped_ids.len(), 2);
+    assert_eq!(execution_groups, BTreeSet::from(["production", "tests"]));
+
+    let fixture_ids = ids_for_text("Fixture phrase");
+    assert_eq!(fixture_ids.len(), 1);
+    assert_eq!(
+        queue["classifications"][&fixture_ids[0]]["text_role"],
+        "test_fixture"
+    );
+    assert_eq!(
+        queue["classifications"][&fixture_ids[0]]["execution"],
+        "tests"
+    );
+    let unknown_ids = ids_for_text("Unclassified phrase");
+    assert_eq!(unknown_ids.len(), 1);
+    assert_eq!(
+        queue["classifications"][&unknown_ids[0]]["text_role"],
+        "unknown"
+    );
+    let unknown_class: anki_repo::code_review::review_queue::StructuralClassification =
+        serde_json::from_value(queue["classifications"][&unknown_ids[0]].clone()).unwrap();
+    assert!(unknown_class.is_unknown());
 }
 
 #[test]
@@ -979,6 +1788,112 @@ fn collect_uses_rust_test_surface_and_canonical_file_surface_labels() {
     assert_eq!(classification["code_role"], "test_helper");
     assert!(summary.contains("agent_context: 1"));
     assert!(!summary.contains("agentcontext"));
+}
+
+#[test]
+fn collect_distinguishes_function_tests_and_resolved_io_boundaries() {
+    let repo = TempDir::new("collect-function-test-boundaries");
+    let artifacts = TempDir::new("collect-function-test-boundaries-artifacts");
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    commit(repo.path(), "база");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    let mut source =
+        String::from("struct File; impl File { fn open(_: &str) -> Result<(), ()> { Ok(()) } }\n");
+    for (attribute, name) in [
+        ("#[test]", "ordinary_test"),
+        ("#[tokio::test]", "async_test"),
+        ("", "production"),
+    ] {
+        source.push_str(&format!("{attribute}\nfn {name}() {{\n"));
+        for _ in 0..8 {
+            source.push_str("    let _ = None::<u8>.unwrap();\n");
+        }
+        source.push_str("}\n");
+    }
+    source.push_str("#[unknown::test]\nfn unresolved_test() { let _ = None::<u8>.unwrap(); }\n");
+    source.push_str("fn local_type() { let _ = File::open(\"data\").unwrap(); }\n");
+    source.push_str("fn proven_io() { let _ = std::fs::File::open(\"data\").unwrap(); }\n");
+    fs::write(repo.path().join("src/lib.rs"), source).unwrap();
+    commit(repo.path(), "добавить атрибуты функций и одноимённые типы");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let output = artifacts.path().join("collected");
+    collect_pack(repo.path(), &base, &head, &output, false);
+    let pack: Value =
+        serde_json::from_slice(&fs::read(output.join("review.json")).unwrap()).unwrap();
+    let queue: Value =
+        serde_json::from_slice(&fs::read(output.join("review-queue.json")).unwrap()).unwrap();
+    let candidates = pack["candidates"].as_array().unwrap();
+    let units = queue["units"].as_array().unwrap();
+    let detail = |fragment: &str| {
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                candidate["detector"] == "error_path"
+                    && candidate["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains(fragment))
+            })
+            .unwrap();
+        &queue["classifications"][candidate["id"].as_str().unwrap()]
+    };
+    assert_eq!(detail("fn local_type")["execution"], "production");
+    assert_eq!(detail("fn local_type")["code_role"], "runtime");
+    assert_eq!(detail("fn proven_io")["code_role"], "runtime_boundary");
+    assert_eq!(detail("fn unresolved_test")["execution"], Value::Null);
+    assert_eq!(detail("fn unresolved_test")["code_role"], "unknown");
+    let setup_group = units
+        .iter()
+        .find(|unit| {
+            unit["members"]["kind"] == "group"
+                && unit["signature"]["classification"]["code_role"] == "test_setup"
+        })
+        .expect("доказанные функции test должны образовать отдельную группу");
+    assert_eq!(
+        setup_group["signature"]["classification"]["execution"],
+        "tests"
+    );
+    assert_eq!(setup_group["priority"], "low");
+    let test_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate["detector"] == "error_path"
+                && queue["classifications"][candidate["id"].as_str().unwrap()]["execution"]
+                    == "tests"
+        })
+        .collect();
+    assert_eq!(test_candidates.len(), 16);
+    for id in setup_group["members"]["candidate_ids"].as_array().unwrap() {
+        assert!(
+            test_candidates
+                .iter()
+                .any(|candidate| candidate["id"] == *id)
+        );
+    }
+    let ordinary = candidates
+        .iter()
+        .find(|candidate| {
+            candidate["detector"] == "error_path"
+                && queue["classifications"][candidate["id"].as_str().unwrap()]["code_role"]
+                    == "runtime"
+                && candidate["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.contains("None::<u8>"))
+        })
+        .unwrap();
+    let ordinary_id = ordinary["id"].as_str().unwrap();
+    assert!(
+        !setup_group["members"]["candidate_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == ordinary_id)
+    );
+    let production_unit = units
+        .iter()
+        .find(|unit| unit["members"]["candidate_id"] == ordinary_id)
+        .unwrap();
+    assert_eq!(production_unit["priority"], "high");
 }
 
 #[test]

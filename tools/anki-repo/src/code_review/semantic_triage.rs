@@ -278,11 +278,11 @@ pub fn source_identity(pack: &ReviewPack, source_pack_sha256: &str) -> TriageSou
     }
 }
 
-/// Проверяет общую immutable-source границу semantic triage и review queue.
+/// Проверяет общую границу неизменного источника для семантического разбора и очереди ревью.
 ///
 /// Дайджест должен быть вычислен по точным байтам `review.json`, а не по
-/// повторно сериализованной структуре. Проверка не присваивает кандидатам
-/// semantic status.
+/// повторно сериализованной структуре. Проверка не назначает кандидатам
+/// семантический статус.
 pub fn validate_source(
     source: &TriageSource,
     pack: &ReviewPack,

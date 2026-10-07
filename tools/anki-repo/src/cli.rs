@@ -53,10 +53,11 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review queue/triage, language, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review queue list/validate/summary/group/candidate, triage, language, edit, models, create, retire, migrate-media, visual-report",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
-                  visual-report и code-review collect/verify/delta только читают\n\
+                  visual-report, code-review collect/verify/delta и code-review queue\n\
+                  list/validate/summary/group/candidate только читают\n\
                   зафиксированное состояние репозитория; code-review сохраняет локальные\n\
                   артефакты с точной идентичностью Git-снимка. Семантический разбор отдельно\n\
                   сохраняет и проверяет решения внешнего семантического ревьюера.\n\
@@ -109,6 +110,7 @@ impl Cli {
                 CodeReviewCommand::Verify { .. } => "code-review verify",
                 CodeReviewCommand::Delta { .. } => "code-review delta",
                 CodeReviewCommand::Queue { command } => match command {
+                    ReviewQueueCommand::List { .. } => "code-review queue list",
                     ReviewQueueCommand::Validate { .. } => "code-review queue validate",
                     ReviewQueueCommand::Summary { .. } => "code-review queue summary",
                     ReviewQueueCommand::Group { .. } => "code-review queue group",
@@ -555,7 +557,7 @@ pub enum CodeReviewCommand {
         out: Option<PathBuf>,
     },
 
-    /// Проверить и просматривать детерминированную структурную очередь.
+    /// Проверить, просматривать и фильтровать детерминированную структурную очередь.
     Queue {
         #[command(subcommand)]
         command: ReviewQueueCommand,
@@ -568,41 +570,110 @@ pub enum CodeReviewCommand {
     },
 }
 
-/// Read-only операции над очередью, привязанной к точным байтам `review.json`.
+/// Операции чтения над очередью, привязанной к точным байтам `review.json`.
 #[derive(Debug, Subcommand)]
 pub enum ReviewQueueCommand {
-    /// Проверить источник, полноту покрытия и структуру queue artifact.
-    Validate {
+    /// Вывести страницу элементов очереди, отобранных по приоритету и классификации.
+    #[command(
+        long_about = "Отобрать элементы структурной очереди и показать страницу результатов.\n\
+                      PACK — исходный review.json; QUEUE — review-queue.json для того же пакета.\n\
+                      Значения фильтров классификации задаются точно, в формате snake_case.\n\
+                      --surface: production, tests, ci, config, docs, generated, data,\n\
+                      agent_context, dependencies, unknown. --execution: production, tests,\n\
+                      unknown. --role: text, error_path, security, suppression, test_change,\n\
+                      dependency, configuration, generated, repository_context, path,\n\
+                      development_reference, unknown. --text-role: human_comment,\n\
+                      human_documentation, human_log, human_diagnostic, human_help, human_ui,\n\
+                      technical_identifier, machine_contract, external_literal, path, url,\n\
+                      cli_flag, code_example, test_fixture, unknown. --code-role: runtime,\n\
+                      runtime_boundary, test_setup, test_assertion, test_helper, unknown.\n\
+                      --priority принимает high, normal или low."
+    )]
+    List {
+        /// Путь к исходному пакету свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
+        /// Путь к структурной очереди `review-queue.json` для указанного пакета.
+        #[arg(long, value_name = "QUEUE")]
+        queue: PathBuf,
+        /// Число элементов на странице (от 1 до 200).
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_parser = clap::value_parser!(u64).range(1..=200),
+        )]
+        limit: u64,
+        /// Смещение от начала отсортированной очереди.
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        /// Оставить элементы с приоритетом high, normal или low.
+        #[arg(long, value_name = "PRIORITY")]
+        priority: Option<String>,
+        /// Оставить только элементы с неизвестной структурной классификацией.
+        #[arg(long)]
+        unknown: bool,
+        /// Имя детектора, сформировавшего исходного кандидата.
+        #[arg(long, value_name = "DETECTOR")]
+        detector: Option<String>,
+        /// Каноническая поверхность файла: например, production, tests или docs.
+        #[arg(long, value_name = "SURFACE")]
+        surface: Option<String>,
+        /// Исполняемая поверхность: production или tests.
+        #[arg(long, value_name = "EXECUTION")]
+        execution: Option<String>,
+        /// Каноническая структурная роль, например security или error_path.
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
+        /// Каноническая роль текста, например human_documentation или cli_flag.
+        #[arg(long = "text-role", value_name = "TEXT_ROLE")]
+        text_role: Option<String>,
+        /// Каноническая роль кода: runtime, runtime_boundary или роль теста.
+        #[arg(long = "code-role", value_name = "CODE_ROLE")]
+        code_role: Option<String>,
+    },
+
+    /// Проверить источник, полноту покрытия и структуру queue artifact.
+    Validate {
+        /// Путь к исходному пакету свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
     },
 
     /// Показать агрегированную сводку очереди.
     Summary {
+        /// Путь к исходному пакету свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
+        /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
     },
 
     /// Раскрыть одну группу, включая полное множество исходных candidate IDs.
     Group {
+        /// Путь к исходному пакету свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
+        /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
+        /// Точный ID группы из `review-queue.json`.
         #[arg(long, value_name = "ID")]
         id: String,
     },
 
     /// Найти candidate и показать его исходное evidence, классификацию и unit.
     Candidate {
+        /// Путь к исходному пакету свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
+        /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
+        /// Точный ID candidate из исходного `review.json`.
         #[arg(long, value_name = "ID")]
         id: String,
     },

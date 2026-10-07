@@ -24,11 +24,11 @@ use super::model::{
     ReviewScope, ToolRunEvidence,
 };
 use super::review_queue::{
-    self, ClassificationBasis, CodeRole, QueueSummary, ReviewPriority, ReviewQueue, ReviewUnit,
-    StructuralClassification, TextRole,
+    self, ClassificationBasis, CodeRole, QueueListFilters, QueueListPage, QueueSummary,
+    ReviewPriority, ReviewQueue, ReviewUnit, StructuralClassification, StructuralRole, TextRole,
 };
 use super::rust_context::{
-    RustCallKind, RustCodeRole, RustContext, RustContextBasis, RustContextIndex,
+    RustCallContext, RustCallKind, RustCodeRole, RustContext, RustContextBasis, RustContextIndex,
     RustExecutionContext,
 };
 use super::scope::{
@@ -104,6 +104,21 @@ pub struct SemanticTriageReportSummary {
 pub struct ReviewQueueValidationSummary {
     pub valid: bool,
     pub summary: QueueSummary,
+}
+
+/// Значения фильтров CLI до проверки канонических меток.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewQueueListOptions {
+    pub priority: Option<String>,
+    pub unknown: bool,
+    pub detector: Option<String>,
+    pub surface: Option<String>,
+    pub execution: Option<String>,
+    pub role: Option<String>,
+    pub text_role: Option<String>,
+    pub code_role: Option<String>,
+    pub offset: u64,
+    pub limit: u64,
 }
 
 /// Полное свидетельство одного кандидата вместе с его маршрутизацией.
@@ -241,6 +256,192 @@ pub fn summarize_review_queue(
     queue_path: &Path,
 ) -> Result<QueueSummary, DomainError> {
     Ok(load_validated_review_queue(pack_path, queue_path)?.2)
+}
+
+/// Возвращает страницу только после проверки точной привязки обоих артефактов к источнику.
+pub fn list_review_queue(
+    pack_path: &Path,
+    queue_path: &Path,
+    options: &ReviewQueueListOptions,
+) -> Result<QueueListPage, DomainError> {
+    let (_, queue, _) = load_validated_review_queue(pack_path, queue_path)?;
+    if !(1..=200).contains(&options.limit) {
+        return Err(invalid_queue_list_filter(
+            "limit",
+            &options.limit.to_string(),
+        ));
+    }
+    let filters = parse_review_queue_filters(options)?;
+    let offset = usize::try_from(options.offset).map_err(|_| {
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "Смещение очереди слишком велико для этой платформы",
+        )
+    })?;
+    let limit = usize::try_from(options.limit).map_err(|_| {
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "Размер страницы очереди слишком велик для этой платформы",
+        )
+    })?;
+    Ok(review_queue::list_units(&queue, &filters, offset, limit))
+}
+
+fn parse_review_queue_filters(
+    options: &ReviewQueueListOptions,
+) -> Result<QueueListFilters, DomainError> {
+    let priority = parse_queue_filter(
+        options.priority.as_deref(),
+        "priority",
+        &[
+            ("high", ReviewPriority::High),
+            ("normal", ReviewPriority::Normal),
+            ("low", ReviewPriority::Low),
+        ],
+    )?;
+    let detector = options
+        .detector
+        .as_deref()
+        .map(|value| {
+            if is_canonical_filter_label(value) {
+                Ok(value.to_owned())
+            } else {
+                Err(invalid_queue_list_filter("detector", value))
+            }
+        })
+        .transpose()?;
+    let surface = parse_string_queue_filter(
+        options.surface.as_deref(),
+        "surface",
+        &[
+            "production",
+            "tests",
+            "ci",
+            "config",
+            "docs",
+            "generated",
+            "data",
+            "agent_context",
+            "dependencies",
+            "unknown",
+        ],
+    )?;
+    let execution = parse_string_queue_filter(
+        options.execution.as_deref(),
+        "execution",
+        &["production", "tests", "unknown"],
+    )?;
+    let role = parse_queue_filter(
+        options.role.as_deref(),
+        "role",
+        &[
+            ("text", StructuralRole::Text),
+            ("error_path", StructuralRole::ErrorPath),
+            ("security", StructuralRole::Security),
+            ("suppression", StructuralRole::Suppression),
+            ("test_change", StructuralRole::TestChange),
+            ("dependency", StructuralRole::Dependency),
+            ("configuration", StructuralRole::Configuration),
+            ("generated", StructuralRole::Generated),
+            ("repository_context", StructuralRole::RepositoryContext),
+            ("path", StructuralRole::Path),
+            (
+                "development_reference",
+                StructuralRole::DevelopmentReference,
+            ),
+            ("unknown", StructuralRole::Unknown),
+        ],
+    )?;
+    let text_role = parse_queue_filter(
+        options.text_role.as_deref(),
+        "text-role",
+        &[
+            ("human_comment", TextRole::HumanComment),
+            ("human_documentation", TextRole::HumanDocumentation),
+            ("human_log", TextRole::HumanLog),
+            ("human_diagnostic", TextRole::HumanDiagnostic),
+            ("human_help", TextRole::HumanHelp),
+            ("human_ui", TextRole::HumanUi),
+            ("technical_identifier", TextRole::TechnicalIdentifier),
+            ("machine_contract", TextRole::MachineContract),
+            ("external_literal", TextRole::ExternalLiteral),
+            ("path", TextRole::Path),
+            ("url", TextRole::Url),
+            ("cli_flag", TextRole::CliFlag),
+            ("code_example", TextRole::CodeExample),
+            ("test_fixture", TextRole::TestFixture),
+            ("unknown", TextRole::Unknown),
+        ],
+    )?;
+    let code_role = parse_queue_filter(
+        options.code_role.as_deref(),
+        "code-role",
+        &[
+            ("runtime", CodeRole::Runtime),
+            ("runtime_boundary", CodeRole::RuntimeBoundary),
+            ("test_setup", CodeRole::TestSetup),
+            ("test_assertion", CodeRole::TestAssertion),
+            ("test_helper", CodeRole::TestHelper),
+            ("unknown", CodeRole::Unknown),
+        ],
+    )?;
+    Ok(QueueListFilters {
+        priority,
+        unknown_only: options.unknown,
+        detector,
+        surface,
+        execution,
+        role,
+        text_role,
+        code_role,
+    })
+}
+
+fn parse_queue_filter<T: Copy>(
+    value: Option<&str>,
+    flag: &str,
+    labels: &[(&str, T)],
+) -> Result<Option<T>, DomainError> {
+    value
+        .map(|value| {
+            labels
+                .iter()
+                .find_map(|(label, parsed)| (*label == value).then_some(*parsed))
+                .ok_or_else(|| invalid_queue_list_filter(flag, value))
+        })
+        .transpose()
+}
+
+fn parse_string_queue_filter(
+    value: Option<&str>,
+    flag: &str,
+    labels: &[&str],
+) -> Result<Option<String>, DomainError> {
+    value
+        .map(|value| {
+            labels
+                .contains(&value)
+                .then(|| value.to_owned())
+                .ok_or_else(|| invalid_queue_list_filter(flag, value))
+        })
+        .transpose()
+}
+
+fn is_canonical_filter_label(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && !value.starts_with('_')
+        && !value.ends_with('_')
+        && !value.contains("__")
+}
+
+fn invalid_queue_list_filter(flag: &str, value: &str) -> DomainError {
+    DomainError::new(
+        ErrorCode::InvalidRequest,
+        format!("Некорректное значение --{flag}: «{value}»"),
+    )
 }
 
 /// Раскрывает группу до полного списка IDs и полных свидетельств представителей.
@@ -610,6 +811,7 @@ fn save_snapshot(
 struct RustImages {
     index: RustContextIndex,
     source: BTreeMap<String, String>,
+    lines: BTreeMap<String, SourceLines>,
 }
 
 impl RustImages {
@@ -618,8 +820,56 @@ impl RustImages {
             .iter()
             .map(|file| (file.path.clone(), file.content.clone()))
             .collect();
+        let lines = sources
+            .iter()
+            .map(|file| (file.path.clone(), SourceLines::new(&file.content)))
+            .collect();
         let index = RustContextIndex::from_sources(&sources);
-        Self { index, source }
+        Self {
+            index,
+            source,
+            lines,
+        }
+    }
+
+    fn line(&self, path: &str, line: usize) -> Option<&str> {
+        let source = self.source.get(path)?;
+        self.lines.get(path)?.get(source, line)
+    }
+}
+
+/// Смещения строк одного Git image. Диапазоны исключают LF и необязательный CR.
+/// Индекс строится один раз на файл и сохраняет поведение `str::lines()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceLines {
+    ranges: Vec<(usize, usize)>,
+}
+
+impl SourceLines {
+    fn new(source: &str) -> Self {
+        let bytes = source.as_bytes();
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        for (end, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                let content_end = if end > start && bytes[end - 1] == b'\r' {
+                    end - 1
+                } else {
+                    end
+                };
+                ranges.push((start, content_end));
+                start = end + 1;
+            }
+        }
+        if start < bytes.len() {
+            ranges.push((start, bytes.len()));
+        }
+        Self { ranges }
+    }
+
+    fn get<'a>(&self, source: &'a str, line: usize) -> Option<&'a str> {
+        let (start, end) = *self.ranges.get(line.checked_sub(1)?)?;
+        source.get(start..end)
     }
 }
 
@@ -683,7 +933,10 @@ fn syntax_contexts(
                 continue;
             };
             let context = post.index.lookup_range(&candidate.path, start, end);
-            let text_role = classify_rust_text(&candidate, source, &context);
+            let line = candidate
+                .line
+                .and_then(|line| post.line(&candidate.path, line));
+            let text_role = classify_rust_text(&candidate, source, &context, line);
             rust_syntax_context(context, Some(text_role))
         } else {
             let Some(line) = candidate.line else {
@@ -691,21 +944,19 @@ fn syntax_contexts(
             };
             let matches_evidence = |images: &RustImages| {
                 images
-                    .source
-                    .get(&candidate.path)
-                    .and_then(|source| source.lines().nth(line.saturating_sub(1)))
+                    .line(&candidate.path, line)
                     .zip(candidate.snippet.as_deref())
                     .is_some_and(|(source_line, snippet)| source_line.trim() == snippet.trim())
             };
-            let (images, source) = if candidate.snippet.is_some() && matches_evidence(post) {
-                (post, &post.source[&candidate.path])
+            let images = if candidate.snippet.is_some() && matches_evidence(post) {
+                post
             } else if candidate.snippet.is_some() && matches_evidence(base) {
-                (base, &base.source[&candidate.path])
+                base
             } else if candidate.snippet.is_none() {
-                if let Some(source) = post.source.get(&candidate.path) {
-                    (post, source)
-                } else if let Some(source) = base.source.get(&candidate.path) {
-                    (base, source)
+                if post.source.contains_key(&candidate.path) {
+                    post
+                } else if base.source.contains_key(&candidate.path) {
+                    base
                 } else {
                     continue;
                 }
@@ -714,9 +965,11 @@ fn syntax_contexts(
                 // синтаксический контекст несвязанной строки из образа Git.
                 continue;
             };
-            let column = candidate
-                .column
-                .or_else(|| detector_column(source, line, &candidate.signals));
+            let column = candidate.column.or_else(|| {
+                images
+                    .line(&candidate.path, line)
+                    .and_then(|line| detector_column(line, &candidate.signals))
+            });
             rust_syntax_context(images.index.lookup(&candidate.path, line, column), None)
         };
         result.insert(candidate.id, context);
@@ -771,8 +1024,7 @@ fn rust_syntax_context(
     }
 }
 
-fn detector_column(source: &str, line: usize, signals: &[String]) -> Option<usize> {
-    let line_text = source.lines().nth(line.checked_sub(1)?)?;
+fn detector_column(line_text: &str, signals: &[String]) -> Option<usize> {
     let tokens: BTreeSet<&str> = signals
         .iter()
         .filter_map(|signal| match signal.as_str() {
@@ -805,6 +1057,7 @@ fn classify_rust_text(
     candidate: &CandidateEvidence,
     source: &str,
     context: &RustContext,
+    line: Option<&str>,
 ) -> TextRole {
     let text_context = candidate
         .metadata
@@ -814,16 +1067,7 @@ fn classify_rust_text(
     if text_context != Some(super::language::TextContext::StringLiteral) {
         return TextRole::Unknown;
     }
-    if context.execution == RustExecutionContext::Test {
-        return TextRole::TestFixture;
-    }
-    let Some(line_number) = candidate.line else {
-        return TextRole::Unknown;
-    };
-    let line = source
-        .lines()
-        .nth(line_number.saturating_sub(1))
-        .unwrap_or_default();
+    let line = line.unwrap_or_default();
     let Some(call) = context.call_context.as_ref() else {
         return TextRole::Unknown;
     };
@@ -912,7 +1156,38 @@ fn classify_rust_text(
     {
         return TextRole::HumanUi;
     }
+    if context.execution == RustExecutionContext::Test && is_test_fixture_context(call) {
+        return TextRole::TestFixture;
+    }
     TextRole::Unknown
+}
+
+fn is_test_fixture_context(call: &RustCallContext) -> bool {
+    let name = call.path.rsplit("::").next().unwrap_or(&call.path);
+    match call.kind {
+        RustCallKind::Macro => matches!(
+            name,
+            "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "debug_assert"
+                | "debug_assert_eq"
+                | "debug_assert_ne"
+                | "assert_snapshot"
+                | "assert_json_snapshot"
+                | "assert_yaml_snapshot"
+                | "assert_toml_snapshot"
+                | "expect_file"
+                | "include"
+                | "include_bytes"
+                | "include_str"
+        ),
+        RustCallKind::Call | RustCallKind::Method => call
+            .path
+            .split("::")
+            .any(|part| matches!(part, "fixture" | "fixtures" | "snapshot" | "snapshots")),
+        RustCallKind::Attribute => false,
+    }
 }
 
 fn build_pack(root: &Path, collected: CollectedScope, run_clippy: bool) -> ReviewPack {
@@ -1461,17 +1736,17 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
     let summary = &queue.summary;
     let _ = writeln!(
         text,
-        "Raw candidates: {}; review units: {} (individual: {}, group: {})",
+        "Сырых кандидатов: {}; единиц ревью: {} (отдельных: {}, групп: {})",
         summary.raw_candidates, summary.review_units, summary.individual_units, summary.group_units,
     );
     let _ = writeln!(
         text,
-        "Покрыто группами: {} candidates; representatives: {}; unknown: {}",
+        "Кандидатов в группах: {}; представителей: {}; с неизвестной классификацией: {}",
         summary.grouped_candidates, summary.representative_candidates, summary.unknown_candidates,
     );
     let _ = writeln!(
         text,
-        "Приоритет units: {}",
+        "Приоритет единиц ревью: {}",
         display_counts(
             &summary
                 .units_by_priority
@@ -1483,17 +1758,17 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
     );
     let _ = writeln!(
         text,
-        "Детекторы candidates: {}",
+        "Число кандидатов по детекторам: {}",
         display_counts(&summary.by_detector, |key| key.clone())
     );
     let _ = writeln!(
         text,
-        "Поверхности candidates: {}",
+        "Число кандидатов по поверхностям: {}",
         display_counts(&summary.by_surface, |key| key.clone())
     );
     let _ = writeln!(
         text,
-        "Исполняемый контекст: {}; роли: {}; текст: {}; код: {}",
+        "Исполнение: {}; структурные роли: {}; роли текста: {}; роли кода: {}",
         display_counts(&summary.by_execution, |key| key.clone()),
         display_counts(&summary.by_structural_role, |key| key.as_str().to_owned()),
         display_counts(&summary.by_text_role, |key| key.as_str().to_owned()),
@@ -1502,7 +1777,7 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
     if !summary.largest_group_sizes.is_empty() {
         let _ = writeln!(
             text,
-            "Самые крупные группы (число candidates): {}",
+            "Самые крупные группы (число кандидатов): {}",
             summary
                 .largest_group_sizes
                 .iter()
@@ -1529,7 +1804,7 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
         .collect();
     let _ = writeln!(
         text,
-        "Важные individual units ({} показано, максимум 20):",
+        "Важные отдельные единицы ({} показано, максимум 20):",
         important.len()
     );
     for unit in &important {
@@ -1568,7 +1843,7 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
     if important_total > important.len() {
         let _ = writeln!(
             text,
-            "  … ещё {} individual units",
+            "  … ещё {} отдельных единиц",
             important_total - important.len()
         );
     }
@@ -1588,7 +1863,7 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
             .join(", ");
         let _ = writeln!(
             text,
-            "  [{}] {} · {} candidates · {} / {} · reps: {}",
+            "  [{}] {} · кандидатов: {} · детектор: {} · семейство путей: {} · представители: {}",
             unit.priority.as_str(),
             unit.id,
             unit.candidate_ids().len(),
@@ -1601,10 +1876,14 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
         let _ = writeln!(text, "  … ещё {} групп", groups.len() - 20);
     }
     let _ = writeln!(text, "Очередь: review-queue.json");
-    let _ = writeln!(text, "Полные evidence: review.json");
+    let _ = writeln!(text, "Полные свидетельства: review.json");
     let _ = writeln!(
         text,
-        "Приоритет и группа задают навигацию; они не являются semantic decision."
+        "Все единицы доступны постранично через `code-review queue list`."
+    );
+    let _ = writeln!(
+        text,
+        "Приоритет и группа задают навигацию, но не являются семантическим решением."
     );
     let _ = writeln!(
         text,
@@ -2299,7 +2578,10 @@ mod tests {
     }
 
     fn rust_text_candidate(source: &str, text: &str) -> CandidateEvidence {
-        let start = source.find(text).unwrap();
+        rust_text_candidate_at(source, text, source.find(text).unwrap())
+    }
+
+    fn rust_text_candidate_at(source: &str, text: &str, start: usize) -> CandidateEvidence {
         let end = start + text.len();
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -2431,12 +2713,108 @@ fn fixture() { assert_eq!(1, 1, "fixture message"); }
             let start = candidate.metadata["start"].as_u64().unwrap() as usize;
             let end = candidate.metadata["end"].as_u64().unwrap() as usize;
             let context = index.lookup_range("src/context.rs", start, end);
+            let line = candidate
+                .line
+                .and_then(|line| SourceLines::new(source).get(source, line));
             assert_eq!(
-                classify_rust_text(&candidate, source, &context),
+                classify_rust_text(&candidate, source, &context, line),
                 expected,
                 "unexpected role for {text}"
             );
         }
+    }
+
+    #[test]
+    fn rust_test_text_roles_do_not_follow_execution_alone() {
+        let source = r#"
+fn production_log() { println!("Shared message"); }
+#[test]
+fn test_log() { eprintln!("Shared message"); }
+#[test]
+fn fixture() { let _ = include_str!("fixtures/input.json"); }
+#[test]
+fn json_contract() { let _ = serde_json::json!({"message": "JSON contract"}); }
+#[test]
+fn unknown_context() { custom_test_macro!("Unknown macro text"); }
+"#;
+        let index = RustContextIndex::from_sources(&[SourceFile {
+            path: "src/context.rs".into(),
+            content: source.into(),
+        }]);
+        let lines = SourceLines::new(source);
+        let shared: Vec<_> = source.match_indices("Shared message").collect();
+        assert_eq!(shared.len(), 2);
+        for (index_in_source, (start, _)) in shared.iter().enumerate() {
+            let candidate = rust_text_candidate_at(source, "Shared message", *start);
+            let end = start + "Shared message".len();
+            let context = index.lookup_range("src/context.rs", *start, end);
+            let line = candidate.line.and_then(|line| lines.get(source, line));
+            assert_eq!(
+                classify_rust_text(&candidate, source, &context, line),
+                TextRole::HumanLog
+            );
+            assert_eq!(
+                context.execution,
+                if index_in_source == 0 {
+                    RustExecutionContext::Runtime
+                } else {
+                    RustExecutionContext::Test
+                }
+            );
+        }
+
+        for (text, expected) in [
+            ("fixtures/input.json", TextRole::TestFixture),
+            ("JSON contract", TextRole::MachineContract),
+            ("Unknown macro text", TextRole::Unknown),
+        ] {
+            let candidate = rust_text_candidate(source, text);
+            let start = candidate.metadata["start"].as_u64().unwrap() as usize;
+            let end = candidate.metadata["end"].as_u64().unwrap() as usize;
+            let context = index.lookup_range("src/context.rs", start, end);
+            let line = candidate.line.and_then(|line| lines.get(source, line));
+            assert_eq!(
+                classify_rust_text(&candidate, source, &context, line),
+                expected,
+                "unexpected role for {text}"
+            );
+            assert_eq!(context.execution, RustExecutionContext::Test);
+        }
+    }
+
+    #[test]
+    fn source_line_index_matches_lf_crlf_utf8_and_str_lines_edges() {
+        let source = "первая\r\n二行\nпоследняя";
+        let lines = SourceLines::new(source);
+        assert_eq!(lines.get(source, 1), Some("первая"));
+        assert_eq!(lines.get(source, 2), Some("二行"));
+        assert_eq!(lines.get(source, 3), Some("последняя"));
+        assert_eq!(lines.get(source, 0), None);
+        assert_eq!(lines.get(source, 4), None);
+
+        let trailing_newline = "one\r\n\n";
+        let lines = SourceLines::new(trailing_newline);
+        assert_eq!(lines.get(trailing_newline, 1), Some("one"));
+        assert_eq!(lines.get(trailing_newline, 2), Some(""));
+        assert_eq!(lines.get(trailing_newline, 3), None);
+        assert_eq!(SourceLines::new("").get("", 1), None);
+    }
+
+    #[test]
+    fn rust_images_keep_line_indexes_for_each_git_image() {
+        let base = RustImages::new(vec![SourceFile {
+            path: "src/image.rs".into(),
+            content: "fn base() {}\nsecond base line\n".into(),
+        }]);
+        let post = RustImages::new(vec![SourceFile {
+            path: "src/image.rs".into(),
+            content: "первая post строка\r\nпоследняя post строка".into(),
+        }]);
+        assert_eq!(base.line("src/image.rs", 2), Some("second base line"));
+        assert_eq!(post.line("src/image.rs", 1), Some("первая post строка"));
+        assert_eq!(post.line("src/image.rs", 2), Some("последняя post строка"));
+        assert_eq!(base.line("src/image.rs", 3), None);
+        assert_eq!(post.line("src/image.rs", 3), None);
     }
 
     #[test]
