@@ -584,7 +584,7 @@ fn human_review_summary_preserves_snapshot_and_evidence_meaning() {
             "Кандидатов: {} (требуют семантической проверки)",
             result["candidates"]
         ),
-        "suppression src/lib.rs:1 существовал в base".into(),
+        "rust_suppression src/lib.rs:1 существовал в исходной версии".into(),
         "error_path src/lib.rs:4 внесён или изменён диапазоном".into(),
         "Диагностик: 0 (сами по себе не являются подтверждёнными замечаниями)".into(),
         "Анализатор clippy: skipped".into(),

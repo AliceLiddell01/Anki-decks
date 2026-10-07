@@ -1,0 +1,11 @@
+[Unit]
+Description=Ежедневная проверка дискового мусора Anki-decks
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=anki-repository-maintenance.service
+
+[Install]
+WantedBy=timers.target

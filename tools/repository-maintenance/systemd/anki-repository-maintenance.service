@@ -1,0 +1,8 @@
+[Unit]
+Description=Безопасная очистка артефактов Anki-decks
+
+[Service]
+Type=oneshot
+# Установщик подставляет сюда PATH, начинающийся с каталога найденного Cargo.
+@CARGO_PATH_ENV@
+ExecStart=%h/.local/bin/anki-repository-maintenance clean --apply --installed-root
