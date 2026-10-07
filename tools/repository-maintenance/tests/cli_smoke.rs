@@ -3,8 +3,9 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
-use std::process::{Command, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_anki-repository-maintenance");
 const ORPHAN_HELPER_ENV: &str = "ANKI_REPOSITORY_MAINTENANCE_ORPHAN_TEST_ROOT";
@@ -58,13 +59,15 @@ fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
     assert!(before > 2);
     let scan = invoke_scan(&root, &policy, &temp_root, &cache_home);
     assert!(
-        scan.status.code().is_some_and(|code| code <= 1),
+        scan.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&scan.stdout),
         String::from_utf8_lossy(&scan.stderr)
     );
     let scan_json = json(&scan);
     assert_eq!(scan_json["cargo_target"]["action"], "warn");
+    assert_eq!(scan_json["mode"], "scan");
+    assert_eq!(scan_json["cargo_target"]["result"], "not_needed");
     let temp_inventory = scan_json["tmp"]
         .as_array()
         .unwrap()
@@ -83,28 +86,30 @@ fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
     .unwrap();
     let dry = invoke(&root, &policy, &temp_root, &cache_home, false);
     assert!(
-        dry.status.code().is_some_and(|code| code <= 1),
+        dry.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&dry.stdout),
         String::from_utf8_lossy(&dry.stderr)
     );
     let dry_json = json(&dry);
-    assert!(matches!(
-        dry_json["cargo_target"]["action"].as_str(),
-        Some("delete" | "deferred")
-    ));
+    assert_eq!(dry_json["cargo_target"]["action"], "delete", "{dry_json}");
+    assert_eq!(dry_json["mode"], "dry-run");
     assert!(dry_json["cargo_target"]["bytes_before"].as_u64().unwrap() >= before);
     assert!(target.join("synthetic-artifact").exists());
     assert_eq!(directory_entry_names(&target), target_entries_before);
     assert_eq!(allocated_bytes(&target), before);
-    if dry_json["cargo_target"]["action"] == "deferred" {
-        return;
-    }
     assert_eq!(dry_json["cargo_target"]["result"], "planned");
+    let exceeded = invoke_scan(&root, &policy, &temp_root, &cache_home);
+    assert!(exceeded.status.success(), "{}", json(&exceeded));
+    assert_eq!(json(&exceeded)["cargo_target"]["action"], "warn");
+    assert_eq!(
+        json(&exceeded)["cargo_target"]["result"],
+        "threshold_exceeded"
+    );
 
     let applied = invoke(&root, &policy, &temp_root, &cache_home, true);
     assert!(
-        applied.status.code().is_some_and(|code| code <= 1),
+        applied.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&applied.stdout),
         String::from_utf8_lossy(&applied.stderr)
@@ -122,7 +127,7 @@ fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
 
     let repeated = invoke(&root, &policy, &temp_root, &cache_home, true);
     assert!(
-        repeated.status.code().is_some_and(|code| code <= 1),
+        repeated.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&repeated.stdout),
         String::from_utf8_lossy(&repeated.stderr)
@@ -175,7 +180,7 @@ fn cli_preserves_live_unknown_and_unverifiable_tmp_entries() {
     let live_path = live.path().to_path_buf();
     let run = invoke(&root, &policy, &temp_root, &cache_home, true);
     assert!(
-        run.status.code().is_some_and(|code| code <= 1),
+        run.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -249,6 +254,11 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
     );
     let cache_dir = cache_home.join("anki-decks/repository-maintenance/cache-smoke");
     let target_dir = cache_dir.join("target");
+    let cargo = write_cargo(
+        owner.path(),
+        "test \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_TARGET_DIR\" && test \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_BUILD_DIR\"\n",
+    );
+    let runtime = private_runtime(&cache_home);
     let invoked = Command::new(BINARY)
         .args([
             "cache",
@@ -259,11 +269,12 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
             root.to_str().unwrap(),
             "--json",
             "--",
-            "/bin/sh",
-            "-c",
-            "test \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_TARGET_DIR\" && test \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_BUILD_DIR\"",
+            cargo.to_str().unwrap(),
+            "build",
         ])
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("TMPDIR", &temp_root)
         .output()
         .unwrap();
     assert!(
@@ -292,7 +303,7 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
 
     let dry_run = invoke(&root, &policy, &temp_root, &cache_home, false);
     assert!(
-        dry_run.status.code().is_some_and(|code| code <= 1),
+        dry_run.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&dry_run.stdout),
         String::from_utf8_lossy(&dry_run.stderr)
@@ -310,7 +321,7 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
 
     let pruned = invoke(&root, &policy, &temp_root, &cache_home, true);
     assert!(
-        pruned.status.code().is_some_and(|code| code <= 1),
+        pruned.status.success(),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&pruned.stdout),
         String::from_utf8_lossy(&pruned.stderr)
@@ -321,10 +332,428 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
     assert!(!target_dir.exists());
 }
 
-fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply: bool) -> Output {
+struct CacheFixture {
+    owner: TempWorkspace,
+    root: PathBuf,
+    cache_home: PathBuf,
+    temp_root: PathBuf,
+    policy: PathBuf,
+    cache_dir: PathBuf,
+}
+
+impl CacheFixture {
+    fn new() -> Self {
+        let owner = TempWorkspace::create("maintenance-cli-regression").unwrap();
+        let root = owner.path().join("checkout");
+        let cache_home = owner.path().join("cache-home");
+        let temp_root = owner.path().join("tmp");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(&cache_home).unwrap();
+        fs::create_dir_all(&temp_root).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname=\"maintenance_cli_regression\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n").unwrap();
+        fs::write(root.join("Cargo.lock"), "version = 3\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        let policy = owner.path().join("policy.toml");
+        fs::write(&policy, "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_min_age_days=7\norphan_min_age_hours=24\ntmp_top_entries=20\n").unwrap();
+        let cache_dir = cache_home.join("anki-decks/repository-maintenance/fixture");
+        let fixture = Self {
+            owner,
+            root,
+            cache_home,
+            temp_root,
+            policy,
+            cache_dir,
+        };
+        let initialized = fixture.command("init").output().unwrap();
+        assert!(initialized.status.success(), "{}", json(&initialized));
+        fixture
+    }
+
+    fn command(&self, action: &str) -> Command {
+        let mut command = Command::new(BINARY);
+        command
+            .args(["cache", action, "--id", "fixture", "--workspace-root"])
+            .arg(&self.root)
+            .arg("--json")
+            .env("XDG_CACHE_HOME", &self.cache_home)
+            .env("XDG_RUNTIME_DIR", private_runtime(&self.cache_home))
+            .env("TMPDIR", &self.temp_root);
+        command
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.cache_dir.join(".anki-decks-build-cache.json")
+    }
+
+    fn age_marker(&self) {
+        let mut marker: Value = serde_json::from_slice(&fs::read(self.marker()).unwrap()).unwrap();
+        marker["last_used_unix_seconds"] = 1.into();
+        fs::write(self.marker(), serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    fn last_used(&self) -> u64 {
+        let marker: Value = serde_json::from_slice(&fs::read(self.marker()).unwrap()).unwrap();
+        marker["last_used_unix_seconds"].as_u64().unwrap()
+    }
+}
+
+#[test]
+fn cli_cache_run_rejects_directory_overrides_before_marker_or_child_changes() {
+    let fixture = CacheFixture::new();
+    let cargo = write_cargo(fixture.owner.path(), "touch \"$CHILD_RAN\"\n");
+    let child_ran = fixture.owner.path().join("child-ran");
+    for (name, contents) in [
+        ("target.toml", "[build]\ntarget-dir=\"outside\"\n"),
+        ("build.toml", "[build]\nbuild-dir=\"outside\"\n"),
+    ] {
+        fs::write(fixture.root.join(name), contents).unwrap();
+    }
+    let cases = [
+        vec!["build", "--target-dir", "outside"],
+        vec!["build", "--target-dir=outside"],
+        vec!["--config", "build.target-dir=\"outside\"", "build"],
+        vec!["--config=build.target-dir=\"outside\"", "build"],
+        vec!["--config", "build.build-dir=\"outside\"", "build"],
+        vec!["--config=build.build-dir=\"outside\"", "build"],
+        vec!["--config", "target.toml", "build"],
+        vec!["--config=build.toml", "build"],
+        vec!["-C", "outside", "build"],
+        vec!["-Coutside", "build"],
+    ];
+    let before = fs::read(fixture.marker()).unwrap();
+    for args in cases {
+        let output = fixture
+            .command("run")
+            .arg("--")
+            .arg(&cargo)
+            .args(&args)
+            .env("CHILD_RAN", &child_ran)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {}", json(&output));
+        assert!(json(&output)["error"].as_str().is_some(), "{args:?}");
+        assert_eq!(fs::read(fixture.marker()).unwrap(), before, "{args:?}");
+        assert!(!child_ran.exists(), "{args:?}");
+    }
+    for args in [
+        vec!["env", "cargo", "build"],
+        vec!["/bin/sh", "-c", "cargo build"],
+    ] {
+        let output = fixture
+            .command("run")
+            .arg("--")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{}", json(&output));
+        assert!(json(&output)["error"].as_str().unwrap().contains("Cargo"));
+        assert_eq!(fs::read(fixture.marker()).unwrap(), before);
+    }
+}
+
+#[test]
+fn cli_cache_run_json_forwards_noise_preserves_exit_and_finishes_lifecycle() {
+    let fixture = CacheFixture::new();
+    let cargo = write_cargo(
+        fixture.owner.path(),
+        "printf 'child stdout diagnostic\\n'\nprintf 'child stderr diagnostic\\n' >&2\nprintf '%s\\n' \"$@\" >&2\ntest \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_TARGET_DIR\" || exit 91\ntest \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_BUILD_DIR\" || exit 92\nexit \"$CHILD_EXIT\"\n",
+    );
+    fixture.age_marker();
+    let output = fixture
+        .command("run")
+        .arg("--")
+        .arg(&cargo)
+        .arg("build")
+        .env("CHILD_EXIT", "37")
+        .env("CARGO_TARGET_DIR", "outside-inherited-target")
+        .env("CARGO_BUILD_TARGET_DIR", "outside-inherited-build-target")
+        .env("CARGO_BUILD_BUILD_DIR", "outside-inherited-build")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(37));
+    assert_eq!(json(&output)["exit_code"], 37);
+    assert_eq!(json(&output)["error"], Value::Null);
+    assert_eq!(
+        json(&output)["target_dir"],
+        fixture.cache_dir.join("target").to_str().unwrap()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("child stdout diagnostic"), "{stderr}");
+    assert!(stderr.contains("child stderr diagnostic"), "{stderr}");
+    assert!(stderr.contains("build.target-dir="), "{stderr}");
+    assert!(stderr.contains("build.build-dir="), "{stderr}");
+    assert!(
+        stderr.contains(fixture.cache_dir.join("target").to_str().unwrap()),
+        "{stderr}"
+    );
+    assert!(fixture.last_used() > 1);
+    let next = fixture
+        .command("run")
+        .arg("--")
+        .arg(&cargo)
+        .arg("build")
+        .env("CHILD_EXIT", "0")
+        .output()
+        .unwrap();
+    assert!(next.status.success(), "{}", json(&next));
+    assert_eq!(json(&next)["exit_code"], 0);
+}
+
+struct RunningChild(Option<Child>);
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn cli_cache_run_lease_defers_clean_and_second_run_until_marker_refresh() {
+    let fixture = CacheFixture::new();
+    let cargo = write_cargo(
+        fixture.owner.path(),
+        "touch \"$READY\"\nwhile test ! -e \"$RELEASE\"; do sleep 0.01; done\n",
+    );
+    let ready = fixture.owner.path().join("ready");
+    let release = fixture.owner.path().join("release");
+    fixture.age_marker();
+    let mut child = RunningChild(Some(
+        fixture
+            .command("run")
+            .arg("--")
+            .arg(&cargo)
+            .arg("build")
+            .env("READY", &ready)
+            .env("RELEASE", &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "управляемая дочерняя команда не сообщила о готовности"
+        );
+        assert!(
+            child.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "управляемая дочерняя команда завершилась до сообщения о готовности"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        fixture.last_used() > 1,
+        "перед запуском дочерней команды маркер должен обновляться"
+    );
+    fixture.age_marker();
+    let artifact = fixture.cache_dir.join("target/artifact");
+    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    fs::write(&artifact, [42_u8; 8192]).unwrap();
+    let local_target = fixture.root.join("target");
+    fs::create_dir(&local_target).unwrap();
+    fs::write(
+        local_target.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\nGenerated by Cargo\n",
+    )
+    .unwrap();
+    fs::write(local_target.join("artifact"), [42_u8; 8192]).unwrap();
+    let local_before = directory_entry_names(&local_target);
+    let local_bytes_before = allocated_bytes(&local_target);
+    let clean = invoke(
+        &fixture.root,
+        &fixture.policy,
+        &fixture.temp_root,
+        &fixture.cache_home,
+        true,
+    );
+    assert_eq!(clean.status.code(), Some(2), "{}", json(&clean));
+    assert!(
+        json(&clean)["error"]
+            .as_str()
+            .unwrap()
+            .contains("maintenance lock")
+    );
+    assert!(artifact.exists());
+    assert_eq!(directory_entry_names(&local_target), local_before);
+    assert_eq!(allocated_bytes(&local_target), local_bytes_before);
+    assert_eq!(fixture.last_used(), 1);
+    let second = fixture
+        .command("run")
+        .arg("--")
+        .arg(&cargo)
+        .arg("build")
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(2), "{}", json(&second));
+    assert_eq!(fixture.last_used(), 1);
+    fs::write(&release, "").unwrap();
+    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", json(&output));
+    assert!(
+        fixture.last_used() > 1,
+        "после завершения дочерней команды маркер должен обновляться"
+    );
+    let after = fixture
+        .command("run")
+        .arg("--")
+        .arg(&cargo)
+        .arg("build")
+        .env("READY", &ready)
+        .env("RELEASE", &release)
+        .output()
+        .unwrap();
+    assert!(after.status.success(), "{}", json(&after));
+}
+
+#[test]
+fn cli_partial_tmp_inventory_is_reported_without_fatal_exit() {
+    let fixture = CacheFixture::new();
+    let unreadable = fixture.temp_root.join("unreadable-foreign-directory");
+    fs::create_dir(&unreadable).unwrap();
+    fs::write(unreadable.join("hidden"), "foreign data").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let output = invoke_scan(
+        &fixture.root,
+        &fixture.policy,
+        &fixture.temp_root,
+        &fixture.cache_home,
+    );
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(output.status.success(), "{}", json(&output));
+    let report = json(&output);
+    assert_eq!(report["fatal_errors"], 0);
+    assert!(
+        report["tmp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |inventory| inventory["root"] == fixture.temp_root.to_str().unwrap()
+                    && inventory["complete"] == false
+            )
+    );
+    assert!(unreadable.join("hidden").exists());
+}
+
+#[test]
+fn cli_destructive_cleanup_failure_returns_non_success() {
+    let owner = TempWorkspace::create("repository-maintenance-clean-failure-test").unwrap();
+    let root = owner.path().join("checkout");
+    let target = root.join("target");
+    let temp_root = owner.path().join("tmp-sandbox");
+    let cache_home = owner.path().join("cache-home");
+    let cargo_home = owner.path().join("cargo-home");
+    let cargo_bin = owner.path().join("mock-bin");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&temp_root).unwrap();
+    fs::create_dir_all(&cache_home).unwrap();
+    fs::create_dir_all(&cargo_home).unwrap();
+    fs::create_dir_all(&cargo_bin).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"gc_clean_failure_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("Cargo.lock"), "version = 3\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\nGenerated by Cargo\n",
+    )
+    .unwrap();
+    fs::write(target.join("synthetic-artifact"), [0x42_u8; 8192]).unwrap();
+
+    let metadata = owner.path().join("metadata.json");
+    fs::write(
+        &metadata,
+        serde_json::to_vec(&serde_json::json!({
+            "workspace_root": root,
+            "target_directory": target,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    write_cargo(
+        &cargo_bin,
+        &format!(
+            "if [ \"${{1-}}\" = metadata ]; then\n  exec /bin/cat {}\nfi\nprintf '%s\\n' 'synthetic cargo clean failure' >&2\nexit 42\n",
+            shell_quote(&metadata)
+        ),
+    );
+
+    let policy = owner.path().join("policy.toml");
+    fs::write(
+        &policy,
+        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=3600\ntmp_top_entries=1\n",
+    )
+    .unwrap();
+    let runtime = private_runtime(&cache_home);
+    let mut search_path = vec![cargo_bin];
+    if let Some(existing) = std::env::var_os("PATH") {
+        search_path.extend(std::env::split_paths(&existing));
+    }
+    let search_path = std::env::join_paths(search_path).unwrap();
+    let output = Command::new(BINARY)
+        .args([
+            "clean",
+            "--workspace-root",
+            root.to_str().unwrap(),
+            "--policy",
+            policy.to_str().unwrap(),
+            "--temp-root",
+            temp_root.to_str().unwrap(),
+            "--json",
+            "--apply",
+        ])
+        .env("PATH", search_path)
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("TMPDIR", &temp_root)
+        .env("CARGO_HOME", cargo_home)
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "stdout={}", json(&output));
+    let report = json(&output);
+    assert_eq!(report["cargo_target"]["action"], "error", "{report}");
+    assert_eq!(report["cargo_target"]["result"], "failed", "{report}");
+    assert_eq!(report["fatal_errors"], 1, "{report}");
+    assert!(
+        report["cargo_target"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic cargo clean failure"),
+        "{report}"
+    );
+    assert!(target.join("synthetic-artifact").exists());
+}
+
+fn private_runtime(cache_home: &Path) -> PathBuf {
     let runtime = cache_home.join("runtime");
     fs::create_dir_all(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    runtime
+}
+
+fn write_cargo(directory: &Path, body: &str) -> PathBuf {
+    let cargo = directory.join("cargo");
+    fs::write(&cargo, format!("#!/bin/sh\nset -eu\n{body}")).unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    cargo
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply: bool) -> Output {
+    let runtime = private_runtime(cache_home);
     let mut command = Command::new(BINARY);
     command
         .args([
@@ -338,7 +767,8 @@ fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply
             "--json",
         ])
         .env("XDG_CACHE_HOME", cache_home)
-        .env("XDG_RUNTIME_DIR", runtime);
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("TMPDIR", temp_root);
     if apply {
         command.arg("--apply");
     }
@@ -346,9 +776,7 @@ fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply
 }
 
 fn invoke_scan(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path) -> Output {
-    let runtime = cache_home.join("runtime");
-    fs::create_dir_all(&runtime).unwrap();
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = private_runtime(cache_home);
     Command::new(BINARY)
         .args([
             "scan",
@@ -362,6 +790,7 @@ fn invoke_scan(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path) 
         ])
         .env("XDG_CACHE_HOME", cache_home)
         .env("XDG_RUNTIME_DIR", runtime)
+        .env("TMPDIR", temp_root)
         .output()
         .unwrap()
 }
@@ -369,7 +798,7 @@ fn invoke_scan(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path) 
 fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
-            "invalid JSON ({error}): {}",
+            "некорректный JSON ({error}): {}",
             String::from_utf8_lossy(&output.stdout)
         )
     })

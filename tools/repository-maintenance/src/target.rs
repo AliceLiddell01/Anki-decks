@@ -30,6 +30,20 @@ pub enum ThresholdDecision {
     Clean,
 }
 
+pub fn threshold_decision(
+    allocated_bytes: u64,
+    warning_bytes: u64,
+    hard_limit_bytes: u64,
+) -> ThresholdDecision {
+    if allocated_bytes >= hard_limit_bytes {
+        ThresholdDecision::Clean
+    } else if allocated_bytes >= warning_bytes {
+        ThresholdDecision::Warn
+    } else {
+        ThresholdDecision::Keep
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CargoTargetMeasurement {
     pub workspace_root: PathBuf,
@@ -76,14 +90,14 @@ pub fn discover_workspace(root: &Path) -> Result<CargoWorkspace, String> {
         ));
     }
     let metadata: CargoMetadata = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("cargo metadata вернул невалидный JSON: {error}"))?;
+        .map_err(|error| format!("cargo metadata вернул некорректный JSON: {error}"))?;
     let metadata_root = metadata
         .workspace_root
         .canonicalize()
-        .map_err(|error| format!("не удалось разрешить Cargo workspace root: {error}"))?;
+        .map_err(|error| format!("не удалось определить корень рабочей области Cargo: {error}"))?;
     if metadata_root != root {
         return Err(format!(
-            "указанный root {} не совпадает с Cargo workspace root {}",
+            "указанный корень {} не совпадает с корнем рабочей области Cargo {}",
             root.display(),
             metadata_root.display()
         ));
@@ -148,13 +162,13 @@ fn configured_build_dir(root: &Path) -> Result<Option<PathBuf>, String> {
         };
         let Some(build_dir) = build_dir.as_str() else {
             return Err(format!(
-                "build.build-dir в {} должен быть строкой",
+                "параметр Cargo `build.build-dir` в {} должен быть строкой",
                 config.display()
             ));
         };
         if build_dir.contains('{') || build_dir.contains('}') {
             return Err(format!(
-                "build.build-dir в {} использует Cargo path template; очистка отложена, пока путь нельзя надёжно разрешить",
+                "параметр Cargo `build.build-dir` в {} использует шаблон пути; очистка отложена, пока путь нельзя надёжно определить",
                 config.display()
             ));
         }
@@ -212,11 +226,17 @@ pub fn inspect_target(
                 continue;
             }
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                errors.push(format!("{} — target является symlink", path.display()));
+                errors.push(format!(
+                    "{} — `target` является символической ссылкой",
+                    path.display()
+                ));
                 continue;
             }
             Ok(metadata) if !metadata.is_dir() => {
-                errors.push(format!("{} — target не является каталогом", path.display()));
+                errors.push(format!(
+                    "{} — `target` не является каталогом",
+                    path.display()
+                ));
                 continue;
             }
             Ok(_) => (),
@@ -237,13 +257,7 @@ pub fn inspect_target(
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
     }
-    let decision = if allocated >= hard_limit_bytes {
-        ThresholdDecision::Clean
-    } else if allocated >= warning_bytes {
-        ThresholdDecision::Warn
-    } else {
-        ThresholdDecision::Keep
-    };
+    let decision = threshold_decision(allocated, warning_bytes, hard_limit_bytes);
     let safety = if decision == ThresholdDecision::Clean {
         workspace
             .measured_dirs
@@ -267,13 +281,17 @@ pub fn inspect_target(
     let reason = if decision == ThresholdDecision::Keep {
         "размер ниже порога предупреждения".into()
     } else if decision == ThresholdDecision::Warn {
-        "размер выше warning threshold; очистка не запускается".into()
+        "размер выше порога предупреждения; очистка не запускается".into()
     } else if !errors.is_empty() {
-        format!("нельзя безопасно измерить target: {}", errors.join("; "))
+        format!(
+            "нельзя безопасно измерить каталог `target`: {}",
+            errors.join("; ")
+        )
     } else if mount_boundaries != 0 {
-        "обнаружен вложенный mount; очистка всего Cargo target отложена".into()
+        "обнаружена вложенная точка монтирования; очистка всего каталога Cargo `target` отложена"
+            .into()
     } else if !ownership_safe {
-        "target/build-dir выходит за workspace root и не имеет project ownership marker; очистка отложена".into()
+        "каталог `target` или `build-dir` находится вне workspace root (корня рабочей области) и не имеет маркера владения проекта; очистка отложена".into()
     } else if !matches!(safety, ProcessCheck::Clear) {
         match &safety {
             ProcessCheck::Busy {
@@ -289,9 +307,9 @@ pub fn inspect_target(
             ProcessCheck::Clear => unreachable!(),
         }
     } else if let Err(error) = validate_cargo_target(&workspace.target_dir) {
-        format!("target не подтверждён Cargo CACHEDIR.TAG: {error}")
+        format!("каталог `target` не подтверждён маркером Cargo `CACHEDIR.TAG`: {error}")
     } else {
-        "target превысил hard limit и подтверждён Cargo".into()
+        "каталог `target` превысил жёсткий предел и подтверждён Cargo".into()
     };
     CargoTargetMeasurement {
         workspace_root: workspace.root.clone(),
@@ -343,7 +361,7 @@ pub fn validate_cargo_target(path: &Path) -> io::Result<()> {
     if metadata.uid() != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Cargo target принадлежит другому UID",
+            "каталог Cargo `target` принадлежит другому UID",
         ));
     }
     let marker_fd = openat(
@@ -392,7 +410,7 @@ fn open_directory_without_symlinks(path: &Path) -> io::Result<fs::File> {
             std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "путь Cargo target содержит запрещённый компонент",
+                    "путь к каталогу Cargo `target` содержит запрещённый компонент",
                 ));
             }
         }
@@ -435,9 +453,9 @@ pub fn cargo_clean(workspace: &CargoWorkspace) -> Result<(String, String), Strin
     Ok((stdout, stderr))
 }
 
-/// Очищает только явно указанный managed external target. Для него build-dir
-/// временно совмещается с target-dir, чтобы Cargo не затронул второй путь из
-/// workspace config.
+/// Очищает только явно указанный управляемый внешний каталог сборки. Для него
+/// `build-dir` временно совмещается с `target-dir`, чтобы Cargo не затронул
+/// второй путь из конфигурации рабочей области.
 pub fn cargo_clean_external(workspace: &CargoWorkspace) -> Result<(String, String), String> {
     let mut command = Command::new("cargo");
     command
@@ -487,11 +505,12 @@ mod tests {
     use asset_store::temp_workspace::TempWorkspace;
 
     #[test]
-    fn threshold_hysteresis_warns_before_cleaning() {
-        assert_eq!(assess(99, 100, 200), ThresholdDecision::Keep);
-        assert_eq!(assess(100, 100, 200), ThresholdDecision::Warn);
-        assert_eq!(assess(199, 100, 200), ThresholdDecision::Warn);
-        assert_eq!(assess(200, 100, 200), ThresholdDecision::Clean);
+    fn threshold_decision_uses_production_policy_at_boundaries() {
+        assert_eq!(threshold_decision(99, 100, 200), ThresholdDecision::Keep);
+        assert_eq!(threshold_decision(100, 100, 200), ThresholdDecision::Warn);
+        assert_eq!(threshold_decision(150, 100, 200), ThresholdDecision::Warn);
+        assert_eq!(threshold_decision(200, 100, 200), ThresholdDecision::Clean);
+        assert_eq!(threshold_decision(201, 100, 200), ThresholdDecision::Clean);
     }
 
     #[test]
@@ -521,20 +540,10 @@ mod tests {
         assert!(measurement.reason.contains("workspace root"));
     }
 
-    fn assess(size: u64, warning: u64, hard: u64) -> ThresholdDecision {
-        if size >= hard {
-            ThresholdDecision::Clean
-        } else if size >= warning {
-            ThresholdDecision::Warn
-        } else {
-            ThresholdDecision::Keep
-        }
-    }
-
     #[test]
     fn cargo_clean_apply_removes_only_explicit_synthetic_target() {
         let owner = TempWorkspace::create("repository-maintenance-cargo-clean-test")
-            .expect("project-owned temp workspace создаётся");
+            .expect("временная рабочая область проекта создаётся");
         let root = owner.path().join("fixture");
         let target = root.join("target");
         let build_dir = root.join("build");

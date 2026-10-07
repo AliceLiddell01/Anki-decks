@@ -26,7 +26,7 @@ const REPORT_SCHEMA: u32 = 1;
 pub struct Candidate {
     pub category: &'static str,
     pub path: PathBuf,
-    pub ownership: &'static str,
+    pub ownership: String,
     pub bytes_before: u64,
     pub bytes_after: Option<u64>,
     pub bytes_freed: u64,
@@ -63,6 +63,10 @@ pub struct Report {
     pub tmp: Vec<TmpInventory>,
     pub system_tmpfiles: SystemTmpfilesStatus,
     pub errors: usize,
+    /// Ошибки операций обслуживания; ошибки частичной инвентаризации только для
+    /// чтения сюда не входят.
+    pub fatal_errors: usize,
+    pub operation_errors: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -94,7 +98,7 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
             Ok(lock) => Some(lock),
             Err(error) => {
                 return Err(format!(
-                    "очистка отложена: не удалось получить maintenance lock: {error}"
+                    "очистка отложена: не удалось получить общую блокировку обслуживания (maintenance lock): {error}"
                 ));
             }
         }
@@ -113,7 +117,9 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
             &cache_home.join("anki-decks/repository-maintenance"),
             policy.external_cache_min_age(),
         )
-        .map_err(|error| format!("не удалось инвентаризировать external build caches: {error}"))?,
+        .map_err(|error| {
+            format!("не удалось инвентаризировать внешние каталоги сборки Cargo: {error}")
+        })?,
         None => cache::ExternalCacheInventory::empty(),
     };
     let external_cache_bytes_before = external_caches.allocated_bytes;
@@ -133,7 +139,7 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         )
     };
     let orphan_plan = plan_orphans_under(&options.temp_root, policy.orphan_min_age())
-        .map_err(|error| format!("не удалось построить план TempWorkspace GC: {error}"))?;
+        .map_err(|error| format!("не удалось построить план очистки `TempWorkspace`: {error}"))?;
     let legacy_plan = plan_legacy_orphans_under(&options.temp_root, policy.orphan_min_age())
         .map_err(|error| format!("не удалось построить план legacy GC: {error}"))?;
     let mut orphan_entries = orphan_plan.entries;
@@ -193,27 +199,40 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
     let mut target_error = None;
     if target_report.decision == ThresholdDecision::Clean && target_report.safe_to_clean {
         let clean_start = Instant::now();
-        if options.apply {
-            let safety = recheck_target(&workspace, &target_report);
-            match safety {
-                Ok(()) => match target::cargo_clean(&workspace) {
-                    Ok((_stdout, _stderr)) => {
-                        target_result = "removed";
-                        target_after = Some(measure_workspace_bytes(&workspace));
-                        target_freed = target_report
-                            .allocated_bytes
-                            .saturating_sub(target_after.unwrap_or(0));
-                    }
-                    Err(error) => {
-                        target_action = "error";
-                        target_result = "failed";
-                        target_error = Some(error);
-                    }
-                },
-                Err(reason) => {
+        if options.mode == "scan" {
+            // `scan` сообщает состояние порогов, но не строит план действий.
+        } else if options.apply {
+            match clean_target_if_needed(
+                &workspace,
+                &target_report,
+                policy.warning_bytes(),
+                policy.hard_limit_bytes(),
+            ) {
+                TargetCleanOutcome::Removed => {
+                    target_result = "removed";
+                    target_after = Some(measure_workspace_bytes(&workspace));
+                    target_freed = target_report
+                        .allocated_bytes
+                        .saturating_sub(target_after.unwrap_or(0));
+                }
+                TargetCleanOutcome::NotNeeded(decision) => {
+                    target_action = match decision {
+                        ThresholdDecision::Keep => "keep",
+                        ThresholdDecision::Warn => "warn",
+                        ThresholdDecision::Clean => unreachable!("порог обработки проверен"),
+                    };
+                    target_result = "not_needed";
+                    target_error = None;
+                }
+                TargetCleanOutcome::Deferred(reason) => {
                     target_action = "deferred";
                     target_result = "busy";
                     target_error = Some(reason);
+                }
+                TargetCleanOutcome::Failed(error) => {
+                    target_action = "error";
+                    target_result = "failed";
+                    target_error = Some(error);
                 }
             }
         } else {
@@ -236,21 +255,21 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
                     Ok(()) => match candidate
                         .target_dir
                         .as_deref()
-                        .ok_or_else(|| "в marker отсутствует target_dir".to_owned())
+                        .ok_or_else(|| "в маркере отсутствует `target_dir`".to_owned())
                         .and_then(|target_dir| cache::clean_cache(root, target_dir))
                     {
                         Ok(_) => {
                             let measured_after = candidate
                                 .target_dir
                                 .as_deref()
-                                .ok_or_else(|| "в marker отсутствует target_dir".to_owned())
+                                .ok_or_else(|| "в маркере отсутствует `target_dir`".to_owned())
                                 .and_then(|path| match inventory::measure_path(path) {
                                     Ok(measurement) => Ok(measurement.allocated_bytes),
                                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                                         Ok(0)
                                     }
                                     Err(error) => Err(format!(
-                                        "не удалось измерить cache после очистки: {error}"
+                                        "не удалось измерить кэш после очистки: {error}"
                                     )),
                                 });
                             match measured_after {
@@ -259,7 +278,7 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
                                     candidate.bytes_freed =
                                         candidate.allocated_bytes.saturating_sub(bytes_after);
                                     candidate.reason =
-                                        "cache очищен штатной командой cargo clean".into();
+                                        "кэш очищен штатной командой `cargo clean`".into();
                                 }
                                 Err(error) => {
                                     candidate.action = "error";
@@ -282,6 +301,7 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         cleanup_ms = cleanup_ms.saturating_add(clean_start.elapsed().as_millis());
     }
     let mut temp_apply_entries = Vec::new();
+    let mut operation_errors = Vec::new();
     if options.apply {
         let clean_start = Instant::now();
         let marker_gc = cleanup_orphans_under(&options.temp_root, policy.orphan_min_age());
@@ -290,23 +310,31 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
                 temp_evidence = namespace_evidence(&report.entries, &options.temp_root);
                 temp_apply_entries.extend(report.entries);
             }
-            Err(error) => temp_evidence.push(OwnershipEvidence {
-                path: options.temp_root.clone(),
-                ownership: "project-owned",
-                live: None,
-                action: "error",
-                reason: format!("ошибка marker orphan GC: {error}"),
-            }),
+            Err(error) => {
+                let message = format!("ошибка сборщика бесхозных каталогов по маркеру: {error}");
+                operation_errors.push(message.clone());
+                temp_evidence.push(OwnershipEvidence {
+                    path: options.temp_root.clone(),
+                    ownership: "project-owned",
+                    live: None,
+                    action: "error",
+                    reason: message,
+                });
+            }
         }
         match cleanup_legacy_orphans_under(&options.temp_root, policy.orphan_min_age()) {
             Ok(report) => temp_apply_entries.extend(report.entries),
-            Err(error) => temp_evidence.push(OwnershipEvidence {
-                path: options.temp_root.clone(),
-                ownership: "project-owned",
-                live: None,
-                action: "error",
-                reason: format!("ошибка legacy orphan GC: {error}"),
-            }),
+            Err(error) => {
+                let message = format!("ошибка legacy orphan GC: {error}");
+                operation_errors.push(message.clone());
+                temp_evidence.push(OwnershipEvidence {
+                    path: options.temp_root.clone(),
+                    ownership: "project-owned",
+                    live: None,
+                    action: "error",
+                    reason: message,
+                });
+            }
         }
         cleanup_ms = cleanup_ms.saturating_add(clean_start.elapsed().as_millis());
     }
@@ -372,7 +400,7 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         .fold(0_u64, u64::saturating_add);
     let external_cache_bytes_freed =
         external_cache_bytes_before.saturating_sub(external_cache_bytes_after);
-    let errors = usize::from(target_action == "error")
+    let fatal_errors = usize::from(target_action == "error")
         + external_caches
             .candidates
             .iter()
@@ -382,7 +410,8 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
             .iter()
             .filter(|candidate| candidate.action == "error")
             .count()
-        + tmp.iter().map(|inventory| inventory.errors).sum::<usize>();
+        + operation_errors.len();
+    let errors = fatal_errors + tmp.iter().map(|inventory| inventory.errors).sum::<usize>();
     Ok(Report {
         schema_version: REPORT_SCHEMA,
         mode: options.mode,
@@ -399,9 +428,9 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
             category: "cargo-target",
             path: target_report.target_dir,
             ownership: if target_report.ownership_safe {
-                "project-owned"
+                "project-owned".to_owned()
             } else {
-                "unknown"
+                "unknown".to_owned()
             },
             bytes_before: target_report.allocated_bytes,
             bytes_after: target_after,
@@ -421,13 +450,43 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         tmp,
         system_tmpfiles: systemd_tmpfiles_status(),
         errors,
+        fatal_errors,
+        operation_errors,
     })
+}
+
+enum TargetCleanOutcome {
+    Removed,
+    NotNeeded(ThresholdDecision),
+    Deferred(String),
+    Failed(String),
+}
+
+fn clean_target_if_needed(
+    workspace: &CargoWorkspace,
+    initial: &CargoTargetMeasurement,
+    warning_bytes: u64,
+    hard_limit_bytes: u64,
+) -> TargetCleanOutcome {
+    let decision = match recheck_target(workspace, initial, warning_bytes, hard_limit_bytes) {
+        Ok(decision) => decision,
+        Err(reason) => return TargetCleanOutcome::Deferred(reason),
+    };
+    if decision != ThresholdDecision::Clean {
+        return TargetCleanOutcome::NotNeeded(decision);
+    }
+    match target::cargo_clean(workspace) {
+        Ok(_) => TargetCleanOutcome::Removed,
+        Err(error) => TargetCleanOutcome::Failed(error),
+    }
 }
 
 fn recheck_target(
     workspace: &CargoWorkspace,
     initial: &CargoTargetMeasurement,
-) -> Result<(), String> {
+    warning_bytes: u64,
+    hard_limit_bytes: u64,
+) -> Result<ThresholdDecision, String> {
     if !initial.safe_to_clean {
         return Err(initial.reason.clone());
     }
@@ -462,7 +521,33 @@ fn recheck_target(
         }
     }
     target::validate_cargo_target(&workspace.target_dir)
-        .map_err(|error| format!("Cargo marker изменился до очистки: {error}"))
+        .map_err(|error| format!("маркер Cargo изменился до очистки: {error}"))?;
+
+    // Размер проверяется последним, после повторной проверки процессов и маркера:
+    // уменьшившийся ниже жёсткого предела `target` больше не требует очистки.
+    let mut allocated_bytes = 0_u64;
+    for directory in &workspace.measured_dirs {
+        let current = inventory::measure_path(directory).map_err(|error| {
+            format!(
+                "не удалось повторно измерить {}: {error}",
+                directory.display()
+            )
+        })?;
+        if let Some(before) = initial.dirs.iter().find(|item| item.path == *directory)
+            && (before.device != current.device || before.inode != current.inode)
+        {
+            return Err(format!("{} заменён перед очисткой", directory.display()));
+        }
+        if current.mount_boundaries != 0 || !current.errors.is_empty() {
+            return Err(format!("{} изменился перед очисткой", directory.display()));
+        }
+        allocated_bytes = allocated_bytes.saturating_add(current.allocated_bytes);
+    }
+    Ok(target::threshold_decision(
+        allocated_bytes,
+        warning_bytes,
+        hard_limit_bytes,
+    ))
 }
 
 fn recheck_external_cache(
@@ -470,43 +555,46 @@ fn recheck_external_cache(
     candidate: &cache::ExternalCacheCandidate,
 ) -> Result<(), String> {
     if candidate.ownership != "project-owned" || candidate.live != Some(false) {
-        return Err("cache не подтверждён как безопасный для очистки".into());
+        return Err("кэш не подтверждён как безопасный для очистки".into());
     }
     let target_dir = candidate
         .target_dir
         .as_deref()
-        .ok_or_else(|| "в marker отсутствует target_dir".to_owned())?;
+        .ok_or_else(|| "в маркере отсутствует `target_dir`".to_owned())?;
     target::validate_cargo_target(target_dir)
-        .map_err(|error| format!("Cargo marker изменился до очистки: {error}"))?;
+        .map_err(|error| format!("маркер Cargo изменился до очистки: {error}"))?;
     let fresh = cache::inspect_external_caches(
         repository_root,
-        candidate.path.parent().ok_or("cache root отсутствует")?,
+        candidate
+            .path
+            .parent()
+            .ok_or("не найден корень внешних кэшей")?,
         Duration::ZERO,
     )
-    .map_err(|error| format!("не удалось перепроверить ownership marker: {error}"))?;
+    .map_err(|error| format!("не удалось повторно проверить маркер владения: {error}"))?;
     let current = fresh
         .candidates
         .iter()
         .find(|item| item.id == candidate.id)
-        .ok_or_else(|| "cache исчез после scan".to_owned())?;
+        .ok_or_else(|| "кэш исчез после проверки".to_owned())?;
     if current.ownership != "project-owned"
         || current.target_dir != candidate.target_dir
         || current.last_used_unix_seconds != candidate.last_used_unix_seconds
         || current.live != Some(false)
     {
-        return Err("ownership или process state cache изменились после scan".into());
+        return Err("владение кэшем или состояние процесса изменились после проверки".into());
     }
     let before = candidate
         .measurement
         .as_ref()
-        .ok_or_else(|| "измерение cache отсутствует".to_owned())?;
+        .ok_or_else(|| "измерение кэша отсутствует".to_owned())?;
     let after = inventory::measure_path(target_dir)
-        .map_err(|error| format!("не удалось повторно измерить cache: {error}"))?;
+        .map_err(|error| format!("не удалось повторно измерить кэш: {error}"))?;
     if before.device != after.device || before.inode != after.inode {
-        return Err("cache target заменён после scan".into());
+        return Err("каталог `target` кэша заменён после проверки".into());
     }
     if after.mount_boundaries != 0 || !after.errors.is_empty() {
-        return Err("cache target содержит mount boundary или ошибки".into());
+        return Err("каталог `target` кэша содержит границы точек монтирования или ошибки".into());
     }
     match process::target_process_check(target_dir, repository_root) {
         process::ProcessCheck::Clear => Ok(()),
@@ -562,9 +650,9 @@ fn namespace_evidence(entries: &[GcEntry], root: &Path) -> Vec<OwnershipEvidence
                 live,
                 action: "keep",
                 reason: if all_owned {
-                    "namespace содержит marker-verified TempWorkspace runs".into()
+                    "пространство имён содержит запуски `TempWorkspace` с проверенными маркерами владения".into()
                 } else {
-                    "не все дочерние записи подтверждены ownership marker".into()
+                    "маркеры владения подтверждают не все дочерние записи".into()
                 },
             }
         })
@@ -601,7 +689,7 @@ fn project_temp_candidates(
             Candidate {
                 category: "temp-workspace",
                 path: entry.path.clone(),
-                ownership: "project-owned",
+                ownership: entry.ownership.clone(),
                 bytes_before: before,
                 bytes_after: after,
                 bytes_freed: before.saturating_sub(after.unwrap_or(before)),
@@ -631,7 +719,7 @@ pub fn systemd_tmpfiles_status() -> SystemTmpfilesStatus {
                     state
                 },
                 message: if output.status.success() {
-                    "системный таймер очистки temporary files обнаружен".into()
+                    "обнаружен системный таймер очистки временных файлов".into()
                 } else {
                     format!("таймер не активен или отсутствует: {stderr}")
                 },
@@ -649,15 +737,15 @@ pub fn render_text(report: &Report) -> String {
     let mut text = String::new();
     use std::fmt::Write as _;
     let _ = writeln!(text, "Режим: {}", report.mode);
-    let _ = writeln!(text, "Workspace: {}", report.workspace_root.display());
+    let _ = writeln!(text, "Рабочая область: {}", report.workspace_root.display());
     let _ = writeln!(
         text,
-        "Время: scan {} мс, cleanup {} мс, всего {} мс",
+        "Время: проверка {} мс, очистка {} мс, всего {} мс",
         report.scan_elapsed_ms, report.cleanup_elapsed_ms, report.elapsed_ms
     );
     let _ = writeln!(
         text,
-        "Cargo target: {} — {} ({}, ownership {}, освобождено {} байт)",
+        "Каталог Cargo `target`: {} — {} ({}, владение {}, освобождено {} байт)",
         report.cargo_target.path.display(),
         human_bytes(report.cargo_target.bytes_before),
         report.cargo_target.action,
@@ -670,7 +758,7 @@ pub fn render_text(report: &Report) -> String {
     }
     let _ = writeln!(
         text,
-        "Внешние project-owned build caches: {} байт до, {} после, освобождено {} байт; неизвестных объектов {}",
+        "Внешние кэши сборки, принадлежащие проекту: {} байт до, {} после, освобождено {} байт; неизвестных объектов {}",
         report.external_cache_bytes_before,
         report.external_cache_bytes_after,
         report.external_cache_bytes_freed,
@@ -696,13 +784,13 @@ pub fn render_text(report: &Report) -> String {
     }
     let _ = writeln!(
         text,
-        "TempWorkspace candidates: {}",
+        "Кандидаты `TempWorkspace`: {}",
         report.project_temp.len()
     );
     for candidate in &report.project_temp {
         let _ = writeln!(
             text,
-            "  {} — {} байт, ownership {}, {} / {}: {}",
+            "  {} — {} байт, владение {}, {} / {}: {}",
             candidate.path.display(),
             candidate.bytes_before,
             candidate.ownership,
@@ -714,7 +802,7 @@ pub fn render_text(report: &Report) -> String {
     for inventory in &report.tmp {
         let _ = writeln!(
             text,
-            "/tmp {}: {}, {} top-level entries, {} mount boundaries, {} scan errors, обход {}",
+            "/tmp {}: {}, {} записей верхнего уровня, {} границ точек монтирования, {} ошибок проверки; обход {}",
             inventory.root.display(),
             human_bytes(inventory.allocated_bytes),
             inventory.top_level_entries,
@@ -729,7 +817,7 @@ pub fn render_text(report: &Report) -> String {
         for entry in &inventory.largest {
             let owner = entry
                 .owner_uid
-                .map_or_else(|| "mixed/unknown".into(), |uid| uid.to_string());
+                .map_or_else(|| "смешанный/неизвестный".into(), |uid| uid.to_string());
             let age = entry
                 .age_seconds
                 .map_or_else(|| "?".into(), |age| format!("{}с", age));
@@ -748,10 +836,17 @@ pub fn render_text(report: &Report) -> String {
     }
     let _ = writeln!(
         text,
-        "systemd-tmpfiles: {} ({})",
+        "Состояние systemd-tmpfiles: {} ({})",
         report.system_tmpfiles.timer_state, report.system_tmpfiles.message
     );
-    let _ = writeln!(text, "Ошибки: {}", report.errors);
+    let _ = writeln!(
+        text,
+        "Ошибки: {} (препятствуют успешному завершению: {})",
+        report.errors, report.fatal_errors
+    );
+    for error in &report.operation_errors {
+        let _ = writeln!(text, "  Ошибка операции обслуживания: {error}");
+    }
     text
 }
 
@@ -774,6 +869,7 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     fn synthetic_target(root: &Path) -> (target::CargoWorkspace, CargoTargetMeasurement) {
         let target_dir = root.join("target");
@@ -818,7 +914,7 @@ mod tests {
         let (workspace, initial) = synthetic_target(&root);
         fs::remove_dir_all(&initial.target_dir).unwrap();
 
-        let error = recheck_target(&workspace, &initial).unwrap_err();
+        let error = recheck_target(&workspace, &initial, 1, 1).unwrap_err();
         assert!(error.contains("не удалось перепроверить"));
     }
 
@@ -841,9 +937,63 @@ mod tests {
         .unwrap();
         fs::write(initial.target_dir.join("artifact"), [0x32_u8; 4096]).unwrap();
 
-        let error = recheck_target(&workspace, &initial).unwrap_err();
+        let error = recheck_target(&workspace, &initial, 1, 1).unwrap_err();
         assert!(error.contains("заменён после scan"));
         assert!(replaced.join("artifact").exists());
+    }
+
+    #[test]
+    fn target_recheck_skips_clean_when_size_falls_below_hard_limit() {
+        let owner = asset_store::temp_workspace::TempWorkspace::create(
+            "repository-maintenance-smaller-target-test",
+        )
+        .unwrap();
+        let root = owner.path().join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        let (workspace, initial) = synthetic_target(&root);
+        let artifact = initial.target_dir.join("artifact");
+        fs::write(&artifact, []).unwrap();
+        let initial_metadata = fs::metadata(&initial.target_dir).unwrap();
+        let outcome = clean_target_if_needed(&workspace, &initial, 0, initial.allocated_bytes);
+        let final_metadata = fs::metadata(&initial.target_dir).unwrap();
+
+        assert!(
+            initial.allocated_bytes
+                > inventory::measure_path(&initial.target_dir)
+                    .unwrap()
+                    .allocated_bytes
+        );
+        assert!(matches!(
+            outcome,
+            TargetCleanOutcome::NotNeeded(ThresholdDecision::Warn)
+        ));
+        assert_eq!(initial_metadata.ino(), final_metadata.ino());
+        assert!(
+            artifact.exists(),
+            "повторная проверка не удаляет содержимое"
+        );
+    }
+
+    #[test]
+    fn project_temp_report_preserves_legacy_ownership() {
+        let owner = asset_store::temp_workspace::TempWorkspace::create(
+            "repository-maintenance-temp-ownership-test",
+        )
+        .unwrap();
+        let path = owner.path().join("legacy-run");
+        let entry = GcEntry {
+            path: path.clone(),
+            outcome: "deferred".into(),
+            reason: "legacy marker".into(),
+            bytes: 0,
+            ownership: "legacy-project-owned".into(),
+            live: Some(false),
+        };
+
+        let candidates = project_temp_candidates(&[entry], false, &BTreeMap::new());
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ownership, "legacy-project-owned");
     }
 
     #[test]
@@ -851,7 +1001,7 @@ mod tests {
         let candidate = Candidate {
             category: "cargo-target",
             path: PathBuf::from("/tmp/test/target"),
-            ownership: "project-owned",
+            ownership: "project-owned".into(),
             bytes_before: 12,
             bytes_after: None,
             bytes_freed: 0,
@@ -883,6 +1033,8 @@ mod tests {
                 message: "нет".into(),
             },
             errors: 0,
+            fatal_errors: 0,
+            operation_errors: Vec::new(),
         };
         let json = render_json(&report).unwrap();
         assert!(json.contains("\"schema_version\": 1"));

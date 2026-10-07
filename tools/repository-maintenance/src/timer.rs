@@ -13,7 +13,9 @@ const TIMER_NAME: &str = "anki-repository-maintenance.timer";
 const INSTALLED_CONFIG_NAME: &str = "repository-maintenance-install.toml";
 const SERVICE_TEMPLATE: &str = include_str!("../systemd/anki-repository-maintenance.service");
 const TIMER_TEMPLATE: &str = include_str!("../systemd/anki-repository-maintenance.timer");
+// Точная подпись владения unit-файла, которую установщик проверяет при обновлении и удалении.
 const MANAGED_MARKER: &str = "# Managed by repository-maintenance; do not edit by hand.";
+const CARGO_PATH_MARKER: &str = "@CARGO_PATH_ENV@";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TimerResult {
@@ -31,6 +33,8 @@ struct InstalledConfig<'a> {
 
 pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
     require_user_systemd()?;
+    let cargo_bin_dir = resolve_cargo_bin_dir()?;
+    let service_unit = render_service_unit(&cargo_bin_dir)?;
     let config_home = config_home().ok_or("не задан HOME или XDG_CONFIG_HOME")?;
     let unit_dir = config_home.join("systemd/user");
     let app_config = config_home.join(format!("anki-decks/{INSTALLED_CONFIG_NAME}"));
@@ -53,7 +57,7 @@ pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
     ensure_binary_managed_or_absent(&installed_binary, &service_path, &app_config)?;
     atomic_write(
         &service_path,
-        format!("{MANAGED_MARKER}\n{SERVICE_TEMPLATE}").as_bytes(),
+        format!("{MANAGED_MARKER}\n{service_unit}").as_bytes(),
         0o644,
     )?;
     atomic_write(
@@ -74,7 +78,7 @@ pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
     let status = systemctl(&["status", TIMER_NAME, "--no-pager"])?;
     Ok(TimerResult {
         state: "enabled",
-        message: "ежедневный user-level systemd timer установлен и включён".into(),
+        message: "ежедневный пользовательский таймер systemd установлен и включён".into(),
         command_output: Some(status),
     })
 }
@@ -171,7 +175,7 @@ pub fn status() -> Result<TimerResult, String> {
     let output = systemctl(&["status", TIMER_NAME, "--no-pager"])?;
     Ok(TimerResult {
         state: "enabled",
-        message: "состояние user-level systemd timer".into(),
+        message: "состояние пользовательского таймера systemd".into(),
         command_output: Some(output),
     })
 }
@@ -212,6 +216,118 @@ fn systemctl(args: &[&str]) -> Result<String, String> {
         ));
     }
     Ok(stdout)
+}
+
+fn resolve_cargo_bin_dir() -> Result<PathBuf, String> {
+    let search_path = std::env::var_os("PATH")
+        .ok_or("не задан PATH; установщик не может найти исполняемый Cargo")?;
+    for directory in std::env::split_paths(&search_path) {
+        let directory = if directory.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            directory
+        };
+        let candidate = directory.join("cargo");
+        let metadata = match fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+            continue;
+        }
+        let resolved = candidate.canonicalize().map_err(|error| {
+            format!(
+                "не удалось разрешить найденный Cargo {}: {error}",
+                candidate.display()
+            )
+        })?;
+        let resolved_metadata = fs::metadata(&resolved).map_err(|error| {
+            format!("не удалось проверить Cargo {}: {error}", resolved.display())
+        })?;
+        if !resolved_metadata.is_file() || resolved_metadata.mode() & 0o111 == 0 {
+            return Err(format!(
+                "найденный Cargo {} не является исполняемым обычным файлом",
+                candidate.display()
+            ));
+        }
+        let output = Command::new(&candidate)
+            .arg("--version")
+            .output()
+            .map_err(|error| {
+                format!(
+                    "не удалось запустить найденный Cargo {}: {error}",
+                    candidate.display()
+                )
+            })?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(format!(
+                "найденный Cargo {} недействителен: команда --version завершилась с кодом {:?}{}",
+                candidate.display(),
+                output.status.code(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            ));
+        }
+        return candidate
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .map_err(|error| {
+                format!(
+                    "не удалось разрешить каталог найденного Cargo {}: {error}",
+                    candidate.display()
+                )
+            });
+    }
+    Err("не удалось найти исполняемый Cargo в PATH; установите Rust/Cargo и повторите `timer install`".into())
+}
+
+fn render_service_unit(cargo_bin_dir: &Path) -> Result<String, String> {
+    let cargo_bin_dir = cargo_bin_dir
+        .to_str()
+        .ok_or("путь к Cargo содержит символы, которые systemd не поддерживает")?;
+    if !Path::new(cargo_bin_dir).is_absolute() {
+        return Err("путь к каталогу Cargo должен быть абсолютным".into());
+    }
+    if cargo_bin_dir.contains(':') {
+        return Err("путь к каталогу Cargo содержит ':' и не может быть сохранён в PATH".into());
+    }
+    let path =
+        format!("{cargo_bin_dir}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    let escaped_path = escape_systemd_value(&path)?;
+    if SERVICE_TEMPLATE.matches(CARGO_PATH_MARKER).count() != 1 {
+        return Err(
+            "шаблон unit-файла службы должен содержать ровно одно место для подстановки PATH Cargo"
+                .into(),
+        );
+    }
+    Ok(SERVICE_TEMPLATE.replace(
+        CARGO_PATH_MARKER,
+        &format!("Environment=\"PATH={escaped_path}\""),
+    ))
+}
+
+fn escape_systemd_value(value: &str) -> Result<String, String> {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\0'..='\u{1f}' | '\u{7f}' => {
+                return Err(
+                    "путь к Cargo содержит управляющий символ, недопустимый в unit-файле".into(),
+                );
+            }
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '%' => escaped.push_str("%%"),
+            _ => escaped.push(character),
+        }
+    }
+    Ok(escaped)
 }
 
 fn ensure_managed_or_absent(path: &Path) -> Result<(), String> {
@@ -434,11 +550,97 @@ mod tests {
             PathBuf::from(std::env::var_os("ANKI_REPOSITORY_MAINTENANCE_TEST_ROOT").unwrap());
         let executable = std::env::current_exe().unwrap();
         match action.as_str() {
-            "install" => install(&root, &executable).unwrap(),
-            "status" => status().unwrap(),
-            "uninstall" => uninstall().unwrap(),
-            _ => panic!("unknown helper action"),
-        };
+            "install" => {
+                install(&root, &executable).unwrap();
+            }
+            "status" => {
+                status().unwrap();
+            }
+            "uninstall" => {
+                uninstall().unwrap();
+            }
+            "service" => {
+                run_installed_service().unwrap();
+            }
+            "service-run" => {
+                run_installed_cargo_command().unwrap();
+            }
+            _ => panic!("неизвестное действие вспомогательного процесса"),
+        }
+    }
+
+    fn run_installed_service() -> Result<(), String> {
+        let home = PathBuf::from(std::env::var_os("HOME").ok_or("переменная HOME не задана")?);
+        let config_home = PathBuf::from(
+            std::env::var_os("XDG_CONFIG_HOME").ok_or("переменная XDG_CONFIG_HOME не задана")?,
+        );
+        let installed_binary = home.join(".local/bin/anki-repository-maintenance");
+        if !installed_binary.is_file() {
+            return Err(format!(
+                "установленный исполняемый файл {} отсутствует",
+                installed_binary.display()
+            ));
+        }
+        let service_path = config_home.join("systemd/user").join(SERVICE_NAME);
+        let service = fs::read_to_string(&service_path)
+            .map_err(|error| format!("не удалось прочитать {}: {error}", service_path.display()))?;
+        let unit_path = service
+            .lines()
+            .find_map(parse_service_path)
+            .ok_or("в unit-файле службы не задан PATH")?;
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("не удалось определить вспомогательный процесс: {error}"))?;
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "timer::tests::timer_subprocess_helper",
+                "--nocapture",
+            ])
+            .env(HELPER_ENV, "service-run")
+            .env("PATH", unit_path)
+            .output()
+            .map_err(|error| {
+                format!("не удалось запустить процесс, имитирующий службу: {error}")
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "процесс, имитирующий службу, завершился с кодом {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    fn run_installed_cargo_command() -> Result<(), String> {
+        let root = crate::policy::workspace_root(None, true)?;
+        crate::target::discover_workspace(&root).map(|_| ())
+    }
+
+    fn parse_service_path(line: &str) -> Option<String> {
+        let encoded = line
+            .strip_prefix("Environment=\"PATH=")?
+            .strip_suffix('"')?;
+        let mut decoded = String::with_capacity(encoded.len());
+        let mut characters = encoded.chars();
+        while let Some(character) = characters.next() {
+            if character == '\\' {
+                match characters.next()? {
+                    '\\' => decoded.push('\\'),
+                    '"' => decoded.push('"'),
+                    _ => return None,
+                }
+            } else if character == '%' {
+                if characters.next()? != '%' {
+                    return None;
+                }
+                decoded.push('%');
+            } else {
+                decoded.push(character);
+            }
+        }
+        Some(decoded)
     }
 
     #[test]
@@ -446,7 +648,7 @@ mod tests {
         let owner = TempWorkspace::create("repository-maintenance-timer-test").unwrap();
         let home = owner.path().join("home");
         let config_home = owner.path().join("config");
-        let fake_bin = owner.path().join("fake-bin");
+        let fake_bin = owner.path().join(r#"fake cargo % " quote \ slash"#);
         let root = owner.path().join("checkout");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&config_home).unwrap();
@@ -461,12 +663,28 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let cargo_log = owner.path().join("cargo.log");
+        let cargo = fake_bin.join("cargo");
+        fs::write(
+            &cargo,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\ncase \"$1\" in\n  --version) echo 'cargo 1.0.0';;\n  metadata) printf '{\"workspace_root\":\"%s\",\"target_directory\":\"%s/target\"}\\n' \"$ANKI_REPOSITORY_MAINTENANCE_TEST_ROOT\" \"$ANKI_REPOSITORY_MAINTENANCE_TEST_ROOT\";;\n  clean) :;;\n  *) exit 2;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", fake_bin.display());
         let executable = std::env::current_exe().unwrap();
+        let helper = HelperHarness {
+            executable: &executable,
+            root: &root,
+            home: &home,
+            config_home: &config_home,
+            path: &path,
+            systemctl_log: &log,
+            cargo_log: &cargo_log,
+        };
 
-        for action in ["install", "install", "status", "uninstall"] {
-            let output =
-                invoke_helper(&executable, action, &root, &home, &config_home, &path, &log);
+        for action in ["install", "install", "service", "status"] {
+            let output = helper.invoke(action);
             assert!(
                 output.status.success(),
                 "{}",
@@ -475,6 +693,45 @@ mod tests {
         }
 
         let unit_dir = config_home.join("systemd/user");
+        let installed_service = fs::read_to_string(unit_dir.join(SERVICE_NAME)).unwrap();
+        assert!(SERVICE_TEMPLATE.contains("%h/.local/bin/anki-repository-maintenance"));
+        assert!(SERVICE_TEMPLATE.contains(CARGO_PATH_MARKER));
+        assert!(!installed_service.contains(CARGO_PATH_MARKER));
+        assert!(installed_service.contains(r#"fake cargo %% \" quote \\ slash"#));
+        assert!(!installed_service.contains("/home/"));
+        assert!(!installed_service.contains("/mnt/c/"));
+        assert!(installed_service.contains("Environment=\"PATH="));
+        let missing_cargo_bin = owner.path().join("systemctl-only");
+        fs::create_dir_all(&missing_cargo_bin).unwrap();
+        fs::copy(&systemctl, missing_cargo_bin.join("systemctl")).unwrap();
+        let missing_cargo_path = missing_cargo_bin.display().to_string();
+        let output = helper.invoke_with_path("install", &missing_cargo_path);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("не удалось найти исполняемый Cargo")
+        );
+
+        let invalid_cargo_bin = owner.path().join("invalid-cargo");
+        fs::create_dir_all(&invalid_cargo_bin).unwrap();
+        let invalid_systemctl = invalid_cargo_bin.join("systemctl");
+        fs::copy(&systemctl, &invalid_systemctl).unwrap();
+        fs::set_permissions(&invalid_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let invalid_cargo = invalid_cargo_bin.join("cargo");
+        fs::write(&invalid_cargo, "#!/bin/sh\necho 'not Cargo' >&2\nexit 17\n").unwrap();
+        fs::set_permissions(&invalid_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let invalid_cargo_path = invalid_cargo_bin.display().to_string();
+        let output = helper.invoke_with_path("install", &invalid_cargo_path);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("найденный Cargo"), "{error}");
+        assert!(error.contains("--version"), "{error}");
+
+        let output = helper.invoke("uninstall");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(!unit_dir.join(SERVICE_NAME).exists());
         assert!(!unit_dir.join(TIMER_NAME).exists());
         assert!(!home.join(".local/bin/anki-repository-maintenance").exists());
@@ -482,33 +739,47 @@ mod tests {
         assert_eq!(calls.matches("enable --now").count(), 2);
         assert!(calls.contains("is-enabled"));
         assert!(calls.contains("disable --now"));
-        assert!(SERVICE_TEMPLATE.contains("%h/.local/bin/anki-repository-maintenance"));
-        assert!(!SERVICE_TEMPLATE.contains("/home/"));
-        assert!(!SERVICE_TEMPLATE.contains("/mnt/c/"));
+        assert!(fs::read_to_string(&cargo_log).unwrap().contains("metadata"));
     }
 
-    fn invoke_helper(
-        executable: &Path,
-        action: &str,
-        root: &Path,
-        home: &Path,
-        config_home: &Path,
-        path: &str,
-        log: &Path,
-    ) -> Output {
-        Command::new(executable)
-            .args([
-                "--exact",
-                "timer::tests::timer_subprocess_helper",
-                "--nocapture",
-            ])
-            .env(HELPER_ENV, action)
-            .env("ANKI_REPOSITORY_MAINTENANCE_TEST_ROOT", root)
-            .env("HOME", home)
-            .env("XDG_CONFIG_HOME", config_home)
-            .env("PATH", path)
-            .env("SYSTEMCTL_LOG", log)
-            .output()
-            .unwrap()
+    struct HelperHarness<'a> {
+        executable: &'a Path,
+        root: &'a Path,
+        home: &'a Path,
+        config_home: &'a Path,
+        path: &'a str,
+        systemctl_log: &'a Path,
+        cargo_log: &'a Path,
+    }
+
+    impl HelperHarness<'_> {
+        fn invoke(&self, action: &str) -> Output {
+            self.invoke_with_path(action, self.path)
+        }
+
+        fn invoke_with_path(&self, action: &str, path: &str) -> Output {
+            Command::new(self.executable)
+                .args([
+                    "--exact",
+                    "timer::tests::timer_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env(HELPER_ENV, action)
+                .env("ANKI_REPOSITORY_MAINTENANCE_TEST_ROOT", self.root)
+                .env("HOME", self.home)
+                .env("XDG_CONFIG_HOME", self.config_home)
+                .env(
+                    "PATH",
+                    if action == "service" {
+                        "/usr/bin:/bin"
+                    } else {
+                        path
+                    },
+                )
+                .env("SYSTEMCTL_LOG", self.systemctl_log)
+                .env("CARGO_LOG", self.cargo_log)
+                .output()
+                .unwrap()
+        }
     }
 }

@@ -1,12 +1,13 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{Mode, OFlags, openat};
+use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
 use serde::{Deserialize, Serialize};
 
+use crate::guard::MaintenanceLock;
 use crate::inventory::{Measurement, measure_path};
 use crate::process::{ProcessCheck, target_process_check};
 use crate::target::{CargoWorkspace, cargo_clean_external, validate_cargo_target};
@@ -53,6 +54,153 @@ pub struct BuildCacheMarker {
     pub last_used_unix_seconds: u64,
 }
 
+/// Удерживает общую блокировку обслуживания от проверки происхождения до завершения
+/// дочерней команды. Вызывающий код должен дождаться команды перед `finish`; при
+/// раннем возврате `Drop` обновит маркер.
+pub struct CacheRunGuard {
+    _lock: MaintenanceLock,
+    directory: File,
+    cache_dir: PathBuf,
+    target_dir: PathBuf,
+    marker: BuildCacheMarker,
+    uid: u32,
+    active: bool,
+}
+
+impl CacheRunGuard {
+    /// Блокировка передаётся уже захваченной: повторный `flock` и ожидание сборщика
+    /// мусора здесь не нужны.
+    pub fn begin(
+        repository_root: &Path,
+        cache_root: &Path,
+        id: &str,
+        lock: MaintenanceLock,
+    ) -> Result<Self, String> {
+        let (cache_dir, target_dir) = resolve_build_cache(repository_root, cache_root, id)?;
+        let uid = fs::metadata("/proc/self")
+            .map_err(|error| error.to_string())?
+            .uid();
+        let directory =
+            open_private_directory(&cache_dir, uid).map_err(|error| error.to_string())?;
+        let marker = read_marker_at(&directory, uid).map_err(|error| error.to_string())?;
+        if marker.schema != 1
+            || marker.repository_root
+                != repository_root
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?
+            || marker.cache_id != id
+            || !valid_relative_target(&marker.target_dir)
+            || cache_dir.join(&marker.target_dir) != target_dir
+        {
+            return Err("маркер владения кэшем изменился перед запуском команды".into());
+        }
+        validate_managed_target_path(&cache_dir, &marker.target_dir, uid)?;
+        let mut guard = Self {
+            _lock: lock,
+            directory,
+            cache_dir,
+            target_dir,
+            marker,
+            uid,
+            active: false,
+        };
+        guard.refresh()?;
+        guard.active = true;
+        Ok(guard)
+    }
+
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    pub fn target_dir(&self) -> &Path {
+        &self.target_dir
+    }
+
+    /// Обновляет `last_used` после ошибки запуска или ожидания команды, затем
+    /// освобождает блокировку. Ошибка маркера возвращается вызывающему коду;
+    /// блокировка освобождается при любом результате.
+    pub fn finish(mut self) -> Result<(), String> {
+        self.active = false;
+        self.refresh()
+    }
+
+    fn refresh(&mut self) -> Result<(), String> {
+        let pinned = self
+            .directory
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        let current = fs::symlink_metadata(&self.cache_dir).map_err(|error| error.to_string())?;
+        if !current.is_dir()
+            || current.file_type().is_symlink()
+            || current.uid() != self.uid
+            || current.mode() & 0o077 != 0
+            || current.dev() != pinned.dev()
+            || current.ino() != pinned.ino()
+        {
+            return Err("каталог кэша изменился во время управляемой команды".into());
+        }
+        let mut marker =
+            read_marker_at(&self.directory, self.uid).map_err(|error| error.to_string())?;
+        if marker.schema != self.marker.schema
+            || marker.repository_root != self.marker.repository_root
+            || marker.cache_id != self.marker.cache_id
+            || marker.target_dir != self.marker.target_dir
+            || marker.created_unix_seconds != self.marker.created_unix_seconds
+        {
+            return Err("маркер владения кэшем изменился во время управляемой команды".into());
+        }
+        marker.last_used_unix_seconds = marker.last_used_unix_seconds.max(unix_now());
+        write_marker_at(&self.directory, &marker).map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for CacheRunGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // Явный `finish` возвращает ошибки; `Drop` старается сохранить маркер
+            // при раскрутке стека.
+            let _ = self.refresh();
+        }
+    }
+}
+
+fn validate_managed_target_path(cache_dir: &Path, target: &Path, uid: u32) -> Result<(), String> {
+    let cache_device = fs::symlink_metadata(cache_dir)
+        .map_err(|error| error.to_string())?
+        .dev();
+    let mut path = cache_dir.to_path_buf();
+    for component in target.components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.uid() == uid
+                    && metadata.dev() == cache_device => {}
+            Ok(_) => {
+                return Err(
+                    "управляемый каталог `target` содержит символическую ссылку, каталог другого владельца или границу точки монтирования".into(),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "не удалось проверить управляемый каталог `target`: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl ExternalCacheInventory {
     pub fn empty() -> Self {
         Self {
@@ -78,8 +226,9 @@ impl ExternalCacheCandidate {
     }
 }
 
-/// Владелец внешнего cache-пути подтверждается marker-файлом, совпадающим с
-/// текущим checkout. Немаркированные записи измеряются, но не становятся целью GC.
+/// Владение внешним путём кэша подтверждается маркером, совпадающим с корнем
+/// текущей рабочей области. Немаркированные записи измеряются, но не становятся
+/// целью сборщика мусора.
 pub fn inspect_external_caches(
     repository_root: &Path,
     cache_root: &Path,
@@ -95,7 +244,7 @@ pub fn inspect_external_caches(
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "external cache root должен быть обычным каталогом",
+                "корень внешних кэшей должен быть обычным каталогом",
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -113,7 +262,7 @@ pub fn inspect_external_caches(
     if root_meta.uid() != current_uid || root_meta.mode() & 0o077 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "external cache root должен принадлежать текущему UID и быть приватным",
+            "корень внешних кэшей должен принадлежать текущему UID и быть приватным",
         ));
     }
     let canonical_cache_root = cache_root.canonicalize()?;
@@ -143,7 +292,7 @@ pub fn inspect_external_caches(
             unknown_entries += 1;
             candidates.push(unknown_candidate(
                 &path,
-                "объект не является обычным cache-каталогом; он не удаляется",
+                "объект не является обычным каталогом кэша; он не удаляется",
             ));
             continue;
         }
@@ -151,7 +300,7 @@ pub fn inspect_external_caches(
             unknown_entries += 1;
             candidates.push(unknown_candidate(
                 &path,
-                "каталог принадлежит другому UID или не имеет private permissions",
+                "каталог принадлежит другому UID или права доступа не ограничены владельцем",
             ));
             continue;
         }
@@ -183,9 +332,9 @@ pub fn inspect_external_caches(
                     live: Some(false),
                     action: "keep",
                     reason: if marker.last_used_unix_seconds > min_used {
-                        "cache использовался недавно; действует minimum age".into()
+                        "кэш использовался недавно; минимальный срок хранения ещё не истёк".into()
                     } else {
-                        "marker подтверждает cache этого checkout".into()
+                        "маркер подтверждает кэш этой рабочей области".into()
                     },
                     error: None,
                     measurement: None,
@@ -213,7 +362,7 @@ pub fn inspect_external_caches(
                             }
                             if measurement.mount_boundaries != 0 || !measurement.errors.is_empty() {
                                 candidate.error = Some(format!(
-                                    "tree содержит mount/error: {} границ, {} ошибок",
+                                    "дерево содержит границы точек монтирования или ошибки: {} границ, {} ошибок",
                                     measurement.mount_boundaries,
                                     measurement.errors.len()
                                 ));
@@ -235,7 +384,7 @@ pub fn inspect_external_caches(
                 unknown_entries += 1;
                 candidates.push(unknown_candidate(
                     &path,
-                    "ownership marker не совпал с checkout",
+                    "маркер владения не совпал с корнем рабочей области",
                 ));
             }
             Err(error) => {
@@ -253,14 +402,14 @@ pub fn inspect_external_caches(
     })
 }
 
-/// Создаёт provenance только в новой пустой project cache directory.
+/// Создаёт сведения о происхождении только в новом пустом каталоге кэша проекта.
 pub fn initialize_build_cache(
     repository_root: &Path,
     cache_root: &Path,
     id: &str,
 ) -> Result<PathBuf, String> {
     if !safe_cache_id(id) {
-        return Err("cache id должен состоять из ASCII букв, цифр, '-' или '_'".into());
+        return Err("идентификатор кэша должен состоять из букв ASCII, цифр, '-' или '_'".into());
     }
     let root = cache_root.join(id);
     ensure_private_directory(cache_root)?;
@@ -270,10 +419,10 @@ pub fn initialize_build_cache(
             return resolve_build_cache(repository_root, cache_root, id)
                 .map(|(cache_dir, _)| cache_dir);
         }
-        Err(error) => return Err(format!("не удалось создать cache directory: {error}")),
+        Err(error) => return Err(format!("не удалось создать каталог кэша: {error}")),
     }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("не удалось закрыть права cache directory: {error}"))?;
+        .map_err(|error| format!("не удалось ограничить права доступа к каталогу кэша: {error}"))?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -296,18 +445,18 @@ pub fn resolve_build_cache(
     id: &str,
 ) -> Result<(PathBuf, PathBuf), String> {
     if !safe_cache_id(id) {
-        return Err("cache id должен состоять из ASCII букв, цифр, '-' или '_'".into());
+        return Err("идентификатор кэша должен состоять из букв ASCII, цифр, '-' или '_'".into());
     }
     let repository_root = repository_root
         .canonicalize()
-        .map_err(|error| format!("не удалось разрешить workspace root: {error}"))?;
+        .map_err(|error| format!("не удалось определить корень рабочей области: {error}"))?;
     let cache_dir = cache_root.join(id);
     let uid = fs::metadata("/proc/self")
         .map_err(|error| error.to_string())?
         .uid();
     let metadata = fs::symlink_metadata(&cache_dir).map_err(|error| {
         format!(
-            "не удалось проверить cache {}: {error}",
+            "не удалось проверить каталог кэша {}: {error}",
             cache_dir.display()
         )
     })?;
@@ -316,33 +465,34 @@ pub fn resolve_build_cache(
         || metadata.uid() != uid
         || metadata.mode() & 0o077 != 0
     {
-        return Err("cache directory не является приватным каталогом текущего пользователя".into());
+        return Err("каталог кэша не является приватным каталогом текущего пользователя".into());
     }
     let cache_dir = cache_dir
         .canonicalize()
-        .map_err(|error| format!("не удалось разрешить cache directory: {error}"))?;
+        .map_err(|error| format!("не удалось определить путь к каталогу кэша: {error}"))?;
     let marker = read_marker(&cache_dir, uid).map_err(|error| error.to_string())?;
     if marker.schema != 1
         || marker.repository_root != repository_root
         || marker.cache_id != id
         || !valid_relative_target(&marker.target_dir)
     {
-        return Err("ownership marker cache не совпадает с checkout или cache id".into());
+        return Err(
+            "маркер владения кэшем не совпадает с рабочей областью или идентификатором кэша".into(),
+        );
     }
     Ok((cache_dir.clone(), cache_dir.join(marker.target_dir)))
 }
 
-/// Обновляет last-used marker перед запуском producer'а managed cache.
+/// Обновляет время последнего использования в маркере перед запуском процесса,
+/// создающего данные в управляемом кэше.
 pub fn touch_build_cache(path: &Path) -> Result<(), String> {
     let uid = fs::metadata("/proc/self")
         .map_err(|error| error.to_string())?
         .uid();
-    let mut marker = read_marker(path, uid).map_err(|error| error.to_string())?;
-    marker.last_used_unix_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    write_marker(path, &marker).map_err(|error| error.to_string())
+    let directory = open_private_directory(path, uid).map_err(|error| error.to_string())?;
+    let mut marker = read_marker_at(&directory, uid).map_err(|error| error.to_string())?;
+    marker.last_used_unix_seconds = marker.last_used_unix_seconds.max(unix_now());
+    write_marker_at(&directory, &marker).map_err(|error| error.to_string())
 }
 
 pub fn cleanup_plan(
@@ -374,7 +524,7 @@ pub fn cleanup_plan(
         if candidate.live != Some(false) {
             candidate.action = "deferred";
             candidate.reason = if candidate.live == Some(true) {
-                "активный процесс использует cache; очистка отложена".into()
+                "активный процесс использует кэш; очистка отложена".into()
             } else {
                 "нельзя доказать отсутствие активного процесса; очистка отложена".into()
             };
@@ -383,7 +533,8 @@ pub fn cleanup_plan(
             continue;
         } else if !candidate.eligible_for_cleanup(min_age, now) {
             candidate.action = "deferred";
-            candidate.reason = "cache моложе minimum age; очистка отложена".into();
+            candidate.reason =
+                "минимальный срок хранения кэша ещё не истёк; очистка отложена".into();
         }
     }
     let mut remaining = inventory.allocated_bytes;
@@ -400,7 +551,7 @@ pub fn cleanup_plan(
             continue;
         };
         candidate.action = "delete";
-        candidate.reason = "совокупный project-owned external cache превысил hard limit; очищается самый старый cache".into();
+        candidate.reason = "общий размер внешних кэшей, принадлежащих проекту, превысил жёсткий предел; очищается самый старый кэш".into();
         remaining = remaining.saturating_sub(candidate.allocated_bytes);
         selected.push(candidate.id.clone());
     }
@@ -408,8 +559,9 @@ pub fn cleanup_plan(
 }
 
 pub fn clean_cache(repository_root: &Path, target_dir: &Path) -> Result<(String, String), String> {
-    validate_cargo_target(target_dir)
-        .map_err(|error| format!("cache target не подтверждён CACHEDIR.TAG: {error}"))?;
+    validate_cargo_target(target_dir).map_err(|error| {
+        format!("каталог `target` кэша не подтверждён маркером `CACHEDIR.TAG`: {error}")
+    })?;
     let workspace = CargoWorkspace {
         root: repository_root.to_path_buf(),
         manifest: repository_root.join("Cargo.toml"),
@@ -460,19 +612,35 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn read_marker(directory: &Path, uid: u32) -> io::Result<BuildCacheMarker> {
-    let dir = rustix::fs::open(
+fn open_private_directory(directory: &Path, uid: u32) -> io::Result<File> {
+    let file = File::from(rustix::fs::open(
         directory,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
+    )?);
+    let metadata = file.metadata()?;
+    if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "каталог кэша не является приватным каталогом текущего UID",
+        ));
+    }
+    Ok(file)
+}
+
+fn read_marker(directory: &Path, uid: u32) -> io::Result<BuildCacheMarker> {
+    let directory = open_private_directory(directory, uid)?;
+    read_marker_at(&directory, uid)
+}
+
+fn read_marker_at(directory: &File, uid: u32) -> io::Result<BuildCacheMarker> {
     let marker_fd = openat(
-        &dir,
+        directory,
         MARKER,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )?;
-    let file = fs::File::from(marker_fd);
+    let file = File::from(marker_fd);
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != uid
@@ -482,7 +650,7 @@ fn read_marker(directory: &Path, uid: u32) -> io::Result<BuildCacheMarker> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "небезопасный external cache marker",
+            "небезопасный маркер внешнего кэша",
         ));
     }
     let mut bytes = Vec::new();
@@ -491,22 +659,35 @@ fn read_marker(directory: &Path, uid: u32) -> io::Result<BuildCacheMarker> {
 }
 
 fn write_marker(directory: &Path, marker: &BuildCacheMarker) -> io::Result<()> {
+    let uid = fs::metadata("/proc/self")?.uid();
+    let directory = open_private_directory(directory, uid)?;
+    write_marker_at(&directory, marker)
+}
+
+fn write_marker_at(directory: &File, marker: &BuildCacheMarker) -> io::Result<()> {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temporary = directory.join(format!("{MARKER}.tmp-{}-{suffix}", std::process::id()));
-    let path = directory.join(MARKER);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    serde_json::to_writer(&mut file, marker).map_err(io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    let temporary = format!("{MARKER}.tmp-{}-{suffix}", std::process::id());
+    let mut file = File::from(openat(
+        directory,
+        temporary.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?);
+    let result = (|| {
+        serde_json::to_writer(&mut file, marker).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        renameat(directory, temporary.as_str(), directory, MARKER)?;
+        directory.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = unlinkat(directory, temporary.as_str(), AtFlags::empty());
+    }
+    result
 }
 
 fn valid_relative_target(path: &Path) -> bool {
@@ -535,7 +716,7 @@ fn unknown_candidate(path: &Path, reason: &str) -> ExternalCacheCandidate {
                             None
                         } else {
                             Some(format!(
-                                "неполное измерение: {} границ mount, {} ошибок",
+                                "неполное измерение: {} границ точек монтирования, {} ошибок",
                                 measurement.mount_boundaries,
                                 measurement.errors.len()
                             ))
@@ -619,6 +800,152 @@ mod tests {
             serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
         marker.last_used_unix_seconds = timestamp;
         fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    fn begin_fixture(fixture: &Fixture, id: &str) -> (CacheRunGuard, PathBuf) {
+        let lock_directory = fixture._owner.path().join("locks");
+        let lock = MaintenanceLock::acquire_at(&lock_directory).unwrap();
+        let guard =
+            CacheRunGuard::begin(&fixture.repository, &fixture.cache_root, id, lock).unwrap();
+        (guard, lock_directory)
+    }
+
+    #[test]
+    fn managed_child_holds_lock_and_updates_marker_before_and_after_wait() {
+        let fixture = fixture("producer");
+        set_last_used(&fixture.cache_dir, 1);
+        let (guard, lock_directory) = begin_fixture(&fixture, "producer");
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        assert!(
+            read_marker(&fixture.cache_dir, uid)
+                .unwrap()
+                .last_used_unix_seconds
+                > 1
+        );
+        assert_eq!(guard.target_dir(), fixture.target);
+        assert_eq!(guard.cache_dir(), fixture.cache_dir);
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let other_lock_directory = lock_directory.clone();
+        let other = thread::spawn(move || {
+            MaintenanceLock::acquire_at(&other_lock_directory)
+                .err()
+                .unwrap()
+                .kind()
+        });
+        assert_eq!(other.join().unwrap(), io::ErrorKind::WouldBlock);
+        assert!(child.try_wait().unwrap().is_none());
+        set_last_used(&fixture.cache_dir, 1);
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        guard.finish().unwrap();
+        assert!(
+            read_marker(&fixture.cache_dir, uid)
+                .unwrap()
+                .last_used_unix_seconds
+                > 1
+        );
+        assert!(MaintenanceLock::acquire_at(&lock_directory).is_ok());
+    }
+
+    #[test]
+    fn managed_child_failure_and_signal_release_lock_after_marker_refresh() {
+        let fixture = fixture("failed-producer");
+        for killed in [false, true] {
+            let (guard, lock_directory) = begin_fixture(&fixture, "failed-producer");
+            let mut child = if killed {
+                Command::new("cat")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            } else {
+                Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap()
+            };
+            if killed {
+                child.kill().unwrap();
+            }
+            assert!(!child.wait().unwrap().success());
+            set_last_used(&fixture.cache_dir, 1);
+            guard.finish().unwrap();
+            let uid = fs::metadata("/proc/self").unwrap().uid();
+            assert!(
+                read_marker(&fixture.cache_dir, uid)
+                    .unwrap()
+                    .last_used_unix_seconds
+                    > 1
+            );
+            assert!(MaintenanceLock::acquire_at(&lock_directory).is_ok());
+        }
+    }
+
+    #[test]
+    fn managed_guard_refreshes_marker_and_unlocks_on_early_return() {
+        let fixture = fixture("drop-producer");
+        let (guard, lock_directory) = begin_fixture(&fixture, "drop-producer");
+        set_last_used(&fixture.cache_dir, 1);
+        drop(guard);
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        assert!(
+            read_marker(&fixture.cache_dir, uid)
+                .unwrap()
+                .last_used_unix_seconds
+                > 1
+        );
+        assert!(MaintenanceLock::acquire_at(&lock_directory).is_ok());
+    }
+
+    #[test]
+    fn managed_guard_refuses_unknown_cache_and_replaced_marker() {
+        let fixture = fixture("owned-producer");
+        let unknown = fixture.cache_root.join("unknown");
+        fs::create_dir(&unknown).unwrap();
+        fs::set_permissions(&unknown, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(unknown.join("keep"), b"foreign").unwrap();
+        let lock_directory = fixture._owner.path().join("locks");
+        let lock = MaintenanceLock::acquire_at(&lock_directory).unwrap();
+        assert!(
+            CacheRunGuard::begin(&fixture.repository, &fixture.cache_root, "unknown", lock)
+                .is_err()
+        );
+        assert!(!unknown.join(MARKER).exists());
+        assert_eq!(fs::read(unknown.join("keep")).unwrap(), b"foreign");
+        let (guard, _) = begin_fixture(&fixture, "owned-producer");
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        let mut marker = read_marker(&fixture.cache_dir, uid).unwrap();
+        marker.cache_id = "foreign-cache".into();
+        write_marker(&fixture.cache_dir, &marker).unwrap();
+        let before = fs::read(fixture.cache_dir.join(MARKER)).unwrap();
+        assert!(guard.finish().is_err());
+        assert_eq!(fs::read(fixture.cache_dir.join(MARKER)).unwrap(), before);
+        assert!(MaintenanceLock::acquire_at(&lock_directory).is_ok());
+    }
+
+    #[test]
+    fn managed_guard_refuses_target_symlink_before_updating_marker() {
+        let fixture = fixture("linked-target");
+        let outside = fixture._owner.path().join("outside-target");
+        fs::rename(&fixture.target, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &fixture.target).unwrap();
+        let before = fs::read(fixture.cache_dir.join(MARKER)).unwrap();
+        let directory = fixture._owner.path().join("locks");
+        let lock = MaintenanceLock::acquire_at(&directory).unwrap();
+        assert!(
+            CacheRunGuard::begin(
+                &fixture.repository,
+                &fixture.cache_root,
+                "linked-target",
+                lock
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(fixture.cache_dir.join(MARKER)).unwrap(), before);
+        assert!(outside.join("artifact").is_file());
+        assert!(MaintenanceLock::acquire_at(&directory).is_ok());
     }
 
     #[test]
