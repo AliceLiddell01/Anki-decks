@@ -651,6 +651,9 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         json!(format!("{:x}", sha2::Sha256::digest(&pack_bytes)))
     );
     assert_eq!(queue["summary"]["raw_candidates"], result["candidates"]);
+    assert!(text.contains("error_path: 1201"), "review.txt: {text}");
+    assert!(text.contains("test_setup: 2401"), "review.txt: {text}");
+    assert!(text.contains("runtime_boundary: 1"), "review.txt: {text}");
     let static_ids: Vec<_> = pack["candidates"]
         .as_array()
         .unwrap()
@@ -885,6 +888,56 @@ fn collect_keeps_mixed_rust_items_unknown_when_a_line_has_no_single_column() {
     assert_eq!(classification["code_role"], "unknown");
     assert_eq!(classification["code_basis"], "unknown");
     assert!(queue["summary"]["unknown_candidates"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn collect_uses_rust_test_surface_and_canonical_file_surface_labels() {
+    let repo = TempDir::new("collect-rust-test-surface");
+    let artifacts = TempDir::new("collect-rust-test-surface-artifacts");
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    commit(repo.path(), "база");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    fs::create_dir_all(repo.path().join("tests")).unwrap();
+    fs::create_dir_all(repo.path().join(".agents")).unwrap();
+    fs::write(
+        repo.path().join("tests/helper.rs"),
+        "pub fn read_fixture(path: &str) { let _ = std::fs::read(path).unwrap(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join(".agents/context.rs"),
+        "pub fn context() {}\n",
+    )
+    .unwrap();
+    commit(repo.path(), "добавить тестовый helper и агентский context");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let output = artifacts.path().join("collected");
+    collect_pack(repo.path(), &base, &head, &output, false);
+
+    let pack: Value =
+        serde_json::from_slice(&fs::read(output.join("review.json")).unwrap()).unwrap();
+    let queue: Value =
+        serde_json::from_slice(&fs::read(output.join("review-queue.json")).unwrap()).unwrap();
+    let summary = fs::read_to_string(output.join("review.txt")).unwrap();
+    let candidate = pack["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| {
+            candidate["path"] == "tests/helper.rs"
+                && candidate["detector"] == "error_path"
+                && candidate["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.contains("std::fs::read"))
+        })
+        .expect("test helper должен давать error_path candidate");
+    let classification = &queue["classifications"][candidate["id"].as_str().unwrap()];
+    assert_eq!(classification["execution"], "tests");
+    assert_eq!(classification["code_role"], "test_helper");
+    assert!(summary.contains("agent_context: 1"));
+    assert!(!summary.contains("agentcontext"));
 }
 
 #[test]

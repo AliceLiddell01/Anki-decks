@@ -795,7 +795,7 @@ pub fn build(
     Ok(queue)
 }
 
-fn surface_name(surface: &FileSurface) -> &'static str {
+pub(crate) fn surface_name(surface: &FileSurface) -> &'static str {
     match surface {
         FileSurface::Production => "production",
         FileSurface::Tests => "tests",

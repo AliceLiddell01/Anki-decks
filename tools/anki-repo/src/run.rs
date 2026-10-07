@@ -18,7 +18,7 @@ use crate::cli::{
     SemanticTriageCommand,
 };
 use crate::code_review::model::CandidateStatus;
-use crate::code_review::workflow::{LanguageSummary, SnapshotSummary};
+use crate::code_review::workflow::{LanguageSummary, SnapshotSummary, display_counts};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
 use crate::loader::load_export;
@@ -871,31 +871,32 @@ fn human_review_queue_summary(summary: &crate::code_review::review_queue::QueueS
     let _ = writeln!(
         text,
         "Приоритет units: {}",
-        display_queue_counts(
+        display_counts(
             &summary
                 .units_by_priority
                 .iter()
                 .map(|(key, value)| (key.as_str(), *value))
-                .collect()
+                .collect(),
+            |key| (*key).to_owned(),
         )
     );
     let _ = writeln!(
         text,
         "Детекторы: {}",
-        display_queue_counts(&summary.by_detector)
+        display_counts(&summary.by_detector, |key| key.clone())
     );
     let _ = writeln!(
         text,
         "Поверхности: {}",
-        display_queue_counts(&summary.by_surface)
+        display_counts(&summary.by_surface, |key| key.clone())
     );
     let _ = writeln!(
         text,
         "Execution: {}; structural roles: {}; text roles: {}; code roles: {}",
-        display_queue_debug_counts(&summary.by_execution),
-        display_queue_debug_counts(&summary.by_structural_role),
-        display_queue_debug_counts(&summary.by_text_role),
-        display_queue_debug_counts(&summary.by_code_role),
+        display_counts(&summary.by_execution, |key| key.clone()),
+        display_counts(&summary.by_structural_role, |key| key.as_str().to_owned()),
+        display_counts(&summary.by_text_role, |key| key.as_str().to_owned()),
+        display_counts(&summary.by_code_role, |key| key.as_str().to_owned()),
     );
     if !summary.largest_group_sizes.is_empty() {
         let _ = writeln!(
@@ -1031,34 +1032,6 @@ fn human_review_queue_candidate(
     }
     let _ = writeln!(text, "Evidence is not a confirmed finding.");
     text
-}
-
-fn display_queue_counts<K>(counts: &BTreeMap<K, usize>) -> String
-where
-    K: Ord + std::fmt::Display,
-{
-    if counts.is_empty() {
-        return "—".into();
-    }
-    counts
-        .iter()
-        .map(|(key, count)| format!("{key}: {count}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn display_queue_debug_counts<K>(counts: &BTreeMap<K, usize>) -> String
-where
-    K: Ord + std::fmt::Debug,
-{
-    if counts.is_empty() {
-        return "—".into();
-    }
-    counts
-        .iter()
-        .map(|(key, count)| format!("{}: {count}", format!("{key:?}").to_ascii_lowercase()))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn human_semantic_triage_init(
@@ -1548,6 +1521,33 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_queue_summary_uses_stable_enum_labels() {
+        use crate::code_review::review_queue::{CodeRole, QueueSummary, StructuralRole, TextRole};
+
+        let mut summary = QueueSummary::default();
+        summary.by_execution.insert("production".into(), 4);
+        summary
+            .by_structural_role
+            .insert(StructuralRole::ErrorPath, 1);
+        summary.by_text_role.insert(TextRole::HumanDocumentation, 2);
+        summary.by_code_role.insert(CodeRole::RuntimeBoundary, 3);
+
+        let rendered = human_review_queue_summary(&summary);
+        for label in [
+            "production: 4",
+            "error_path: 1",
+            "human_documentation: 2",
+            "runtime_boundary: 3",
+        ] {
+            assert!(
+                rendered.contains(label),
+                "summary omits {label:?}: {rendered}"
+            );
+        }
+        assert!(!rendered.contains("runtimeboundary"));
+    }
 
     /// Бесконечный reader: если бы чтение не было ограничено, тест не завершился
     /// бы, поэтому это прямая проверка предела, а не косвенная.

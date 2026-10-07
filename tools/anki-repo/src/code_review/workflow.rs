@@ -1441,15 +1441,19 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
             .or_insert(0usize) += 1;
         for surface in &file.surfaces {
             *file_surfaces
-                .entry(format!("{surface:?}").to_ascii_lowercase())
+                .entry(review_queue::surface_name(surface))
                 .or_insert(0usize) += 1;
         }
     }
-    let _ = writeln!(text, "Статусы файлов: {}", display_counts(&file_statuses));
+    let _ = writeln!(
+        text,
+        "Статусы файлов: {}",
+        display_counts(&file_statuses, |key| (*key).to_owned())
+    );
     let _ = writeln!(
         text,
         "Поверхности файлов: {}",
-        display_counts(&file_surfaces)
+        display_counts(&file_surfaces, |key| (*key).to_owned())
     );
     let summary = &queue.summary;
     let _ = writeln!(
@@ -1470,26 +1474,27 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
                 .units_by_priority
                 .iter()
                 .map(|(priority, count)| (priority.as_str(), *count))
-                .collect()
+                .collect(),
+            |key| (*key).to_owned(),
         )
     );
     let _ = writeln!(
         text,
         "Детекторы candidates: {}",
-        display_counts(&summary.by_detector)
+        display_counts(&summary.by_detector, |key| key.clone())
     );
     let _ = writeln!(
         text,
         "Поверхности candidates: {}",
-        display_counts(&summary.by_surface)
+        display_counts(&summary.by_surface, |key| key.clone())
     );
     let _ = writeln!(
         text,
         "Исполняемый контекст: {}; роли: {}; текст: {}; код: {}",
-        display_counts(&summary.by_execution),
-        display_enum_counts(&summary.by_structural_role),
-        display_enum_counts(&summary.by_text_role),
-        display_enum_counts(&summary.by_code_role),
+        display_counts(&summary.by_execution, |key| key.clone()),
+        display_counts(&summary.by_structural_role, |key| key.as_str().to_owned()),
+        display_counts(&summary.by_text_role, |key| key.as_str().to_owned()),
+        display_counts(&summary.by_code_role, |key| key.as_str().to_owned()),
     );
     if !summary.largest_group_sizes.is_empty() {
         let _ = writeln!(
@@ -1613,7 +1618,7 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
         let _ = writeln!(
             text,
             "Серьёзность диагностик: {}",
-            display_counts(&diagnostic_severities)
+            display_counts(&diagnostic_severities, |key| key.to_string())
         );
     }
     for diagnostic in pack.diagnostics.iter().take(12) {
@@ -1658,30 +1663,17 @@ fn human_summary(pack: &ReviewPack, queue: &ReviewQueue) -> String {
     text
 }
 
-fn display_counts<K>(counts: &BTreeMap<K, usize>) -> String
+pub(crate) fn display_counts<K, F>(counts: &BTreeMap<K, usize>, label: F) -> String
 where
-    K: Ord + std::fmt::Display,
+    K: Ord,
+    F: Fn(&K) -> String,
 {
     if counts.is_empty() {
         return "—".into();
     }
     counts
         .iter()
-        .map(|(key, count)| format!("{key}: {count}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn display_enum_counts<K>(counts: &BTreeMap<K, usize>) -> String
-where
-    K: Ord + std::fmt::Debug,
-{
-    if counts.is_empty() {
-        return "—".into();
-    }
-    counts
-        .iter()
-        .map(|(key, count)| format!("{}: {count}", format!("{key:?}").to_ascii_lowercase()))
+        .map(|(key, count)| format!("{}: {count}", label(key)))
         .collect::<Vec<_>>()
         .join(", ")
 }

@@ -1,8 +1,8 @@
 //! Синтаксический контекст Rust для производной очереди ревью.
 //!
 //! Индекс получает полные тексты конкретного снимка, не читает файлы и не
-//! разворачивает макросы. Ошибка разбора всего файла сохраняет `Unknown`;
-//! одно лишь имя пути не доказывает runtime или test контекст.
+//! разворачивает макросы. Корневое execution берётся только из однозначной
+//! Production/Tests-поверхности; иначе оно остаётся `Unknown`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -99,9 +99,9 @@ impl RustContext {
         }
     }
 
-    fn root() -> Self {
+    fn root(execution: RustExecutionContext) -> Self {
         Self {
-            execution: RustExecutionContext::Runtime,
+            execution,
             code_role: RustCodeRole::Item,
             basis: RustContextBasis::RustSyntax,
             enclosing_item: None,
@@ -150,7 +150,19 @@ impl RustContextIndex {
                 }
                 continue;
             }
-            files.insert(source.path.clone(), FileContext::parse(&source.content));
+            let (_, surfaces) = super::scope::classify_path(&source.path);
+            let execution = match (
+                surfaces.contains(&super::scope::FileSurface::Production),
+                surfaces.contains(&super::scope::FileSurface::Tests),
+            ) {
+                (true, false) => RustExecutionContext::Runtime,
+                (false, true) => RustExecutionContext::Test,
+                _ => RustExecutionContext::Unknown,
+            };
+            files.insert(
+                source.path.clone(),
+                FileContext::parse(&source.content, execution),
+            );
         }
         Self { files }
     }
@@ -207,7 +219,7 @@ impl RustContextIndex {
 }
 
 impl FileContext {
-    fn parse(source: &str) -> Self {
+    fn parse(source: &str, execution: RustExecutionContext) -> Self {
         let mut line_starts = vec![0];
         line_starts.extend(source.match_indices('\n').map(|(offset, _)| offset + 1));
         let mut file = Self {
@@ -222,7 +234,7 @@ impl FileContext {
         };
         let mut visitor = ContextVisitor {
             regions: Vec::new(),
-            context: RustContext::root(),
+            context: RustContext::root(execution),
             depth: 0,
         };
         apply_test_attributes(&mut visitor.context, &syntax.attrs);
