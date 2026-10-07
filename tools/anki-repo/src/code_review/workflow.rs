@@ -1418,7 +1418,8 @@ mod tests {
         fn new(label: &str) -> Self {
             let workspace = TempWorkspace::create(&format!("anki-review-{label}"))
                 .expect("временная рабочая область проекта должна создаваться");
-            let path = workspace.path().to_path_buf();
+            let path = workspace.path().join("repo");
+            fs::create_dir(&path).unwrap();
             git_ok(&path, &["init", "-q"]);
             git_ok(&path, &["config", "user.email", "test@example.invalid"]);
             git_ok(&path, &["config", "user.name", "Test"]);
@@ -1428,6 +1429,11 @@ mod tests {
             fs::write(path.join("src/lib.rs"), "pub fn run() { let _ = 1; }\n").unwrap();
             git_ok(&path, &["add", "."]);
             git_ok(&path, &["commit", "-qm", "base"]);
+            let tracked = String::from_utf8(
+                git_output(&path, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(tracked, "src/lib.rs\n");
             Self(path, workspace)
         }
 

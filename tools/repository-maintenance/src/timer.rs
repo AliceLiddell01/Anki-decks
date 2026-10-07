@@ -697,8 +697,11 @@ mod tests {
         let unit_dir = config_home.join("systemd/user");
         let installed_service = fs::read_to_string(unit_dir.join(SERVICE_NAME)).unwrap();
         assert!(SERVICE_TEMPLATE.contains("%h/.local/bin/anki-repository-maintenance"));
+        assert!(SERVICE_TEMPLATE.contains("clean --apply --installed-root"));
+        assert!(!SERVICE_TEMPLATE.contains("--cleanup-legacy"));
         assert!(SERVICE_TEMPLATE.contains(CARGO_PATH_MARKER));
         assert!(!installed_service.contains(CARGO_PATH_MARKER));
+        assert!(!installed_service.contains("--cleanup-legacy"));
         assert!(installed_service.contains(r#"fake cargo %% \" quote \\ slash"#));
         assert!(!installed_service.contains("/home/"));
         assert!(!installed_service.contains("/mnt/c/"));

@@ -1,11 +1,11 @@
 use asset_store::temp_workspace::TempWorkspace;
 use serde_json::Value;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, FileTimes};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_anki-repository-maintenance");
 const ORPHAN_HELPER_ENV: &str = "ANKI_REPOSITORY_MAINTENANCE_ORPHAN_TEST_ROOT";
@@ -50,7 +50,7 @@ fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
     let policy = owner.path().join("policy.toml");
     fs::write(
         &policy,
-        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=20000\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=3600\ntmp_top_entries=1\n",
+        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=20000\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=1\n",
     )
     .unwrap();
 
@@ -244,7 +244,7 @@ fn cli_preserves_live_unknown_and_unverifiable_tmp_entries() {
     let policy = owner.path().join("policy.toml");
     fs::write(
         &policy,
-        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1048576\ntarget_hard_limit_bytes=2097152\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3145728\nexternal_cache_goal_bytes=1048576\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=60\norphan_min_age_hours=24\norphan_min_age_seconds=3600\ntmp_top_entries=20\n",
+        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1048576\ntarget_hard_limit_bytes=2097152\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3145728\nexternal_cache_goal_bytes=1048576\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=60\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=20\n",
     )
     .unwrap();
 
@@ -293,6 +293,81 @@ fn cli_preserves_live_unknown_and_unverifiable_tmp_entries() {
 }
 
 #[test]
+fn cli_legacy_temp_cleanup_requires_explicit_opt_in() {
+    let owner = TempWorkspace::create("repository-maintenance-cli-legacy-smoke").unwrap();
+    let root = owner.path().join("checkout");
+    let temp_root = owner.path().join("tmp-sandbox");
+    let cache_home = owner.path().join("cache-home");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir(&temp_root).unwrap();
+    fs::create_dir(&cache_home).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"gc_legacy_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("Cargo.lock"), "version = 3\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    let policy = owner.path().join("policy.toml");
+    fs::write(&policy, include_str!("../policy.toml")).unwrap();
+    let legacy = temp_root.join(format!("kanji-{}", "a".repeat(32)));
+    fs::create_dir(&legacy).unwrap();
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(legacy.join("artifact"), [0x52_u8; 128]).unwrap();
+    fs::File::open(&legacy)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(172_800)))
+        .unwrap();
+    let legacy_name = legacy.file_name().unwrap().to_string_lossy().into_owned();
+
+    let default = invoke(&root, &policy, &temp_root, &cache_home, true);
+    assert!(
+        default.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&default.stdout),
+        String::from_utf8_lossy(&default.stderr)
+    );
+    assert!(legacy.exists());
+    let default_report = json(&default);
+    let candidate = default_report["project_temp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(&legacy_name))
+        })
+        .unwrap();
+    assert_eq!(candidate["ownership"], "unknown");
+    assert_eq!(candidate["action"], "keep");
+    assert_eq!(candidate["result"], "opt_in_required");
+
+    let opted_in = invoke_with_legacy(&root, &policy, &temp_root, &cache_home, true, true);
+    assert!(
+        opted_in.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&opted_in.stdout),
+        String::from_utf8_lossy(&opted_in.stderr)
+    );
+    assert!(!legacy.exists());
+    let opted_in_report = json(&opted_in);
+    let candidate = opted_in_report["project_temp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(&legacy_name))
+        })
+        .unwrap();
+    assert_eq!(candidate["ownership"], "unknown");
+    assert_eq!(candidate["action"], "delete");
+    assert_eq!(candidate["result"], "removed");
+}
+
+#[test]
 fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
     let owner = TempWorkspace::create("repository-maintenance-cli-cache-smoke").unwrap();
     let root = owner.path().join("checkout");
@@ -311,7 +386,7 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
     let policy = owner.path().join("policy.toml");
     fs::write(
         &policy,
-        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1048576\ntarget_hard_limit_bytes=2097152\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=1\nexternal_cache_goal_bytes=0\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=3600\ntmp_top_entries=20\n",
+        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1048576\ntarget_hard_limit_bytes=2097152\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=1\nexternal_cache_goal_bytes=0\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=20\n",
     )
     .unwrap();
 
@@ -894,7 +969,7 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
     let policy = owner.path().join("policy.toml");
     fs::write(
         &policy,
-        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=3600\ntmp_top_entries=1\n",
+        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=1\n",
     )
     .unwrap();
     let runtime = private_runtime(&cache_home);
@@ -958,6 +1033,17 @@ fn shell_quote(path: &Path) -> String {
 }
 
 fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply: bool) -> Output {
+    invoke_with_legacy(root, policy, temp_root, cache_home, apply, false)
+}
+
+fn invoke_with_legacy(
+    root: &Path,
+    policy: &Path,
+    temp_root: &Path,
+    cache_home: &Path,
+    apply: bool,
+    cleanup_legacy: bool,
+) -> Output {
     let runtime = private_runtime(cache_home);
     let mut command = Command::new(BINARY);
     command
@@ -976,6 +1062,9 @@ fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply
         .env("TMPDIR", temp_root);
     if apply {
         command.arg("--apply");
+    }
+    if cleanup_legacy {
+        command.arg("--cleanup-legacy");
     }
     command.output().unwrap()
 }

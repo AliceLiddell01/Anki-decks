@@ -64,6 +64,9 @@ struct CleanArgs {
     /// Выполнить очистку подтверждённых кандидатов.
     #[arg(long)]
     apply: bool,
+    /// Включить старые каталоги без маркера; удаление требует также --apply.
+    #[arg(long)]
+    cleanup_legacy: bool,
 }
 
 #[derive(Debug, Args)]
@@ -127,10 +130,10 @@ struct ErrorReport<'a> {
 fn main() {
     let cli = Cli::parse();
     let exit_code = match cli.command {
-        Command::Scan(args) => execute(args, false, "scan"),
+        Command::Scan(args) => execute(args, false, "scan", false),
         Command::Clean(args) => {
             let mode = if args.apply { "apply" } else { "dry-run" };
-            execute(args.common, args.apply, mode)
+            execute(args.common, args.apply, mode, args.cleanup_legacy)
         }
         Command::Timer(args) => timer(args),
         Command::Cache(args) => cache(args),
@@ -140,7 +143,7 @@ fn main() {
     }
 }
 
-fn execute(args: RunArgs, apply: bool, mode: &'static str) -> i32 {
+fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool) -> i32 {
     let policy = match args.policy.as_deref() {
         Some(path) => Policy::from_path(path),
         None => Policy::defaults(),
@@ -158,6 +161,7 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str) -> i32 {
     };
     let options = RunOptions {
         apply,
+        cleanup_legacy,
         detail: args.detail,
         mode,
         temp_root: args.temp_root,

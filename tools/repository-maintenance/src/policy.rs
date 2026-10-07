@@ -91,6 +91,7 @@ impl Policy {
             || self.external_goal_bytes() > self.external_hard_limit_bytes()
             || self.external_cache_min_age().is_zero()
             || self.orphan_min_age().is_zero()
+            || self.orphan_min_age() < asset_store::temp_workspace::DEFAULT_ORPHAN_MIN_AGE
             || self.tmp_top_entries == 0
             || self.tmp_top_entries > 500
         {
@@ -228,13 +229,24 @@ mod tests {
     #[test]
     fn byte_and_second_overrides_allow_small_reproducible_test_limits() {
         let policy: Policy = toml::from_str(
-            "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=4\norphan_min_age_hours=24\norphan_min_age_seconds=5\ntmp_top_entries=4\n",
+            "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=4\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=4\n",
         )
         .unwrap();
         policy.validate().unwrap();
         assert_eq!(policy.hard_limit_bytes(), 2);
         assert_eq!(policy.external_hard_limit_bytes(), 3);
-        assert_eq!(policy.orphan_min_age(), Duration::from_secs(5));
+        assert_eq!(policy.orphan_min_age(), Duration::from_secs(86_400));
         assert_eq!(policy.external_cache_min_age(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn orphan_age_cannot_be_lower_than_asset_store_minimum() {
+        let mut policy = Policy::defaults().unwrap();
+        let minimum = asset_store::temp_workspace::DEFAULT_ORPHAN_MIN_AGE;
+        policy.orphan_min_age_seconds = Some(minimum.as_secs() - 1);
+        assert!(policy.validate().is_err());
+
+        policy.orphan_min_age_seconds = Some(minimum.as_secs());
+        policy.validate().unwrap();
     }
 }

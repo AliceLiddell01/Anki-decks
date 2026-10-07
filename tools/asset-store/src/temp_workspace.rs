@@ -255,7 +255,7 @@ pub struct GcReport {
     pub entries: Vec<GcEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GcEntry {
     pub path: PathBuf,
     pub outcome: String,
@@ -1560,7 +1560,7 @@ fn cleanup_legacy_under(root: &Path, min_age: Duration, apply: bool) -> io::Resu
                         "старое имя каталога, UID, возраст и отсутствие живого PID подтверждены"
                             .into(),
                         bytes,
-                        "legacy-project-owned",
+                        "legacy-unverified",
                         Some(false),
                     )
                 } else {
@@ -1577,7 +1577,7 @@ fn cleanup_legacy_under(root: &Path, min_age: Duration, apply: bool) -> io::Resu
                                 "removed",
                                 "старое имя каталога подтверждено".into(),
                                 bytes,
-                                "legacy-project-owned",
+                                "legacy-unverified",
                                 Some(false),
                             )
                         }
@@ -1587,13 +1587,13 @@ fn cleanup_legacy_under(root: &Path, min_age: Duration, apply: bool) -> io::Resu
                                 "deferred",
                                 "дерево уже удалено параллельной уборкой".into(),
                                 0,
-                                "legacy-project-owned",
+                                "legacy-unverified",
                                 None,
                             )
                         }
                         Err(error) => {
                             report.errors += 1;
-                            ("error", error.to_string(), 0, "legacy-project-owned", None)
+                            ("error", error.to_string(), 0, "legacy-unverified", None)
                         }
                     }
                 }
@@ -2940,6 +2940,15 @@ mod tests {
         assert_eq!(report.removed, 1);
         assert_eq!(report.removed_bytes, 11);
         assert_eq!(report.skipped, 4);
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.outcome == "removed")
+                .unwrap()
+                .ownership,
+            "legacy-unverified"
+        );
         assert!(!old.exists());
         assert!(target.path().join("keep").exists());
         for path in [&fresh, &live, &foreign, &link, &inner_link] {

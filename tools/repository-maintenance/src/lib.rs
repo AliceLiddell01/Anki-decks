@@ -120,6 +120,7 @@ pub struct Report {
 #[derive(Debug)]
 pub struct RunOptions {
     pub apply: bool,
+    pub cleanup_legacy: bool,
     pub detail: bool,
     pub mode: &'static str,
     pub temp_root: PathBuf,
@@ -130,6 +131,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             apply: false,
+            cleanup_legacy: false,
             detail: false,
             mode: "scan",
             temp_root: PathBuf::from("/tmp"),
@@ -190,8 +192,9 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         .map_err(|error| format!("не удалось построить план очистки `TempWorkspace`: {error}"))?;
     let legacy_plan = plan_legacy_orphans_under(&options.temp_root, policy.orphan_min_age())
         .map_err(|error| format!("не удалось построить план legacy GC: {error}"))?;
+    let legacy_entries = legacy_plan.entries;
     let mut orphan_entries = orphan_plan.entries;
-    orphan_entries.extend(legacy_plan.entries);
+    orphan_entries.extend(legacy_entries.iter().cloned());
     let temp_allocated_before = orphan_entries
         .iter()
         .map(|entry| {
@@ -381,46 +384,65 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
                 operation_errors.push(message.clone());
                 temp_evidence.push(OwnershipEvidence {
                     path: options.temp_root.clone(),
-                    ownership: "project-owned",
+                    ownership: "unknown",
                     live: None,
                     action: "error",
                     reason: message,
                 });
             }
         }
-        match cleanup_legacy_orphans_under(&options.temp_root, policy.orphan_min_age()) {
-            Ok(report) => temp_apply_entries.extend(report.entries),
-            Err(error) => {
-                let message = format!("ошибка сборщика старых временных каталогов: {error}");
-                operation_errors.push(message.clone());
-                temp_evidence.push(OwnershipEvidence {
-                    path: options.temp_root.clone(),
-                    ownership: "project-owned",
-                    live: None,
-                    action: "error",
-                    reason: message,
-                });
+        if options.cleanup_legacy {
+            match cleanup_legacy_orphans_under(&options.temp_root, policy.orphan_min_age()) {
+                Ok(report) => temp_apply_entries.extend(report.entries),
+                Err(error) => {
+                    let message = format!("ошибка сборщика старых временных каталогов: {error}");
+                    operation_errors.push(message.clone());
+                    temp_evidence.push(OwnershipEvidence {
+                        path: options.temp_root.clone(),
+                        ownership: "unknown",
+                        live: None,
+                        action: "error",
+                        reason: message,
+                    });
+                }
             }
+        } else {
+            temp_apply_entries.extend(legacy_entries.iter().cloned());
         }
         cleanup_ms = cleanup_ms.saturating_add(clean_start.elapsed().as_millis());
     }
     drop(lock);
 
     let project_temp = if options.apply {
-        project_temp_candidates(&temp_apply_entries, true, &temp_allocated_before)
+        project_temp_candidates(
+            &temp_apply_entries,
+            true,
+            options.cleanup_legacy,
+            &temp_allocated_before,
+        )
     } else if options.mode == "scan" {
-        project_temp_candidates(&orphan_entries, false, &temp_allocated_before)
-            .into_iter()
-            .map(|mut candidate| {
-                if candidate.action == "delete" {
-                    candidate.action = "keep";
-                    candidate.result = "scan_only";
-                }
-                candidate
-            })
-            .collect()
+        project_temp_candidates(
+            &orphan_entries,
+            false,
+            options.cleanup_legacy,
+            &temp_allocated_before,
+        )
+        .into_iter()
+        .map(|mut candidate| {
+            if candidate.action == "delete" {
+                candidate.action = "keep";
+                candidate.result = "scan_only";
+            }
+            candidate
+        })
+        .collect()
     } else {
-        project_temp_candidates(&orphan_entries, false, &temp_allocated_before)
+        project_temp_candidates(
+            &orphan_entries,
+            false,
+            options.cleanup_legacy,
+            &temp_allocated_before,
+        )
     };
     let mut temp_after = Vec::new();
     if options.apply {
@@ -754,18 +776,24 @@ fn namespace_evidence(entries: &[GcEntry], root: &Path) -> Vec<OwnershipEvidence
 fn project_temp_candidates(
     entries: &[GcEntry],
     apply: bool,
+    cleanup_legacy: bool,
     bytes_before: &BTreeMap<PathBuf, u64>,
 ) -> Vec<Candidate> {
     entries
         .iter()
         .map(|entry| {
-            let (action, result) = match entry.outcome.as_str() {
-                "delete" => ("delete", if apply { "removed" } else { "planned" }),
-                "removed" => ("delete", "removed"),
-                "error" => ("error", "failed"),
-                "deferred" if entry.live == Some(true) => ("deferred", "busy"),
-                "deferred" => ("deferred", "unverified_or_fresh"),
-                _ => ("keep", "skipped"),
+            let legacy = entry.ownership == "legacy-unverified";
+            let (action, result) = if legacy && !cleanup_legacy && entry.outcome == "delete" {
+                ("keep", "opt_in_required")
+            } else {
+                match entry.outcome.as_str() {
+                    "delete" => ("delete", if apply { "removed" } else { "planned" }),
+                    "removed" => ("delete", "removed"),
+                    "error" => ("error", "failed"),
+                    "deferred" if entry.live == Some(true) => ("deferred", "busy"),
+                    "deferred" => ("deferred", "unverified_or_fresh"),
+                    _ => ("keep", "skipped"),
+                }
             };
             let before = bytes_before
                 .get(&entry.path)
@@ -778,14 +806,25 @@ fn project_temp_candidates(
                     .ok()
                     .map(|measurement| measurement.allocated_bytes)
             };
+            let reason = if legacy && !cleanup_legacy && entry.outcome == "delete" {
+                "каталог без маркера владения сохранён; удаление требует `clean --cleanup-legacy --apply`".into()
+            } else if legacy {
+                format!("{}; маркер владения отсутствует", entry.reason)
+            } else {
+                entry.reason.clone()
+            };
             Candidate {
                 category: "temp-workspace",
                 path: entry.path.clone(),
-                ownership: entry.ownership.clone(),
+                ownership: if legacy {
+                    "unknown".into()
+                } else {
+                    entry.ownership.clone()
+                },
                 bytes_before: before,
                 bytes_after: after,
                 bytes_freed: before.saturating_sub(after.unwrap_or(before)),
-                reason: entry.reason.clone(),
+                reason,
                 action,
                 result,
                 live: entry.live,
@@ -1076,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn project_temp_report_preserves_legacy_ownership() {
+    fn project_temp_report_marks_legacy_ownership_unverified_and_requires_opt_in() {
         let owner = asset_store::temp_workspace::TempWorkspace::create(
             "repository-maintenance-temp-ownership-test",
         )
@@ -1084,17 +1123,27 @@ mod tests {
         let path = owner.path().join("legacy-run");
         let entry = GcEntry {
             path: path.clone(),
-            outcome: "deferred".into(),
-            reason: "старый маркер".into(),
-            bytes: 0,
-            ownership: "legacy-project-owned".into(),
+            outcome: "delete".into(),
+            reason: "старое имя каталога, UID, возраст и отсутствие живого PID подтверждены".into(),
+            bytes: 12,
+            ownership: "legacy-unverified".into(),
             live: Some(false),
         };
 
-        let candidates = project_temp_candidates(&[entry], false, &BTreeMap::new());
+        let candidates =
+            project_temp_candidates(std::slice::from_ref(&entry), false, false, &BTreeMap::new());
 
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].ownership, "legacy-project-owned");
+        assert_eq!(candidates[0].ownership, "unknown");
+        assert_eq!(candidates[0].action, "keep");
+        assert_eq!(candidates[0].result, "opt_in_required");
+        assert!(candidates[0].reason.contains("--cleanup-legacy --apply"));
+
+        let opted_in =
+            project_temp_candidates(std::slice::from_ref(&entry), false, true, &BTreeMap::new());
+        assert_eq!(opted_in[0].ownership, "unknown");
+        assert_eq!(opted_in[0].action, "delete");
+        assert_eq!(opted_in[0].result, "planned");
     }
 
     #[test]

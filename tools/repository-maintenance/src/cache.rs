@@ -424,22 +424,32 @@ pub fn initialize_build_cache(
         }
         Err(error) => return Err(format!("не удалось создать каталог кэша: {error}")),
     }
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("не удалось ограничить права доступа к каталогу кэша: {error}"))?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let marker = BuildCacheMarker {
-        schema: 1,
-        repository_root: repository_root.canonicalize().map_err(|e| e.to_string())?,
-        cache_id: id.to_owned(),
-        target_dir: PathBuf::from("target"),
-        created_unix_seconds: now,
-        last_used_unix_seconds: now,
-    };
-    write_marker(&root, &marker).map_err(|error| error.to_string())?;
-    root.canonicalize().map_err(|error| error.to_string())
+    let initialized = (|| {
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!("не удалось ограничить права доступа к каталогу кэша: {error}")
+        })?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let marker = BuildCacheMarker {
+            schema: 1,
+            repository_root: repository_root.canonicalize().map_err(|e| e.to_string())?,
+            cache_id: id.to_owned(),
+            target_dir: PathBuf::from("target"),
+            created_unix_seconds: now,
+            last_used_unix_seconds: now,
+        };
+        write_marker(&root, &marker).map_err(|error| error.to_string())?;
+        root.canonicalize().map_err(|error| error.to_string())
+    })();
+    match initialized {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&root);
+            Err(error)
+        }
+    }
 }
 
 pub fn resolve_build_cache(
@@ -795,6 +805,35 @@ mod tests {
             cache_dir,
             target,
         }
+    }
+
+    #[test]
+    fn failed_cache_initialization_removes_only_its_new_directory() {
+        let owner =
+            TempWorkspace::create("repository-maintenance-cache-init-failure-test").unwrap();
+        let cache_root = owner.path().join("managed-caches");
+        fs::create_dir(&cache_root).unwrap();
+        let missing_repository = owner.path().join("missing-checkout");
+        let created = cache_root.join("new-cache");
+        let original_error = missing_repository.canonicalize().unwrap_err().to_string();
+
+        let error =
+            initialize_build_cache(&missing_repository, &cache_root, "new-cache").unwrap_err();
+
+        assert!(error.contains(&original_error));
+        assert!(!created.exists());
+
+        let existing = cache_root.join("existing-cache");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(existing.join("keep"), b"existing user data").unwrap();
+        assert!(
+            initialize_build_cache(&missing_repository, &cache_root, "existing-cache").is_err()
+        );
+        assert_eq!(
+            fs::read(existing.join("keep")).unwrap(),
+            b"existing user data"
+        );
     }
 
     fn set_last_used(path: &Path, timestamp: u64) {
