@@ -58,8 +58,8 @@ pub enum MatchArg {
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report и code-review collect/verify/delta только читают\n\
                   зафиксированное состояние репозитория; code-review сохраняет локальные\n\
-                  артефакты с точной идентичностью Git-снимка. Semantic triage отдельно\n\
-                  сохраняет и проверяет решения внешнего semantic reviewer.\n\
+                  артефакты с точной идентичностью Git-снимка. Семантический разбор отдельно\n\
+                  сохраняет и проверяет решения внешнего семантического ревьюера.\n\
                   language scan/check только читают. language apply требует\n\
                   явного --apply и решений replace, подтверждённых человеком.\n\
                   edit меняет значения существующих полей существующих заметок.\n\
@@ -549,55 +549,64 @@ pub enum CodeReviewCommand {
         out: Option<PathBuf>,
     },
 
-    /// Создать, проверить или представить решения semantic triage для пакета ревью.
+    /// Создать, проверить или представить решения семантического разбора пакета ревью.
     Triage {
         #[command(subcommand)]
         command: SemanticTriageCommand,
     },
 }
 
-/// Операции отдельного versioned semantic-triage artifact.
+/// Операции над отдельным версионируемым документом семантического разбора.
 #[derive(Debug, Subcommand)]
 pub enum SemanticTriageCommand {
     /// Инициализировать документ с явным списком нерассмотренных кандидатов.
+    ///
+    /// Требует запуска из Git-репозитория для проверки безопасного пути записи.
     Init {
         /// Неизменяемый пакет свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Путь нового semantic-triage JSON artifact.
+        /// Путь нового JSON-документа семантического разбора.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
 
-    /// Проверить заполненный triage против точного исходного review-pack.
+    /// Проверить заполненный разбор по точному исходному пакету `review.json`.
+    ///
+    /// Без `--canonical-out` команда не зависит от Git-каталога. Запись
+    /// канонического JSON требует запуска из Git-репозитория.
     Validate {
         /// Неизменяемый пакет свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Заполненный semantic-triage JSON artifact.
+        /// Заполненный JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
-        /// Необязательный путь для отсортированного canonical JSON.
+        /// Необязательный путь для отсортированного канонического JSON.
+        /// Запись запрещена под `decks/**`, в служебные каталоги Git и по
+        /// символьным ссылкам.
         #[arg(long = "canonical-out", value_name = "PATH")]
         canonical_out: Option<PathBuf>,
     },
 
-    /// Показать компактную воспроизводимую сводку валидного triage.
+    /// Показать компактную воспроизводимую сводку проверенного разбора.
     Summary {
         /// Неизменяемый пакет свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Semantic-triage JSON artifact.
+        /// JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
     },
 
-    /// Создать компактный Markdown-отчёт из валидного canonical triage.
+    /// Создать компактный Markdown-отчёт по проверенному каноническому разбору.
+    ///
+    /// Требует запуска из Git-репозитория для проверки безопасного пути записи.
     Report {
         /// Неизменяемый пакет свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Semantic-triage JSON artifact.
+        /// JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
         /// Путь нового Markdown-отчёта.

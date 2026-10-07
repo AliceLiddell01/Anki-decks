@@ -49,7 +49,7 @@ use crate::render::{human, json};
 /// Полностью подготовленный к печати результат команды.
 #[derive(Debug)]
 pub struct Rendered {
-    /// Имя команды для JSON envelope.
+    /// Имя команды для оболочки JSON.
     pub command: &'static str,
     /// Текст, который должен попасть в stdout.
     pub stdout: String,
@@ -771,7 +771,7 @@ fn human_semantic_triage_init(
     result: &crate::code_review::workflow::SemanticTriageInitSummary,
 ) -> String {
     format!(
-        "Semantic triage создан: {}\nКандидатов: {}; пока не рассмотрено: {}.\nHEAD: {}\n",
+        "Семантический разбор создан: {}\nКандидатов: {}; пока не рассмотрено: {}.\nHEAD: {}\n",
         result.artifact,
         result.total_candidates,
         result.unreviewed_candidates,
@@ -783,14 +783,14 @@ fn human_semantic_triage_validation(
     result: &crate::code_review::workflow::SemanticTriageValidationSummary,
 ) -> String {
     let mut text = format!(
-        "Semantic triage валиден.\nКандидатов: {}; рассмотрено: {}; не рассмотрено: {}.\n",
+        "Семантический разбор прошёл проверку.\nКандидатов: {}; рассмотрено: {}; не рассмотрено: {}.\n",
         result.summary.total_candidates,
         result.summary.reviewed_candidates,
         result.summary.unreviewed_candidates,
     );
     if let Some(path) = &result.canonical_artifact {
         use std::fmt::Write as _;
-        let _ = writeln!(text, "Canonical JSON: {path}");
+        let _ = writeln!(text, "Канонический JSON: {path}");
     }
     text
 }
@@ -800,7 +800,7 @@ fn human_semantic_triage_summary(
 ) -> String {
     use std::fmt::Write as _;
     let mut text = format!(
-        "Semantic triage summary\nВсего кандидатов: {}\nРассмотрено: {}\nНерассмотрено: {}\n",
+        "Сводка семантического разбора\nВсего кандидатов: {}\nРассмотрено: {}\nНе рассмотрено: {}\n",
         summary.total_candidates, summary.reviewed_candidates, summary.unreviewed_candidates,
     );
     let _ = writeln!(
@@ -809,24 +809,32 @@ fn human_semantic_triage_summary(
         summary.individual_review.decision_count
     );
     for (disposition, count) in &summary.individual_review.by_disposition {
-        let _ = writeln!(text, "  individual {}: {count}", disposition.as_str());
+        let _ = writeln!(
+            text,
+            "  Отдельные решения «{}»: {count}",
+            disposition.as_str()
+        );
     }
     let _ = writeln!(
         text,
-        "Групповых решений: {}; покрытых candidate IDs: {}; representative IDs: {}",
+        "Групповых решений: {}; ID кандидатов в группах: {}; ID представителей: {}",
         summary.group_review.decisions.decision_count,
         summary.group_review.covered_candidate_ids,
         summary.group_review.representative_candidate_ids,
     );
     for (disposition, count) in &summary.group_review.decisions.by_disposition {
-        let _ = writeln!(text, "  group {} decisions: {count}", disposition.as_str());
+        let _ = writeln!(
+            text,
+            "  Групповые решения «{}»: {count}",
+            disposition.as_str()
+        );
     }
-    let _ = writeln!(text, "Findings: {}", summary.findings.total_findings);
+    let _ = writeln!(text, "Замечаний: {}", summary.findings.total_findings);
     for (severity, count) in &summary.findings.by_severity {
-        let _ = writeln!(text, "  severity {}: {count}", severity.as_str());
+        let _ = writeln!(text, "  Серьёзность {}: {count}", severity.as_str());
     }
     for (provenance, count) in &summary.findings.by_provenance {
-        let _ = writeln!(text, "  provenance {}: {count}", provenance.as_str());
+        let _ = writeln!(text, "  Происхождение {}: {count}", provenance.as_str());
     }
     text
 }
@@ -835,7 +843,7 @@ fn human_semantic_triage_report(
     result: &crate::code_review::workflow::SemanticTriageReportSummary,
 ) -> String {
     format!(
-        "Markdown-отчёт сохранён: {}\nFindings: {}; нерассмотренных кандидатов: {}.\n",
+        "Markdown-отчёт сохранён: {}\nЗамечаний: {}; нерассмотренных кандидатов: {}.\n",
         result.report, result.total_findings, result.unreviewed_candidates,
     )
 }
@@ -1226,8 +1234,8 @@ fn build_review_criteria(
 
 /// Готовит stdout/stderr для доменной ошибки.
 ///
-/// В JSON mode stdout содержит только один валидный JSON document, а stderr
-/// остаётся пустым. В human mode сообщение уходит в stderr, а stdout пуст.
+/// В режиме JSON stdout содержит только один корректный документ JSON, а stderr
+/// остаётся пустым. В обычном режиме сообщение уходит в stderr, а stdout пуст.
 pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (String, String) {
     if json_mode {
         (json::error_json(command, error), String::new())

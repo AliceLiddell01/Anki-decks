@@ -13,7 +13,7 @@ use crate::error::{DomainError, ErrorCode};
 use super::model::ReviewPack;
 use super::scope::GitTarget;
 
-/// Версия отдельного контракта semantic-triage.
+/// Версия отдельного контракта семантического разбора.
 pub const TRIAGE_SCHEMA_VERSION: u32 = 1;
 
 /// Состояние кандидата после внешнего семантического рассмотрения.
@@ -119,18 +119,18 @@ impl FindingProvenance {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriageSource {
-    /// Полная переносимая идентичность Git без пути к локальному clone.
+    /// Полная переносимая идентичность Git без пути к локальному клону.
     pub snapshot: TriageSnapshot,
-    /// SHA-256 точных байтов исходного review.json, lowercase hex.
+    /// SHA-256 точных байтов исходного review.json в виде строчных шестнадцатеричных символов.
     pub review_pack_sha256: String,
-    /// Число уникальных кандидатов в общем пространстве static/language.
+    /// Число уникальных кандидатов в общей выборке статического анализа и языковой проверки.
     pub candidate_count: usize,
 }
 
-/// Строгая форма Git-снимка внутри triage.
+/// Строгая форма Git-снимка внутри семантического разбора.
 ///
 /// `GitTarget` также используется внутри старого `review.json`, где неизвестные
-/// поля сохраняют совместимость формата. Новый triage-контракт закрыт для
+/// поля сохраняют совместимость формата. Новый контракт разбора закрыт для
 /// неизвестных полей и поэтому использует отдельный тип с теми же данными.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,7 +266,7 @@ pub fn initialize(pack: &ReviewPack, source_pack_sha256: &str) -> SemanticTriage
     }
 }
 
-/// Сортирует множества, сохраняя дубликаты для последующего отказа validator.
+/// Сортирует множества, сохраняя дубликаты для последующего отказа проверки.
 pub fn canonicalize(triage: &mut SemanticTriage) {
     triage
         .individual_decisions
@@ -293,7 +293,9 @@ fn invalid(message: impl Into<String>) -> DomainError {
 
 fn require_nonempty(value: &str, field: &str) -> Result<(), DomainError> {
     if value.trim().is_empty() {
-        return Err(invalid(format!("Пустое значение semantic-triage: {field}")));
+        return Err(invalid(format!(
+            "В документе семантического разбора не задано значение: {field}"
+        )));
     }
     Ok(())
 }
@@ -315,11 +317,11 @@ fn cover<'a>(
     coverage: &mut BTreeSet<&'a str>,
 ) -> Result<(), DomainError> {
     if !candidates.contains(id) {
-        return Err(invalid(format!("Неизвестный candidate ID: {id}")));
+        return Err(invalid(format!("Неизвестный ID кандидата: {id}")));
     }
     if !coverage.insert(id) {
         return Err(invalid(format!(
-            "Неоднозначное покрытие candidate ID: {id}"
+            "Кандидат уже охвачен другим решением: {id}"
         )));
     }
     Ok(())
@@ -337,12 +339,12 @@ fn link_decision<'a>(
     let unique_findings = unique_strings(finding_ids, "decision.finding_ids")?;
     if disposition == Disposition::Confirmed && unique_findings.is_empty() {
         return Err(invalid(
-            "Решение confirmed требует связи хотя бы с одним finding",
+            "Для решения confirmed нужно указать хотя бы одно связанное замечание",
         ));
     }
     for finding_id in &unique_findings {
         if !findings.contains_key(finding_id) {
-            return Err(invalid(format!("Неизвестный finding ID: {finding_id}")));
+            return Err(invalid(format!("Неизвестный ID замечания: {finding_id}")));
         }
     }
     for candidate_id in candidate_ids {
@@ -355,15 +357,17 @@ fn link_decision<'a>(
 
 /// Проверяет идентичность, точное покрытие и взаимность всех связей.
 ///
-/// digest относится к точным байтам review.json; его вычисляет владелец чтения.
-/// Функция принимает input в любом порядке и не нормализует противоречия.
+/// Дайджест относится к точным байтам review.json; его вычисляет владелец чтения.
+/// Функция принимает входные данные в любом порядке и не нормализует противоречия.
 pub fn validate(
     triage: &SemanticTriage,
     pack: &ReviewPack,
     source_pack_sha256: &str,
 ) -> Result<TriageSummary, DomainError> {
     if triage.schema_version != TRIAGE_SCHEMA_VERSION {
-        return Err(invalid("Неподдерживаемая schema_version semantic-triage"));
+        return Err(invalid(
+            "Неподдерживаемое значение schema_version документа семантического разбора",
+        ));
     }
     let valid_digest = source_pack_sha256.len() == 64
         && source_pack_sha256
@@ -371,13 +375,13 @@ pub fn validate(
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     if !valid_digest || triage.source.review_pack_sha256 != source_pack_sha256 {
         return Err(invalid(
-            "SHA-256 semantic-triage не соответствует точному source review-pack",
+            "SHA-256 документа семантического разбора не соответствует точным байтам исходного review.json",
         ));
     }
     if triage.source.snapshot != TriageSnapshot::from(&pack.target) {
         return Err(DomainError::new(
             ErrorCode::BaselineMismatch,
-            "Снимок semantic-triage не соответствует source review-pack",
+            "Git-снимок документа семантического разбора не соответствует исходному review.json",
         ));
     }
     let all_candidates = pack.all_candidates();
@@ -385,12 +389,12 @@ pub fn validate(
     if all_candidates.len() != candidates.len() || candidates.iter().any(|id| id.trim().is_empty())
     {
         return Err(invalid(
-            "Source review-pack содержит пустые или повторяющиеся candidate IDs",
+            "В исходном review.json есть пустые или повторяющиеся ID кандидатов",
         ));
     }
     if triage.source.candidate_count != candidates.len() {
         return Err(invalid(
-            "candidate_count не соответствует source review-pack",
+            "Значение candidate_count не соответствует числу кандидатов в исходном review.json",
         ));
     }
     let mut findings = BTreeMap::new();
@@ -399,7 +403,7 @@ pub fn validate(
         require_nonempty(&finding.title, "finding.title")?;
         require_nonempty(&finding.description, "finding.description")?;
         if findings.insert(finding.id.as_str(), finding).is_some() {
-            return Err(invalid(format!("Повтор finding ID: {}", finding.id)));
+            return Err(invalid(format!("Повтор ID замечания: {}", finding.id)));
         }
     }
     let mut coverage = BTreeSet::new();
@@ -421,12 +425,12 @@ pub fn validate(
     for group in &triage.group_decisions {
         require_nonempty(&group.id, "group.id")?;
         if !group_ids.insert(group.id.as_str()) {
-            return Err(invalid(format!("Повтор group ID: {}", group.id)));
+            return Err(invalid(format!("Повтор ID группы: {}", group.id)));
         }
         let ids = unique_strings(&group.candidate_ids, "group.candidate_ids")?;
         if ids.len() < 2 {
             return Err(invalid(
-                "Группа должна покрывать хотя бы два различных candidate IDs",
+                "Группа должна охватывать хотя бы два разных ID кандидатов",
             ));
         }
         let representatives = unique_strings(
@@ -435,7 +439,7 @@ pub fn validate(
         )?;
         if representatives.is_empty() || !representatives.is_subset(&ids) {
             return Err(invalid(
-                "Представители группы должны быть непустым подмножеством её candidate IDs",
+                "ID представителей группы должны быть непустым подмножеством ID кандидатов в ней",
             ));
         }
         for id in &ids {
@@ -456,7 +460,7 @@ pub fn validate(
     }
     if coverage.len() != candidates.len() {
         return Err(invalid(
-            "Каждый source candidate требует решения или явного unreviewed_candidate_ids",
+            "Для каждого кандидата исходного пакета нужно указать решение или внести его ID в unreviewed_candidate_ids",
         ));
     }
     let mut finding_links = BTreeSet::new();
@@ -465,14 +469,14 @@ pub fn validate(
         match finding.provenance {
             FindingProvenance::Independent if !ids.is_empty() => {
                 return Err(invalid(
-                    "Independent finding не должен ссылаться на candidates",
+                    "Для замечания со значением independent в provenance список candidate_ids должен быть пуст",
                 ));
             }
             FindingProvenance::DirectCandidate | FindingProvenance::CandidateAssisted
                 if ids.is_empty() =>
             {
                 return Err(invalid(
-                    "Finding с provenance кандидата требует непустого candidate_ids",
+                    "Для замечания, связанного с кандидатом, нужно указать хотя бы один ID в candidate_ids",
                 ));
             }
             _ => {}
@@ -480,14 +484,14 @@ pub fn validate(
         for id in ids {
             if !candidates.contains(id) || !reviewed_dispositions.contains_key(id) {
                 return Err(invalid(format!(
-                    "Finding ссылается на отсутствующий или нерассмотренный candidate: {id}"
+                    "Замечание связано с отсутствующим или нерассмотренным кандидатом: {id}"
                 )));
             }
             if finding.provenance == FindingProvenance::DirectCandidate
                 && reviewed_dispositions.get(id) != Some(&Disposition::Confirmed)
             {
                 return Err(invalid(format!(
-                    "Direct candidate finding требует решения confirmed для candidate: {id}"
+                    "Для замечания со значением direct_candidate кандидат должен иметь решение confirmed: {id}"
                 )));
             }
             finding_links.insert((id, finding.id.as_str()));
@@ -495,7 +499,7 @@ pub fn validate(
     }
     if decision_links != finding_links {
         return Err(invalid(
-            "Связи decision.finding_ids и finding.candidate_ids должны быть строго взаимными",
+            "Связи decision.finding_ids и finding.candidate_ids должны в точности совпадать",
         ));
     }
     Ok(summarize(triage, pack))
@@ -507,7 +511,7 @@ fn count_decision(counts: &mut DecisionCounts, disposition: Disposition, reason:
     *counts.by_reason_code.entry(reason).or_default() += 1;
 }
 
-/// Статистика валидированного artifact; не создаёт решения для пропущенных IDs.
+/// Статистика проверенного документа; не создаёт решения для пропущенных ID.
 #[must_use]
 pub fn summarize(triage: &SemanticTriage, pack: &ReviewPack) -> TriageSummary {
     let mut summary = TriageSummary {
@@ -603,8 +607,8 @@ fn markdown_cell(value: &str) -> String {
         .replace(['\n', '\r'], " ")
 }
 
-/// Компактный детерминированный отчёт: агрегаты вместо списка всех candidates.
-/// Вызывающий владелец сначала валидирует artifact относительно source pack.
+/// Компактный детерминированный отчёт: агрегаты вместо списка всех кандидатов.
+/// Вызывающая сторона сначала проверяет документ по исходному пакету.
 #[must_use]
 pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
     let summary = summarize(triage, pack);
@@ -620,7 +624,7 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
     );
     let _ = writeln!(
         output,
-        "Source SHA-256: `{}`\n",
+        "SHA-256 исходного пакета: `{}`\n",
         triage.source.review_pack_sha256
     );
     let _ = writeln!(
@@ -636,7 +640,7 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
         summary.group_review.covered_candidate_ids,
         summary.group_review.representative_candidate_ids
     );
-    output.push_str("## Исходы рассмотрения\n\n| disposition | Индивидуальных решений | Групповых решений | Покрытых IDs в группах |\n| --- | ---: | ---: | ---: |\n");
+    output.push_str("## Исходы рассмотрения\n\n| Решение | Индивидуальных решений | Групповых решений | ID кандидатов в группах |\n| --- | ---: | ---: | ---: |\n");
     for disposition in [
         Disposition::Confirmed,
         Disposition::Acceptable,
@@ -670,7 +674,7 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
             grouped_ids
         );
     }
-    output.push_str("\n## Причины\n\n| reason_code | Индивидуальных решений | Групповых решений | Покрытых IDs в группах |\n| --- | ---: | ---: | ---: |\n");
+    output.push_str("\n## Причины\n\n| Код причины | Индивидуальных решений | Групповых решений | ID кандидатов в группах |\n| --- | ---: | ---: | ---: |\n");
     let reasons: BTreeSet<_> = summary
         .individual_review
         .by_reason_code
@@ -705,7 +709,7 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
             grouped_ids
         );
     }
-    output.push_str("\n## Детекторы\n\nЧисла исходов в этой таблице обозначают покрытые candidate IDs.\n\n| Детектор | Всего | Не рассмотрено | Индивидуально | Группой | confirmed | acceptable | false_positive | not_applicable | uncertain | Связаны с finding |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    output.push_str("\n## Детекторы\n\nЧисла исходов в этой таблице обозначают охваченные ID кандидатов.\n\n| Детектор | Всего | Не рассмотрено | Рассмотрено отдельно | Рассмотрено в группе | confirmed | acceptable | false_positive | not_applicable | uncertain | Связано с замечаниями |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for (name, counts) in &summary.by_detector {
         let get = |disposition| {
             counts
@@ -733,14 +737,14 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
     output.push_str("\n## Замечания\n\n");
     let _ = writeln!(
         output,
-        "Всего findings: {}.\n",
+        "Всего замечаний: {}.\n",
         summary.findings.total_findings
     );
-    output.push_str("| Severity | Число |\n| --- | ---: |\n");
+    output.push_str("| Серьёзность | Число |\n| --- | ---: |\n");
     for (severity, count) in &summary.findings.by_severity {
         let _ = writeln!(output, "| {} | {} |", severity.as_str(), count);
     }
-    output.push_str("\n| Provenance | Число |\n| --- | ---: |\n");
+    output.push_str("\n| Происхождение | Число |\n| --- | ---: |\n");
     for (provenance, count) in &summary.findings.by_provenance {
         let _ = writeln!(output, "| {} | {} |", provenance.as_str(), count);
     }
@@ -749,7 +753,7 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
     for finding in findings {
         let _ = writeln!(
             output,
-            "\n### [{}] {}\n\nID: {}; provenance: {}; связанных candidates: {}.\n\n{}\n",
+            "\n### [{}] {}\n\nID: {}; происхождение: {}; связанных кандидатов: {}.\n\n{}\n",
             finding.severity.as_str(),
             markdown_cell(&finding.title),
             markdown_cell(&finding.id),
@@ -758,7 +762,8 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
             finding.description
         );
     }
-    output.push_str("\nПолная связь решений, групп, представителей и findings сохранена в JSON.\n");
+    output
+        .push_str("\nПолные связи решений, групп, представителей и замечаний сохранены в JSON.\n");
     output
 }
 

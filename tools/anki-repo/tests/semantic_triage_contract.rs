@@ -46,7 +46,11 @@ fn success(result: (i32, String, String)) -> String {
 fn failure(result: (i32, String, String), expected_code: &str) {
     let (code, stdout, stderr) = result;
     assert_ne!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
-    assert_eq!(parse_json(&stdout)["error"]["code"], expected_code);
+    assert_eq!(
+        parse_json(&stdout)["error"]["code"],
+        expected_code,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
 }
 
 impl Fixture {
@@ -154,6 +158,36 @@ impl Fixture {
         run_cli_in(Some(self.repository.path()), args)
     }
 
+    fn canonicalize(&self, output: &Path) -> (i32, String, String) {
+        self.run(&[
+            "--json",
+            "code-review",
+            "triage",
+            "validate",
+            "--pack",
+            self.pack.to_str().unwrap(),
+            "--triage",
+            self.triage.to_str().unwrap(),
+            "--canonical-out",
+            output.to_str().unwrap(),
+        ])
+    }
+
+    fn report(&self, triage: &Path, output: &Path) -> (i32, String, String) {
+        self.run(&[
+            "--json",
+            "code-review",
+            "triage",
+            "report",
+            "--pack",
+            self.pack.to_str().unwrap(),
+            "--triage",
+            triage.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+    }
+
     fn ids(&self) -> Vec<String> {
         self.initial["unreviewed_candidate_ids"]
             .as_array()
@@ -215,6 +249,156 @@ fn init_preserves_explicit_unreviewed_and_unified_candidate_space() {
     let bytes = fs::read(&fixture.triage).unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains(fixture.repository.path().to_str().unwrap()));
     assert!(!String::from_utf8_lossy(&bytes).contains(fixture.artifacts.path().to_str().unwrap()));
+}
+
+#[test]
+fn init_is_idempotent_and_preserves_edited_decisions() {
+    let fixture = Fixture::new();
+    let arguments = [
+        "--json",
+        "code-review",
+        "triage",
+        "init",
+        "--pack",
+        fixture.pack.to_str().unwrap(),
+        "--out",
+        fixture.triage.to_str().unwrap(),
+    ];
+    let initial_bytes = fs::read(&fixture.triage).unwrap();
+    success(fixture.run(&arguments));
+    assert_eq!(fs::read(&fixture.triage).unwrap(), initial_bytes);
+    success(fixture.validate(&fixture.reviewed()));
+    let edited_bytes = fs::read(&fixture.triage).unwrap();
+    failure(fixture.run(&arguments), "review_artifact_conflict");
+    assert_eq!(fs::read(&fixture.triage).unwrap(), edited_bytes);
+}
+
+#[test]
+fn derived_outputs_refresh_after_decision_changes_and_remain_idempotent() {
+    let fixture = Fixture::new();
+    let canonical = fixture.artifacts.path().join("canonical.json");
+    let report = fixture.artifacts.path().join("report.md");
+    let evidence_bytes = fs::read(&fixture.pack).unwrap();
+    let first_triage = fixture.reviewed();
+    write_json(&fixture.triage, &first_triage);
+    success(fixture.canonicalize(&canonical));
+    assert_eq!(read_json(&canonical), first_triage);
+    success(fixture.report(&canonical, &report));
+    let first_canonical_bytes = fs::read(&canonical).unwrap();
+    let first_report_bytes = fs::read(&report).unwrap();
+
+    let mut updated = first_triage;
+    updated["individual_decisions"][0]["disposition"] = json!("acceptable");
+    updated["individual_decisions"][0]["explanation"] =
+        json!("Проверка вызовов уточнила связь сигнала с дефектом.");
+    updated["findings"][0]["provenance"] = json!("candidate_assisted");
+    updated["findings"][0]["severity"] = json!("minor");
+    updated["findings"][0]["title"] = json!("Уточнённый дефект");
+    write_json(&fixture.triage, &updated);
+    let editable_bytes = fs::read(&fixture.triage).unwrap();
+    success(fixture.canonicalize(&canonical));
+    assert_eq!(read_json(&canonical), updated);
+    let updated_canonical_bytes = fs::read(&canonical).unwrap();
+    assert_ne!(updated_canonical_bytes, first_canonical_bytes);
+    success(fixture.report(&canonical, &report));
+    let updated_report_bytes = fs::read(&report).unwrap();
+    assert_ne!(updated_report_bytes, first_report_bytes);
+    let report_text = String::from_utf8(updated_report_bytes.clone()).unwrap();
+    assert!(report_text.contains("Уточнённый дефект"));
+    assert!(report_text.contains("candidate_assisted"));
+    assert!(!report_text.contains("Подтверждённый дефект"));
+
+    success(fixture.canonicalize(&canonical));
+    success(fixture.report(&canonical, &report));
+    assert_eq!(fs::read(&canonical).unwrap(), updated_canonical_bytes);
+    assert_eq!(fs::read(&report).unwrap(), updated_report_bytes);
+    assert_eq!(fs::read(&fixture.triage).unwrap(), editable_bytes);
+    assert_eq!(fs::read(&fixture.pack).unwrap(), evidence_bytes);
+
+    // Провал текущей проверки не должен менять уже существующие производные файлы.
+    updated["individual_decisions"][0]["finding_ids"] = json!(["unknown-finding"]);
+    write_json(&fixture.triage, &updated);
+    failure(fixture.canonicalize(&canonical), "review_artifact_invalid");
+    failure(
+        fixture.report(&fixture.triage, &report),
+        "review_artifact_invalid",
+    );
+    assert_eq!(fs::read(&canonical).unwrap(), updated_canonical_bytes);
+    assert_eq!(fs::read(&report).unwrap(), updated_report_bytes);
+}
+
+#[test]
+fn derived_overwrite_rejects_source_collisions_and_unsafe_existing_paths() {
+    let fixture = Fixture::new();
+    success(fixture.validate(&fixture.reviewed()));
+    for source in [&fixture.pack, &fixture.triage] {
+        let before = fs::read(source).unwrap();
+        failure(fixture.canonicalize(source), "invalid_request");
+        failure(fixture.report(&fixture.triage, source), "invalid_request");
+        assert_eq!(fs::read(source).unwrap(), before);
+    }
+
+    let directory = fixture.artifacts.path().join("existing-directory");
+    fs::create_dir(&directory).unwrap();
+    failure(fixture.canonicalize(&directory), "review_artifact_conflict");
+    failure(
+        fixture.report(&fixture.triage, &directory),
+        "review_artifact_conflict",
+    );
+    assert!(directory.is_dir());
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+
+    let decks = fixture.repository.path().join("decks");
+    fs::create_dir(&decks).unwrap();
+    fs::create_dir(decks.join("nested")).unwrap();
+    let protected_paths = [
+        decks.join("existing-output"),
+        fixture.repository.path().join(".git/existing-output"),
+        decks.join("nested/../existing-output"),
+    ];
+    for output in protected_paths {
+        fs::write(&output, b"protected bytes").unwrap();
+        failure(fixture.canonicalize(&output), "invalid_request");
+        failure(fixture.report(&fixture.triage, &output), "invalid_request");
+        assert_eq!(fs::read(&output).unwrap(), b"protected bytes");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn derived_overwrite_rejects_live_dangling_and_parent_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    success(fixture.validate(&fixture.reviewed()));
+    let target = fixture.artifacts.path().join("protected-target");
+    fs::write(&target, b"protected bytes").unwrap();
+    let missing = fixture.artifacts.path().join("missing-target");
+    for (name, target) in [("live-link", &target), ("dangling-link", &missing)] {
+        let output = fixture.artifacts.path().join(name);
+        symlink(target, &output).unwrap();
+        failure(fixture.canonicalize(&output), "invalid_request");
+        failure(fixture.report(&fixture.triage, &output), "invalid_request");
+        assert_eq!(fs::read_link(&output).unwrap(), *target);
+    }
+    assert_eq!(fs::read(&target).unwrap(), b"protected bytes");
+    assert!(!missing.exists());
+
+    let decks = fixture.repository.path().join("decks");
+    fs::create_dir(&decks).unwrap();
+    for (name, parent) in [
+        ("decks-alias", decks),
+        ("metadata-alias", fixture.repository.path().join(".git")),
+    ] {
+        let target = parent.join("existing-output");
+        fs::write(&target, b"protected bytes").unwrap();
+        let alias = fixture.artifacts.path().join(name);
+        symlink(parent, &alias).unwrap();
+        let output = alias.join("existing-output");
+        failure(fixture.canonicalize(&output), "invalid_request");
+        failure(fixture.report(&fixture.triage, &output), "invalid_request");
+        assert_eq!(fs::read(target).unwrap(), b"protected bytes");
+    }
 }
 
 #[test]
@@ -342,70 +526,132 @@ fn rejects_incompatible_source_identity_and_unaccounted_candidate() {
 fn rejects_unknown_duplicate_conflicting_and_inconsistent_links() {
     let fixture = Fixture::new();
     let valid = fixture.reviewed();
-    let cases: &[fn(&mut Value)] = &[
-        |v| v["individual_decisions"][0]["candidate_id"] = json!("unknown-candidate"),
-        |v| v["individual_decisions"][0]["finding_ids"] = json!(["unknown-finding"]),
-        |v| v["individual_decisions"][0]["finding_ids"] = json!([]),
+    // Нарушения структуры, покрытия и связей принадлежат review_artifact_invalid.
+    // Несовместимость снимка проверяется отдельно как baseline_mismatch.
+    type InvalidCase = (fn(&mut Value), &'static str);
+    let cases: &[InvalidCase] = &[
+        (
+            |v| v["individual_decisions"][0]["candidate_id"] = json!("unknown-candidate"),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["individual_decisions"][0]["finding_ids"] = json!(["unknown-finding"]),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["individual_decisions"][0]["finding_ids"] = json!([]),
+            "review_artifact_invalid",
+        ),
         // Прямое подтверждение finding требует подтверждённого disposition.
-        |v| v["individual_decisions"][0]["disposition"] = json!("acceptable"),
-        |v| v["findings"][0]["candidate_ids"] = json!([]),
-        |v| v["findings"][0]["candidate_ids"] = json!(["unknown-candidate"]),
-        |v| {
-            let duplicate = v["findings"][0].clone();
-            v["findings"].as_array_mut().unwrap().push(duplicate);
-        },
-        |v| {
-            let duplicate = v["individual_decisions"][0].clone();
-            v["individual_decisions"]
-                .as_array_mut()
-                .unwrap()
-                .push(duplicate);
-        },
-        |v| {
-            let id = v["individual_decisions"][0]["candidate_id"].clone();
-            v["group_decisions"][0]["candidate_ids"]
-                .as_array_mut()
-                .unwrap()
-                .push(id);
-        },
-        |v| {
-            let id = v["individual_decisions"][0]["candidate_id"].clone();
-            v["unreviewed_candidate_ids"] = json!([id]);
-        },
-        |v| v["group_decisions"][0]["representative_candidate_ids"] = json!(["unknown-candidate"]),
-        |v| v["group_decisions"][0]["representative_candidate_ids"] = json!([]),
-        |v| v["group_decisions"][0]["candidate_ids"] = json!([]),
-        |v| {
-            let id = v["group_decisions"][0]["candidate_ids"][0].clone();
-            v["group_decisions"][0]["candidate_ids"] = json!([id]);
-        },
-        |v| {
-            let id = v["individual_decisions"][0]["candidate_id"].clone();
-            v["group_decisions"][0]["representative_candidate_ids"] = json!([id]);
-        },
-        |v| {
-            let duplicate = v["group_decisions"][0].clone();
-            v["group_decisions"].as_array_mut().unwrap().push(duplicate);
-        },
-        |v| {
-            let id = v["group_decisions"][0]["candidate_ids"][0].clone();
-            v["group_decisions"][0]["candidate_ids"]
-                .as_array_mut()
-                .unwrap()
-                .push(id);
-        },
-        |v| v["individual_decisions"][0]["explanation"] = json!("   "),
-        |v| v["individual_decisions"][0]["reason_code"] = json!("unknown-reason"),
-        |v| v["source"]["snapshot"]["unexpected"] = json!("must be rejected"),
+        (
+            |v| v["individual_decisions"][0]["disposition"] = json!("acceptable"),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["findings"][0]["candidate_ids"] = json!([]),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["findings"][0]["candidate_ids"] = json!(["unknown-candidate"]),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let duplicate = v["findings"][0].clone();
+                v["findings"].as_array_mut().unwrap().push(duplicate);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let duplicate = v["individual_decisions"][0].clone();
+                v["individual_decisions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let id = v["individual_decisions"][0]["candidate_id"].clone();
+                v["group_decisions"][0]["candidate_ids"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(id);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let id = v["individual_decisions"][0]["candidate_id"].clone();
+                v["unreviewed_candidate_ids"] = json!([id]);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                v["group_decisions"][0]["representative_candidate_ids"] =
+                    json!(["unknown-candidate"])
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["group_decisions"][0]["representative_candidate_ids"] = json!([]),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["group_decisions"][0]["candidate_ids"] = json!([]),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let id = v["group_decisions"][0]["candidate_ids"][0].clone();
+                v["group_decisions"][0]["candidate_ids"] = json!([id]);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let id = v["individual_decisions"][0]["candidate_id"].clone();
+                v["group_decisions"][0]["representative_candidate_ids"] = json!([id]);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let duplicate = v["group_decisions"][0].clone();
+                v["group_decisions"].as_array_mut().unwrap().push(duplicate);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| {
+                let id = v["group_decisions"][0]["candidate_ids"][0].clone();
+                v["group_decisions"][0]["candidate_ids"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(id);
+            },
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["individual_decisions"][0]["explanation"] = json!("   "),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["individual_decisions"][0]["reason_code"] = json!("unknown-reason"),
+            "review_artifact_invalid",
+        ),
+        (
+            |v| v["source"]["snapshot"]["unexpected"] = json!("must be rejected"),
+            "review_artifact_invalid",
+        ),
     ];
-    for (index, mutate) in cases.iter().enumerate() {
+    for (mutate, expected_code) in cases {
         let mut invalid = valid.clone();
         mutate(&mut invalid);
-        let (code, stdout, stderr) = fixture.validate(&invalid);
-        assert_ne!(
-            code, 0,
-            "некорректный artifact #{index}: {stdout}\n{stderr}"
-        );
+        failure(fixture.validate(&invalid), expected_code);
     }
 }
 
@@ -454,6 +700,57 @@ fn detector_assistance_remains_distinct_and_partial_review_stays_explicit() {
         summary["result"]["reviewed_candidates"],
         json!(fixture.ids().len() - 1)
     );
+}
+
+#[test]
+fn validation_without_output_is_portable_and_keeps_typed_mismatches() {
+    let fixture = Fixture::new();
+    let original = parse_json(&success(fixture.validate(&fixture.reviewed())));
+    let outside = TempDir::new("semantic-triage-outside-git");
+    let pack = outside.path().join("review.json");
+    let triage = outside.path().join("semantic-triage.json");
+    fs::copy(&fixture.pack, &pack).unwrap();
+    fs::copy(&fixture.triage, &triage).unwrap();
+    assert!(
+        !Command::new("git")
+            .current_dir(outside.path())
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let arguments = [
+        "--json",
+        "code-review",
+        "triage",
+        "validate",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--triage",
+        triage.to_str().unwrap(),
+    ];
+    let result = parse_json(&success(run_cli_in(Some(outside.path()), &arguments)));
+    assert_eq!(result["result"], original["result"]);
+    let original_triage_bytes = fs::read(&triage).unwrap();
+    let mut incompatible_snapshot = read_json(&triage);
+    incompatible_snapshot["source"]["snapshot"]["head_sha"] = json!("incompatible-snapshot");
+    write_json(&triage, &incompatible_snapshot);
+    failure(
+        run_cli_in(Some(outside.path()), &arguments),
+        "baseline_mismatch",
+    );
+    fs::write(&triage, &original_triage_bytes).unwrap();
+
+    // Семантически тот же JSON с другими байтами всё равно имеет другой SHA-256.
+    let mut changed_pack_bytes = fs::read(&pack).unwrap();
+    changed_pack_bytes.push(b'\n');
+    fs::write(&pack, changed_pack_bytes).unwrap();
+    failure(
+        run_cli_in(Some(outside.path()), &arguments),
+        "review_artifact_invalid",
+    );
+    assert_eq!(fs::read(triage).unwrap(), original_triage_bytes);
 }
 
 #[test]
