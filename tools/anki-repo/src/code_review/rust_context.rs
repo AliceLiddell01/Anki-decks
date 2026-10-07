@@ -218,6 +218,33 @@ impl RustContextIndex {
     }
 }
 
+/// Сохраняет смещения байтов исходника: `syn::parse_file` удаляет BOM и shebang перед разбором.
+fn parse_rust_file_with_aligned_spans(source: &str) -> syn::Result<syn::File> {
+    const BOM: &str = "\u{feff}";
+
+    let has_bom = source.starts_with(BOM);
+    let parsed = syn::parse_file(source)?;
+    if !has_bom && parsed.shebang.is_none() {
+        return Ok(parsed);
+    }
+
+    let mut masked = source.to_owned();
+    if has_bom {
+        masked.replace_range(..BOM.len(), &" ".repeat(BOM.len()));
+    }
+    if parsed.shebang.is_some() {
+        let shebang_start = if has_bom { BOM.len() } else { 0 };
+        let shebang_end = source[shebang_start..]
+            .find('\n')
+            .map_or(source.len(), |offset| shebang_start + offset);
+        masked.replace_range(
+            shebang_start..shebang_end,
+            &" ".repeat(shebang_end - shebang_start),
+        );
+    }
+    syn::parse_str(&masked)
+}
+
 impl FileContext {
     fn parse(source: &str, execution: RustExecutionContext) -> Self {
         let mut line_starts = vec![0];
@@ -228,7 +255,7 @@ impl FileContext {
             segments: Vec::new(),
             failure: None,
         };
-        let Ok(syntax) = syn::parse_file(source) else {
+        let Ok(syntax) = parse_rust_file_with_aligned_spans(source) else {
             file.failure = Some(RustContextBasis::ParseFailure);
             return file;
         };
@@ -1022,6 +1049,36 @@ fn runtime() { open().unwrap(); }
             );
             assert_eq!(context.basis, RustContextBasis::RustSyntax);
         }
+    }
+
+    #[test]
+    fn bom_and_shebang_preserve_ast_source_offsets() {
+        for prefix in [
+            "\u{feff}",
+            "#!/usr/bin/env rustx\n",
+            "\u{feff}#!/usr/bin/env rustx\n",
+        ] {
+            let source = format!("{prefix}fn run() {{ std::fs::read(path).unwrap(); }}");
+            let context = at_text(&index(&source), &source, "unwrap");
+
+            assert_eq!(
+                context.execution,
+                RustExecutionContext::Runtime,
+                "{prefix:?}"
+            );
+            assert_eq!(
+                context.code_role,
+                RustCodeRole::RuntimeBoundary,
+                "{prefix:?}"
+            );
+            assert_eq!(context.basis, RustContextBasis::RustSyntax, "{prefix:?}");
+        }
+
+        let source = "\u{feff}#![cfg(test)]\n#[test] fn check() { setup().unwrap(); }";
+        let context = at_text(&index(source), source, "unwrap");
+        assert_eq!(context.execution, RustExecutionContext::Test);
+        assert_eq!(context.code_role, RustCodeRole::TestSetup);
+        assert_eq!(context.basis, RustContextBasis::RustSyntax);
     }
 
     #[test]

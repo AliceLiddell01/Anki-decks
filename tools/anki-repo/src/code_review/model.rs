@@ -246,11 +246,10 @@ impl ReviewPack {
         files
     }
 
-    /// Индексирует текущие и предыдущие пути в исходном порядке файлов.
+    /// Индексирует текущие пути, затем добавляет предыдущие как псевдонимы без перезаписи.
     pub(crate) fn scope_files_by_candidate_path(&self) -> BTreeMap<&str, &ReviewFile> {
-        let mut files = BTreeMap::new();
+        let mut files = self.scope_files_by_path();
         for file in &self.scope.files {
-            files.entry(file.path.as_str()).or_insert(file);
             if let Some(previous_path) = file.previous_path.as_deref() {
                 files.entry(previous_path).or_insert(file);
             }
@@ -447,5 +446,23 @@ mod tests {
         file.binary = true;
         file.post_state = ImageState::Binary;
         assert_eq!(pack.all_candidates()[0].origin, CandidateOrigin::Unknown);
+    }
+
+    #[test]
+    fn current_path_takes_precedence_over_renamed_file_alias() {
+        let mut pack = language_pack("// Existing English explanation\n", Vec::new());
+        let mut renamed = pack.scope.files[0].clone();
+        renamed.path = "src/new.rs".into();
+        renamed.previous_path = Some("src/reused.rs".into());
+
+        let mut added_at_previous_path = renamed.clone();
+        added_at_previous_path.path = "src/reused.rs".into();
+        added_at_previous_path.previous_path = None;
+        added_at_previous_path.status = FileStatus::Added;
+        pack.scope.files = vec![renamed, added_at_previous_path];
+
+        let files = pack.scope_files_by_candidate_path();
+        assert_eq!(files["src/new.rs"].path, "src/new.rs");
+        assert_eq!(files["src/reused.rs"].path, "src/reused.rs");
     }
 }
