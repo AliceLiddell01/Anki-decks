@@ -607,21 +607,28 @@ fn markdown_cell(value: &str) -> String {
         .replace(['\n', '\r'], " ")
 }
 
+fn markdown_inline(value: &str) -> String {
+    let normalized = value.replace(['\n', '\r'], " ");
+    escape_markdown_punctuation(&normalized)
+}
+
+fn escape_markdown_punctuation(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_punctuation() {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 fn markdown_blockquote(value: &str) -> String {
     value
         .replace("\r\n", "\n")
         .replace('\r', "\n")
         .split('\n')
-        .map(|line| {
-            let mut escaped = String::with_capacity(line.len());
-            for character in line.chars() {
-                if character.is_ascii_punctuation() {
-                    escaped.push('\\');
-                }
-                escaped.push(character);
-            }
-            format!("> {escaped}")
-        })
+        .map(|line| format!("> {}", escape_markdown_punctuation(line)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -774,8 +781,8 @@ pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
             output,
             "\n### [{}] {}\n\nID: {}; происхождение: {}; связанных кандидатов: {}.\n\n",
             finding.severity.as_str(),
-            markdown_cell(&finding.title),
-            markdown_cell(&finding.id),
+            markdown_inline(&finding.title),
+            markdown_inline(&finding.id),
             finding.provenance.as_str(),
             finding.candidate_ids.len()
         );
@@ -1234,6 +1241,25 @@ mod tests {
         assert!(report.contains("> \\<script\\>alert\\(1\\)\\<\\/script\\>"));
         assert!(!report.contains("\n# Заголовок"));
         assert!(!report.contains("\n| Поле |"));
+        assert!(!report.contains("\n<script>"));
+    }
+
+    #[test]
+    fn finding_title_and_id_cannot_inject_markdown_structure() {
+        let pack = pack();
+        let mut triage = initialize(&pack, DIGEST);
+        let mut finding = finding(Vec::new(), FindingProvenance::Independent);
+        finding.title = "# Заголовок\n<script>alert(1)</script>".into();
+        finding.id = "id\n## Injected | [link](https://example.test)".into();
+        triage.findings.push(finding);
+
+        validate(&triage, &pack, DIGEST).unwrap();
+        let report = render_markdown(&triage, &pack);
+
+        assert!(report.contains("### [major] \\# Заголовок \\<script\\>"));
+        assert!(report.contains("ID: id \\#\\# Injected \\| \\[link\\]"));
+        assert!(report.contains("\\(https\\:\\/\\/example\\.test\\)"));
+        assert!(!report.contains("\n## Injected"));
         assert!(!report.contains("\n<script>"));
     }
 
