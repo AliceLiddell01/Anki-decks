@@ -53,7 +53,7 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review triage, language, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review queue/triage, language, edit, models, create, retire, migrate-media, visual-report",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report и code-review collect/verify/delta только читают\n\
@@ -108,6 +108,12 @@ impl Cli {
                 CodeReviewCommand::Collect { .. } => "code-review collect",
                 CodeReviewCommand::Verify { .. } => "code-review verify",
                 CodeReviewCommand::Delta { .. } => "code-review delta",
+                CodeReviewCommand::Queue { command } => match command {
+                    ReviewQueueCommand::Validate { .. } => "code-review queue validate",
+                    ReviewQueueCommand::Summary { .. } => "code-review queue summary",
+                    ReviewQueueCommand::Group { .. } => "code-review queue group",
+                    ReviewQueueCommand::Candidate { .. } => "code-review queue candidate",
+                },
                 CodeReviewCommand::Triage { command } => match command {
                     SemanticTriageCommand::Init { .. } => "code-review triage init",
                     SemanticTriageCommand::Validate { .. } => "code-review triage validate",
@@ -549,10 +555,56 @@ pub enum CodeReviewCommand {
         out: Option<PathBuf>,
     },
 
+    /// Проверить и просматривать детерминированную структурную очередь.
+    Queue {
+        #[command(subcommand)]
+        command: ReviewQueueCommand,
+    },
+
     /// Создать, проверить или представить решения семантического разбора пакета ревью.
     Triage {
         #[command(subcommand)]
         command: SemanticTriageCommand,
+    },
+}
+
+/// Read-only операции над очередью, привязанной к точным байтам `review.json`.
+#[derive(Debug, Subcommand)]
+pub enum ReviewQueueCommand {
+    /// Проверить источник, полноту покрытия и структуру queue artifact.
+    Validate {
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        #[arg(long, value_name = "QUEUE")]
+        queue: PathBuf,
+    },
+
+    /// Показать агрегированную сводку очереди.
+    Summary {
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        #[arg(long, value_name = "QUEUE")]
+        queue: PathBuf,
+    },
+
+    /// Раскрыть одну группу, включая полное множество исходных candidate IDs.
+    Group {
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        #[arg(long, value_name = "QUEUE")]
+        queue: PathBuf,
+        #[arg(long, value_name = "ID")]
+        id: String,
+    },
+
+    /// Найти candidate и показать его исходное evidence, классификацию и unit.
+    Candidate {
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        #[arg(long, value_name = "QUEUE")]
+        queue: PathBuf,
+        #[arg(long, value_name = "ID")]
+        id: String,
     },
 }
 

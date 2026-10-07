@@ -122,6 +122,28 @@
 корректно продолжить. Статусы анализаторов учитывай отдельно от отсутствия
 сигналов; не устанавливай и не скачивай инструменты ради обычного сборщика.
 
+После успешного `collect` или `verify` используй автоматически созданные рядом с `review.json`
+`review-queue.json` и `review.txt`. Сначала проверь, что очередь относится к
+этому пакету, затем начни со сводки и high/unknown units; после них просматривай
+остальные units по surface, роли и структуре:
+
+```bash
+anki-repo code-review queue validate --pack "$PACK" --queue "$QUEUE"
+anki-repo code-review queue summary --pack "$PACK" --queue "$QUEUE"
+anki-repo code-review queue group --pack "$PACK" --queue "$QUEUE" --id "$GROUP_ID"
+anki-repo code-review queue candidate --pack "$PACK" --queue "$QUEUE" --id "$CANDIDATE_ID"
+```
+
+`QUEUE` — соседний `review-queue.json` того же снимка. Сводки и раскрытие units
+ссылаются на исходные candidate IDs. `review.txt` — краткая карта для
+навигации, `review-queue.json` — структурированное членство и классификация,
+`review.json` — полный авторитетный raw evidence. Priority указывает только
+порядок внимания; group unit предлагает совместное рассмотрение и не является
+semantic group decision. Representatives не доказывают, что все участники имеют
+одинаковый смысл. Если группа выглядит неоднородной, раскрывай её глубже и
+рассматривай различающиеся случаи отдельно. Независимо читай diff и окружающий
+код; пустая очередь кандидатов не доказывает отсутствие дефекта.
+
 Если работа распределена между субагентами, передай им один сохранённый
 неизменяемый пакет и одинаковые SHA. Не собирай плавающие снимки для каждого
 направления отдельно.
@@ -134,6 +156,9 @@ anki-repo code-review triage init --pack "$PACK" --out "$TRIAGE"
 
 `init` связывает документ с точными байтами `review.json` и Git-снимком. Дальше
 редактируй только JSON с решениями; свидетельства остаются неизменными.
+Не превращай структурные группы очереди в решения без содержательной проверки:
+каждое semantic group decision должно отражать фактически рассмотренные
+`candidate_ids` и `representative_candidate_ids`.
 Подробные поля, коды причин, проверки связей и правила идентичности заданы в публичном контракте
 [anki-repo](../../../../tools/anki-repo/README.md#code-review-collectverifydeltatriage).
 

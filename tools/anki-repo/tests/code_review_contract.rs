@@ -6,6 +6,7 @@ use std::process::Command;
 
 use crate::common::{TempDir, cli_binary, parse_json, run_cli, run_cli_in};
 use serde_json::{Value, json};
+use sha2::Digest as _;
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -93,6 +94,7 @@ fn code_review_namespace_does_not_replace_card_review_commands() {
     assert!(help.contains("collect"));
     assert!(help.contains("verify"));
     assert!(help.contains("delta"));
+    assert!(help.contains("queue"));
 
     for subcommand in ["collect", "verify"] {
         let (code, help, stderr) = run_cli(&["code-review", subcommand, "--help"]);
@@ -162,6 +164,8 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
     assert_eq!(result["tool_runs"][0]["status"], json!("skipped"));
     let baseline_path = baseline_dir.join("review.json");
     let baseline_bytes = fs::read(&baseline_path).unwrap();
+    assert!(baseline_dir.join("review-queue.json").is_file());
+    assert!(baseline_dir.join("review.txt").is_file());
     assert!(
         !String::from_utf8_lossy(&baseline_bytes)
             .contains(&temp.path().to_string_lossy().to_string())
@@ -221,6 +225,8 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
     );
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let verified = parse_json(&stdout)["result"].clone();
+    assert!(verified_dir.join("review-queue.json").is_file());
+    assert!(verified_dir.join("review.txt").is_file());
     assert_eq!(verified["target"]["base_sha"], json!(base_sha));
     assert_eq!(verified["target"]["head_sha"], json!(fixed_sha));
     assert!(
@@ -575,17 +581,16 @@ fn human_review_summary_preserves_snapshot_and_evidence_meaning() {
     let output = artifacts.path().join("collected");
     let result = collect_pack(repo.path(), &base, &head, &output, false);
     let text = fs::read_to_string(output.join("review.txt")).unwrap();
+    let queue: Value =
+        serde_json::from_slice(&fs::read(output.join("review-queue.json")).unwrap()).unwrap();
     for required in [
         format!("База: {base}"),
         format!("HEAD: {head}"),
         format!("Общий предок (merge-base): {base}"),
-        "src/lib.rs изменён".into(),
-        format!(
-            "Кандидатов: {} (требуют семантической проверки)",
-            result["candidates"]
-        ),
-        "rust_suppression src/lib.rs:1 существовал в исходной версии".into(),
-        "error_path src/lib.rs:4 внесён или изменён диапазоном".into(),
+        "Статусы файлов: изменён: 1".into(),
+        format!("Raw candidates: {}", result["candidates"]),
+        "review-queue.json".into(),
+        "Полные evidence: review.json".into(),
         "Диагностик: 0 (сами по себе не являются подтверждёнными замечаниями)".into(),
         "Анализатор clippy: skipped".into(),
     ] {
@@ -594,7 +599,255 @@ fn human_review_summary_preserves_snapshot_and_evidence_meaning() {
             "в review.txt отсутствует {required:?}:\n{text}"
         );
     }
+    assert_eq!(
+        queue["source"]["review_pack_sha256"],
+        serde_json::json!(format!(
+            "{:x}",
+            sha2::Sha256::digest(fs::read(output.join("review.json")).unwrap())
+        ))
+    );
+    assert_eq!(
+        queue["summary"]["raw_candidates"],
+        result["review_queue"]["raw_candidates"]
+    );
     assert!(!text.contains(repo.path().to_str().unwrap()));
+}
+
+#[test]
+fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
+    let repo = TempDir::new("review-queue-large-group");
+    let artifacts = TempDir::new("review-queue-large-group-artifacts");
+    init_repo(&repo);
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    commit(repo.path(), "base");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    let mut source = String::from(
+        "// Human review message\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn repeated_setup() {\n",
+    );
+    for _ in 0..1_200 {
+        source.push_str("        let _ = Result::<(), &str>::Err(\"fixture\").unwrap();\n");
+    }
+    source.push_str(
+        "    }\n}\npub fn read_boundary(path: &str) { let _ = std::fs::read(path).unwrap(); }\n",
+    );
+    fs::write(repo.path().join("src/lib.rs"), source).unwrap();
+    commit(
+        repo.path(),
+        "add repeated test evidence and runtime boundary",
+    );
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let output = artifacts.path().join("collected");
+    let result = collect_pack(repo.path(), &base, &head, &output, false);
+    let pack_bytes = fs::read(output.join("review.json")).unwrap();
+    let queue_bytes = fs::read(output.join("review-queue.json")).unwrap();
+    let pack: Value = serde_json::from_slice(&pack_bytes).unwrap();
+    let queue: Value = serde_json::from_slice(&queue_bytes).unwrap();
+    let text = fs::read_to_string(output.join("review.txt")).unwrap();
+
+    assert_eq!(
+        queue["source"]["review_pack_sha256"],
+        json!(format!("{:x}", sha2::Sha256::digest(&pack_bytes)))
+    );
+    assert_eq!(queue["summary"]["raw_candidates"], result["candidates"]);
+    let static_ids: Vec<_> = pack["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|candidate| candidate["detector"] == "error_path")
+        .map(|candidate| candidate["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        static_ids.len(),
+        1_201,
+        "ожидались 1200 test calls и один production call"
+    );
+    let group = queue["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["members"]["kind"] == "group")
+        .expect("повторяющиеся test calls должны образовать группу");
+    let group_ids = group["members"]["candidate_ids"].as_array().unwrap();
+    let group_id_set: std::collections::BTreeSet<_> =
+        group_ids.iter().map(|id| id.as_str().unwrap()).collect();
+    assert_eq!(group_ids.len(), 1_200);
+    let production = pack["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["path"] == "src/lib.rs" && candidate["line"] == 1206)
+        .or_else(|| {
+            pack["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| {
+                    candidate["detector"] == "error_path"
+                        && candidate["snippet"]
+                            .as_str()
+                            .is_some_and(|snippet| snippet.contains("std::fs::read"))
+                })
+        })
+        .expect("production filesystem candidate");
+    let production_id = production["id"].as_str().unwrap();
+    assert!(!group_id_set.contains(production_id));
+    let production_class = &queue["classifications"][production_id];
+    assert_eq!(production_class["execution"], "production");
+    assert_eq!(production_class["code_role"], "runtime_boundary");
+    assert_eq!(group["signature"]["classification"]["execution"], "tests");
+    assert_eq!(
+        group["signature"]["classification"]["code_role"],
+        "test_setup"
+    );
+    let language_ids: Vec<_> = pack["language"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !language_ids.is_empty(),
+        "human comment must remain in raw language evidence"
+    );
+    for id in &language_ids {
+        assert!(queue["classifications"][*id].is_object());
+    }
+    assert!(
+        text.lines().count() < 150,
+        "review.txt должен оставаться компактным"
+    );
+    let non_representative = group_ids
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .find(|id| {
+            !group["members"]["representative_candidate_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|representative| representative == *id)
+        })
+        .unwrap();
+    assert!(!text.contains(non_representative));
+    let queue_text = String::from_utf8(queue_bytes).unwrap();
+    assert!(!queue_text.contains(repo.path().to_str().unwrap()));
+    assert!(!queue_text.contains("findings"));
+    assert!(!queue_text.contains("disposition"));
+
+    let pack_path = output.join("review.json");
+    let queue_path = output.join("review-queue.json");
+    let pack_arg = pack_path.to_string_lossy().into_owned();
+    let queue_arg = queue_path.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "validate",
+            "--pack",
+            &pack_arg,
+            "--queue",
+            &queue_arg,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["result"]["valid"], true);
+
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "summary",
+            "--pack",
+            &pack_arg,
+            "--queue",
+            &queue_arg,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        parse_json(&stdout)["result"]["raw_candidates"],
+        queue["summary"]["raw_candidates"]
+    );
+
+    let group_id = group["id"].as_str().unwrap();
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "group",
+            "--pack",
+            &pack_arg,
+            "--queue",
+            &queue_arg,
+            "--id",
+            group_id,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let expanded = parse_json(&stdout)["result"].clone();
+    assert_eq!(
+        expanded["unit"]["members"]["candidate_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1_200
+    );
+    assert_eq!(expanded["representatives"].as_array().unwrap().len(), 3);
+
+    let candidate_id = group["members"]["representative_candidate_ids"][0]
+        .as_str()
+        .unwrap();
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "candidate",
+            "--pack",
+            &pack_arg,
+            "--queue",
+            &queue_arg,
+            "--id",
+            candidate_id,
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        parse_json(&stdout)["result"]["candidate"]["id"],
+        candidate_id
+    );
+
+    let tampered_pack_path = artifacts.path().join("review-with-whitespace.json");
+    let mut tampered = pack_bytes;
+    tampered.push(b' ');
+    fs::write(&tampered_pack_path, tampered).unwrap();
+    let tampered_arg = tampered_pack_path.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "validate",
+            "--pack",
+            &tampered_arg,
+            "--queue",
+            &queue_arg,
+        ],
+    );
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        parse_json(&stdout)["error"]["code"],
+        "review_artifact_invalid"
+    );
 }
 
 #[test]

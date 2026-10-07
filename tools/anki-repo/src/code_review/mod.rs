@@ -8,6 +8,8 @@ pub mod detectors;
 pub mod diagnostics;
 pub mod language;
 pub mod model;
+pub mod review_queue;
+pub mod rust_context;
 pub mod scope;
 pub mod semantic_triage;
 pub mod workflow;
