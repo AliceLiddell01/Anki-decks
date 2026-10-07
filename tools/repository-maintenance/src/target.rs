@@ -30,6 +30,12 @@ pub enum ThresholdDecision {
     Clean,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetBlocker {
+    Busy,
+    Unsafe(String),
+}
+
 pub fn threshold_decision(
     allocated_bytes: u64,
     warning_bytes: u64,
@@ -55,6 +61,8 @@ pub struct CargoTargetMeasurement {
     pub safety: ProcessCheck,
     pub safe_to_clean: bool,
     pub ownership_safe: bool,
+    #[serde(skip)]
+    pub blocker: Option<TargetBlocker>,
     pub reason: String,
 }
 
@@ -272,12 +280,17 @@ pub fn inspect_target(
         .measured_dirs
         .iter()
         .all(|path| path_is_within_workspace(&workspace.root, path));
+    let marker_error = if decision == ThresholdDecision::Clean {
+        validate_cargo_target(&workspace.target_dir).err()
+    } else {
+        None
+    };
     let safe_to_clean = decision == ThresholdDecision::Clean
         && errors.is_empty()
         && mount_boundaries == 0
         && ownership_safe
         && matches!(safety, ProcessCheck::Clear)
-        && validate_cargo_target(&workspace.target_dir).is_ok();
+        && marker_error.is_none();
     let reason = if decision == ThresholdDecision::Keep {
         "размер ниже порога предупреждения".into()
     } else if decision == ThresholdDecision::Warn {
@@ -291,7 +304,9 @@ pub fn inspect_target(
         "обнаружена вложенная точка монтирования; очистка всего каталога Cargo `target` отложена"
             .into()
     } else if !ownership_safe {
-        "каталог `target` или `build-dir` находится вне workspace root (корня рабочей области) и не имеет маркера владения проекта; очистка отложена".into()
+        "каталог `target` или `build-dir` находится вне корня рабочей области и не имеет маркера владения проекта; очистка отложена".into()
+    } else if let Some(error) = &marker_error {
+        format!("каталог `target` не подтверждён маркером Cargo `CACHEDIR.TAG`: {error}")
     } else if !matches!(safety, ProcessCheck::Clear) {
         match &safety {
             ProcessCheck::Busy {
@@ -306,10 +321,20 @@ pub fn inspect_target(
             }
             ProcessCheck::Clear => unreachable!(),
         }
-    } else if let Err(error) = validate_cargo_target(&workspace.target_dir) {
-        format!("каталог `target` не подтверждён маркером Cargo `CACHEDIR.TAG`: {error}")
     } else {
         "каталог `target` превысил жёсткий предел и подтверждён Cargo".into()
+    };
+    let blocker = if decision != ThresholdDecision::Clean || safe_to_clean {
+        None
+    } else if errors.is_empty()
+        && mount_boundaries == 0
+        && ownership_safe
+        && marker_error.is_none()
+        && matches!(safety, ProcessCheck::Busy { .. })
+    {
+        Some(TargetBlocker::Busy)
+    } else {
+        Some(TargetBlocker::Unsafe(reason.clone()))
     };
     CargoTargetMeasurement {
         workspace_root: workspace.root.clone(),
@@ -321,6 +346,7 @@ pub fn inspect_target(
         safety,
         safe_to_clean,
         ownership_safe,
+        blocker,
         reason,
     }
 }
@@ -537,7 +563,7 @@ mod tests {
         assert_eq!(measurement.decision, ThresholdDecision::Clean);
         assert!(!measurement.ownership_safe);
         assert!(!measurement.safe_to_clean);
-        assert!(measurement.reason.contains("workspace root"));
+        assert!(measurement.reason.contains("корня рабочей области"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! CLI-сценарии для неизменяемых свидетельств code-review и языковой политики.
+//! CLI-сценарии для неизменяемых свидетельств code-review и правил обработки языка.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -44,7 +44,7 @@ pub struct SnapshotSummary {
     pub delta: Option<ReviewDelta>,
 }
 
-/// Краткий результат language scan/check.
+/// Краткий результат команд `language scan` и `language check`.
 #[derive(Debug, Clone, Serialize)]
 pub struct LanguageSummary {
     pub artifact: String,
@@ -54,7 +54,7 @@ pub struct LanguageSummary {
     pub skipped: usize,
 }
 
-/// Краткий результат language apply без копирования всего содержимого файлов в stdout.
+/// Краткий результат `language apply` без копирования всего содержимого файлов в stdout.
 #[derive(Debug, Clone, Serialize)]
 pub struct LanguageApplySummary {
     pub applied: bool,
@@ -85,7 +85,7 @@ pub fn collect(
     save_snapshot(&root, out_dir, &pack, None)
 }
 
-/// Пересобирает свидетельства от зафиксированной base и создаёт дельту детекторов.
+/// Пересобирает свидетельства от зафиксированной базовой версии и создаёт дельту детекторов.
 pub fn verify(
     baseline_path: &Path,
     head: &str,
@@ -96,7 +96,7 @@ pub fn verify(
     let baseline: ReviewPack = read_json(
         baseline_path,
         MAX_REVIEW_ARTIFACT_BYTES,
-        "исходный review-pack",
+        "исходный пакет ревью",
     )?;
     delta::validate_review_pack(&baseline)?;
     let collected =
@@ -108,7 +108,7 @@ pub fn verify(
         // Проверяем до build_pack: он может явно запускать Clippy.
         return Err(DomainError::with_details(
             ErrorCode::BaselineMismatch,
-            "новый снимок относится к другому репозиторию или merge-base относительно исходного пакета",
+            "новый снимок относится к другому репозиторию или отличается по merge-base от исходного пакета",
             crate::details! {
                 "baseline_base_sha" => baseline.target.base_sha,
                 "new_base_sha" => collected.target.base_sha,
@@ -131,9 +131,9 @@ pub fn compare_files(
     let before: ReviewPack = read_json(
         before_path,
         MAX_REVIEW_ARTIFACT_BYTES,
-        "исходный review-pack",
+        "исходный пакет ревью",
     )?;
-    let after: ReviewPack = read_json(after_path, MAX_REVIEW_ARTIFACT_BYTES, "новый review-pack")?;
+    let after: ReviewPack = read_json(after_path, MAX_REVIEW_ARTIFACT_BYTES, "новый пакет ревью")?;
     let changes = delta::compare(&before, &after)?;
     if let Some(path) = output {
         let bytes = json_bytes(&changes)?;
@@ -144,7 +144,7 @@ pub fn compare_files(
     Ok(changes)
 }
 
-/// Сканирует явные пути относительно репозитория или полные новые версии файлов review-pack.
+/// Сканирует явные пути относительно репозитория или полные новые версии файлов пакета ревью.
 pub fn scan_language(
     root_arg: &Path,
     paths: &[PathBuf],
@@ -153,7 +153,7 @@ pub fn scan_language(
 ) -> Result<LanguageSummary, DomainError> {
     let root = repository_root(root_arg)?;
     let (sources, mut skipped) = if let Some(pack_path) = pack_path {
-        let pack: ReviewPack = read_json(pack_path, MAX_REVIEW_ARTIFACT_BYTES, "review-pack")?;
+        let pack: ReviewPack = read_json(pack_path, MAX_REVIEW_ARTIFACT_BYTES, "пакет ревью")?;
         delta::validate_review_pack(&pack)?;
         let collected = scope::collect_scope(&root, &pack.target.base_sha, &pack.target.head_sha)
             .map_err(scope_error)?;
@@ -163,7 +163,7 @@ pub fn scan_language(
         {
             return Err(DomainError::new(
                 ErrorCode::BaselineMismatch,
-                "review-pack относится к другому репозиторию или Git-снимку",
+                "пакет ревью относится к другому репозиторию или снимку Git",
             ));
         }
         sources_from_scope(&collected)
@@ -171,7 +171,7 @@ pub fn scan_language(
         if paths.is_empty() {
             return Err(DomainError::new(
                 ErrorCode::Usage,
-                "language scan требует хотя бы один --path или --pack",
+                "для `language scan` укажите хотя бы один `--path` или `--pack`",
             ));
         }
         read_language_paths(&root, paths)?
@@ -192,13 +192,16 @@ pub fn check_language(
     output: Option<&Path>,
 ) -> Result<(LanguageScan, Option<LanguageSummary>), DomainError> {
     let root = repository_root(root_arg)?;
-    let previous: LanguageScan =
-        read_json(scan_path, MAX_LANGUAGE_ARTIFACT_BYTES, "language scan")?;
+    let previous: LanguageScan = read_json(
+        scan_path,
+        MAX_LANGUAGE_ARTIFACT_BYTES,
+        "артефакт `language scan`",
+    )?;
     if previous.schema_version != language::LANGUAGE_SCHEMA_VERSION {
         return Err(DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
             format!(
-                "неподдерживаемая версия language scan: {}",
+                "неподдерживаемая версия артефакта `language scan`: {}",
                 previous.schema_version
             ),
         ));
@@ -224,7 +227,7 @@ pub fn check_language(
     Ok((scan, summary))
 }
 
-/// Проверяет решения в dry-run и применяет только явные `replace` с `apply_changes`.
+/// Проверяет решения без записи и применяет только явные `replace` через `apply_changes`.
 pub fn apply_language(
     root_arg: &Path,
     decisions_path: &Path,
@@ -234,13 +237,13 @@ pub fn apply_language(
     let decisions: LanguageDecisions = read_json(
         decisions_path,
         MAX_LANGUAGE_ARTIFACT_BYTES,
-        "language decisions",
+        "файл решений для `language apply`",
     )?;
     let result = language::apply(&root, &decisions, apply_changes).map_err(language_error)?;
     Ok(apply_summary(result))
 }
 
-/// Готовит сводку и локальные артефакты пакета и, при verify, дельту.
+/// Готовит сводку и локальные артефакты пакета и, при режиме `verify`, дельту.
 fn save_snapshot(
     root: &Path,
     out_dir: Option<&Path>,
@@ -899,7 +902,7 @@ fn file_status_label(status: &FileStatus) -> &'static str {
 fn candidate_origin_label(origin: CandidateOrigin) -> &'static str {
     match origin {
         CandidateOrigin::IntroducedOrChanged => "внесён или изменён диапазоном",
-        CandidateOrigin::PreExisting => "существовал в base",
+        CandidateOrigin::PreExisting => "существовал в исходной версии",
         CandidateOrigin::Unknown => "происхождение неизвестно",
     }
 }
@@ -1208,7 +1211,7 @@ fn normalize_relative_path(path: &Path) -> Result<String, DomainError> {
     if path.is_absolute() {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "language --path должен быть относительным",
+            "путь в аргументе `language --path` должен быть относительным",
         ));
     }
     let mut segments = Vec::new();
@@ -1230,7 +1233,7 @@ fn normalize_relative_path(path: &Path) -> Result<String, DomainError> {
             _ => {
                 return Err(DomainError::new(
                     ErrorCode::InvalidRequest,
-                    "language --path не должен выходить за корень репозитория",
+                    "путь из `language --path` не должен выходить за корень репозитория",
                 ));
             }
         }
@@ -1238,7 +1241,7 @@ fn normalize_relative_path(path: &Path) -> Result<String, DomainError> {
     if segments.is_empty() {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "language --path должен указывать на файл",
+            "аргумент `language --path` должен указывать на файл",
         ));
     }
     Ok(segments.join("/"))
@@ -1257,7 +1260,7 @@ fn checked_source_path(root: &Path, relative: &str) -> Result<PathBuf, DomainErr
         if metadata.file_type().is_symlink() {
             return Err(DomainError::new(
                 ErrorCode::InvalidRequest,
-                format!("символьная ссылка в language path запрещена: {relative}"),
+                format!("символьная ссылка в пути `language --path` запрещена: {relative}"),
             ));
         }
     }
@@ -1270,7 +1273,7 @@ fn checked_source_path(root: &Path, relative: &str) -> Result<PathBuf, DomainErr
     if !resolved.starts_with(root) {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "language path вышел за корень репозитория",
+            "путь из `language --path` вышел за корень репозитория",
         ));
     }
     Ok(resolved)
@@ -1414,7 +1417,7 @@ mod tests {
     impl GitFixture {
         fn new(label: &str) -> Self {
             let workspace = TempWorkspace::create(&format!("anki-review-{label}"))
-                .expect("проектный temp workspace должен создаваться");
+                .expect("временная рабочая область проекта должна создаваться");
             let path = workspace.path().to_path_buf();
             git_ok(&path, &["init", "-q"]);
             git_ok(&path, &["config", "user.email", "test@example.invalid"]);
@@ -1617,7 +1620,7 @@ mod tests {
             fs::write(&path, b"ignored Cargo input").unwrap();
             assert!(
                 !working_tree_matches(&target, &repo.0),
-                "ignored Cargo input {relative} must prevent running Clippy"
+                "изменение входного файла Cargo «{relative}» должно блокировать запуск Clippy"
             );
             fs::remove_file(path).unwrap();
         }
@@ -1635,7 +1638,7 @@ mod tests {
             fs::write(&path, b"ignored local data").unwrap();
             assert!(
                 working_tree_matches(&target, &repo.0),
-                "ignored local data {relative} must not prevent running Clippy"
+                "изменение локальных данных «{relative}» не должно блокировать запуск Clippy"
             );
             fs::remove_file(path).unwrap();
         }
@@ -1736,7 +1739,7 @@ mod tests {
     #[test]
     fn artifacts_are_idempotent_but_never_silently_overwritten() {
         let owner = TempWorkspace::create("anki-artifact-write-test")
-            .expect("проектный temp workspace должен создаваться");
+            .expect("временная рабочая область проекта должна создаваться");
         let temp = owner.path().to_path_buf();
         let first = BTreeMap::from([("review.json", b"{}\n".to_vec())]);
         let second = BTreeMap::from([("review.json", b"{\"different\":true}\n".to_vec())]);

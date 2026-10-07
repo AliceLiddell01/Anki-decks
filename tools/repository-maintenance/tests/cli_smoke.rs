@@ -143,6 +143,43 @@ fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
 }
 
 #[test]
+fn cli_clean_reports_invalid_target_marker_as_fatal_and_preserves_target() {
+    let owner = TempWorkspace::create("repository-maintenance-invalid-target-marker").unwrap();
+    let root = owner.path().join("checkout");
+    let target = root.join("target");
+    let temp_root = owner.path().join("tmp");
+    let cache_home = owner.path().join("cache-home");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&temp_root).unwrap();
+    fs::create_dir_all(&cache_home).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"invalid_target_marker_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("Cargo.lock"), "version = 3\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(target.join("CACHEDIR.TAG"), "not a Cargo marker\n").unwrap();
+    fs::write(target.join("synthetic-artifact"), [0x71_u8; 8192]).unwrap();
+    let policy = owner.path().join("policy.toml");
+    fs::write(
+        &policy,
+        "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_min_age_days=7\norphan_min_age_hours=24\ntmp_top_entries=20\n",
+    )
+    .unwrap();
+
+    let output = invoke(&root, &policy, &temp_root, &cache_home, true);
+    assert_eq!(output.status.code(), Some(1), "{}", json(&output));
+    let report = json(&output);
+    assert_eq!(report["cargo_target"]["action"], "error");
+    assert_eq!(report["cargo_target"]["result"], "failed");
+    assert!(report["cargo_target"]["error"].as_str().is_some());
+    assert_eq!(report["fatal_errors"], 1);
+    assert!(target.join("synthetic-artifact").exists());
+}
+
+#[test]
 fn cli_preserves_live_unknown_and_unverifiable_tmp_entries() {
     let owner = TempWorkspace::create("repository-maintenance-cli-temp-smoke").unwrap();
     let root = owner.path().join("checkout");
@@ -411,6 +448,13 @@ fn cli_cache_run_rejects_directory_overrides_before_marker_or_child_changes() {
     let cases = [
         vec!["build", "--target-dir", "outside"],
         vec!["build", "--target-dir=outside"],
+        vec!["build", "--config", "build.target-dir=\"outside\""],
+        vec!["build", "--config=build.target-dir=\"outside\""],
+        vec!["build", "--config", "build.build-dir=\"outside\""],
+        vec!["build", "--config=build.build-dir=\"outside\""],
+        vec!["build", "--config", "target.toml"],
+        vec!["build", "--config=build.toml"],
+        vec!["build", "-C", "outside"],
         vec!["--config", "build.target-dir=\"outside\"", "build"],
         vec!["--config=build.target-dir=\"outside\"", "build"],
         vec!["--config", "build.build-dir=\"outside\"", "build"],
@@ -449,6 +493,117 @@ fn cli_cache_run_rejects_directory_overrides_before_marker_or_child_changes() {
         assert!(json(&output)["error"].as_str().unwrap().contains("Cargo"));
         assert_eq!(fs::read(fixture.marker()).unwrap(), before);
     }
+
+    fs::create_dir_all(fixture.root.join(".cargo")).unwrap();
+    fs::write(
+        fixture.root.join(".cargo/config.toml"),
+        "[alias]\nescape = \"check --target-dir outside\"\n",
+    )
+    .unwrap();
+    let alias = fixture
+        .command("run")
+        .arg("--")
+        .arg(&cargo)
+        .args(["escape", "--offline"])
+        .env("CHILD_RAN", &child_ran)
+        .output()
+        .unwrap();
+    assert_eq!(alias.status.code(), Some(2), "{}", json(&alias));
+    assert!(
+        json(&alias)["error"]
+            .as_str()
+            .unwrap()
+            .contains("псевдоним")
+    );
+    assert_eq!(fs::read(fixture.marker()).unwrap(), before);
+    assert!(!child_ran.exists());
+    assert!(!fixture.root.join("outside").exists());
+}
+
+#[test]
+fn cli_cache_run_does_not_parse_application_arguments_after_cargo_separator() {
+    let fixture = CacheFixture::new();
+    let cargo = write_cargo(
+        fixture.owner.path(),
+        "printf '%s\\n' \"$@\" > \"$CHILD_ARGS\"\n",
+    );
+    let child_args = fixture.owner.path().join("child-args");
+    let output = fixture
+        .command("run")
+        .arg("--")
+        .arg(&cargo)
+        .args([
+            "+stable",
+            "run",
+            "--",
+            "--target-dir",
+            "app-output",
+            "--config",
+            "аргумент приложения с пробелами",
+            "-C",
+            "application-value",
+        ])
+        .env("CHILD_ARGS", &child_args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nstderr={}",
+        json(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = fs::read_to_string(child_args).unwrap();
+    for argument in [
+        "+stable",
+        "--target-dir",
+        "app-output",
+        "--config",
+        "аргумент приложения с пробелами",
+        "-C",
+        "application-value",
+    ] {
+        assert!(args.lines().any(|line| line == argument), "{args}");
+    }
+}
+
+#[test]
+fn cli_cache_run_managed_directories_override_included_cargo_config() {
+    let fixture = CacheFixture::new();
+    let cargo_config_dir = fixture.root.join(".cargo");
+    fs::create_dir_all(&cargo_config_dir).unwrap();
+    let outside_target = fixture.owner.path().join("outside-target");
+    let included = format!(
+        "[build]\ntarget-dir = {}\n",
+        toml::Value::String(outside_target.to_string_lossy().into_owned())
+    );
+    fs::write(cargo_config_dir.join("nested.toml"), included).unwrap();
+    fs::write(
+        cargo_config_dir.join("extra.toml"),
+        "include = [\"nested.toml\"]\n",
+    )
+    .unwrap();
+
+    let output = fixture
+        .command("run")
+        .arg("--")
+        .arg("cargo")
+        .args(["--config", ".cargo/extra.toml", "check", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nstderr={}",
+        json(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    let managed_target = fixture.cache_dir.join("target");
+    assert_eq!(report["target_dir"], managed_target.to_str().unwrap());
+    assert!(managed_target.join("debug/deps").is_dir());
+    assert!(
+        !outside_target.exists(),
+        "Cargo записал данные вне управляемого каталога сборки"
+    );
 }
 
 #[test]
@@ -456,7 +611,7 @@ fn cli_cache_run_json_forwards_noise_preserves_exit_and_finishes_lifecycle() {
     let fixture = CacheFixture::new();
     let cargo = write_cargo(
         fixture.owner.path(),
-        "printf 'child stdout diagnostic\\n'\nprintf 'child stderr diagnostic\\n' >&2\nprintf '%s\\n' \"$@\" >&2\ntest \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_TARGET_DIR\" || exit 91\ntest \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_BUILD_DIR\" || exit 92\nexit \"$CHILD_EXIT\"\n",
+        "printf 'диагностика дочерней команды в stdout\\n'\nprintf 'диагностика дочерней команды в stderr\\n' >&2\nprintf '%s\\n' \"$@\" >&2\ntest \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_TARGET_DIR\" || exit 91\ntest \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_BUILD_DIR\" || exit 92\nexit \"$CHILD_EXIT\"\n",
     );
     fixture.age_marker();
     let output = fixture
@@ -478,8 +633,14 @@ fn cli_cache_run_json_forwards_noise_preserves_exit_and_finishes_lifecycle() {
         fixture.cache_dir.join("target").to_str().unwrap()
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("child stdout diagnostic"), "{stderr}");
-    assert!(stderr.contains("child stderr diagnostic"), "{stderr}");
+    assert!(
+        stderr.contains("диагностика дочерней команды в stdout"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("диагностика дочерней команды в stderr"),
+        "{stderr}"
+    );
     assert!(stderr.contains("build.target-dir="), "{stderr}");
     assert!(stderr.contains("build.build-dir="), "{stderr}");
     assert!(
@@ -575,7 +736,7 @@ fn cli_cache_run_lease_defers_clean_and_second_run_until_marker_refresh() {
         json(&clean)["error"]
             .as_str()
             .unwrap()
-            .contains("maintenance lock")
+            .contains("блокировку обслуживания")
     );
     assert!(artifact.exists());
     assert_eq!(directory_entry_names(&local_target), local_before);
@@ -681,7 +842,7 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
     write_cargo(
         &cargo_bin,
         &format!(
-            "if [ \"${{1-}}\" = metadata ]; then\n  exec /bin/cat {}\nfi\nprintf '%s\\n' 'synthetic cargo clean failure' >&2\nexit 42\n",
+            "if [ \"${{1-}}\" = metadata ]; then\n  exec /bin/cat {}\nfi\nprintf '%s\\n' 'синтетическая ошибка cargo clean' >&2\nexit 42\n",
             shell_quote(&metadata)
         ),
     );
@@ -728,7 +889,7 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         report["cargo_target"]["error"]
             .as_str()
             .unwrap()
-            .contains("synthetic cargo clean failure"),
+            .contains("синтетическая ошибка cargo clean"),
         "{report}"
     );
     assert!(target.join("synthetic-artifact").exists());

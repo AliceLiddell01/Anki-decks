@@ -138,7 +138,11 @@ pub fn target_process_check(target: &Path, workspace: &Path) -> ProcessCheck {
     let self_identity = match reader.identity(self_pid) {
         Ok(Some(identity)) => identity,
         Ok(None) => return unknown("не удалось определить identity собственного процесса".into()),
-        Err(error) => return unknown(format!("не удалось определить self identity: {error}")),
+        Err(error) => {
+            return unknown(format!(
+                "не удалось определить идентичность текущего процесса: {error}"
+            ));
+        }
     };
     check_processes(&reader, &target, &workspace, uid, self_pid, self_identity)
 }

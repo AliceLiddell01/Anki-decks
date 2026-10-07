@@ -288,9 +288,7 @@ fn cache(args: CacheArgs) -> i32 {
                 }
                 Err(error) => {
                     return fail(
-                        &format!(
-                            "не удалось получить общую блокировку обслуживания (maintenance lock): {error}"
-                        ),
+                        &format!("не удалось получить общую блокировку обслуживания: {error}"),
                         json,
                     );
                 }
@@ -375,8 +373,86 @@ fn validate_cache_cargo_invocation(
         );
     }
     let mut index = 1;
+    if command
+        .get(index)
+        .is_some_and(|argument| argument.to_string_lossy().starts_with('+'))
+    {
+        index += 1;
+    }
+    let subcommand_index = loop {
+        let Some(argument) = command.get(index) else {
+            return Err("`cache run` требует поддерживаемую встроенную команду Cargo".into());
+        };
+        let argument_text = argument.to_string_lossy();
+        match argument_text.as_ref() {
+            "--config" => {
+                let value = command
+                    .get(index + 1)
+                    .ok_or("после `--config` ожидается значение")?;
+                validate_cargo_config(value, workspace_root)?;
+                index += 2;
+            }
+            "--target-dir" => {
+                return Err("`cache run` запрещает переопределять `--target-dir`".into());
+            }
+            "-C" => {
+                return Err(
+                    "`cache run` запрещает Cargo `-C`, меняющий каталог проекта и поиск конфигурации"
+                        .into(),
+                );
+            }
+            "--locked" | "--offline" | "--frozen" | "--quiet" | "-q" | "--verbose" | "-v"
+            | "--help" | "-h" | "--version" | "-V" => index += 1,
+            "--color" | "-Z" => {
+                if command.get(index + 1).is_none() {
+                    return Err(format!("после `{argument_text}` ожидается значение"));
+                }
+                index += 2;
+            }
+            _ if argument_text.starts_with("--config=") => {
+                validate_cargo_config(
+                    &OsString::from(argument_text.strip_prefix("--config=").unwrap()),
+                    workspace_root,
+                )?;
+                index += 1;
+            }
+            _ if argument_text.starts_with("--color=") => index += 1,
+            _ if argument_text.starts_with("--target-dir=") => {
+                return Err("`cache run` запрещает переопределять `--target-dir`".into());
+            }
+            _ if argument_text.starts_with("-C") => {
+                return Err(
+                    "`cache run` запрещает Cargo `-C`, меняющий каталог проекта и поиск конфигурации"
+                        .into(),
+                );
+            }
+            _ if argument_text.starts_with("-Z") || argument_text.starts_with("-v") => {
+                index += 1;
+            }
+            _ if argument_text.starts_with('-') => {
+                return Err(format!(
+                    "неподдерживаемый глобальный аргумент Cargo до подкоманды: {argument_text}"
+                ));
+            }
+            _ => break index,
+        }
+    };
+    let subcommand = command[subcommand_index].to_string_lossy();
+    if !matches!(
+        subcommand.as_ref(),
+        "build" | "check" | "test" | "bench" | "doc" | "run"
+    ) {
+        return Err(format!(
+            "`cache run` разрешает только встроенные команды Cargo для сборки; `{subcommand}` может быть псевдонимом или внешней командой"
+        ));
+    }
+
+    let mut index = subcommand_index + 1;
     while index < command.len() {
         let argument = command[index].to_string_lossy();
+        if argument == "--" {
+            break;
+        }
         if argument == "--target-dir" || argument.starts_with("--target-dir=") {
             return Err("`cache run` запрещает переопределять `--target-dir`".into());
         }
@@ -451,11 +527,18 @@ fn managed_cargo_command(
         .ok_or("путь к управляемому кэшу нельзя передать Cargo: он не является UTF-8")?;
     let target_value = toml::Value::String(target_dir.to_owned()).to_string();
     let mut managed = command.to_vec();
-    let insert_at = usize::from(
+    let mut insert_at = usize::from(
         managed
             .get(1)
             .is_some_and(|argument| argument.to_string_lossy().starts_with('+')),
     ) + 1;
+    while insert_at < managed.len() {
+        match managed[insert_at].to_string_lossy().as_ref() {
+            "--" => break,
+            "--config" => insert_at += 2,
+            _ => insert_at += 1,
+        }
+    }
     let overrides = [
         OsString::from("--config"),
         OsString::from(format!("build.target-dir={target_value}")),

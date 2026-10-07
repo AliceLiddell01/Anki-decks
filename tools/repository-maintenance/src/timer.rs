@@ -13,7 +13,7 @@ const TIMER_NAME: &str = "anki-repository-maintenance.timer";
 const INSTALLED_CONFIG_NAME: &str = "repository-maintenance-install.toml";
 const SERVICE_TEMPLATE: &str = include_str!("../systemd/anki-repository-maintenance.service");
 const TIMER_TEMPLATE: &str = include_str!("../systemd/anki-repository-maintenance.timer");
-// Точная подпись владения unit-файла, которую установщик проверяет при обновлении и удалении.
+// Точная подпись владения служебным файлом systemd, которую установщик проверяет при обновлении и удалении.
 const MANAGED_MARKER: &str = "# Managed by repository-maintenance; do not edit by hand.";
 const CARGO_PATH_MARKER: &str = "@CARGO_PATH_ENV@";
 
@@ -70,7 +70,7 @@ pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
         schema: 1,
         repository_root: root,
     })
-    .map_err(|error| format!("не удалось подготовить install config: {error}"))?;
+    .map_err(|error| format!("не удалось подготовить конфигурацию установки: {error}"))?;
     atomic_write(&app_config, config_text.as_bytes(), 0o600)?;
     install_binary(current_exe, &installed_binary)?;
     systemctl(&["daemon-reload"])?;
@@ -110,7 +110,7 @@ pub fn uninstall() -> Result<TimerResult, String> {
     if let Ok(metadata) = fs::symlink_metadata(&app_config) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(format!(
-                "{} не является обычным install config",
+                "{} не является обычным файлом конфигурации установки",
                 app_config.display()
             ));
         }
@@ -144,16 +144,17 @@ pub fn uninstall() -> Result<TimerResult, String> {
     }
     if managed_config {
         fs::remove_file(&app_config)
-            .map_err(|error| format!("не удалось удалить install config: {error}"))?;
+            .map_err(|error| format!("не удалось удалить конфигурацию установки: {error}"))?;
     }
     if binary_exists && (has_managed_unit || managed_config) {
-        fs::remove_file(&installed_binary)
-            .map_err(|error| format!("не удалось удалить установленный binary: {error}"))?;
+        fs::remove_file(&installed_binary).map_err(|error| {
+            format!("не удалось удалить установленный исполняемый файл: {error}")
+        })?;
     }
     systemctl(&["daemon-reload"])?;
     Ok(TimerResult {
         state: "disabled",
-        message: "ежедневный timer отключён; его unit-файлы, install config и binary удалены"
+        message: "ежедневный таймер отключён; его служебные файлы, конфигурация установки и исполняемый файл удалены"
             .into(),
         command_output: None,
     })
@@ -164,11 +165,11 @@ pub fn status() -> Result<TimerResult, String> {
     let enabled = Command::new("systemctl")
         .args(["--user", "is-enabled", TIMER_NAME])
         .output()
-        .map_err(|error| format!("не удалось проверить timer: {error}"))?;
+        .map_err(|error| format!("не удалось проверить таймер: {error}"))?;
     if !enabled.status.success() {
         return Ok(TimerResult {
             state: "disabled",
-            message: "timer не включён".into(),
+            message: "таймер не включён".into(),
             command_output: Some(String::from_utf8_lossy(&enabled.stdout).trim().to_owned()),
         });
     }
@@ -184,13 +185,13 @@ fn require_user_systemd() -> Result<(), String> {
     let output = Command::new("systemctl")
         .args(["--user", "show-environment"])
         .output()
-        .map_err(|error| format!("systemd user manager недоступен: {error}"))?;
+        .map_err(|error| format!("пользовательский менеджер systemd недоступен: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
     let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     Err(format!(
-        "systemd user manager недоступен; ручные scan/clean продолжают работать: {}",
+        "пользовательский менеджер systemd недоступен; ручные `scan` и `clean` продолжают работать: {}",
         if message.is_empty() {
             "нет ответа от systemctl"
         } else {
@@ -302,7 +303,7 @@ fn render_service_unit(cargo_bin_dir: &Path) -> Result<String, String> {
     let escaped_path = escape_systemd_value(&path)?;
     if SERVICE_TEMPLATE.matches(CARGO_PATH_MARKER).count() != 1 {
         return Err(
-            "шаблон unit-файла службы должен содержать ровно одно место для подстановки PATH Cargo"
+            "шаблон служебного файла systemd должен содержать ровно одно место для подстановки пути Cargo из `PATH`"
                 .into(),
         );
     }
@@ -318,7 +319,7 @@ fn escape_systemd_value(value: &str) -> Result<String, String> {
         match character {
             '\0'..='\u{1f}' | '\u{7f}' => {
                 return Err(
-                    "путь к Cargo содержит управляющий символ, недопустимый в unit-файле".into(),
+            "путь к Cargo содержит управляющий символ, недопустимый в служебном файле systemd".into(),
                 );
             }
             '\\' => escaped.push_str("\\\\"),
@@ -342,7 +343,7 @@ fn ensure_managed_or_absent(path: &Path) -> Result<(), String> {
     match fs::read_to_string(path) {
         Ok(text) if text.starts_with(MANAGED_MARKER) => Ok(()),
         Ok(_) => Err(format!(
-            "{} уже существует и не создан repository-maintenance; файл не перезаписан",
+            "{} уже существует и не был создан инструментом `repository-maintenance`; файл не перезаписан",
             path.display()
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -355,7 +356,7 @@ fn ensure_managed(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("не удалось проверить {}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(format!(
-            "{} не является обычным unit-файлом",
+            "{} не является обычным служебным файлом systemd",
             path.display()
         ));
     }
@@ -365,7 +366,7 @@ fn ensure_managed(path: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{} не подтверждён как unit repository-maintenance",
+            "владение служебным файлом systemd `repository-maintenance` не подтверждено: {}",
             path.display()
         ))
     }
@@ -459,7 +460,7 @@ fn ensure_binary_managed_or_absent(
             ensure_installed_config_or_absent(config)?;
             if !service_owned && !config.exists() {
                 return Err(format!(
-                    "{} уже существует, но не найдена owned install config",
+                    "{} уже существует, но подтверждённая конфигурация установки не найдена",
                     binary.display()
                 ));
             }
@@ -473,14 +474,14 @@ fn ensure_installed_config_or_absent(path: &Path) -> Result<(), String> {
         && (metadata.file_type().is_symlink() || !metadata.is_file())
     {
         return Err(format!(
-            "{} не является обычным install config",
+            "{} не является обычным файлом конфигурации установки",
             path.display()
         ));
     }
     match fs::read_to_string(path) {
         Ok(text) if text.starts_with("managed_by = \"repository-maintenance\"") => Ok(()),
         Ok(_) => Err(format!(
-            "{} уже существует и не принадлежит installer; файл не перезаписан",
+            "{} уже существует и не принадлежит установщику; файл не перезаписан",
             path.display()
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -489,9 +490,9 @@ fn ensure_installed_config_or_absent(path: &Path) -> Result<(), String> {
 }
 
 fn install_binary(source: &Path, destination: &Path) -> Result<(), String> {
-    let source = source
-        .canonicalize()
-        .map_err(|error| format!("не удалось разрешить текущий binary: {error}"))?;
+    let source = source.canonicalize().map_err(|error| {
+        format!("не удалось определить путь к текущему исполняемому файлу: {error}")
+    })?;
     if source == destination {
         return Ok(());
     }
@@ -500,13 +501,14 @@ fn install_binary(source: &Path, destination: &Path) -> Result<(), String> {
         .unwrap_or_default()
         .as_nanos();
     let temporary = destination.with_extension(format!("install-{}-{suffix}", std::process::id()));
-    fs::copy(&source, &temporary)
-        .map_err(|error| format!("не удалось скопировать binary в staging: {error}"))?;
+    fs::copy(&source, &temporary).map_err(|error| {
+        format!("не удалось скопировать исполняемый файл во временный файл установки: {error}")
+    })?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("не удалось выставить executable bit: {error}"))?;
+        .map_err(|error| format!("не удалось установить право на выполнение: {error}"))?;
     fs::rename(&temporary, destination).map_err(|error| {
         format!(
-            "не удалось установить binary {}: {error}",
+            "не удалось установить исполняемый файл {}: {error}",
             destination.display()
         )
     })
@@ -587,7 +589,7 @@ mod tests {
         let unit_path = service
             .lines()
             .find_map(parse_service_path)
-            .ok_or("в unit-файле службы не задан PATH")?;
+            .ok_or("в служебном файле systemd не задан `PATH`")?;
         let executable = std::env::current_exe()
             .map_err(|error| format!("не удалось определить вспомогательный процесс: {error}"))?;
         let output = Command::new(&executable)

@@ -73,9 +73,9 @@ struct InodeKey {
     inode: u64,
 }
 
-/// Инвентаризирует весь `root`, не переходя через symlink и mount boundary.
-/// Выделенные блоки считаются один раз на `(device, inode)`, поэтому sparse
-/// files и hard links отражаются так, как они занимают место на диске.
+/// Инвентаризирует всё дерево `root`, не переходя по symlink и не пересекая границы mount.
+/// Выделенные блоки считаются один раз на `(device, inode)`, поэтому разреженные файлы
+/// и жёсткие ссылки учитываются по фактически занятому месту на диске.
 pub fn scan_tmp(
     root: &Path,
     top_n: usize,
@@ -127,7 +127,7 @@ pub fn scan_tmp(
                     if opened.dev() != top_stat.st_dev || opened.ino() != top_stat.st_ino {
                         totals
                             .errors
-                            .push("top-level entry заменён во время scan".into());
+                            .push("запись верхнего уровня заменена во время сканирования".into());
                     } else if same_mount(&root_fd, &directory).is_err() {
                         totals.mount_boundaries += 1;
                     } else {
@@ -164,7 +164,7 @@ pub fn scan_tmp(
                 "unknown",
                 None,
                 "keep",
-                "нет подтверждения project ownership; только инвентаризация".into(),
+                "владение проектом не подтверждено; выполняется только инвентаризация".into(),
             ),
         };
         let entry_errors = if totals.errors.is_empty() && totals.mount_boundaries == 0 {
@@ -174,7 +174,7 @@ pub fn scan_tmp(
             let mut reasons = totals.errors;
             if totals.mount_boundaries > 0 {
                 reasons.push(format!(
-                    "пропущено вложенных mount boundary: {}",
+                    "пропущено вложенных границ mount: {}",
                     totals.mount_boundaries
                 ));
             }
@@ -217,7 +217,7 @@ pub fn scan_tmp(
     })
 }
 
-/// Измеряет одно дерево без перехода через symlink или mount boundary.
+/// Измеряет одно дерево без перехода по symlink или пересечения границ mount.
 pub fn measure_path(path: &Path) -> io::Result<Measurement> {
     let directory = open_directory(path)?;
     let metadata = directory.metadata()?;
@@ -290,7 +290,9 @@ fn scan_directory(
         };
         let after = child.metadata()?;
         if after.dev() != stat.st_dev || after.ino() != stat.st_ino {
-            totals.errors.push("каталог заменён во время scan".into());
+            totals
+                .errors
+                .push("каталог заменён во время сканирования".into());
             continue;
         }
         if same_mount(directory, &child).is_err() {
@@ -368,7 +370,7 @@ fn same_mount(parent: &File, child: &File) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "mount boundary или неизвестный mount id",
+            "граница mount или неизвестный идентификатор mount",
         ));
     }
     Ok(())
@@ -418,7 +420,7 @@ mod tests {
 
     fn sandbox() -> (TempWorkspace, PathBuf) {
         let owner = TempWorkspace::create("repository-maintenance-scan-test")
-            .expect("project-owned temp workspace создаётся");
+            .expect("временная рабочая область проекта создаётся");
         let path = owner.path().join("inventory");
         fs::create_dir(&path).unwrap();
         (owner, path)
@@ -465,7 +467,7 @@ mod tests {
             ownership: "project-owned",
             live: Some(false),
             action: "delete",
-            reason: "подтверждённый orphan".into(),
+            reason: "подтверждённый осиротевший каталог".into(),
         }];
         let inventory = scan_tmp(&root, 1, &evidence).unwrap();
         assert_eq!(inventory.top_level_entries, 2);

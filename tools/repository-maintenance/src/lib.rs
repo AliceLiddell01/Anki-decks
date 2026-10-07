@@ -18,7 +18,7 @@ use asset_store::temp_workspace::{
 use inventory::{OwnershipEvidence, TmpInventory, scan_tmp};
 use policy::Policy;
 use serde::Serialize;
-use target::{CargoTargetMeasurement, CargoWorkspace, ThresholdDecision};
+use target::{CargoTargetMeasurement, CargoWorkspace, TargetBlocker, ThresholdDecision};
 
 const REPORT_SCHEMA: u32 = 1;
 
@@ -98,7 +98,7 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
             Ok(lock) => Some(lock),
             Err(error) => {
                 return Err(format!(
-                    "очистка отложена: не удалось получить общую блокировку обслуживания (maintenance lock): {error}"
+                    "очистка отложена: не удалось получить общую блокировку обслуживания: {error}"
                 ));
             }
         }
@@ -197,6 +197,19 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         ThresholdDecision::Clean => "deferred",
     };
     let mut target_error = None;
+    match &target_report.blocker {
+        Some(TargetBlocker::Busy) => {
+            target_action = "deferred";
+            target_result = "busy";
+            target_error = Some(target_report.reason.clone());
+        }
+        Some(TargetBlocker::Unsafe(reason)) => {
+            target_action = "error";
+            target_result = "failed";
+            target_error = Some(reason.clone());
+        }
+        None => (),
+    }
     if target_report.decision == ThresholdDecision::Clean && target_report.safe_to_clean {
         let clean_start = Instant::now();
         if options.mode == "scan" {
@@ -228,6 +241,11 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
                     target_action = "deferred";
                     target_result = "busy";
                     target_error = Some(reason);
+                }
+                TargetCleanOutcome::Unsafe(error) => {
+                    target_action = "error";
+                    target_result = "failed";
+                    target_error = Some(error);
                 }
                 TargetCleanOutcome::Failed(error) => {
                     target_action = "error";
@@ -325,7 +343,7 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         match cleanup_legacy_orphans_under(&options.temp_root, policy.orphan_min_age()) {
             Ok(report) => temp_apply_entries.extend(report.entries),
             Err(error) => {
-                let message = format!("ошибка legacy orphan GC: {error}");
+                let message = format!("ошибка сборщика старых временных каталогов: {error}");
                 operation_errors.push(message.clone());
                 temp_evidence.push(OwnershipEvidence {
                     path: options.temp_root.clone(),
@@ -459,7 +477,14 @@ enum TargetCleanOutcome {
     Removed,
     NotNeeded(ThresholdDecision),
     Deferred(String),
+    Unsafe(String),
     Failed(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TargetRecheckFailure {
+    Busy(String),
+    Unsafe(String),
 }
 
 fn clean_target_if_needed(
@@ -470,7 +495,8 @@ fn clean_target_if_needed(
 ) -> TargetCleanOutcome {
     let decision = match recheck_target(workspace, initial, warning_bytes, hard_limit_bytes) {
         Ok(decision) => decision,
-        Err(reason) => return TargetCleanOutcome::Deferred(reason),
+        Err(TargetRecheckFailure::Busy(reason)) => return TargetCleanOutcome::Deferred(reason),
+        Err(TargetRecheckFailure::Unsafe(reason)) => return TargetCleanOutcome::Unsafe(reason),
     };
     if decision != ThresholdDecision::Clean {
         return TargetCleanOutcome::NotNeeded(decision);
@@ -486,21 +512,30 @@ fn recheck_target(
     initial: &CargoTargetMeasurement,
     warning_bytes: u64,
     hard_limit_bytes: u64,
-) -> Result<ThresholdDecision, String> {
+) -> Result<ThresholdDecision, TargetRecheckFailure> {
     if !initial.safe_to_clean {
-        return Err(initial.reason.clone());
+        return Err(TargetRecheckFailure::Unsafe(initial.reason.clone()));
     }
     for directory in &workspace.measured_dirs {
         let current = inventory::measure_path(directory).map_err(|error| {
-            format!("не удалось перепроверить {}: {error}", directory.display())
+            TargetRecheckFailure::Unsafe(format!(
+                "не удалось перепроверить {}: {error}",
+                directory.display()
+            ))
         })?;
         if let Some(before) = initial.dirs.iter().find(|item| item.path == *directory)
             && (before.device != current.device || before.inode != current.inode)
         {
-            return Err(format!("{} заменён после scan", directory.display()));
+            return Err(TargetRecheckFailure::Unsafe(format!(
+                "{} заменён после scan",
+                directory.display()
+            )));
         }
         if current.mount_boundaries != 0 || !current.errors.is_empty() {
-            return Err(format!("{} изменился во время scan", directory.display()));
+            return Err(TargetRecheckFailure::Unsafe(format!(
+                "{} изменился во время scan",
+                directory.display()
+            )));
         }
     }
     for directory in &workspace.measured_dirs {
@@ -511,35 +546,44 @@ fn recheck_target(
                 process,
                 reference,
             } => {
-                return Err(format!("активен {process} PID {pid}: {reference}"));
+                return Err(TargetRecheckFailure::Busy(format!(
+                    "активен {process} PID {pid}: {reference}"
+                )));
             }
             process::ProcessCheck::Unknown { reason } => {
-                return Err(format!(
+                return Err(TargetRecheckFailure::Unsafe(format!(
                     "нельзя доказать отсутствие активного процесса: {reason}"
-                ));
+                )));
             }
         }
     }
-    target::validate_cargo_target(&workspace.target_dir)
-        .map_err(|error| format!("маркер Cargo изменился до очистки: {error}"))?;
+    target::validate_cargo_target(&workspace.target_dir).map_err(|error| {
+        TargetRecheckFailure::Unsafe(format!("маркер Cargo изменился до очистки: {error}"))
+    })?;
 
     // Размер проверяется последним, после повторной проверки процессов и маркера:
     // уменьшившийся ниже жёсткого предела `target` больше не требует очистки.
     let mut allocated_bytes = 0_u64;
     for directory in &workspace.measured_dirs {
         let current = inventory::measure_path(directory).map_err(|error| {
-            format!(
+            TargetRecheckFailure::Unsafe(format!(
                 "не удалось повторно измерить {}: {error}",
                 directory.display()
-            )
+            ))
         })?;
         if let Some(before) = initial.dirs.iter().find(|item| item.path == *directory)
             && (before.device != current.device || before.inode != current.inode)
         {
-            return Err(format!("{} заменён перед очисткой", directory.display()));
+            return Err(TargetRecheckFailure::Unsafe(format!(
+                "{} заменён перед очисткой",
+                directory.display()
+            )));
         }
         if current.mount_boundaries != 0 || !current.errors.is_empty() {
-            return Err(format!("{} изменился перед очисткой", directory.display()));
+            return Err(TargetRecheckFailure::Unsafe(format!(
+                "{} изменился перед очисткой",
+                directory.display()
+            )));
         }
         allocated_bytes = allocated_bytes.saturating_add(current.allocated_bytes);
     }
@@ -898,7 +942,8 @@ mod tests {
             safety: process::ProcessCheck::Clear,
             safe_to_clean: true,
             ownership_safe: true,
-            reason: "synthetic test measurement".into(),
+            blocker: None,
+            reason: "синтетическое тестовое измерение".into(),
         };
         (workspace, initial)
     }
@@ -915,7 +960,11 @@ mod tests {
         fs::remove_dir_all(&initial.target_dir).unwrap();
 
         let error = recheck_target(&workspace, &initial, 1, 1).unwrap_err();
-        assert!(error.contains("не удалось перепроверить"));
+        assert!(matches!(
+            error,
+            TargetRecheckFailure::Unsafe(message)
+                if message.contains("не удалось перепроверить")
+        ));
     }
 
     #[test]
@@ -938,7 +987,11 @@ mod tests {
         fs::write(initial.target_dir.join("artifact"), [0x32_u8; 4096]).unwrap();
 
         let error = recheck_target(&workspace, &initial, 1, 1).unwrap_err();
-        assert!(error.contains("заменён после scan"));
+        assert!(matches!(
+            error,
+            TargetRecheckFailure::Unsafe(message)
+                if message.contains("заменён после scan")
+        ));
         assert!(replaced.join("artifact").exists());
     }
 
@@ -984,7 +1037,7 @@ mod tests {
         let entry = GcEntry {
             path: path.clone(),
             outcome: "deferred".into(),
-            reason: "legacy marker".into(),
+            reason: "старый маркер".into(),
             bytes: 0,
             ownership: "legacy-project-owned".into(),
             live: Some(false),

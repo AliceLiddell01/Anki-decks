@@ -124,13 +124,13 @@ pub fn workspace_root(
             break;
         }
     }
-    Err("не удалось найти Cargo workspace; укажите --workspace-root".into())
+    Err("не удалось найти рабочую область Cargo; укажите --workspace-root".into())
 }
 
 fn canonical_workspace(path: &Path) -> Result<std::path::PathBuf, String> {
     let root = path.canonicalize().map_err(|error| {
         format!(
-            "не удалось разрешить workspace root {}: {error}",
+            "не удалось определить корень рабочей области {}: {error}",
             path.display()
         )
     })?;
@@ -157,11 +157,15 @@ fn installed_root_config() -> Result<Option<std::path::PathBuf>, String> {
         schema: u32,
         repository_root: std::path::PathBuf,
     }
-    let config: InstalledRoot = toml::from_str(&text)
-        .map_err(|error| format!("повреждён install config {}: {error}", path.display()))?;
+    let config: InstalledRoot = toml::from_str(&text).map_err(|error| {
+        format!(
+            "повреждена конфигурация установки {}: {error}",
+            path.display()
+        )
+    })?;
     if config.schema != 1 || config.managed_by != "repository-maintenance" {
         return Err(format!(
-            "неподдерживаемая версия install config {}",
+            "неподдерживаемая версия конфигурации установки {}",
             path.display()
         ));
     }
