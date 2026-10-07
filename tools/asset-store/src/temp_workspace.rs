@@ -1556,14 +1556,19 @@ fn cleanup_legacy_under(root: &Path, min_age: Duration, apply: bool) -> io::Resu
                 ("deferred", error.to_string(), 0, "unknown", None)
             }
             Ok((directory, bytes)) => {
+                let live = pid.map(|_| false);
                 if !apply {
                     (
                         "delete",
-                        "старое имя каталога, UID, возраст и отсутствие живого PID подтверждены"
-                            .into(),
+                        if pid.is_some() {
+                            "старое имя каталога, UID, возраст и отсутствие живого PID подтверждены"
+                        } else {
+                            "старое имя каталога без PID, UID и возраст подтверждены"
+                        }
+                        .into(),
                         bytes,
                         "legacy-unverified",
-                        Some(false),
+                        live,
                     )
                 } else {
                     match verify_identity(&parent, &name, &directory)
@@ -1577,10 +1582,15 @@ fn cleanup_legacy_under(root: &Path, min_age: Duration, apply: bool) -> io::Resu
                             report.removed_bytes = report.removed_bytes.saturating_add(bytes);
                             (
                                 "removed",
-                                "старое имя каталога подтверждено".into(),
+                                if pid.is_some() {
+                                    "старое имя каталога с PID удалено после проверки его отсутствия"
+                                } else {
+                                    "старое имя каталога без PID удалено после проверки UID и возраста"
+                                }
+                                .into(),
                                 bytes,
                                 "legacy-unverified",
-                                Some(false),
+                                live,
                             )
                         }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2943,15 +2953,13 @@ mod tests {
         assert_eq!(report.removed, 1);
         assert_eq!(report.removed_bytes, 11);
         assert_eq!(report.skipped, 4);
-        assert_eq!(
-            report
-                .entries
-                .iter()
-                .find(|entry| entry.outcome == "removed")
-                .unwrap()
-                .ownership,
-            "legacy-unverified"
-        );
+        let removed = report
+            .entries
+            .iter()
+            .find(|entry| entry.outcome == "removed")
+            .unwrap();
+        assert_eq!(removed.ownership, "legacy-unverified");
+        assert_eq!(removed.live, Some(false));
         assert!(!old.exists());
         assert!(target.path().join("keep").exists());
         for path in [&fresh, &live, &foreign, &link, &inner_link] {
@@ -2963,6 +2971,41 @@ mod tests {
                 .removed,
             0
         );
+    }
+
+    #[test]
+    fn legacy_name_without_pid_keeps_liveness_unknown_in_plan_and_apply() {
+        let root = sandbox();
+        let path = root.path().join("kanji-0123456789abcdef0123456789abcdef");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("data"), b"legacy data").unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(172800)),
+            )
+            .unwrap();
+
+        let plan = plan_legacy_orphans_under(root.path(), DEFAULT_ORPHAN_MIN_AGE).unwrap();
+        let planned = plan
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap();
+        assert_eq!(planned.outcome, "delete");
+        assert_eq!(planned.live, None);
+        assert!(planned.reason.contains("без PID"));
+
+        let applied = cleanup_legacy_orphans_under(root.path(), DEFAULT_ORPHAN_MIN_AGE).unwrap();
+        let removed = applied
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap();
+        assert_eq!(removed.outcome, "removed");
+        assert_eq!(removed.live, None);
+        assert!(removed.reason.contains("без PID"));
+        assert!(!path.exists());
     }
 
     #[test]
