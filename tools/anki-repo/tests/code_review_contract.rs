@@ -821,6 +821,47 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         candidate_id
     );
 
+    let individual_id = queue["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["members"]["kind"] == "individual")
+        .expect("очередь содержит отдельную unit")["id"]
+        .as_str()
+        .unwrap();
+    for (subcommand, id) in [
+        ("group", "missing-group"),
+        ("group", individual_id),
+        ("candidate", "missing-candidate"),
+    ] {
+        let (code, stdout, stderr) = run_cli_in(
+            Some(repo.path()),
+            &[
+                "--json",
+                "code-review",
+                "queue",
+                subcommand,
+                "--pack",
+                &pack_arg,
+                "--queue",
+                &queue_arg,
+                "--id",
+                id,
+            ],
+        );
+        assert_eq!(code, 4, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.is_empty(),
+            "JSON-режим записал ошибку в stderr: {stderr}"
+        );
+        let envelope = parse_json(&stdout);
+        assert_eq!(envelope["error"]["code"], "not_found");
+        assert!(
+            envelope.get("result").is_none(),
+            "unexpected result: {envelope}"
+        );
+    }
+
     let tampered_pack_path = artifacts.path().join("review-with-whitespace.json");
     let mut tampered = pack_bytes;
     tampered.push(b' ');

@@ -407,13 +407,13 @@ fn classify_text(
     {
         return (Some(role), syntax.basis);
     }
-    if shape != TextRole::Unknown {
-        return (Some(shape), ClassificationBasis::LiteralShape);
-    }
     if let Some(syntax) = syntax
         && let Some(role) = syntax.text_role.filter(|role| role.is_human())
     {
         return (Some(role), syntax.basis);
+    }
+    if shape != TextRole::Unknown {
+        return (Some(shape), ClassificationBasis::LiteralShape);
     }
     (Some(TextRole::Unknown), ClassificationBasis::Unknown)
 }
@@ -1244,6 +1244,37 @@ mod tests {
             .unwrap();
         assert!(!human.is_group());
         assert_eq!(human.priority, ReviewPriority::High);
+    }
+
+    #[test]
+    fn syntax_proven_human_log_overrides_identifier_shaped_literal() {
+        let pack = pack(vec![text_candidate(
+            "usage-log",
+            "Usage:",
+            TextContext::StringLiteral,
+        )]);
+        let mut contexts = contexts(&pack);
+        contexts.insert(
+            "usage-log".into(),
+            SyntaxContext {
+                execution: Some(FileSurface::Production),
+                code_role: CodeRole::Runtime,
+                text_role: Some(TextRole::HumanLog),
+                signature: Some("macro:println".into()),
+                basis: ClassificationBasis::SyntaxContext,
+            },
+        );
+
+        let queue = build(&pack, DIGEST, &contexts).unwrap();
+        assert_eq!(
+            queue.classifications["usage-log"].text_role,
+            Some(TextRole::HumanLog)
+        );
+        assert_eq!(
+            queue.classifications["usage-log"].text_basis,
+            ClassificationBasis::SyntaxContext
+        );
+        assert_eq!(queue.units[0].priority, ReviewPriority::High);
     }
 
     #[test]
