@@ -24,6 +24,8 @@ mod qa_contract;
 mod review_check_contract;
 #[path = "review_contract.rs"]
 mod review_contract;
+#[path = "semantic_triage_contract.rs"]
+mod semantic_triage_contract;
 #[path = "synthetic.rs"]
 mod synthetic;
 #[path = "visual_report_contract.rs"]

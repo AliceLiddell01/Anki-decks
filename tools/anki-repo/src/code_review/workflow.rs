@@ -9,6 +9,7 @@ use std::process::Command;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::error::{DomainError, ErrorCode};
 
@@ -25,6 +26,7 @@ use super::model::{
 use super::scope::{
     self, CollectedScope, FileStatus, GitTarget, ImageState, ScopeError, ScopedFile,
 };
+use super::semantic_triage::{self, SemanticTriage, TriageSummary};
 
 /// Верхняя граница читаемого артефакта ревью.
 pub const MAX_REVIEW_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
@@ -61,6 +63,30 @@ pub struct LanguageApplySummary {
     pub files: usize,
     pub replacements: usize,
     pub results: Vec<AppliedFileSummary>,
+}
+
+/// Результат инициализации JSON-документа семантических решений.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticTriageInitSummary {
+    pub artifact: String,
+    pub target: GitTarget,
+    pub total_candidates: usize,
+    pub unreviewed_candidates: usize,
+}
+
+/// Результат проверки JSON-документа семантических решений.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticTriageValidationSummary {
+    pub canonical_artifact: Option<String>,
+    pub summary: TriageSummary,
+}
+
+/// Результат сохранения Markdown-отчёта по семантическим решениям.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticTriageReportSummary {
+    pub report: String,
+    pub total_findings: usize,
+    pub unreviewed_candidates: usize,
 }
 
 /// Результат публикации одного файла языкового процесса.
@@ -142,6 +168,99 @@ pub fn compare_files(
         write_document_once(&path, &bytes)?;
     }
     Ok(changes)
+}
+
+/// Создаёт версионируемый JSON-документ с явным списком нерассмотренных кандидатов.
+pub fn init_semantic_triage(
+    pack_path: &Path,
+    output: &Path,
+) -> Result<SemanticTriageInitSummary, DomainError> {
+    let root = repository_root(Path::new("."))?;
+    let (pack, source_bytes) = read_review_pack(pack_path)?;
+    let source_hash = sha256_hex(&source_bytes);
+    let mut triage = semantic_triage::initialize(&pack, &source_hash);
+    semantic_triage::canonicalize(&mut triage);
+    let summary = semantic_triage::validate(&triage, &pack, &source_hash)?;
+    let bytes = json_bytes(&triage)?;
+    let output = output_path(&root, output)?;
+    write_document_once(&output, &bytes)?;
+    Ok(SemanticTriageInitSummary {
+        artifact: output.display().to_string(),
+        target: pack.target,
+        total_candidates: summary.total_candidates,
+        unreviewed_candidates: summary.unreviewed_candidates,
+    })
+}
+
+/// Проверяет решения относительно точного источника и при запросе сохраняет нормализованный JSON.
+pub fn validate_semantic_triage(
+    pack_path: &Path,
+    triage_path: &Path,
+    canonical_output: Option<&Path>,
+) -> Result<SemanticTriageValidationSummary, DomainError> {
+    let (pack, source_bytes) = read_review_pack(pack_path)?;
+    let source_hash = sha256_hex(&source_bytes);
+    let (mut triage, _) = read_json_with_bytes::<SemanticTriage>(
+        triage_path,
+        MAX_REVIEW_ARTIFACT_BYTES,
+        "JSON-документ семантических решений",
+    )?;
+    let summary = semantic_triage::validate(&triage, &pack, &source_hash)?;
+    let canonical_artifact = if let Some(canonical_output) = canonical_output {
+        semantic_triage::canonicalize(&mut triage);
+        let bytes = json_bytes(&triage)?;
+        let root = repository_root(Path::new("."))?;
+        let output =
+            replace_derived_document(&root, canonical_output, &bytes, &[pack_path, triage_path])?;
+        Some(output.display().to_string())
+    } else {
+        None
+    };
+    Ok(SemanticTriageValidationSummary {
+        canonical_artifact,
+        summary,
+    })
+}
+
+/// Возвращает только воспроизводимую сводку проверенного документа решений.
+pub fn summarize_semantic_triage(
+    pack_path: &Path,
+    triage_path: &Path,
+) -> Result<TriageSummary, DomainError> {
+    let (pack, source_bytes) = read_review_pack(pack_path)?;
+    let source_hash = sha256_hex(&source_bytes);
+    let (triage, _) = read_json_with_bytes::<SemanticTriage>(
+        triage_path,
+        MAX_REVIEW_ARTIFACT_BYTES,
+        "JSON-документ семантических решений",
+    )?;
+    semantic_triage::validate(&triage, &pack, &source_hash)
+}
+
+/// Создаёт компактный Markdown-отчёт по проверенному документу решений.
+pub fn report_semantic_triage(
+    pack_path: &Path,
+    triage_path: &Path,
+    output: &Path,
+) -> Result<SemanticTriageReportSummary, DomainError> {
+    let root = repository_root(Path::new("."))?;
+    let (pack, source_bytes) = read_review_pack(pack_path)?;
+    let source_hash = sha256_hex(&source_bytes);
+    let (mut triage, _) = read_json_with_bytes::<SemanticTriage>(
+        triage_path,
+        MAX_REVIEW_ARTIFACT_BYTES,
+        "JSON-документ семантических решений",
+    )?;
+    let summary = semantic_triage::validate(&triage, &pack, &source_hash)?;
+    semantic_triage::canonicalize(&mut triage);
+    let report = semantic_triage::render_markdown(&triage, &pack);
+    let output =
+        replace_derived_document(&root, output, report.as_bytes(), &[pack_path, triage_path])?;
+    Ok(SemanticTriageReportSummary {
+        report: output.display().to_string(),
+        total_findings: triage.findings.len(),
+        unreviewed_candidates: summary.unreviewed_candidates,
+    })
 }
 
 /// Сканирует явные пути относительно репозитория или полные новые версии файлов пакета ревью.
@@ -912,6 +1031,24 @@ fn single_line(value: &str) -> String {
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path, limit: u64, what: &str) -> Result<T, DomainError> {
+    read_json_with_bytes(path, limit, what).map(|(document, _)| document)
+}
+
+fn read_review_pack(path: &Path) -> Result<(ReviewPack, Vec<u8>), DomainError> {
+    let (pack, bytes) = read_json_with_bytes(
+        path,
+        MAX_REVIEW_ARTIFACT_BYTES,
+        "пакет свидетельств code-review",
+    )?;
+    delta::validate_review_pack(&pack)?;
+    Ok((pack, bytes))
+}
+
+fn read_json_with_bytes<T: DeserializeOwned>(
+    path: &Path,
+    limit: u64,
+    what: &str,
+) -> Result<(T, Vec<u8>), DomainError> {
     let metadata = fs::metadata(path).map_err(|error| {
         DomainError::new(
             ErrorCode::InputUnreadable,
@@ -939,12 +1076,17 @@ fn read_json<T: DeserializeOwned>(path: &Path, limit: u64, what: &str) -> Result
             format!("{what} превышает лимит {limit} байт"),
         ));
     }
-    serde_json::from_slice(&bytes).map_err(|error| {
+    let document = serde_json::from_slice(&bytes).map_err(|error| {
         DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
             format!("некорректный JSON в {what}: {error}"),
         )
-    })
+    })?;
+    Ok((document, bytes))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, DomainError> {
@@ -1023,6 +1165,7 @@ fn write_directory_once(
     Ok(())
 }
 
+/// Сохраняет исходный артефакт однократно; повтор допустим только с теми же байтами.
 fn write_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainError> {
     if path.exists() {
         if path.is_symlink() || !path.is_file() || fs::read(path).ok().as_deref() != Some(bytes) {
@@ -1039,6 +1182,39 @@ fn write_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainError> {
             artifact_write_error(path, &error)
         }
     })
+}
+
+/// Обновляет производный документ, сохраняя входные артефакты и ограничения путей.
+fn replace_derived_document(
+    root: &Path,
+    requested: &Path,
+    bytes: &[u8],
+    source_paths: &[&Path],
+) -> Result<PathBuf, DomainError> {
+    let output = output_path(root, requested)?;
+    for source in source_paths {
+        let source = fs::canonicalize(source).map_err(|error| {
+            DomainError::new(
+                ErrorCode::InputUnreadable,
+                format!("не удалось разрешить путь исходного артефакта: {error}"),
+            )
+        })?;
+        if output == source {
+            return Err(DomainError::with_details(
+                ErrorCode::InvalidRequest,
+                "производный артефакт нельзя сохранять вместо исходного документа",
+                crate::details! { "path" => output.display().to_string() },
+            ));
+        }
+    }
+    if output.exists() {
+        let existing = fs::read(&output).map_err(|error| artifact_write_error(&output, &error))?;
+        if existing == bytes {
+            return Ok(output);
+        }
+    }
+    crate::write::replace_document_atomically(&output, bytes)?;
+    Ok(output)
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1064,9 +1240,7 @@ fn safe_output_path(
     }
     let requested = lexical_absolute(requested);
     reject_decks_path(root, &requested)?;
-    if requested.exists()
-        && fs::symlink_metadata(&requested).is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
+    if requested.is_symlink() {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
             "символьная ссылка как путь артефакта запрещена",
@@ -1085,13 +1259,13 @@ fn safe_output_path(
         )
     })?;
     let resolved = parent.join(name);
+    if resolved.is_symlink() {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "символьная ссылка как путь артефакта запрещена",
+        ));
+    }
     let resolved = if resolved.exists() {
-        if resolved.is_symlink() {
-            return Err(DomainError::new(
-                ErrorCode::InvalidRequest,
-                "символьная ссылка как путь артефакта запрещена",
-            ));
-        }
         if directory && !resolved.is_dir() || !directory && !resolved.is_file() {
             return Err(DomainError::new(
                 ErrorCode::ReviewArtifactConflict,

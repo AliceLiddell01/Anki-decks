@@ -9,4 +9,5 @@ pub mod diagnostics;
 pub mod language;
 pub mod model;
 pub mod scope;
+pub mod semantic_triage;
 pub mod workflow;

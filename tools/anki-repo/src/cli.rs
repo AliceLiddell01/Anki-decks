@@ -53,12 +53,13 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review, language, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review triage, language, edit, models, create, retire, migrate-media, visual-report",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report и code-review collect/verify/delta только читают\n\
                   зафиксированное состояние репозитория; code-review сохраняет локальные\n\
-                  артефакты с точной идентичностью Git-снимка.\n\
+                  артефакты с точной идентичностью Git-снимка. Семантический разбор отдельно\n\
+                  сохраняет и проверяет решения внешнего семантического ревьюера.\n\
                   language scan/check только читают. language apply требует\n\
                   явного --apply и решений replace, подтверждённых человеком.\n\
                   edit меняет значения существующих полей существующих заметок.\n\
@@ -107,6 +108,12 @@ impl Cli {
                 CodeReviewCommand::Collect { .. } => "code-review collect",
                 CodeReviewCommand::Verify { .. } => "code-review verify",
                 CodeReviewCommand::Delta { .. } => "code-review delta",
+                CodeReviewCommand::Triage { command } => match command {
+                    SemanticTriageCommand::Init { .. } => "code-review triage init",
+                    SemanticTriageCommand::Validate { .. } => "code-review triage validate",
+                    SemanticTriageCommand::Summary { .. } => "code-review triage summary",
+                    SemanticTriageCommand::Report { .. } => "code-review triage report",
+                },
             },
             Command::Language { command } => match command {
                 LanguageCommand::Scan { .. } => "language scan",
@@ -540,6 +547,71 @@ pub enum CodeReviewCommand {
         /// Необязательный путь JSON-отчёта delta.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+    },
+
+    /// Создать, проверить или представить решения семантического разбора пакета ревью.
+    Triage {
+        #[command(subcommand)]
+        command: SemanticTriageCommand,
+    },
+}
+
+/// Операции над отдельным версионируемым документом семантического разбора.
+#[derive(Debug, Subcommand)]
+pub enum SemanticTriageCommand {
+    /// Инициализировать документ с явным списком нерассмотренных кандидатов.
+    ///
+    /// Требует запуска из Git-репозитория для проверки безопасного пути записи.
+    Init {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Путь нового JSON-документа семантического разбора.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+
+    /// Проверить заполненный разбор по точному исходному пакету `review.json`.
+    ///
+    /// Без `--canonical-out` команда не зависит от Git-каталога. Запись
+    /// канонического JSON требует запуска из Git-репозитория.
+    Validate {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Заполненный JSON-документ семантического разбора.
+        #[arg(long, value_name = "PATH")]
+        triage: PathBuf,
+        /// Необязательный путь для отсортированного канонического JSON.
+        /// Запись запрещена под `decks/**`, в служебные каталоги Git и по
+        /// символьным ссылкам.
+        #[arg(long = "canonical-out", value_name = "PATH")]
+        canonical_out: Option<PathBuf>,
+    },
+
+    /// Показать компактную воспроизводимую сводку проверенного разбора.
+    Summary {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// JSON-документ семантического разбора.
+        #[arg(long, value_name = "PATH")]
+        triage: PathBuf,
+    },
+
+    /// Создать компактный Markdown-отчёт по проверенному каноническому разбору.
+    ///
+    /// Требует запуска из Git-репозитория для проверки безопасного пути записи.
+    Report {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// JSON-документ семантического разбора.
+        #[arg(long, value_name = "PATH")]
+        triage: PathBuf,
+        /// Путь нового Markdown-отчёта.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
     },
 }
 
