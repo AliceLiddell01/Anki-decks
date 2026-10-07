@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, mkdirat, open, openat};
 
@@ -13,10 +13,15 @@ pub struct MaintenanceLock {
 
 impl MaintenanceLock {
     pub fn acquire() -> io::Result<Self> {
-        let directory = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("anki-decks-maintenance");
+        let cache_home = crate::policy::cache_home().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "не задан HOME или XDG_CACHE_HOME для общей блокировки обслуживания",
+            )
+        })?;
+        let shared_parent = cache_home.join("anki-decks");
+        fs::create_dir_all(&shared_parent)?;
+        let directory = shared_parent.join("maintenance-lock");
         Self::acquire_at(&directory)
     }
 

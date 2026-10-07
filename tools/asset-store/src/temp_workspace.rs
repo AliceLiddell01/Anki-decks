@@ -386,11 +386,8 @@ fn cleanup_under_with_sources(
                                 Some(false),
                             )
                         }
-                        Err(DeleteFailure::Skip(reason)) => {
+                        Err(DeleteFailure::Skip { reason, live }) => {
                             report.skipped += 1;
-                            let live = (reason
-                                == "временную рабочую область использует живой процесс")
-                                .then_some(true);
                             ("deferred", reason.into(), 0, "project-owned", live)
                         }
                         Err(DeleteFailure::Io(error))
@@ -451,7 +448,10 @@ enum ProcessReferencePolicy {
 }
 
 enum DeleteFailure {
-    Skip(&'static str),
+    Skip {
+        reason: &'static str,
+        live: Option<bool>,
+    },
     Io(io::Error),
 }
 
@@ -475,14 +475,16 @@ fn remove_inspected_orphan(
         ) {
             Ok(false) => (),
             Ok(true) => {
-                return Err(DeleteFailure::Skip(
-                    "временную рабочую область использует живой процесс",
-                ));
+                return Err(DeleteFailure::Skip {
+                    reason: "временную рабочую область использует живой процесс",
+                    live: Some(true),
+                });
             }
             Err(_) => {
-                return Err(DeleteFailure::Skip(
-                    "не удалось подтвердить отсутствие ссылок процессов на каталог",
-                ));
+                return Err(DeleteFailure::Skip {
+                    reason: "не удалось подтвердить отсутствие ссылок процессов на каталог",
+                    live: None,
+                });
             }
         }
     }
@@ -2321,9 +2323,10 @@ mod tests {
                 uid,
                 reference_policy,
             ),
-            Err(DeleteFailure::Skip(
-                "временную рабочую область использует живой процесс"
-            ))
+            Err(DeleteFailure::Skip {
+                reason: "временную рабочую область использует живой процесс",
+                live: Some(true),
+            })
         ));
         assert!(path.exists());
 

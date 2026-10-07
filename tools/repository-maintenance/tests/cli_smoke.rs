@@ -185,7 +185,6 @@ fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
     let fixture = CacheFixture::new();
     let target_file = fixture.owner.path().join("target-is-a-file");
     fs::write(&target_file, b"target contents must be preserved").unwrap();
-    let runtime = private_runtime(&fixture.cache_home);
     let output = Command::new(BINARY)
         .args([
             "clean",
@@ -201,7 +200,7 @@ fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
         .env("CARGO_TARGET_DIR", &target_file)
         .env_remove("CARGO_BUILD_BUILD_DIR")
         .env("XDG_CACHE_HOME", &fixture.cache_home)
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", &fixture.temp_root)
         .output()
         .unwrap();
@@ -415,7 +414,6 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
         owner.path(),
         "test \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_TARGET_DIR\" && test \"$CARGO_TARGET_DIR\" = \"$CARGO_BUILD_BUILD_DIR\"\n",
     );
-    let runtime = private_runtime(&cache_home);
     let invoked = Command::new(BINARY)
         .args([
             "cache",
@@ -430,7 +428,7 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
             "build",
         ])
         .env("XDG_CACHE_HOME", &cache_home)
-        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", &temp_root)
         .output()
         .unwrap();
@@ -533,7 +531,7 @@ impl CacheFixture {
             .arg(&self.root)
             .arg("--json")
             .env("XDG_CACHE_HOME", &self.cache_home)
-            .env("XDG_RUNTIME_DIR", private_runtime(&self.cache_home))
+            .env_remove("XDG_RUNTIME_DIR")
             .env("TMPDIR", &self.temp_root);
         command
     }
@@ -892,6 +890,10 @@ fn cli_cache_run_lease_defers_clean_and_second_run_until_marker_refresh() {
 
 #[test]
 fn cli_partial_tmp_inventory_is_reported_without_fatal_exit() {
+    if fs::metadata("/proc/self").unwrap().uid() == 0 {
+        eprintln!("skipping permission-based inventory test when running as root");
+        return;
+    }
     let fixture = CacheFixture::new();
     let unreadable = fixture.temp_root.join("unreadable-foreign-directory");
     fs::create_dir(&unreadable).unwrap();
@@ -972,7 +974,6 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=1\n",
     )
     .unwrap();
-    let runtime = private_runtime(&cache_home);
     let mut search_path = vec![cargo_bin];
     if let Some(existing) = std::env::var_os("PATH") {
         search_path.extend(std::env::split_paths(&existing));
@@ -992,7 +993,7 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         ])
         .env("PATH", search_path)
         .env("XDG_CACHE_HOME", &cache_home)
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", &temp_root)
         .env("CARGO_HOME", cargo_home)
         .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -1012,13 +1013,6 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         "{report}"
     );
     assert!(target.join("synthetic-artifact").exists());
-}
-
-fn private_runtime(cache_home: &Path) -> PathBuf {
-    let runtime = cache_home.join("runtime");
-    fs::create_dir_all(&runtime).unwrap();
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
-    runtime
 }
 
 fn write_cargo(directory: &Path, body: &str) -> PathBuf {
@@ -1044,7 +1038,6 @@ fn invoke_with_legacy(
     apply: bool,
     cleanup_legacy: bool,
 ) -> Output {
-    let runtime = private_runtime(cache_home);
     let mut command = Command::new(BINARY);
     command
         .args([
@@ -1058,7 +1051,7 @@ fn invoke_with_legacy(
             "--json",
         ])
         .env("XDG_CACHE_HOME", cache_home)
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", temp_root);
     if apply {
         command.arg("--apply");
@@ -1070,7 +1063,6 @@ fn invoke_with_legacy(
 }
 
 fn invoke_scan(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path) -> Output {
-    let runtime = private_runtime(cache_home);
     Command::new(BINARY)
         .args([
             "scan",
@@ -1083,7 +1075,7 @@ fn invoke_scan(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path) 
             "--json",
         ])
         .env("XDG_CACHE_HOME", cache_home)
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", temp_root)
         .output()
         .unwrap()
