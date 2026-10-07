@@ -114,7 +114,7 @@ pub struct ReviewQueueCandidateDetail {
     pub unit: ReviewUnit,
 }
 
-/// Raw evidence representative without repeating the complete containing unit.
+/// Полное исходное свидетельство представителя без повтора всей содержащей группы.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewQueueRepresentativeDetail {
     pub candidate: CandidateEvidence,
@@ -257,7 +257,10 @@ pub fn expand_review_queue_group(
         .filter(|unit| unit.is_group())
         .cloned()
         .ok_or_else(|| {
-            DomainError::new(ErrorCode::NotFound, format!("Review group не найден: {id}"))
+            DomainError::new(
+                ErrorCode::NotFound,
+                format!("Группа очереди ревью не найдена: {id}"),
+            )
         })?;
     let candidates: BTreeMap<_, _> = pack
         .all_candidates()
@@ -294,7 +297,7 @@ pub fn inspect_review_queue_candidate(
         .ok_or_else(|| {
             DomainError::new(
                 ErrorCode::NotFound,
-                format!("Candidate не найден в review queue: {id}"),
+                format!("Кандидат не найден в структурной очереди: {id}"),
             )
         })?;
     let candidates: BTreeMap<_, _> = pack
@@ -328,13 +331,13 @@ fn queue_candidate_detail(
     let candidate = candidates.get(id).cloned().ok_or_else(|| {
         DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
-            format!("Queue ссылается на неизвестный candidate ID: {id}"),
+            format!("Очередь ссылается на неизвестный ID кандидата: {id}"),
         )
     })?;
     let classification = queue.classifications.get(id).cloned().ok_or_else(|| {
         DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
-            format!("Queue не содержит classification кандидата: {id}"),
+            format!("В очереди отсутствует классификация кандидата: {id}"),
         )
     })?;
     Ok(ReviewQueueCandidateDetail {
@@ -352,13 +355,13 @@ fn queue_representative_detail(
     let candidate = candidates.get(id).cloned().ok_or_else(|| {
         DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
-            format!("Queue ссылается на неизвестный representative candidate ID: {id}"),
+            format!("Очередь ссылается на неизвестный ID кандидата-представителя: {id}"),
         )
     })?;
     let classification = queue.classifications.get(id).cloned().ok_or_else(|| {
         DomainError::new(
             ErrorCode::ReviewArtifactInvalid,
-            format!("Queue не содержит classification representative: {id}"),
+            format!("В очереди отсутствует классификация кандидата-представителя: {id}"),
         )
     })?;
     Ok(ReviewQueueRepresentativeDetail {
@@ -620,8 +623,8 @@ impl RustImages {
     }
 }
 
-/// Retains separate base and post images so removed/renamed evidence is parsed
-/// against the source version that actually contains it.
+/// Сохраняет исходные образы base и post отдельно, чтобы разбирать удалённые
+/// и переименованные свидетельства по той версии файла, где они находились.
 fn rust_sources_from_scope(collected: &CollectedScope) -> (Vec<SourceFile>, Vec<SourceFile>) {
     let mut post_sources = Vec::new();
     let mut base_sources = Vec::new();
@@ -707,8 +710,8 @@ fn syntax_contexts(
                     continue;
                 }
             } else {
-                // A stale or non-positional snippet must not inherit syntax from
-                // an unrelated line in either Git image.
+                // Устаревший или непозиционный фрагмент не должен наследовать
+                // синтаксический контекст несвязанной строки из образа Git.
                 continue;
             };
             let column = candidate

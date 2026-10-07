@@ -124,6 +124,18 @@ pub enum CandidateOrigin {
     Unknown,
 }
 
+impl CandidateOrigin {
+    /// Стабильная метка происхождения в машиночитаемом формате.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntroducedOrChanged => "introduced_or_changed",
+            Self::PreExisting => "pre_existing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Итог анализатора без дублирования диагностик, которые хранятся рядом в review-pack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRunEvidence {

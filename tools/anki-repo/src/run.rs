@@ -923,17 +923,20 @@ fn human_review_queue_group(
     use std::fmt::Write as _;
     let class = &result.unit.signature.classification;
     let mut text = format!(
-        "Группа {}\nPriority: {}; candidates: {}; detector: {}; path family: {}.\nRole: {:?}; execution: {:?}; text role: {:?}; code role: {:?}; origin: {:?}.\n",
+        "Группа {}\nПриоритет: {}; кандидатов: {}; детектор: {}; семейство путей: {}.\nРоль: {}; исполнение: {}; роль текста: {}; роль кода: {}; происхождение: {}.\n",
         result.unit.id,
         result.unit.priority.as_str(),
         result.unit.candidate_ids().len(),
         result.unit.signature.detector,
         result.unit.signature.path_family,
-        class.role,
-        class.execution,
-        class.text_role,
-        class.code_role,
-        class.origin,
+        class.role.as_str(),
+        class
+            .execution
+            .as_ref()
+            .map_or("unknown", crate::code_review::review_queue::surface_name),
+        class.text_role.map_or("unknown", |role| role.as_str()),
+        class.code_role.as_str(),
+        class.origin.as_str(),
     );
     let _ = writeln!(text, "Представители:");
     for detail in &result.representatives {
@@ -964,18 +967,18 @@ fn human_review_queue_group(
         .join(", ");
     let _ = writeln!(
         text,
-        "Candidate IDs (первые {}): {ids}",
+        "ID кандидатов (первые {}): {ids}",
         result.unit.candidate_ids().len().min(20)
     );
     if result.unit.candidate_ids().len() > 20 {
         let _ = writeln!(
             text,
-            "Остальные IDs доступны в --json; для candidate details: `code-review queue candidate --id ID`."
+            "Остальные ID доступны в --json; подробности кандидата: `code-review queue candidate --id ID`."
         );
     }
     let _ = writeln!(
         text,
-        "Группа не является общим semantic decision; раскрывайте неоднородные случаи."
+        "Группа не является общим семантическим решением; неоднородные случаи нужно рассматривать отдельно."
     );
     text
 }
@@ -994,32 +997,45 @@ fn human_review_queue_candidate(
         .as_deref()
         .map(crate::text::bounded_sample)
         .unwrap_or_default();
+    let surfaces = if class.surfaces.is_empty() {
+        "unknown".to_owned()
+    } else {
+        class
+            .surfaces
+            .iter()
+            .map(crate::code_review::review_queue::surface_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let mut text = format!(
-        "Candidate {}\n{}{} · detector: {} · origin: {:?}\nSignals: {}\nSnippet: {}\nSurface: {:?}; execution: {:?}; role: {:?}; text role: {:?}; code role: {:?}\nUnit: {} ({}, priority: {}).\n",
+        "Кандидат {}\n{}{} · детектор: {} · происхождение: {}\nСигналы: {}\nФрагмент: {}\nПоверхности: {}; исполнение: {}; роль: {}; роль текста: {}; роль кода: {}\nОчередь: {} ({}, приоритет: {}).\n",
         candidate.id,
         candidate.path,
         line,
         candidate.detector,
-        candidate.origin,
+        candidate.origin.as_str(),
         candidate.signals.join(", "),
         snippet,
-        class.surfaces,
-        class.execution,
-        class.role,
-        class.text_role,
-        class.code_role,
+        surfaces,
+        class
+            .execution
+            .as_ref()
+            .map_or("unknown", crate::code_review::review_queue::surface_name),
+        class.role.as_str(),
+        class.text_role.map_or("unknown", |role| role.as_str()),
+        class.code_role.as_str(),
         result.unit.id,
         if result.unit.is_group() {
-            "group"
+            "группа"
         } else {
-            "individual"
+            "отдельный кандидат"
         },
         result.unit.priority.as_str(),
     );
     if result.unit.is_group() {
         let _ = writeln!(
             text,
-            "Group members: {}; representatives: {}.",
+            "Участников группы: {}; представителей: {}.",
             result.unit.candidate_ids().len(),
             result
                 .unit
@@ -1030,7 +1046,10 @@ fn human_review_queue_candidate(
                 .join(", ")
         );
     }
-    let _ = writeln!(text, "Evidence is not a confirmed finding.");
+    let _ = writeln!(
+        text,
+        "Свидетельство — это сигнал, а не подтверждённое замечание."
+    );
     text
 }
 
@@ -1521,6 +1540,138 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn review_queue_candidate_detail() -> crate::code_review::workflow::ReviewQueueCandidateDetail {
+        use crate::code_review::model::{CandidateEvidence, CandidateOrigin};
+        use crate::code_review::review_queue::{
+            ClassificationBasis, CodeRole, GroupingSignature, ReviewPriority, ReviewUnit,
+            StructuralClassification, StructuralRole, TextRole, UnitMembers, UnitStatistics,
+        };
+        use crate::code_review::scope::{FileCategory, FileSurface};
+
+        let classification = StructuralClassification {
+            surfaces: vec![FileSurface::Tests],
+            surface_basis: ClassificationBasis::FileContext,
+            file_category: Some(FileCategory::Rust),
+            execution: Some(FileSurface::Tests),
+            execution_basis: ClassificationBasis::FileContext,
+            origin: CandidateOrigin::IntroducedOrChanged,
+            role: StructuralRole::ErrorPath,
+            role_basis: ClassificationBasis::Detector,
+            text_role: Some(TextRole::HumanComment),
+            text_basis: ClassificationBasis::Detector,
+            code_role: CodeRole::TestHelper,
+            code_basis: ClassificationBasis::SyntaxContext,
+            syntax_signature: None,
+        };
+        let unit = ReviewUnit {
+            id: "unit-1".into(),
+            members: UnitMembers::Group {
+                candidate_ids: vec!["candidate-1".into(), "candidate-2".into()],
+                representative_candidate_ids: vec!["candidate-1".into()],
+            },
+            signature: GroupingSignature {
+                detector: "error_path".into(),
+                source: "synthetic_detector".into(),
+                classification: classification.clone(),
+                detector_signals: vec!["unwrap_call".into()],
+                text_context: None,
+                path_family: "tools/anki-repo/src".into(),
+                structural_pattern: None,
+            },
+            priority: ReviewPriority::Normal,
+            priority_signals: Vec::new(),
+            statistics: UnitStatistics {
+                candidates: 2,
+                paths: std::collections::BTreeMap::from([("src/lib.rs".into(), 2)]),
+            },
+        };
+
+        crate::code_review::workflow::ReviewQueueCandidateDetail {
+            candidate: CandidateEvidence {
+                id: "candidate-1".into(),
+                detector: "error_path".into(),
+                path: "src/lib.rs".into(),
+                line: Some(7),
+                column: None,
+                snippet: Some("result.unwrap()".into()),
+                origin: CandidateOrigin::IntroducedOrChanged,
+                signals: vec!["unwrap_call".into()],
+                source: "synthetic_detector".into(),
+                metadata: std::collections::BTreeMap::new(),
+            },
+            classification,
+            unit,
+        }
+    }
+
+    #[test]
+    fn review_queue_group_uses_stable_labels() {
+        let detail = review_queue_candidate_detail();
+        let result = crate::code_review::workflow::ReviewQueueGroupDetail {
+            unit: detail.unit,
+            representatives: vec![
+                crate::code_review::workflow::ReviewQueueRepresentativeDetail {
+                    candidate: detail.candidate,
+                    classification: detail.classification,
+                },
+            ],
+        };
+
+        let rendered = human_review_queue_group(&result);
+        for label in [
+            "Роль: error_path",
+            "исполнение: tests",
+            "роль текста: human_comment",
+            "роль кода: test_helper",
+            "происхождение: introduced_or_changed",
+        ] {
+            assert!(rendered.contains(label), "нет метки {label:?}: {rendered}");
+        }
+        for unstable in [
+            "ErrorPath",
+            "Some(",
+            "HumanComment",
+            "TestHelper",
+            "IntroducedOrChanged",
+        ] {
+            assert!(
+                !rendered.contains(unstable),
+                "найдена нестабильная метка {unstable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_queue_candidate_uses_stable_labels() {
+        let result = review_queue_candidate_detail();
+
+        let rendered = human_review_queue_candidate(&result);
+        for label in [
+            "Поверхности: tests",
+            "исполнение: tests",
+            "роль: error_path",
+            "роль текста: human_comment",
+            "роль кода: test_helper",
+            "происхождение: introduced_or_changed",
+            "Участников группы: 2; представителей: candidate-1.",
+            "Свидетельство — это сигнал, а не подтверждённое замечание.",
+        ] {
+            assert!(rendered.contains(label), "нет метки {label:?}: {rendered}");
+        }
+        for unstable in [
+            "ErrorPath",
+            "Some(",
+            "HumanComment",
+            "TestHelper",
+            "IntroducedOrChanged",
+        ] {
+            assert!(
+                !rendered.contains(unstable),
+                "найдена нестабильная метка {unstable:?}"
+            );
+        }
+    }
 
     #[test]
     fn review_queue_summary_uses_stable_enum_labels() {
