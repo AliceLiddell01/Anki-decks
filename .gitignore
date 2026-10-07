@@ -52,3 +52,5 @@
 # текущего PR (`/.codex/local/pr/<task>/body.md`). Это не публикуемый контракт
 # репозитория и не tracked: процедуру владеет `.agents/skills/anki-git-workflow/`.
 /.codex/local/
+
+/.anki-repo/review/
