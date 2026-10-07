@@ -730,7 +730,7 @@ fn rust_syntax_context(
         RustExecutionContext::Test => Some(super::scope::FileSurface::Tests),
         RustExecutionContext::Unknown => None,
     };
-    let code_role = match context.code_role {
+    let mut code_role = match context.code_role {
         RustCodeRole::Runtime => CodeRole::Runtime,
         RustCodeRole::Item if execution == Some(super::scope::FileSurface::Tests) => {
             CodeRole::TestHelper
@@ -752,11 +752,18 @@ fn rust_syntax_context(
             ClassificationBasis::Unknown
         }
     };
+    let (execution, text_role, signature) =
+        if basis == ClassificationBasis::SyntaxContext && execution.is_some() {
+            (execution, text_role, context.call_signature())
+        } else {
+            code_role = CodeRole::Unknown;
+            (None, None, None)
+        };
     review_queue::SyntaxContext {
         execution,
         code_role,
         text_role,
-        signature: context.call_signature(),
+        signature,
         basis,
     }
 }

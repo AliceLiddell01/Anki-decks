@@ -225,9 +225,31 @@ pub struct ToolRunChange {
 }
 
 impl ReviewPack {
+    /// Индексирует файлы по текущему пути, сохраняя первый элемент при совпадении.
+    pub(crate) fn scope_files_by_path(&self) -> BTreeMap<&str, &ReviewFile> {
+        let mut files = BTreeMap::new();
+        for file in &self.scope.files {
+            files.entry(file.path.as_str()).or_insert(file);
+        }
+        files
+    }
+
+    /// Индексирует текущие и предыдущие пути в исходном порядке файлов.
+    pub(crate) fn scope_files_by_candidate_path(&self) -> BTreeMap<&str, &ReviewFile> {
+        let mut files = BTreeMap::new();
+        for file in &self.scope.files {
+            files.entry(file.path.as_str()).or_insert(file);
+            if let Some(previous_path) = file.previous_path.as_deref() {
+                files.entry(previous_path).or_insert(file);
+            }
+        }
+        files
+    }
+
     /// Возвращает всех кандидатов одним детерминированным списком.
     #[must_use]
     pub fn all_candidates(&self) -> Vec<CandidateEvidence> {
+        let files_by_path = self.scope_files_by_path();
         let mut candidates = self.candidates.clone();
         candidates.extend(self.language.candidates.iter().map(|candidate| {
             let mut metadata = BTreeMap::new();
@@ -241,12 +263,9 @@ impl ReviewPack {
                 "context".to_owned(),
                 serde_json::to_value(candidate.context).unwrap_or(Value::Null),
             );
-            let origin = self
-                .scope
-                .files
-                .iter()
-                .find(|file| file.path == candidate.path)
-                .map_or(CandidateOrigin::Unknown, |file| {
+            let origin = files_by_path.get(candidate.path.as_str()).copied().map_or(
+                CandidateOrigin::Unknown,
+                |file| {
                     if file.binary {
                         return CandidateOrigin::Unknown;
                     }
@@ -277,7 +296,8 @@ impl ReviewPack {
                     } else {
                         CandidateOrigin::Unknown
                     }
-                });
+                },
+            );
             CandidateEvidence {
                 id: candidate.id.clone(),
                 detector: "residual_foreign_human_text".to_owned(),

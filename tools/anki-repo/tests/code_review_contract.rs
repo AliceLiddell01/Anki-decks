@@ -677,18 +677,11 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|candidate| candidate["path"] == "src/lib.rs" && candidate["line"] == 1206)
-        .or_else(|| {
-            pack["candidates"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|candidate| {
-                    candidate["detector"] == "error_path"
-                        && candidate["snippet"]
-                            .as_str()
-                            .is_some_and(|snippet| snippet.contains("std::fs::read"))
-                })
+        .find(|candidate| {
+            candidate["detector"] == "error_path"
+                && candidate["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.contains("std::fs::read"))
         })
         .expect("production filesystem candidate");
     let production_id = production["id"].as_str().unwrap();
@@ -848,6 +841,50 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         parse_json(&stdout)["error"]["code"],
         "review_artifact_invalid"
     );
+}
+
+#[test]
+fn collect_keeps_mixed_rust_items_unknown_when_a_line_has_no_single_column() {
+    let repo = TempDir::new("collect-mixed-rust-items");
+    let artifacts = TempDir::new("collect-mixed-rust-items-artifacts");
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    commit(repo.path(), "база");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "const RUNTIME: i32 = todo!(); #[cfg(test)] mod tests { const TEST: i32 = todo!(); }\n",
+    )
+    .unwrap();
+    commit(repo.path(), "смешать test и runtime items на одной строке");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let output = artifacts.path().join("collected");
+    collect_pack(repo.path(), &base, &head, &output, false);
+
+    let pack: Value =
+        serde_json::from_slice(&fs::read(output.join("review.json")).unwrap()).unwrap();
+    let queue: Value =
+        serde_json::from_slice(&fs::read(output.join("review-queue.json")).unwrap()).unwrap();
+    let candidate = pack["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| {
+            candidate["detector"] == "error_path"
+                && candidate["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.matches("todo!").count() == 2)
+        })
+        .expect("строка с двумя todo! должна дать один error_path candidate");
+    assert_eq!(candidate["line"], 1);
+    assert_eq!(candidate["column"], Value::Null);
+
+    let classification = &queue["classifications"][candidate["id"].as_str().unwrap()];
+    assert_eq!(classification["execution"], Value::Null);
+    assert_eq!(classification["code_role"], "unknown");
+    assert_eq!(classification["code_basis"], "unknown");
+    assert!(queue["summary"]["unknown_candidates"].as_u64().unwrap() > 0);
 }
 
 #[test]

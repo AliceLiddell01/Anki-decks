@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{DomainError, ErrorCode};
 
 use super::language::TextContext;
-use super::model::{CandidateEvidence, CandidateOrigin, ReviewPack};
+use super::model::{CandidateEvidence, CandidateOrigin, ReviewFile, ReviewPack};
 use super::scope::{FileCategory, FileSurface};
 use super::semantic_triage::{self, TriageSource};
 
@@ -425,9 +425,18 @@ pub fn classify(
     candidate: &CandidateEvidence,
     syntax: Option<&SyntaxContext>,
 ) -> StructuralClassification {
-    let file = pack.scope.files.iter().find(|file| {
-        file.path == candidate.path || file.previous_path.as_ref() == Some(&candidate.path)
-    });
+    let files_by_candidate_path = pack.scope_files_by_candidate_path();
+    classify_indexed(candidate, &files_by_candidate_path, syntax)
+}
+
+fn classify_indexed(
+    candidate: &CandidateEvidence,
+    files_by_candidate_path: &BTreeMap<&str, &ReviewFile>,
+    syntax: Option<&SyntaxContext>,
+) -> StructuralClassification {
+    let file = files_by_candidate_path
+        .get(candidate.path.as_str())
+        .copied();
     let (file_category, mut surfaces) = file.map_or_else(
         || (None, Vec::new()),
         |file| {
@@ -653,10 +662,10 @@ fn statistics(candidates: &[&CandidateEvidence]) -> UnitStatistics {
 
 fn validate_classification(
     class: &StructuralClassification,
-    pack: &ReviewPack,
+    files_by_candidate_path: &BTreeMap<&str, &ReviewFile>,
     candidate: &CandidateEvidence,
 ) -> Result<(), DomainError> {
-    let fallback = classify(pack, candidate, None);
+    let fallback = classify_indexed(candidate, files_by_candidate_path, None);
     if class.surfaces != fallback.surfaces
         || class.surface_basis != fallback.surface_basis
         || class.file_category != fallback.file_category
@@ -737,18 +746,27 @@ pub fn build(
     let source = semantic_triage::source_identity(pack, source_pack_sha256);
     semantic_triage::validate_source(&source, pack, source_pack_sha256)?;
     let candidates = pack.all_candidates();
+    let candidate_ids: BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
     if contexts
         .keys()
-        .any(|id| !candidates.iter().any(|candidate| &candidate.id == id))
+        .any(|id| !candidate_ids.contains(id.as_str()))
     {
         return Err(invalid("Syntax context содержит неизвестный candidate ID"));
     }
+    let files_by_candidate_path = pack.scope_files_by_candidate_path();
     let mut classifications = BTreeMap::new();
     let mut grouped: BTreeMap<String, (GroupingSignature, Vec<&CandidateEvidence>)> =
         BTreeMap::new();
     let mut units = Vec::new();
     for candidate in &candidates {
-        let classification = classify(pack, candidate, contexts.get(&candidate.id));
+        let classification = classify_indexed(
+            candidate,
+            &files_by_candidate_path,
+            contexts.get(&candidate.id),
+        );
         let signature = signature(candidate, &classification);
         classifications.insert(candidate.id.clone(), classification);
         if can_group(&signature) {
@@ -853,6 +871,7 @@ pub fn validate(
     }
     semantic_triage::validate_source(&queue.source, pack, source_pack_sha256)?;
     let candidates = pack.all_candidates();
+    let files_by_candidate_path = pack.scope_files_by_candidate_path();
     let candidates: BTreeMap<_, _> = candidates
         .iter()
         .map(|candidate| (candidate.id.as_str(), candidate))
@@ -888,7 +907,7 @@ pub fn validate(
                 return Err(invalid(format!("Candidate покрыт повторно: {id}")));
             }
             let class = &queue.classifications[id];
-            validate_classification(class, pack, candidate)?;
+            validate_classification(class, &files_by_candidate_path, candidate)?;
             if class.origin != candidate.origin
                 || class.role != structural_role(&candidate.detector)
                 || class.surfaces.windows(2).any(|pair| pair[0] >= pair[1])
