@@ -53,12 +53,13 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review, language, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki и свидетельства для ревью кода: inspect, find, stats, validate, qa, review, review-check, code-review triage, language, edit, models, create, retire, migrate-media, visual-report",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report и code-review collect/verify/delta только читают\n\
                   зафиксированное состояние репозитория; code-review сохраняет локальные\n\
-                  артефакты с точной идентичностью Git-снимка.\n\
+                  артефакты с точной идентичностью Git-снимка. Semantic triage отдельно\n\
+                  сохраняет и проверяет решения внешнего semantic reviewer.\n\
                   language scan/check только читают. language apply требует\n\
                   явного --apply и решений replace, подтверждённых человеком.\n\
                   edit меняет значения существующих полей существующих заметок.\n\
@@ -107,6 +108,12 @@ impl Cli {
                 CodeReviewCommand::Collect { .. } => "code-review collect",
                 CodeReviewCommand::Verify { .. } => "code-review verify",
                 CodeReviewCommand::Delta { .. } => "code-review delta",
+                CodeReviewCommand::Triage { command } => match command {
+                    SemanticTriageCommand::Init { .. } => "code-review triage init",
+                    SemanticTriageCommand::Validate { .. } => "code-review triage validate",
+                    SemanticTriageCommand::Summary { .. } => "code-review triage summary",
+                    SemanticTriageCommand::Report { .. } => "code-review triage report",
+                },
             },
             Command::Language { command } => match command {
                 LanguageCommand::Scan { .. } => "language scan",
@@ -540,6 +547,62 @@ pub enum CodeReviewCommand {
         /// Необязательный путь JSON-отчёта delta.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+    },
+
+    /// Создать, проверить или представить решения semantic triage для пакета ревью.
+    Triage {
+        #[command(subcommand)]
+        command: SemanticTriageCommand,
+    },
+}
+
+/// Операции отдельного versioned semantic-triage artifact.
+#[derive(Debug, Subcommand)]
+pub enum SemanticTriageCommand {
+    /// Инициализировать документ с явным списком нерассмотренных кандидатов.
+    Init {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Путь нового semantic-triage JSON artifact.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+
+    /// Проверить заполненный triage против точного исходного review-pack.
+    Validate {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Заполненный semantic-triage JSON artifact.
+        #[arg(long, value_name = "PATH")]
+        triage: PathBuf,
+        /// Необязательный путь для отсортированного canonical JSON.
+        #[arg(long = "canonical-out", value_name = "PATH")]
+        canonical_out: Option<PathBuf>,
+    },
+
+    /// Показать компактную воспроизводимую сводку валидного triage.
+    Summary {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Semantic-triage JSON artifact.
+        #[arg(long, value_name = "PATH")]
+        triage: PathBuf,
+    },
+
+    /// Создать компактный Markdown-отчёт из валидного canonical triage.
+    Report {
+        /// Неизменяемый пакет свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Semantic-triage JSON artifact.
+        #[arg(long, value_name = "PATH")]
+        triage: PathBuf,
+        /// Путь нового Markdown-отчёта.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
     },
 }
 

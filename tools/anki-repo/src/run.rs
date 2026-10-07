@@ -13,7 +13,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::cli::{Cli, CodeReviewCommand, Command, LanguageCommand, MatchArg};
+use crate::cli::{
+    Cli, CodeReviewCommand, Command, LanguageCommand, MatchArg, SemanticTriageCommand,
+};
 use crate::code_review::model::CandidateStatus;
 use crate::code_review::workflow::{LanguageSummary, SnapshotSummary};
 use crate::error::{DomainError, ErrorCode};
@@ -582,6 +584,66 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     exit: 0,
                 })
             }
+            CodeReviewCommand::Triage { command } => match command {
+                SemanticTriageCommand::Init { pack, out } => {
+                    let result = crate::code_review::workflow::init_semantic_triage(pack, out)?;
+                    Ok(Rendered {
+                        command: "code-review triage init",
+                        stdout: if cli.json {
+                            json::generic_json("code-review triage init", result)
+                        } else {
+                            human_semantic_triage_init(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                SemanticTriageCommand::Validate {
+                    pack,
+                    triage,
+                    canonical_out,
+                } => {
+                    let result = crate::code_review::workflow::validate_semantic_triage(
+                        pack,
+                        triage,
+                        canonical_out.as_deref(),
+                    )?;
+                    Ok(Rendered {
+                        command: "code-review triage validate",
+                        stdout: if cli.json {
+                            json::generic_json("code-review triage validate", result)
+                        } else {
+                            human_semantic_triage_validation(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                SemanticTriageCommand::Summary { pack, triage } => {
+                    let result =
+                        crate::code_review::workflow::summarize_semantic_triage(pack, triage)?;
+                    Ok(Rendered {
+                        command: "code-review triage summary",
+                        stdout: if cli.json {
+                            json::generic_json("code-review triage summary", &result)
+                        } else {
+                            human_semantic_triage_summary(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                SemanticTriageCommand::Report { pack, triage, out } => {
+                    let result =
+                        crate::code_review::workflow::report_semantic_triage(pack, triage, out)?;
+                    Ok(Rendered {
+                        command: "code-review triage report",
+                        stdout: if cli.json {
+                            json::generic_json("code-review triage report", result)
+                        } else {
+                            human_semantic_triage_report(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+            },
         },
 
         Command::Language { command } => match command {
@@ -703,6 +765,79 @@ fn human_snapshot(result: &crate::code_review::workflow::SnapshotSummary) -> Str
         );
     }
     text
+}
+
+fn human_semantic_triage_init(
+    result: &crate::code_review::workflow::SemanticTriageInitSummary,
+) -> String {
+    format!(
+        "Semantic triage создан: {}\nКандидатов: {}; пока не рассмотрено: {}.\nHEAD: {}\n",
+        result.artifact,
+        result.total_candidates,
+        result.unreviewed_candidates,
+        result.target.head_sha,
+    )
+}
+
+fn human_semantic_triage_validation(
+    result: &crate::code_review::workflow::SemanticTriageValidationSummary,
+) -> String {
+    let mut text = format!(
+        "Semantic triage валиден.\nКандидатов: {}; рассмотрено: {}; не рассмотрено: {}.\n",
+        result.summary.total_candidates,
+        result.summary.reviewed_candidates,
+        result.summary.unreviewed_candidates,
+    );
+    if let Some(path) = &result.canonical_artifact {
+        use std::fmt::Write as _;
+        let _ = writeln!(text, "Canonical JSON: {path}");
+    }
+    text
+}
+
+fn human_semantic_triage_summary(
+    summary: &crate::code_review::semantic_triage::TriageSummary,
+) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "Semantic triage summary\nВсего кандидатов: {}\nРассмотрено: {}\nНерассмотрено: {}\n",
+        summary.total_candidates, summary.reviewed_candidates, summary.unreviewed_candidates,
+    );
+    let _ = writeln!(
+        text,
+        "Индивидуальных решений: {}",
+        summary.individual_review.decision_count
+    );
+    for (disposition, count) in &summary.individual_review.by_disposition {
+        let _ = writeln!(text, "  individual {}: {count}", disposition.as_str());
+    }
+    let _ = writeln!(
+        text,
+        "Групповых решений: {}; покрытых candidate IDs: {}; representative IDs: {}",
+        summary.group_review.decisions.decision_count,
+        summary.group_review.covered_candidate_ids,
+        summary.group_review.representative_candidate_ids,
+    );
+    for (disposition, count) in &summary.group_review.decisions.by_disposition {
+        let _ = writeln!(text, "  group {} decisions: {count}", disposition.as_str());
+    }
+    let _ = writeln!(text, "Findings: {}", summary.findings.total_findings);
+    for (severity, count) in &summary.findings.by_severity {
+        let _ = writeln!(text, "  severity {}: {count}", severity.as_str());
+    }
+    for (provenance, count) in &summary.findings.by_provenance {
+        let _ = writeln!(text, "  provenance {}: {count}", provenance.as_str());
+    }
+    text
+}
+
+fn human_semantic_triage_report(
+    result: &crate::code_review::workflow::SemanticTriageReportSummary,
+) -> String {
+    format!(
+        "Markdown-отчёт сохранён: {}\nFindings: {}; нерассмотренных кандидатов: {}.\n",
+        result.report, result.total_findings, result.unreviewed_candidates,
+    )
 }
 
 fn human_delta(result: &crate::code_review::model::ReviewDelta) -> String {

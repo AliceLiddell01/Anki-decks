@@ -5,9 +5,11 @@
 ревью кода репозитория `Anki-decks`. Он даёт агенту быстрый и предсказуемый доступ к структуре
 `deck.json`, не требуя читать многомегабайтный JSON вручную.
 
-Девять команд — `inspect`, `find`, `stats`, `validate`, `qa`, `review`,
-`review-check`, `models`, `visual-report` — только читают: `visual-report` пишет
-лишь новый каталог отчёта и не касается экспорта. Команды, меняющие экспорт:
+Команды `inspect`, `find`, `stats`, `validate`, `qa`, `review`, `review-check`
+и `models` только читают экспорт. `visual-report` читает экспорт и записывает
+лишь новый каталог отчёта. `code-review triage` работает с отдельными локальными
+артефактами semantic review; ни одна из этих команд не меняет экспорт. Команды,
+меняющие экспорт:
 
 - `edit` меняет **значения** уже существующих полей уже существующих заметок;
 - `create` **добавляет** новые заметки в существующую колоду по уже существующей
@@ -120,7 +122,7 @@ CrowdAnki-экспортом и не знает имён полей конкре
 Имя поля всегда называет вызывающая сторона, а сверяется оно с фактическими
 `note_models[].flds[].name` того экспорта, с которым работает команда.
 
-### `code-review collect|verify|delta`
+### `code-review collect|verify|delta|triage`
 
 Пространство `code-review` собирает детерминированные свидетельства для
 независимого ревью кода. Порядком самого ревью владеет
@@ -205,6 +207,187 @@ Cargo (компиляция, проверка, время завершения �
 другое содержимое даёт `review_artifact_conflict`. Набор диагностик зависит
 также от доступности и версии локального анализатора; этот статус нужно
 учитывать при сравнении.
+
+#### Semantic triage
+
+`collect`, `verify` и `delta` остаются слоем свидетельств о коде и сигналах
+детекторов. Semantic triage — отдельный версионируемый JSON-артефакт внешнего
+ревьюера: он хранит решения по кандидатам и findings, не меняя `review.json`.
+Сформированный report строится из валидированного triage и служит его
+человекочитаемым представлением; финальный ответ ревьюера — отдельное
+обобщение только доказанных findings и реальных ограничений. Ни evidence,
+ни triage-команды не вызывают LLM/API, не исправляют код и не меняют
+проверяемый исходный код.
+
+Полный цикл:
+
+```bash
+anki-repo code-review triage init --pack "$PACK" --out "$TRIAGE"
+# Внешний reviewer заполняет TRIAGE; незавершённые кандидаты остаются явными.
+anki-repo code-review triage validate --pack "$PACK" --triage "$TRIAGE" --canonical-out "$CANONICAL_TRIAGE"
+anki-repo code-review triage summary --pack "$PACK" --triage "$CANONICAL_TRIAGE"
+anki-repo code-review triage report --pack "$PACK" --triage "$CANONICAL_TRIAGE" --out "$REPORT.md"
+```
+
+`PACK` — путь к исходному `review.json`, `TRIAGE` — редактируемый JSON-артефакт,
+`CANONICAL_TRIAGE` — его каноническое отсортированное представление после
+валидации, `REPORT.md` — производный отчёт. `--canonical-out PATH` необязателен;
+в рекомендуемом цикле summary и report читают сохранённый canonical artifact.
+`validate`, `summary` и `report` проверяют triage относительно того же исходного
+пакета.
+
+В `triage init` создаётся versioned документ, в котором каждый элемент
+`ReviewPack::all_candidates()` — то есть static и language candidate из общего
+пространства ID — явно остаётся нерассмотренным до решения reviewer'а. Основные
+поля документа:
+
+```json
+{
+  "schema_version": 1,
+  "source": {
+    "snapshot": {
+      "repository_id": "<portable id>",
+      "base_sha": "<full SHA>",
+      "head_sha": "<full SHA>",
+      "merge_base_sha": "<full SHA>"
+    },
+    "review_pack_sha256": "<SHA256 of exact review.json bytes>",
+    "candidate_count": 0
+  },
+  "individual_decisions": [],
+  "group_decisions": [],
+  "findings": [],
+  "unreviewed_candidate_ids": []
+}
+```
+
+Фрагмент показывает форму, а не готовый документ: `init` заполняет identity и
+список кандидатов, поэтому их число и ID берутся из фактического `PACK`.
+`source.snapshot` содержит переносимый `GitTarget` (`repository_id`, `base_sha`,
+`head_sha`, `merge_base_sha`); абсолютный путь клона в artifact не записывается.
+`review_pack_sha256` — SHA-256 в виде 64 строчных hex-символов по точным байтам
+исходного `review.json`, а
+`candidate_count` — по объединённому списку кандидатов. Совпадение одного лишь
+имени файла недостаточно: изменение байтов pack, Git snapshot или числа
+кандидатов приводит к отказу валидации. Несовпадающий Git snapshot возвращает
+типизированную ошибку `baseline_mismatch`; несовпадение hash/count, неизвестные
+ID и другие нарушения artifact — `review_artifact_invalid`.
+
+Каждая запись `individual_decisions` содержит `candidate_id`, `disposition`,
+`reason_code`, человекочитаемое `explanation` и `finding_ids`. Каждая запись
+`group_decisions` содержит `id`, `candidate_ids`,
+`representative_candidate_ids`, `disposition`, `reason_code`, `explanation` и
+`finding_ids`. Каждый finding содержит `id`, `severity`, `title`, `description`,
+`provenance` и `candidate_ids`. `unreviewed_candidate_ids` перечисляет каждый
+исходный candidate, для которого ещё нет individual или group decision.
+
+Допустимые `disposition`: `confirmed`, `acceptable`, `false_positive`,
+`not_applicable`, `uncertain`. «Не рассмотрен» задаётся только отдельным
+`unreviewed_candidate_ids`, а не отсутствующим решением или disposition.
+Подтверждённое решение обязано ссылаться на finding. Ссылки `finding_ids` и
+`findings[].candidate_ids` проверяются взаимно: неизвестные ID и односторонняя
+связь отклоняются. Для каждой пары candidate/finding обе стороны должны
+содержать взаимную ссылку. Finding может существовать без candidate; provenance
+различает `direct_candidate` (кандидат непосредственно указал на finding),
+`candidate_assisted` (сигнал помог навигации или расследованию, а дефект
+установлен шире исходного сигнала) и `independent` (finding найден без помощи
+candidates). Для provenance кандидата `candidate_ids` обязаны быть непустыми и
+указывать на рассмотренные candidates; для `independent` список пуст. Каждый
+candidate у `direct_candidate` должен иметь disposition `confirmed`; для
+`candidate_assisted` допустимы и другие рассмотренные dispositions. Допустимые
+severity: `critical`, `major`, `minor`, `trivial`.
+
+`reason_code` — стабильный закрытый enum в `snake_case`; пояснение не заменяет
+машинный код. Текущий набор: `pre_existing`, `out_of_scope`, `test_fixture`,
+`machine_contract`, `technical_identifier`, `documented_invariant`,
+`expected_failure_path`, `insufficient_evidence`, `duplicate_signal`, `other`.
+Новые или переименованные коды требуют изменения версии публичного контракта.
+
+Способ review следует из структуры, а не задаётся свободной меткой:
+
+- запись в `individual_decisions` означает индивидуально рассмотренный candidate;
+- `group_decisions` означает групповое решение по ровно перечисленным
+  `candidate_ids`; `representative_candidate_ids` показывает, какие элементы
+  группы непосредственно изучались как представители;
+- `unreviewed_candidate_ids` означает, что решения ещё нет.
+
+Группа включает не менее двух уникальных `candidate_ids` и не менее одного
+уникального `representative_candidate_id`; представители должны входить в
+покрытую группу. Candidate не может повторяться между группами, individual
+decisions и `unreviewed_candidate_ids`: все кандидаты source pack покрываются
+ровно одним из этих трёх способов. `group_decisions[].id` и `findings[].id`
+уникальны внутри artifact. Неизвестные JSON-поля и пустые обязательные ID,
+пояснения, названия или описания отклоняются. Валидация также отклоняет
+неоднозначное покрытие, дублирующие конфликтующие решения, неподдерживаемую
+версию схемы, несовпадающий snapshot/hash/count, unknown candidate/finding IDs,
+подтверждённые решения без finding и решения без устойчивой причины. Частичный
+triage допустим: непроверенные кандидаты сохраняются в явном виде.
+
+`summary` выводит детерминированный `TriageSummary` (с `--json` он находится в
+поле envelope `result`) со следующими ключами и смыслом:
+
+```json
+{
+  "schema_version": 1,
+  "total_candidates": 0,
+  "reviewed_candidates": 0,
+  "unreviewed_candidates": 0,
+  "individual_review": {
+    "decision_count": 0,
+    "by_disposition": {},
+    "by_reason_code": {}
+  },
+  "group_review": {
+    "decisions": {
+      "decision_count": 0,
+      "by_disposition": {},
+      "by_reason_code": {}
+    },
+    "covered_candidate_ids": 0,
+    "representative_candidate_ids": 0
+  },
+  "by_detector": {
+    "<detector>": {
+      "total_candidates": 0,
+      "reviewed_candidates": 0,
+      "unreviewed_candidates": 0,
+      "individually_reviewed_candidates": 0,
+      "group_reviewed_candidates": 0,
+      "finding_linked_candidates": 0,
+      "covered_ids_by_disposition": {},
+      "covered_ids_by_reason_code": {}
+    }
+  },
+  "findings": {
+    "total_findings": 0,
+    "by_severity": {},
+    "by_provenance": {}
+  }
+}
+```
+
+`individual_review.decision_count` и `group_review.decisions.decision_count` —
+числа единиц решений; `group_review.covered_candidate_ids` и
+`representative_candidate_ids` — отдельные числа покрытых и непосредственно
+изученных IDs. В `by_detector` disposition/reason и `finding_linked_candidates`
+считаются по покрытым candidate IDs; эти показатели не являются detector
+precision. Сводка разделяет рассмотренные и нерассмотренные candidates,
+индивидуальное и групповое покрытие, решения по disposition/reason, candidates
+по detector и findings по severity/provenance. Markdown report повторяет
+агрегаты и сами findings, но не дублирует строки решений или тысячи candidates;
+полная трассировка остаётся в JSON.
+
+Новый semantic triage не связан с `LanguageDecisions`: те по-прежнему отвечают
+только за явные решения безопасного language-edit/apply workflow. Semantic
+disposition language candidate не утверждает замену и не запускает `language
+apply`. Если меняется проверяемый HEAD/base или source pack, собери новый pack,
+создай новый triage и заново проверь решения. Артефакт старого snapshot нельзя
+молча переносить на новый.
+
+```bash
+anki-repo code-review triage init --help
+anki-repo --json code-review triage summary --pack "$PACK" --triage "$CANONICAL_TRIAGE"
+```
 
 ### `language scan|check|apply`
 
