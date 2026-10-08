@@ -165,7 +165,7 @@ impl Default for Enforcement {
                 "Изоляция source обеспечена отдельным detached worktree; запрещённые записи вне job не блокируются ОС.".into(),
                 "Git objects и metadata общие; проверяемому коду не запрещён прямой доступ к ним.".into(),
                 "Потомки могут уйти из процессной группы; их завершение не гарантируется.".into(),
-                "Полные логи хранятся на диске без лимита; ограничен только вывод внутри JSON.".into(),
+                "Полные логи хранятся на диске без лимита и без маскирования секретов; распознанные значения маскируются только в ограниченном выводе внутри JSON.".into(),
             ],
         }
     }
@@ -679,6 +679,7 @@ pub fn run_job(
     } else {
         status
     };
+    let sensitive_values = sensitive_request_values(request);
     let result = ExecutionResult {
         schema_version: EXECUTION_SCHEMA_VERSION,
         job_id: job.metadata.job_id.clone(),
@@ -695,13 +696,13 @@ pub fn run_job(
             job,
             "stdout.log",
             request.options.output_limit_bytes,
-            &sensitive_environment_values(&request.options.environment),
+            &sensitive_values,
         )?,
         stderr: output_evidence(
             job,
             "stderr.log",
             request.options.output_limit_bytes,
-            &sensitive_environment_values(&request.options.environment),
+            &sensitive_values,
         )?,
         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         enforcement,
@@ -888,47 +889,149 @@ fn validate_result(metadata: &JobMetadata, result: &ExecutionResult) -> Result<(
 }
 
 pub fn safe_argv(argv: &[String]) -> Vec<String> {
-    let mut redact_next = false;
-    argv.iter()
-        .map(|argument| {
-            if std::mem::take(&mut redact_next) {
-                return "<redacted>".to_owned();
-            }
-            if let Some((key, _)) = argument.split_once('=')
-                && is_sensitive_key(key)
-            {
-                return format!("{key}=<redacted>");
-            }
-            if is_sensitive_key(argument) {
-                if argument.starts_with('-') {
-                    redact_next = true;
-                    argument.clone()
-                } else {
-                    "<redacted>".to_owned()
-                }
-            } else {
-                argument.clone()
-            }
-        })
-        .collect()
+    redact_argv(argv).0
 }
 
-fn is_sensitive_key(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    [
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "api_key",
-        "api-key",
-        "apikey",
-        "authorization",
-        "credential",
-        "cookie",
-    ]
-    .iter()
-    .any(|needle| value.contains(needle))
+/// Один разбор задаёт безопасное представление argv и значения для очистки вывода.
+fn redact_argv(argv: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut safe = argv.to_vec();
+    let mut values = Vec::new();
+    let mut index = 1; // argv[0] — имя исполняемого файла, а не параметр.
+    while index < argv.len() {
+        let argument = &argv[index];
+        if argument == "--" {
+            break;
+        }
+        if matches!(argument.as_str(), "-H" | "--header" | "--proxy-header") {
+            if let Some(value) = argv.get(index + 1) {
+                if let Some(redacted) = redact_header(value, &mut values) {
+                    safe[index + 1] = redacted;
+                }
+                index += 1;
+            }
+        } else if let Some(redacted) = redact_header(argument, &mut values) {
+            safe[index] = redacted;
+        } else if let Some(value) = argument.strip_prefix("-H") {
+            if let Some(redacted) = redact_header(value, &mut values) {
+                safe[index] = format!("-H{redacted}");
+            }
+        } else if let Some((key, value)) = argument.split_once('=') {
+            if matches!(key, "--header" | "--proxy-header") {
+                if let Some(redacted) = redact_header(value, &mut values) {
+                    safe[index] = format!("{key}={redacted}");
+                }
+            } else if is_sensitive_option_key(key)
+                || (!key.starts_with('-') && is_sensitive_environment_key(key))
+            {
+                remember_sensitive_value(value, &mut values);
+                safe[index] = format!("{key}=<redacted>");
+            }
+        } else if argument.starts_with('-')
+            && is_sensitive_option_key(argument)
+            && let Some(value) = argv.get(index + 1)
+        {
+            remember_sensitive_value(value, &mut values);
+            safe[index + 1] = "<redacted>".into();
+            index += 1;
+        }
+        index += 1;
+    }
+    (safe, values)
+}
+
+fn is_sensitive_option_key(value: &str) -> bool {
+    matches!(
+        value
+            .trim_start_matches('-')
+            .to_ascii_lowercase()
+            .replace('_', "-")
+            .as_str(),
+        "token"
+            | "api-token"
+            | "access-token"
+            | "auth-token"
+            | "refresh-token"
+            | "secret"
+            | "client-secret"
+            | "password"
+            | "passwd"
+            | "api-key"
+            | "apikey"
+            | "authorization"
+            | "proxy-authorization"
+            | "credential"
+            | "credentials"
+            | "cookie"
+    )
+}
+
+fn is_sensitive_environment_key(value: &str) -> bool {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return false;
+    }
+    value.split('_').any(|part| {
+        matches!(
+            part.to_ascii_lowercase().as_str(),
+            "token"
+                | "secret"
+                | "password"
+                | "passwd"
+                | "apikey"
+                | "authorization"
+                | "credential"
+                | "credentials"
+                | "cookie"
+        )
+    }) || value.eq_ignore_ascii_case("API_KEY")
+        || value.to_ascii_uppercase().ends_with("_API_KEY")
+}
+
+fn remember_sensitive_value(value: &str, values: &mut Vec<String>) {
+    if !value.is_empty() {
+        values.push(value.to_owned());
+        // Заголовок Authorization может отражаться вместе со схемой или без неё.
+        if let Some((scheme, credential)) = value.split_once(char::is_whitespace)
+            && (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
+            && !credential.trim().is_empty()
+        {
+            values.push(credential.trim().to_owned());
+        }
+    }
+}
+
+fn redact_header(value: &str, values: &mut Vec<String>) -> Option<String> {
+    let (key, content) = value.split_once(':')?;
+    if !matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "x-api-key" | "api-key"
+    ) {
+        return None;
+    }
+    remember_sensitive_value(content.trim(), values);
+    Some(format!("{key}: <redacted>"))
+}
+
+fn sensitive_request_values(request: &CommandRequest) -> Vec<String> {
+    let (_, mut values) = redact_argv(&request.argv);
+    if let EnvironmentPolicy::Explicit {
+        values: environment,
+    } = &request.options.environment
+    {
+        for (key, value) in environment {
+            if is_sensitive_environment_key(key) {
+                remember_sensitive_value(value, &mut values);
+            }
+        }
+    }
+    values
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn argv_digest(argv: &[String]) -> String {
@@ -1318,14 +1421,27 @@ fn output_evidence(
         .take(read_limit as u64)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    let cutoff = output_evidence_cutoff(&bytes, limit, sensitive_values);
-    let bytes = &bytes[..cutoff];
-    let utf8_lossy = std::str::from_utf8(bytes).is_err();
-    let truncated = total_bytes > limit as u64;
-    let mut text = String::from_utf8_lossy(bytes).into_owned();
-    for value in sensitive_values.iter().filter(|value| !value.is_empty()) {
-        text = text.replace(value, "<redacted>");
+    let intervals = sensitive_output_intervals(&bytes, sensitive_values);
+    let mut cutoff = bytes.len().min(limit);
+    for &(begin, end) in &intervals {
+        if begin < cutoff && cutoff < end {
+            cutoff = begin;
+            break;
+        }
     }
+    let utf8_lossy = std::str::from_utf8(&bytes[..cutoff]).is_err();
+    let mut text = String::new();
+    let mut copied = 0;
+    for &(begin, end) in &intervals {
+        if begin >= cutoff {
+            break;
+        }
+        text.push_str(&String::from_utf8_lossy(&bytes[copied..begin]));
+        text.push_str("<redacted>");
+        copied = end;
+    }
+    text.push_str(&String::from_utf8_lossy(&bytes[copied..cutoff]));
+    let truncated = total_bytes > cutoff as u64 || text.len() > limit;
     if text.len() > limit {
         let mut end = limit;
         while !text.is_char_boundary(end) {
@@ -1342,38 +1458,49 @@ fn output_evidence(
     })
 }
 
-fn output_evidence_cutoff(bytes: &[u8], limit: usize, sensitive_values: &[String]) -> usize {
-    let mut cutoff = bytes.len().min(limit);
-    loop {
-        let previous = cutoff;
-        for value in sensitive_values.iter().filter(|value| !value.is_empty()) {
-            let pattern = value.as_bytes();
-            if pattern.len() > bytes.len() {
-                continue;
-            }
-            for (start, window) in bytes.windows(pattern.len()).enumerate() {
-                let end = start + pattern.len();
-                if start < cutoff && cutoff < end && window == pattern {
-                    cutoff = start;
+/// Объединяем пересечения по исходным байтам до замены: последовательный replace
+/// теряет перекрывающиеся секреты и способен раскрыть их оставшийся суффикс.
+fn sensitive_output_intervals(bytes: &[u8], sensitive_values: &[String]) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    for value in sensitive_values.iter().filter(|value| !value.is_empty()) {
+        let pattern = value.as_bytes();
+        if pattern.len() > bytes.len() {
+            continue;
+        }
+        let mut previous: Option<(usize, usize)> = None;
+        for (begin, window) in bytes.windows(pattern.len()).enumerate() {
+            if window == pattern {
+                let end = begin + pattern.len();
+                if let Some((_, previous_end)) = previous.as_mut()
+                    && begin <= *previous_end
+                {
+                    *previous_end = end;
+                } else {
+                    if let Some(interval) = previous {
+                        matches.push(interval);
+                    }
+                    previous = Some((begin, end));
                 }
             }
         }
-        if cutoff == previous {
-            return cutoff;
+        if let Some(interval) = previous {
+            matches.push(interval);
         }
     }
+    matches.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (begin, end) in matches {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && begin <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((begin, end));
+        }
+    }
+    merged
 }
 
-fn sensitive_environment_values(environment: &EnvironmentPolicy) -> Vec<String> {
-    match environment {
-        EnvironmentPolicy::Minimal => Vec::new(),
-        EnvironmentPolicy::Explicit { values } => values
-            .iter()
-            .filter(|(key, _)| is_sensitive_key(key))
-            .map(|(_, value)| value.clone())
-            .collect(),
-    }
-}
 fn exit_summary(status: ExitStatus) -> ProcessExit {
     #[cfg(unix)]
     {
@@ -2395,6 +2522,298 @@ mod tests {
                 .len()
                 > 1000
         );
+    }
+
+    #[test]
+    fn regression_reflected_argv_secrets_are_redacted_in_both_streams() {
+        let repo = Repo::new();
+        for arguments in [
+            vec!["--api-key=argv-secret"],
+            vec!["--api-key", "argv-secret"],
+        ] {
+            let job = repo.prepare(ExecutionMode::IsolatedChecks);
+            let command = CommandRequest {
+                argv: [
+                    vec![
+                        "sh",
+                        "-c",
+                        "printf '%s\\n' \"$@\"; printf '%s\\n' \"$@\" >&2",
+                        "fixture",
+                    ],
+                    arguments,
+                ]
+                .concat()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                cwd: ".".into(),
+                options: RunOptions::default(),
+            };
+            let original = command.argv.clone();
+            let digest = argv_digest(&original);
+            let result = run_job(&job, &command, &AtomicBool::new(false)).unwrap();
+            assert!(!result.stdout.text.contains("argv-secret"));
+            assert!(!result.stderr.text.contains("argv-secret"));
+            assert_eq!(command.argv, original);
+            assert_eq!(result.request.argv, original);
+            assert_eq!(result.argv_sha256, digest);
+            assert_eq!(read_result(job.directory()).unwrap().argv_sha256, digest);
+        }
+    }
+
+    #[test]
+    fn regression_short_secrets_mark_final_text_truncated() {
+        let repo = Repo::new();
+        let job = repo.prepare(ExecutionMode::IsolatedChecks);
+        fs::write(job.directory.join("logs/stdout.log"), "x x x").unwrap();
+        let result = output_evidence(&job, "stdout.log", 5, &["x".into()]).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.total_bytes, 5);
+        assert_eq!(result.text, "<reda");
+        assert!(!result.utf8_lossy);
+    }
+
+    #[test]
+    fn regression_regular_tokenizer_arguments_stay_readable() {
+        let argv = [
+            "tool",
+            "src/tokenizer.rs",
+            "--detector",
+            "tokenizer",
+            "--secretary=public",
+            "token",
+            "password",
+        ]
+        .map(str::to_owned);
+        assert_eq!(safe_argv(&argv), argv);
+    }
+
+    #[test]
+    fn reflected_secret_crossing_source_limit_never_exposes_prefix() {
+        let repo = Repo::new();
+        for (arguments, expected) in [
+            (vec!["--api-key=boundary-secret"], "--api-key="),
+            (vec!["--api-key", "boundary-secret"], "--api-key\n"),
+        ] {
+            let job = repo.prepare(ExecutionMode::IsolatedChecks);
+            let command = CommandRequest {
+                argv: [
+                    vec![
+                        "sh",
+                        "-c",
+                        "printf '%s\\n' \"$@\"; printf '%s\\n' \"$@\" >&2",
+                        "fixture",
+                    ],
+                    arguments,
+                ]
+                .concat()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                cwd: ".".into(),
+                options: RunOptions {
+                    output_limit_bytes: 14,
+                    ..RunOptions::default()
+                },
+            };
+            let result = run_job(&job, &command, &AtomicBool::new(false)).unwrap();
+            for evidence in [&result.stdout, &result.stderr] {
+                assert_eq!(evidence.text, expected);
+                assert!(evidence.truncated);
+                assert!(!evidence.text.contains("boun"));
+                assert!(
+                    fs::read_to_string(job.directory.join(&evidence.log))
+                        .unwrap()
+                        .contains("boundary-secret")
+                );
+            }
+            assert_eq!(result.argv_sha256, argv_digest(&command.argv));
+        }
+    }
+
+    #[test]
+    fn sensitive_argument_forms_share_one_precise_parser() {
+        let mut command = request("pass");
+        command.argv = [
+            "secret-tool",
+            "--token",
+            "first",
+            "--api-key=ключ",
+            "--password",
+            "",
+            "-H",
+            "Authorization: Bearer auth-value",
+            "--header=Cookie: session=value",
+            "-HProxy-Authorization: Basic encoded=",
+            "X-Api-Key: header-key",
+            "SERVICE_API_TOKEN=env-assignment",
+            "--detector",
+            "tokenizer",
+            "--header",
+            "X-Tokenizer: public",
+            "--",
+            "--password",
+            "ordinary-positional",
+        ]
+        .map(str::to_owned)
+        .into();
+        command.options.environment = EnvironmentPolicy::Explicit {
+            values: BTreeMap::from([
+                ("SERVICE_API_TOKEN".into(), "env-value".into()),
+                ("SERVICE_API_KEY".into(), "key-value".into()),
+                ("TOKENIZER_PATH".into(), "src/tokenizer.rs".into()),
+                ("SECRETARY_NAME".into(), "public-name".into()),
+                ("PASSWORD".into(), "".into()),
+            ]),
+        };
+        let original = command.argv.clone();
+        let safe = safe_argv(&original);
+        assert_eq!(safe[0], "secret-tool");
+        assert_eq!(safe[1], "--token");
+        assert_eq!(safe[2], "<redacted>");
+        assert_eq!(safe[3], "--api-key=<redacted>");
+        assert_eq!(safe[5], "<redacted>");
+        assert_eq!(safe[7], "Authorization: <redacted>");
+        assert_eq!(safe[8], "--header=Cookie: <redacted>");
+        assert_eq!(safe[9], "-HProxy-Authorization: <redacted>");
+        assert_eq!(safe[10], "X-Api-Key: <redacted>");
+        assert_eq!(safe[11], "SERVICE_API_TOKEN=<redacted>");
+        assert_eq!(&safe[12..], &original[12..]);
+        assert_eq!(
+            sensitive_request_values(&command)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            [
+                "first",
+                "ключ",
+                "Bearer auth-value",
+                "auth-value",
+                "session=value",
+                "Basic encoded=",
+                "encoded=",
+                "header-key",
+                "env-assignment",
+                "env-value",
+                "key-value"
+            ]
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(command.argv, original);
+    }
+
+    #[test]
+    fn output_redaction_handles_unicode_overlaps_and_source_boundaries() {
+        let repo = Repo::new();
+        let job = repo.prepare(ExecutionMode::IsolatedChecks);
+        for (source, limit, secrets, expected, truncated, lossy) in [
+            (
+                "abcdef!".as_bytes(),
+                64,
+                vec!["abc", "bcdef"],
+                "<redacted>!",
+                false,
+                false,
+            ),
+            (
+                "visible:abcdef tail".as_bytes(),
+                12,
+                vec!["abc", "bcdef"],
+                "visible:",
+                true,
+                false,
+            ),
+            (
+                "口:秘密 tail".as_bytes(),
+                8,
+                vec!["秘密"],
+                "口:",
+                true,
+                false,
+            ),
+            (
+                "口:秘密!".as_bytes(),
+                64,
+                vec!["秘密"],
+                "口:<redacted>!",
+                false,
+                false,
+            ),
+            ("éé".as_bytes(), 3, vec![], "é", true, true),
+            ("é x".as_bytes(), 4, vec!["x"], "é <", true, false),
+            ("".as_bytes(), 0, vec![""], "", false, false),
+            ("plain".as_bytes(), 0, vec!["plain"], "", true, false),
+            (
+                b"\xffsecret!",
+                64,
+                vec!["secret"],
+                "�<redacted>!",
+                false,
+                true,
+            ),
+        ] {
+            fs::write(job.directory.join("logs/stdout.log"), source).unwrap();
+            let values = secrets.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let evidence = output_evidence(&job, "stdout.log", limit, &values).unwrap();
+            assert_eq!(evidence.text, expected, "исходные байты: {source:?}");
+            assert_eq!(evidence.total_bytes, source.len() as u64);
+            assert_eq!(evidence.truncated, truncated);
+            assert_eq!(evidence.utf8_lossy, lossy);
+            assert!(evidence.text.len() <= limit);
+            assert_eq!(
+                fs::read(job.directory.join("logs/stdout.log")).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn reflected_header_and_unicode_secrets_preserve_raw_logs_and_digest() {
+        let repo = Repo::new();
+        let job = repo.prepare(ExecutionMode::IsolatedChecks);
+        let command = CommandRequest {
+            argv: [
+                "sh",
+                "-c",
+                "printf '%s\\n' \"$@\"; printf '%s\\n' \"$@\" >&2",
+                "fixture",
+                "--password",
+                "長い秘密",
+                "--api-key=short-key",
+                "-H",
+                "Authorization: Bearer auth-secret",
+                "--detector",
+                "tokenizer",
+                "src/tokenizer.rs",
+            ]
+            .map(str::to_owned)
+            .into(),
+            cwd: ".".into(),
+            options: RunOptions::default(),
+        };
+        let digest = argv_digest(&command.argv);
+        let result = run_job(&job, &command, &AtomicBool::new(false)).unwrap();
+        for evidence in [&result.stdout, &result.stderr] {
+            for secret in ["長い秘密", "short-key", "auth-secret"] {
+                assert!(!evidence.text.contains(secret));
+                assert!(
+                    fs::read_to_string(job.directory.join(&evidence.log))
+                        .unwrap()
+                        .contains(secret)
+                );
+            }
+            assert!(evidence.text.contains("tokenizer"));
+            assert!(evidence.text.contains("src/tokenizer.rs"));
+            assert!(!evidence.truncated);
+        }
+        assert_eq!(result.argv_sha256, digest);
+        assert_eq!(result.request.argv, command.argv);
+        let persisted = fs::read_to_string(job.directory.join("result.json")).unwrap();
+        for secret in ["長い秘密", "short-key", "auth-secret"] {
+            assert!(!persisted.contains(secret));
+        }
+        assert_eq!(read_result(job.directory()).unwrap().argv_sha256, digest);
     }
 
     #[test]
