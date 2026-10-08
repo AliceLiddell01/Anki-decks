@@ -312,10 +312,11 @@ pub fn prepare_execution_job(
 pub fn run_execution_job(
     job_path: &Path,
     request: &super::execution::CommandRequest,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<super::execution::ExecutionResult, DomainError> {
     let root = repository_root(Path::new("."))?;
     let job = super::execution::open_job(&root, job_path)?;
-    super::execution::run_job(&job, request, &std::sync::atomic::AtomicBool::new(false))
+    super::execution::run_job(&job, request, cancel)
 }
 
 /// Читает lifecycle/result execution job без изменений.
@@ -592,9 +593,17 @@ fn validate_queue_authenticity(
     pack: &ReviewPack,
     source_pack_sha256: &str,
 ) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
-    let root = repository_root(Path::new("."))?;
+    let unavailable = |detail: String| {
+        DomainError::new(
+            ErrorCode::SyntaxAuthenticityUnavailable,
+            format!(
+                "точные Git images для проверки syntax authenticity недоступны: {detail}; используйте явный --structure-only, если достаточно проверки структуры и digest"
+            ),
+        )
+    };
+    let root = repository_root(Path::new(".")).map_err(|error| unavailable(error.to_string()))?;
     let collected = scope::collect_scope(&root, &pack.target.base_sha, &pack.target.head_sha)
-        .map_err(scope_error)?;
+        .map_err(|error| unavailable(error.to_string()))?;
     if collected.target.repository_id != pack.target.repository_id
         || collected.target.base_sha != pack.target.base_sha
         || collected.target.head_sha != pack.target.head_sha

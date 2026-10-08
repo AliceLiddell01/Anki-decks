@@ -346,11 +346,12 @@ Cargo (компиляция, проверка, время завершения �
 авторитетного классификатора, восстановленным из точных Git images и AST
 снимка. Самосогласованные поля очереди, её групповые подписи и digest не служат
 доказательством происхождения классификации. Если нужные Git objects или AST
-недоступны, команда явно сообщает ограниченный статус `structural-only`:
-структура и связь с пакетом проверены, но syntax authenticity не подтверждена.
-Команды `summary`, `list`, `group` и `candidate` должны сохранять это
-ограничение; такой результат нельзя представлять как полностью подлинную
-syntax-derived классификацию.
+недоступны, полная проверка завершается `syntax_authenticity_unavailable`.
+Передай `--structure-only`, чтобы ограничить проверку структурой и digest;
+результат явно помечается `structural-only`, и syntax authenticity не
+подтверждается. Этот флаг поддерживают также команды `summary`, `list`, `group`
+и `candidate`; ограниченный результат нельзя представлять как полностью
+подлинную syntax-derived классификацию.
 
 Очередь можно проверить, свести к навигационной сводке, получить страницу
 подходящих элементов и раскрыть отдельную группу или кандидата командами только
@@ -381,12 +382,13 @@ anki-repo code-review queue candidate --pack "$PACK" --queue "$QUEUE" --id "$CAN
 `PACK` и `QUEUE` относятся к одному точному снимку: сверяются байты `review.json`, Git
 identity, структура очереди и доступный результат syntax-authenticity
 verification. При несовпадении команда завершается ошибкой, а частичный список
-не возвращается. При недоступных исходниках/AST результат остаётся явно
-ограниченным structural-only. В `--help` команда описана как постраничный
-просмотр элементов очереди с фильтрами; доступные параметры:
+не возвращается. Если exact Git images или AST недоступны, передай
+`--structure-only`, чтобы вывести ограниченный результат с явным статусом
+`structural-only`. В `--help` команда описана как постраничный просмотр
+элементов очереди с фильтрами; доступные параметры:
 
 ```text
-anki-repo code-review queue list --pack PACK --queue QUEUE [--limit N] [--offset N] [--priority high|normal|low] [--unknown] [--detector LABEL] [--surface LABEL] [--execution LABEL] [--role LABEL] [--text-role LABEL] [--code-role LABEL]
+anki-repo code-review queue list --pack PACK --queue QUEUE [--limit N] [--offset N] [--priority high|normal|low] [--unknown] [--detector LABEL] [--surface LABEL] [--execution LABEL] [--role LABEL] [--text-role LABEL] [--code-role LABEL] [--structure-only]
 ```
 
 По умолчанию `--limit` равен `50`, максимум — `200`; `--offset` по умолчанию
@@ -2512,7 +2514,12 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `6` | `validate` нашёл хотя бы одну проблему уровня `ERROR`, в том числе `invalid_json`, `root_not_deck` или `schema_invalid`; `edit` отказался править экспорт с `ERROR` или с неоднозначным определением модели. Повтор `guid` (`duplicate_note_guid`) — это `ERROR`, поэтому `edit` на таком экспорте завершается кодом `6`, а не `5`: проверка валидности исходника идёт раньше разрешения правки. `review-check` называет тот же блокер (`export_invalid` / `export_not_mutable`) и возвращает `6` вместо итогового кода отчёта — запрос он не выпускает |
 | `7` | `edit` обнаружил конфликт предусловия: текущее значение поля не совпало с `expected` (`expected_mismatch`) либо `deck.json` изменился между проверкой и заменой файла (`source_changed`); `review-check` обнаружил хотя бы одно предложение со статусом `conflict` (`stale`); `language apply` обнаружил устаревший исходник или якорь (`source_changed`); каталог или путь артефакта ревью уже содержит другое содержимое (`review_artifact_conflict`) |
 | `8` | Отказ записи или публикации: `edit` не смог заменить `deck.json`; `code-review`/`language` не смогли сохранить артефакт или опубликовать замены (`write_failed`) |
+| `9` | `code-review execution run`: команда завершилась с ненулевым кодом (`failed`) |
+| `10` | `code-review execution run`: выполнение нельзя считать полным или воспроизводимым (`incomplete`) |
+| `11` | `code-review execution run`: команда остановлена по timeout (`timed_out`) |
+| `12` | `code-review execution run`: команда отменена запросом или сигналом (`cancelled`) |
 | `70` | Неожиданная внутренняя ошибка, включая нарушение внутреннего инварианта правки и отказ записи вывода (нет места на диске, негодный дескриптор) |
+| `127` | `code-review execution run`: исполняемая команда недоступна (`unavailable`) |
 
 Закрытый читателем pipe (например `anki-repo … | head`) внутренней ошибкой не
 считается: результат команды уже вычислен, поэтому сохраняется её собственный

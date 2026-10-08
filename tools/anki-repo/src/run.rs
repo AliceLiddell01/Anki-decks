@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 
@@ -205,6 +207,33 @@ fn language_check_output(
 ///
 /// Возвращает [`DomainError`] для любой доменной проблемы.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
+    execute_with_cancellation(cli, &AtomicBool::new(false))
+}
+
+/// Выполняет CLI, устанавливая обработчики отмены только для execution run.
+pub fn execute_cli(cli: &Cli) -> Result<Rendered, DomainError> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    if cli.command_name() == "code-review execution run" {
+        #[cfg(unix)]
+        for (signal, name) in [
+            (signal_hook::consts::SIGINT, "SIGINT"),
+            (signal_hook::consts::SIGTERM, "SIGTERM"),
+        ] {
+            signal_hook::flag::register(signal, Arc::clone(&cancellation)).map_err(|error| {
+                DomainError::new(
+                    ErrorCode::Internal,
+                    format!("не удалось установить обработчик {name}: {error}"),
+                )
+            })?;
+        }
+    }
+    execute_with_cancellation(cli, &cancellation)
+}
+
+fn execute_with_cancellation(
+    cli: &Cli,
+    cancellation: &AtomicBool,
+) -> Result<Rendered, DomainError> {
     match &cli.command {
         Command::Inspect {
             export_dir,
@@ -675,7 +704,11 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                             max_parallel_jobs: *max_parallel_jobs as usize,
                         },
                     };
-                    let result = crate::code_review::workflow::run_execution_job(job, &request)?;
+                    let result = crate::code_review::workflow::run_execution_job(
+                        job,
+                        &request,
+                        cancellation,
+                    )?;
                     let exit = execution_exit(result.status);
                     Ok(Rendered {
                         command: "code-review execution run",
@@ -1104,11 +1137,11 @@ fn execution_exit(status: crate::code_review::execution::ExecutionStatus) -> u8 
     use crate::code_review::execution::ExecutionStatus;
     match status {
         ExecutionStatus::Passed => 0,
-        ExecutionStatus::Failed => 1,
-        ExecutionStatus::TimedOut => 124,
-        ExecutionStatus::Cancelled => 130,
+        ExecutionStatus::Failed => 9,
+        ExecutionStatus::Incomplete => 10,
+        ExecutionStatus::TimedOut => 11,
+        ExecutionStatus::Cancelled => 12,
         ExecutionStatus::Unavailable => 127,
-        ExecutionStatus::Incomplete => 2,
     }
 }
 
@@ -1947,6 +1980,20 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_exit_codes_are_stable_and_do_not_overlap_cli_errors() {
+        use crate::code_review::execution::ExecutionStatus;
+
+        assert_eq!(execution_exit(ExecutionStatus::Passed), 0);
+        assert_eq!(execution_exit(ExecutionStatus::Failed), 9);
+        assert_eq!(execution_exit(ExecutionStatus::Incomplete), 10);
+        assert_eq!(execution_exit(ExecutionStatus::TimedOut), 11);
+        assert_eq!(execution_exit(ExecutionStatus::Cancelled), 12);
+        assert_eq!(execution_exit(ExecutionStatus::Unavailable), 127);
+        assert_eq!(ErrorCode::Usage.exit_code(), 2);
+        assert_eq!(ErrorCode::Internal.exit_code(), 70);
+    }
 
     fn review_queue_candidate_detail() -> crate::code_review::workflow::ReviewQueueCandidateDetail {
         use crate::code_review::model::{CandidateEvidence, CandidateOrigin};

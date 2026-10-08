@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::common::{TempDir, cli_binary, parse_json, run_cli, run_cli_in};
 use serde_json::{Value, json};
@@ -583,13 +584,26 @@ fn verify_and_language_pack_scan_reject_mismatched_baseline() {
             scan_output.to_str().unwrap(),
         ],
     ];
-    for args in commands {
-        let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &args);
-        assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
-        assert_eq!(parse_json(&stdout)["error"]["code"], "baseline_mismatch");
-    }
+    let baseline_before_verify = fs::read(&pack_path).unwrap();
+    let entries_before_verify: BTreeSet<_> = fs::read_dir(&verify_output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &commands[0]);
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["error"]["code"], "baseline_mismatch");
+    assert_eq!(fs::read(&pack_path).unwrap(), baseline_before_verify);
+    let entries_after_verify: BTreeSet<_> = fs::read_dir(&verify_output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries_after_verify, entries_before_verify);
     assert!(verify_output.join("review.json").is_file());
     assert!(!verify_output.join("delta.json").exists());
+
+    let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &commands[1]);
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["error"]["code"], "baseline_mismatch");
     assert!(!scan_output.exists());
 }
 
@@ -2217,6 +2231,45 @@ fn ignored_review_fixture(name: &str) -> (TempDir, String, String) {
     (repo, base, head)
 }
 
+fn prepare_execution_job(root: &Path, pack: &Path, scope: &str) -> PathBuf {
+    let prepared = review_success(run_cli_in(
+        Some(root),
+        &[
+            "--json",
+            "code-review",
+            "execution",
+            "prepare",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--mode",
+            "isolated_checks",
+            "--scope",
+            scope,
+        ],
+    ));
+    root.join(prepared["job_directory"].as_str().unwrap())
+}
+
+fn run_execution_job(
+    root: &Path,
+    job: &Path,
+    timeout: &str,
+    argv: &[&str],
+) -> (i32, String, String) {
+    let mut arguments = vec![
+        "--json",
+        "code-review",
+        "execution",
+        "run",
+        job.to_str().unwrap(),
+        "--timeout-seconds",
+        timeout,
+        "--",
+    ];
+    arguments.extend_from_slice(argv);
+    run_cli_in(Some(root), &arguments)
+}
+
 fn collect_pr_workspace(root: &Path, base: &str, head: &str, pr: &str) -> PathBuf {
     let result = review_success(run_cli_in(
         Some(root),
@@ -2391,6 +2444,133 @@ fn pr_review_pipeline_keeps_all_artifacts_and_job_in_returned_workspace() {
             job.to_str().unwrap(),
         ],
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn execution_run_exit_codes_distinguish_failed_incomplete_timeout_and_unavailable() {
+    let (repo, base, head) = ignored_review_fixture("execution-exit-codes");
+    let artifacts = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &artifacts, false);
+    let pack = artifacts.join("review.json");
+
+    let failed_job = prepare_execution_job(repo.path(), &pack, "failed");
+    let (code, stdout, stderr) =
+        run_execution_job(repo.path(), &failed_job, "10", &["/bin/sh", "-c", "exit 1"]);
+    assert_eq!(code, 9, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["result"]["status"], "failed");
+
+    let incomplete_job = prepare_execution_job(repo.path(), &pack, "incomplete");
+    let (code, stdout, stderr) = run_execution_job(
+        repo.path(),
+        &incomplete_job,
+        "10",
+        &["/bin/sh", "-c", "printf '\\n' >> src/lib.rs"],
+    );
+    assert_eq!(code, 10, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["result"]["status"], "incomplete");
+
+    let timeout_job = prepare_execution_job(repo.path(), &pack, "timeout");
+    let (code, stdout, stderr) =
+        run_execution_job(repo.path(), &timeout_job, "1", &["/bin/sleep", "5"]);
+    assert_eq!(code, 11, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["result"]["status"], "timed_out");
+
+    let unavailable_job = prepare_execution_job(repo.path(), &pack, "unavailable");
+    let (code, stdout, stderr) = run_execution_job(
+        repo.path(),
+        &unavailable_job,
+        "10",
+        &["/missing/anki-repo-execution-command"],
+    );
+    assert_eq!(code, 127, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["result"]["status"], "unavailable");
+}
+
+#[cfg(unix)]
+#[test]
+fn execution_run_sigterm_cancels_and_stops_the_child_process_group() {
+    use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
+
+    let (repo, base, head) = ignored_review_fixture("execution-sigterm-cancellation");
+    let artifacts = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &artifacts, false);
+    let pack = artifacts.join("review.json");
+    let job = prepare_execution_job(repo.path(), &pack, "sigterm");
+    let mut runner = Command::new(cli_binary())
+        .current_dir(repo.path())
+        .args([
+            "--json",
+            "code-review",
+            "execution",
+            "run",
+            job.to_str().unwrap(),
+            "--timeout-seconds",
+            "30",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$$\" > \"$TMPDIR/child.pid\"; exec /bin/sleep 30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child_pid_path = job.join("tmp/child.pid");
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    while !child_pid_path.is_file() {
+        if let Some(status) = runner.try_wait().unwrap() {
+            let output = runner.wait_with_output().unwrap();
+            panic!(
+                "execution run закончился до запуска команды: {status:?}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "execution run не запустил дочернюю команду"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let process_group = Pid::from_raw(
+        fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(test_kill_process_group(process_group).is_ok());
+
+    let runner_pid = Pid::from_raw(runner.id() as i32).unwrap();
+    kill_process(runner_pid, Signal::TERM).unwrap();
+    let completion_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if runner.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= completion_deadline {
+            let _ = rustix::process::kill_process_group(process_group, Signal::KILL);
+            let _ = runner.kill();
+            let _ = runner.wait();
+            panic!("execution run не обработал SIGTERM своевременно");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = runner.wait_with_output().unwrap();
+    if output.status.code() != Some(12) {
+        let _ = rustix::process::kill_process_group(process_group, Signal::KILL);
+    }
+    assert_eq!(
+        output.status.code(),
+        Some(12),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = parse_json(&String::from_utf8(output.stdout).unwrap())["result"].clone();
+    assert_eq!(result["status"], "cancelled");
+    assert!(test_kill_process_group(process_group).is_err());
 }
 
 #[test]
@@ -2996,8 +3176,7 @@ fn queue_validation_requires_git_images_unless_structure_only_is_requested() {
         queue.to_str().unwrap(),
     ];
     let (code, stdout, stderr) = run_cli_in(Some(outside.path()), &arguments);
-    assert_ne!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(parse_json(&stdout).get("result").is_none());
+    assert_review_failure((code, stdout, stderr), "syntax_authenticity_unavailable");
     let mut explicit = arguments.to_vec();
     explicit.push("--structure-only");
     let (code, stdout, stderr) = run_cli_in(Some(outside.path()), &explicit);
