@@ -333,13 +333,21 @@ pub fn cancel_execution_job(
     super::execution::request_cancel(job_path)
 }
 
-/// Очищает только runtime/worktree принадлежащего job, сохраняя typed evidence.
+/// Очищает временные каталоги и worktree своего задания, сохраняя свидетельства.
 pub fn cleanup_execution_job(
     job_path: &Path,
 ) -> Result<super::execution::CleanupResult, DomainError> {
+    cleanup_execution_job_with_options(job_path, &super::execution::CleanupOptions::default())
+}
+
+/// Передаёт явное подтверждение оператора в проверку безопасности очистки.
+pub fn cleanup_execution_job_with_options(
+    job_path: &Path,
+    options: &super::execution::CleanupOptions,
+) -> Result<super::execution::CleanupResult, DomainError> {
     let root = repository_root(Path::new("."))?;
     let job = super::execution::open_job(&root, job_path)?;
-    super::execution::cleanup_workspace(&job)
+    super::execution::cleanup_workspace_with_options(&job, options)
 }
 
 /// Сравнивает сохранённые снимки; опциональный JSON пишется без перезаписи.
@@ -370,21 +378,8 @@ pub fn validate_review_queue(
     queue_path: &Path,
     structure_only: bool,
 ) -> Result<ReviewQueueValidationSummary, DomainError> {
-    let (pack, pack_bytes) = read_review_pack(pack_path)?;
-    let queue: ReviewQueue = read_json(
-        queue_path,
-        MAX_REVIEW_ARTIFACT_BYTES,
-        "структурная очередь code-review",
-    )?;
-    let source_pack_sha256 = sha256_hex(&pack_bytes);
-    let (summary, syntax_authenticity) = if structure_only {
-        (
-            review_queue::validate(&queue, &pack, &source_pack_sha256)?,
-            SyntaxAuthenticityStatus::StructureOnly,
-        )
-    } else {
-        validate_queue_authenticity(&queue, &pack, &source_pack_sha256)?
-    };
+    let (_, _, summary, syntax_authenticity) =
+        load_validated_review_queue(pack_path, queue_path, structure_only)?;
     Ok(ReviewQueueValidationSummary {
         valid: true,
         source_digest_valid: true,
@@ -593,17 +588,28 @@ fn validate_queue_authenticity(
     pack: &ReviewPack,
     source_pack_sha256: &str,
 ) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
-    let unavailable = |detail: String| {
-        DomainError::new(
-            ErrorCode::SyntaxAuthenticityUnavailable,
-            format!(
-                "точные Git images для проверки syntax authenticity недоступны: {detail}; используйте явный --structure-only, если достаточно проверки структуры и digest"
-            ),
-        )
-    };
-    let root = repository_root(Path::new(".")).map_err(|error| unavailable(error.to_string()))?;
-    let collected = scope::collect_scope(&root, &pack.target.base_sha, &pack.target.head_sha)
-        .map_err(|error| unavailable(error.to_string()))?;
+    let root = repository_root(Path::new("."))
+        .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
+    validate_queue_authenticity_in_repository(&root, queue, pack, source_pack_sha256)
+}
+
+fn syntax_authenticity_unavailable(detail: String) -> DomainError {
+    DomainError::new(
+        ErrorCode::SyntaxAuthenticityUnavailable,
+        format!(
+            "точные образы Git для проверки подлинности синтаксической классификации недоступны: {detail}; используйте явный --structure-only, если достаточно проверки структуры и digest"
+        ),
+    )
+}
+
+fn validate_queue_authenticity_in_repository(
+    root: &Path,
+    queue: &ReviewQueue,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+    let collected = scope::collect_scope(root, &pack.target.base_sha, &pack.target.head_sha)
+        .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
     if collected.target.repository_id != pack.target.repository_id
         || collected.target.base_sha != pack.target.base_sha
         || collected.target.head_sha != pack.target.head_sha
@@ -2528,6 +2534,7 @@ fn write_review_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainErr
             DomainError::new(ErrorCode::InvalidRequest, "имя review artifact не UTF-8")
         })?;
     let directory_fd = super::execution::safe_dir(parent)?;
+    let _lock = lock_review_workspace(&directory_fd, parent)?;
     if let Some(existing) =
         super::execution::read_optional_file_at(&directory_fd, name, MAX_REVIEW_ARTIFACT_BYTES)?
     {
@@ -2537,13 +2544,22 @@ fn write_review_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainErr
             Err(artifact_conflict(path))
         };
     }
-    super::execution::write_new_fd(&directory_fd, name, bytes).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            artifact_conflict(path)
-        } else {
-            artifact_write_error(path, &error)
+    match super::execution::write_new_fd(&directory_fd, name, bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = super::execution::read_optional_file_at(
+                &directory_fd,
+                name,
+                MAX_REVIEW_ARTIFACT_BYTES,
+            )?;
+            if existing.as_deref() == Some(bytes) {
+                Ok(())
+            } else {
+                Err(artifact_conflict(path))
+            }
         }
-    })
+        Err(error) => Err(artifact_write_error(path, &error)),
+    }
 }
 
 /// Сохраняет исходный артефакт однократно; повтор допустим только с теми же байтами.
@@ -2575,7 +2591,7 @@ fn replace_derived_document(
     source_pack_sha256: &str,
     expected_name: &str,
 ) -> Result<PathBuf, DomainError> {
-    let (pack_path, _) = sources.first().ok_or_else(|| {
+    let (pack_path, pack_bytes) = sources.first().ok_or_else(|| {
         DomainError::new(
             ErrorCode::Internal,
             "для производного файла не задан review pack",
@@ -2602,13 +2618,41 @@ fn replace_derived_document(
     })?;
     let workspace_fd = super::execution::safe_dir(workspace)?;
     let _lock = lock_review_workspace(&workspace_fd, workspace)?;
+    // Принадлежность проверяем по тому же закреплённому каталогу, куда пишем.
+    // Подмена родительского пути не должна перенести запись к чужому review.json.
+    let current_pack = super::execution::read_optional_file_at(
+        &workspace_fd,
+        "review.json",
+        MAX_REVIEW_ARTIFACT_BYTES,
+    )?;
+    if current_pack.as_deref() != Some(*pack_bytes) {
+        return Err(DomainError::new(
+            ErrorCode::SourceChanged,
+            "исходный пакет в закреплённом review workspace изменился",
+        ));
+    }
     for (source_path, expected_bytes) in sources {
-        let current =
-            fs::read(source_path).map_err(|error| artifact_write_error(source_path, &error))?;
-        if current != *expected_bytes {
+        reject_parent_components(source_path)?;
+        let parent = source_path.parent().unwrap_or_else(|| Path::new("."));
+        let source_directory = super::execution::safe_dir(parent)?;
+        let name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::InvalidRequest,
+                    "имя исходного review artifact не UTF-8",
+                )
+            })?;
+        let current = super::execution::read_optional_file_at(
+            &source_directory,
+            name,
+            MAX_REVIEW_ARTIFACT_BYTES,
+        )?;
+        if current.as_deref() != Some(*expected_bytes) {
             return Err(DomainError::new(
                 ErrorCode::SourceChanged,
-                "исходный review pack или editable triage изменился во время подготовки производного файла",
+                "исходный пакет ревью или редактируемый triage изменился во время подготовки производного файла",
             ));
         }
     }
@@ -3818,8 +3862,8 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             ("review.json", b"{\"source\":true}\n".to_vec()),
             ("review-queue.json", b"{\"queue\":true}\n".to_vec()),
         ]);
-        let barrier = Arc::new(Barrier::new(3));
-        let handles: Vec<_> = (0..2)
+        let barrier = Arc::new(Barrier::new(13));
+        let handles: Vec<_> = (0..12)
             .map(|_| {
                 let barrier = Arc::clone(&barrier);
                 let directory = directory.clone();
@@ -3840,6 +3884,470 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
         for (name, expected) in documents {
             assert_eq!(fs::read(directory.join(name)).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn concurrent_different_snapshot_writers_never_mix_documents() {
+        use std::sync::{Arc, Barrier};
+        let owner = TempWorkspace::create("anki-concurrent-snapshot-conflict").unwrap();
+        let directory = owner.path().join("snapshot");
+        let barrier = Arc::new(Barrier::new(9));
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let barrier = Arc::clone(&barrier);
+                let directory = directory.clone();
+                std::thread::spawn(move || {
+                    let documents = BTreeMap::from([
+                        (
+                            "review.json",
+                            format!("{{\"snapshot\":{index}}}\n").into_bytes(),
+                        ),
+                        (
+                            "review-queue.json",
+                            format!("{{\"queue\":{index}}}\n").into_bytes(),
+                        ),
+                    ]);
+                    barrier.wait();
+                    (
+                        documents.clone(),
+                        write_directory_once(&directory, &documents),
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        for (name, bytes) in &winners[0].0 {
+            assert_eq!(fs::read(directory.join(name)).unwrap(), *bytes);
+        }
+        assert!(
+            results
+                .iter()
+                .filter_map(|(_, result)| result.as_ref().err())
+                .all(|error| error.code == ErrorCode::ReviewArtifactConflict)
+        );
+    }
+
+    fn concurrent_document_writes(
+        path: &Path,
+        documents: Vec<Vec<u8>>,
+    ) -> Vec<Result<(), DomainError>> {
+        use std::sync::{Arc, Barrier};
+        let barrier = Arc::new(Barrier::new(documents.len() + 1));
+        let handles: Vec<_> = documents
+            .into_iter()
+            .map(|bytes| {
+                let barrier = Arc::clone(&barrier);
+                let path = path.to_path_buf();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_review_document_once(&path, &bytes)
+                })
+            })
+            .collect();
+        barrier.wait();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_identical_triage_and_delta_publications_are_idempotent() {
+        let owner = TempWorkspace::create("anki-identical-documents").unwrap();
+        let directory = owner.path().join("snapshot");
+        fs::create_dir(&directory).unwrap();
+        let bytes = vec![b'x'; 1024 * 1024];
+        for name in ["semantic-triage.input.json", "delta.json"] {
+            let path = directory.join(name);
+            let results = concurrent_document_writes(&path, vec![bytes.clone(); 12]);
+            assert!(results.iter().all(Result::is_ok), "{name}: {results:?}");
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            write_review_document_once(&path, &bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_different_documents_preserve_the_only_winner() {
+        let owner = TempWorkspace::create("anki-conflicting-documents").unwrap();
+        let path = owner.path().join("delta.json");
+        let documents: Vec<_> = (0..8).map(|index| vec![index; 1024 * 1024]).collect();
+        let results = concurrent_document_writes(&path, documents.clone());
+        let winners: Vec<_> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| result.is_ok())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| error.code == ErrorCode::ReviewArtifactConflict)
+        );
+        assert_eq!(fs::read(path).unwrap(), documents[winners[0].0]);
+    }
+
+    fn owned_snapshot(repo: &GitFixture) -> (ReviewPack, Vec<u8>, PathBuf) {
+        let base = String::from_utf8(git_output(&repo.0, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+        repo.add_head("pub fn run() { panic!(\"example\"); }\n");
+        let head = String::from_utf8(git_output(&repo.0, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+        let collected = scope::collect_scope(&repo.0, base.trim(), head.trim()).unwrap();
+        let pack = build_pack(&repo.0, collected, false);
+        let bytes = json_bytes(&pack).unwrap();
+        let workspace =
+            review_workspace_directory(&repo.0, None, None, &pack.target.head_sha).unwrap();
+        fs::write(workspace.join("review.json"), &bytes).unwrap();
+        (pack, bytes, workspace)
+    }
+
+    #[test]
+    fn derived_documents_check_paths_ownership_and_source_bytes() {
+        let repo = GitFixture::new("derived-ownership");
+        let (pack, pack_bytes, workspace) = owned_snapshot(&repo);
+        let pack_path = workspace.join("review.json");
+        let digest = sha256_hex(&pack_bytes);
+        let triage = semantic_triage::initialize(&pack, &digest);
+        let triage_bytes = json_bytes(&triage).unwrap();
+        let triage_path = workspace.join("semantic-triage.input.json");
+        fs::write(&triage_path, &triage_bytes).unwrap();
+        let sources = [
+            (pack_path.as_path(), pack_bytes.as_slice()),
+            (triage_path.as_path(), triage_bytes.as_slice()),
+        ];
+
+        let foreign = repo.0.join("README.md");
+        fs::write(&foreign, "чужой документ").unwrap();
+        let foreign_before = fs::read(&foreign).unwrap();
+        for path in [&foreign, &pack_path, &triage_path] {
+            assert_eq!(
+                replace_derived_document(
+                    &repo.0,
+                    path,
+                    &triage_bytes,
+                    &sources,
+                    &pack,
+                    &digest,
+                    "semantic-triage.json"
+                )
+                .unwrap_err()
+                .code,
+                ErrorCode::InvalidRequest
+            );
+        }
+        assert_eq!(fs::read(&foreign).unwrap(), foreign_before);
+
+        for (name, bytes) in [
+            ("semantic-triage.json", triage_bytes.clone()),
+            (
+                "review-report.md",
+                semantic_triage::render_markdown(&triage, &pack).into_bytes(),
+            ),
+        ] {
+            let output = workspace.join(name);
+            fs::write(&output, b"foreign bytes").unwrap();
+            assert_eq!(
+                replace_derived_document(&repo.0, &output, &bytes, &sources, &pack, &digest, name)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ReviewArtifactConflict
+            );
+            assert_eq!(fs::read(&output).unwrap(), b"foreign bytes");
+            fs::remove_file(&output).unwrap();
+            replace_derived_document(&repo.0, &output, &bytes, &sources, &pack, &digest, name)
+                .unwrap();
+            replace_derived_document(&repo.0, &output, &bytes, &sources, &pack, &digest, name)
+                .unwrap();
+            assert_eq!(fs::read(&output).unwrap(), bytes);
+        }
+        fs::write(&triage_path, "новые решения").unwrap();
+        let output = workspace.join("semantic-triage.json");
+        assert_eq!(
+            replace_derived_document(
+                &repo.0,
+                &output,
+                &triage_bytes,
+                &sources,
+                &pack,
+                &digest,
+                "semantic-triage.json"
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::SourceChanged
+        );
+        assert_eq!(fs::read(output).unwrap(), triage_bytes);
+        assert_eq!(fs::read(pack_path).unwrap(), pack_bytes);
+        assert_eq!(fs::read(triage_path).unwrap(), "новые решения".as_bytes());
+    }
+
+    #[test]
+    fn concurrent_derived_writers_preserve_current_decisions_and_reject_stale_source() {
+        use std::sync::{Arc, Barrier};
+        let repo = GitFixture::new("derived-concurrent-decisions");
+        let (pack, pack_bytes, workspace) = owned_snapshot(&repo);
+        let digest = sha256_hex(&pack_bytes);
+        let old_triage = semantic_triage::initialize(&pack, &digest);
+        let old_bytes = json_bytes(&old_triage).unwrap();
+        let mut current_triage = old_triage;
+        let candidate_id = current_triage.unreviewed_candidate_ids.remove(0);
+        current_triage
+            .individual_decisions
+            .push(semantic_triage::CandidateDecision {
+                candidate_id,
+                disposition: semantic_triage::Disposition::Acceptable,
+                reason_code: semantic_triage::ReasonCode::Other,
+                explanation: "Проверенный пример допустим в этом контексте".into(),
+                finding_ids: Vec::new(),
+            });
+        semantic_triage::validate(&current_triage, &pack, &digest).unwrap();
+        let current_bytes = json_bytes(&current_triage).unwrap();
+        let triage_path = workspace.join("semantic-triage.input.json");
+        fs::write(&triage_path, &old_bytes).unwrap();
+        let output = workspace.join("semantic-triage.json");
+        let initial_sources = [
+            (workspace.join("review.json"), pack_bytes.clone()),
+            (triage_path.clone(), old_bytes.clone()),
+        ];
+        let initial_refs: Vec<_> = initial_sources
+            .iter()
+            .map(|(path, bytes)| (path.as_path(), bytes.as_slice()))
+            .collect();
+        replace_derived_document(
+            &repo.0,
+            &output,
+            &old_bytes,
+            &initial_refs,
+            &pack,
+            &digest,
+            "semantic-triage.json",
+        )
+        .unwrap();
+        fs::write(&triage_path, &current_bytes).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [old_bytes, current_bytes.clone()]
+            .into_iter()
+            .map(|bytes| {
+                let barrier = Arc::clone(&barrier);
+                let root = repo.0.clone();
+                let pack = pack.clone();
+                let pack_bytes = pack_bytes.clone();
+                let workspace = workspace.clone();
+                let digest = digest.clone();
+                std::thread::spawn(move || {
+                    let sources = [
+                        (workspace.join("review.json"), pack_bytes),
+                        (workspace.join("semantic-triage.input.json"), bytes.clone()),
+                    ];
+                    let source_refs: Vec<_> = sources
+                        .iter()
+                        .map(|(path, bytes)| (path.as_path(), bytes.as_slice()))
+                        .collect();
+                    barrier.wait();
+                    replace_derived_document(
+                        &root,
+                        &workspace.join("semantic-triage.json"),
+                        &bytes,
+                        &source_refs,
+                        &pack,
+                        &digest,
+                        "semantic-triage.json",
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            results[0].as_ref().unwrap_err().code,
+            ErrorCode::SourceChanged
+        );
+        assert!(results[1].is_ok());
+        assert_eq!(fs::read(output).unwrap(), current_bytes);
+        assert_eq!(fs::read(triage_path).unwrap(), current_bytes);
+        assert_eq!(fs::read(workspace.join("review.json")).unwrap(), pack_bytes);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn derived_canonical_names_refuse_target_and_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+        let repo = GitFixture::new("derived-symlinks");
+        let (pack, pack_bytes, workspace) = owned_snapshot(&repo);
+        let pack_path = workspace.join("review.json");
+        let digest = sha256_hex(&pack_bytes);
+        let sources = [(pack_path.as_path(), pack_bytes.as_slice())];
+        let protected = repo.1.path().join("protected");
+        fs::create_dir(&protected).unwrap();
+        for name in ["semantic-triage.json", "review-report.md"] {
+            let target = protected.join(name);
+            fs::write(&target, b"protected bytes").unwrap();
+            let output = workspace.join(name);
+            symlink(&target, &output).unwrap();
+            let error = replace_derived_document(
+                &repo.0,
+                &output,
+                b"new bytes",
+                &sources,
+                &pack,
+                &digest,
+                name,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ReviewArtifactConflict);
+            assert!(error.message.contains("symlink"));
+            assert_eq!(fs::read(&target).unwrap(), b"protected bytes");
+            fs::remove_file(output).unwrap();
+        }
+        let relocated = workspace.with_extension("saved");
+        fs::rename(&workspace, &relocated).unwrap();
+        fs::write(protected.join("review.json"), &pack_bytes).unwrap();
+        symlink(&protected, &workspace).unwrap();
+        let output = workspace.join("semantic-triage.json");
+        let error = replace_derived_document(
+            &repo.0,
+            &output,
+            b"new bytes",
+            &sources,
+            &pack,
+            &digest,
+            "semantic-triage.json",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("symlink"));
+        assert_eq!(
+            fs::read(protected.join("semantic-triage.json")).unwrap(),
+            b"protected bytes"
+        );
+        assert_eq!(fs::read(protected.join("review.json")).unwrap(), pack_bytes);
+        assert!(!protected.join(".writer.lock").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn immutable_documents_refuse_symlinks_and_preserve_external_bytes() {
+        use std::os::unix::fs::symlink;
+        let owner = TempWorkspace::create("anki-immutable-symlinks").unwrap();
+        let protected = owner.path().join("protected");
+        fs::write(&protected, b"same bytes").unwrap();
+        for name in ["semantic-triage.input.json", "delta.json"] {
+            let output = owner.path().join(name);
+            symlink(&protected, &output).unwrap();
+            assert_eq!(
+                write_review_document_once(&output, b"same bytes")
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ReviewArtifactConflict
+            );
+            assert_eq!(fs::read(&protected).unwrap(), b"same bytes");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn derived_document_refuses_symlink_source_even_when_bytes_match() {
+        use std::os::unix::fs::symlink;
+        let repo = GitFixture::new("derived-source-symlink");
+        let (pack, pack_bytes, workspace) = owned_snapshot(&repo);
+        let digest = sha256_hex(&pack_bytes);
+        let triage = semantic_triage::initialize(&pack, &digest);
+        let bytes = json_bytes(&triage).unwrap();
+        let protected = repo.1.path().join("protected-triage.json");
+        fs::write(&protected, &bytes).unwrap();
+        let triage_path = workspace.join("semantic-triage.input.json");
+        symlink(&protected, &triage_path).unwrap();
+        let output = workspace.join("semantic-triage.json");
+        let sources = [
+            (workspace.join("review.json"), pack_bytes),
+            (triage_path, bytes.clone()),
+        ];
+        let source_refs: Vec<_> = sources
+            .iter()
+            .map(|(path, bytes)| (path.as_path(), bytes.as_slice()))
+            .collect();
+        let error = replace_derived_document(
+            &repo.0,
+            &output,
+            &bytes,
+            &source_refs,
+            &pack,
+            &digest,
+            "semantic-triage.json",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ReviewArtifactConflict);
+        assert!(error.message.contains("symlink"));
+        assert!(!output.exists());
+        assert_eq!(fs::read(protected).unwrap(), bytes);
+    }
+
+    #[test]
+    fn queue_authenticity_uses_git_images_and_rejects_consistent_forgery() {
+        let repo = GitFixture::new("queue-exact-images");
+        let (pack, pack_bytes, _) = owned_snapshot(&repo);
+        let digest = sha256_hex(&pack_bytes);
+        let collected =
+            scope::collect_scope(&repo.0, &pack.target.base_sha, &pack.target.head_sha).unwrap();
+        let (post_sources, base_sources) = rust_sources_from_scope(&collected);
+        let contexts = syntax_contexts(
+            &pack,
+            &RustImages::new(post_sources),
+            &RustImages::new(base_sources),
+        );
+        let queue = review_queue::build(&pack, &digest, &contexts).unwrap();
+        fs::write(
+            repo.0.join("src/lib.rs"),
+            "#[test]\nfn run() { panic!(\"example\"); }\n",
+        )
+        .unwrap();
+        let (_, status) =
+            validate_queue_authenticity_in_repository(&repo.0, &queue, &pack, &digest).unwrap();
+        assert_eq!(status, SyntaxAuthenticityStatus::Verified);
+
+        let forged_contexts = pack
+            .all_candidates()
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.id,
+                    review_queue::SyntaxContext {
+                        execution: Some(scope::FileSurface::Tests),
+                        code_role: CodeRole::TestSetup,
+                        text_role: None,
+                        signature: Some("macro:panic".into()),
+                        basis: ClassificationBasis::SyntaxContext,
+                    },
+                )
+            })
+            .collect();
+        let forged = review_queue::build(&pack, &digest, &forged_contexts).unwrap();
+        review_queue::validate(&forged, &pack, &digest).unwrap();
+        assert_eq!(
+            validate_queue_authenticity_in_repository(&repo.0, &forged, &pack, &digest)
+                .unwrap_err()
+                .code,
+            ErrorCode::ReviewArtifactInvalid
+        );
+        let mut unavailable_pack = pack.clone();
+        unavailable_pack.target.head_sha = "0".repeat(pack.target.head_sha.len());
+        assert_eq!(
+            validate_queue_authenticity_in_repository(&repo.0, &queue, &unavailable_pack, &digest)
+                .unwrap_err()
+                .code,
+            ErrorCode::SyntaxAuthenticityUnavailable
+        );
     }
 
     #[test]
