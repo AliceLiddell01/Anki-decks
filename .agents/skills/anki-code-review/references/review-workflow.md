@@ -372,7 +372,7 @@ syntax-authenticity verification либо явно помеченная как s
   Общий предел активных jobs задаётся `--max-parallel-jobs`: одновременно активные
   запросы обязаны согласовать одно значение. Полная ёмкость или занятость job
   возвращает `execution_busy` (exit 13, `details.retryable: true`); другой предел
-  при активных jobs — постоянный конфликт.
+  при активных jobs отклоняется как `invalid_request` (exit 3) до завершения этих jobs.
 - **Disposable source experiment.** Если проверка требует менять исходник или
   тесты, выбери `disposable_source_experiment`. CLI создаст отдельный Git worktree
   с detached HEAD на точном проверяемом SHA; обычная рабочая копия и неизменяемый

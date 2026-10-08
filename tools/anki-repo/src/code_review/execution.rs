@@ -1094,6 +1094,13 @@ fn cleanup_preflight(
         if SURFACES.contains(&name) || name == "worktree" {
             continue;
         }
+        if name.starts_with(".publish-") || name.starts_with(".review-publish-") {
+            let file_type = entry.file_type().map_err(read_error)?;
+            if file_type.is_file() && !file_type.is_symlink() {
+                drop(open_file(directory, name, false)?);
+                continue;
+            }
+        }
         if !matches!(
             name,
             "job.json"

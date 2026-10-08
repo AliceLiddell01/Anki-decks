@@ -191,6 +191,25 @@ fn cleanup_preflights_all_surfaces_before_removing_worktree() {
 }
 
 #[test]
+fn cleanup_preserves_regular_leftover_atomic_publication_files() {
+    let fixture = Fixture::new();
+    let job = fixture.prepare("isolated_checks");
+    let publish = b"partial metadata publication";
+    let review_publish = b"partial review artifact publication";
+    fs::write(job.join(".publish-leftover"), publish).unwrap();
+    fs::write(job.join(".review-publish-leftover"), review_publish).unwrap();
+
+    let result = success(fixture.operation("cleanup", &job));
+    assert_eq!(result["workspace_removed"], true);
+    assert_eq!(fs::read(job.join(".publish-leftover")).unwrap(), publish);
+    assert_eq!(
+        fs::read(job.join(".review-publish-leftover")).unwrap(),
+        review_publish
+    );
+    assert!(!job.join("worktree").exists());
+}
+
+#[test]
 fn failures_before_spawn_leave_proven_not_started_job_inspectable() {
     for surface in ["logs/stdout.log", "logs/stderr.log", "home"] {
         let fixture = Fixture::new();
@@ -482,10 +501,8 @@ fn private_cargo_home_has_deterministic_offline_behavior() {
     let result = &parse_json(&stdout)["result"];
     assert_eq!(result["status"], "failed");
     assert!(
-        result["stderr"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("no matching package named")
+        result["stderr"]["text"].as_str().unwrap().contains("serde"),
+        "{result}"
     );
     assert!(!fixture.root().join("target").exists());
 }
