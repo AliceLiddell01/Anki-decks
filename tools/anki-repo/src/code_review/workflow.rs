@@ -2179,6 +2179,7 @@ fn write_directory_once(
     }
     super::execution::ensure_dir(directory)?;
     let directory_fd = super::execution::safe_dir(directory)?;
+    let _lock = lock_review_workspace(&directory_fd, directory)?;
     let entries =
         fs::read_dir(directory).map_err(|error| artifact_write_error(directory, &error))?;
     let mut names = BTreeSet::new();
@@ -2188,6 +2189,12 @@ fn write_directory_once(
         let file_type = entry
             .file_type()
             .map_err(|error| artifact_write_error(&entry.path(), &error))?;
+        if name.starts_with(".publish-") || name.starts_with(".review-publish-") {
+            if !file_type.is_file() || file_type.is_symlink() {
+                return Err(artifact_conflict(&entry.path()));
+            }
+            continue;
+        }
         if name == "delta.json" && !documents.contains_key(name.as_str()) {
             if !file_type.is_file() || file_type.is_symlink() {
                 return Err(artifact_conflict(&entry.path()));
@@ -3761,6 +3768,42 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             ErrorCode::ReviewArtifactConflict
         );
         assert_eq!(fs::read(directory.join("delta.json")).unwrap(), delta);
+    }
+
+    #[test]
+    fn snapshot_ignores_only_regular_publication_temporaries() {
+        let owner = TempWorkspace::create("anki-snapshot-publication-temporaries")
+            .expect("временная рабочая область проекта должна создаваться");
+        let directory = owner.path().join("snapshot");
+        fs::create_dir(&directory).unwrap();
+        for name in [".publish-leftover", ".review-publish-leftover"] {
+            fs::write(directory.join(name), b"temporary bytes").unwrap();
+        }
+        let documents = BTreeMap::from([("review.json", b"{}\n".to_vec())]);
+
+        write_directory_once(&directory, &documents).unwrap();
+        assert_eq!(
+            fs::read(directory.join(".publish-leftover")).unwrap(),
+            b"temporary bytes"
+        );
+        assert_eq!(
+            fs::read(directory.join(".review-publish-leftover")).unwrap(),
+            b"temporary bytes"
+        );
+
+        #[cfg(unix)]
+        {
+            let protected = owner.path().join("protected-target");
+            fs::write(&protected, b"protected bytes").unwrap();
+            std::os::unix::fs::symlink(&protected, directory.join(".publish-symlink")).unwrap();
+            assert_eq!(
+                write_directory_once(&directory, &documents)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ReviewArtifactConflict
+            );
+            assert_eq!(fs::read(protected).unwrap(), b"protected bytes");
+        }
     }
 
     #[test]
