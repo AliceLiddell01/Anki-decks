@@ -2103,6 +2103,7 @@ mod tests {
                 merge_base_sha: "a".repeat(40),
             },
             review_pack_sha256: "c".repeat(64),
+            workspace_variant: None,
         };
         let output = OutputEvidence {
             text: String::new(),

@@ -162,7 +162,10 @@ PR подтверждено; тогда каталог использует се
 `.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/`. Для PR номер —
 навигационный сегмент; полный SHA HEAD и digest байтов `review.json` задают
 идентичность снимка. Новый HEAD в том же PR получает отдельный каталог и не
-перезаписывает предыдущий. Ожидаемая структура одного снимка:
+перезаписывает предыдущий. Если для того же HEAD нужна другая база или набор
+анализаторов, передай `--out-dir` с новым дочерним каталогом
+`snapshot-<32 lowercase hex>`; он хранит отдельные свидетельства и не заменяет
+предыдущий снимок. Ожидаемая структура снимка по умолчанию:
 
 ```text
 .anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/
@@ -181,8 +184,10 @@ PR подтверждено; тогда каталог использует се
 Используй фактический `artifact_dir`, возвращённый успешным `collect`/`verify`,
 как источник всех downstream-путей; не реконструируй путь по SHA вручную и не
 выбирай временный каталог. Необязательный `--out-dir DIR` допустим только если
-он в точности совпадает с каноническим workspace, выбранным по номеру PR/local и
-полному HEAD SHA. Произвольный каталог, tracked workspace, symlink, `..` и
+он в точности совпадает с workspace по номеру PR/local и полному HEAD SHA либо
+с его единственным дочерним каталогом `snapshot-<32 lowercase hex>`. Выбирай новый
+snapshot ID при повторном сборе того же HEAD с другой базой или набором
+анализаторов. Произвольный каталог, tracked workspace, symlink, `..` и
 конфликтующий файл отвергаются до записи. Исходные артефакты неизменяемы:
 повторная генерация тех же байтов идемпотентна, другое содержимое для того же
 пути завершается конфликтом. Проверенные производные triage/report могут
@@ -288,9 +293,10 @@ anki-repo --json code-review execution inspect "$JOB_PATH"
 `prepare` принимает путь к пакету, режим `isolated_checks` или
 `disposable_source_experiment`, обязательное направление `--scope` и
 необязательный `--pr-number`. `--pack` обязан указывать на канонический
-`review.json` внутри `.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/`;
-`prepare` наследует namespace и полный HEAD SHA из этого пути и source pack,
-создавая job только в sibling `runs/<unique-job-id>/`. Если передан
+`review.json` внутри `.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/` или
+его `snapshot-<32 lowercase hex>` варианта; `prepare` наследует namespace,
+полный HEAD SHA и вариант workspace из этого пути и source pack, создавая job
+только в `runs/<unique-job-id>/` этого workspace. Если передан
 `--pr-number`, он проверяется как assertion; несовпадение завершается
 `invalid_request` до создания job. Поэтому известный PR не может незаметно
 попасть в `local` или другой PR namespace. `run` принимает timeout от
@@ -545,7 +551,8 @@ JSON-артефакт решений ревьюера, `CANONICAL_TRIAGE` — е
 проверки не требуется. `triage init`, `validate --canonical-out` и `triage report
 --out` определяют корень репозитория от текущего каталога, поэтому их нужно
 запускать внутри Git-репозитория. Запись принимается только в точные имена
-артефактов внутри `.anki-repo/review/<pr-number|local>/<full-head-sha>/`.
+артефактов внутри `.anki-repo/review/<pr-number|local>/<full-head-sha>/` или
+его `snapshot-<32 lowercase hex>` варианта.
 Произвольные пути, tracked файлы, `..`, symlink traversal и замена `review.json`
 или `review-queue.json` запрещены. Действующие derived files проверяются по
 типу и привязке к текущему snapshot; публикация выполняется атомарно под lock с

@@ -49,6 +49,8 @@ pub enum ExecutionMode {
 pub struct ExecutionSource {
     pub snapshot: GitTarget,
     pub review_pack_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_variant: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,12 +256,12 @@ struct State {
 }
 
 /// Проверяет идентичность исходных свидетельств до любых операций с временными каталогами.
-fn source_pack_namespace(
+fn source_pack_location(
     root: &Path,
     pack: &ReviewPack,
     bytes: &[u8],
     options: &PrepareOptions,
-) -> Result<String, DomainError> {
+) -> Result<(String, Option<String>), DomainError> {
     // Path::components нормализует внутренние "."; проверяем исходное написание тоже.
     if options
         .source_pack
@@ -281,23 +283,42 @@ fn source_pack_namespace(
         )
     })?;
     let components: Vec<_> = relative.components().collect();
-    let [
-        Component::Normal(owner),
-        Component::Normal(review),
-        Component::Normal(namespace),
-        Component::Normal(head),
-        Component::Normal(filename),
-    ] = components.as_slice()
-    else {
-        return Err(DomainError::new(
-            ErrorCode::InvalidRequest,
-            "Исходный пакет должен быть в .anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/review.json",
-        ));
+    let (owner, review, namespace, head, variant, filename) = match components.as_slice() {
+        [
+            Component::Normal(owner),
+            Component::Normal(review),
+            Component::Normal(namespace),
+            Component::Normal(head),
+            Component::Normal(filename),
+        ] => (owner, review, namespace, head, None, filename),
+        [
+            Component::Normal(owner),
+            Component::Normal(review),
+            Component::Normal(namespace),
+            Component::Normal(head),
+            Component::Normal(variant),
+            Component::Normal(filename),
+        ] => (owner, review, namespace, head, Some(variant), filename),
+        _ => {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "Исходный пакет должен находиться в канонической рабочей области PR/local и полного HEAD SHA",
+            ));
+        }
     };
     if *owner != ".anki-repo" || *review != "review" || *filename != "review.json" {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
             "исходный пакет должен быть каноническим review.json",
+        ));
+    }
+    if variant.is_some_and(|name| {
+        name.to_str()
+            .is_none_or(|name| !super::workflow::is_review_snapshot_variant(name))
+    }) {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "Вариант workspace должен иметь вид `snapshot-<32 hex>`",
         ));
     }
     let namespace = namespace.to_str().ok_or_else(|| {
@@ -336,11 +357,14 @@ fn source_pack_namespace(
             "HEAD каталога исходного review.json не совпадает с пакетом ревью",
         ));
     }
-    let canonical = root
+    let mut canonical = root
         .join(".anki-repo/review")
         .join(namespace)
-        .join(&pack.target.head_sha)
-        .join("review.json");
+        .join(&pack.target.head_sha);
+    if let Some(variant) = variant {
+        canonical.push(variant);
+    }
+    canonical.push("review.json");
     if source_path.as_os_str() != canonical.as_os_str() {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
@@ -364,7 +388,23 @@ fn source_pack_namespace(
             "байты исходного review.json не совпадают с каноническим evidence",
         ));
     }
-    Ok(namespace.to_owned())
+    let workspace_variant = variant.map(|name| {
+        name.to_str()
+            .expect("validated snapshot variant is UTF-8")
+            .to_owned()
+    });
+    Ok((namespace.to_owned(), workspace_variant))
+}
+
+fn job_runs_directory(root: &Path, namespace: &str, source: &ExecutionSource) -> PathBuf {
+    let mut workspace = root
+        .join(".anki-repo/review")
+        .join(namespace)
+        .join(&source.snapshot.head_sha);
+    if let Some(variant) = &source.workspace_variant {
+        workspace.push(variant);
+    }
+    workspace.join("runs")
 }
 
 /// Создаёт уникальное задание и точный worktree с detached HEAD; код проекта не запускается.
@@ -396,13 +436,14 @@ pub fn prepare_job(
     }
     let root = root.canonicalize().map_err(read_error)?;
     safe_dir(&root)?;
-    let namespace = source_pack_namespace(&root, pack, bytes, &options)?;
+    let (namespace, workspace_variant) = source_pack_location(&root, pack, bytes, &options)?;
     verify_snapshot(&root, &pack.target)?;
-    let parent = root
-        .join(".anki-repo/review")
-        .join(&namespace)
-        .join(&pack.target.head_sha)
-        .join("runs");
+    let source = ExecutionSource {
+        snapshot: pack.target.clone(),
+        review_pack_sha256: format!("{:x}", Sha256::digest(bytes)),
+        workspace_variant,
+    };
+    let parent = job_runs_directory(&root, &namespace, &source);
     super::workflow::reject_tracked_review_workspace(
         &root,
         Path::new(".anki-repo")
@@ -417,10 +458,7 @@ pub fn prepare_job(
     let metadata = JobMetadata {
         schema_version: EXECUTION_SCHEMA_VERSION,
         job_id,
-        source: ExecutionSource {
-            snapshot: pack.target.clone(),
-            review_pack_sha256: format!("{:x}", Sha256::digest(bytes)),
-        },
+        source,
         mode: options.mode,
         scope: options.scope,
         namespace,
@@ -439,11 +477,7 @@ pub fn prepare_job(
     })();
     if let Err(error) = initialized {
         if let Err(cleanup_error) = remove_partial_job_directory(
-            &job.root
-                .join(".anki-repo/review")
-                .join(&job.metadata.namespace)
-                .join(&job.metadata.source.snapshot.head_sha)
-                .join("runs"),
+            &job_runs_directory(&job.root, &job.metadata.namespace, &job.metadata.source),
             &job.metadata.job_id,
         ) {
             return Err(DomainError::with_details(
@@ -502,12 +536,6 @@ pub fn open_job(root: &Path, directory: &Path) -> Result<PreparedJob, DomainErro
     }
     safe_dir(&directory)?;
     let metadata: JobMetadata = read_document(&directory, "job.json")?;
-    let expected = root
-        .join(".anki-repo/review")
-        .join(&metadata.namespace)
-        .join(&metadata.source.snapshot.head_sha)
-        .join("runs")
-        .join(&metadata.job_id);
     valid_component(&metadata.namespace)?;
     valid_component(&metadata.job_id)?;
     if metadata.namespace != "local"
@@ -525,18 +553,29 @@ pub fn open_job(root: &Path, directory: &Path) -> Result<PreparedJob, DomainErro
     validate_sha(&metadata.source.snapshot.head_sha)?;
     validate_sha(&metadata.source.snapshot.base_sha)?;
     validate_sha(&metadata.source.snapshot.merge_base_sha)?;
+    if metadata
+        .source
+        .workspace_variant
+        .as_deref()
+        .is_some_and(|variant| !super::workflow::is_review_snapshot_variant(variant))
+    {
+        return Err(invalid("Вариант workspace задания имеет неверный формат"));
+    }
+    let expected =
+        job_runs_directory(&root, &metadata.namespace, &metadata.source).join(&metadata.job_id);
     validate_hex(
         &metadata.source.review_pack_sha256,
         64,
         "digest review pack",
     )?;
-    if metadata.schema_version != EXECUTION_SCHEMA_VERSION
-        || directory != expected
-        || metadata.owner_nonce.len() != 32
-    {
-        return Err(invalid(
-            "Путь задания или идентификатор владельца не соответствует манифесту",
-        ));
+    if metadata.schema_version != EXECUTION_SCHEMA_VERSION {
+        return Err(invalid("Версия манифеста задания не поддерживается"));
+    }
+    if directory != expected {
+        return Err(invalid("Путь задания не соответствует манифесту"));
+    }
+    if metadata.owner_nonce.len() != 32 {
+        return Err(invalid("Идентификатор владельца имеет неверную длину"));
     }
     let job = PreparedJob {
         root,
@@ -772,11 +811,8 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
             "Каталог задания исполнения не найден",
         ));
     }
-    let root = directory
-        .ancestors()
-        .nth(6)
-        .ok_or_else(|| invalid("Задание находится вне пространства ревью репозитория"))?;
-    let verified = open_job(root, &directory)?;
+    let root = repository_root_for_job(&directory)?;
+    let verified = open_job(&root, &directory)?;
     let metadata = verified.metadata;
     let state: State = read_document(&directory, "state.json")?;
     if metadata.owner_nonce != state.owner_nonce {
@@ -820,6 +856,47 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
         workspace_removed: state.workspace_removed,
         limitations,
     })
+}
+
+fn repository_root_for_job(directory: &Path) -> Result<PathBuf, DomainError> {
+    let runs = directory
+        .parent()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("runs"))
+        .ok_or_else(|| invalid("Задание находится вне каталога runs"))?;
+    let workspace = runs
+        .parent()
+        .ok_or_else(|| invalid("У каталога runs нет workspace"))?;
+    let head_directory = if workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(super::workflow::is_review_snapshot_variant)
+    {
+        workspace
+            .parent()
+            .ok_or_else(|| invalid("У варианта workspace нет каталога HEAD"))?
+    } else {
+        workspace
+    };
+    let head = head_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("В каталоге задания отсутствует HEAD SHA"))?;
+    validate_sha(head)?;
+    let namespace = head_directory
+        .parent()
+        .ok_or_else(|| invalid("У каталога HEAD нет пространства имён"))?;
+    let review = namespace
+        .parent()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("review"))
+        .ok_or_else(|| invalid("Задание находится вне каталога review"))?;
+    let anki_repo = review
+        .parent()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some(".anki-repo"))
+        .ok_or_else(|| invalid("Задание находится вне каталога .anki-repo"))?;
+    anki_repo
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| invalid("Задание находится вне корня репозитория"))
 }
 
 /// Читает только завершённый результат; не исполняет повторно и не меняет артефакты.

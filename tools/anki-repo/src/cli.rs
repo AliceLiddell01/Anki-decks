@@ -532,7 +532,7 @@ pub enum CodeReviewCommand {
         /// Верхняя ссылка Git; её SHA фиксируется в пакете.
         #[arg(long)]
         head: String,
-        /// Каноническая рабочая область PR/HEAD; по умолчанию `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`.
+        /// Workspace PR/HEAD; по умолчанию `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`, варианты — `snapshot-<32 hex>` внутри него.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
@@ -551,7 +551,7 @@ pub enum CodeReviewCommand {
         /// Новый HEAD для сравнения; базовый SHA берётся из исходного пакета.
         #[arg(long)]
         head: String,
-        /// Рабочая область нового HEAD: `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`; пространство наследуется из исходного пакета.
+        /// Workspace нового HEAD: `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/`; namespace наследуется из исходного пакета.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
@@ -570,7 +570,7 @@ pub enum CodeReviewCommand {
         /// Более новый review.json.
         #[arg(long, value_name = "PACK")]
         after: PathBuf,
-        /// Только `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/delta.json` пакета --after.
+        /// Только delta.json в workspace `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --after.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
@@ -723,7 +723,7 @@ pub enum ReviewQueueCommand {
 pub enum ReviewExecutionCommand {
     /// Подготовить отдельное задание и detached worktree, не запуская проектный код.
     Prepare {
-        /// Канонический review.json из `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`.
+        /// Канонический review.json из `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
         /// Режим изолированной проверки или эксперимента с отдельной копией исходников.
@@ -791,8 +791,8 @@ pub enum SemanticTriageCommand {
         /// Неизменяемый пакет свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Только `semantic-triage.input.json` в
-        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/` пакета --pack.
+        /// Только semantic-triage.input.json в workspace
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --pack.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
@@ -808,8 +808,8 @@ pub enum SemanticTriageCommand {
         /// Заполненный JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
-        /// Только `semantic-triage.json` в
-        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/` пакета --pack.
+        /// Только semantic-triage.json в workspace
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --pack.
         /// Валидный собственный документ можно атомарно обновить.
         #[arg(long = "canonical-out", value_name = "PATH")]
         canonical_out: Option<PathBuf>,
@@ -835,8 +835,8 @@ pub enum SemanticTriageCommand {
         /// JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
-        /// Только `review-report.md` в
-        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/` пакета --pack.
+        /// Только review-report.md в workspace
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --pack.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },

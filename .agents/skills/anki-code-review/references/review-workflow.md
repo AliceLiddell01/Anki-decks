@@ -168,16 +168,20 @@ checkout сверь `git rev-parse HEAD` с `headRefOid`; при расхожд�
 [anki-repo](../../../../tools/anki-repo/README.md#code-review-collectverifydeltaqueuetriage).
 Для известного PR обязательно передай `--pr-number "$PR_NUMBER"` каждому
 `collect` и `verify`. Все локальные результаты этого ревью хранятся только в
-`<repo-root>/.anki-repo/review/<PR_NUMBER>/<FULL_HEAD_SHA>/`. При доказанном
-отсутствии PR опусти `--pr-number` и явно обозначь единственный допустимый
-workspace `.anki-repo/review/local/<FULL_HEAD_SHA>/`. `local` не служит запасным
-вариантом для известного PR или ошибки определения PR.
+`<repo-root>/.anki-repo/review/<PR_NUMBER>/<FULL_HEAD_SHA>/` или его
+`snapshot-<32 lowercase hex>` варианте. Если для того же HEAD собирается другая
+база или набор анализаторов, выбери новый variant через `--out-dir`; существующий
+workspace не удаляй и не перезаписывай. При доказанном отсутствии PR опусти
+`--pr-number` и используй `.anki-repo/review/local/<FULL_HEAD_SHA>/` либо его
+variant. `local` не служит запасным вариантом для известного PR или ошибки
+определения PR.
 
 Прими `result.artifact_dir` из успешного JSON-envelope CLI, разрешив относительный
 путь от корня репозитория; не конструируй каталог на стороне LLM повторно.
 `PACK`, `QUEUE`, `TRIAGE`, `CANONICAL_TRIAGE`, `REPORT`, delta и остальные
 результаты относятся к этому workspace. `--out-dir` не выбирает произвольное
-место: CLI разрешает только точный канонический каталог данного namespace и HEAD.
+место: CLI разрешает каталог данного namespace и HEAD, а для отдельного снимка —
+только один дочерний каталог с формой `snapshot-<32 lowercase hex>`.
 Не сохраняй постоянные результаты в `/tmp`, корне проекта, `decks/**` или ином
 каталоге. Весь `/.anki-repo/review/` gitignored; не добавляй артефакты ревью
 в индекс и не публикуй их автоматически.
@@ -236,7 +240,9 @@ anki-repo code-review triage validate --pack "$PACK" --triage "$TRIAGE" --canoni
 anki-repo code-review triage summary --pack "$PACK" --triage "$CANONICAL_TRIAGE"
 anki-repo code-review triage report --pack "$PACK" --triage "$CANONICAL_TRIAGE" --out "$REPORT"
 
-git check-ignore -- "$PACK" "$QUEUE" "$TRIAGE" "$CANONICAL_TRIAGE" "$REPORT" "$JOB_PATH"
+for path in "$PACK" "$QUEUE" "$TRIAGE" "$CANONICAL_TRIAGE" "$REPORT" "$JOB_PATH"; do
+  git check-ignore -q -- "$path"
+done
 git status --short
 ```
 

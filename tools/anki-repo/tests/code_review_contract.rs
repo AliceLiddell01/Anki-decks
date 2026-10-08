@@ -3014,10 +3014,11 @@ fn collect_rejects_arbitrary_output_before_writing_or_running_clippy() {
     let arbitrary = repo.path().join("arbitrary/nested");
     let external = outside.path().join("output");
     let dotdot = review_workspace(repo.path(), &head).join("../").join(&head);
+    let invalid_variant = review_workspace(repo.path(), &head).join("snapshot-not-a-digest");
     let cargo_bytes = fs::read(&tracked).unwrap();
     let status = git(repo.path(), &["status", "--porcelain=v1"]);
     let index = git(repo.path(), &["ls-files", "--stage"]);
-    for output in [&arbitrary, &tracked, &external, &dotdot] {
+    for output in [&arbitrary, &tracked, &external, &dotdot, &invalid_variant] {
         assert_review_failure(
             run_cli_in(
                 Some(repo.path()),
@@ -3038,12 +3039,126 @@ fn collect_rejects_arbitrary_output_before_writing_or_running_clippy() {
         );
         assert_eq!(fs::read(&tracked).unwrap(), cargo_bytes);
         assert!(!arbitrary.exists());
+        assert!(!invalid_variant.exists());
         assert!(!external.exists());
         assert!(!repo.path().join(".anki-repo").exists());
         assert!(!repo.path().join("target").exists());
         assert_eq!(git(repo.path(), &["status", "--porcelain=v1"]), status);
         assert_eq!(git(repo.path(), &["ls-files", "--stage"]), index);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn same_head_can_use_an_explicit_snapshot_variant_for_an_alternate_base() {
+    let repo = TempDir::new("collect-same-head-snapshot-variant");
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    commit(repo.path(), "исходная база");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    commit(repo.path(), "изменить HEAD");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let original_workspace = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &original_workspace, false);
+    let original_pack = fs::read(original_workspace.join("review.json")).unwrap();
+
+    let variant = original_workspace.join("snapshot-0123456789abcdef0123456789abcdef");
+    let variant_arg = variant.to_string_lossy().into_owned();
+    let alternate = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "collect",
+            "--base",
+            &head,
+            "--head",
+            &head,
+            "--out-dir",
+            &variant_arg,
+        ],
+    ));
+    assert_eq!(
+        alternate["artifact_dir"],
+        format!(".anki-repo/review/local/{head}/snapshot-0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(
+        alternate["target"]["base_sha"].as_str(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        fs::read(original_workspace.join("review.json")).unwrap(),
+        original_pack
+    );
+    let variant_pack = variant.join("review.json");
+    let variant_bytes = fs::read(&variant_pack).unwrap();
+    let variant_json: Value = serde_json::from_slice(&variant_bytes).unwrap();
+    assert_eq!(variant_json["target"]["head_sha"], head);
+    assert_eq!(variant_json["target"]["base_sha"], head);
+
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 3 }\n",
+    )
+    .unwrap();
+    commit(repo.path(), "следующий HEAD");
+    let next_head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let verified = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "verify",
+            "--baseline",
+            variant_pack.to_str().unwrap(),
+            "--head",
+            &next_head,
+        ],
+    ));
+    assert_eq!(verified["target"]["base_sha"].as_str(), Some(head.as_str()));
+    assert_eq!(
+        verified["artifact_dir"],
+        format!(".anki-repo/review/local/{next_head}")
+    );
+
+    let job = prepare_execution_job(repo.path(), &variant_pack, "alternate-base");
+    assert_eq!(
+        fs::read(job.join("source-review.json")).unwrap(),
+        variant_bytes
+    );
+    let job_metadata: Value =
+        serde_json::from_slice(&fs::read(job.join("job.json")).unwrap()).unwrap();
+    assert_eq!(job_metadata["namespace"], "local");
+    assert_eq!(job_metadata["source"]["snapshot"]["head_sha"], head);
+    assert_eq!(
+        job.file_name().unwrap().to_str().unwrap(),
+        job_metadata["job_id"]
+    );
+    assert_eq!(
+        job_metadata["source"]["workspace_variant"],
+        "snapshot-0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(
+        job.parent().unwrap(),
+        variant.join("runs"),
+        "job path: {}",
+        job.display()
+    );
+    let job_arg = job.to_string_lossy().into_owned();
+    let inspection = review_success(run_cli_in(
+        Some(repo.path()),
+        &["--json", "code-review", "execution", "inspect", &job_arg],
+    ));
+    assert_eq!(
+        inspection["job"]["source"]["workspace_variant"],
+        "snapshot-0123456789abcdef0123456789abcdef"
+    );
 }
 
 #[cfg(unix)]

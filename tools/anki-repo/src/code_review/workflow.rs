@@ -2296,6 +2296,7 @@ fn review_workspace_directory(
         .join("review")
         .join(namespace)
         .join(head_sha);
+    let mut workspace = expected.clone();
     if let Some(requested) = requested {
         reject_parent_components(requested)?;
         let absolute = if requested.is_absolute() {
@@ -2305,19 +2306,37 @@ fn review_workspace_directory(
                 .map_err(|error| artifact_write_error(requested, &error))?
                 .join(requested)
         };
-        if normalize_without_parent(&absolute) != expected {
+        let normalized = normalize_without_parent(&absolute);
+        let is_default = normalized == expected;
+        let is_snapshot_variant = normalized.parent() == Some(expected.as_path())
+            && normalized
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_review_snapshot_variant);
+        if !is_default && !is_snapshot_variant {
             return Err(DomainError::with_details(
                 ErrorCode::InvalidRequest,
-                "--out-dir должен точно указывать на рабочую область выбранного PR и полного HEAD SHA",
+                "--out-dir должен указывать на рабочую область выбранного PR и полного HEAD SHA либо на её snapshot-<32 hex> вариант",
                 crate::details! {
                     "expected" => expected.display().to_string(),
-                    "requested" => absolute.display().to_string(),
+                    "requested" => normalized.display().to_string(),
                 },
             ));
         }
+        workspace = normalized;
     }
-    ensure_workspace_directory(root, &expected)?;
-    Ok(expected)
+    ensure_workspace_directory(root, &workspace)?;
+    Ok(workspace)
+}
+
+pub(super) fn is_review_snapshot_variant(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix("snapshot-") else {
+        return false;
+    };
+    suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_canonical_pr_number(number: &str) -> bool {
@@ -2336,7 +2355,16 @@ fn ensure_workspace_directory(root: &Path, workspace: &Path) -> Result<(), Domai
             "Рабочая область ревью должна находиться под .anki-repo/review",
         ));
     }
-    let relative = workspace.strip_prefix(root).map_err(|_| {
+    let tracked_workspace = if workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_review_snapshot_variant)
+    {
+        workspace.parent().unwrap_or(workspace)
+    } else {
+        workspace
+    };
+    let relative = tracked_workspace.strip_prefix(root).map_err(|_| {
         DomainError::new(
             ErrorCode::InvalidRequest,
             "Рабочая область ревью вышла за пределы корня репозитория",
@@ -2432,7 +2460,14 @@ fn workspace_for_pack(
             "У review.json нет каталога рабочей области",
         )
     })?;
-    let namespace = workspace
+    let head_directory = review_workspace_head_directory(workspace, &pack.target.head_sha)
+        .ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::InvalidRequest,
+                "review.json должен находиться в канонической рабочей области полного HEAD",
+            )
+        })?;
+    let namespace = head_directory
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
@@ -2452,6 +2487,17 @@ fn workspace_for_pack(
         ));
     }
     Ok(expected)
+}
+
+fn review_workspace_head_directory<'a>(workspace: &'a Path, head_sha: &str) -> Option<&'a Path> {
+    if workspace.file_name().and_then(|name| name.to_str()) == Some(head_sha) {
+        return Some(workspace);
+    }
+    let variant = workspace.file_name()?.to_str()?;
+    let head_directory = workspace.parent()?;
+    (is_review_snapshot_variant(variant)
+        && head_directory.file_name().and_then(|name| name.to_str()) == Some(head_sha))
+    .then_some(head_directory)
 }
 
 /// Возвращает пространство имён PR/local, если входной пакет уже лежит в канонической рабочей области.
@@ -2482,7 +2528,14 @@ fn review_workspace_namespace(
         return Ok(None);
     }
     let workspace = workspace_for_pack(root, pack_path, pack)?;
-    let namespace = workspace
+    let head_directory = review_workspace_head_directory(&workspace, &pack.target.head_sha)
+        .ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::InvalidRequest,
+                "Не удалось разрешить namespace и HEAD рабочей области review.json",
+            )
+        })?;
+    let namespace = head_directory
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
