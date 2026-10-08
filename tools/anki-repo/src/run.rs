@@ -1001,7 +1001,7 @@ fn human_review_queue_list(page: &crate::code_review::review_queue::QueueListPag
             classification.role.as_str(),
             classification
                 .text_role
-                .map_or("unknown", |role| role.as_str()),
+                .map_or("не применяется", |role| role.as_str()),
             classification.code_role.as_str(),
         );
         if let Some(candidate_id) = &unit.candidate_id {
@@ -1037,7 +1037,9 @@ fn human_review_queue_group(
             .execution
             .as_ref()
             .map_or("unknown", crate::code_review::review_queue::surface_name),
-        class.text_role.map_or("unknown", |role| role.as_str()),
+        class
+            .text_role
+            .map_or("не применяется", |role| role.as_str()),
         class.code_role.as_str(),
         class.origin.as_str(),
     );
@@ -1125,7 +1127,9 @@ fn human_review_queue_candidate(
             .as_ref()
             .map_or("unknown", crate::code_review::review_queue::surface_name),
         class.role.as_str(),
-        class.text_role.map_or("unknown", |role| role.as_str()),
+        class
+            .text_role
+            .map_or("не применяется", |role| role.as_str()),
         class.code_role.as_str(),
         result.unit.id,
         if result.unit.is_group() {
@@ -1774,6 +1778,48 @@ mod tests {
                 "найдена нестабильная метка {unstable:?}"
             );
         }
+    }
+
+    #[test]
+    fn review_queue_outputs_mark_missing_text_role_as_not_applicable() {
+        use crate::code_review::review_queue::{QueueListItem, QueueListPage, QueueUnitKind};
+
+        let mut detail = review_queue_candidate_detail();
+        detail.classification.text_role = None;
+        detail.unit.signature.classification.text_role = None;
+
+        assert!(human_review_queue_candidate(&detail).contains("роль текста: не применяется"));
+
+        let group = crate::code_review::workflow::ReviewQueueGroupDetail {
+            unit: detail.unit.clone(),
+            representatives: vec![
+                crate::code_review::workflow::ReviewQueueRepresentativeDetail {
+                    candidate: detail.candidate.clone(),
+                    classification: detail.classification.clone(),
+                },
+            ],
+        };
+        assert!(human_review_queue_group(&group).contains("роль текста: не применяется"));
+
+        let page = QueueListPage {
+            total_units: 1,
+            matched_units: 1,
+            offset: 0,
+            limit: 50,
+            returned_units: 1,
+            has_more: false,
+            units: vec![QueueListItem {
+                id: detail.unit.id,
+                kind: QueueUnitKind::Group,
+                candidate_id: None,
+                priority: detail.unit.priority,
+                classification: detail.classification,
+                detector: "error_path".into(),
+                candidate_count: 2,
+                representative_candidate_ids: vec!["candidate-1".into()],
+            }],
+        };
+        assert!(human_review_queue_list(&page).contains("роль текста не применяется"));
     }
 
     #[test]

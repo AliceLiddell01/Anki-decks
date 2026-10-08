@@ -177,8 +177,8 @@ CodeRabbit, другого LLM-ревьюера или человека как �
 ```bash
 anki-repo code-review queue validate --pack "$PACK" --queue "$QUEUE"
 anki-repo code-review queue summary --pack "$PACK" --queue "$QUEUE"
-anki-repo code-review queue list --pack "$PACK" --queue "$QUEUE" --priority high --limit 200 --offset 0
-anki-repo code-review queue list --pack "$PACK" --queue "$QUEUE" --unknown --limit 200 --offset 0
+anki-repo --json code-review queue list --pack "$PACK" --queue "$QUEUE" --priority high --limit 200 --offset 0
+anki-repo --json code-review queue list --pack "$PACK" --queue "$QUEUE" --unknown --limit 200 --offset 0
 anki-repo code-review queue list --pack "$PACK" --queue "$QUEUE" --priority normal --surface "$SURFACE" --limit 200 --offset 0
 anki-repo code-review queue group --pack "$PACK" --queue "$QUEUE" --id "$GROUP_ID"
 anki-repo code-review queue candidate --pack "$PACK" --queue "$QUEUE" --id "$CANDIDATE_ID"
