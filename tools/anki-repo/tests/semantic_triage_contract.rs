@@ -104,7 +104,7 @@ impl Fixture {
                 .unwrap()
                 .is_empty()
         );
-        // Добавляем синтетические static signals, не фиксируя эвристики collector.
+        // Добавляем синтетические статические сигналы, не фиксируя эвристики сборщика.
         evidence["candidates"] = json!(
             (0..3)
                 .map(|index| json!({
@@ -340,13 +340,17 @@ fn derived_overwrite_rejects_source_collisions_and_unsafe_existing_paths() {
         assert_eq!(fs::read(source).unwrap(), before);
     }
 
-    let directory = fixture.artifacts.as_path().join("existing-directory");
+    let directory = fixture.artifacts.as_path().join("semantic-triage.json");
     fs::create_dir(&directory).unwrap();
-    failure(fixture.canonicalize(&directory), "invalid_request");
+    failure(fixture.canonicalize(&directory), "review_artifact_conflict");
+
+    let report_directory = fixture.artifacts.join("review-report.md");
+    fs::create_dir(&report_directory).unwrap();
     failure(
-        fixture.report(&fixture.triage, &directory),
-        "invalid_request",
+        fixture.report(&fixture.triage, &report_directory),
+        "review_artifact_conflict",
     );
+    assert_eq!(fs::read_dir(&report_directory).unwrap().count(), 0);
     assert!(directory.is_dir());
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
 
@@ -354,9 +358,9 @@ fn derived_overwrite_rejects_source_collisions_and_unsafe_existing_paths() {
     fs::create_dir(&decks).unwrap();
     fs::create_dir(decks.join("nested")).unwrap();
     let protected_paths = [
-        decks.join("existing-output"),
-        fixture.repository.path().join(".git/existing-output"),
-        decks.join("nested/../existing-output"),
+        decks.join("semantic-triage.json"),
+        fixture.repository.path().join(".git/semantic-triage.json"),
+        decks.join("nested/../semantic-triage.json"),
     ];
     for output in protected_paths {
         fs::write(&output, b"protected bytes").unwrap();
@@ -368,47 +372,85 @@ fn derived_overwrite_rejects_source_collisions_and_unsafe_existing_paths() {
 
 #[cfg(unix)]
 #[test]
-fn derived_overwrite_rejects_live_dangling_and_protected_parent_symlinks() {
+fn derived_overwrite_rejects_live_and_dangling_canonical_symlinks() {
     use std::os::unix::fs::symlink;
 
     let fixture = Fixture::new();
     success(fixture.validate(&fixture.reviewed()));
-    let target = fixture.artifacts.as_path().join("protected-target");
+    let outside = TempDir::new("triage-protected-targets");
+    let target = outside.path().join("protected-target");
     fs::write(&target, b"protected bytes").unwrap();
-    let missing = fixture.artifacts.as_path().join("missing-target");
-    for (name, target) in [("live-link", &target), ("dangling-link", &missing)] {
-        let output = fixture.artifacts.as_path().join(name);
-        symlink(target, &output).unwrap();
-        failure(fixture.canonicalize(&output), "invalid_request");
-        failure(fixture.report(&fixture.triage, &output), "invalid_request");
-        assert_eq!(fs::read_link(&output).unwrap(), *target);
+    let missing = outside.path().join("missing-target");
+    for target in [&target, &missing] {
+        for name in ["semantic-triage.json", "review-report.md"] {
+            let output = fixture.artifacts.join(name);
+            symlink(target, &output).unwrap();
+            let result = if name == "semantic-triage.json" {
+                fixture.canonicalize(&output)
+            } else {
+                fixture.report(&fixture.triage, &output)
+            };
+            let document = parse_json(&result.1);
+            failure(result, "review_artifact_conflict");
+            assert!(
+                document["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("symlink"),
+                "{document}"
+            );
+            assert_eq!(fs::read_link(&output).unwrap(), *target);
+            fs::remove_file(output).unwrap();
+        }
     }
     assert_eq!(fs::read(&target).unwrap(), b"protected bytes");
     assert!(!missing.exists());
+}
 
-    let decks = fixture.repository.path().join("decks");
-    fs::create_dir(&decks).unwrap();
-    for (name, parent) in [
-        ("decks-alias", decks),
-        ("metadata-alias", fixture.repository.path().join(".git")),
-    ] {
-        let target = parent.join("existing-output");
-        fs::write(&target, b"protected bytes").unwrap();
-        let alias = fixture.artifacts.as_path().join(name);
-        symlink(parent, &alias).unwrap();
-        let output = alias.join("existing-output");
-        failure(fixture.canonicalize(&output), "invalid_request");
-        failure(fixture.report(&fixture.triage, &output), "invalid_request");
-        assert_eq!(fs::read(target).unwrap(), b"protected bytes");
-    }
+#[cfg(unix)]
+#[test]
+fn derived_overwrite_rejects_replaced_snapshot_parent() {
+    use std::os::unix::fs::symlink;
 
-    let safe_parent = fixture.artifacts.as_path().join("safe-parent");
-    fs::create_dir(&safe_parent).unwrap();
-    let safe_alias = fixture.artifacts.as_path().join("safe-alias");
-    symlink(&safe_parent, &safe_alias).unwrap();
-    let output = safe_alias.join("nested/canonical.json");
-    failure(fixture.canonicalize(&output), "invalid_request");
-    assert!(!safe_parent.join("nested/canonical.json").exists());
+    let fixture = Fixture::new();
+    success(fixture.validate(&fixture.reviewed()));
+    let outside = TempDir::new("triage-parent-replacement");
+    let retained = outside.path().join("retained-snapshot");
+    fs::rename(&fixture.artifacts, &retained).unwrap();
+    let target = retained.join("semantic-triage.json");
+    fs::write(&target, b"protected parent bytes").unwrap();
+    symlink(&retained, &fixture.artifacts).unwrap();
+    let triage = retained.join("semantic-triage.input.json");
+    let pack_bytes = fs::read(retained.join("review.json")).unwrap();
+    let triage_bytes = fs::read(&triage).unwrap();
+    assert_eq!(fs::read(&fixture.pack).unwrap(), pack_bytes);
+    // Сначала доказываем, что CLI действительно читает входы через alias:
+    // без записи валидация проходит, отказ ниже вызван защитой пути вывода.
+    let arguments = [
+        "--json",
+        "code-review",
+        "triage",
+        "validate",
+        "--pack",
+        fixture.pack.to_str().unwrap(),
+        "--triage",
+        triage.to_str().unwrap(),
+    ];
+    success(fixture.run(&arguments));
+    let output = fixture.artifacts.join("semantic-triage.json");
+    let mut write_arguments = arguments.to_vec();
+    write_arguments.extend(["--canonical-out", output.to_str().unwrap()]);
+    let result = fixture.run(&write_arguments);
+    let document = parse_json(&result.1);
+    failure(result, "invalid_request");
+    assert_eq!(
+        document["error"]["details"]["path"],
+        fixture.artifacts.to_str().unwrap()
+    );
+    assert_eq!(fs::read_link(&fixture.artifacts).unwrap(), retained);
+    assert_eq!(fs::read(target).unwrap(), b"protected parent bytes");
+    assert_eq!(fs::read(retained.join("review.json")).unwrap(), pack_bytes);
+    assert_eq!(fs::read(triage).unwrap(), triage_bytes);
 }
 
 #[test]
@@ -977,17 +1019,4 @@ fn triage_rejects_symlink_at_canonical_artifact_without_changing_target() {
     assert_eq!(fs::read(&target).unwrap(), b"protected bytes");
     assert_eq!(fs::read_link(canonical).unwrap(), target);
     assert_eq!(fs::read_link(report).unwrap(), target);
-
-    let parent = outside.path().join("artifact-parent");
-    fs::create_dir(&parent).unwrap();
-    let parent_target = parent.join("semantic-triage.json");
-    fs::write(&parent_target, b"parent protected bytes").unwrap();
-    let parent_alias = fixture.artifacts.join("parent-alias");
-    symlink(&parent, &parent_alias).unwrap();
-    failure(
-        fixture.canonicalize(&parent_alias.join("semantic-triage.json")),
-        "invalid_request",
-    );
-    assert_eq!(fs::read(&parent_target).unwrap(), b"parent protected bytes");
-    assert_eq!(fs::read_link(parent_alias).unwrap(), parent);
 }

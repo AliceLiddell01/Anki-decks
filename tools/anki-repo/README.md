@@ -269,9 +269,16 @@ job режима `isolated_checks`; наличие `--run-clippy` само по 
 для эксперимента, меняющего исходники или тесты, используй
 `disposable_source_experiment` на detached worktree проверяемого HEAD.
 
+Возвращённые `artifact_dir` и `job_directory` заданы относительно корня
+репозитория. CLI принимает относительные входные пути от текущего рабочего
+каталога: выполняй весь workflow из корня или преобразуй возвращённые пути в
+абсолютные относительно корня.
+
 Последовательность CLI для уже полученного `artifact_dir`:
 
 ```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
 PREPARED=$(anki-repo --json code-review execution prepare --pack "$PACK" --mode isolated_checks --scope tests --pr-number "$PR_NUMBER")
 JOB_PATH=$(jq -er '.result.job_directory' <<< "$PREPARED")
 anki-repo code-review execution run "$JOB_PATH" --timeout-seconds "$TIMEOUT_SECONDS" --cwd "$CWD" --env RUST_BACKTRACE=1 -- cargo test --workspace --locked
@@ -287,19 +294,61 @@ anki-repo --json code-review execution inspect "$JOB_PATH"
 `--pr-number`, он проверяется как assertion; несовпадение завершается
 `invalid_request` до создания job. Поэтому известный PR не может незаметно
 попасть в `local` или другой PR namespace. `run` принимает timeout от
-1 секунды до 24 часов, относительный `--cwd` и explicit argv после `--`; shell
-сам по себе не запускается. Среда по умолчанию minimal. Повторяемый `--env
-KEY=VALUE` выбирает explicit policy; job-private пути нельзя переопределить. В
-структурированном результате маскируются аргументы с распознаваемыми именами
-секретов (`token`, `password`, `api_key` и подобные), а также значения env vars
-с такими именами ключей. Не передавай секреты под произвольными именами аргументов.
+1 секунды до 24 часов, относительный `--cwd` и явный argv после `--`; оболочка
+самостоятельно не запускается. Политика среды по умолчанию — `minimal`.
+`HOME`, `CARGO_HOME` и каталог сборки приватны для job: общий изменяемый кеш Cargo не используется. Зависимости общего кеша не
+появляются в новом job автоматически; выполнение Cargo может требовать сети,
+а `--offline` — завершаться отказом при отсутствии зависимостей в приватном кеше. Повторяемый `--env
+KEY=VALUE` выбирает политику `explicit`; приватные пути job нельзя переопределить. В
+структурированном результате распознаются формы `--key value`, `--key=value` и
+`KEY=value` для ключей `token`, `api-token`, `access-token`, `auth-token`,
+`refresh-token`, `secret`, `client-secret`, `password`, `passwd`, `api-key`,
+`apikey`, `authorization`, `proxy-authorization`, `credential`, `credentials`,
+`cookie` без учёта регистра; дефис и underscore эквивалентны.
+Распознаются заголовки `Authorization`, `Proxy-Authorization`, `Cookie`,
+`X-Api-Key`, `Api-Key`, в том числе через `-H`, `--header` и `--proxy-header`.
+`argv[0]` и аргументы после отдельного `--` не разбираются как секретные флаги.
+Для explicit env распознаются отдельные компоненты имени `TOKEN`, `SECRET`,
+`PASSWORD`, `PASSWD`, `APIKEY`, `AUTHORIZATION`, `CREDENTIAL`, `CREDENTIALS`,
+`COOKIE`, имя `API_KEY` и суффикс `_API_KEY`; `TOKENIZER_PATH` и
+`SECRETARY_NAME` не считаются секретными.
+
+Эти значения маскируются в `request.argv` и ограниченных текстах stdout/stderr.
+Маскирование работает по совпадению исходных байтов; секрет, пересекающий
+границу вывода, не оставляет видимого префикса. `total_bytes` относится к сырому
+логу, а `truncated` учитывает как исходный лимит, так и дополнительную обрезку
+после маскирования. `utf8_lossy` сообщает о замене некорректного UTF-8. Произвольные
+секреты под нераспознаваемыми именами автоматически не обнаруживаются.
 SHA-256 сохраняет проверяемую идентичность исходного argv.
-Предел одновременных jobs задаётся `--max-parallel-jobs` (1–64, по умолчанию
-4). `inspect` читает typed result, `cancel` создаёт отдельный marker, `cleanup`
-проверяет ownership и lifecycle перед удалением runtime. Job без запущенного
-процесса можно очистить с сохранением manifest/evidence. После запуска процесса
-worktree остаётся, если нельзя доказать отсутствие escaped descendants;
-завершённые логи и result не удаляются автоматически.
+`--max-parallel-jobs` задаёт общий для репозитория предел одновременно активных
+jobs (1–64, по умолчанию 4). Пока есть активные jobs, запрос с другим пределом
+отклоняется как `review_artifact_conflict`; после их завершения можно выбрать
+другое значение. При совпадающем пределе и полной ёмкости возвращается
+`execution_busy` (exit 13) с `details.retryable: true`, `resource` и `reason`.
+Занятый job также возвращает временный отказ; завершённый job повторно запускать
+нельзя, и это постоянный конфликт.
+
+`inspect` показывает наблюдаемое состояние job и ограничения отдельно от
+сохранённого результата. Жизненный цикл различает `prepared`, `running`,
+`completed`, `preparation_failed` и `interrupted`; статус проверки различает
+`passed`, `failed`, `timed_out`, `cancelled`, `unavailable` и `incomplete`.
+`cancel` создаёт отдельный маркер, `cleanup` проверяет ownership и состояние
+перед удалением временных каталогов. Manifest, результаты, `logs/` и `outputs/`,
+включая `outputs/direction-report.json`, сохраняются.
+
+После запуска процесса обычный `cleanup` сохраняет worktree, поскольку
+невозможно доказать отсутствие потомков, вышедших из группы процессов.
+Оператор может явно подтвердить отсутствие живых потомков:
+
+```bash
+anki-repo --json code-review execution cleanup "$JOB_PATH" --confirm-no-live-descendants
+```
+
+Этот флаг — подтверждение оператора, а не техническое доказательство.
+Проверки ownership, блокировки и безопасных путей продолжают действовать;
+в результате очистки сохраняется это ограничение. `workspace_removed` описывает
+удаление исходного worktree и временных рабочих поверхностей, а `evidence_retained` — сохранение
+свидетельств и результатов.
 
 Execution jobs и отчёты отдельных субагентов используют только свои каталоги
 внутри `runs/<unique-job-id>/` того же PR/HEAD workspace. Execution jobs
@@ -307,11 +356,12 @@ Execution jobs и отчёты отдельных субагентов испо�
 должны перезаписывать общий пакет или выходы другого job. Это разделение
 рабочих файлов предотвращает конфликты, но само по себе не является security
 sandbox и не доказывает запрет доступа к файлам, окружению, сети или секретам.
-Текущая файловая/process boundary для execution доступна на Unix; Windows
-execution завершится отказом до запуска. Полные stdout/stderr логи сохраняются
-в приватном job и могут содержать вывод программы; проверь их перед передачей
-другому агенту. `collect` и подготовка job проверяемый код автоматически не
-запускают; исполнение выбирает ревьюер с учётом действующей trust policy. Делегирование
+Текущая граница владения файлами и процессами для execution доступна на Unix;
+нативный Windows execution завершится отказом до запуска. Полные `logs/stdout.log` и `logs/stderr.log` сохраняются в приватном job
+без очистки секретов и могут содержать чувствительные значения. Маскирование
+ограниченного свидетельства в JSON не очищает эти файлы; проверь сырые логи
+перед передачей другому агенту. `collect` и подготовка job проверяемый код автоматически не
+запускают; исполнение выбирает ревьюер с учётом действующей политики доверия. Делегирование
 субагентов остаётся ответственностью Codex CLI, DSH или другого агента; у
 `anki-repo` нет общего API их запуска.
 
@@ -349,7 +399,7 @@ Cargo (компиляция, проверка, время завершения �
 доказательством происхождения классификации. Если нужные Git objects или AST
 недоступны, полная проверка завершается `syntax_authenticity_unavailable`.
 Передай `--structure-only`, чтобы ограничить проверку структурой и digest;
-результат явно помечается `structural-only`, и syntax authenticity не
+результат явно помечается `structure_only`, и syntax authenticity не
 подтверждается. Этот флаг поддерживают также команды `summary`, `list`, `group`
 и `candidate`; ограниченный результат нельзя представлять как полностью
 подлинную syntax-derived классификацию.
@@ -385,7 +435,7 @@ identity, структура очереди и доступный результ
 verification. При несовпадении команда завершается ошибкой, а частичный список
 не возвращается. Если exact Git images или AST недоступны, передай
 `--structure-only`, чтобы вывести ограниченный результат с явным статусом
-`structural-only`. В `--help` команда описана как постраничный просмотр
+`structure_only`. В `--help` команда описана как постраничный просмотр
 элементов очереди с фильтрами; доступные параметры:
 
 ```text
@@ -407,7 +457,8 @@ anki-repo code-review queue list --pack PACK --queue QUEUE [--limit N] [--offset
 одно измерение классификации; его можно сочетать с остальными фильтрами.
 Фильтр не меняет очередь и не подтверждает семантическое решение.
 
-В JSON-режиме объект `result` содержит `total_units` (все элементы очереди),
+В JSON-режиме объект `result` содержит `source_digest_valid`,
+`syntax_authenticity`, `total_units` (все элементы очереди),
 `matched_units` (число элементов после фильтрации, до пагинации), `offset`, `limit`,
 `returned_units`, `has_more` и страницу `units`. Каждый элемент `units` — краткая
 запись с `id`, `kind`, `priority`, `classification`, `detector`,
@@ -2519,6 +2570,8 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `10` | `code-review execution run`: выполнение нельзя считать полным или воспроизводимым (`incomplete`) |
 | `11` | `code-review execution run`: команда остановлена по timeout (`timed_out`) |
 | `12` | `code-review execution run`: команда отменена запросом или сигналом (`cancelled`) |
+| `13` | Временная занятость job или общего предела исполнения (`execution_busy`); `details.retryable: true` |
+| `14` | Ошибка операции с процессом (`process_operation_failed`) |
 | `70` | Неожиданная внутренняя ошибка, включая нарушение внутреннего инварианта правки и отказ записи вывода (нет места на диске, негодный дескриптор) |
 | `127` | `code-review execution run`: исполняемая команда недоступна (`unavailable`) |
 
@@ -2555,6 +2608,8 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `git_evidence_failed` | 3 | `code-review`: у коммитов нет общего предка, область изменений Git недоступна или машинный ответ Git некорректен |
 | `review_artifact_invalid` | 3 | `code-review`/`language`: JSON, версия схемы либо лимит размера артефакта не прошли проверку; `code-review queue validate`/`summary`/`list`/`group`/`candidate`: структура очереди недействительна либо указанный в очереди SHA-256 исходного пакета не совпадает с хэшем точных байтов `review.json` |
 | `baseline_mismatch` | 3 | `verify`/`delta`: идентичность диапазона, base SHA или merge-base отличаются от исходного пакета; `code-review queue validate`/`summary`/`list`/`group`/`candidate`: Git-снимок очереди не совпадает со снимком исходного `review.json` |
+| `execution_busy` | 13 | Временная занятость execution job или общего предела; `details.retryable: true`, `resource` и `reason` позволяют отличить её от постоянного конфликта артефакта |
+| `process_operation_failed` | 14 | Не удалось выполнить операцию с процессом; это не ошибка записи review artifact |
 | `syntax_authenticity_unavailable` | 3 | `code-review queue validate`/`summary`/`list`/`group`/`candidate`: exact Git images или AST недоступны; для явной ограниченной проверки структуры и digest передай `--structure-only` |
 | `language_decision_invalid` | 3 | `language apply`: решение, якорь или ограничение замены не прошли предварительную проверку |
 | `not_found` | 4 | `find` и `review --guid`: нет совпадений по заданному критерию; `code-review queue group` / `candidate`: указанный unit или candidate ID отсутствует |

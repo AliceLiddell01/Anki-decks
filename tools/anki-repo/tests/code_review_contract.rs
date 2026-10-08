@@ -3095,7 +3095,19 @@ fn queue_cli_rejects_consistent_forgery_but_marks_structure_only_explicitly() {
     };
     use anki_repo::code_review::scope::FileSurface;
 
-    let (repo, base, head) = boundary_fixture("queue-authenticity-boundary");
+    let (repo, base, _) = boundary_fixture("queue-authenticity-boundary");
+    let mut source = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    source.push_str("#[cfg(test)] mod tests { #[test] fn setup() {\n");
+    for _ in 0..3 {
+        source.push_str("let _ = Result::<(), &str>::Err(\"fixture\").unwrap();\n");
+    }
+    source.push_str("} }\n");
+    fs::write(repo.path().join("src/lib.rs"), source).unwrap();
+    commit(
+        repo.path(),
+        "Добавить синтетическую группу тестовых сигналов",
+    );
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
     let output = review_workspace(repo.path(), &head);
     collect_pack(repo.path(), &base, &head, &output, false);
     let pack_path = output.join("review.json");
@@ -3116,6 +3128,30 @@ fn queue_cli_rejects_consistent_forgery_but_marks_structure_only_explicitly() {
         parse_json(&stdout)["result"]["syntax_authenticity"],
         "verified"
     );
+    let authentic: review_queue::ReviewQueue =
+        serde_json::from_slice(&fs::read(&queue_path).unwrap()).unwrap();
+    let authentic_group = authentic.units.iter().find(|unit| unit.is_group()).unwrap();
+    let authentic_candidate = authentic_group.candidate_ids()[0].clone();
+    for command in ["list", "summary", "group", "candidate"] {
+        let mut read_arguments = arguments.to_vec();
+        read_arguments[3] = command;
+        if command == "group" || command == "candidate" {
+            read_arguments.extend([
+                "--id",
+                if command == "group" {
+                    &authentic_group.id
+                } else {
+                    &authentic_candidate
+                },
+            ]);
+        }
+        let result = review_success(run_cli_in(Some(repo.path()), &read_arguments));
+        assert_eq!(result["source_digest_valid"], true, "{command}: {result}");
+        assert_eq!(
+            result["syntax_authenticity"], "verified",
+            "{command}: {result}"
+        );
+    }
     let bytes = fs::read(&pack_path).unwrap();
     let pack: ReviewPack = serde_json::from_slice(&bytes).unwrap();
     let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
@@ -3144,13 +3180,43 @@ fn queue_cli_rejects_consistent_forgery_but_marks_structure_only_explicitly() {
         run_cli_in(Some(repo.path()), &arguments),
         "review_artifact_invalid",
     );
-    let mut structure_arguments = arguments.to_vec();
-    structure_arguments.push("--structure-only");
-    let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &structure_arguments);
-    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
-    let result = parse_json(&stdout)["result"].clone();
-    assert_eq!(result["source_digest_valid"], true);
-    assert_eq!(result["syntax_authenticity"], "structure_only");
+    let group_id = forged
+        .units
+        .iter()
+        .find(|unit| unit.is_group())
+        .unwrap()
+        .id
+        .clone();
+    let candidate_id = pack.all_candidates()[0].id.clone();
+    for command in ["validate", "list", "summary", "group", "candidate"] {
+        let mut read_arguments = arguments.to_vec();
+        read_arguments[3] = command;
+        if command == "group" || command == "candidate" {
+            read_arguments.extend([
+                "--id",
+                if command == "group" {
+                    &group_id
+                } else {
+                    &candidate_id
+                },
+            ]);
+        }
+        assert_review_failure(
+            run_cli_in(Some(repo.path()), &read_arguments),
+            "review_artifact_invalid",
+        );
+        read_arguments.push("--structure-only");
+        let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &read_arguments);
+        assert_eq!(code, 0, "{command}: stdout: {stdout}\nstderr: {stderr}");
+        let result = parse_json(&stdout)["result"].clone();
+        assert_eq!(result["source_digest_valid"], true, "{command}: {result}");
+        assert_eq!(
+            result["syntax_authenticity"], "structure_only",
+            "{command}: {result}"
+        );
+        assert_eq!(fs::read(&queue_path).unwrap(), forged_bytes);
+        assert_eq!(fs::read(&pack_path).unwrap(), bytes);
+    }
     assert_eq!(fs::read(&queue_path).unwrap(), forged_bytes);
     assert_eq!(fs::read(&pack_path).unwrap(), bytes);
 }
@@ -3300,4 +3366,46 @@ fn verify_and_delta_allow_external_input_but_reject_writes_outside_review_worksp
     );
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(parse_json(&stdout)["result"]["after"]["head_sha"], head);
+}
+
+#[test]
+fn returned_artifact_path_is_reusable_from_repository_root() {
+    let (repo, base, head) = boundary_fixture("review-returned-root-path");
+    let worktrees_before = git(repo.path(), &["worktree", "list", "--porcelain"]);
+    let result = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "collect",
+            "--base",
+            &base,
+            "--head",
+            &head,
+        ],
+    ));
+    let artifact = result["artifact_dir"].as_str().unwrap();
+    assert!(!Path::new(artifact).is_absolute());
+    let pack = format!("{artifact}/review.json");
+    let queue = format!("{artifact}/review-queue.json");
+    let result = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "list",
+            "--pack",
+            &pack,
+            "--queue",
+            &queue,
+        ],
+    ));
+    assert_eq!(result["source_digest_valid"], true);
+    assert_eq!(result["syntax_authenticity"], "verified");
+    assert_eq!(
+        git(repo.path(), &["worktree", "list", "--porcelain"]),
+        worktrees_before
+    );
+    assert!(!repo.path().join(artifact).join("runs").exists());
 }
