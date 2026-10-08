@@ -254,16 +254,86 @@ pub fn initialize(pack: &ReviewPack, source_pack_sha256: &str) -> SemanticTriage
     let ids: BTreeSet<_> = pack.all_candidates().into_iter().map(|c| c.id).collect();
     SemanticTriage {
         schema_version: TRIAGE_SCHEMA_VERSION,
-        source: TriageSource {
-            snapshot: TriageSnapshot::from(&pack.target),
-            review_pack_sha256: source_pack_sha256.to_owned(),
-            candidate_count: ids.len(),
-        },
+        source: source_identity(pack, source_pack_sha256),
         individual_decisions: Vec::new(),
         group_decisions: Vec::new(),
         findings: Vec::new(),
         unreviewed_candidate_ids: ids.into_iter().collect(),
     }
+}
+
+/// Создаёт общую для производных review-artifacts идентичность точного пакета.
+#[must_use]
+pub fn source_identity(pack: &ReviewPack, source_pack_sha256: &str) -> TriageSource {
+    let candidate_count = pack
+        .all_candidates()
+        .into_iter()
+        .map(|candidate| candidate.id)
+        .collect::<BTreeSet<_>>()
+        .len();
+    TriageSource {
+        snapshot: TriageSnapshot::from(&pack.target),
+        review_pack_sha256: source_pack_sha256.to_owned(),
+        candidate_count,
+    }
+}
+
+/// Проверяет общую границу неизменного источника для семантического разбора и очереди ревью.
+///
+/// Дайджест должен быть вычислен по точным байтам `review.json`, а не по
+/// повторно сериализованной структуре. Проверка не назначает кандидатам
+/// семантический статус.
+pub fn validate_source(
+    source: &TriageSource,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> Result<(), DomainError> {
+    validate_source_for(
+        source,
+        pack,
+        source_pack_sha256,
+        "производного review-artifact",
+    )
+}
+
+fn validate_source_for(
+    source: &TriageSource,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+    artifact_label: &str,
+) -> Result<(), DomainError> {
+    let valid_digest = source_pack_sha256.len() == 64
+        && source_pack_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid_digest || source.review_pack_sha256 != source_pack_sha256 {
+        return Err(invalid(format!(
+            "SHA-256 {artifact_label} не соответствует точным байтам исходного review.json"
+        )));
+    }
+    if source.snapshot != TriageSnapshot::from(&pack.target) {
+        return Err(DomainError::new(
+            ErrorCode::BaselineMismatch,
+            format!("Git-снимок {artifact_label} не соответствует исходному review.json"),
+        ));
+    }
+    let all_candidates = pack.all_candidates();
+    let candidates: BTreeSet<_> = all_candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    if all_candidates.len() != candidates.len() || candidates.iter().any(|id| id.trim().is_empty())
+    {
+        return Err(invalid(
+            "В исходном review.json есть пустые или повторяющиеся ID кандидатов",
+        ));
+    }
+    if source.candidate_count != candidates.len() {
+        return Err(invalid(
+            "Значение candidate_count не соответствует числу кандидатов в исходном review.json",
+        ));
+    }
+    Ok(())
 }
 
 /// Сортирует множества, сохраняя дубликаты для последующего отказа проверки.
@@ -369,34 +439,14 @@ pub fn validate(
             "Неподдерживаемое значение schema_version документа семантического разбора",
         ));
     }
-    let valid_digest = source_pack_sha256.len() == 64
-        && source_pack_sha256
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !valid_digest || triage.source.review_pack_sha256 != source_pack_sha256 {
-        return Err(invalid(
-            "SHA-256 документа семантического разбора не соответствует точным байтам исходного review.json",
-        ));
-    }
-    if triage.source.snapshot != TriageSnapshot::from(&pack.target) {
-        return Err(DomainError::new(
-            ErrorCode::BaselineMismatch,
-            "Git-снимок документа семантического разбора не соответствует исходному review.json",
-        ));
-    }
+    validate_source_for(
+        &triage.source,
+        pack,
+        source_pack_sha256,
+        "документа семантического разбора",
+    )?;
     let all_candidates = pack.all_candidates();
     let candidates: BTreeSet<_> = all_candidates.iter().map(|c| c.id.clone()).collect();
-    if all_candidates.len() != candidates.len() || candidates.iter().any(|id| id.trim().is_empty())
-    {
-        return Err(invalid(
-            "В исходном review.json есть пустые или повторяющиеся ID кандидатов",
-        ));
-    }
-    if triage.source.candidate_count != candidates.len() {
-        return Err(invalid(
-            "Значение candidate_count не соответствует числу кандидатов в исходном review.json",
-        ));
-    }
     let mut findings = BTreeMap::new();
     for finding in &triage.findings {
         require_nonempty(&finding.id, "finding.id")?;

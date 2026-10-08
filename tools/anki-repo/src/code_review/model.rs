@@ -124,6 +124,18 @@ pub enum CandidateOrigin {
     Unknown,
 }
 
+impl CandidateOrigin {
+    /// Стабильная метка происхождения в машиночитаемом формате.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntroducedOrChanged => "introduced_or_changed",
+            Self::PreExisting => "pre_existing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Итог анализатора без дублирования диагностик, которые хранятся рядом в review-pack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRunEvidence {
@@ -225,9 +237,30 @@ pub struct ToolRunChange {
 }
 
 impl ReviewPack {
+    /// Индексирует файлы по текущему пути, сохраняя первый элемент при совпадении.
+    pub(crate) fn scope_files_by_path(&self) -> BTreeMap<&str, &ReviewFile> {
+        let mut files = BTreeMap::new();
+        for file in &self.scope.files {
+            files.entry(file.path.as_str()).or_insert(file);
+        }
+        files
+    }
+
+    /// Индексирует текущие пути, затем добавляет предыдущие как псевдонимы без перезаписи.
+    pub(crate) fn scope_files_by_candidate_path(&self) -> BTreeMap<&str, &ReviewFile> {
+        let mut files = self.scope_files_by_path();
+        for file in &self.scope.files {
+            if let Some(previous_path) = file.previous_path.as_deref() {
+                files.entry(previous_path).or_insert(file);
+            }
+        }
+        files
+    }
+
     /// Возвращает всех кандидатов одним детерминированным списком.
     #[must_use]
     pub fn all_candidates(&self) -> Vec<CandidateEvidence> {
+        let files_by_path = self.scope_files_by_path();
         let mut candidates = self.candidates.clone();
         candidates.extend(self.language.candidates.iter().map(|candidate| {
             let mut metadata = BTreeMap::new();
@@ -241,12 +274,9 @@ impl ReviewPack {
                 "context".to_owned(),
                 serde_json::to_value(candidate.context).unwrap_or(Value::Null),
             );
-            let origin = self
-                .scope
-                .files
-                .iter()
-                .find(|file| file.path == candidate.path)
-                .map_or(CandidateOrigin::Unknown, |file| {
+            let origin = files_by_path.get(candidate.path.as_str()).copied().map_or(
+                CandidateOrigin::Unknown,
+                |file| {
                     if file.binary {
                         return CandidateOrigin::Unknown;
                     }
@@ -277,7 +307,8 @@ impl ReviewPack {
                     } else {
                         CandidateOrigin::Unknown
                     }
-                });
+                },
+            );
             CandidateEvidence {
                 id: candidate.id.clone(),
                 detector: "residual_foreign_human_text".to_owned(),
@@ -415,5 +446,23 @@ mod tests {
         file.binary = true;
         file.post_state = ImageState::Binary;
         assert_eq!(pack.all_candidates()[0].origin, CandidateOrigin::Unknown);
+    }
+
+    #[test]
+    fn current_path_takes_precedence_over_renamed_file_alias() {
+        let mut pack = language_pack("// Existing English explanation\n", Vec::new());
+        let mut renamed = pack.scope.files[0].clone();
+        renamed.path = "src/new.rs".into();
+        renamed.previous_path = Some("src/reused.rs".into());
+
+        let mut added_at_previous_path = renamed.clone();
+        added_at_previous_path.path = "src/reused.rs".into();
+        added_at_previous_path.previous_path = None;
+        added_at_previous_path.status = FileStatus::Added;
+        pack.scope.files = vec![renamed, added_at_previous_path];
+
+        let files = pack.scope_files_by_candidate_path();
+        assert_eq!(files["src/new.rs"].path, "src/new.rs");
+        assert_eq!(files["src/reused.rs"].path, "src/reused.rs");
     }
 }

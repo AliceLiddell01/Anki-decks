@@ -25,10 +25,12 @@ dependencies = [
  "clap",
  "fs2",
  "getrandom 0.4.3",
+ "proc-macro2",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "syn 2.0.119",
  "thiserror",
  "yaml_serde",
 ]

@@ -14,10 +14,11 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::cli::{
-    Cli, CodeReviewCommand, Command, LanguageCommand, MatchArg, SemanticTriageCommand,
+    Cli, CodeReviewCommand, Command, LanguageCommand, MatchArg, ReviewQueueCommand,
+    SemanticTriageCommand,
 };
 use crate::code_review::model::CandidateStatus;
-use crate::code_review::workflow::{LanguageSummary, SnapshotSummary};
+use crate::code_review::workflow::{LanguageSummary, SnapshotSummary, display_counts};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
 use crate::loader::load_export;
@@ -83,9 +84,11 @@ struct LanguageCandidateSummary {
 #[derive(Serialize)]
 struct SnapshotOutput {
     artifact_dir: String,
+    review_queue_artifact: String,
     target: crate::code_review::scope::GitTarget,
     files: usize,
     candidates: usize,
+    review_queue: crate::code_review::review_queue::QueueSummary,
     diagnostics: usize,
     tool_runs: Vec<crate::code_review::model::ToolRunEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,9 +141,11 @@ fn snapshot_output(summary: &SnapshotSummary) -> SnapshotOutput {
     });
     SnapshotOutput {
         artifact_dir: summary.artifact_dir.clone(),
+        review_queue_artifact: summary.review_queue_artifact.clone(),
         target: summary.target.clone(),
         files: summary.files,
         candidates: summary.candidates,
+        review_queue: summary.review_queue.clone(),
         diagnostics: summary.diagnostics,
         tool_runs: summary.tool_runs.clone(),
         delta,
@@ -584,6 +589,97 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     exit: 0,
                 })
             }
+            CodeReviewCommand::Queue { command } => match command {
+                ReviewQueueCommand::List {
+                    pack,
+                    queue,
+                    limit,
+                    offset,
+                    priority,
+                    unknown,
+                    detector,
+                    surface,
+                    execution,
+                    role,
+                    text_role,
+                    code_role,
+                } => {
+                    let options = crate::code_review::workflow::ReviewQueueListOptions {
+                        priority: *priority,
+                        unknown: *unknown,
+                        detector: detector.clone(),
+                        surface: *surface,
+                        execution: *execution,
+                        role: *role,
+                        text_role: *text_role,
+                        code_role: *code_role,
+                        offset: *offset,
+                        limit: *limit,
+                    };
+                    let result =
+                        crate::code_review::workflow::list_review_queue(pack, queue, &options)?;
+                    Ok(Rendered {
+                        command: "code-review queue list",
+                        stdout: if cli.json {
+                            json::generic_json("code-review queue list", result)
+                        } else {
+                            human_review_queue_list(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                ReviewQueueCommand::Validate { pack, queue } => {
+                    let result = crate::code_review::workflow::validate_review_queue(pack, queue)?;
+                    Ok(Rendered {
+                        command: "code-review queue validate",
+                        stdout: if cli.json {
+                            json::generic_json("code-review queue validate", result)
+                        } else {
+                            human_review_queue_validation(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                ReviewQueueCommand::Summary { pack, queue } => {
+                    let result = crate::code_review::workflow::summarize_review_queue(pack, queue)?;
+                    Ok(Rendered {
+                        command: "code-review queue summary",
+                        stdout: if cli.json {
+                            json::generic_json("code-review queue summary", result)
+                        } else {
+                            human_review_queue_summary(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                ReviewQueueCommand::Group { pack, queue, id } => {
+                    let result =
+                        crate::code_review::workflow::expand_review_queue_group(pack, queue, id)?;
+                    Ok(Rendered {
+                        command: "code-review queue group",
+                        stdout: if cli.json {
+                            json::generic_json("code-review queue group", result)
+                        } else {
+                            human_review_queue_group(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                ReviewQueueCommand::Candidate { pack, queue, id } => {
+                    let result = crate::code_review::workflow::inspect_review_queue_candidate(
+                        pack, queue, id,
+                    )?;
+                    Ok(Rendered {
+                        command: "code-review queue candidate",
+                        stdout: if cli.json {
+                            json::generic_json("code-review queue candidate", result)
+                        } else {
+                            human_review_queue_candidate(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+            },
             CodeReviewCommand::Triage { command } => match command {
                 SemanticTriageCommand::Init { pack, out } => {
                     let result = crate::code_review::workflow::init_semantic_triage(pack, out)?;
@@ -736,8 +832,22 @@ fn human_snapshot(result: &crate::code_review::workflow::SnapshotSummary) -> Str
     let _ = writeln!(text, "Файлов: {}", result.files);
     let _ = writeln!(
         text,
-        "Кандидатов: {} (нужна семантическая проверка)",
-        result.candidates
+        "Структурная очередь: {}",
+        result.review_queue_artifact
+    );
+    let _ = writeln!(
+        text,
+        "Кандидатов: {}; единиц ревью: {} (отдельных: {}, групп: {}, кандидатов в группах: {}, с неизвестной классификацией: {})",
+        result.review_queue.raw_candidates,
+        result.review_queue.review_units,
+        result.review_queue.individual_units,
+        result.review_queue.group_units,
+        result.review_queue.grouped_candidates,
+        result.review_queue.unknown_candidates,
+    );
+    let _ = writeln!(
+        text,
+        "Полные свидетельства: review.json; навигационная сводка: review.txt"
     );
     let _ = writeln!(
         text,
@@ -764,6 +874,289 @@ fn human_snapshot(result: &crate::code_review::workflow::SnapshotSummary) -> Str
             "Сравнение сигналов детекторов не подтверждает исправление дефекта."
         );
     }
+    text
+}
+
+fn human_review_queue_validation(
+    result: &crate::code_review::workflow::ReviewQueueValidationSummary,
+) -> String {
+    format!(
+        "Структурная очередь проверена: {}.\nСырых кандидатов: {}; единиц ревью: {}; отдельных: {}; групп: {}.\n",
+        if result.valid {
+            "валидна"
+        } else {
+            "невалидна"
+        },
+        result.summary.raw_candidates,
+        result.summary.review_units,
+        result.summary.individual_units,
+        result.summary.group_units,
+    )
+}
+
+fn human_review_queue_summary(summary: &crate::code_review::review_queue::QueueSummary) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "Структурная очередь\nСырых кандидатов: {}; единиц ревью: {} (отдельных: {}, групп: {}).\nКандидатов в группах: {}; представителей: {}; с неизвестной классификацией: {}.\n",
+        summary.raw_candidates,
+        summary.review_units,
+        summary.individual_units,
+        summary.group_units,
+        summary.grouped_candidates,
+        summary.representative_candidates,
+        summary.unknown_candidates,
+    );
+    let _ = writeln!(
+        text,
+        "Приоритет единиц ревью: {}",
+        display_counts(
+            &summary
+                .units_by_priority
+                .iter()
+                .map(|(key, value)| (key.as_str(), *value))
+                .collect(),
+            |key| (*key).to_owned(),
+        )
+    );
+    let _ = writeln!(
+        text,
+        "Детекторы: {}",
+        display_counts(&summary.by_detector, |key| key.clone())
+    );
+    let _ = writeln!(
+        text,
+        "Поверхности: {}",
+        display_counts(&summary.by_surface, |key| key.clone())
+    );
+    let _ = writeln!(
+        text,
+        "Исполнение: {}; структурные роли: {}; роли текста: {}; роли кода: {}",
+        display_counts(&summary.by_execution, |key| key.clone()),
+        display_counts(&summary.by_structural_role, |key| key.as_str().to_owned()),
+        display_counts(&summary.by_text_role, |key| key.as_str().to_owned()),
+        display_counts(&summary.by_code_role, |key| key.as_str().to_owned()),
+    );
+    if !summary.largest_group_sizes.is_empty() {
+        let _ = writeln!(
+            text,
+            "Крупнейшие группы: {}",
+            summary
+                .largest_group_sizes
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let _ = writeln!(
+        text,
+        "Классификация и приоритет задают навигацию, а не семантическое решение."
+    );
+    text
+}
+
+fn human_review_queue_list(page: &crate::code_review::review_queue::QueueListPage) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "Всего единиц: {}; совпало по фильтрам: {}; смещение: {}; показано: {}; есть следующая страница: {}.\n",
+        page.total_units,
+        page.matched_units,
+        page.offset,
+        page.returned_units,
+        if page.has_more { "да" } else { "нет" },
+    );
+    for unit in &page.units {
+        let classification = &unit.classification;
+        let kind = match unit.kind {
+            crate::code_review::review_queue::QueueUnitKind::Individual => "отдельная единица",
+            crate::code_review::review_queue::QueueUnitKind::Group => "группа",
+        };
+        let surfaces = if classification.surfaces.is_empty() {
+            "unknown".to_owned()
+        } else {
+            classification
+                .surfaces
+                .iter()
+                .map(crate::code_review::review_queue::surface_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = writeln!(
+            text,
+            "{} · {} · приоритет {} · детектор {} · кандидатов: {}",
+            unit.id,
+            kind,
+            unit.priority.as_str(),
+            unit.detector,
+            unit.candidate_count
+        );
+        let _ = writeln!(
+            text,
+            "  Классификация: поверхности {}; исполнение {}; структурная роль {}; роль текста {}; роль кода {}.",
+            surfaces,
+            classification
+                .execution
+                .as_ref()
+                .map_or("unknown", crate::code_review::review_queue::surface_name),
+            classification.role.as_str(),
+            classification
+                .text_role
+                .map_or("не применяется", |role| role.as_str()),
+            classification.code_role.as_str(),
+        );
+        if let Some(candidate_id) = &unit.candidate_id {
+            let _ = writeln!(text, "  Исходный ID кандидата: {candidate_id}");
+        }
+        if !unit.representative_candidate_ids.is_empty() {
+            let representatives = unit
+                .representative_candidate_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(text, "  Представители: {representatives}");
+        }
+    }
+    text
+}
+
+fn human_review_queue_group(
+    result: &crate::code_review::workflow::ReviewQueueGroupDetail,
+) -> String {
+    use std::fmt::Write as _;
+    let class = &result.unit.signature.classification;
+    let mut text = format!(
+        "Группа {}\nПриоритет: {}; кандидатов: {}; детектор: {}; семейство путей: {}.\nРоль: {}; исполнение: {}; роль текста: {}; роль кода: {}; происхождение: {}.\n",
+        result.unit.id,
+        result.unit.priority.as_str(),
+        result.unit.candidate_ids().len(),
+        result.unit.signature.detector,
+        result.unit.signature.path_family,
+        class.role.as_str(),
+        class
+            .execution
+            .as_ref()
+            .map_or("unknown", crate::code_review::review_queue::surface_name),
+        class
+            .text_role
+            .map_or("не применяется", |role| role.as_str()),
+        class.code_role.as_str(),
+        class.origin.as_str(),
+    );
+    let _ = writeln!(text, "Представители:");
+    for detail in &result.representatives {
+        let line = detail
+            .candidate
+            .line
+            .map_or_else(String::new, |line| format!(":{line}"));
+        let snippet = detail
+            .candidate
+            .snippet
+            .as_deref()
+            .map(crate::text::bounded_sample)
+            .map(|value| format!(" — {}", value.replace(['\r', '\n'], "↵")))
+            .unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "  {} {}{}{}",
+            detail.candidate.id, detail.candidate.path, line, snippet
+        );
+    }
+    let ids = result
+        .unit
+        .candidate_ids()
+        .iter()
+        .take(20)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        text,
+        "ID кандидатов (первые {}): {ids}",
+        result.unit.candidate_ids().len().min(20)
+    );
+    if result.unit.candidate_ids().len() > 20 {
+        let _ = writeln!(
+            text,
+            "Остальные ID доступны в --json; подробности кандидата: `code-review queue candidate --id ID`."
+        );
+    }
+    let _ = writeln!(
+        text,
+        "Группа не является общим семантическим решением; неоднородные случаи нужно рассматривать отдельно."
+    );
+    text
+}
+
+fn human_review_queue_candidate(
+    result: &crate::code_review::workflow::ReviewQueueCandidateDetail,
+) -> String {
+    use std::fmt::Write as _;
+    let candidate = &result.candidate;
+    let class = &result.classification;
+    let line = candidate
+        .line
+        .map_or_else(String::new, |line| format!(":{line}"));
+    let snippet = candidate
+        .snippet
+        .as_deref()
+        .map(crate::text::bounded_sample)
+        .unwrap_or_default();
+    let surfaces = if class.surfaces.is_empty() {
+        "unknown".to_owned()
+    } else {
+        class
+            .surfaces
+            .iter()
+            .map(crate::code_review::review_queue::surface_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut text = format!(
+        "Кандидат {}\n{}{} · детектор: {} · происхождение: {}\nСигналы: {}\nФрагмент: {}\nПоверхности: {}; исполнение: {}; роль: {}; роль текста: {}; роль кода: {}\nОчередь: {} ({}, приоритет: {}).\n",
+        candidate.id,
+        candidate.path,
+        line,
+        candidate.detector,
+        candidate.origin.as_str(),
+        candidate.signals.join(", "),
+        snippet,
+        surfaces,
+        class
+            .execution
+            .as_ref()
+            .map_or("unknown", crate::code_review::review_queue::surface_name),
+        class.role.as_str(),
+        class
+            .text_role
+            .map_or("не применяется", |role| role.as_str()),
+        class.code_role.as_str(),
+        result.unit.id,
+        if result.unit.is_group() {
+            "группа"
+        } else {
+            "отдельный кандидат"
+        },
+        result.unit.priority.as_str(),
+    );
+    if result.unit.is_group() {
+        let _ = writeln!(
+            text,
+            "Участников группы: {}; представителей: {}.",
+            result.unit.candidate_ids().len(),
+            result
+                .unit
+                .representative_candidate_ids()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let _ = writeln!(
+        text,
+        "Свидетельство — это сигнал, а не подтверждённое замечание."
+    );
     text
 }
 
@@ -1254,6 +1647,207 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn review_queue_candidate_detail() -> crate::code_review::workflow::ReviewQueueCandidateDetail {
+        use crate::code_review::model::{CandidateEvidence, CandidateOrigin};
+        use crate::code_review::review_queue::{
+            ClassificationBasis, CodeRole, GroupingSignature, ReviewPriority, ReviewUnit,
+            StructuralClassification, StructuralRole, TextRole, UnitMembers, UnitStatistics,
+        };
+        use crate::code_review::scope::{FileCategory, FileSurface};
+
+        let classification = StructuralClassification {
+            surfaces: vec![FileSurface::Tests],
+            surface_basis: ClassificationBasis::FileContext,
+            file_category: Some(FileCategory::Rust),
+            execution: Some(FileSurface::Tests),
+            execution_basis: ClassificationBasis::FileContext,
+            origin: CandidateOrigin::IntroducedOrChanged,
+            role: StructuralRole::ErrorPath,
+            role_basis: ClassificationBasis::Detector,
+            text_role: Some(TextRole::HumanComment),
+            text_basis: ClassificationBasis::Detector,
+            code_role: CodeRole::TestHelper,
+            code_basis: ClassificationBasis::SyntaxContext,
+            syntax_signature: None,
+        };
+        let unit = ReviewUnit {
+            id: "unit-1".into(),
+            members: UnitMembers::Group {
+                candidate_ids: vec!["candidate-1".into(), "candidate-2".into()],
+                representative_candidate_ids: vec!["candidate-1".into()],
+            },
+            signature: GroupingSignature {
+                detector: "error_path".into(),
+                source: "synthetic_detector".into(),
+                classification: classification.clone(),
+                detector_signals: vec!["unwrap_call".into()],
+                text_context: None,
+                path_family: "tools/anki-repo/src".into(),
+                structural_pattern: None,
+            },
+            priority: ReviewPriority::Normal,
+            priority_signals: Vec::new(),
+            statistics: UnitStatistics {
+                candidates: 2,
+                paths: std::collections::BTreeMap::from([("src/lib.rs".into(), 2)]),
+            },
+        };
+
+        crate::code_review::workflow::ReviewQueueCandidateDetail {
+            candidate: CandidateEvidence {
+                id: "candidate-1".into(),
+                detector: "error_path".into(),
+                path: "src/lib.rs".into(),
+                line: Some(7),
+                column: None,
+                snippet: Some("result.unwrap()".into()),
+                origin: CandidateOrigin::IntroducedOrChanged,
+                signals: vec!["unwrap_call".into()],
+                source: "synthetic_detector".into(),
+                metadata: std::collections::BTreeMap::new(),
+            },
+            classification,
+            unit,
+        }
+    }
+
+    #[test]
+    fn review_queue_group_uses_stable_labels() {
+        let detail = review_queue_candidate_detail();
+        let result = crate::code_review::workflow::ReviewQueueGroupDetail {
+            unit: detail.unit,
+            representatives: vec![
+                crate::code_review::workflow::ReviewQueueRepresentativeDetail {
+                    candidate: detail.candidate,
+                    classification: detail.classification,
+                },
+            ],
+        };
+
+        let rendered = human_review_queue_group(&result);
+        for label in [
+            "Роль: error_path",
+            "исполнение: tests",
+            "роль текста: human_comment",
+            "роль кода: test_helper",
+            "происхождение: introduced_or_changed",
+        ] {
+            assert!(rendered.contains(label), "нет метки {label:?}: {rendered}");
+        }
+        for unstable in [
+            "ErrorPath",
+            "Some(",
+            "HumanComment",
+            "TestHelper",
+            "IntroducedOrChanged",
+        ] {
+            assert!(
+                !rendered.contains(unstable),
+                "найдена нестабильная метка {unstable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_queue_candidate_uses_stable_labels() {
+        let result = review_queue_candidate_detail();
+
+        let rendered = human_review_queue_candidate(&result);
+        for label in [
+            "Поверхности: tests",
+            "исполнение: tests",
+            "роль: error_path",
+            "роль текста: human_comment",
+            "роль кода: test_helper",
+            "происхождение: introduced_or_changed",
+            "Участников группы: 2; представителей: candidate-1.",
+            "Свидетельство — это сигнал, а не подтверждённое замечание.",
+        ] {
+            assert!(rendered.contains(label), "нет метки {label:?}: {rendered}");
+        }
+        for unstable in [
+            "ErrorPath",
+            "Some(",
+            "HumanComment",
+            "TestHelper",
+            "IntroducedOrChanged",
+        ] {
+            assert!(
+                !rendered.contains(unstable),
+                "найдена нестабильная метка {unstable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_queue_outputs_mark_missing_text_role_as_not_applicable() {
+        use crate::code_review::review_queue::{QueueListItem, QueueListPage, QueueUnitKind};
+
+        let mut detail = review_queue_candidate_detail();
+        detail.classification.text_role = None;
+        detail.unit.signature.classification.text_role = None;
+
+        assert!(human_review_queue_candidate(&detail).contains("роль текста: не применяется"));
+
+        let group = crate::code_review::workflow::ReviewQueueGroupDetail {
+            unit: detail.unit.clone(),
+            representatives: vec![
+                crate::code_review::workflow::ReviewQueueRepresentativeDetail {
+                    candidate: detail.candidate.clone(),
+                    classification: detail.classification.clone(),
+                },
+            ],
+        };
+        assert!(human_review_queue_group(&group).contains("роль текста: не применяется"));
+
+        let page = QueueListPage {
+            total_units: 1,
+            matched_units: 1,
+            offset: 0,
+            limit: 50,
+            returned_units: 1,
+            has_more: false,
+            units: vec![QueueListItem {
+                id: detail.unit.id,
+                kind: QueueUnitKind::Group,
+                candidate_id: None,
+                priority: detail.unit.priority,
+                classification: detail.classification,
+                detector: "error_path".into(),
+                candidate_count: 2,
+                representative_candidate_ids: vec!["candidate-1".into()],
+            }],
+        };
+        assert!(human_review_queue_list(&page).contains("роль текста не применяется"));
+    }
+
+    #[test]
+    fn review_queue_summary_uses_stable_enum_labels() {
+        use crate::code_review::review_queue::{CodeRole, QueueSummary, StructuralRole, TextRole};
+
+        let mut summary = QueueSummary::default();
+        summary.by_execution.insert("production".into(), 4);
+        summary
+            .by_structural_role
+            .insert(StructuralRole::ErrorPath, 1);
+        summary.by_text_role.insert(TextRole::HumanDocumentation, 2);
+        summary.by_code_role.insert(CodeRole::RuntimeBoundary, 3);
+
+        let rendered = human_review_queue_summary(&summary);
+        for label in [
+            "production: 4",
+            "error_path: 1",
+            "human_documentation: 2",
+            "runtime_boundary: 3",
+        ] {
+            assert!(
+                rendered.contains(label),
+                "summary omits {label:?}: {rendered}"
+            );
+        }
+        assert!(!rendered.contains("runtimeboundary"));
+    }
 
     /// Бесконечный reader: если бы чтение не было ограничено, тест не завершился
     /// бы, поэтому это прямая проверка предела, а не косвенная.
