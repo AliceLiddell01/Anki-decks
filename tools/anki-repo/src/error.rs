@@ -64,6 +64,8 @@ pub enum ErrorCode {
     ReviewArtifactInvalid,
     /// Исходный пакет относится к другому репозиторию или несовместимой базе.
     BaselineMismatch,
+    /// Полная проверка syntax-derived queue невозможна из-за недоступного или непарсируемого AST.
+    SyntaxAuthenticityUnavailable,
     /// Путь пакета ревью занят несовместимым сохранённым содержимым.
     ReviewArtifactConflict,
     /// Решения для языковой проверки не прошли безопасную проверку предусловий.
@@ -123,6 +125,7 @@ impl ErrorCode {
             Self::GitEvidenceFailed => "git_evidence_failed",
             Self::ReviewArtifactInvalid => "review_artifact_invalid",
             Self::BaselineMismatch => "baseline_mismatch",
+            Self::SyntaxAuthenticityUnavailable => "syntax_authenticity_unavailable",
             Self::ReviewArtifactConflict => "review_artifact_conflict",
             Self::LanguageDecisionInvalid => "language_decision_invalid",
             Self::NotFound => "not_found",
@@ -162,6 +165,7 @@ impl ErrorCode {
             | Self::GitEvidenceFailed
             | Self::ReviewArtifactInvalid
             | Self::BaselineMismatch
+            | Self::SyntaxAuthenticityUnavailable
             | Self::LanguageDecisionInvalid
             | Self::UnknownQaCode
             | Self::SourceNotCanonical
@@ -257,6 +261,7 @@ mod tests {
         assert_eq!(ErrorCode::GitEvidenceFailed.exit_code(), 3);
         assert_eq!(ErrorCode::ReviewArtifactInvalid.exit_code(), 3);
         assert_eq!(ErrorCode::BaselineMismatch.exit_code(), 3);
+        assert_eq!(ErrorCode::SyntaxAuthenticityUnavailable.exit_code(), 3);
         assert_eq!(ErrorCode::LanguageDecisionInvalid.exit_code(), 3);
         assert_eq!(ErrorCode::ReviewArtifactConflict.exit_code(), 7);
         assert_eq!(ErrorCode::UnknownField.exit_code(), 3);
@@ -352,6 +357,7 @@ mod tests {
             ErrorCode::GitEvidenceFailed,
             ErrorCode::ReviewArtifactInvalid,
             ErrorCode::BaselineMismatch,
+            ErrorCode::SyntaxAuthenticityUnavailable,
             ErrorCode::ReviewArtifactConflict,
             ErrorCode::LanguageDecisionInvalid,
             ErrorCode::NotFound,

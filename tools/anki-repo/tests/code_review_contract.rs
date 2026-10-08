@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::common::{TempDir, cli_binary, parse_json, run_cli, run_cli_in};
@@ -36,8 +36,19 @@ fn init_repo(temp: &TempDir) {
 }
 
 fn commit(root: &Path, message: &str) {
-    git(root, &["add", "--all"]);
+    git(root, &["add", "--", ".", ":!.anki-repo"]);
     git(root, &["commit", "-qm", message]);
+}
+
+fn review_workspace(root: &Path, head: &str) -> PathBuf {
+    root.join(".anki-repo/review/local").join(head)
+}
+
+fn tracked_status(root: &Path) -> String {
+    git(
+        root,
+        &["status", "--porcelain=v1", "--", ".", ":!.anki-repo"],
+    )
 }
 
 fn collect_pack(root: &Path, base: &str, head: &str, output: &Path, run_clippy: bool) -> Value {
@@ -140,7 +151,7 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
     commit(temp.path(), "добавить кандидатов");
     git(temp.path(), &["branch", "synthetic-review"]);
     let reviewed_sha = git(temp.path(), &["rev-parse", "HEAD"]);
-    let baseline_dir = temp.path().join(".anki-repo/review/baseline");
+    let baseline_dir = review_workspace(temp.path(), &reviewed_sha);
     let baseline_dir_arg = baseline_dir.to_string_lossy().into_owned();
     let (code, stdout, stderr) = run_cli_in(
         Some(temp.path()),
@@ -173,14 +184,9 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
     );
     let visible = git(
         temp.path(),
-        &[
-            "status",
-            "--porcelain=v1",
-            "--",
-            ".anki-repo/review/baseline",
-        ],
+        &["status", "--porcelain=v1", "--", ".anki-repo/review/local"],
     );
-    assert!(visible.contains(".anki-repo/review/baseline"));
+    assert!(visible.contains(".anki-repo/review/local"));
 
     // Повтор записи того же снимка по тому же пути идемпотентен.
     let (code, _, stderr) = run_cli_in(
@@ -207,7 +213,7 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
     commit(temp.path(), "убрать кандидата");
     git(temp.path(), &["branch", "synthetic-fixed"]);
     let fixed_sha = git(temp.path(), &["rev-parse", "HEAD"]);
-    let verified_dir = temp.path().join(".anki-repo/review/verified");
+    let verified_dir = review_workspace(temp.path(), &fixed_sha);
     let verified_dir_arg = verified_dir.to_string_lossy().into_owned();
     let baseline_path_arg = baseline_path.to_string_lossy().into_owned();
     let (code, stdout, stderr) = run_cli_in(
@@ -249,7 +255,7 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
 
     let new_pack = verified_dir.join("review.json");
     let new_pack_arg = new_pack.to_string_lossy().into_owned();
-    let delta_path = temp.path().join("shared-delta.json");
+    let delta_path = verified_dir.join("delta.json");
     let delta_path_arg = delta_path.to_string_lossy().into_owned();
     let (code, stdout, stderr) = run_cli_in(
         Some(temp.path()),
@@ -280,7 +286,6 @@ fn collect_verify_and_delta_keep_sha_identity_and_visible_artifacts() {
 #[test]
 fn default_collect_does_not_execute_reviewed_build_script() {
     let repo = TempDir::new("collect-execution-boundary");
-    let artifacts = TempDir::new("collect-execution-artifacts");
     let external = TempDir::new("build-script-external-marker");
     init_repo(&repo);
     write_cargo_project(repo.path());
@@ -294,10 +299,10 @@ fn default_collect_does_not_execute_reviewed_build_script() {
     .unwrap();
     commit(repo.path(), "добавить синтетический build.rs");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let status_before = git(repo.path(), &["status", "--porcelain=v1"]);
+    let status_before = tracked_status(repo.path());
     let index_before = git(repo.path(), &["ls-files", "--stage"]);
 
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     let result = collect_pack(repo.path(), &base, &head, &output, false);
     assert_eq!(result["tool_runs"][0]["status"], "skipped");
     assert!(
@@ -311,17 +316,13 @@ fn default_collect_does_not_execute_reviewed_build_script() {
         "build.rs не должен исполняться по умолчанию"
     );
     assert!(!repo.path().join("target").exists());
-    assert_eq!(
-        git(repo.path(), &["status", "--porcelain=v1"]),
-        status_before
-    );
+    assert_eq!(tracked_status(repo.path()), status_before);
     assert_eq!(git(repo.path(), &["ls-files", "--stage"]), index_before);
 }
 
 #[test]
 fn collect_handles_file_directory_transitions_in_both_directions() {
     let repo = TempDir::new("collect-file-directory-transition");
-    let artifacts = TempDir::new("collect-file-directory-artifacts");
     init_repo(&repo);
     fs::write(repo.path().join("foo"), "old file\nsecond line\n").unwrap();
     commit(repo.path(), "добавить файл");
@@ -332,7 +333,7 @@ fn collect_handles_file_directory_transitions_in_both_directions() {
     fs::write(repo.path().join("foo/child.rs"), "fn child() {}\n").unwrap();
     commit(repo.path(), "заменить файл каталогом");
     let directory_head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let forward_dir = artifacts.path().join("file-to-directory");
+    let forward_dir = review_workspace(repo.path(), &directory_head);
     collect_pack(repo.path(), &base, &directory_head, &forward_dir, false);
     let forward: Value =
         serde_json::from_slice(&fs::read(forward_dir.join("review.json")).unwrap()).unwrap();
@@ -358,7 +359,7 @@ fn collect_handles_file_directory_transitions_in_both_directions() {
     fs::write(repo.path().join("foo"), "replacement file\n").unwrap();
     commit(repo.path(), "заменить каталог файлом");
     let file_head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let reverse_dir = artifacts.path().join("directory-to-file");
+    let reverse_dir = review_workspace(repo.path(), &file_head);
     collect_pack(
         repo.path(),
         &directory_head,
@@ -380,13 +381,12 @@ fn collect_handles_file_directory_transitions_in_both_directions() {
     assert_eq!(files[1]["path"], "foo/child.rs");
     assert_eq!(files[1]["status"], "deleted");
     assert_eq!(files[1]["post_state"], "missing");
-    assert!(git(repo.path(), &["status", "--porcelain=v1"]).is_empty());
+    assert!(tracked_status(repo.path()).is_empty());
 }
 
 #[test]
 fn explicit_real_clippy_collect_is_byte_stable_and_idempotent() {
     let repo = TempDir::new("collect-real-clippy");
-    let artifacts = TempDir::new("collect-real-clippy-artifacts");
     init_repo(&repo);
     // Это доверенное рабочее пространство: без зависимостей, build.rs и proc-macro.
     write_cargo_project(repo.path());
@@ -400,7 +400,7 @@ fn explicit_real_clippy_collect_is_byte_stable_and_idempotent() {
     commit(repo.path(), "изменить значение");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
 
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     let first = collect_pack(repo.path(), &base, &head, &output, true);
     assert_eq!(
         first["tool_runs"][0]["status"],
@@ -416,7 +416,7 @@ fn explicit_real_clippy_collect_is_byte_stable_and_idempotent() {
     assert_eq!(fs::read(output.join("review.json")).unwrap(), json_before);
     assert_eq!(fs::read(output.join("review.txt")).unwrap(), text_before);
     assert!(repo.path().join("target").is_dir());
-    assert!(git(repo.path(), &["status", "--porcelain=v1"]).is_empty());
+    assert!(tracked_status(repo.path()).is_empty());
 }
 
 #[test]
@@ -437,7 +437,7 @@ fn review_pack_is_portable_to_another_clone_for_verify_and_language_scan() {
     .unwrap();
     commit(repo_a.path(), "добавить кандидатов");
     let head = git(repo_a.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts_a.path().join("collected");
+    let output = review_workspace(repo_a.path(), &head);
     let original = collect_pack(repo_a.path(), &base, &head, &output, false);
     let pack_a = output.join("review.json");
     let pack_b = artifacts_b.path().join("downloaded-review.json");
@@ -456,7 +456,7 @@ fn review_pack_is_portable_to_another_clone_for_verify_and_language_scan() {
     git(repo_b.path(), &["config", "core.autocrlf", "false"]);
     assert_ne!(repo_a.path(), repo_b.path());
 
-    let verified_dir = artifacts_b.path().join("verified");
+    let verified_dir = review_workspace(repo_b.path(), &head);
     let (code, stdout, stderr) = run_cli_in(
         Some(repo_b.path()),
         &[
@@ -510,7 +510,7 @@ fn review_pack_is_portable_to_another_clone_for_verify_and_language_scan() {
         fs::read(&scans[0].2).unwrap(),
         fs::read(&scans[1].2).unwrap()
     );
-    assert!(git(repo_b.path(), &["status", "--porcelain=v1"]).is_empty());
+    assert!(tracked_status(repo_b.path()).is_empty());
 }
 
 #[test]
@@ -521,13 +521,13 @@ fn verify_and_language_pack_scan_reject_mismatched_baseline() {
     fs::write(repo.path().join("message.md"), "Human message\n").unwrap();
     commit(repo.path(), "база");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     collect_pack(repo.path(), &head, &head, &output, false);
     let pack_path = output.join("review.json");
     let mut pack: Value = serde_json::from_slice(&fs::read(&pack_path).unwrap()).unwrap();
     pack["target"]["repository_id"] = json!("0".repeat(64));
     fs::write(&pack_path, serde_json::to_vec_pretty(&pack).unwrap()).unwrap();
-    let verify_output = artifacts.path().join("verified");
+    let verify_output = review_workspace(repo.path(), &head);
     let scan_output = artifacts.path().join("scan.json");
     let commands = [
         vec![
@@ -558,14 +558,14 @@ fn verify_and_language_pack_scan_reject_mismatched_baseline() {
         assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
         assert_eq!(parse_json(&stdout)["error"]["code"], "baseline_mismatch");
     }
-    assert!(!verify_output.exists());
+    assert!(verify_output.join("review.json").is_file());
+    assert!(!verify_output.join("delta.json").exists());
     assert!(!scan_output.exists());
 }
 
 #[test]
 fn human_review_summary_preserves_snapshot_and_evidence_meaning() {
     let repo = TempDir::new("review-human-summary");
-    let artifacts = TempDir::new("review-human-summary-artifacts");
     init_repo(&repo);
     fs::create_dir_all(repo.path().join("src")).unwrap();
     let base_source = "#[allow(dead_code)]\npub fn value() {}\n";
@@ -579,7 +579,7 @@ fn human_review_summary_preserves_snapshot_and_evidence_meaning() {
     .unwrap();
     commit(repo.path(), "добавить кандидатов");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     let result = collect_pack(repo.path(), &base, &head, &output, false);
     let text = fs::read_to_string(output.join("review.txt")).unwrap();
     let queue: Value =
@@ -639,7 +639,7 @@ fn queue_compresses_large_test_surface_and_read_only_cli_expands_it() {
         "add repeated test evidence and runtime boundary",
     );
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     let result = collect_pack(repo.path(), &base, &head, &output, false);
     let pack_bytes = fs::read(output.join("review.json")).unwrap();
     let queue_bytes = fs::read(output.join("review-queue.json")).unwrap();
@@ -1037,7 +1037,7 @@ fn queue_list_pages_all_high_and_unknown_units_without_losing_raw_identity() {
         "добавить много отдельных доказанных и неизвестных контекстов",
     );
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     let collected = collect_pack(repo.path(), &base, &head, &output, false);
     let pack_path = output.join("review.json");
     let queue_path = output.join("review-queue.json");
@@ -1113,6 +1113,8 @@ fn queue_list_pages_all_high_and_unknown_units_without_losing_raw_identity() {
     assert_eq!(first_page["offset"], 0);
     assert_eq!(first_page["returned_units"], 50);
     assert_eq!(first_page["has_more"], true);
+    assert_eq!(first_page["source_digest_valid"], true);
+    assert_eq!(first_page["syntax_authenticity"], "verified");
     let page_fields: BTreeSet<_> = first_page
         .as_object()
         .unwrap()
@@ -1128,7 +1130,9 @@ fn queue_list_pages_all_high_and_unknown_units_without_losing_raw_identity() {
             "limit",
             "returned_units",
             "has_more",
-            "units"
+            "units",
+            "source_digest_valid",
+            "syntax_authenticity",
         ])
     );
     for row in first_page["units"].as_array().unwrap() {
@@ -1396,13 +1400,12 @@ fn queue_list_pages_all_high_and_unknown_units_without_losing_raw_identity() {
         );
     }
 
-    let triage_path = artifacts.path().join("semantic-triage.json");
+    let triage_path = output.join("semantic-triage.input.json");
     for json_mode in [true, false] {
-        let initialized = artifacts.path().join(if json_mode {
-            "init-json.json"
-        } else {
-            "init-human.json"
-        });
+        let initialized = output.join("semantic-triage.input.json");
+        if initialized.exists() {
+            fs::remove_file(&initialized).unwrap();
+        }
         let mut args = vec![
             "code-review",
             "triage",
@@ -1459,9 +1462,9 @@ fn queue_list_pages_all_high_and_unknown_units_without_losing_raw_identity() {
             assert_eq!(summary["unreviewed_candidates"], raw_ids.len() - 1);
         }
     }
-    let canonical_a = artifacts.path().join("triage-canonical-a.json");
-    let canonical_b = artifacts.path().join("triage-canonical-b.json");
-    for canonical in [&canonical_a, &canonical_b] {
+    let canonical = output.join("semantic-triage.json");
+    let mut canonical_bytes = None;
+    for _ in 0..2 {
         let (code, stdout, stderr) = run_cli_in(
             Some(repo.path()),
             &[
@@ -1478,12 +1481,15 @@ fn queue_list_pages_all_high_and_unknown_units_without_losing_raw_identity() {
             ],
         );
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        let bytes = fs::read(&canonical).unwrap();
+        if let Some(previous) = &canonical_bytes {
+            assert_eq!(
+                &bytes, previous,
+                "канонический triage должен быть детерминирован"
+            );
+        }
+        canonical_bytes = Some(bytes);
     }
-    assert_eq!(
-        fs::read(&canonical_a).unwrap(),
-        fs::read(&canonical_b).unwrap(),
-        "канонический triage должен быть детерминирован"
-    );
     collect_pack(repo.path(), &base, &head, &output, false);
     assert_eq!(fs::read(&pack_path).unwrap(), pack_bytes);
     assert_eq!(fs::read(&queue_path).unwrap(), queue_bytes);
@@ -1602,7 +1608,6 @@ fn queue_list_rejects_invalid_priority_as_cli_usage_error() {
 #[test]
 fn rust_text_roles_remain_orthogonal_to_execution_and_grouping() {
     let repo = TempDir::new("rust-text-role-separation");
-    let artifacts = TempDir::new("rust-text-role-separation-artifacts");
     init_repo(&repo);
     write_cargo_project(repo.path());
     commit(repo.path(), "база");
@@ -1623,7 +1628,7 @@ fn production_json_b() { let _ = serde_json::json!({"message": "Shared machine p
     fs::write(repo.path().join("src/lib.rs"), source).unwrap();
     commit(repo.path(), "добавить строки разных ролей и контекстов");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     collect_pack(repo.path(), &base, &head, &output, false);
     let pack: Value =
         serde_json::from_slice(&fs::read(output.join("review.json")).unwrap()).unwrap();
@@ -1721,7 +1726,6 @@ fn production_json_b() { let _ = serde_json::json!({"message": "Shared machine p
 #[test]
 fn collect_keeps_mixed_rust_items_unknown_when_a_line_has_no_single_column() {
     let repo = TempDir::new("collect-mixed-rust-items");
-    let artifacts = TempDir::new("collect-mixed-rust-items-artifacts");
     init_repo(&repo);
     write_cargo_project(repo.path());
     commit(repo.path(), "база");
@@ -1734,7 +1738,7 @@ fn collect_keeps_mixed_rust_items_unknown_when_a_line_has_no_single_column() {
     .unwrap();
     commit(repo.path(), "смешать test и runtime items на одной строке");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     collect_pack(repo.path(), &base, &head, &output, false);
 
     let pack: Value =
@@ -1765,7 +1769,6 @@ fn collect_keeps_mixed_rust_items_unknown_when_a_line_has_no_single_column() {
 #[test]
 fn collect_uses_rust_test_surface_and_canonical_file_surface_labels() {
     let repo = TempDir::new("collect-rust-test-surface");
-    let artifacts = TempDir::new("collect-rust-test-surface-artifacts");
     init_repo(&repo);
     write_cargo_project(repo.path());
     commit(repo.path(), "база");
@@ -1785,7 +1788,7 @@ fn collect_uses_rust_test_surface_and_canonical_file_surface_labels() {
     .unwrap();
     commit(repo.path(), "добавить тестовый helper и агентский context");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     collect_pack(repo.path(), &base, &head, &output, false);
 
     let pack: Value =
@@ -1815,7 +1818,6 @@ fn collect_uses_rust_test_surface_and_canonical_file_surface_labels() {
 #[test]
 fn collect_distinguishes_function_tests_and_resolved_io_boundaries() {
     let repo = TempDir::new("collect-function-test-boundaries");
-    let artifacts = TempDir::new("collect-function-test-boundaries-artifacts");
     init_repo(&repo);
     write_cargo_project(repo.path());
     commit(repo.path(), "база");
@@ -1839,7 +1841,7 @@ fn collect_distinguishes_function_tests_and_resolved_io_boundaries() {
     fs::write(repo.path().join("src/lib.rs"), source).unwrap();
     commit(repo.path(), "добавить атрибуты функций и одноимённые типы");
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let output = artifacts.path().join("collected");
+    let output = review_workspace(repo.path(), &head);
     collect_pack(repo.path(), &base, &head, &output, false);
     let pack: Value =
         serde_json::from_slice(&fs::read(output.join("review.json")).unwrap()).unwrap();
@@ -2129,4 +2131,372 @@ fn language_check_bounds_stdout_and_keeps_full_scan_in_requested_artifact() {
     assert_eq!(bounded_stdout["candidates"].as_array().unwrap().len(), 20);
     let full_scan: Value = serde_json::from_slice(&fs::read(updated_path).unwrap()).unwrap();
     assert_eq!(full_scan["candidates"].as_array().unwrap().len(), 25);
+}
+
+fn boundary_fixture(name: &str) -> (TempDir, String, String) {
+    let repo = TempDir::new(name);
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    commit(repo.path(), "база");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn first(path: &str) { let _ = std::fs::read(path).unwrap(); }\npub fn second(path: &str) { let _ = std::fs::read(path).unwrap(); }\n",
+    )
+    .unwrap();
+    commit(repo.path(), "добавить границы ввода");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    (repo, base, head)
+}
+
+fn assert_review_failure(result: (i32, String, String), expected: &str) {
+    let (code, stdout, stderr) = result;
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["error"]["code"], expected);
+}
+
+#[test]
+fn collect_rejects_arbitrary_output_before_writing_or_running_clippy() {
+    let (repo, base, head) = boundary_fixture("collect-output-boundary");
+    let outside = TempDir::new("collect-output-outside");
+    let tracked = repo.path().join("Cargo.toml");
+    let arbitrary = repo.path().join("arbitrary/nested");
+    let external = outside.path().join("output");
+    let cargo_bytes = fs::read(&tracked).unwrap();
+    let status = git(repo.path(), &["status", "--porcelain=v1"]);
+    let index = git(repo.path(), &["ls-files", "--stage"]);
+    for output in [&arbitrary, &tracked, &external] {
+        assert_review_failure(
+            run_cli_in(
+                Some(repo.path()),
+                &[
+                    "--json",
+                    "code-review",
+                    "collect",
+                    "--base",
+                    &base,
+                    "--head",
+                    &head,
+                    "--run-clippy",
+                    "--out-dir",
+                    output.to_str().unwrap(),
+                ],
+            ),
+            "invalid_request",
+        );
+        assert_eq!(fs::read(&tracked).unwrap(), cargo_bytes);
+        assert!(!arbitrary.exists());
+        assert!(!external.exists());
+        assert!(!repo.path().join(".anki-repo").exists());
+        assert!(!repo.path().join("target").exists());
+        assert_eq!(git(repo.path(), &["status", "--porcelain=v1"]), status);
+        assert_eq!(git(repo.path(), &["ls-files", "--stage"]), index);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn collect_rejects_symlink_namespace_before_any_artifact_write() {
+    use std::os::unix::fs::symlink;
+
+    let (repo, base, head) = boundary_fixture("collect-symlink-namespace");
+    let outside = TempDir::new("collect-symlink-outside");
+    fs::create_dir_all(repo.path().join(".anki-repo/review")).unwrap();
+    symlink(outside.path(), repo.path().join(".anki-repo/review/local")).unwrap();
+    let output = review_workspace(repo.path(), &head);
+    assert_review_failure(
+        run_cli_in(
+            Some(repo.path()),
+            &[
+                "--json",
+                "code-review",
+                "collect",
+                "--base",
+                &base,
+                "--head",
+                &head,
+                "--out-dir",
+                output.to_str().unwrap(),
+            ],
+        ),
+        "invalid_request",
+    );
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert!(!outside.path().join(&head).exists());
+}
+
+#[test]
+fn collect_rejects_noncanonical_pr_number_before_creating_workspace() {
+    let (repo, base, head) = boundary_fixture("collect-pr-leading-zero");
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "collect",
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--pr-number",
+            "017",
+        ],
+    );
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["error"]["code"], "invalid_request");
+    assert!(!repo.path().join(".anki-repo/review").exists());
+}
+
+#[test]
+fn collect_pr_artifacts_all_belong_to_namespace_and_full_head() {
+    let (repo, base, head) = boundary_fixture("collect-pr-namespace");
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "collect",
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--pr-number",
+            "17",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["result"]["target"]["head_sha"], head);
+    let namespace = repo.path().join(".anki-repo/review/17");
+    assert_eq!(fs::read_dir(&namespace).unwrap().count(), 1);
+    let output = namespace.join(&head);
+    let files = fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".writer.lock")
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        files,
+        BTreeSet::from([
+            "review.json".into(),
+            "review-queue.json".into(),
+            "review.txt".into()
+        ])
+    );
+    assert!(!review_workspace(repo.path(), &head).exists());
+}
+
+#[test]
+fn queue_cli_rejects_consistent_forgery_but_marks_structure_only_explicitly() {
+    use anki_repo::code_review::model::ReviewPack;
+    use anki_repo::code_review::review_queue::{
+        self, ClassificationBasis, CodeRole, SyntaxContext,
+    };
+    use anki_repo::code_review::scope::FileSurface;
+
+    let (repo, base, head) = boundary_fixture("queue-authenticity-boundary");
+    let output = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &output, false);
+    let pack_path = output.join("review.json");
+    let queue_path = output.join("review-queue.json");
+    let arguments = [
+        "--json",
+        "code-review",
+        "queue",
+        "validate",
+        "--pack",
+        pack_path.to_str().unwrap(),
+        "--queue",
+        queue_path.to_str().unwrap(),
+    ];
+    let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &arguments);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        parse_json(&stdout)["result"]["syntax_authenticity"],
+        "verified"
+    );
+    let bytes = fs::read(&pack_path).unwrap();
+    let pack: ReviewPack = serde_json::from_slice(&bytes).unwrap();
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let contexts = pack
+        .all_candidates()
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.id.clone(),
+                SyntaxContext {
+                    execution: Some(FileSurface::Tests),
+                    code_role: CodeRole::TestSetup,
+                    text_role: None,
+                    signature: Some("method:unwrap".into()),
+                    basis: ClassificationBasis::SyntaxContext,
+                },
+            )
+        })
+        .collect();
+    let forged = review_queue::build(&pack, &digest, &contexts).unwrap();
+    assert!(review_queue::validate(&forged, &pack, &digest).is_ok());
+    assert_eq!(forged.summary.group_units, 1);
+    fs::write(&queue_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+    let forged_bytes = fs::read(&queue_path).unwrap();
+    assert_review_failure(
+        run_cli_in(Some(repo.path()), &arguments),
+        "review_artifact_invalid",
+    );
+    let mut structure_arguments = arguments.to_vec();
+    structure_arguments.push("--structure-only");
+    let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &structure_arguments);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let result = parse_json(&stdout)["result"].clone();
+    assert_eq!(result["source_digest_valid"], true);
+    assert_eq!(result["syntax_authenticity"], "structure_only");
+    assert_eq!(fs::read(&queue_path).unwrap(), forged_bytes);
+    assert_eq!(fs::read(&pack_path).unwrap(), bytes);
+}
+
+#[test]
+fn queue_validation_requires_git_images_unless_structure_only_is_requested() {
+    let (repo, base, head) = boundary_fixture("queue-missing-git-images");
+    let output = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &output, false);
+    let outside = TempDir::new("queue-without-repository");
+    let pack = outside.path().join("review.json");
+    let queue = outside.path().join("review-queue.json");
+    fs::copy(output.join("review.json"), &pack).unwrap();
+    fs::copy(output.join("review-queue.json"), &queue).unwrap();
+    let arguments = [
+        "--json",
+        "code-review",
+        "queue",
+        "validate",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--queue",
+        queue.to_str().unwrap(),
+    ];
+    let (code, stdout, stderr) = run_cli_in(Some(outside.path()), &arguments);
+    assert_ne!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(parse_json(&stdout).get("result").is_none());
+    let mut explicit = arguments.to_vec();
+    explicit.push("--structure-only");
+    let (code, stdout, stderr) = run_cli_in(Some(outside.path()), &explicit);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        parse_json(&stdout)["result"]["syntax_authenticity"],
+        "structure_only"
+    );
+    explicit.remove(0);
+    let (code, stdout, stderr) = run_cli_in(Some(outside.path()), &explicit);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("structure_only"), "{stdout}");
+}
+
+#[test]
+fn queue_parse_failure_requires_explicit_structure_only() {
+    let (repo, base, _) = boundary_fixture("queue-unparseable-git-image");
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn broken() { let _ = std::fs::read(\"x\").unwrap();\n",
+    )
+    .unwrap();
+    commit(repo.path(), "сохранить незавершённый исходник");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let output = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &output, false);
+    let pack = output.join("review.json");
+    let queue = output.join("review-queue.json");
+    let arguments = [
+        "--json",
+        "code-review",
+        "queue",
+        "validate",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--queue",
+        queue.to_str().unwrap(),
+    ];
+    assert_review_failure(
+        run_cli_in(Some(repo.path()), &arguments),
+        "syntax_authenticity_unavailable",
+    );
+    let mut explicit = arguments.to_vec();
+    explicit.push("--structure-only");
+    let (code, stdout, stderr) = run_cli_in(Some(repo.path()), &explicit);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        parse_json(&stdout)["result"]["syntax_authenticity"],
+        "structure_only"
+    );
+}
+
+#[test]
+fn verify_and_delta_allow_external_input_but_reject_writes_outside_review_workspace() {
+    let (repo, base, head) = boundary_fixture("verify-delta-output-boundary");
+    let output = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &output, false);
+    let outside = TempDir::new("verify-delta-external-input");
+    let baseline = outside.path().join("downloaded-review.json");
+    fs::copy(output.join("review.json"), &baseline).unwrap();
+    let pack = output.join("review.json");
+    let original = fs::read(&pack).unwrap();
+    let cargo = repo.path().join("Cargo.toml");
+    let cargo_bytes = fs::read(&cargo).unwrap();
+    let arbitrary = repo.path().join("unexpected/nested");
+    let external = outside.path().join("output");
+    for target in [&cargo, &arbitrary, &external] {
+        assert_review_failure(
+            run_cli_in(
+                Some(repo.path()),
+                &[
+                    "--json",
+                    "code-review",
+                    "verify",
+                    "--baseline",
+                    baseline.to_str().unwrap(),
+                    "--head",
+                    &head,
+                    "--run-clippy",
+                    "--out-dir",
+                    target.to_str().unwrap(),
+                ],
+            ),
+            "invalid_request",
+        );
+        assert_review_failure(
+            run_cli_in(
+                Some(repo.path()),
+                &[
+                    "--json",
+                    "code-review",
+                    "delta",
+                    "--before",
+                    baseline.to_str().unwrap(),
+                    "--after",
+                    pack.to_str().unwrap(),
+                    "--out",
+                    target.to_str().unwrap(),
+                ],
+            ),
+            "invalid_request",
+        );
+        assert_eq!(fs::read(&cargo).unwrap(), cargo_bytes);
+        assert_eq!(fs::read(&pack).unwrap(), original);
+        assert!(!arbitrary.exists());
+        assert!(!external.exists());
+        assert!(!output.join("delta.json").exists());
+        assert!(!repo.path().join("target").exists());
+    }
+    let (code, stdout, stderr) = run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "delta",
+            "--before",
+            baseline.to_str().unwrap(),
+            "--after",
+            pack.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["result"]["after"]["head_sha"], head);
 }

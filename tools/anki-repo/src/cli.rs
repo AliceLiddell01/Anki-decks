@@ -114,6 +114,13 @@ impl Cli {
                 CodeReviewCommand::Collect { .. } => "code-review collect",
                 CodeReviewCommand::Verify { .. } => "code-review verify",
                 CodeReviewCommand::Delta { .. } => "code-review delta",
+                CodeReviewCommand::Execution { command } => match command {
+                    ReviewExecutionCommand::Prepare { .. } => "code-review execution prepare",
+                    ReviewExecutionCommand::Run { .. } => "code-review execution run",
+                    ReviewExecutionCommand::Inspect { .. } => "code-review execution inspect",
+                    ReviewExecutionCommand::Cancel { .. } => "code-review execution cancel",
+                    ReviewExecutionCommand::Cleanup { .. } => "code-review execution cleanup",
+                },
                 CodeReviewCommand::Queue { command } => match command {
                     ReviewQueueCommand::List { .. } => "code-review queue list",
                     ReviewQueueCommand::Validate { .. } => "code-review queue validate",
@@ -531,6 +538,9 @@ pub enum CodeReviewCommand {
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
         run_clippy: bool,
+        /// Номер PR для навигации внутри локального review workspace.
+        #[arg(long, value_name = "NUMBER")]
+        pr_number: Option<String>,
     },
 
     /// Повторно собрать свидетельства для нового HEAD и сравнить с исходным пакетом.
@@ -547,6 +557,9 @@ pub enum CodeReviewCommand {
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
         run_clippy: bool,
+        /// Номер PR для навигации внутри локального review workspace.
+        #[arg(long, value_name = "NUMBER")]
+        pr_number: Option<String>,
     },
 
     /// Сравнить два ранее сохранённых пакета ревью без повторного анализа.
@@ -566,6 +579,12 @@ pub enum CodeReviewCommand {
     Queue {
         #[command(subcommand)]
         command: ReviewQueueCommand,
+    },
+
+    /// Изолированное исполнение проверок на закреплённом review snapshot.
+    Execution {
+        #[command(subcommand)]
+        command: ReviewExecutionCommand,
     },
 
     /// Создать, проверить или представить решения семантического разбора пакета ревью.
@@ -635,6 +654,9 @@ pub enum ReviewQueueCommand {
         /// Каноническая роль кода: runtime, runtime_boundary или роль теста.
         #[arg(long = "code-role", value_name = "CODE_ROLE")]
         code_role: Option<CodeRole>,
+        /// Пропустить восстановление Git images/AST и явно показать structural-only статус.
+        #[arg(long)]
+        structure_only: bool,
     },
 
     /// Проверить источник, полноту покрытия и структуру queue artifact.
@@ -645,6 +667,9 @@ pub enum ReviewQueueCommand {
         /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
+        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        #[arg(long)]
+        structure_only: bool,
     },
 
     /// Показать агрегированную сводку очереди.
@@ -655,6 +680,9 @@ pub enum ReviewQueueCommand {
         /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
+        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        #[arg(long)]
+        structure_only: bool,
     },
 
     /// Раскрыть одну группу, включая полное множество исходных candidate IDs.
@@ -668,6 +696,9 @@ pub enum ReviewQueueCommand {
         /// Точный ID группы из `review-queue.json`.
         #[arg(long, value_name = "ID")]
         id: String,
+        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        #[arg(long)]
+        structure_only: bool,
     },
 
     /// Найти candidate и показать его исходное evidence, классификацию и unit.
@@ -681,6 +712,68 @@ pub enum ReviewQueueCommand {
         /// Точный ID candidate из исходного `review.json`.
         #[arg(long, value_name = "ID")]
         id: String,
+        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        #[arg(long)]
+        structure_only: bool,
+    },
+}
+
+/// Управление изолированным execution job без зависимости от agent framework.
+#[derive(Debug, Subcommand)]
+pub enum ReviewExecutionCommand {
+    /// Подготовить приватный job и detached worktree, не запуская проектный код.
+    Prepare {
+        /// Исходный review.json.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Режим проверки или disposable source experiment.
+        #[arg(long, value_enum)]
+        mode: crate::code_review::execution::ExecutionMode,
+        /// Номер PR только как навигационный сегмент workspace.
+        #[arg(long, value_name = "NUMBER")]
+        pr_number: Option<String>,
+        /// Именованное направление review, например tests, runtime, docs или security.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
+
+    /// Запустить явную argv-команду в рабочем каталоге job.
+    Run {
+        /// Каталог ранее подготовленного execution job.
+        job: PathBuf,
+        /// Обязательный timeout команды в секундах.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        timeout_seconds: u64,
+        /// Рабочий каталог относительно корня pinned worktree.
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        /// Максимум одновременных тяжёлых execution jobs в этом репозитории.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=64))]
+        max_parallel_jobs: u64,
+        /// Явно передать переменную окружения; при наличии параметров включается explicit policy.
+        #[arg(long = "env", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+        environment: Vec<String>,
+        /// Исполняемый файл и аргументы после `--`; shell не запускается.
+        #[arg(last = true, required = true, value_name = "ARGV")]
+        argv: Vec<String>,
+    },
+
+    /// Прочитать сохранённое состояние job/result без изменения файлов.
+    Inspect {
+        /// Каталог execution job.
+        job: PathBuf,
+    },
+
+    /// Запросить отмену активного job.
+    Cancel {
+        /// Каталог execution job.
+        job: PathBuf,
+    },
+
+    /// Очистить только собственный worktree и временные каталоги job.
+    Cleanup {
+        /// Каталог execution job.
+        job: PathBuf,
     },
 }
 

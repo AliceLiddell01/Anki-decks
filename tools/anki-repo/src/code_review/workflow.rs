@@ -57,6 +57,17 @@ pub struct SnapshotSummary {
     pub delta: Option<ReviewDelta>,
 }
 
+/// Краткая ссылка на подготовленное isolated execution job.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionPreparedSummary {
+    pub job_id: String,
+    pub job_directory: String,
+    pub worktree: String,
+    pub source: super::execution::ExecutionSource,
+    pub mode: super::execution::ExecutionMode,
+    pub scope: String,
+}
+
 /// Краткий результат команд `language scan` и `language check`.
 #[derive(Debug, Clone, Serialize)]
 pub struct LanguageSummary {
@@ -104,7 +115,26 @@ pub struct SemanticTriageReportSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewQueueValidationSummary {
     pub valid: bool,
+    pub source_digest_valid: bool,
+    pub syntax_authenticity: SyntaxAuthenticityStatus,
     pub summary: QueueSummary,
+}
+
+/// Степень доказанности классификаций очереди относительно Git images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntaxAuthenticityStatus {
+    Verified,
+    StructureOnly,
+}
+
+/// Метаданные проверки, добавляемые к сохранённой полезной нагрузке очереди.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueAuthenticityEnvelope<T> {
+    #[serde(flatten)]
+    pub value: T,
+    pub source_digest_valid: bool,
+    pub syntax_authenticity: SyntaxAuthenticityStatus,
 }
 
 /// Типизированные параметры CLI для фильтрации очереди.
@@ -159,15 +189,17 @@ pub fn collect(
     head: &str,
     out_dir: Option<&Path>,
     run_clippy: bool,
+    pr_number: Option<&str>,
 ) -> Result<SnapshotSummary, DomainError> {
     let root = repository_root(Path::new("."))?;
     let collected = scope::collect_scope(&root, base, head).map_err(scope_error)?;
+    review_workspace_directory(&root, out_dir, pr_number, &collected.target.head_sha)?;
     let (post_sources, base_sources) = rust_sources_from_scope(&collected);
     let post = RustImages::new(post_sources);
     let base = RustImages::new(base_sources);
     let pack = build_pack(&root, collected, run_clippy);
     let contexts = syntax_contexts(&pack, &post, &base);
-    save_snapshot(&root, out_dir, &pack, None, &contexts)
+    save_snapshot(&root, out_dir, &pack, None, &contexts, pr_number)
 }
 
 /// Пересобирает свидетельства от зафиксированной базовой версии и создаёт дельту детекторов.
@@ -176,6 +208,7 @@ pub fn verify(
     head: &str,
     out_dir: Option<&Path>,
     run_clippy: bool,
+    pr_number: Option<&str>,
 ) -> Result<SnapshotSummary, DomainError> {
     let root = repository_root(Path::new("."))?;
     let baseline: ReviewPack = read_json(
@@ -202,13 +235,77 @@ pub fn verify(
             },
         ));
     }
+    review_workspace_directory(&root, out_dir, pr_number, &collected.target.head_sha)?;
     let (post_sources, base_sources) = rust_sources_from_scope(&collected);
     let post = RustImages::new(post_sources);
     let base = RustImages::new(base_sources);
     let pack = build_pack(&root, collected, run_clippy);
     let changes = delta::compare(&baseline, &pack)?;
     let contexts = syntax_contexts(&pack, &post, &base);
-    save_snapshot(&root, out_dir, &pack, Some(changes), &contexts)
+    save_snapshot(&root, out_dir, &pack, Some(changes), &contexts, pr_number)
+}
+
+/// Подготавливает job на pinned snapshot, не исполняя проектный код.
+pub fn prepare_execution_job(
+    pack_path: &Path,
+    mode: super::execution::ExecutionMode,
+    pr_number: Option<&str>,
+    scope: &str,
+) -> Result<ExecutionPreparedSummary, DomainError> {
+    let root = repository_root(Path::new("."))?;
+    let (pack, bytes) = read_review_pack(pack_path)?;
+    let namespace = pr_number.unwrap_or("local").to_owned();
+    let job = super::execution::prepare_job(
+        &root,
+        &pack,
+        &bytes,
+        super::execution::PrepareOptions {
+            mode,
+            scope: scope.to_owned(),
+            namespace,
+        },
+    )?;
+    Ok(ExecutionPreparedSummary {
+        job_id: job.metadata().job_id.clone(),
+        job_directory: display_path(job.directory(), &root),
+        worktree: display_path(&job.worktree(), &root),
+        source: job.metadata().source.clone(),
+        mode: job.metadata().mode,
+        scope: job.metadata().scope.clone(),
+    })
+}
+
+/// Исполняет одну команду в уже подготовленном job.
+pub fn run_execution_job(
+    job_path: &Path,
+    request: &super::execution::CommandRequest,
+) -> Result<super::execution::ExecutionResult, DomainError> {
+    let root = repository_root(Path::new("."))?;
+    let job = super::execution::open_job(&root, job_path)?;
+    super::execution::run_job(&job, request, &std::sync::atomic::AtomicBool::new(false))
+}
+
+/// Читает lifecycle/result execution job без изменений.
+pub fn inspect_execution_job(
+    job_path: &Path,
+) -> Result<super::execution::JobInspection, DomainError> {
+    super::execution::inspect_job(job_path)
+}
+
+/// Запрашивает отмену активного execution job.
+pub fn cancel_execution_job(
+    job_path: &Path,
+) -> Result<super::execution::JobInspection, DomainError> {
+    super::execution::request_cancel(job_path)
+}
+
+/// Очищает только runtime/worktree принадлежащего job, сохраняя typed evidence.
+pub fn cleanup_execution_job(
+    job_path: &Path,
+) -> Result<super::execution::CleanupResult, DomainError> {
+    let root = repository_root(Path::new("."))?;
+    let job = super::execution::open_job(&root, job_path)?;
+    super::execution::cleanup_workspace(&job)
 }
 
 /// Сравнивает сохранённые снимки; опциональный JSON пишется без перезаписи.
@@ -227,8 +324,8 @@ pub fn compare_files(
     if let Some(path) = output {
         let bytes = json_bytes(&changes)?;
         let root = repository_root(Path::new("."))?;
-        let path = output_path(&root, path)?;
-        write_document_once(&path, &bytes)?;
+        let path = review_workspace_file(&root, after_path, &after, path, "delta.json")?;
+        write_review_document_once(&path, &bytes)?;
     }
     Ok(changes)
 }
@@ -237,6 +334,7 @@ pub fn compare_files(
 pub fn validate_review_queue(
     pack_path: &Path,
     queue_path: &Path,
+    structure_only: bool,
 ) -> Result<ReviewQueueValidationSummary, DomainError> {
     let (pack, pack_bytes) = read_review_pack(pack_path)?;
     let queue: ReviewQueue = read_json(
@@ -244,9 +342,19 @@ pub fn validate_review_queue(
         MAX_REVIEW_ARTIFACT_BYTES,
         "структурная очередь code-review",
     )?;
-    let summary = review_queue::validate(&queue, &pack, &sha256_hex(&pack_bytes))?;
+    let source_pack_sha256 = sha256_hex(&pack_bytes);
+    let (summary, syntax_authenticity) = if structure_only {
+        (
+            review_queue::validate(&queue, &pack, &source_pack_sha256)?,
+            SyntaxAuthenticityStatus::StructureOnly,
+        )
+    } else {
+        validate_queue_authenticity(&queue, &pack, &source_pack_sha256)?
+    };
     Ok(ReviewQueueValidationSummary {
         valid: true,
+        source_digest_valid: true,
+        syntax_authenticity,
         summary,
     })
 }
@@ -255,8 +363,15 @@ pub fn validate_review_queue(
 pub fn summarize_review_queue(
     pack_path: &Path,
     queue_path: &Path,
-) -> Result<QueueSummary, DomainError> {
-    Ok(load_validated_review_queue(pack_path, queue_path)?.2)
+    structure_only: bool,
+) -> Result<QueueAuthenticityEnvelope<QueueSummary>, DomainError> {
+    let (_, _, summary, syntax_authenticity) =
+        load_validated_review_queue(pack_path, queue_path, structure_only)?;
+    Ok(QueueAuthenticityEnvelope {
+        value: summary,
+        source_digest_valid: true,
+        syntax_authenticity,
+    })
 }
 
 /// Возвращает страницу только после проверки точной привязки обоих артефактов к источнику.
@@ -264,8 +379,10 @@ pub fn list_review_queue(
     pack_path: &Path,
     queue_path: &Path,
     options: &ReviewQueueListOptions,
-) -> Result<QueueListPage, DomainError> {
-    let (_, queue, _) = load_validated_review_queue(pack_path, queue_path)?;
+    structure_only: bool,
+) -> Result<QueueAuthenticityEnvelope<QueueListPage>, DomainError> {
+    let (_, queue, _, syntax_authenticity) =
+        load_validated_review_queue(pack_path, queue_path, structure_only)?;
     if !(1..=review_queue::MAX_QUEUE_LIST_LIMIT).contains(&options.limit) {
         return Err(invalid_queue_list_filter(
             "limit",
@@ -305,7 +422,11 @@ pub fn list_review_queue(
             "Размер страницы очереди слишком велик для этой платформы",
         )
     })?;
-    Ok(review_queue::list_units(&queue, &filters, offset, limit))
+    Ok(QueueAuthenticityEnvelope {
+        value: review_queue::list_units(&queue, &filters, offset, limit),
+        source_digest_valid: true,
+        syntax_authenticity,
+    })
 }
 
 fn is_canonical_filter_label(value: &str) -> bool {
@@ -330,8 +451,10 @@ pub fn expand_review_queue_group(
     pack_path: &Path,
     queue_path: &Path,
     id: &str,
-) -> Result<ReviewQueueGroupDetail, DomainError> {
-    let (pack, queue, _) = load_validated_review_queue(pack_path, queue_path)?;
+    structure_only: bool,
+) -> Result<QueueAuthenticityEnvelope<ReviewQueueGroupDetail>, DomainError> {
+    let (pack, queue, _, syntax_authenticity) =
+        load_validated_review_queue(pack_path, queue_path, structure_only)?;
     let unit = queue
         .units
         .iter()
@@ -354,9 +477,13 @@ pub fn expand_review_queue_group(
         .iter()
         .map(|candidate_id| queue_representative_detail(&queue, &candidates, candidate_id))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(ReviewQueueGroupDetail {
-        unit,
-        representatives,
+    Ok(QueueAuthenticityEnvelope {
+        value: ReviewQueueGroupDetail {
+            unit,
+            representatives,
+        },
+        source_digest_valid: true,
+        syntax_authenticity,
     })
 }
 
@@ -365,8 +492,10 @@ pub fn inspect_review_queue_candidate(
     pack_path: &Path,
     queue_path: &Path,
     id: &str,
-) -> Result<ReviewQueueCandidateDetail, DomainError> {
-    let (pack, queue, _) = load_validated_review_queue(pack_path, queue_path)?;
+    structure_only: bool,
+) -> Result<QueueAuthenticityEnvelope<ReviewQueueCandidateDetail>, DomainError> {
+    let (pack, queue, _, syntax_authenticity) =
+        load_validated_review_queue(pack_path, queue_path, structure_only)?;
     let unit = queue
         .units
         .iter()
@@ -387,21 +516,77 @@ pub fn inspect_review_queue_candidate(
         .into_iter()
         .map(|candidate| (candidate.id.clone(), candidate))
         .collect();
-    queue_candidate_detail(&queue, &candidates, &unit, id)
+    Ok(QueueAuthenticityEnvelope {
+        value: queue_candidate_detail(&queue, &candidates, &unit, id)?,
+        source_digest_valid: true,
+        syntax_authenticity,
+    })
 }
 
 fn load_validated_review_queue(
     pack_path: &Path,
     queue_path: &Path,
-) -> Result<(ReviewPack, ReviewQueue, QueueSummary), DomainError> {
+    structure_only: bool,
+) -> Result<
+    (
+        ReviewPack,
+        ReviewQueue,
+        QueueSummary,
+        SyntaxAuthenticityStatus,
+    ),
+    DomainError,
+> {
     let (pack, pack_bytes) = read_review_pack(pack_path)?;
     let queue = read_json(
         queue_path,
         MAX_REVIEW_ARTIFACT_BYTES,
         "структурная очередь code-review",
     )?;
-    let summary = review_queue::validate(&queue, &pack, &sha256_hex(&pack_bytes))?;
-    Ok((pack, queue, summary))
+    let source_pack_sha256 = sha256_hex(&pack_bytes);
+    let (summary, syntax_authenticity) = if structure_only {
+        (
+            review_queue::validate(&queue, &pack, &source_pack_sha256)?,
+            SyntaxAuthenticityStatus::StructureOnly,
+        )
+    } else {
+        validate_queue_authenticity(&queue, &pack, &source_pack_sha256)?
+    };
+    Ok((pack, queue, summary, syntax_authenticity))
+}
+
+fn validate_queue_authenticity(
+    queue: &ReviewQueue,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+    let root = repository_root(Path::new("."))?;
+    let collected = scope::collect_scope(&root, &pack.target.base_sha, &pack.target.head_sha)
+        .map_err(scope_error)?;
+    if collected.target.repository_id != pack.target.repository_id
+        || collected.target.base_sha != pack.target.base_sha
+        || collected.target.head_sha != pack.target.head_sha
+        || collected.target.merge_base_sha != pack.target.merge_base_sha
+    {
+        return Err(DomainError::new(
+            ErrorCode::BaselineMismatch,
+            "точные Git images не соответствуют идентичности исходного review pack",
+        ));
+    }
+    let (post_sources, base_sources) = rust_sources_from_scope(&collected);
+    let post = RustImages::new(post_sources);
+    let base = RustImages::new(base_sources);
+    let contexts = syntax_contexts(pack, &post, &base);
+    if contexts
+        .values()
+        .any(|context| context.basis == ClassificationBasis::ParseFailure)
+    {
+        return Err(DomainError::new(
+            ErrorCode::SyntaxAuthenticityUnavailable,
+            "AST одного из исходников Rust разобрать не удалось; используйте явный --structure-only, если достаточно проверки структуры и digest",
+        ));
+    }
+    let summary = review_queue::validate_with_syntax(queue, pack, source_pack_sha256, &contexts)?;
+    Ok((summary, SyntaxAuthenticityStatus::Verified))
 }
 
 fn queue_candidate_detail(
@@ -464,8 +649,14 @@ pub fn init_semantic_triage(
     semantic_triage::canonicalize(&mut triage);
     let summary = semantic_triage::validate(&triage, &pack, &source_hash)?;
     let bytes = json_bytes(&triage)?;
-    let output = output_path(&root, output)?;
-    write_document_once(&output, &bytes)?;
+    let output = review_workspace_file(
+        &root,
+        pack_path,
+        &pack,
+        output,
+        "semantic-triage.input.json",
+    )?;
+    write_review_document_once(&output, &bytes)?;
     Ok(SemanticTriageInitSummary {
         artifact: output.display().to_string(),
         target: pack.target,
@@ -482,7 +673,7 @@ pub fn validate_semantic_triage(
 ) -> Result<SemanticTriageValidationSummary, DomainError> {
     let (pack, source_bytes) = read_review_pack(pack_path)?;
     let source_hash = sha256_hex(&source_bytes);
-    let (mut triage, _) = read_json_with_bytes::<SemanticTriage>(
+    let (mut triage, triage_bytes) = read_json_with_bytes::<SemanticTriage>(
         triage_path,
         MAX_REVIEW_ARTIFACT_BYTES,
         "JSON-документ семантических решений",
@@ -492,8 +683,15 @@ pub fn validate_semantic_triage(
         semantic_triage::canonicalize(&mut triage);
         let bytes = json_bytes(&triage)?;
         let root = repository_root(Path::new("."))?;
-        let output =
-            replace_derived_document(&root, canonical_output, &bytes, &[pack_path, triage_path])?;
+        let output = replace_derived_document(
+            &root,
+            canonical_output,
+            &bytes,
+            &[(pack_path, &source_bytes), (triage_path, &triage_bytes)],
+            &pack,
+            &source_hash,
+            "semantic-triage.json",
+        )?;
         Some(output.display().to_string())
     } else {
         None
@@ -528,7 +726,7 @@ pub fn report_semantic_triage(
     let root = repository_root(Path::new("."))?;
     let (pack, source_bytes) = read_review_pack(pack_path)?;
     let source_hash = sha256_hex(&source_bytes);
-    let (mut triage, _) = read_json_with_bytes::<SemanticTriage>(
+    let (mut triage, triage_bytes) = read_json_with_bytes::<SemanticTriage>(
         triage_path,
         MAX_REVIEW_ARTIFACT_BYTES,
         "JSON-документ семантических решений",
@@ -536,8 +734,15 @@ pub fn report_semantic_triage(
     let summary = semantic_triage::validate(&triage, &pack, &source_hash)?;
     semantic_triage::canonicalize(&mut triage);
     let report = semantic_triage::render_markdown(&triage, &pack);
-    let output =
-        replace_derived_document(&root, output, report.as_bytes(), &[pack_path, triage_path])?;
+    let output = replace_derived_document(
+        &root,
+        output,
+        report.as_bytes(),
+        &[(pack_path, &source_bytes), (triage_path, &triage_bytes)],
+        &pack,
+        &source_hash,
+        "review-report.md",
+    )?;
     Ok(SemanticTriageReportSummary {
         report: output.display().to_string(),
         total_findings: triage.findings.len(),
@@ -651,19 +856,9 @@ fn save_snapshot(
     pack: &ReviewPack,
     changes: Option<ReviewDelta>,
     contexts: &BTreeMap<String, review_queue::SyntaxContext>,
+    pr_number: Option<&str>,
 ) -> Result<SnapshotSummary, DomainError> {
-    let default_name = match changes.as_ref() {
-        Some(delta) => format!(
-            "{}-{}-{}",
-            delta.before.head_sha, pack.target.base_sha, pack.target.head_sha
-        ),
-        None => format!("{}-{}", pack.target.base_sha, pack.target.head_sha),
-    };
-    let directory = out_dir.map_or_else(
-        || root.join(".anki-repo").join("review").join(default_name),
-        Path::to_path_buf,
-    );
-    let directory = safe_output_path(root, &directory, true)?;
+    let directory = review_workspace_directory(root, out_dir, pr_number, &pack.target.head_sha)?;
     let mut documents = BTreeMap::new();
     let pack_bytes = json_bytes(pack)?;
     let queue = review_queue::build(pack, &sha256_hex(&pack_bytes), contexts)?;
@@ -1931,65 +2126,328 @@ fn write_directory_once(
     directory: &Path,
     documents: &BTreeMap<&str, Vec<u8>>,
 ) -> Result<(), DomainError> {
-    let created_directory = if directory.exists() {
-        if directory.is_symlink() || !directory.is_dir() {
-            return Err(artifact_conflict(directory));
-        }
-        let entries =
-            fs::read_dir(directory).map_err(|error| artifact_write_error(directory, &error))?;
-        let mut names = BTreeSet::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| artifact_write_error(directory, &error))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(expected) = documents.get(name.as_str()) else {
-                return Err(artifact_conflict(directory));
-            };
-            if !entry
-                .file_type()
-                .map_err(|error| artifact_write_error(&entry.path(), &error))?
-                .is_file()
-                || fs::read(entry.path())
-                    .map_err(|error| artifact_write_error(&entry.path(), &error))?
-                    != *expected
-            {
-                return Err(artifact_conflict(directory));
-            }
-            names.insert(name);
-        }
-        if names.len() == documents.len() {
-            return Ok(());
-        }
-        if !names.is_empty() {
-            return Err(artifact_conflict(directory));
-        }
-        false
-    } else {
-        let parent = directory.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|error| artifact_write_error(parent, &error))?;
-        fs::create_dir(directory).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                artifact_conflict(directory)
+    if documents
+        .keys()
+        .any(|name| !super::execution::valid_artifact_name(name))
+    {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "имя review artifact должно быть одним безопасным компонентом",
+        ));
+    }
+    super::execution::ensure_dir(directory)?;
+    let directory_fd = super::execution::safe_dir(directory)?;
+    let entries =
+        fs::read_dir(directory).map_err(|error| artifact_write_error(directory, &error))?;
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| artifact_write_error(directory, &error))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| artifact_write_error(&entry.path(), &error))?;
+        if matches!(
+            name.as_str(),
+            "runs"
+                | ".writer.lock"
+                | "semantic-triage.input.json"
+                | "semantic-triage.json"
+                | "review-report.md"
+        ) {
+            let expected_type = if name == "runs" {
+                file_type.is_dir()
             } else {
-                artifact_write_error(directory, &error)
+                file_type.is_file()
+            };
+            if !expected_type || file_type.is_symlink() {
+                return Err(artifact_conflict(&entry.path()));
             }
-        })?;
-        true
-    };
-    let mut written = Vec::new();
-    for (name, bytes) in documents {
-        let path = directory.join(name);
-        if let Err(error) = write_new_file(&path, bytes) {
-            for written_path in written {
-                let _ = fs::remove_file(written_path);
-            }
-            if created_directory {
-                let _ = fs::remove_dir(directory);
-            }
-            return Err(artifact_write_error(&path, &error));
+            continue;
         }
-        written.push(path);
+        let Some(expected) = documents.get(name.as_str()) else {
+            return Err(artifact_conflict(directory));
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(artifact_conflict(&entry.path()));
+        }
+        let actual = super::execution::read_optional_file_at(
+            &directory_fd,
+            &name,
+            MAX_REVIEW_ARTIFACT_BYTES,
+        )?
+        .ok_or_else(|| artifact_conflict(&entry.path()))?;
+        if actual != *expected {
+            return Err(artifact_conflict(directory));
+        }
+        names.insert(name);
+    }
+    if documents.keys().all(|name| names.contains(*name)) {
+        return Ok(());
+    }
+    for (name, bytes) in documents {
+        if names.contains(*name) {
+            continue;
+        }
+        if let Err(error) = super::execution::write_new_fd(&directory_fd, name, bytes) {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(artifact_conflict(&directory.join(name)));
+            }
+            return Err(artifact_write_error(&directory.join(name), &error));
+        }
     }
     Ok(())
+}
+
+/// Возвращает workspace конкретного PR/local HEAD, не разрешая произвольный --out-dir.
+fn review_workspace_directory(
+    root: &Path,
+    requested: Option<&Path>,
+    pr_number: Option<&str>,
+    head_sha: &str,
+) -> Result<PathBuf, DomainError> {
+    if !(matches!(head_sha.len(), 40 | 64) && head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "review workspace требует полный hexadecimal HEAD SHA",
+        ));
+    }
+    let namespace = match pr_number {
+        Some(number)
+            if !number.is_empty()
+                && number
+                    .parse::<u64>()
+                    .is_ok_and(|value| value > 0 && value.to_string() == number)
+                && number.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            number
+        }
+        Some(_) => {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "--pr-number должен быть положительным десятичным числом",
+            ));
+        }
+        None => "local",
+    };
+    let expected = root
+        .join(".anki-repo")
+        .join("review")
+        .join(namespace)
+        .join(head_sha);
+    if let Some(requested) = requested {
+        reject_parent_components(requested)?;
+        let absolute = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| artifact_write_error(requested, &error))?
+                .join(requested)
+        };
+        if normalize_without_parent(&absolute) != expected {
+            return Err(DomainError::with_details(
+                ErrorCode::InvalidRequest,
+                "--out-dir должен точно указывать на workspace выбранного PR и полного HEAD SHA",
+                crate::details! {
+                    "expected" => expected.display().to_string(),
+                    "requested" => absolute.display().to_string(),
+                },
+            ));
+        }
+    }
+    ensure_workspace_directory(root, &expected)?;
+    Ok(expected)
+}
+
+fn ensure_workspace_directory(root: &Path, workspace: &Path) -> Result<(), DomainError> {
+    let expected_root = root.join(".anki-repo").join("review");
+    if !workspace.starts_with(&expected_root) {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "review workspace должен находиться под .anki-repo/review",
+        ));
+    }
+    let relative = workspace.strip_prefix(root).map_err(|_| {
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "review workspace вышел за пределы корня репозитория",
+        )
+    })?;
+    reject_tracked_review_workspace(root, relative)?;
+    super::execution::ensure_dir(workspace)?;
+    super::execution::safe_dir(workspace)?;
+    Ok(())
+}
+
+pub(super) fn reject_tracked_review_workspace(
+    root: &Path,
+    relative_workspace: &Path,
+) -> Result<(), DomainError> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--cached", "-z", "--", ".anki-repo/review/"])
+        .output()
+        .map_err(|error| artifact_write_error(root, &error))?;
+    if !output.status.success() {
+        return Err(DomainError::new(
+            ErrorCode::GitEvidenceFailed,
+            "не удалось проверить index перед записью review workspace",
+        ));
+    }
+    let prefix = relative_workspace
+        .to_str()
+        .ok_or_else(|| DomainError::new(ErrorCode::InvalidRequest, "путь workspace не UTF-8"))?;
+    let prefix_with_slash = format!("{}/", prefix.trim_end_matches('/'));
+    if output.stdout.split(|byte| *byte == 0).any(|path| {
+        let path = String::from_utf8_lossy(path);
+        path == prefix || path.starts_with(&prefix_with_slash)
+    }) {
+        return Err(DomainError::with_details(
+            ErrorCode::InvalidRequest,
+            "review workspace содержит отслеживаемые Git-файлы и не допускает запись",
+            crate::details! { "workspace" => relative_workspace.display().to_string() },
+        ));
+    }
+    Ok(())
+}
+
+fn reject_parent_components(path: &Path) -> Result<(), DomainError> {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "компонент `..` в пути review artifact запрещён",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_without_parent(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {}
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
+fn workspace_for_pack(
+    root: &Path,
+    pack_path: &Path,
+    pack: &ReviewPack,
+) -> Result<PathBuf, DomainError> {
+    reject_parent_components(pack_path)?;
+    reject_symlink_path(root, pack_path)?;
+    let pack_path = fs::canonicalize(pack_path).map_err(|error| {
+        DomainError::new(
+            ErrorCode::InputUnreadable,
+            format!("не удалось разрешить путь review.json: {error}"),
+        )
+    })?;
+    if pack_path.file_name().and_then(|name| name.to_str()) != Some("review.json") {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "запись производных review artifacts требует канонический файл review.json",
+        ));
+    }
+    let workspace = pack_path.parent().ok_or_else(|| {
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "у review.json нет каталога workspace",
+        )
+    })?;
+    let namespace = workspace
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            DomainError::new(ErrorCode::InvalidRequest, "нет namespace review workspace")
+        })?;
+    let pr_number = (namespace != "local").then_some(namespace);
+    let expected =
+        review_workspace_directory(root, Some(workspace), pr_number, &pack.target.head_sha)?;
+    if expected != workspace {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "review.json не принадлежит workspace этого HEAD",
+        ));
+    }
+    Ok(expected)
+}
+
+fn reject_symlink_path(root: &Path, requested: &Path) -> Result<(), DomainError> {
+    let absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| artifact_write_error(requested, &error))?
+            .join(requested)
+    };
+    let normalized = normalize_without_parent(&absolute);
+    let relative = normalized.strip_prefix(root).map_err(|_| {
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "путь review artifact должен находиться в текущем репозитории",
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "путь review artifact содержит недопустимый компонент",
+            ));
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DomainError::with_details(
+                    ErrorCode::InvalidRequest,
+                    "symlink/junction traversal для review artifact запрещён",
+                    crate::details! { "path" => current.display().to_string() },
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(artifact_write_error(&current, &error)),
+        }
+    }
+    Ok(())
+}
+
+/// Сохраняет исходный артефакт однократно; повтор допустим только с теми же байтами.
+fn write_review_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            DomainError::new(ErrorCode::InvalidRequest, "имя review artifact не UTF-8")
+        })?;
+    let directory_fd = super::execution::safe_dir(parent)?;
+    if let Some(existing) =
+        super::execution::read_optional_file_at(&directory_fd, name, MAX_REVIEW_ARTIFACT_BYTES)?
+    {
+        return if existing == bytes {
+            Ok(())
+        } else {
+            Err(artifact_conflict(path))
+        };
+    }
+    super::execution::write_new_fd(&directory_fd, name, bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            artifact_conflict(path)
+        } else {
+            artifact_write_error(path, &error)
+        }
+    })
 }
 
 /// Сохраняет исходный артефакт однократно; повтор допустим только с теми же байтами.
@@ -2016,11 +2474,20 @@ fn replace_derived_document(
     root: &Path,
     requested: &Path,
     bytes: &[u8],
-    source_paths: &[&Path],
+    sources: &[(&Path, &[u8])],
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+    expected_name: &str,
 ) -> Result<PathBuf, DomainError> {
-    let output = output_path(root, requested)?;
-    for source in source_paths {
-        let source = fs::canonicalize(source).map_err(|error| {
+    let (pack_path, _) = sources.first().ok_or_else(|| {
+        DomainError::new(
+            ErrorCode::Internal,
+            "для производного файла не задан review pack",
+        )
+    })?;
+    let output = review_workspace_file(root, pack_path, pack, requested, expected_name)?;
+    for (source_path, _) in sources {
+        let source = fs::canonicalize(source_path).map_err(|error| {
             DomainError::new(
                 ErrorCode::InputUnreadable,
                 format!("не удалось разрешить путь исходного артефакта: {error}"),
@@ -2034,14 +2501,112 @@ fn replace_derived_document(
             ));
         }
     }
-    if output.exists() {
-        let existing = fs::read(&output).map_err(|error| artifact_write_error(&output, &error))?;
+    let workspace = output.parent().ok_or_else(|| {
+        DomainError::new(ErrorCode::InvalidRequest, "у review artifact нет workspace")
+    })?;
+    let workspace_fd = super::execution::safe_dir(workspace)?;
+    let _lock = lock_review_workspace(&workspace_fd, workspace)?;
+    for (source_path, expected_bytes) in sources {
+        let current =
+            fs::read(source_path).map_err(|error| artifact_write_error(source_path, &error))?;
+        if current != *expected_bytes {
+            return Err(DomainError::new(
+                ErrorCode::SourceChanged,
+                "исходный review pack или editable triage изменился во время подготовки производного файла",
+            ));
+        }
+    }
+    if let Some(existing) = super::execution::read_optional_file_at(
+        &workspace_fd,
+        expected_name,
+        MAX_REVIEW_ARTIFACT_BYTES,
+    )? {
         if existing == bytes {
             return Ok(output);
         }
+        if !derived_artifact_belongs_to_snapshot(expected_name, &existing, pack, source_pack_sha256)
+        {
+            return Err(artifact_conflict(&output));
+        }
     }
-    crate::write::replace_document_atomically(&output, bytes)?;
+    super::execution::replace_file_at(&workspace_fd, expected_name, bytes)
+        .map_err(|error| artifact_write_error(&output, &error))?;
     Ok(output)
+}
+
+fn derived_artifact_belongs_to_snapshot(
+    name: &str,
+    bytes: &[u8],
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> bool {
+    match name {
+        "semantic-triage.json" => serde_json::from_slice::<SemanticTriage>(bytes)
+            .ok()
+            .is_some_and(|triage| {
+                semantic_triage::validate(&triage, pack, source_pack_sha256).is_ok()
+            }),
+        "review-report.md" => std::str::from_utf8(bytes).is_ok_and(|report| {
+            report.starts_with(
+                "# Семантическое ревью\n\n<!-- anki-repo:semantic-review-report:v1 -->\n\n",
+            ) && report
+                .lines()
+                .take(8)
+                .any(|line| line.contains(&format!("head: `{}`", pack.target.head_sha)))
+                && report
+                    .lines()
+                    .take(8)
+                    .any(|line| line == format!("SHA-256 исходного пакета: `{source_pack_sha256}`"))
+        }),
+        _ => false,
+    }
+}
+
+fn lock_review_workspace(
+    workspace: &std::fs::File,
+    workspace_path: &Path,
+) -> Result<std::fs::File, DomainError> {
+    use fs2::FileExt;
+    let file = super::execution::lock_file(workspace, ".writer.lock")?;
+    file.lock_exclusive()
+        .map_err(|error| artifact_write_error(&workspace_path.join(".writer.lock"), &error))?;
+    Ok(file)
+}
+
+fn review_workspace_file(
+    root: &Path,
+    pack_path: &Path,
+    pack: &ReviewPack,
+    requested: &Path,
+    expected_name: &str,
+) -> Result<PathBuf, DomainError> {
+    let workspace = workspace_for_pack(root, pack_path, pack)?;
+    reject_parent_components(requested)?;
+    let absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| artifact_write_error(requested, &error))?
+            .join(requested)
+    };
+    let expected = workspace.join(expected_name);
+    if normalize_without_parent(&absolute) != expected {
+        return Err(DomainError::with_details(
+            ErrorCode::InvalidRequest,
+            format!("путь review artifact должен указывать на {expected_name} в своём workspace"),
+            crate::details! {
+                "expected" => expected.display().to_string(),
+                "requested" => absolute.display().to_string(),
+            },
+        ));
+    }
+    let directory_fd = super::execution::safe_dir(&workspace)?;
+    super::execution::read_optional_file_at(
+        &directory_fd,
+        expected_name,
+        MAX_REVIEW_ARTIFACT_BYTES,
+    )?;
+    Ok(expected)
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -2805,33 +3370,36 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
         let mut baseline_a = pack.clone();
         baseline_a.target.head_sha = base.clone();
         let changes_a = delta::compare(&baseline_a, &pack).unwrap();
-        let result_a =
-            save_snapshot(&repo.0, None, &pack, Some(changes_a), &BTreeMap::new()).unwrap();
+        let result_a = save_snapshot(
+            &repo.0,
+            None,
+            &pack,
+            Some(changes_a),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
 
         let mut baseline_b = pack.clone();
         baseline_b.target.head_sha = head.clone();
         let changes_b = delta::compare(&baseline_b, &pack).unwrap();
-        let result_b =
-            save_snapshot(&repo.0, None, &pack, Some(changes_b), &BTreeMap::new()).unwrap();
-
+        let error = save_snapshot(
+            &repo.0,
+            None,
+            &pack,
+            Some(changes_b),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ReviewArtifactConflict);
         assert_eq!(
             result_a.artifact_dir,
-            format!(".anki-repo/review/{base}-{base}-{head}")
+            format!(".anki-repo/review/local/{head}")
         );
-        assert_eq!(
-            result_b.artifact_dir,
-            format!(".anki-repo/review/{head}-{base}-{head}")
-        );
-        assert_ne!(result_a.artifact_dir, result_b.artifact_dir);
         assert!(
             repo.0
                 .join(&result_a.artifact_dir)
-                .join("delta.json")
-                .exists()
-        );
-        assert!(
-            repo.0
-                .join(&result_b.artifact_dir)
                 .join("delta.json")
                 .exists()
         );
@@ -2981,8 +3549,19 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
         assert!(pack_a.tool_runs[0].exit_status.unwrap().success);
         assert_eq!(pack_a.tool_runs[0].status, "diagnostics");
         assert!(!pack_a.diagnostics.is_empty());
-        let output = repo.0.join(".anki-repo/review/stable");
-        save_snapshot(&repo.0, Some(&output), &pack_a, None, &BTreeMap::new()).unwrap();
+        let output = repo
+            .0
+            .join(".anki-repo/review/local")
+            .join(&pack_a.target.head_sha);
+        save_snapshot(
+            &repo.0,
+            Some(&output),
+            &pack_a,
+            None,
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
         let second = scope::collect_scope(&repo.0, "HEAD~1", "HEAD").unwrap();
         let pack_b = build_pack(&repo.0, second, true);
         assert!(pack_b.tool_runs[0].exit_status.unwrap().success);
@@ -2991,7 +3570,15 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             human_summary(&pack_a, &test_review_queue(&pack_a)),
             human_summary(&pack_b, &test_review_queue(&pack_b))
         );
-        save_snapshot(&repo.0, Some(&output), &pack_b, None, &BTreeMap::new()).unwrap();
+        save_snapshot(
+            &repo.0,
+            Some(&output),
+            &pack_b,
+            None,
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
         assert!(working_tree_matches(&pack_b.target, &repo.0));
     }
 
@@ -3030,29 +3617,65 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             ErrorCode::ReviewArtifactConflict
         );
 
-        let failing_documents = BTreeMap::from([
+        let invalid_documents = BTreeMap::from([
             ("a", b"written before failure".to_vec()),
             ("nested/file", b"write failure".to_vec()),
         ]);
         let existing_empty = temp.join("existing-empty");
         fs::create_dir(&existing_empty).unwrap();
         assert_eq!(
-            write_directory_once(&existing_empty, &failing_documents)
+            write_directory_once(&existing_empty, &invalid_documents)
                 .unwrap_err()
                 .code,
-            ErrorCode::WriteFailed
+            ErrorCode::InvalidRequest
         );
         assert!(existing_empty.is_dir());
         assert_eq!(fs::read_dir(&existing_empty).unwrap().count(), 0);
 
         let newly_created = temp.join("newly-created");
         assert_eq!(
-            write_directory_once(&newly_created, &failing_documents)
+            write_directory_once(&newly_created, &invalid_documents)
                 .unwrap_err()
                 .code,
-            ErrorCode::WriteFailed
+            ErrorCode::InvalidRequest
         );
         assert!(!newly_created.exists());
+    }
+
+    #[test]
+    fn concurrent_snapshot_writers_never_remove_a_neighbor_publication() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let owner = TempWorkspace::create("anki-concurrent-review-write")
+            .expect("временная рабочая область проекта должна создаваться");
+        let directory = owner.path().join("snapshot");
+        let documents = BTreeMap::from([
+            ("review.json", b"{\"source\":true}\n".to_vec()),
+            ("review-queue.json", b"{\"queue\":true}\n".to_vec()),
+        ]);
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let directory = directory.clone();
+                let documents = documents.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    write_directory_once(&directory, &documents)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(results.iter().any(Result::is_ok));
+        write_directory_once(&directory, &documents).unwrap();
+        for (name, expected) in documents {
+            assert_eq!(fs::read(directory.join(name)).unwrap(), expected);
+        }
     }
 
     #[test]
