@@ -124,6 +124,7 @@ CrowdAnki-экспортом и не знает имён полей конкре
 Имя поля всегда называет вызывающая сторона, а сверяется оно с фактическими
 `note_models[].flds[].name` того экспорта, с которым работает команда.
 
+<a id="code-review-collectverifydeltaqueuetriage"></a>
 <a id="code-review-collectverifydeltatriage"></a>
 
 ### `code-review collect|verify|delta|queue|triage|execution`

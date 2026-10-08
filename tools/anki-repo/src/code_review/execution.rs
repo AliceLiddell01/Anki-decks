@@ -1306,13 +1306,20 @@ fn output_evidence(
     let directory = safe_dir(&job.directory.join("logs"))?;
     let mut file = open_file(&directory, name, false)?;
     let total_bytes = file.metadata().map_err(io_error)?.len();
+    let redaction_context_bytes = sensitive_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .map(String::len)
+        .max()
+        .unwrap_or_default();
+    let read_limit = limit.saturating_add(redaction_context_bytes);
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
-        .take(limit as u64)
+        .take(read_limit as u64)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     let utf8_lossy = std::str::from_utf8(&bytes).is_err();
-    let mut truncated = total_bytes > bytes.len() as u64;
+    let truncated = total_bytes > limit as u64;
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     for value in sensitive_values.iter().filter(|value| !value.is_empty()) {
         text = text.replace(value, "<redacted>");
@@ -1323,7 +1330,6 @@ fn output_evidence(
             end -= 1;
         }
         text.truncate(end);
-        truncated = true;
     }
     Ok(OutputEvidence {
         text,
@@ -2394,6 +2400,25 @@ mod tests {
             ]),
             vec!["cargo", "--api-token", "<redacted>", "--mode=test",]
         );
+    }
+
+    #[test]
+    fn output_redaction_includes_sensitive_values_crossing_the_limit() {
+        let repo = Repo::new();
+        let job = repo.prepare(ExecutionMode::IsolatedChecks);
+        let logs = job.directory.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let source = b"visible:local-secret-value tail";
+        fs::write(logs.join("stdout.log"), source).unwrap();
+
+        let secret = "local-secret-value".to_owned();
+        let evidence = output_evidence(&job, "stdout.log", 18, &[secret]).unwrap();
+
+        assert_eq!(evidence.text, "visible:<redacted>");
+        assert!(!evidence.text.contains("loc"));
+        assert_eq!(evidence.total_bytes, source.len() as u64);
+        assert!(evidence.truncated);
+        assert!(evidence.text.len() <= 18);
     }
 
     #[test]
