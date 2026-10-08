@@ -532,13 +532,13 @@ pub enum CodeReviewCommand {
         /// Верхняя ссылка Git; её SHA фиксируется в пакете.
         #[arg(long)]
         head: String,
-        /// Канонический workspace PR/HEAD; по умолчанию `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`.
+        /// Каноническая рабочая область PR/HEAD; по умолчанию `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
         run_clippy: bool,
-        /// Номер существующего PR; для code-review PR передавайте его явно.
+        /// Номер существующего PR; при ревью PR передавайте его явно.
         #[arg(long, value_name = "NUMBER")]
         pr_number: Option<String>,
     },
@@ -551,7 +551,7 @@ pub enum CodeReviewCommand {
         /// Новый HEAD для сравнения; базовый SHA берётся из исходного пакета.
         #[arg(long)]
         head: String,
-        /// Workspace нового HEAD: `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`; namespace берётся из baseline.
+        /// Рабочая область нового HEAD: `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`; пространство наследуется из исходного пакета.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
@@ -581,7 +581,7 @@ pub enum CodeReviewCommand {
         command: ReviewQueueCommand,
     },
 
-    /// Изолированное исполнение проверок на закреплённом review snapshot.
+    /// Изолированное исполнение проверок на закреплённом снимке ревью.
     Execution {
         #[command(subcommand)]
         command: ReviewExecutionCommand,
@@ -654,12 +654,12 @@ pub enum ReviewQueueCommand {
         /// Каноническая роль кода: runtime, runtime_boundary или роль теста.
         #[arg(long = "code-role", value_name = "CODE_ROLE")]
         code_role: Option<CodeRole>,
-        /// Пропустить восстановление Git images/AST и явно показать structural-only статус.
+        /// Пропустить восстановление Git-снимков/AST и явно показать статус structure_only.
         #[arg(long)]
         structure_only: bool,
     },
 
-    /// Проверить источник, полноту покрытия и структуру queue artifact.
+    /// Проверить источник, полноту покрытия и структуру артефакта очереди.
     Validate {
         /// Путь к исходному пакету свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
@@ -667,7 +667,7 @@ pub enum ReviewQueueCommand {
         /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
-        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
         #[arg(long)]
         structure_only: bool,
     },
@@ -680,7 +680,7 @@ pub enum ReviewQueueCommand {
         /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
-        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
         #[arg(long)]
         structure_only: bool,
     },
@@ -696,7 +696,7 @@ pub enum ReviewQueueCommand {
         /// Точный ID группы из `review-queue.json`.
         #[arg(long, value_name = "ID")]
         id: String,
-        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
         #[arg(long)]
         structure_only: bool,
     },
@@ -712,45 +712,45 @@ pub enum ReviewQueueCommand {
         /// Точный ID candidate из исходного `review.json`.
         #[arg(long, value_name = "ID")]
         id: String,
-        /// Проверить только JSON-структуру и digest, не подтверждая syntax-derived классификацию.
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
         #[arg(long)]
         structure_only: bool,
     },
 }
 
-/// Управление изолированным execution job без зависимости от agent framework.
+/// Управление изолированным заданием без зависимости от системы агентов.
 #[derive(Debug, Subcommand)]
 pub enum ReviewExecutionCommand {
-    /// Подготовить приватный job и detached worktree, не запуская проектный код.
+    /// Подготовить отдельное задание и detached worktree, не запуская проектный код.
     Prepare {
         /// Канонический review.json из `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Режим проверки или disposable source experiment.
+        /// Режим изолированной проверки или эксперимента с отдельной копией исходников.
         #[arg(long, value_enum)]
         mode: crate::code_review::execution::ExecutionMode,
-        /// Проверить PR namespace канонического --pack; без параметра namespace наследуется из пути.
+        /// Проверить пространство PR канонического --pack; без параметра пространство наследуется из пути.
         #[arg(long, value_name = "NUMBER")]
         pr_number: Option<String>,
-        /// Именованное направление review, например tests, runtime, docs или security.
+        /// Именованное направление ревью, например tests, runtime, docs или security.
         #[arg(long, value_name = "SCOPE")]
         scope: String,
     },
 
-    /// Запустить явную argv-команду в рабочем каталоге job.
+    /// Запустить явную argv-команду в рабочем каталоге задания.
     Run {
-        /// Каталог ранее подготовленного execution job.
+        /// Каталог ранее подготовленного задания.
         job: PathBuf,
-        /// Обязательный timeout команды в секундах.
+        /// Обязательный срок выполнения команды в секундах.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
         timeout_seconds: u64,
-        /// Рабочий каталог относительно корня pinned worktree.
+        /// Рабочий каталог относительно корня закреплённого worktree.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        /// Максимум одновременных тяжёлых execution jobs в этом репозитории.
+        /// Общий репозиторный предел одновременных заданий; значения должны совпадать, пока есть активные задания.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=64))]
         max_parallel_jobs: u64,
-        /// Явно передать переменную окружения; при наличии параметров включается explicit policy.
+        /// Явно передать переменную окружения; при наличии параметров включается политика explicit.
         #[arg(long = "env", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
         environment: Vec<String>,
         /// Исполняемый файл и аргументы после `--`; shell не запускается.
@@ -758,22 +758,26 @@ pub enum ReviewExecutionCommand {
         argv: Vec<String>,
     },
 
-    /// Прочитать сохранённое состояние job/result без изменения файлов.
+    /// Прочитать сохранённое состояние задания и результат без изменения файлов.
     Inspect {
-        /// Каталог execution job.
+        /// Каталог задания.
         job: PathBuf,
     },
 
-    /// Запросить отмену активного job.
+    /// Запросить отмену активного задания.
     Cancel {
-        /// Каталог execution job.
+        /// Каталог задания.
         job: PathBuf,
     },
 
-    /// Очистить только собственный worktree и временные каталоги job.
+    /// Очистить только собственный worktree и временные каталоги задания.
     Cleanup {
-        /// Каталог execution job.
+        /// Каталог задания.
         job: PathBuf,
+        /// Подтвердить отсутствие живых потомков после самостоятельной проверки оператором.
+        /// Требуется для очистки задания, в котором процесс мог запускаться.
+        #[arg(long)]
+        confirm_no_live_descendants: bool,
     },
 }
 
@@ -889,4 +893,41 @@ pub enum LanguageCommand {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[cfg(test)]
+mod execution_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn execution_cleanup_descendant_confirmation_is_explicit() {
+        for (extra, expected) in [(None, false), (Some("--confirm-no-live-descendants"), true)] {
+            let mut argv = vec![
+                "anki-repo",
+                "code-review",
+                "execution",
+                "cleanup",
+                "job-fixture",
+            ];
+            if let Some(flag) = extra {
+                argv.push(flag);
+            }
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Command::CodeReview {
+                command:
+                    CodeReviewCommand::Execution {
+                        command:
+                            ReviewExecutionCommand::Cleanup {
+                                confirm_no_live_descendants,
+                                ..
+                            },
+                    },
+            } = cli.command
+            else {
+                panic!("ожидалась команда очистки задания")
+            };
+            assert_eq!(confirm_no_live_descendants, expected);
+        }
+    }
 }

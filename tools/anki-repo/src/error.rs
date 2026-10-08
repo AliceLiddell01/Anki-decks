@@ -1,13 +1,13 @@
 //! Доменные ошибки и их отображение на process exit codes.
 //!
-//! Machine-readable контракт — только значения [`ErrorCode`] в snake_case.
+//! Машиночитаемый контракт — только значения [`ErrorCode`] в snake_case.
 //! Rust-имена типов наружу не выходят.
 
 use std::fmt;
 
 use serde_json::{Map, Value};
 
-/// Стабильные machine-readable коды доменных ошибок.
+/// Стабильные машиночитаемые коды доменных ошибок.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ErrorCode {
     /// Некорректная комбинация аргументов, обнаруженная вне clap.
@@ -32,7 +32,7 @@ pub enum ErrorCode {
     UnknownModel,
     /// Селектор модели заметок совпал более чем с одной моделью.
     AmbiguousModel,
-    /// Модель заметок существует, но её field/template schema непригодна
+    /// Модель заметок существует, но её схема полей и шаблонов непригодна
     /// для безопасной сборки значений полей.
     ModelSchemaUnusable,
     /// Модель требует значение поля, которого нет в запросе создания.
@@ -64,10 +64,14 @@ pub enum ErrorCode {
     ReviewArtifactInvalid,
     /// Исходный пакет относится к другому репозиторию или несовместимой базе.
     BaselineMismatch,
-    /// Полная проверка syntax-derived queue невозможна из-за недоступного или непарсируемого AST.
+    /// Полная проверка очереди на основе синтаксиса невозможна из-за недоступного или непарсируемого AST.
     SyntaxAuthenticityUnavailable,
     /// Путь пакета ревью занят несовместимым сохранённым содержимым.
     ReviewArtifactConflict,
+    /// Задание или общий слот исполнения временно заняты; запрос можно повторить.
+    ExecutionBusy,
+    /// Не удалось выполнить операцию управления процессом.
+    ProcessOperationFailed,
     /// Решения для языковой проверки не прошли безопасную проверку предусловий.
     LanguageDecisionInvalid,
     /// `find` по идентичности не нашёл ни одного совпадения.
@@ -127,6 +131,8 @@ impl ErrorCode {
             Self::BaselineMismatch => "baseline_mismatch",
             Self::SyntaxAuthenticityUnavailable => "syntax_authenticity_unavailable",
             Self::ReviewArtifactConflict => "review_artifact_conflict",
+            Self::ExecutionBusy => "execution_busy",
+            Self::ProcessOperationFailed => "process_operation_failed",
             Self::LanguageDecisionInvalid => "language_decision_invalid",
             Self::NotFound => "not_found",
             Self::Ambiguous => "ambiguous",
@@ -181,6 +187,8 @@ impl ErrorCode {
             Self::ExpectedMismatch | Self::SourceChanged => 7,
             Self::WriteFailed => 8,
             Self::ReviewArtifactConflict => 7,
+            Self::ExecutionBusy => 13,
+            Self::ProcessOperationFailed => 14,
             Self::Internal => 70,
         }
     }
@@ -196,11 +204,11 @@ impl fmt::Display for ErrorCode {
 #[derive(Debug, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct DomainError {
-    /// Стабильный machine-readable код.
+    /// Стабильный машиночитаемый код.
     pub code: ErrorCode,
     /// Человекочитаемое объяснение (на русском языке).
     pub message: String,
-    /// Дополнительные machine-readable детали.
+    /// Дополнительные машиночитаемые детали.
     pub details: Value,
 }
 
@@ -299,7 +307,7 @@ mod tests {
         assert_eq!(ErrorCode::WriteFailed.as_str(), "write_failed");
     }
 
-    /// Exit semantics, которые обязан документировать `tools/anki-repo/README.md`.
+    /// Семантика кодов завершения, которую обязан документировать `tools/anki-repo/README.md`.
     ///
     /// Один exit code описывает несколько кодов ошибок, поэтому документация
     /// должна перечислять их вместе: `4` — `find`/`not_found` и
@@ -315,7 +323,7 @@ mod tests {
         assert_eq!(ErrorCode::ExpectedMismatch.exit_code(), 7);
         assert_eq!(ErrorCode::SourceChanged.exit_code(), 7);
 
-        // Коды различаются, несмотря на общий exit code: wrapper'у нужна причина,
+        // Коды различаются, несмотря на общий exit code: вызывающей программе нужна причина,
         // а не только код процесса.
         assert_ne!(ErrorCode::NotFound, ErrorCode::NoteNotFound);
         assert_ne!(ErrorCode::ExpectedMismatch, ErrorCode::SourceChanged);
@@ -359,6 +367,8 @@ mod tests {
             ErrorCode::BaselineMismatch,
             ErrorCode::SyntaxAuthenticityUnavailable,
             ErrorCode::ReviewArtifactConflict,
+            ErrorCode::ExecutionBusy,
+            ErrorCode::ProcessOperationFailed,
             ErrorCode::LanguageDecisionInvalid,
             ErrorCode::NotFound,
             ErrorCode::Ambiguous,
