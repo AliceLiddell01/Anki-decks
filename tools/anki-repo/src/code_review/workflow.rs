@@ -24,8 +24,9 @@ use super::model::{
     ReviewScope, ToolRunEvidence,
 };
 use super::review_queue::{
-    self, ClassificationBasis, CodeRole, QueueListFilters, QueueListPage, QueueSummary,
-    ReviewPriority, ReviewQueue, ReviewUnit, StructuralClassification, StructuralRole, TextRole,
+    self, ClassificationBasis, CodeRole, QueueExecutionFilter, QueueListFilters, QueueListPage,
+    QueueSummary, QueueSurfaceFilter, ReviewPriority, ReviewQueue, ReviewUnit,
+    StructuralClassification, StructuralRole, TextRole,
 };
 use super::rust_context::{
     RustCallContext, RustCallKind, RustCodeRole, RustContext, RustContextBasis, RustContextIndex,
@@ -106,17 +107,17 @@ pub struct ReviewQueueValidationSummary {
     pub summary: QueueSummary,
 }
 
-/// Значения фильтров CLI до проверки канонических меток.
+/// Типизированные параметры CLI для фильтрации очереди.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewQueueListOptions {
-    pub priority: Option<String>,
+    pub priority: Option<ReviewPriority>,
     pub unknown: bool,
     pub detector: Option<String>,
-    pub surface: Option<String>,
-    pub execution: Option<String>,
-    pub role: Option<String>,
-    pub text_role: Option<String>,
-    pub code_role: Option<String>,
+    pub surface: Option<QueueSurfaceFilter>,
+    pub execution: Option<QueueExecutionFilter>,
+    pub role: Option<StructuralRole>,
+    pub text_role: Option<TextRole>,
+    pub code_role: Option<CodeRole>,
     pub offset: u64,
     pub limit: u64,
 }
@@ -271,7 +272,27 @@ pub fn list_review_queue(
             &options.limit.to_string(),
         ));
     }
-    let filters = parse_review_queue_filters(options)?;
+    let detector = options
+        .detector
+        .as_deref()
+        .map(|value| {
+            if is_canonical_filter_label(value) {
+                Ok(value.to_owned())
+            } else {
+                Err(invalid_queue_list_filter("detector", value))
+            }
+        })
+        .transpose()?;
+    let filters = QueueListFilters {
+        priority: options.priority,
+        unknown_only: options.unknown,
+        detector,
+        surface: options.surface,
+        execution: options.execution,
+        role: options.role,
+        text_role: options.text_role,
+        code_role: options.code_role,
+    };
     let offset = usize::try_from(options.offset).map_err(|_| {
         DomainError::new(
             ErrorCode::InvalidRequest,
@@ -285,146 +306,6 @@ pub fn list_review_queue(
         )
     })?;
     Ok(review_queue::list_units(&queue, &filters, offset, limit))
-}
-
-fn parse_review_queue_filters(
-    options: &ReviewQueueListOptions,
-) -> Result<QueueListFilters, DomainError> {
-    let priority = parse_queue_filter(
-        options.priority.as_deref(),
-        "priority",
-        &[
-            ("high", ReviewPriority::High),
-            ("normal", ReviewPriority::Normal),
-            ("low", ReviewPriority::Low),
-        ],
-    )?;
-    let detector = options
-        .detector
-        .as_deref()
-        .map(|value| {
-            if is_canonical_filter_label(value) {
-                Ok(value.to_owned())
-            } else {
-                Err(invalid_queue_list_filter("detector", value))
-            }
-        })
-        .transpose()?;
-    let surface = parse_string_queue_filter(
-        options.surface.as_deref(),
-        "surface",
-        &[
-            "production",
-            "tests",
-            "ci",
-            "config",
-            "docs",
-            "generated",
-            "data",
-            "agent_context",
-            "dependencies",
-            "unknown",
-        ],
-    )?;
-    let execution = parse_string_queue_filter(
-        options.execution.as_deref(),
-        "execution",
-        &["production", "tests", "unknown"],
-    )?;
-    let role = parse_queue_filter(
-        options.role.as_deref(),
-        "role",
-        &[
-            ("text", StructuralRole::Text),
-            ("error_path", StructuralRole::ErrorPath),
-            ("security", StructuralRole::Security),
-            ("suppression", StructuralRole::Suppression),
-            ("test_change", StructuralRole::TestChange),
-            ("dependency", StructuralRole::Dependency),
-            ("configuration", StructuralRole::Configuration),
-            ("generated", StructuralRole::Generated),
-            ("repository_context", StructuralRole::RepositoryContext),
-            ("path", StructuralRole::Path),
-            (
-                "development_reference",
-                StructuralRole::DevelopmentReference,
-            ),
-            ("unknown", StructuralRole::Unknown),
-        ],
-    )?;
-    let text_role = parse_queue_filter(
-        options.text_role.as_deref(),
-        "text-role",
-        &[
-            ("human_comment", TextRole::HumanComment),
-            ("human_documentation", TextRole::HumanDocumentation),
-            ("human_log", TextRole::HumanLog),
-            ("human_diagnostic", TextRole::HumanDiagnostic),
-            ("human_help", TextRole::HumanHelp),
-            ("human_ui", TextRole::HumanUi),
-            ("technical_identifier", TextRole::TechnicalIdentifier),
-            ("machine_contract", TextRole::MachineContract),
-            ("external_literal", TextRole::ExternalLiteral),
-            ("path", TextRole::Path),
-            ("url", TextRole::Url),
-            ("cli_flag", TextRole::CliFlag),
-            ("code_example", TextRole::CodeExample),
-            ("test_fixture", TextRole::TestFixture),
-            ("unknown", TextRole::Unknown),
-        ],
-    )?;
-    let code_role = parse_queue_filter(
-        options.code_role.as_deref(),
-        "code-role",
-        &[
-            ("runtime", CodeRole::Runtime),
-            ("runtime_boundary", CodeRole::RuntimeBoundary),
-            ("test_setup", CodeRole::TestSetup),
-            ("test_assertion", CodeRole::TestAssertion),
-            ("test_helper", CodeRole::TestHelper),
-            ("unknown", CodeRole::Unknown),
-        ],
-    )?;
-    Ok(QueueListFilters {
-        priority,
-        unknown_only: options.unknown,
-        detector,
-        surface,
-        execution,
-        role,
-        text_role,
-        code_role,
-    })
-}
-
-fn parse_queue_filter<T: Copy>(
-    value: Option<&str>,
-    flag: &str,
-    labels: &[(&str, T)],
-) -> Result<Option<T>, DomainError> {
-    value
-        .map(|value| {
-            labels
-                .iter()
-                .find_map(|(label, parsed)| (*label == value).then_some(*parsed))
-                .ok_or_else(|| invalid_queue_list_filter(flag, value))
-        })
-        .transpose()
-}
-
-fn parse_string_queue_filter(
-    value: Option<&str>,
-    flag: &str,
-    labels: &[&str],
-) -> Result<Option<String>, DomainError> {
-    value
-        .map(|value| {
-            labels
-                .contains(&value)
-                .then(|| value.to_owned())
-                .ok_or_else(|| invalid_queue_list_filter(flag, value))
-        })
-        .transpose()
 }
 
 fn is_canonical_filter_label(value: &str) -> bool {
@@ -879,19 +760,20 @@ fn rust_sources_from_scope(collected: &CollectedScope) -> (Vec<SourceFile>, Vec<
     let mut post_sources = Vec::new();
     let mut base_sources = Vec::new();
     for file in &collected.files {
-        if let (ImageState::Text, Some(content)) = (&file.post.state, &file.post.text) {
+        if file.path.ends_with(".rs")
+            && let (ImageState::Text, Some(content)) = (&file.post.state, &file.post.text)
+        {
             post_sources.push(SourceFile {
                 path: file.path.clone(),
                 content: content.clone(),
             });
         }
-        if let (ImageState::Text, Some(content)) = (&file.base.state, &file.base.text) {
+        let base_path = file.previous_path.as_deref().unwrap_or(&file.path);
+        if base_path.ends_with(".rs")
+            && let (ImageState::Text, Some(content)) = (&file.base.state, &file.base.text)
+        {
             base_sources.push(SourceFile {
-                path: file
-                    .previous_path
-                    .as_deref()
-                    .unwrap_or(&file.path)
-                    .to_owned(),
+                path: base_path.to_owned(),
                 content: content.clone(),
             });
         }
@@ -2570,6 +2452,94 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} завершился с ошибкой");
+    }
+
+    #[test]
+    fn rust_source_images_include_only_rust_effective_paths() {
+        let image = |text: Option<&str>| match text {
+            Some(text) => scope::FileImage {
+                state: ImageState::Text,
+                size: text.len() as u64,
+                object_id: None,
+                mode: None,
+                text: Some(text.to_owned()),
+            },
+            None => scope::FileImage {
+                state: ImageState::Missing,
+                size: 0,
+                object_id: None,
+                mode: None,
+                text: None,
+            },
+        };
+        let file = |path: &str,
+                    previous_path: Option<&str>,
+                    base_text: Option<&str>,
+                    post_text: Option<&str>| ScopedFile {
+            path: path.to_owned(),
+            previous_path: previous_path.map(str::to_owned),
+            status: FileStatus::Modified,
+            additions: None,
+            deletions: None,
+            category: scope::FileCategory::Other,
+            surfaces: Vec::new(),
+            binary: false,
+            base_changed_lines: Vec::new(),
+            post_changed_lines: Vec::new(),
+            base: image(base_text),
+            post: image(post_text),
+        };
+        let collected = CollectedScope {
+            target: GitTarget {
+                repository_id: "repo".into(),
+                base_sha: "base".into(),
+                head_sha: "head".into(),
+                merge_base_sha: "base".into(),
+            },
+            text_image_limit_bytes: 1024,
+            files: vec![
+                file(
+                    "README.md",
+                    None,
+                    Some("pub fn markdown_base() {}"),
+                    Some("pub fn markdown_post() {}"),
+                ),
+                file(
+                    "src/current.rs",
+                    Some("docs/old.md"),
+                    Some("pub fn old_markdown() {}"),
+                    Some("pub fn current_rust() {}"),
+                ),
+                file(
+                    "docs/current.md",
+                    Some("src/old.rs"),
+                    Some("pub fn old_rust() {}"),
+                    Some("pub fn current_markdown() {}"),
+                ),
+                file(
+                    "src/unchanged.rs",
+                    None,
+                    Some("pub fn rust_base() {}"),
+                    Some("pub fn rust_post() {}"),
+                ),
+            ],
+        };
+
+        let (post_sources, base_sources) = rust_sources_from_scope(&collected);
+        assert_eq!(
+            post_sources
+                .iter()
+                .map(|source| source.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/current.rs", "src/unchanged.rs"]
+        );
+        assert_eq!(
+            base_sources
+                .iter()
+                .map(|source| source.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/old.rs", "src/unchanged.rs"]
+        );
     }
 
     fn test_review_queue(pack: &ReviewPack) -> ReviewQueue {

@@ -7,6 +7,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::code_review::review_queue::{
+    CodeRole, QueueExecutionFilter, QueueSurfaceFilter, ReviewPriority, StructuralRole, TextRole,
+};
+
 /// Предел результата `find` по умолчанию.
 pub const DEFAULT_LIMIT: u64 = 20;
 /// Жёсткий максимум результата `find`.
@@ -608,7 +612,7 @@ pub enum ReviewQueueCommand {
         offset: u64,
         /// Оставить элементы с приоритетом high, normal или low.
         #[arg(long, value_name = "PRIORITY")]
-        priority: Option<String>,
+        priority: Option<ReviewPriority>,
         /// Оставить только элементы с неизвестной структурной классификацией.
         #[arg(long)]
         unknown: bool,
@@ -617,19 +621,19 @@ pub enum ReviewQueueCommand {
         detector: Option<String>,
         /// Каноническая поверхность файла: например, production, tests или docs.
         #[arg(long, value_name = "SURFACE")]
-        surface: Option<String>,
+        surface: Option<QueueSurfaceFilter>,
         /// Исполняемая поверхность: production или tests.
         #[arg(long, value_name = "EXECUTION")]
-        execution: Option<String>,
+        execution: Option<QueueExecutionFilter>,
         /// Каноническая структурная роль, например security или error_path.
         #[arg(long, value_name = "ROLE")]
-        role: Option<String>,
+        role: Option<StructuralRole>,
         /// Каноническая роль текста, например human_documentation или cli_flag.
         #[arg(long = "text-role", value_name = "TEXT_ROLE")]
-        text_role: Option<String>,
+        text_role: Option<TextRole>,
         /// Каноническая роль кода: runtime, runtime_boundary или роль теста.
         #[arg(long = "code-role", value_name = "CODE_ROLE")]
-        code_role: Option<String>,
+        code_role: Option<CodeRole>,
     },
 
     /// Проверить источник, полноту покрытия и структуру queue artifact.

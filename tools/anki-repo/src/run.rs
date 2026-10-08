@@ -605,14 +605,14 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     code_role,
                 } => {
                     let options = crate::code_review::workflow::ReviewQueueListOptions {
-                        priority: priority.clone(),
+                        priority: *priority,
                         unknown: *unknown,
                         detector: detector.clone(),
-                        surface: surface.clone(),
-                        execution: execution.clone(),
-                        role: role.clone(),
-                        text_role: text_role.clone(),
-                        code_role: code_role.clone(),
+                        surface: *surface,
+                        execution: *execution,
+                        role: *role,
+                        text_role: *text_role,
+                        code_role: *code_role,
                         offset: *offset,
                         limit: *limit,
                     };

@@ -1578,6 +1578,28 @@ fn queue_list_help_explains_filters_and_rejects_invalid_pages() {
 }
 
 #[test]
+fn queue_list_rejects_invalid_priority_as_cli_usage_error() {
+    let (code, stdout, stderr) = run_cli(&[
+        "code-review",
+        "queue",
+        "list",
+        "--pack",
+        "unused-review.json",
+        "--queue",
+        "unused-review-queue.json",
+        "--priority",
+        "urgent",
+    ]);
+
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "ошибка разбора не должна выдавать результат"
+    );
+    assert!(stderr.contains("--priority"), "stderr: {stderr}");
+}
+
+#[test]
 fn rust_text_roles_remain_orthogonal_to_execution_and_grouping() {
     let repo = TempDir::new("rust-text-role-separation");
     let artifacts = TempDir::new("rust-text-role-separation-artifacts");

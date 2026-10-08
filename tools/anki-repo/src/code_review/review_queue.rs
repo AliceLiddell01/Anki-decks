@@ -1,7 +1,7 @@
-//! Детерминированная структурная очередь поверх полного raw evidence.
+//! Детерминированная структурная очередь поверх полного пакета исходных свидетельств.
 //!
 //! Классификация, приоритет и группа задают маршрутизацию внешнего ревью.
-//! Они не утверждают семантический результат или покрытие semantic review.
+//! Они не утверждают семантический результат или полноту семантического ревью.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,13 +17,24 @@ use super::semantic_triage::{self, TriageSource};
 
 /// Версия самостоятельного контракта структурной очереди.
 pub const QUEUE_SCHEMA_VERSION: u32 = 1;
-/// Представители ограничены тремя разными местами; остальные IDs раскрываются отдельно.
+/// Представители ограничены тремя разными местами; остальные идентификаторы раскрываются отдельно.
 pub const REPRESENTATIVE_LIMIT: usize = 3;
 
 macro_rules! named_enum {
     ($name:ident { $($variant:ident => $label:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+        named_enum!(@define $name [] [] { $($variant => $label),+ });
+    };
+    ($name:ident, value_enum { $($variant:ident => $label:literal),+ $(,)? }) => {
+        named_enum!(@define $name [clap::ValueEnum] [value(rename_all = "snake_case")] {
+            $($variant => $label),+
+        });
+    };
+    (@define $name:ident [$($derive:path)?] [$($attribute:meta)?] {
+        $($variant:ident => $label:literal),+ $(,)?
+    }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize $(, $derive)?)]
         #[serde(rename_all = "snake_case")]
+        $(#[$attribute])?
         pub enum $name { $($variant),+ }
         impl $name {
             #[must_use]
@@ -44,7 +55,7 @@ named_enum!(ClassificationBasis {
     Unknown => "unknown",
 });
 
-named_enum!(StructuralRole {
+named_enum!(StructuralRole, value_enum {
     Text => "text",
     ErrorPath => "error_path",
     Security => "security",
@@ -59,7 +70,7 @@ named_enum!(StructuralRole {
     Unknown => "unknown",
 });
 
-named_enum!(TextRole {
+named_enum!(TextRole, value_enum {
     HumanComment => "human_comment",
     HumanDocumentation => "human_documentation",
     HumanLog => "human_log",
@@ -105,7 +116,7 @@ impl TextRole {
     }
 }
 
-named_enum!(CodeRole {
+named_enum!(CodeRole, value_enum {
     Runtime => "runtime",
     RuntimeBoundary => "runtime_boundary",
     TestSetup => "test_setup",
@@ -124,13 +135,32 @@ impl CodeRole {
     }
 }
 
-named_enum!(ReviewPriority {
+named_enum!(ReviewPriority, value_enum {
     High => "high",
     Normal => "normal",
     Low => "low",
 });
 
-/// Адаптер доказанного синтаксического контекста; core не содержит парсер Rust.
+named_enum!(QueueSurfaceFilter, value_enum {
+    Production => "production",
+    Tests => "tests",
+    Ci => "ci",
+    Config => "config",
+    Docs => "docs",
+    Generated => "generated",
+    Data => "data",
+    AgentContext => "agent_context",
+    Dependencies => "dependencies",
+    Unknown => "unknown",
+});
+
+named_enum!(QueueExecutionFilter, value_enum {
+    Production => "production",
+    Tests => "tests",
+    Unknown => "unknown",
+});
+
+/// Адаптер доказанного синтаксического контекста; основная логика не содержит парсер Rust.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxContext {
     /// Исполняемая поверхность: только Production/Tests; None сохраняет unknown.
@@ -142,7 +172,7 @@ pub struct SyntaxContext {
     pub basis: ClassificationBasis,
 }
 
-/// Независимые структурные измерения одного исходного candidate ID.
+/// Независимые структурные измерения одного исходного идентификатора кандидата.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuralClassification {
@@ -182,7 +212,7 @@ impl StructuralClassification {
     }
 }
 
-/// Все существенные измерения однородности; сами по себе не semantic decision.
+/// Все существенные измерения однородности; сами по себе они не являются семантическим решением.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupingSignature {
@@ -197,7 +227,7 @@ pub struct GroupingSignature {
     pub structural_pattern: Option<String>,
 }
 
-/// Тип unit явно определяет гранулярность навигации, не результат рассмотрения.
+/// Тип элемента явно задаёт гранулярность навигации, но не результат рассмотрения.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UnitMembers {
@@ -278,7 +308,7 @@ pub struct QueueSummary {
     pub largest_group_sizes: Vec<usize>,
 }
 
-/// Самостоятельный versioned artifact; исходный pack остаётся полным evidence.
+/// Самостоятельный версионируемый артефакт; исходный пакет остаётся полным и неизменным.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewQueue {
@@ -296,8 +326,8 @@ pub struct QueueListFilters {
     pub priority: Option<ReviewPriority>,
     pub unknown_only: bool,
     pub detector: Option<String>,
-    pub surface: Option<String>,
-    pub execution: Option<String>,
+    pub surface: Option<QueueSurfaceFilter>,
+    pub execution: Option<QueueExecutionFilter>,
     pub role: Option<StructuralRole>,
     pub text_role: Option<TextRole>,
     pub code_role: Option<CodeRole>,
@@ -467,7 +497,7 @@ fn classify_text(
     (Some(TextRole::Unknown), ClassificationBasis::Unknown)
 }
 
-/// Классифицирует candidate, сохраняя неизвестные измерения явно.
+/// Классифицирует кандидата, явно сохраняя неизвестные измерения.
 #[must_use]
 pub fn classify(
     pack: &ReviewPack,
@@ -658,7 +688,7 @@ fn can_group(signature: &GroupingSignature) -> bool {
 fn serialized_signature(signature: &GroupingSignature) -> Result<String, DomainError> {
     serde_json::to_string(signature).map_err(|error| {
         invalid(format!(
-            "Не удалось сериализовать structural signature: {error}"
+            "Не удалось сериализовать структурную подпись: {error}"
         ))
     })
 }
@@ -743,7 +773,7 @@ fn validate_classification(
             .is_some_and(|value| value.is_empty())
     {
         return Err(invalid(format!(
-            "Structural classification противоречит исходному evidence: {}",
+            "Структурная классификация противоречит исходному свидетельству: {}",
             candidate.id
         )));
     }
@@ -786,7 +816,7 @@ fn make_unit(
     })
 }
 
-/// Строит queue без изменения raw pack и без семантических решений.
+/// Строит очередь без изменения исходного пакета и без семантических решений.
 pub fn build(
     pack: &ReviewPack,
     source_pack_sha256: &str,
@@ -803,7 +833,9 @@ pub fn build(
         .keys()
         .any(|id| !candidate_ids.contains(id.as_str()))
     {
-        return Err(invalid("Syntax context содержит неизвестный candidate ID"));
+        return Err(invalid(
+            "Контекст синтаксиса содержит неизвестный идентификатор кандидата",
+        ));
     }
     let files_by_candidate_path = pack.scope_files_by_candidate_path();
     let mut classifications = BTreeMap::new();
@@ -868,22 +900,23 @@ fn matches_list_filters(unit: &ReviewUnit, filters: &QueueListFilters) -> bool {
             .detector
             .as_ref()
             .is_none_or(|detector| unit.signature.detector == detector.as_str())
-        && filters.surface.as_ref().is_none_or(|surface| {
-            classification
+        && filters.surface.is_none_or(|surface| match surface {
+            QueueSurfaceFilter::Unknown => {
+                classification.surfaces.is_empty()
+                    || (classification.file_category == Some(FileCategory::Rust)
+                        && classification.execution.is_none())
+            }
+            _ => classification
                 .surfaces
                 .iter()
-                .any(|item| surface_name(item) == surface.as_str())
-                || (surface == "unknown"
-                    && (classification.surfaces.is_empty()
-                        || (classification.file_category == Some(FileCategory::Rust)
-                            && classification.execution.is_none())))
+                .any(|item| surface_name(item) == surface.as_str()),
         })
-        && filters.execution.as_ref().is_none_or(|execution| {
-            classification
-                .execution
-                .as_ref()
-                .map_or("unknown", surface_name)
-                == execution.as_str()
+        && filters.execution.is_none_or(|execution| match execution {
+            QueueExecutionFilter::Production => {
+                classification.execution == Some(FileSurface::Production)
+            }
+            QueueExecutionFilter::Tests => classification.execution == Some(FileSurface::Tests),
+            QueueExecutionFilter::Unknown => classification.execution.is_none(),
         })
         && filters
             .role
@@ -999,7 +1032,7 @@ fn summarize(queue: &ReviewQueue) -> QueueSummary {
     summary
 }
 
-/// Проверяет точную source boundary, membership, homogeneous signatures и summary.
+/// Проверяет точную границу источника, принадлежность кандидатов, однородность подписей и сводку.
 pub fn validate(
     queue: &ReviewQueue,
     pack: &ReviewPack,
@@ -1007,7 +1040,7 @@ pub fn validate(
 ) -> Result<QueueSummary, DomainError> {
     if queue.schema_version != QUEUE_SCHEMA_VERSION {
         return Err(invalid(
-            "Неподдерживаемая schema_version структурной очереди",
+            "Значение поля `schema_version` структурной очереди не поддерживается",
         ));
     }
     semantic_triage::validate_source(&queue.source, pack, source_pack_sha256)?;
@@ -1024,28 +1057,30 @@ pub fn validate(
             .any(|id| !candidates.contains_key(id.as_str()))
     {
         return Err(invalid(
-            "Classifications не покрывают точное множество raw candidate IDs",
+            "Классификации не покрывают точное множество исходных идентификаторов кандидатов",
         ));
     }
     let mut unit_ids = BTreeSet::new();
     let mut coverage = BTreeSet::new();
     for unit in &queue.units {
         if unit.id.is_empty() || !unit_ids.insert(&unit.id) {
-            return Err(invalid("Пустой или повторяющийся review unit ID"));
+            return Err(invalid(
+                "Идентификатор единицы очереди пуст или повторяется",
+            ));
         }
         let ids = unit.candidate_ids();
         if ids.is_empty() || ids.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(invalid(
-                "Candidate IDs unit должны быть непустым сортированным множеством",
+                "Идентификаторы кандидатов в единице очереди должны образовывать непустое отсортированное множество",
             ));
         }
         let mut members = Vec::new();
         for id in ids {
             let candidate = candidates
                 .get(id.as_str())
-                .ok_or_else(|| invalid(format!("Неизвестный candidate ID: {id}")))?;
+                .ok_or_else(|| invalid(format!("Неизвестный идентификатор кандидата: {id}")))?;
             if !coverage.insert(id.as_str()) {
-                return Err(invalid(format!("Candidate покрыт повторно: {id}")));
+                return Err(invalid(format!("Кандидат учтён повторно: {id}")));
             }
             let class = &queue.classifications[id];
             validate_classification(class, &files_by_candidate_path, candidate)?;
@@ -1055,7 +1090,7 @@ pub fn validate(
                 || signature(candidate, class) != unit.signature
             {
                 return Err(invalid(format!(
-                    "Неоднородная либо неверная structural signature: {id}"
+                    "Структурная подпись неоднородна или неверна: {id}"
                 )));
             }
             members.push(*candidate);
@@ -1081,19 +1116,19 @@ pub fn validate(
                 != priority(&unit.signature.classification)
         {
             return Err(invalid(
-                "ID, статистика или приоритет unit не соответствуют её evidence",
+                "Идентификатор, статистика или приоритет единицы не соответствуют её свидетельствам",
             ));
         }
     }
     if coverage.len() != candidates.len() {
         return Err(invalid(
-            "Каждый raw candidate должен присутствовать ровно в одной review unit",
+            "Каждый исходный кандидат должен присутствовать ровно в одной единице очереди",
         ));
     }
     let summary = summarize(queue);
     if summary != queue.summary {
         return Err(invalid(
-            "Queue summary не соответствует classifications и units",
+            "Сводка очереди не соответствует классификациям и единицам",
         ));
     }
     Ok(summary)
@@ -1708,28 +1743,28 @@ mod tests {
         );
         assert_eq!(
             get_ids(QueueListFilters {
-                surface: Some("docs".into()),
+                surface: Some(QueueSurfaceFilter::Docs),
                 ..QueueListFilters::default()
             }),
             BTreeSet::from([doc_id.clone()])
         );
         assert_eq!(
             get_ids(QueueListFilters {
-                surface: Some("tests".into()),
+                surface: Some(QueueSurfaceFilter::Tests),
                 ..QueueListFilters::default()
             }),
             BTreeSet::from([group_id.clone()])
         );
         assert_eq!(
             get_ids(QueueListFilters {
-                execution: Some("tests".into()),
+                execution: Some(QueueExecutionFilter::Tests),
                 ..QueueListFilters::default()
             }),
             BTreeSet::from([group_id.clone()])
         );
         assert_eq!(
             get_ids(QueueListFilters {
-                execution: Some("unknown".into()),
+                execution: Some(QueueExecutionFilter::Unknown),
                 ..QueueListFilters::default()
             }),
             BTreeSet::from([unknown_id.clone(), config_id.clone(), doc_id.clone()])
@@ -1789,7 +1824,7 @@ mod tests {
         let page = list_units(
             &queue,
             &QueueListFilters {
-                surface: Some("unknown".into()),
+                surface: Some(QueueSurfaceFilter::Unknown),
                 ..QueueListFilters::default()
             },
             0,
@@ -1817,7 +1852,7 @@ mod tests {
         let empty_surface_page = list_units(
             &empty_surface_queue,
             &QueueListFilters {
-                surface: Some("unknown".into()),
+                surface: Some(QueueSurfaceFilter::Unknown),
                 ..QueueListFilters::default()
             },
             0,
@@ -1887,8 +1922,8 @@ mod tests {
             priority: Some(ReviewPriority::High),
             unknown_only: true,
             detector: Some("security_surface".into()),
-            surface: Some("production".into()),
-            execution: Some("production".into()),
+            surface: Some(QueueSurfaceFilter::Production),
+            execution: Some(QueueExecutionFilter::Production),
             role: Some(StructuralRole::Security),
             text_role: Some(TextRole::Unknown),
             code_role: Some(CodeRole::Runtime),
