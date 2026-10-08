@@ -2470,7 +2470,15 @@ fn review_workspace_namespace(
             .join(pack_path)
     };
     let review_root = root.join(".anki-repo").join("review");
-    if !normalize_without_parent(&absolute).starts_with(&review_root) {
+    let resolved = fs::canonicalize(pack_path).map_err(|error| {
+        DomainError::new(
+            ErrorCode::InputUnreadable,
+            format!("не удалось разрешить путь baseline: {error}"),
+        )
+    })?;
+    let lexical_workspace_path = normalize_without_parent(&absolute).starts_with(&review_root);
+    let resolved_workspace_path = resolved.starts_with(&review_root);
+    if !lexical_workspace_path && !resolved_workspace_path {
         return Ok(None);
     }
     let workspace = workspace_for_pack(root, pack_path, pack)?;

@@ -192,7 +192,7 @@ fn cleanup_preflights_all_surfaces_before_removing_worktree() {
 
 #[test]
 fn failures_before_spawn_leave_proven_not_started_job_inspectable() {
-    for surface in ["logs/stdout.log", "home"] {
+    for surface in ["logs/stdout.log", "logs/stderr.log", "home"] {
         let fixture = Fixture::new();
         let job = fixture.prepare("isolated_checks");
         let path = job.join(surface);
@@ -211,11 +211,23 @@ fn failures_before_spawn_leave_proven_not_started_job_inspectable() {
         let inspection = success(fixture.operation("inspect", &job));
         assert_eq!(inspection["lifecycle"], "prepared", "{inspection}");
         assert_eq!(inspection["result"], Value::Null);
+        if surface == "home" {
+            assert!(!job.join("logs/stdout.log").exists());
+            assert!(!job.join("logs/stderr.log").exists());
+        } else if surface == "logs/stderr.log" {
+            assert!(!job.join("logs/stdout.log").exists());
+        }
         fs::remove_file(path).unwrap();
         if surface == "home" {
             fs::create_dir(job.join("home")).unwrap();
         }
-        let result = success(fixture.operation("cleanup", &job));
+        let result = success(fixture.run(
+            &job,
+            &["/bin/sh", "-c", "printf started > ../outputs/started"],
+        ));
+        assert_eq!(result["status"], "passed");
+        assert_eq!(fs::read(job.join("outputs/started")).unwrap(), b"started");
+        let result = confirmed_cleanup(&fixture, &job);
         assert_eq!(result["workspace_removed"], true);
     }
 }

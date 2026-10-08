@@ -2726,6 +2726,54 @@ fn verify_new_head_uses_separate_pr_workspace_and_keeps_previous_documents() {
     assert!(git(repo.path(), &["status", "--porcelain=v1"]).is_empty());
 }
 
+#[test]
+fn verify_rejects_parent_alias_to_pr_baseline_instead_of_falling_back_to_local() {
+    let (repo, base, head) = ignored_review_fixture("verify-pr-baseline-parent-alias");
+    let previous = collect_pr_workspace(repo.path(), &base, &head, "52");
+    assert!(previous.join("review.json").is_file());
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 8 }\n",
+    )
+    .unwrap();
+    commit(repo.path(), "новый снимок PR");
+    let next_head = git(repo.path(), &["rev-parse", "HEAD"]);
+    let cwd = repo.path().join("src");
+    let relative_baseline = Path::new("../.anki-repo/review/52")
+        .join(&head)
+        .join("review.json");
+
+    assert_review_failure(
+        run_cli_in(
+            Some(&cwd),
+            &[
+                "--json",
+                "code-review",
+                "verify",
+                "--baseline",
+                relative_baseline.to_str().unwrap(),
+                "--head",
+                &next_head,
+            ],
+        ),
+        "invalid_request",
+    );
+    assert!(
+        !repo
+            .path()
+            .join(".anki-repo/review/local")
+            .join(&next_head)
+            .exists()
+    );
+    assert!(
+        !repo
+            .path()
+            .join(".anki-repo/review/52")
+            .join(&next_head)
+            .exists()
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn execution_prepare_inherits_local_namespace_when_source_has_no_pr() {

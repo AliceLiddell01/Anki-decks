@@ -55,7 +55,7 @@ pub struct ExecutionSource {
 pub struct PrepareOptions {
     pub mode: ExecutionMode,
     pub scope: String,
-    /// Канонический исходный review.json; относительный путь считается от корня репозитория.
+    /// Канонический исходный review.json; относительный путь считается от текущего каталога.
     pub source_pack: PathBuf,
     /// Необязательное утверждение номера PR; пространство имён наследуется из source_pack.
     pub pr_number: Option<String>,
@@ -571,15 +571,11 @@ pub fn run_job(
             "Режим `isolated_checks` требует неизменённых закреплённых исходников; создайте новое задание или выберите `disposable_source_experiment`.",
         ));
     }
-    let stdout = open_file(&safe_dir(&job.directory.join("logs"))?, "stdout.log", true)?;
-    let stderr = open_file(&safe_dir(&job.directory.join("logs"))?, "stderr.log", true)?;
     let mut command = Command::new(&request.argv[0]);
     command
         .args(&request.argv[1..])
         .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
+        .stdin(Stdio::null());
     configure_environment(&mut command, job, &request.options.environment)?;
     #[cfg(unix)]
     {
@@ -587,6 +583,27 @@ pub fn run_job(
         command.process_group(0);
     }
     let cancelled = cancel.load(Ordering::SeqCst) || cancel_requested(job)?;
+    let logs = safe_dir(&job.directory.join("logs"))?;
+    let stdout = open_file(&logs, "stdout.log", true)?;
+    let stderr = match open_file(&logs, "stderr.log", true) {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            drop(stdout);
+            if let Err(cleanup_error) =
+                rustix::fs::unlinkat(&logs, "stdout.log", rustix::fs::AtFlags::empty())
+            {
+                return Err(DomainError::new(
+                    error.code,
+                    format!(
+                        "{}; не удалось удалить частичный `stdout.log`: {cleanup_error}",
+                        error.message
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+    };
+    command.stdout(stdout).stderr(stderr);
     // До этой записи ошибки доказуемо предшествуют запуску процесса.
     save_state(job, LifecycleStatus::Running, false)?;
     let start = Instant::now();
@@ -1303,7 +1320,7 @@ fn sensitive_request_values(request: &CommandRequest) -> Vec<String> {
 
 fn argv_digest(argv: &[String]) -> String {
     let mut digest = Sha256::new();
-    for argument in argv {
+    for argument in safe_argv(argv) {
         digest.update((argument.len() as u64).to_le_bytes());
         digest.update(argument.as_bytes());
     }
@@ -1819,7 +1836,7 @@ fn exit_summary(status: ExitStatus) -> ProcessExit {
 fn observe_child(child: &mut std::process::Child) -> std::io::Result<Option<ProcessExit>> {
     use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
     let pid = Pid::from_raw(child.id() as i32)
-        .ok_or_else(|| std::io::Error::other("invalid child PID"))?;
+        .ok_or_else(|| std::io::Error::other("Некорректный PID дочернего процесса"))?;
     waitid(
         WaitId::Pid(pid),
         WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
@@ -1957,7 +1974,7 @@ fn mkdir_fd(directory: &File, name: &str) -> std::io::Result<()> {
 }
 #[cfg(not(unix))]
 fn mkdir_fd(_directory: &File, _name: &str) -> std::io::Result<()> {
-    Err(std::io::Error::other("unsupported platform"))
+    Err(std::io::Error::other("Платформа не поддерживается"))
 }
 
 #[cfg(unix)]
@@ -2096,7 +2113,7 @@ pub(super) fn write_new_fd(directory: &File, name: &str, bytes: &[u8]) -> std::i
     #[cfg(not(unix))]
     {
         let _ = (directory, name, bytes);
-        Err(std::io::Error::other("unsupported platform"))
+        Err(std::io::Error::other("Платформа не поддерживается"))
     }
 }
 
@@ -2180,7 +2197,7 @@ pub(super) fn replace_file_at(directory: &File, name: &str, bytes: &[u8]) -> std
     #[cfg(not(unix))]
     {
         let _ = (directory, bytes);
-        Err(std::io::Error::other("unsupported platform"))
+        Err(std::io::Error::other("Платформа не поддерживается"))
     }
 }
 
@@ -2970,6 +2987,19 @@ mod tests {
             assert_eq!(result.argv_sha256, digest);
             assert_eq!(read_result(job.directory()).unwrap().argv_sha256, digest);
         }
+    }
+
+    #[test]
+    fn argv_digest_does_not_depend_on_recognized_secret_values() {
+        let first = ["tool", "--password", "low-entropy-first"]
+            .map(str::to_owned)
+            .to_vec();
+        let second = ["tool", "--password", "low-entropy-second"]
+            .map(str::to_owned)
+            .to_vec();
+
+        assert_eq!(argv_digest(&first), argv_digest(&second));
+        assert_eq!(argv_digest(&first), argv_digest(&safe_argv(&first)));
     }
 
     #[test]
