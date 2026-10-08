@@ -183,7 +183,7 @@ pub struct ExecutionResult {
     pub scope: String,
     pub namespace: String,
     pub request: CommandRequest,
-    /// Хеш фактического argv до безопасного представления в JSON результата.
+    /// Хеш безопасного представления argv; распознанные секреты в нём заменены.
     pub argv_sha256: String,
     pub lifecycle: LifecycleStatus,
     pub status: ExecutionStatus,

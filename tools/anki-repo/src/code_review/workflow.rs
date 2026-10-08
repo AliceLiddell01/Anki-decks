@@ -2201,6 +2201,12 @@ fn write_directory_once(
             }
             continue;
         }
+        if is_review_snapshot_variant(&name) {
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(artifact_conflict(&entry.path()));
+            }
+            continue;
+        }
         if name == "delta.json" && !documents.contains_key(name.as_str()) {
             if !file_type.is_file() || file_type.is_symlink() {
                 return Err(artifact_conflict(&entry.path()));

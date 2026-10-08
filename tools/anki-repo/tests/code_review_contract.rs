@@ -3096,6 +3096,15 @@ fn same_head_can_use_an_explicit_snapshot_variant_for_an_alternate_base() {
         fs::read(original_workspace.join("review.json")).unwrap(),
         original_pack
     );
+    let repeated = collect_pack(repo.path(), &base, &head, &original_workspace, false);
+    assert_eq!(
+        repeated["artifact_dir"],
+        format!(".anki-repo/review/local/{head}")
+    );
+    assert_eq!(
+        fs::read(original_workspace.join("review.json")).unwrap(),
+        original_pack
+    );
     let variant_pack = variant.join("review.json");
     let variant_bytes = fs::read(&variant_pack).unwrap();
     let variant_json: Value = serde_json::from_slice(&variant_bytes).unwrap();
