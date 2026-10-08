@@ -10,12 +10,14 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 
 use crate::cli::{
-    Cli, CodeReviewCommand, Command, LanguageCommand, MatchArg, ReviewQueueCommand,
-    SemanticTriageCommand,
+    Cli, CodeReviewCommand, Command, LanguageCommand, MatchArg, ReviewExecutionCommand,
+    ReviewQueueCommand, SemanticTriageCommand,
 };
 use crate::code_review::model::CandidateStatus;
 use crate::code_review::workflow::{LanguageSummary, SnapshotSummary, display_counts};
@@ -205,6 +207,33 @@ fn language_check_output(
 ///
 /// Возвращает [`DomainError`] для любой доменной проблемы.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
+    execute_with_cancellation(cli, &AtomicBool::new(false))
+}
+
+/// Выполняет CLI, устанавливая обработчики отмены только для `code-review execution run`.
+pub fn execute_cli(cli: &Cli) -> Result<Rendered, DomainError> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    if cli.command_name() == "code-review execution run" {
+        #[cfg(unix)]
+        for (signal, name) in [
+            (signal_hook::consts::SIGINT, "SIGINT"),
+            (signal_hook::consts::SIGTERM, "SIGTERM"),
+        ] {
+            signal_hook::flag::register(signal, Arc::clone(&cancellation)).map_err(|error| {
+                DomainError::new(
+                    ErrorCode::Internal,
+                    format!("не удалось установить обработчик {name}: {error}"),
+                )
+            })?;
+        }
+    }
+    execute_with_cancellation(cli, &cancellation)
+}
+
+fn execute_with_cancellation(
+    cli: &Cli,
+    cancellation: &AtomicBool,
+) -> Result<Rendered, DomainError> {
     match &cli.command {
         Command::Inspect {
             export_dir,
@@ -537,12 +566,14 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 head,
                 out_dir,
                 run_clippy,
+                pr_number,
             } => {
                 let result = crate::code_review::workflow::collect(
                     base,
                     head,
                     out_dir.as_deref(),
                     *run_clippy,
+                    pr_number.as_deref(),
                 )?;
                 Ok(Rendered {
                     command: "code-review collect",
@@ -559,12 +590,14 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                 head,
                 out_dir,
                 run_clippy,
+                pr_number,
             } => {
                 let result = crate::code_review::workflow::verify(
                     baseline,
                     head,
                     out_dir.as_deref(),
                     *run_clippy,
+                    pr_number.as_deref(),
                 )?;
                 Ok(Rendered {
                     command: "code-review verify",
@@ -589,6 +622,149 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     exit: 0,
                 })
             }
+            CodeReviewCommand::Execution { command } => match command {
+                ReviewExecutionCommand::Prepare {
+                    pack,
+                    mode,
+                    pr_number,
+                    scope,
+                } => {
+                    let result = crate::code_review::workflow::prepare_execution_job(
+                        pack,
+                        *mode,
+                        pr_number.as_deref(),
+                        scope,
+                    )?;
+                    Ok(Rendered {
+                        command: "code-review execution prepare",
+                        stdout: if cli.json {
+                            json::generic_json("code-review execution prepare", result)
+                        } else {
+                            format!(
+                                "Задание подготовлено без запуска кода.\nID: {}\nКаталог: {}\nWorktree: {}\nHEAD снимка: {}\nНаправление: {}\n",
+                                result.job_id,
+                                result.job_directory,
+                                result.worktree,
+                                result.source.snapshot.head_sha,
+                                result.scope,
+                            )
+                        },
+                        exit: 0,
+                    })
+                }
+                ReviewExecutionCommand::Run {
+                    job,
+                    timeout_seconds,
+                    cwd,
+                    max_parallel_jobs,
+                    environment,
+                    argv,
+                } => {
+                    let cwd = cwd.to_str().ok_or_else(|| {
+                        DomainError::new(
+                            ErrorCode::InvalidRequest,
+                            "--cwd должен быть Unicode-путём для переносимого структурированного результата",
+                        )
+                    })?;
+                    let timeout_ms = timeout_seconds.checked_mul(1_000).ok_or_else(|| {
+                        DomainError::new(ErrorCode::InvalidRequest, "срок выполнения слишком велик")
+                    })?;
+                    let mut environment_values = BTreeMap::new();
+                    for assignment in environment {
+                        let (key, value) = assignment.split_once('=').ok_or_else(|| {
+                            DomainError::new(
+                                ErrorCode::InvalidRequest,
+                                "--env должен иметь формат KEY=VALUE",
+                            )
+                        })?;
+                        if environment_values
+                            .insert(key.to_owned(), value.to_owned())
+                            .is_some()
+                        {
+                            return Err(DomainError::new(
+                                ErrorCode::InvalidRequest,
+                                format!("--env передан несколько раз для ключа {key}"),
+                            ));
+                        }
+                    }
+                    let environment = if environment_values.is_empty() {
+                        crate::code_review::execution::EnvironmentPolicy::Minimal
+                    } else {
+                        crate::code_review::execution::EnvironmentPolicy::Explicit {
+                            values: environment_values,
+                        }
+                    };
+                    let request = crate::code_review::execution::CommandRequest {
+                        argv: argv.clone(),
+                        cwd: cwd.to_owned(),
+                        options: crate::code_review::execution::RunOptions {
+                            timeout_ms: Some(timeout_ms),
+                            output_limit_bytes: 64 * 1024,
+                            environment,
+                            max_parallel_jobs: *max_parallel_jobs as usize,
+                        },
+                    };
+                    let result = crate::code_review::workflow::run_execution_job(
+                        job,
+                        &request,
+                        cancellation,
+                    )?;
+                    let exit = execution_exit(result.status);
+                    Ok(Rendered {
+                        command: "code-review execution run",
+                        stdout: if cli.json {
+                            json::generic_json("code-review execution run", &result)
+                        } else {
+                            human_execution_result(&result)
+                        },
+                        exit,
+                    })
+                }
+                ReviewExecutionCommand::Inspect { job } => {
+                    let result = crate::code_review::workflow::inspect_execution_job(job)?;
+                    Ok(Rendered {
+                        command: "code-review execution inspect",
+                        stdout: if cli.json {
+                            json::generic_json("code-review execution inspect", &result)
+                        } else {
+                            human_execution_inspection(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                ReviewExecutionCommand::Cancel { job } => {
+                    let result = crate::code_review::workflow::cancel_execution_job(job)?;
+                    Ok(Rendered {
+                        command: "code-review execution cancel",
+                        stdout: if cli.json {
+                            json::generic_json("code-review execution cancel", &result)
+                        } else {
+                            human_execution_inspection(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+                ReviewExecutionCommand::Cleanup {
+                    job,
+                    confirm_no_live_descendants,
+                } => {
+                    let options = crate::code_review::execution::CleanupOptions {
+                        confirm_no_live_descendants: *confirm_no_live_descendants,
+                    };
+                    let result = crate::code_review::workflow::cleanup_execution_job_with_options(
+                        job, &options,
+                    )?;
+                    Ok(Rendered {
+                        command: "code-review execution cleanup",
+                        stdout: if cli.json {
+                            json::generic_json("code-review execution cleanup", &result)
+                        } else {
+                            human_execution_cleanup(&result)
+                        },
+                        exit: 0,
+                    })
+                }
+            },
             CodeReviewCommand::Queue { command } => match command {
                 ReviewQueueCommand::List {
                     pack,
@@ -603,6 +779,7 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     role,
                     text_role,
                     code_role,
+                    structure_only,
                 } => {
                     let options = crate::code_review::workflow::ReviewQueueListOptions {
                         priority: *priority,
@@ -616,20 +793,36 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                         offset: *offset,
                         limit: *limit,
                     };
-                    let result =
-                        crate::code_review::workflow::list_review_queue(pack, queue, &options)?;
+                    let result = crate::code_review::workflow::list_review_queue(
+                        pack,
+                        queue,
+                        &options,
+                        *structure_only,
+                    )?;
                     Ok(Rendered {
                         command: "code-review queue list",
                         stdout: if cli.json {
                             json::generic_json("code-review queue list", result)
                         } else {
-                            human_review_queue_list(&result)
+                            format!(
+                                "{}Проверка подлинности: {}.\n",
+                                human_review_queue_list(&result.value),
+                                queue_authenticity_label(result.syntax_authenticity),
+                            )
                         },
                         exit: 0,
                     })
                 }
-                ReviewQueueCommand::Validate { pack, queue } => {
-                    let result = crate::code_review::workflow::validate_review_queue(pack, queue)?;
+                ReviewQueueCommand::Validate {
+                    pack,
+                    queue,
+                    structure_only,
+                } => {
+                    let result = crate::code_review::workflow::validate_review_queue(
+                        pack,
+                        queue,
+                        *structure_only,
+                    )?;
                     Ok(Rendered {
                         command: "code-review queue validate",
                         stdout: if cli.json {
@@ -640,41 +833,78 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                         exit: 0,
                     })
                 }
-                ReviewQueueCommand::Summary { pack, queue } => {
-                    let result = crate::code_review::workflow::summarize_review_queue(pack, queue)?;
+                ReviewQueueCommand::Summary {
+                    pack,
+                    queue,
+                    structure_only,
+                } => {
+                    let result = crate::code_review::workflow::summarize_review_queue(
+                        pack,
+                        queue,
+                        *structure_only,
+                    )?;
                     Ok(Rendered {
                         command: "code-review queue summary",
                         stdout: if cli.json {
                             json::generic_json("code-review queue summary", result)
                         } else {
-                            human_review_queue_summary(&result)
+                            format!(
+                                "{}Проверка подлинности: {}.\n",
+                                human_review_queue_summary(&result.value),
+                                queue_authenticity_label(result.syntax_authenticity),
+                            )
                         },
                         exit: 0,
                     })
                 }
-                ReviewQueueCommand::Group { pack, queue, id } => {
-                    let result =
-                        crate::code_review::workflow::expand_review_queue_group(pack, queue, id)?;
+                ReviewQueueCommand::Group {
+                    pack,
+                    queue,
+                    id,
+                    structure_only,
+                } => {
+                    let result = crate::code_review::workflow::expand_review_queue_group(
+                        pack,
+                        queue,
+                        id,
+                        *structure_only,
+                    )?;
                     Ok(Rendered {
                         command: "code-review queue group",
                         stdout: if cli.json {
                             json::generic_json("code-review queue group", result)
                         } else {
-                            human_review_queue_group(&result)
+                            format!(
+                                "{}Проверка подлинности: {}.\n",
+                                human_review_queue_group(&result.value),
+                                queue_authenticity_label(result.syntax_authenticity),
+                            )
                         },
                         exit: 0,
                     })
                 }
-                ReviewQueueCommand::Candidate { pack, queue, id } => {
+                ReviewQueueCommand::Candidate {
+                    pack,
+                    queue,
+                    id,
+                    structure_only,
+                } => {
                     let result = crate::code_review::workflow::inspect_review_queue_candidate(
-                        pack, queue, id,
+                        pack,
+                        queue,
+                        id,
+                        *structure_only,
                     )?;
                     Ok(Rendered {
                         command: "code-review queue candidate",
                         stdout: if cli.json {
                             json::generic_json("code-review queue candidate", result)
                         } else {
-                            human_review_queue_candidate(&result)
+                            format!(
+                                "{}Проверка подлинности: {}.\n",
+                                human_review_queue_candidate(&result.value),
+                                queue_authenticity_label(result.syntax_authenticity),
+                            )
                         },
                         exit: 0,
                     })
@@ -881,17 +1111,214 @@ fn human_review_queue_validation(
     result: &crate::code_review::workflow::ReviewQueueValidationSummary,
 ) -> String {
     format!(
-        "Структурная очередь проверена: {}.\nСырых кандидатов: {}; единиц ревью: {}; отдельных: {}; групп: {}.\n",
+        "Структурная очередь проверена: {}.\nSHA-256 источника верен: {}; подлинность синтаксической классификации: {}.\nСырых кандидатов: {}; единиц ревью: {}; отдельных: {}; групп: {}.\n",
         if result.valid {
             "валидна"
         } else {
             "невалидна"
         },
+        if result.source_digest_valid {
+            "да"
+        } else {
+            "нет"
+        },
+        queue_authenticity_label(result.syntax_authenticity),
         result.summary.raw_candidates,
         result.summary.review_units,
         result.summary.individual_units,
         result.summary.group_units,
     )
+}
+
+fn execution_exit(status: crate::code_review::execution::ExecutionStatus) -> u8 {
+    use crate::code_review::execution::ExecutionStatus;
+    match status {
+        ExecutionStatus::Passed => 0,
+        ExecutionStatus::Failed => 9,
+        ExecutionStatus::Incomplete => 10,
+        ExecutionStatus::TimedOut => 11,
+        ExecutionStatus::Cancelled => 12,
+        ExecutionStatus::Unavailable => 127,
+    }
+}
+
+fn execution_status_label(status: crate::code_review::execution::ExecutionStatus) -> &'static str {
+    use crate::code_review::execution::ExecutionStatus;
+    match status {
+        ExecutionStatus::Passed => "успешно",
+        ExecutionStatus::Failed => "ошибка проверки",
+        ExecutionStatus::TimedOut => "истёк срок выполнения",
+        ExecutionStatus::Cancelled => "отменено",
+        ExecutionStatus::Unavailable => "исполнение недоступно",
+        ExecutionStatus::Incomplete => "результат неполон",
+    }
+}
+
+fn execution_lifecycle_label(
+    status: crate::code_review::execution::LifecycleStatus,
+) -> &'static str {
+    use crate::code_review::execution::LifecycleStatus;
+    match status {
+        LifecycleStatus::Prepared => "подготовлено",
+        LifecycleStatus::Running => "выполняется",
+        LifecycleStatus::Completed => "завершено",
+        LifecycleStatus::PreparationFailed => "ошибка подготовки",
+        LifecycleStatus::Interrupted => "прервано",
+    }
+}
+
+fn execution_mode_label(mode: crate::code_review::execution::ExecutionMode) -> &'static str {
+    use crate::code_review::execution::ExecutionMode;
+    match mode {
+        ExecutionMode::IsolatedChecks => "изолированные проверки",
+        ExecutionMode::DisposableSourceExperiment => "эксперимент с отдельной копией исходников",
+    }
+}
+
+fn process_cleanup_label(value: &str) -> String {
+    let label = match value {
+        "not_started" => "процесс не запускался",
+        "process_group_killed_partial" => {
+            "процессная группа завершена; вышедшие из неё потомки не проверены"
+        }
+        "process_group_kill_failed" => "не удалось завершить процессную группу",
+        "direct_child_only" => "завершён только непосредственный дочерний процесс",
+        "direct_child_reaped_descendants_unverified" => {
+            "непосредственный дочерний процесс собран; потомки не проверены"
+        }
+        _ => "состояние очистки процессов",
+    };
+    label.to_owned()
+}
+
+fn human_execution_result(result: &crate::code_review::execution::ExecutionResult) -> String {
+    use std::fmt::Write as _;
+    let argv = serde_json::to_string(&crate::code_review::execution::safe_argv(
+        &result.request.argv,
+    ))
+    .expect("массив строк всегда представим в JSON");
+    let code = result
+        .exit
+        .as_ref()
+        .and_then(|exit| exit.code)
+        .map_or_else(|| "отсутствует".to_owned(), |value| value.to_string());
+    let signal = result
+        .exit
+        .as_ref()
+        .and_then(|exit| exit.signal)
+        .map_or_else(|| "отсутствует".to_owned(), |value| value.to_string());
+    let sandbox = if result.enforcement.security_sandbox == "absent" {
+        "отсутствует"
+    } else {
+        &result.enforcement.security_sandbox
+    };
+    let mut text = format!(
+        "Задание {}: результат {}; сохранённое состояние {}.\nHEAD снимка: {}; SHA-256 пакета: {}\nРежим: {}; направление: {}; защитная песочница: {}; завершение процессов: {}.\nКоманда argv (чувствительные значения скрыты): {}; SHA-256 argv: {}\nРабочий каталог: {}\nКод завершения: {}; сигнал: {}; время: {} мс.\n",
+        result.job_id,
+        execution_status_label(result.status),
+        execution_lifecycle_label(result.lifecycle),
+        result.source.snapshot.head_sha,
+        result.source.review_pack_sha256,
+        execution_mode_label(result.mode),
+        result.scope,
+        sandbox,
+        process_cleanup_label(&result.enforcement.process_cleanup),
+        argv,
+        result.argv_sha256,
+        result.request.cwd,
+        code,
+        signal,
+        result.duration_ms,
+    );
+    if let Some(failure) = &result.failure {
+        let _ = writeln!(text, "Причина: {failure}");
+    }
+    for (name, output) in [("stdout", &result.stdout), ("stderr", &result.stderr)] {
+        let _ = writeln!(
+            text,
+            "{name}: {} байт{}; полный лог: {}",
+            output.total_bytes,
+            if output.truncated {
+                " (вывод усечён)"
+            } else {
+                ""
+            },
+            output.log,
+        );
+        if !output.text.is_empty() {
+            let _ = writeln!(text, "{}", output.text);
+        }
+    }
+    for limitation in &result.enforcement.limitations {
+        let _ = writeln!(text, "Ограничение: {limitation}");
+    }
+    let cleanup = match result.cleanup.as_str() {
+        "evidence_retained; workspace_cleanup_allowed" => {
+            "свидетельства сохранены; очистка рабочей области разрешена"
+        }
+        "evidence_and_workspace_retained; descendant_confirmation_required" => {
+            "свидетельства и рабочая область сохранены; для очистки требуется подтверждение отсутствия живых потомков"
+        }
+        "evidence_and_workspace_retained; descendants_may_still_exist" => {
+            "свидетельства и рабочая область сохранены; потомки могут продолжать работу"
+        }
+        _ => "политика сохранённого результата",
+    };
+    let _ = writeln!(text, "Очистка: {cleanup}.");
+    text
+}
+
+fn human_execution_inspection(inspection: &crate::code_review::execution::JobInspection) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "Задание {}: состояние {}; режим {}; направление {}.\nРабочая область удалена: {}.\n",
+        inspection.job.job_id,
+        execution_lifecycle_label(inspection.lifecycle),
+        execution_mode_label(inspection.job.mode),
+        inspection.job.scope,
+        yes_no(inspection.workspace_removed),
+    );
+    for limitation in &inspection.limitations {
+        let _ = writeln!(text, "Ограничение: {limitation}");
+    }
+    if let Some(result) = &inspection.result {
+        let _ = writeln!(text, "Сохранённый результат команды:");
+        text.push_str(&human_execution_result(result));
+    } else {
+        let _ = writeln!(text, "Сохранённого результата команды нет.");
+    }
+    text
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "да" } else { "нет" }
+}
+
+fn human_execution_cleanup(result: &crate::code_review::execution::CleanupResult) -> String {
+    let mut text = format!(
+        "Задание {}: рабочая область удалена: {}; свидетельства сохранены: {}.\n",
+        result.job_id,
+        yes_no(result.workspace_removed),
+        yes_no(result.evidence_retained),
+    );
+    if let Some(limitation) = &result.limitation {
+        use std::fmt::Write as _;
+        let _ = writeln!(text, "Ограничение: {limitation}");
+    }
+    text
+}
+
+fn queue_authenticity_label(
+    status: crate::code_review::workflow::SyntaxAuthenticityStatus,
+) -> &'static str {
+    match status {
+        crate::code_review::workflow::SyntaxAuthenticityStatus::Verified => {
+            "синтаксическая подлинность подтверждена"
+        }
+        crate::code_review::workflow::SyntaxAuthenticityStatus::StructureOnly => {
+            "проверена только структура и digest"
+        }
+    }
 }
 
 fn human_review_queue_summary(summary: &crate::code_review::review_queue::QueueSummary) -> String {
@@ -1647,6 +2074,230 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_exit_codes_are_stable_and_do_not_overlap_cli_errors() {
+        use crate::code_review::execution::ExecutionStatus;
+
+        assert_eq!(execution_exit(ExecutionStatus::Passed), 0);
+        assert_eq!(execution_exit(ExecutionStatus::Failed), 9);
+        assert_eq!(execution_exit(ExecutionStatus::Incomplete), 10);
+        assert_eq!(execution_exit(ExecutionStatus::TimedOut), 11);
+        assert_eq!(execution_exit(ExecutionStatus::Cancelled), 12);
+        assert_eq!(execution_exit(ExecutionStatus::Unavailable), 127);
+        assert_eq!(ErrorCode::ExecutionBusy.exit_code(), 13);
+        assert_eq!(ErrorCode::ProcessOperationFailed.exit_code(), 14);
+        assert_eq!(ErrorCode::Usage.exit_code(), 2);
+        assert_eq!(ErrorCode::Internal.exit_code(), 70);
+    }
+
+    fn execution_inspection_fixture() -> crate::code_review::execution::JobInspection {
+        use crate::code_review::execution::*;
+        use crate::code_review::scope::GitTarget;
+
+        let source = ExecutionSource {
+            snapshot: GitTarget {
+                repository_id: "fixture-repository".into(),
+                base_sha: "a".repeat(40),
+                head_sha: "b".repeat(40),
+                merge_base_sha: "a".repeat(40),
+            },
+            review_pack_sha256: "c".repeat(64),
+            workspace_variant: None,
+        };
+        let output = OutputEvidence {
+            text: String::new(),
+            total_bytes: 0,
+            truncated: false,
+            utf8_lossy: false,
+            log: "logs/stdout.log".into(),
+        };
+        JobInspection {
+            job: JobMetadata {
+                schema_version: EXECUTION_SCHEMA_VERSION,
+                job_id: "fixture-job".into(),
+                source: source.clone(),
+                mode: ExecutionMode::IsolatedChecks,
+                scope: "runtime".into(),
+                namespace: "local".into(),
+                owner_nonce: "d".repeat(32),
+            },
+            lifecycle: LifecycleStatus::Interrupted,
+            workspace_removed: false,
+            limitations: vec!["Запись конечного состояния прервана.".into()],
+            result: Some(ExecutionResult {
+                schema_version: EXECUTION_SCHEMA_VERSION,
+                job_id: "fixture-job".into(),
+                source,
+                mode: ExecutionMode::IsolatedChecks,
+                scope: "runtime".into(),
+                namespace: "local".into(),
+                request: CommandRequest {
+                    argv: vec!["true".into()],
+                    cwd: ".".into(),
+                    options: RunOptions::default(),
+                },
+                argv_sha256: "e".repeat(64),
+                lifecycle: LifecycleStatus::Completed,
+                status: ExecutionStatus::Passed,
+                exit: Some(ProcessExit {
+                    code: Some(0),
+                    signal: None,
+                }),
+                stdout: output.clone(),
+                stderr: OutputEvidence {
+                    log: "logs/stderr.log".into(),
+                    ..output
+                },
+                duration_ms: 1,
+                enforcement: Enforcement::default(),
+                failure: None,
+                cleanup: "evidence_and_workspace_retained; descendants_may_still_exist".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn execution_inspection_human_prioritizes_observed_interruption() {
+        let inspection = execution_inspection_fixture();
+        let rendered = human_execution_inspection(&inspection);
+        assert!(
+            rendered.starts_with("Задание fixture-job: состояние прервано"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Запись конечного состояния прервана."));
+        assert!(rendered.contains("Сохранённый результат команды"));
+        let json: serde_json::Value = serde_json::from_str(&json::generic_json(
+            "code-review execution inspect",
+            &inspection,
+        ))
+        .unwrap();
+        assert_eq!(json["result"]["lifecycle"], "interrupted");
+        assert_eq!(json["result"]["result"]["lifecycle"], "completed");
+        assert_eq!(
+            json["result"]["limitations"][0],
+            "Запись конечного состояния прервана."
+        );
+    }
+
+    #[test]
+    fn execution_human_uses_russian_labels_and_readable_exit() {
+        let inspection = execution_inspection_fixture();
+        let rendered = human_execution_result(inspection.result.as_ref().unwrap());
+        assert!(rendered.contains("результат успешно"), "{rendered}");
+        assert!(rendered.contains("сохранённое состояние завершено"));
+        assert!(rendered.contains("Режим: изолированные проверки"));
+        assert!(rendered.contains("Код завершения: 0; сигнал: отсутствует"));
+        for debug_form in [
+            "Some(0)",
+            "None",
+            "Passed",
+            "Completed",
+            "IsolatedChecks",
+            "(passed)",
+            "(completed)",
+            "(isolated_checks)",
+        ] {
+            assert!(!rendered.contains(debug_form), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn execution_inspection_completed_and_prepared_are_distinct() {
+        use crate::code_review::execution::LifecycleStatus;
+        let mut inspection = execution_inspection_fixture();
+        inspection.lifecycle = LifecycleStatus::Completed;
+        inspection.limitations.clear();
+        assert!(
+            human_execution_inspection(&inspection)
+                .starts_with("Задание fixture-job: состояние завершено")
+        );
+        inspection.lifecycle = LifecycleStatus::Prepared;
+        inspection.result = None;
+        let rendered = human_execution_inspection(&inspection);
+        assert!(rendered.contains("состояние подготовлено"));
+        assert!(rendered.contains("Сохранённого результата команды нет."));
+        assert!(!rendered.contains("успешно (passed)"));
+    }
+
+    #[test]
+    fn execution_cleanup_human_reports_actual_flags_and_limitation() {
+        use crate::code_review::execution::CleanupResult;
+        let mut cleanup = CleanupResult {
+            job_id: "fixture-job".into(),
+            workspace_removed: false,
+            evidence_retained: true,
+            limitation: Some("Потомки не проверены.".into()),
+        };
+        let rendered = human_execution_cleanup(&cleanup);
+        assert!(rendered.contains("рабочая область удалена: нет; свидетельства сохранены: да"));
+        assert!(rendered.contains("Ограничение: Потомки не проверены."));
+        cleanup.workspace_removed = true;
+        cleanup.evidence_retained = false;
+        cleanup.limitation = None;
+        let rendered = human_execution_cleanup(&cleanup);
+        assert!(rendered.contains("рабочая область удалена: да; свидетельства сохранены: нет"));
+        assert!(!rendered.contains("Ограничение:"));
+    }
+
+    #[test]
+    fn execution_error_json_preserves_distinct_busy_and_process_contracts() {
+        let busy = DomainError::with_details(
+            ErrorCode::ExecutionBusy,
+            "Задание временно занято.",
+            serde_json::json!({ "retryable": true, "resource": "fixture-job", "reason": "job_active" }),
+        );
+        let (stdout, stderr) = render_error("code-review execution run", true, &busy);
+        assert!(stderr.is_empty());
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["error"]["code"], "execution_busy");
+        assert_eq!(json["error"]["details"]["retryable"], true);
+        assert_eq!(json["error"]["details"]["reason"], "job_active");
+        assert_eq!(busy.exit_code(), 13);
+        let failed = DomainError::new(
+            ErrorCode::ProcessOperationFailed,
+            "Не удалось наблюдать процесс.",
+        );
+        let (stdout, _) = render_error("code-review execution run", true, &failed);
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["error"]["code"], "process_operation_failed");
+        assert_eq!(failed.exit_code(), 14);
+        assert_ne!(
+            ErrorCode::ReviewArtifactConflict.as_str(),
+            busy.code.as_str()
+        );
+        assert_eq!(ErrorCode::ReviewArtifactConflict.exit_code(), 7);
+    }
+
+    #[test]
+    fn queue_authenticity_keeps_machine_fields_and_localizes_human_labels() {
+        use crate::code_review::workflow::{QueueAuthenticityEnvelope, SyntaxAuthenticityStatus};
+        for (status, canonical) in [
+            (SyntaxAuthenticityStatus::StructureOnly, "structure_only"),
+            (SyntaxAuthenticityStatus::Verified, "verified"),
+        ] {
+            let response = QueueAuthenticityEnvelope {
+                value: serde_json::json!({ "units": [] }),
+                source_digest_valid: true,
+                syntax_authenticity: status,
+            };
+            let json: serde_json::Value =
+                serde_json::from_str(&json::generic_json("code-review queue list", &response))
+                    .unwrap();
+            assert_eq!(json["result"]["source_digest_valid"], true);
+            assert_eq!(json["result"]["syntax_authenticity"], canonical);
+            assert!(json["result"]["units"].is_array());
+        }
+        assert_eq!(
+            queue_authenticity_label(SyntaxAuthenticityStatus::Verified),
+            "синтаксическая подлинность подтверждена"
+        );
+        assert_eq!(
+            queue_authenticity_label(SyntaxAuthenticityStatus::StructureOnly),
+            "проверена только структура и digest"
+        );
+    }
 
     fn review_queue_candidate_detail() -> crate::code_review::workflow::ReviewQueueCandidateDetail {
         use crate::code_review::model::{CandidateEvidence, CandidateOrigin};

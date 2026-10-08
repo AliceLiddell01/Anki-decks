@@ -30,3 +30,7 @@ mod semantic_triage_contract;
 mod synthetic;
 #[path = "visual_report_contract.rs"]
 mod visual_report_contract;
+
+#[cfg(target_os = "linux")]
+#[path = "execution_lifecycle_contract.rs"]
+mod execution_lifecycle_contract;

@@ -6,6 +6,7 @@
 pub mod delta;
 pub mod detectors;
 pub mod diagnostics;
+pub mod execution;
 pub mod language;
 pub mod model;
 pub mod review_queue;

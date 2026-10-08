@@ -688,7 +688,8 @@ fn markdown_blockquote(value: &str) -> String {
 #[must_use]
 pub fn render_markdown(triage: &SemanticTriage, pack: &ReviewPack) -> String {
     let summary = summarize(triage, pack);
-    let mut output = String::from("# Семантическое ревью\n\n");
+    let mut output =
+        String::from("# Семантическое ревью\n\n<!-- anki-repo:semantic-review-report:v1 -->\n\n");
     let snapshot = &triage.source.snapshot;
     let _ = writeln!(
         output,

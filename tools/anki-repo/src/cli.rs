@@ -114,6 +114,13 @@ impl Cli {
                 CodeReviewCommand::Collect { .. } => "code-review collect",
                 CodeReviewCommand::Verify { .. } => "code-review verify",
                 CodeReviewCommand::Delta { .. } => "code-review delta",
+                CodeReviewCommand::Execution { command } => match command {
+                    ReviewExecutionCommand::Prepare { .. } => "code-review execution prepare",
+                    ReviewExecutionCommand::Run { .. } => "code-review execution run",
+                    ReviewExecutionCommand::Inspect { .. } => "code-review execution inspect",
+                    ReviewExecutionCommand::Cancel { .. } => "code-review execution cancel",
+                    ReviewExecutionCommand::Cleanup { .. } => "code-review execution cleanup",
+                },
                 CodeReviewCommand::Queue { command } => match command {
                     ReviewQueueCommand::List { .. } => "code-review queue list",
                     ReviewQueueCommand::Validate { .. } => "code-review queue validate",
@@ -525,12 +532,15 @@ pub enum CodeReviewCommand {
         /// Верхняя ссылка Git; её SHA фиксируется в пакете.
         #[arg(long)]
         head: String,
-        /// Каталог локальных артефактов; по умолчанию вычисляется по SHA.
+        /// Workspace PR/HEAD; по умолчанию `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`, варианты — `snapshot-<32 hex>` внутри него.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
         run_clippy: bool,
+        /// Номер существующего PR; при ревью PR передавайте его явно.
+        #[arg(long, value_name = "NUMBER")]
+        pr_number: Option<String>,
     },
 
     /// Повторно собрать свидетельства для нового HEAD и сравнить с исходным пакетом.
@@ -541,12 +551,15 @@ pub enum CodeReviewCommand {
         /// Новый HEAD для сравнения; базовый SHA берётся из исходного пакета.
         #[arg(long)]
         head: String,
-        /// Каталог нового снимка ревью; имя по умолчанию вычисляется по SHA.
+        /// Workspace нового HEAD: `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/`; namespace наследуется из исходного пакета.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
         run_clippy: bool,
+        /// Проверить namespace PR baseline; при отсутствии параметра namespace наследуется.
+        #[arg(long, value_name = "NUMBER")]
+        pr_number: Option<String>,
     },
 
     /// Сравнить два ранее сохранённых пакета ревью без повторного анализа.
@@ -557,7 +570,7 @@ pub enum CodeReviewCommand {
         /// Более новый review.json.
         #[arg(long, value_name = "PACK")]
         after: PathBuf,
-        /// Необязательный путь JSON-отчёта delta.
+        /// Только delta.json в workspace `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --after.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
@@ -566,6 +579,12 @@ pub enum CodeReviewCommand {
     Queue {
         #[command(subcommand)]
         command: ReviewQueueCommand,
+    },
+
+    /// Изолированное исполнение проверок на закреплённом снимке ревью.
+    Execution {
+        #[command(subcommand)]
+        command: ReviewExecutionCommand,
     },
 
     /// Создать, проверить или представить решения семантического разбора пакета ревью.
@@ -635,9 +654,12 @@ pub enum ReviewQueueCommand {
         /// Каноническая роль кода: runtime, runtime_boundary или роль теста.
         #[arg(long = "code-role", value_name = "CODE_ROLE")]
         code_role: Option<CodeRole>,
+        /// Пропустить восстановление Git-снимков/AST и явно показать статус structure_only.
+        #[arg(long)]
+        structure_only: bool,
     },
 
-    /// Проверить источник, полноту покрытия и структуру queue artifact.
+    /// Проверить источник, полноту покрытия и структуру артефакта очереди.
     Validate {
         /// Путь к исходному пакету свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
@@ -645,6 +667,9 @@ pub enum ReviewQueueCommand {
         /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
+        #[arg(long)]
+        structure_only: bool,
     },
 
     /// Показать агрегированную сводку очереди.
@@ -655,6 +680,9 @@ pub enum ReviewQueueCommand {
         /// Путь к структурной очереди `review-queue.json` для указанного пакета.
         #[arg(long, value_name = "QUEUE")]
         queue: PathBuf,
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
+        #[arg(long)]
+        structure_only: bool,
     },
 
     /// Раскрыть одну группу, включая полное множество исходных candidate IDs.
@@ -668,6 +696,9 @@ pub enum ReviewQueueCommand {
         /// Точный ID группы из `review-queue.json`.
         #[arg(long, value_name = "ID")]
         id: String,
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
+        #[arg(long)]
+        structure_only: bool,
     },
 
     /// Найти candidate и показать его исходное evidence, классификацию и unit.
@@ -681,6 +712,72 @@ pub enum ReviewQueueCommand {
         /// Точный ID candidate из исходного `review.json`.
         #[arg(long, value_name = "ID")]
         id: String,
+        /// Проверить только JSON-структуру и digest, не подтверждая классификацию на основе синтаксиса.
+        #[arg(long)]
+        structure_only: bool,
+    },
+}
+
+/// Управление изолированным заданием без зависимости от системы агентов.
+#[derive(Debug, Subcommand)]
+pub enum ReviewExecutionCommand {
+    /// Подготовить отдельное задание и detached worktree, не запуская проектный код.
+    Prepare {
+        /// Канонический review.json из `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Режим изолированной проверки или эксперимента с отдельной копией исходников.
+        #[arg(long, value_enum)]
+        mode: crate::code_review::execution::ExecutionMode,
+        /// Проверить пространство PR канонического --pack; без параметра пространство наследуется из пути.
+        #[arg(long, value_name = "NUMBER")]
+        pr_number: Option<String>,
+        /// Именованное направление ревью, например tests, runtime, docs или security.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
+
+    /// Запустить явную argv-команду в рабочем каталоге задания.
+    Run {
+        /// Каталог ранее подготовленного задания.
+        job: PathBuf,
+        /// Обязательный срок выполнения команды в секундах.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        timeout_seconds: u64,
+        /// Рабочий каталог относительно корня закреплённого worktree.
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        /// Общий репозиторный предел одновременных заданий; значения должны совпадать, пока есть активные задания.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=64))]
+        max_parallel_jobs: u64,
+        /// Явно передать переменную окружения; при наличии параметров включается политика explicit.
+        #[arg(long = "env", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+        environment: Vec<String>,
+        /// Исполняемый файл и аргументы после `--`; shell не запускается.
+        #[arg(last = true, required = true, value_name = "ARGV")]
+        argv: Vec<String>,
+    },
+
+    /// Прочитать сохранённое состояние задания и результат без изменения файлов.
+    Inspect {
+        /// Каталог задания.
+        job: PathBuf,
+    },
+
+    /// Запросить отмену активного задания.
+    Cancel {
+        /// Каталог задания.
+        job: PathBuf,
+    },
+
+    /// Очистить только собственный worktree и временные каталоги задания.
+    Cleanup {
+        /// Каталог задания.
+        job: PathBuf,
+        /// Подтвердить отсутствие живых потомков после самостоятельной проверки оператором.
+        /// Требуется для очистки задания, в котором процесс мог запускаться.
+        #[arg(long)]
+        confirm_no_live_descendants: bool,
     },
 }
 
@@ -694,7 +791,8 @@ pub enum SemanticTriageCommand {
         /// Неизменяемый пакет свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Путь нового JSON-документа семантического разбора.
+        /// Только semantic-triage.input.json в workspace
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --pack.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
@@ -710,9 +808,9 @@ pub enum SemanticTriageCommand {
         /// Заполненный JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
-        /// Необязательный путь для отсортированного канонического JSON.
-        /// Запись запрещена под `decks/**`, в служебные каталоги Git и по
-        /// символьным ссылкам.
+        /// Только semantic-triage.json в workspace
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --pack.
+        /// Валидный собственный документ можно атомарно обновить.
         #[arg(long = "canonical-out", value_name = "PATH")]
         canonical_out: Option<PathBuf>,
     },
@@ -737,7 +835,8 @@ pub enum SemanticTriageCommand {
         /// JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
-        /// Путь нового Markdown-отчёта.
+        /// Только review-report.md в workspace
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>[/snapshot-<32 hex>]/` пакета --pack.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
@@ -794,4 +893,41 @@ pub enum LanguageCommand {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[cfg(test)]
+mod execution_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn execution_cleanup_descendant_confirmation_is_explicit() {
+        for (extra, expected) in [(None, false), (Some("--confirm-no-live-descendants"), true)] {
+            let mut argv = vec![
+                "anki-repo",
+                "code-review",
+                "execution",
+                "cleanup",
+                "job-fixture",
+            ];
+            if let Some(flag) = extra {
+                argv.push(flag);
+            }
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Command::CodeReview {
+                command:
+                    CodeReviewCommand::Execution {
+                        command:
+                            ReviewExecutionCommand::Cleanup {
+                                confirm_no_live_descendants,
+                                ..
+                            },
+                    },
+            } = cli.command
+            else {
+                panic!("ожидалась команда очистки задания")
+            };
+            assert_eq!(confirm_no_live_descendants, expected);
+        }
+    }
 }

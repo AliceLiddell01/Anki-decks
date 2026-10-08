@@ -1135,6 +1135,28 @@ pub fn validate(
     Ok(summary)
 }
 
+/// Проверяет структуру и подлинность очереди относительно независимо восстановленного синтаксиса.
+///
+/// Вызывающая сторона получает `authoritative_contexts` из точных Git images исходного пакета,
+/// используя тот же выбор base/post, что при построении. Контексты из самой сохранённой очереди
+/// или текущих рабочих файлов не являются доказательством происхождения. Невозможность получить
+/// исходные images должна обрабатываться вызывающей стороной до этой проверки.
+pub fn validate_with_syntax(
+    queue: &ReviewQueue,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+    authoritative_contexts: &BTreeMap<String, SyntaxContext>,
+) -> Result<QueueSummary, DomainError> {
+    let summary = validate(queue, pack, source_pack_sha256)?;
+    let expected = build(pack, source_pack_sha256, authoritative_contexts)?;
+    if queue != &expected {
+        return Err(invalid(
+            "Очередь не соответствует классификации и построению по точным исходным Git images",
+        ));
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,6 +1257,69 @@ mod tests {
             .iter()
             .map(|candidate| (candidate.id.clone(), test_context()))
             .collect()
+    }
+
+    #[test]
+    fn syntax_validation_accepts_authoritative_queue_without_changing_raw_ids() {
+        let pack = pack(vec![
+            candidate("raw-a", "src/lib.rs", 1),
+            candidate("raw-b", "src/lib.rs", 2),
+        ]);
+        let authoritative_contexts = contexts(&pack);
+        let queue = build(&pack, DIGEST, &authoritative_contexts).unwrap();
+        let before = queue.clone();
+        assert_eq!(
+            validate_with_syntax(&queue, &pack, DIGEST, &authoritative_contexts).unwrap(),
+            queue.summary
+        );
+        assert_eq!(queue, before);
+        assert_eq!(queue.units[0].candidate_ids(), ["raw-a", "raw-b"]);
+    }
+
+    #[test]
+    fn syntax_validation_rejects_consistent_runtime_to_test_group_forgery() {
+        let pack = pack(vec![
+            candidate("raw-a", "src/lib.rs", 1),
+            candidate("raw-b", "src/lib.rs", 2),
+        ]);
+        let authoritative_contexts: BTreeMap<_, _> = pack
+            .all_candidates()
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.id.clone(),
+                    SyntaxContext {
+                        execution: Some(FileSurface::Production),
+                        code_role: CodeRole::RuntimeBoundary,
+                        ..test_context()
+                    },
+                )
+            })
+            .collect();
+        let genuine = build(&pack, DIGEST, &authoritative_contexts).unwrap();
+        assert_eq!(genuine.summary.individual_units, 2);
+        assert_eq!(genuine.summary.units_by_priority[&ReviewPriority::High], 2);
+        validate_with_syntax(&genuine, &pack, DIGEST, &authoritative_contexts).unwrap();
+
+        // Пересборка по поддельным контекстам согласованно меняет классификации,
+        // подпись группы, её идентификатор, приоритет и всю сводку, сохраняя raw IDs.
+        let forged = build(&pack, DIGEST, &contexts(&pack)).unwrap();
+        assert_eq!(forged.source, genuine.source);
+        assert_eq!(forged.summary.group_units, 1);
+        assert_eq!(forged.summary.units_by_priority[&ReviewPriority::Low], 1);
+        assert_eq!(forged.units[0].candidate_ids(), ["raw-a", "raw-b"]);
+        assert_eq!(
+            forged.units[0].signature.classification.execution,
+            Some(FileSurface::Tests)
+        );
+        assert_eq!(
+            forged.units[0].signature.classification.code_role,
+            CodeRole::TestSetup
+        );
+        assert!(validate(&forged, &pack, DIGEST).is_ok());
+        let error =
+            validate_with_syntax(&forged, &pack, DIGEST, &authoritative_contexts).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ReviewArtifactInvalid);
     }
 
     fn queue_for_list() -> ReviewQueue {

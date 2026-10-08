@@ -124,9 +124,10 @@ CrowdAnki-экспортом и не знает имён полей конкре
 Имя поля всегда называет вызывающая сторона, а сверяется оно с фактическими
 `note_models[].flds[].name` того экспорта, с которым работает команда.
 
+<a id="code-review-collectverifydeltaqueuetriage"></a>
 <a id="code-review-collectverifydeltatriage"></a>
 
-### `code-review collect|verify|delta|queue|triage`
+### `code-review collect|verify|delta|queue|triage|execution`
 
 Пространство `code-review` собирает детерминированные свидетельства для
 независимого ревью кода. Порядком самого ревью владеет
@@ -148,25 +149,71 @@ CrowdAnki-экспортом и не знает имён полей конкре
 переключается и не очищается. Незакоммиченные изменения не становятся частью
 зафиксированного снимка только потому, что находятся в той же рабочей копии.
 
-`--out-dir DIR` задаёт каталог снимка. Без него `collect` сохраняет данные в
-`.anki-repo/review/<base-sha>-<head-sha>`, а `verify` — в
-`.anki-repo/review/<baseline-head-sha>-<base-sha>-<head-sha>`, чтобы пакеты,
-построенные по разным исходным снимкам, не сталкивались. `collect` и `verify`
-создают в каталоге полный `review.json`, производный `review-queue.json` и
-компактный навигационный `review.txt`; `verify` дополнительно сохраняет
-`delta.json`. Полный набор сырых кандидатов остаётся в `review.json`, а
-структурная классификация и членство в review units — в `review-queue.json`.
-`review.txt` помогает выбрать следующий шаг, но не является источником истины.
-Каталог не скрыт через `.gitignore`, поэтому локальные артефакты видны в Git и
-могут быть включены в PR, когда это нужно для совместного просмотра. Команда
-сама не добавляет файлы в индекс и не создаёт коммиты. Каждый пакет содержит точные SHA, а каталог
-не может находиться внутри `decks/**` или служебных каталогов Git.
+Перед вызовом `collect`/`verify` вызывающий агент устанавливает номер PR из
+запроса или надёжной информации GitHub о текущей ветке. CLI сам не обнаруживает
+PR, а `anki-code-review` skill задаёт порядок такого определения. Не выводи номер
+из имени ветки. Если PR существует, передавай `--pr-number NUMBER` явно в
+каждой команде `collect` и `verify`. Опускай параметр только когда отсутствие
+PR подтверждено; тогда каталог использует сегмент `local`. Если статус PR
+нельзя достоверно установить, не представляй локальное ревью как ревью PR.
 
-`verify --baseline PACK --head REF` повторно собирает свидетельства, используя базу
-из исходного пакета, и сравнивает с новым HEAD. Доступны `--out-dir DIR` и
-`--run-clippy`. `delta --before PACK --after PACK` сравнивает уже сохранённые
-пакеты без повторного анализа; `--out PATH` сохраняет JSON-сравнение.
-Несовместимые снимки репозитория и базы не считаются одной итерацией ревью.
+Все постоянные локальные артефакты независимого code review хранятся только в
+каноническом workspace внутри текущего репозитория:
+`.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/`. Для PR номер —
+навигационный сегмент; полный SHA HEAD и digest байтов `review.json` задают
+идентичность снимка. Новый HEAD в том же PR получает отдельный каталог и не
+перезаписывает предыдущий. Если для того же HEAD нужна другая база или набор
+анализаторов, передай `--out-dir` с новым дочерним каталогом
+`snapshot-<32 lowercase hex>`; он хранит отдельные свидетельства и не заменяет
+предыдущий снимок. Ожидаемая структура снимка по умолчанию:
+
+```text
+.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/
+├── review.json
+├── review-queue.json
+├── review.txt
+├── delta.json                         # если создан verify или delta
+├── semantic-triage.input.json        # решения главного reviewer'а
+├── semantic-triage.json              # проверенное каноническое представление
+├── review-report.md                  # производный отчёт
+└── runs/
+    └── <unique-job-id>/              # собственные файлы execution job/субагента
+```
+
+Имена показывают контракт размещения, а не требование создавать пустые файлы.
+Используй фактический `artifact_dir`, возвращённый успешным `collect`/`verify`,
+как источник всех downstream-путей; не реконструируй путь по SHA вручную и не
+выбирай временный каталог. Необязательный `--out-dir DIR` допустим только если
+он в точности совпадает с workspace по номеру PR/local и полному HEAD SHA либо
+с его единственным дочерним каталогом `snapshot-<32 lowercase hex>`. Выбирай новый
+snapshot ID при повторном сборе того же HEAD с другой базой или набором
+анализаторов. Произвольный каталог, tracked workspace, symlink, `..` и
+конфликтующий файл отвергаются до записи. Исходные артефакты неизменяемы:
+повторная генерация тех же байтов идемпотентна, другое содержимое для того же
+пути завершается конфликтом. Проверенные производные triage/report могут
+обновляться только по своим точным именам и только внутри этого же workspace.
+
+`collect` и `verify` создают полный `review.json`, производный
+`review-queue.json` и компактный навигационный `review.txt`; `verify`
+дополнительно сохраняет `delta.json`. Полный набор сырых кандидатов остаётся в
+`review.json`, а структурная классификация и членство в review units — в
+`review-queue.json`. `review.txt` помогает выбрать следующий шаг, но не является
+источником истины. `.anki-repo/review/` исключён через `.gitignore`: локальные
+артефакты не попадают в PR автоматически. Команда сама не добавляет файлы в
+индекс и не создаёт коммиты. Перед записью проверяется, что workspace не
+содержит tracked Git-файлов. Единственное общее исключение — инфраструктура
+между jobs: `.anki-repo/review/execution-locks/` может содержать общие слоты
+concurrency-lock. Там нет результатов, отчётов или иных артефактов конкретного
+PR/HEAD; все job-файлы остаются внутри `runs/<unique-job-id>/` своего workspace.
+
+`verify --baseline PACK --head REF --pr-number NUMBER` повторно собирает
+свидетельства, используя базу из исходного пакета, и сравнивает с новым HEAD.
+Передавай номер известного PR явно и при `verify`; результат появится в новом
+workspace этого PR, соответствующем полному SHA нового HEAD. Доступны
+`--out-dir DIR` и `--run-clippy`. `delta --before PACK --after PACK` сравнивает
+уже сохранённые пакеты без повторного анализа; `--out PATH` может указывать
+только на `delta.json` канонического workspace пакета `after`. Несовместимые
+снимки репозитория и базы не считаются одной итерацией ревью.
 
 `verify` выводит в stdout счётчики и краткую сводку статусов. Полные списки
 изменений сохраняются в `delta.json` каталога артефактов. Так размер вывода не
@@ -180,14 +227,23 @@ CrowdAnki-экспортом и не знает имён полей конкре
 полные массивы изменений доступны в `delta.json`.
 
 ```bash
-anki-repo code-review collect --base origin/main --head HEAD
+# PR_NUMBER получен из запроса или проверен через GitHub для текущей ветки.
+COLLECT=$(anki-repo --json code-review collect --base origin/main --head HEAD --pr-number "$PR_NUMBER")
+ARTIFACT_DIR=$(jq -er '.result.artifact_dir' <<< "$COLLECT")
+PACK="$ARTIFACT_DIR/review.json"
+QUEUE="$ARTIFACT_DIR/review-queue.json"
 anki-repo code-review collect --help
-anki-repo code-review verify --baseline "$BASELINE_PACK" --head HEAD
-anki-repo code-review delta --before "$BASELINE_PACK" --after "$CURRENT_PACK"
+VERIFY=$(anki-repo --json code-review verify --baseline "$PACK" --head "$NEW_HEAD" --pr-number "$PR_NUMBER")
+NEW_ARTIFACT_DIR=$(jq -er '.result.artifact_dir' <<< "$VERIFY")
+NEW_PACK="$NEW_ARTIFACT_DIR/review.json"
+anki-repo code-review delta --before "$PACK" --after "$NEW_PACK" --out "$NEW_ARTIFACT_DIR/delta.json"
 ```
 
-`BASELINE_PACK` и `CURRENT_PACK` в примерах — фактически полученные пути к
-`review.json`, а не заранее известные имена текущего прогона.
+`artifact_dir` извлекается из JSON-конверта успешной команды. При подтверждённом
+отсутствии PR в `collect`/`verify` опусти `--pr-number`; тогда CLI выберет
+`local/<FULL_HEAD_SHA>`. Не используй такой режим, если номер существующего PR
+не был надёжно выяснен. Для последующих команд получай `PACK`, `QUEUE`, triage,
+report, delta и execution пути от соответствующего `artifact_dir`.
 
 #### Анализаторы и ограничения
 
@@ -196,6 +252,9 @@ anki-repo code-review delta --before "$BASELINE_PACK" --after "$CURRENT_PACK"
 включая исполнение `build.rs`, процедурных макросов и других частей сборки.
 Используй его только для кода, которому доверяешь. Старый `--skip-clippy`
 удалён: для сбора без исполнения дополнительные флаги не нужны.
+Для параллельных проверок в независимом ревью запускай Clippy через приватный
+job режима `isolated_checks`; наличие `--run-clippy` само по себе не обещает
+отдельную job-область.
 
 Адаптер использует уже установленный локальный инструмент в режиме без сети;
 он не устанавливает компоненты и не скачивает зависимости. Режим без сети ограничивает
@@ -205,6 +264,123 @@ anki-repo code-review delta --before "$BASELINE_PACK" --after "$CURRENT_PACK"
 не означает успешную проверку без диагностик. Сообщения Cargo/rustc/Clippy
 читаются из структурированного вывода. Их наличие не превращает сбор
 свидетельств в содержательное ревью.
+
+#### Изолированное исполнение проверок
+
+`code-review execution` управляет локальными execution jobs, привязанными к
+точному snapshot и digest `review.json`. Для обычного чтения неизменяемого
+`review.json`, очереди и точных Git images отдельная рабочая копия не нужна. Для
+сборки или запуска проверок подготовь приватный job в режиме `isolated_checks`;
+для эксперимента, меняющего исходники или тесты, используй
+`disposable_source_experiment` на detached worktree проверяемого HEAD.
+
+Возвращённые `artifact_dir` и `job_directory` заданы относительно корня
+репозитория. CLI принимает относительные входные пути от текущего рабочего
+каталога: выполняй весь workflow из корня или преобразуй возвращённые пути в
+абсолютные относительно корня.
+
+Последовательность CLI для уже полученного `artifact_dir`:
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+PREPARED=$(anki-repo --json code-review execution prepare --pack "$PACK" --mode isolated_checks --scope tests --pr-number "$PR_NUMBER")
+JOB_PATH=$(jq -er '.result.job_directory' <<< "$PREPARED")
+anki-repo code-review execution run "$JOB_PATH" --timeout-seconds "$TIMEOUT_SECONDS" --cwd "$CWD" --env RUST_BACKTRACE=1 -- cargo test --workspace --locked
+anki-repo --json code-review execution inspect "$JOB_PATH"
+```
+
+`prepare` принимает путь к пакету, режим `isolated_checks` или
+`disposable_source_experiment`, обязательное направление `--scope` и
+необязательный `--pr-number`. `--pack` обязан указывать на канонический
+`review.json` внутри `.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/` или
+его `snapshot-<32 lowercase hex>` варианта; `prepare` наследует namespace,
+полный HEAD SHA и вариант workspace из этого пути и source pack, создавая job
+только в `runs/<unique-job-id>/` этого workspace. Если передан
+`--pr-number`, он проверяется как assertion; несовпадение завершается
+`invalid_request` до создания job. Поэтому известный PR не может незаметно
+попасть в `local` или другой PR namespace. `run` принимает timeout от
+1 секунды до 24 часов, относительный `--cwd` и явный argv после `--`; оболочка
+самостоятельно не запускается. Политика среды по умолчанию — `minimal`.
+`HOME`, `CARGO_HOME` и каталог сборки приватны для job: общий изменяемый кеш Cargo не используется. Зависимости общего кеша не
+появляются в новом job автоматически; выполнение Cargo может требовать сети,
+а `--offline` — завершаться отказом при отсутствии зависимостей в приватном кеше. Повторяемый `--env
+KEY=VALUE` выбирает политику `explicit`; приватные пути job нельзя переопределить. В
+структурированном результате распознаются формы `--key value`, `--key=value` и
+`KEY=value` для ключей `token`, `api-token`, `access-token`, `auth-token`,
+`refresh-token`, `secret`, `client-secret`, `password`, `passwd`, `api-key`,
+`apikey`, `authorization`, `proxy-authorization`, `credential`, `credentials`,
+`cookie` без учёта регистра; дефис и underscore эквивалентны.
+Распознаются заголовки `Authorization`, `Proxy-Authorization`, `Cookie`,
+`X-Api-Key`, `Api-Key`, в том числе через `-H`, `--header` и `--proxy-header`.
+`argv[0]` и аргументы после отдельного `--` не разбираются как секретные флаги.
+Для explicit env распознаются отдельные компоненты имени `TOKEN`, `SECRET`,
+`PASSWORD`, `PASSWD`, `APIKEY`, `AUTHORIZATION`, `CREDENTIAL`, `CREDENTIALS`,
+`COOKIE`, имя `API_KEY` и суффикс `_API_KEY`; `TOKENIZER_PATH` и
+`SECRETARY_NAME` не считаются секретными.
+
+Эти значения маскируются в `request.argv` и ограниченных текстах stdout/stderr.
+Маскирование работает по совпадению исходных байтов; секрет, пересекающий
+границу вывода, не оставляет видимого префикса. `total_bytes` относится к сырому
+логу, а `truncated` учитывает как исходный лимит, так и дополнительную обрезку
+после маскирования. `utf8_lossy` сообщает о замене некорректного UTF-8. Произвольные
+секреты под нераспознаваемыми именами автоматически не обнаруживаются.
+`argv_sha256` рассчитывается по безопасному представлению `argv`, поэтому его
+нельзя использовать для перебора распознанных секретных значений.
+`--max-parallel-jobs` задаёт общий для репозитория предел одновременно активных
+jobs (1–64, по умолчанию 4). Пока есть активные jobs, запрос с другим пределом
+отклоняется как `invalid_request` (exit 3); после их завершения можно выбрать
+другое значение. При совпадающем пределе и полной ёмкости возвращается
+`execution_busy` (exit 13) с `details.retryable: true`, `resource` и `reason`.
+Занятый job также возвращает временный отказ; завершённый job повторно запускать
+нельзя, и это постоянный конфликт.
+
+`inspect` показывает наблюдаемое состояние job и ограничения отдельно от
+сохранённого результата. Жизненный цикл различает `prepared`, `running`,
+`completed`, `preparation_failed` и `interrupted`; статус проверки различает
+`passed`, `failed`, `timed_out`, `cancelled`, `unavailable` и `incomplete`.
+`cancel` создаёт отдельный маркер, `cleanup` проверяет ownership и состояние
+перед удалением временных каталогов. Manifest, результаты, `logs/` и `outputs/`,
+включая `outputs/direction-report.json`, сохраняются.
+
+После запуска процесса обычный `cleanup` сохраняет worktree, поскольку
+невозможно доказать отсутствие потомков, вышедших из группы процессов.
+Оператор может явно подтвердить отсутствие живых потомков:
+
+```bash
+anki-repo --json code-review execution cleanup "$JOB_PATH" --confirm-no-live-descendants
+```
+
+Этот флаг — подтверждение оператора, а не техническое доказательство.
+Проверки ownership, блокировки и безопасных путей продолжают действовать;
+в результате очистки сохраняется это ограничение. `workspace_removed` описывает
+удаление исходного worktree и временных рабочих поверхностей, а `evidence_retained` — сохранение
+свидетельств и результатов.
+
+Execution jobs и отчёты отдельных субагентов используют только свои каталоги
+внутри `runs/<unique-job-id>/` того же PR/HEAD workspace. Execution jobs
+выделяют собственные изменяемые каталоги для проверки и не
+должны перезаписывать общий пакет или выходы другого job. Это разделение
+рабочих файлов предотвращает конфликты, но само по себе не является security
+sandbox и не доказывает запрет доступа к файлам, окружению, сети или секретам.
+Execution доступен только на Linux с доступным `/proc` для безопасной очистки;
+на других платформах запуск завершается отказом до исполнения. Полные
+`logs/stdout.log` и `logs/stderr.log` сохраняются в приватном job без очистки
+секретов и могут содержать чувствительные значения. Маскирование
+ограниченного свидетельства в JSON не очищает эти файлы; проверь сырые логи
+перед передачей другому агенту. `collect` и подготовка job проверяемый код автоматически не
+запускают; исполнение выбирает ревьюер с учётом действующей политики доверия. Делегирование
+субагентов остаётся ответственностью Codex CLI, DSH или другого агента; у
+`anki-repo` нет общего API их запуска.
+
+Для provider-neutral handoff reviewer сохраняет в собственном job namespace
+`outputs/direction-report.json` с полями `schema_version`, точным `snapshot`
+(`base_sha`, `head_sha`, `review_pack_sha256`), `direction`, исходной `task`,
+`completion` (`complete`, `incomplete`, `interrupted`, `not_started` или
+`unverified`), `checks` с `job_id`, `status` и evidence paths,
+`potential_findings` и `limitations`. Это сообщение субагента, а не готовое
+семантическое решение: только главный reviewer переносит перепроверенные выводы
+в canonical triage.
 
 Детерминизм относится к нормализованному представлению одного снимка и
 стабильной сортировке. Clippy вызывается с `--quiet`; известные строки прогресса
@@ -224,6 +400,17 @@ Cargo (компиляция, проверка, время завершения �
 идентификаторы кандидатов, классификацию, отдельные элементы и группы,
 представителей и сводные метрики.
 Она не содержит семантических решений или замечаний.
+
+`queue validate` сверяет syntax-derived классификации с результатом
+авторитетного классификатора, восстановленным из точных Git images и AST
+снимка. Самосогласованные поля очереди, её групповые подписи и digest не служат
+доказательством происхождения классификации. Если нужные Git objects или AST
+недоступны, полная проверка завершается `syntax_authenticity_unavailable`.
+Передай `--structure-only`, чтобы ограничить проверку структурой и digest;
+результат явно помечается `structure_only`, и syntax authenticity не
+подтверждается. Этот флаг поддерживают также команды `summary`, `list`, `group`
+и `candidate`; ограниченный результат нельзя представлять как полностью
+подлинную syntax-derived классификацию.
 
 Очередь можно проверить, свести к навигационной сводке, получить страницу
 подходящих элементов и раскрыть отдельную группу или кандидата командами только
@@ -252,12 +439,15 @@ anki-repo code-review queue candidate --pack "$PACK" --queue "$QUEUE" --id "$CAN
 
 `list` выдаёт страницу элементов очереди и перед чтением списка проверяет, что
 `PACK` и `QUEUE` относятся к одному точному снимку: сверяются байты `review.json`, Git
-identity и структура очереди. При несовпадении команда завершается ошибкой, а
-частичный список не возвращается. В `--help` команда описана как постраничный
-просмотр элементов очереди с фильтрами; доступные параметры:
+identity, структура очереди и доступный результат syntax-authenticity
+verification. При несовпадении команда завершается ошибкой, а частичный список
+не возвращается. Если exact Git images или AST недоступны, передай
+`--structure-only`, чтобы вывести ограниченный результат с явным статусом
+`structure_only`. В `--help` команда описана как постраничный просмотр
+элементов очереди с фильтрами; доступные параметры:
 
 ```text
-anki-repo code-review queue list --pack PACK --queue QUEUE [--limit N] [--offset N] [--priority high|normal|low] [--unknown] [--detector LABEL] [--surface LABEL] [--execution LABEL] [--role LABEL] [--text-role LABEL] [--code-role LABEL]
+anki-repo code-review queue list --pack PACK --queue QUEUE [--limit N] [--offset N] [--priority high|normal|low] [--unknown] [--detector LABEL] [--surface LABEL] [--execution LABEL] [--role LABEL] [--text-role LABEL] [--code-role LABEL] [--structure-only]
 ```
 
 По умолчанию `--limit` равен `50`, максимум — `200`; `--offset` по умолчанию
@@ -275,7 +465,8 @@ anki-repo code-review queue list --pack PACK --queue QUEUE [--limit N] [--offset
 одно измерение классификации; его можно сочетать с остальными фильтрами.
 Фильтр не меняет очередь и не подтверждает семантическое решение.
 
-В JSON-режиме объект `result` содержит `total_units` (все элементы очереди),
+В JSON-режиме объект `result` содержит `source_digest_valid`,
+`syntax_authenticity`, `total_units` (все элементы очереди),
 `matched_units` (число элементов после фильтрации, до пагинации), `offset`, `limit`,
 `returned_units`, `has_more` и страницу `units`. Каждый элемент `units` — краткая
 запись с `id`, `kind`, `priority`, `classification`, `detector`,
@@ -332,20 +523,25 @@ JSON-документ ревьюера: он хранит решения по к
 Полный цикл:
 
 ```bash
+WORKSPACE="$ARTIFACT_DIR"
+TRIAGE="$WORKSPACE/semantic-triage.input.json"
+CANONICAL_TRIAGE="$WORKSPACE/semantic-triage.json"
+REPORT="$WORKSPACE/review-report.md"
 anki-repo code-review triage init --pack "$PACK" --out "$TRIAGE"
 # Внешний ревьюер редактирует TRIAGE; незавершённые кандидаты остаются явными.
 anki-repo code-review triage validate --pack "$PACK" --triage "$TRIAGE" --canonical-out "$CANONICAL_TRIAGE" &&
 anki-repo code-review triage summary --pack "$PACK" --triage "$CANONICAL_TRIAGE" &&
-anki-repo code-review triage report --pack "$PACK" --triage "$CANONICAL_TRIAGE" --out "$REPORT.md"
+anki-repo code-review triage report --pack "$PACK" --triage "$CANONICAL_TRIAGE" --out "$REPORT"
 ```
 
 `PACK` — путь к исходному `review.json`, `TRIAGE` — редактируемый исходный
 JSON-артефакт решений ревьюера, `CANONICAL_TRIAGE` — его производный
-канонический JSON после успешной валидации, `REPORT.md` — производный
-человекочитаемый отчёт. `triage init` создаёт `TRIAGE` и не перезаписывает его
-другим содержимым. Команды `validate --canonical-out` и `triage report --out`
-обновляют производные артефакты по указанным путям; сам `TRIAGE` редактирует
-ревьюер. Запускай `summary` и `report` только после успешного `validate`. Если
+канонический JSON после успешной валидации, `REPORT` — производный
+человекочитаемый отчёт. Имена файлов обязательны: `semantic-triage.input.json`,
+`semantic-triage.json`, `review-report.md`. `triage init` создаёт `TRIAGE` и не
+перезаписывает его другим содержимым. Команды `validate --canonical-out` и
+`triage report --out` обновляют только производные файлы своего workspace; сам
+`TRIAGE` редактирует ревьюер. Запускай `summary` и `report` только после успешного `validate`. Если
 проверка текущего `TRIAGE` завершилась ошибкой, не используй оставшийся от
 прежнего запуска `CANONICAL_TRIAGE`: он может содержать старые решения и не
 отражать текущий исходник.
@@ -354,9 +550,13 @@ JSON-артефакт решений ревьюера, `CANONICAL_TRIAGE` — е
 `TRIAGE` по `PACK` и не зависит от текущего каталога: Git-репозиторий для такой
 проверки не требуется. `triage init`, `validate --canonical-out` и `triage report
 --out` определяют корень репозитория от текущего каталога, поэтому их нужно
-запускать внутри Git-репозитория. Записываемый путь проходит общую проверку
-безопасности артефактов: запись запрещена под `decks/**` и в служебные каталоги
-Git, а сам выходной путь не может быть символьной ссылкой. `summary` не требует
+запускать внутри Git-репозитория. Запись принимается только в точные имена
+артефактов внутри `.anki-repo/review/<pr-number|local>/<full-head-sha>/` или
+его `snapshot-<32 lowercase hex>` варианта.
+Произвольные пути, tracked файлы, `..`, symlink traversal и замена `review.json`
+или `review-queue.json` запрещены. Действующие derived files проверяются по
+типу и привязке к текущему snapshot; публикация выполняется атомарно под lock с
+повторной проверкой входных байтов. `summary` не требует
 Git-репозитория; `summary` и `report` сверяют triage с тем же исходным пакетом,
 поэтому используй для них `CANONICAL_TRIAGE`, созданный текущим успешным
 `validate`.
@@ -2375,7 +2575,14 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `6` | `validate` нашёл хотя бы одну проблему уровня `ERROR`, в том числе `invalid_json`, `root_not_deck` или `schema_invalid`; `edit` отказался править экспорт с `ERROR` или с неоднозначным определением модели. Повтор `guid` (`duplicate_note_guid`) — это `ERROR`, поэтому `edit` на таком экспорте завершается кодом `6`, а не `5`: проверка валидности исходника идёт раньше разрешения правки. `review-check` называет тот же блокер (`export_invalid` / `export_not_mutable`) и возвращает `6` вместо итогового кода отчёта — запрос он не выпускает |
 | `7` | `edit` обнаружил конфликт предусловия: текущее значение поля не совпало с `expected` (`expected_mismatch`) либо `deck.json` изменился между проверкой и заменой файла (`source_changed`); `review-check` обнаружил хотя бы одно предложение со статусом `conflict` (`stale`); `language apply` обнаружил устаревший исходник или якорь (`source_changed`); каталог или путь артефакта ревью уже содержит другое содержимое (`review_artifact_conflict`) |
 | `8` | Отказ записи или публикации: `edit` не смог заменить `deck.json`; `code-review`/`language` не смогли сохранить артефакт или опубликовать замены (`write_failed`) |
+| `9` | `code-review execution run`: команда завершилась с ненулевым кодом (`failed`) |
+| `10` | `code-review execution run`: выполнение нельзя считать полным или воспроизводимым (`incomplete`) |
+| `11` | `code-review execution run`: команда остановлена по timeout (`timed_out`) |
+| `12` | `code-review execution run`: команда отменена запросом или сигналом (`cancelled`) |
+| `13` | Временная занятость job или общего предела исполнения (`execution_busy`); `details.retryable: true` |
+| `14` | Ошибка операции с процессом (`process_operation_failed`) |
 | `70` | Неожиданная внутренняя ошибка, включая нарушение внутреннего инварианта правки и отказ записи вывода (нет места на диске, негодный дескриптор) |
+| `127` | `code-review execution run`: исполняемая команда недоступна (`unavailable`) |
 
 Закрытый читателем pipe (например `anki-repo … | head`) внутренней ошибкой не
 считается: результат команды уже вычислен, поэтому сохраняется её собственный
@@ -2396,7 +2603,7 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `unknown_field` | 3 | Указанного поля нет ни в одной модели экспорта; для `edit` — также если поля нет в модели целевой заметки |
 | `unknown_deck` | 3 | Указанная колода не найдена |
 | `unknown_qa_code` | 3 | Указанного кода QA нет в реестре правил (`qa --code`, `review --qa-code`) |
-| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id`, чужая `schema_version`, пустой `guid` (`empty_guid`) или пустое имя поля (`empty_field`); `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large`, `duplicate_proposal_id`, `empty_guid` или `empty_field`; `code-review queue list`: недопустимая метка `--detector`; `code-review`/`language`: некорректный путь артефакта, включая путь внутри `decks/**` или служебных каталогов Git |
+| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id`, чужая `schema_version`, пустой `guid` (`empty_guid`) или пустое имя поля (`empty_field`); `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large`, `duplicate_proposal_id`, `empty_guid` или `empty_field`; `code-review queue list`: недопустимая метка `--detector`; code-review output: имя вне собственного workspace, `..`, symlink traversal или tracked workspace |
 | `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды (отдельный код, а не `details.reason` внутри `invalid_request`) |
 | `proposal_not_executable` (`details.reason`) | — | Не отдельный код: `review-check` сообщает о неисполнимом предложении статусом `invalid` внутри отчёта, а не ошибкой команды |
 | `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме; `review-check`: тот же блокер в `source_blockers`, запрос не выпущен |
@@ -2410,6 +2617,9 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `git_evidence_failed` | 3 | `code-review`: у коммитов нет общего предка, область изменений Git недоступна или машинный ответ Git некорректен |
 | `review_artifact_invalid` | 3 | `code-review`/`language`: JSON, версия схемы либо лимит размера артефакта не прошли проверку; `code-review queue validate`/`summary`/`list`/`group`/`candidate`: структура очереди недействительна либо указанный в очереди SHA-256 исходного пакета не совпадает с хэшем точных байтов `review.json` |
 | `baseline_mismatch` | 3 | `verify`/`delta`: идентичность диапазона, base SHA или merge-base отличаются от исходного пакета; `code-review queue validate`/`summary`/`list`/`group`/`candidate`: Git-снимок очереди не совпадает со снимком исходного `review.json` |
+| `execution_busy` | 13 | Временная занятость execution job или общего предела; `details.retryable: true`, `resource` и `reason` позволяют отличить её от постоянного конфликта артефакта |
+| `process_operation_failed` | 14 | Не удалось выполнить операцию с процессом; это не ошибка записи review artifact |
+| `syntax_authenticity_unavailable` | 3 | `code-review queue validate`/`summary`/`list`/`group`/`candidate`: exact Git images или AST недоступны; для явной ограниченной проверки структуры и digest передай `--structure-only` |
 | `language_decision_invalid` | 3 | `language apply`: решение, якорь или ограничение замены не прошли предварительную проверку |
 | `not_found` | 4 | `find` и `review --guid`: нет совпадений по заданному критерию; `code-review queue group` / `candidate`: указанный unit или candidate ID отсутствует |
 | `note_not_found` | 4 | `edit`: в экспорте нет заметки с указанным `guid`; в отчёте `review-check` — код проблемы предложения (доменной ошибкой не является) |

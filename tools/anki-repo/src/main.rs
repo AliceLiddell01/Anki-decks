@@ -12,12 +12,12 @@ use clap::Parser;
 use anki_repo::cli::Cli;
 use anki_repo::error::ErrorCode;
 use anki_repo::output::write_text;
-use anki_repo::run::{execute, render_error};
+use anki_repo::run::{execute_cli, render_error};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match execute(&cli) {
+    match execute_cli(&cli) {
         Ok(rendered) => {
             if stdout_write_failed(&rendered.stdout) {
                 return internal_failure();

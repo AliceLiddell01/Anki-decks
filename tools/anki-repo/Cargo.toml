@@ -20,17 +20,13 @@ thiserror = "2"
 asset-store = { path = "../asset-store" }
 serde_yaml = { package = "yaml_serde", version = "0.10" }
 sha2 = "0.10"
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
+fs2 = "0.4"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 
-# Межпроцессная сериализация публикации `deck.json`. Публичный API этого crate
-# под `unsafe_code = "forbid"`, поэтому блокировка берётся не через ручной FFI,
-# а через небольшую обёртку над `flock(2)`. На Linux зависимость сводится к
-# `libc`; `File::lock`/`try_lock` из std появились только в Rust 1.89, а
-# заявленная в корневом workspace MSRV ниже этой версии.
 [target.'cfg(unix)'.dependencies]
-fs2 = "0.4"
+signal-hook = "0.4.5"
 
 [lib]
 name = "anki_repo"
