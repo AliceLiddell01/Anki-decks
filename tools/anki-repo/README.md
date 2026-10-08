@@ -148,29 +148,66 @@ CrowdAnki-экспортом и не знает имён полей конкре
 переключается и не очищается. Незакоммиченные изменения не становятся частью
 зафиксированного снимка только потому, что находятся в той же рабочей копии.
 
-`--pr-number NUMBER` задаёт навигационный namespace PR. Каталог снимка имеет вид
-`.anki-repo/review/<pr-number>/<full-head-sha>/`; без PR используется
-`.anki-repo/review/local/<full-head-sha>/`. `--out-dir DIR` можно указать только
-как этот точный каталог для выбранного PR/local HEAD. Команда проверяет путь до
-запуска Clippy; произвольный каталог, tracked workspace, symlink и `..`
-отвергаются до записи. Повторный сбор тех же байтов идемпотентен, а другое
-содержимое для того же workspace завершается конфликтом. `collect` и `verify`
-создают в каталоге полный `review.json`, производный `review-queue.json` и
-компактный навигационный `review.txt`; `verify` дополнительно сохраняет
-`delta.json`. Полный набор сырых кандидатов остаётся в `review.json`, а
-структурная классификация и членство в review units — в `review-queue.json`.
-`review.txt` помогает выбрать следующий шаг, но не является источником истины.
-`.anki-repo/review/` исключён через `.gitignore`: локальные артефакты не попадают
-в PR автоматически. Команда сама не добавляет файлы в индекс и не создаёт
-коммиты. Перед записью проверяется, что workspace не содержит tracked Git-файлов.
-Каждый пакет содержит точные base/HEAD SHA и source digest; PR number не заменяет
-машинную идентичность snapshot.
+Перед вызовом `collect`/`verify` вызывающий агент устанавливает номер PR из
+запроса или надёжной информации GitHub о текущей ветке. CLI сам не обнаруживает
+PR, а `anki-code-review` skill задаёт порядок такого определения. Не выводи номер
+из имени ветки. Если PR существует, передавай `--pr-number NUMBER` явно в
+каждой команде `collect` и `verify`. Опускай параметр только когда отсутствие
+PR подтверждено; тогда каталог использует сегмент `local`. Если статус PR
+нельзя достоверно установить, не представляй локальное ревью как ревью PR.
 
-`verify --baseline PACK --head REF` повторно собирает свидетельства, используя базу
-из исходного пакета, и сравнивает с новым HEAD. Доступны `--out-dir DIR` и
-`--run-clippy`. `delta --before PACK --after PACK` сравнивает уже сохранённые
-пакеты без повторного анализа; `--out PATH` сохраняет JSON-сравнение.
-Несовместимые снимки репозитория и базы не считаются одной итерацией ревью.
+Все постоянные локальные артефакты независимого code review хранятся только в
+каноническом workspace внутри текущего репозитория:
+`.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/`. Для PR номер —
+навигационный сегмент; полный SHA HEAD и digest байтов `review.json` задают
+идентичность снимка. Новый HEAD в том же PR получает отдельный каталог и не
+перезаписывает предыдущий. Ожидаемая структура одного снимка:
+
+```text
+.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/
+├── review.json
+├── review-queue.json
+├── review.txt
+├── delta.json                         # если создан verify или delta
+├── semantic-triage.input.json        # решения главного reviewer'а
+├── semantic-triage.json              # проверенное каноническое представление
+├── review-report.md                  # производный отчёт
+└── runs/
+    └── <unique-job-id>/              # собственные файлы execution job/субагента
+```
+
+Имена показывают контракт размещения, а не требование создавать пустые файлы.
+Используй фактический `artifact_dir`, возвращённый успешным `collect`/`verify`,
+как источник всех downstream-путей; не реконструируй путь по SHA вручную и не
+выбирай временный каталог. Необязательный `--out-dir DIR` допустим только если
+он в точности совпадает с каноническим workspace, выбранным по номеру PR/local и
+полному HEAD SHA. Произвольный каталог, tracked workspace, symlink, `..` и
+конфликтующий файл отвергаются до записи. Исходные артефакты неизменяемы:
+повторная генерация тех же байтов идемпотентна, другое содержимое для того же
+пути завершается конфликтом. Проверенные производные triage/report могут
+обновляться только по своим точным именам и только внутри этого же workspace.
+
+`collect` и `verify` создают полный `review.json`, производный
+`review-queue.json` и компактный навигационный `review.txt`; `verify`
+дополнительно сохраняет `delta.json`. Полный набор сырых кандидатов остаётся в
+`review.json`, а структурная классификация и членство в review units — в
+`review-queue.json`. `review.txt` помогает выбрать следующий шаг, но не является
+источником истины. `.anki-repo/review/` исключён через `.gitignore`: локальные
+артефакты не попадают в PR автоматически. Команда сама не добавляет файлы в
+индекс и не создаёт коммиты. Перед записью проверяется, что workspace не
+содержит tracked Git-файлов. Единственное общее исключение — инфраструктура
+между jobs: `.anki-repo/review/execution-locks/` может содержать общие слоты
+concurrency-lock. Там нет результатов, отчётов или иных артефактов конкретного
+PR/HEAD; все job-файлы остаются внутри `runs/<unique-job-id>/` своего workspace.
+
+`verify --baseline PACK --head REF --pr-number NUMBER` повторно собирает
+свидетельства, используя базу из исходного пакета, и сравнивает с новым HEAD.
+Передавай номер известного PR явно и при `verify`; результат появится в новом
+workspace этого PR, соответствующем полному SHA нового HEAD. Доступны
+`--out-dir DIR` и `--run-clippy`. `delta --before PACK --after PACK` сравнивает
+уже сохранённые пакеты без повторного анализа; `--out PATH` может указывать
+только на `delta.json` канонического workspace пакета `after`. Несовместимые
+снимки репозитория и базы не считаются одной итерацией ревью.
 
 `verify` выводит в stdout счётчики и краткую сводку статусов. Полные списки
 изменений сохраняются в `delta.json` каталога артефактов. Так размер вывода не
@@ -184,14 +221,23 @@ CrowdAnki-экспортом и не знает имён полей конкре
 полные массивы изменений доступны в `delta.json`.
 
 ```bash
-anki-repo code-review collect --base origin/main --head HEAD
+# PR_NUMBER получен из запроса или проверен через GitHub для текущей ветки.
+COLLECT=$(anki-repo --json code-review collect --base origin/main --head HEAD --pr-number "$PR_NUMBER")
+ARTIFACT_DIR=$(jq -er '.result.artifact_dir' <<< "$COLLECT")
+PACK="$ARTIFACT_DIR/review.json"
+QUEUE="$ARTIFACT_DIR/review-queue.json"
 anki-repo code-review collect --help
-anki-repo code-review verify --baseline "$BASELINE_PACK" --head HEAD
-anki-repo code-review delta --before "$BASELINE_PACK" --after "$CURRENT_PACK"
+VERIFY=$(anki-repo --json code-review verify --baseline "$PACK" --head "$NEW_HEAD" --pr-number "$PR_NUMBER")
+NEW_ARTIFACT_DIR=$(jq -er '.result.artifact_dir' <<< "$VERIFY")
+NEW_PACK="$NEW_ARTIFACT_DIR/review.json"
+anki-repo code-review delta --before "$PACK" --after "$NEW_PACK" --out "$NEW_ARTIFACT_DIR/delta.json"
 ```
 
-`BASELINE_PACK` и `CURRENT_PACK` в примерах — фактически полученные пути к
-`review.json`, а не заранее известные имена текущего прогона.
+`artifact_dir` извлекается из JSON-конверта успешной команды. При подтверждённом
+отсутствии PR в `collect`/`verify` опусти `--pr-number`; тогда CLI выберет
+`local/<FULL_HEAD_SHA>`. Не используй такой режим, если номер существующего PR
+не был надёжно выяснен. Для последующих команд получай `PACK`, `QUEUE`, triage,
+report, delta и execution пути от соответствующего `artifact_dir`.
 
 #### Анализаторы и ограничения
 
@@ -222,18 +268,24 @@ job режима `isolated_checks`; наличие `--run-clippy` само по 
 для эксперимента, меняющего исходники или тесты, используй
 `disposable_source_experiment` на detached worktree проверяемого HEAD.
 
-Подтверждённая последовательность CLI:
+Последовательность CLI для уже полученного `artifact_dir`:
 
 ```bash
-anki-repo code-review execution prepare --pack "$PACK" --mode isolated_checks --scope tests
-# Для именованного PR добавь: --pr-number "$PR_NUMBER"
+PREPARED=$(anki-repo --json code-review execution prepare --pack "$PACK" --mode isolated_checks --scope tests --pr-number "$PR_NUMBER")
+JOB_PATH=$(jq -er '.result.job_directory' <<< "$PREPARED")
 anki-repo code-review execution run "$JOB_PATH" --timeout-seconds "$TIMEOUT_SECONDS" --cwd "$CWD" --env RUST_BACKTRACE=1 -- cargo test --workspace --locked
 anki-repo --json code-review execution inspect "$JOB_PATH"
 ```
 
 `prepare` принимает путь к пакету, режим `isolated_checks` или
 `disposable_source_experiment`, обязательное направление `--scope` и
-необязательный `--pr-number` только для навигации. `run` принимает timeout от
+необязательный `--pr-number`. `--pack` обязан указывать на канонический
+`review.json` внутри `.anki-repo/review/<PR_NUMBER|local>/<FULL_HEAD_SHA>/`;
+`prepare` наследует namespace и полный HEAD SHA из этого пути и source pack,
+создавая job только в sibling `runs/<unique-job-id>/`. Если передан
+`--pr-number`, он проверяется как assertion; несовпадение завершается
+`invalid_request` до создания job. Поэтому известный PR не может незаметно
+попасть в `local` или другой PR namespace. `run` принимает timeout от
 1 секунды до 24 часов, относительный `--cwd` и explicit argv после `--`; shell
 сам по себе не запускается. Среда по умолчанию minimal. Повторяемый `--env
 KEY=VALUE` выбирает explicit policy; job-private пути нельзя переопределить. В
@@ -248,7 +300,9 @@ SHA-256 сохраняет проверяемую идентичность ис�
 worktree остаётся, если нельзя доказать отсутствие escaped descendants;
 завершённые логи и result не удаляются автоматически.
 
-Execution jobs выделяют собственные изменяемые каталоги для проверки и не
+Execution jobs и отчёты отдельных субагентов используют только свои каталоги
+внутри `runs/<unique-job-id>/` того же PR/HEAD workspace. Execution jobs
+выделяют собственные изменяемые каталоги для проверки и не
 должны перезаписывать общий пакет или выходы другого job. Это разделение
 рабочих файлов предотвращает конфликты, но само по себе не является security
 sandbox и не доказывает запрет доступа к файлам, окружению, сети или секретам.
@@ -407,7 +461,7 @@ JSON-документ ревьюера: он хранит решения по к
 Полный цикл:
 
 ```bash
-WORKSPACE=$(dirname "$PACK")
+WORKSPACE="$ARTIFACT_DIR"
 TRIAGE="$WORKSPACE/semantic-triage.input.json"
 CANONICAL_TRIAGE="$WORKSPACE/semantic-triage.json"
 REPORT="$WORKSPACE/review-report.md"

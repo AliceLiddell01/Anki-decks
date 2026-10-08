@@ -113,10 +113,40 @@ fn code_review_namespace_does_not_replace_card_review_commands() {
         assert_eq!(code, 0, "{stderr}");
         assert!(help.contains("--run-clippy"));
         assert!(help.contains("build.rs"));
+        assert!(help.contains(".anki-repo/review/"), "{help}");
+        assert!(help.contains("--pr-number"), "{help}");
+        assert!(help.contains("local"), "{help}");
         assert!(!help.contains("--skip-clippy"));
         let (code, _, stderr) = run_cli(&["code-review", subcommand, "--skip-clippy"]);
         assert_eq!(code, 2, "{stderr}");
         assert!(stderr.contains("--skip-clippy"));
+    }
+
+    let (code, help, stderr) = run_cli(&["code-review", "execution", "prepare", "--help"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(help.contains(".anki-repo/review/"), "{help}");
+    assert!(help.contains("--pr-number"), "{help}");
+    assert!(help.contains("namespace"), "{help}");
+    assert!(help.contains("наслед"), "{help}");
+
+    for (args, expected) in [
+        (&["delta", "--help"][..], "delta.json"),
+        (
+            &["triage", "init", "--help"][..],
+            "semantic-triage.input.json",
+        ),
+        (
+            &["triage", "validate", "--help"][..],
+            "semantic-triage.json",
+        ),
+        (&["triage", "report", "--help"][..], "review-report.md"),
+    ] {
+        let mut command = vec!["code-review"];
+        command.extend_from_slice(args);
+        let (code, help, stderr) = run_cli(&command);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(help.contains(".anki-repo/review/"), "{help}");
+        assert!(help.contains(expected), "{help}");
     }
 
     let (code, help, stderr) = run_cli(&["review", "--help"]);
@@ -2151,8 +2181,599 @@ fn boundary_fixture(name: &str) -> (TempDir, String, String) {
 
 fn assert_review_failure(result: (i32, String, String), expected: &str) {
     let (code, stdout, stderr) = result;
-    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    let expected_exit = if expected == "review_artifact_conflict" {
+        7
+    } else {
+        3
+    };
+    assert_eq!(code, expected_exit, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(parse_json(&stdout)["error"]["code"], expected);
+}
+
+fn review_success(result: (i32, String, String)) -> Value {
+    let (code, stdout, stderr) = result;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    parse_json(&stdout)["result"].clone()
+}
+
+fn ignored_review_fixture(name: &str) -> (TempDir, String, String) {
+    let repo = TempDir::new(name);
+    init_repo(&repo);
+    write_cargo_project(repo.path());
+    fs::write(
+        repo.path().join(".gitignore"),
+        "/target/\n/.anki-repo/review/\n",
+    )
+    .unwrap();
+    commit(repo.path(), "база с локальными артефактами ревью");
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn value(path: &str) { let _ = std::fs::read(path).unwrap(); }\n",
+    )
+    .unwrap();
+    commit(repo.path(), "изменение для ревью");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    (repo, base, head)
+}
+
+fn collect_pr_workspace(root: &Path, base: &str, head: &str, pr: &str) -> PathBuf {
+    let result = review_success(run_cli_in(
+        Some(root),
+        &[
+            "--json",
+            "code-review",
+            "collect",
+            "--base",
+            base,
+            "--head",
+            head,
+            "--pr-number",
+            pr,
+        ],
+    ));
+    let relative = Path::new(result["artifact_dir"].as_str().unwrap());
+    assert_eq!(relative, Path::new(".anki-repo/review").join(pr).join(head));
+    root.join(relative)
+}
+
+#[cfg(unix)]
+#[test]
+fn pr_review_pipeline_keeps_all_artifacts_and_job_in_returned_workspace() {
+    let (repo, base, head) = ignored_review_fixture("pr-review-pipeline");
+    let artifacts = collect_pr_workspace(repo.path(), &base, &head, "23");
+    let pack = artifacts.join("review.json");
+    let queue = artifacts.join("review-queue.json");
+    let evidence = fs::read(&pack).unwrap();
+    let queue_bytes = fs::read(&queue).unwrap();
+    let triage = artifacts.join("semantic-triage.input.json");
+    let canonical = artifacts.join("semantic-triage.json");
+    let report = artifacts.join("review-report.md");
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "queue",
+            "validate",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--queue",
+            queue.to_str().unwrap(),
+        ],
+    ));
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "triage",
+            "init",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--out",
+            triage.to_str().unwrap(),
+        ],
+    ));
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "triage",
+            "validate",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--triage",
+            triage.to_str().unwrap(),
+            "--canonical-out",
+            canonical.to_str().unwrap(),
+        ],
+    ));
+    let report_arguments = [
+        "--json",
+        "code-review",
+        "triage",
+        "report",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--triage",
+        canonical.to_str().unwrap(),
+        "--out",
+        report.to_str().unwrap(),
+    ];
+    review_success(run_cli_in(Some(repo.path()), &report_arguments));
+    let report_bytes = fs::read(&report).unwrap();
+    review_success(run_cli_in(Some(repo.path()), &report_arguments));
+    assert_eq!(fs::read(&report).unwrap(), report_bytes);
+
+    let prepared = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "execution",
+            "prepare",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--mode",
+            "isolated_checks",
+            "--scope",
+            "contracts",
+        ],
+    ));
+    let job = repo
+        .path()
+        .join(prepared["job_directory"].as_str().unwrap());
+    assert_eq!(job.parent().unwrap(), artifacts.join("runs"));
+    assert_eq!(
+        job.file_name().unwrap(),
+        prepared["job_id"].as_str().unwrap()
+    );
+    let manifest: Value = serde_json::from_slice(&fs::read(job.join("job.json")).unwrap()).unwrap();
+    assert_eq!(manifest["namespace"], "23");
+    assert_eq!(manifest["source"]["snapshot"]["head_sha"], head);
+    assert_eq!(
+        manifest["source"]["review_pack_sha256"],
+        format!("{:x}", sha2::Sha256::digest(&evidence))
+    );
+    assert_eq!(
+        repo.path().join(prepared["worktree"].as_str().unwrap()),
+        job.join("worktree")
+    );
+    assert_eq!(git(&job.join("worktree"), &["rev-parse", "HEAD"]), head);
+    let run = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "execution",
+            "run",
+            job.to_str().unwrap(),
+            "--timeout-seconds",
+            "10",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'synthetic report\\n' > \"$TMPDIR/subagent-report.md\"; printf 'isolated output\\n'",
+        ],
+    ));
+    assert_eq!(run["status"], "passed");
+    assert_eq!(run["namespace"], "23");
+    assert_eq!(run["source"]["snapshot"]["head_sha"], head);
+    let subagent_report = job.join("tmp/subagent-report.md");
+    assert_eq!(
+        fs::read_to_string(&subagent_report).unwrap(),
+        "synthetic report\n"
+    );
+    assert!(subagent_report.starts_with(&artifacts));
+    assert_eq!(
+        fs::read_to_string(job.join(run["stdout"]["log"].as_str().unwrap())).unwrap(),
+        "isolated output\n"
+    );
+    assert!(job.join("result.json").is_file());
+    assert!(!review_workspace(repo.path(), &head).exists());
+    assert_eq!(fs::read(&pack).unwrap(), evidence);
+    assert_eq!(fs::read(&queue).unwrap(), queue_bytes);
+    assert!(
+        git(repo.path(), &["check-ignore", artifacts.to_str().unwrap()])
+            .contains(".anki-repo/review/23/")
+    );
+    assert!(git(repo.path(), &["status", "--porcelain=v1"]).is_empty());
+    assert!(git(repo.path(), &["ls-files", "--", ".anki-repo/review"]).is_empty());
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "execution",
+            "cleanup",
+            job.to_str().unwrap(),
+        ],
+    ));
+}
+
+#[test]
+fn verify_new_head_uses_separate_pr_workspace_and_keeps_previous_documents() {
+    let (repo, base, head) = ignored_review_fixture("pr-review-next-head");
+    let previous = collect_pr_workspace(repo.path(), &base, &head, "31");
+    let baseline = previous.join("review.json");
+    let triage = previous.join("semantic-triage.input.json");
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "triage",
+            "init",
+            "--pack",
+            baseline.to_str().unwrap(),
+            "--out",
+            triage.to_str().unwrap(),
+        ],
+    ));
+    let canonical = previous.join("semantic-triage.json");
+    let report = previous.join("review-report.md");
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "triage",
+            "validate",
+            "--pack",
+            baseline.to_str().unwrap(),
+            "--triage",
+            triage.to_str().unwrap(),
+            "--canonical-out",
+            canonical.to_str().unwrap(),
+        ],
+    ));
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "triage",
+            "report",
+            "--pack",
+            baseline.to_str().unwrap(),
+            "--triage",
+            canonical.to_str().unwrap(),
+            "--out",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let saved = [
+        "review.json",
+        "review-queue.json",
+        "review.txt",
+        "semantic-triage.input.json",
+        "semantic-triage.json",
+        "review-report.md",
+    ]
+    .map(|name| (name, fs::read(previous.join(name)).unwrap()));
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 7 }\n",
+    )
+    .unwrap();
+    commit(repo.path(), "следующая версия того же PR");
+    let next_head = git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(head, next_head);
+    assert_review_failure(
+        run_cli_in(
+            Some(repo.path()),
+            &[
+                "--json",
+                "code-review",
+                "verify",
+                "--baseline",
+                baseline.to_str().unwrap(),
+                "--head",
+                &next_head,
+                "--pr-number",
+                "32",
+            ],
+        ),
+        "invalid_request",
+    );
+    assert!(!repo.path().join(".anki-repo/review/32").exists());
+    assert!(
+        !repo
+            .path()
+            .join(".anki-repo/review/31")
+            .join(&next_head)
+            .exists()
+    );
+    let result = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "verify",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--head",
+            &next_head,
+        ],
+    ));
+    let next = repo.path().join(result["artifact_dir"].as_str().unwrap());
+    assert_eq!(
+        next,
+        repo.path().join(".anki-repo/review/31").join(&next_head)
+    );
+    for name in [
+        "review.json",
+        "review-queue.json",
+        "review.txt",
+        "delta.json",
+    ] {
+        assert!(next.join(name).is_file(), "missing {name}");
+    }
+    assert!(!next.join("semantic-triage.input.json").exists());
+    assert!(!next.join("semantic-triage.json").exists());
+    assert!(!next.join("review-report.md").exists());
+    assert_review_failure(
+        run_cli_in(
+            Some(repo.path()),
+            &[
+                "--json",
+                "code-review",
+                "triage",
+                "validate",
+                "--pack",
+                next.join("review.json").to_str().unwrap(),
+                "--triage",
+                triage.to_str().unwrap(),
+                "--canonical-out",
+                next.join("semantic-triage.json").to_str().unwrap(),
+            ],
+        ),
+        "review_artifact_invalid",
+    );
+    assert!(!next.join("semantic-triage.json").exists());
+    for (name, bytes) in saved {
+        assert_eq!(fs::read(previous.join(name)).unwrap(), bytes);
+    }
+    assert!(!review_workspace(repo.path(), &next_head).exists());
+    assert_eq!(
+        fs::read_dir(repo.path().join(".anki-repo/review/31"))
+            .unwrap()
+            .count(),
+        2
+    );
+    assert!(git(repo.path(), &["status", "--porcelain=v1"]).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn execution_prepare_inherits_local_namespace_when_source_has_no_pr() {
+    let (repo, base, head) = ignored_review_fixture("execution-inherit-local");
+    let artifacts = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &artifacts, false);
+    let pack = artifacts.join("review.json");
+    let prepared = review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "execution",
+            "prepare",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--mode",
+            "isolated_checks",
+            "--scope",
+            "local-test",
+        ],
+    ));
+    let job = repo
+        .path()
+        .join(prepared["job_directory"].as_str().unwrap());
+    assert_eq!(job.parent().unwrap(), artifacts.join("runs"));
+    let manifest: Value = serde_json::from_slice(&fs::read(job.join("job.json")).unwrap()).unwrap();
+    assert_eq!(manifest["namespace"], "local");
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "execution",
+            "cleanup",
+            job.to_str().unwrap(),
+        ],
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn execution_rejects_namespace_and_pack_path_mismatch_before_creating_any_job() {
+    let (repo, base, head) = ignored_review_fixture("execution-source-namespace");
+    let artifacts = collect_pr_workspace(repo.path(), &base, &head, "37");
+    let pack = artifacts.join("review.json");
+    let local = review_workspace(repo.path(), &head);
+    collect_pack(repo.path(), &base, &head, &local, false);
+    let local_pack = local.join("review.json");
+    let outside = TempDir::new("execution-outside-pack");
+    let copied = outside.path().join("review.json");
+    fs::copy(&pack, &copied).unwrap();
+    let sibling = artifacts.join("copied-review.json");
+    fs::copy(&pack, &sibling).unwrap();
+    let dotdot = artifacts.join("../").join(&head).join("review.json");
+    let worktrees = git(repo.path(), &["worktree", "list", "--porcelain"]);
+    let status = git(repo.path(), &["status", "--porcelain=v1"]);
+    for (source, requested) in [
+        (pack.as_path(), Some("38")),
+        (pack.as_path(), Some("local")),
+        (local_pack.as_path(), Some("37")),
+        (copied.as_path(), None),
+        (sibling.as_path(), None),
+        (dotdot.as_path(), None),
+    ] {
+        let mut args = vec![
+            "--json",
+            "code-review",
+            "execution",
+            "prepare",
+            "--pack",
+            source.to_str().unwrap(),
+            "--mode",
+            "isolated_checks",
+            "--scope",
+            "source-test",
+        ];
+        if let Some(pr) = requested {
+            args.extend(["--pr-number", pr]);
+        }
+        assert_review_failure(run_cli_in(Some(repo.path()), &args), "invalid_request");
+        assert!(!artifacts.join("runs").exists());
+        assert!(!local.join("runs").exists());
+        assert!(!repo.path().join(".anki-repo/review/38").exists());
+        assert_eq!(
+            git(repo.path(), &["worktree", "list", "--porcelain"]),
+            worktrees
+        );
+        assert_eq!(git(repo.path(), &["status", "--porcelain=v1"]), status);
+    }
+}
+
+#[test]
+fn pr_derived_outputs_reject_foreign_namespace_traversal_and_conflicting_evidence() {
+    let (repo, base, head) = ignored_review_fixture("pr-derived-output-boundary");
+    let artifacts = collect_pr_workspace(repo.path(), &base, &head, "43");
+    let pack = artifacts.join("review.json");
+    let evidence = fs::read(&pack).unwrap();
+    let triage = artifacts.join("semantic-triage.input.json");
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "triage",
+            "init",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--out",
+            triage.to_str().unwrap(),
+        ],
+    ));
+    let outside = TempDir::new("pr-derived-output-external");
+    let external = outside.path().join("review-report.md");
+    let foreign = repo
+        .path()
+        .join(".anki-repo/review/44")
+        .join(&head)
+        .join("review-report.md");
+    let local = review_workspace(repo.path(), &head).join("review-report.md");
+    let tracked = repo.path().join("Cargo.toml");
+    let tracked_bytes = fs::read(&tracked).unwrap();
+    let traversal = artifacts.join("../").join(&head).join("review-report.md");
+    for output in [&external, &foreign, &local, &tracked, &traversal, &pack] {
+        assert_review_failure(
+            run_cli_in(
+                Some(repo.path()),
+                &[
+                    "--json",
+                    "code-review",
+                    "triage",
+                    "report",
+                    "--pack",
+                    pack.to_str().unwrap(),
+                    "--triage",
+                    triage.to_str().unwrap(),
+                    "--out",
+                    output.to_str().unwrap(),
+                ],
+            ),
+            "invalid_request",
+        );
+        assert_eq!(fs::read(&pack).unwrap(), evidence);
+        assert_eq!(fs::read(&tracked).unwrap(), tracked_bytes);
+        assert!(!artifacts.join("review-report.md").exists());
+        assert!(!external.exists());
+        assert!(!repo.path().join(".anki-repo/review/44").exists());
+        assert!(!review_workspace(repo.path(), &head).exists());
+    }
+    let report = artifacts.join("review-report.md");
+    fs::write(&report, "Чужой документ без ownership marker.\n").unwrap();
+    let foreign_bytes = fs::read(&report).unwrap();
+    assert_review_failure(
+        run_cli_in(
+            Some(repo.path()),
+            &[
+                "--json",
+                "code-review",
+                "triage",
+                "report",
+                "--pack",
+                pack.to_str().unwrap(),
+                "--triage",
+                triage.to_str().unwrap(),
+                "--out",
+                report.to_str().unwrap(),
+            ],
+        ),
+        "review_artifact_conflict",
+    );
+    assert_eq!(fs::read(&report).unwrap(), foreign_bytes);
+    assert_eq!(fs::read(&pack).unwrap(), evidence);
+    assert!(git(repo.path(), &["status", "--porcelain=v1"]).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn pr_report_symlink_does_not_write_to_external_file() {
+    use std::os::unix::fs::symlink;
+
+    let (repo, base, head) = ignored_review_fixture("pr-report-symlink");
+    let artifacts = collect_pr_workspace(repo.path(), &base, &head, "47");
+    let pack = artifacts.join("review.json");
+    let triage = artifacts.join("semantic-triage.input.json");
+    review_success(run_cli_in(
+        Some(repo.path()),
+        &[
+            "--json",
+            "code-review",
+            "triage",
+            "init",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--out",
+            triage.to_str().unwrap(),
+        ],
+    ));
+    let outside = TempDir::new("pr-report-symlink-outside");
+    let target = outside.path().join("document.md");
+    fs::write(&target, "Внешний документ.\n").unwrap();
+    let bytes = fs::read(&target).unwrap();
+    let report = artifacts.join("review-report.md");
+    symlink(&target, &report).unwrap();
+    assert_review_failure(
+        run_cli_in(
+            Some(repo.path()),
+            &[
+                "--json",
+                "code-review",
+                "triage",
+                "report",
+                "--pack",
+                pack.to_str().unwrap(),
+                "--triage",
+                triage.to_str().unwrap(),
+                "--out",
+                report.to_str().unwrap(),
+            ],
+        ),
+        "review_artifact_conflict",
+    );
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+    assert!(
+        fs::symlink_metadata(&report)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -2162,10 +2783,11 @@ fn collect_rejects_arbitrary_output_before_writing_or_running_clippy() {
     let tracked = repo.path().join("Cargo.toml");
     let arbitrary = repo.path().join("arbitrary/nested");
     let external = outside.path().join("output");
+    let dotdot = review_workspace(repo.path(), &head).join("../").join(&head);
     let cargo_bytes = fs::read(&tracked).unwrap();
     let status = git(repo.path(), &["status", "--porcelain=v1"]);
     let index = git(repo.path(), &["ls-files", "--stage"]);
-    for output in [&arbitrary, &tracked, &external] {
+    for output in [&arbitrary, &tracked, &external, &dotdot] {
         assert_review_failure(
             run_cli_in(
                 Some(repo.path()),

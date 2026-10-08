@@ -532,13 +532,13 @@ pub enum CodeReviewCommand {
         /// Верхняя ссылка Git; её SHA фиксируется в пакете.
         #[arg(long)]
         head: String,
-        /// Каталог локальных артефактов; по умолчанию вычисляется по SHA.
+        /// Канонический workspace PR/HEAD; по умолчанию `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
         run_clippy: bool,
-        /// Номер PR для навигации внутри локального review workspace.
+        /// Номер существующего PR; для code-review PR передавайте его явно.
         #[arg(long, value_name = "NUMBER")]
         pr_number: Option<String>,
     },
@@ -551,13 +551,13 @@ pub enum CodeReviewCommand {
         /// Новый HEAD для сравнения; базовый SHA берётся из исходного пакета.
         #[arg(long)]
         head: String,
-        /// Каталог нового снимка ревью; имя по умолчанию вычисляется по SHA.
+        /// Workspace нового HEAD: `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`; namespace берётся из baseline.
         #[arg(long = "out-dir", value_name = "DIR")]
         out_dir: Option<PathBuf>,
         /// Явно разрешить локальный Clippy; сборка может исполнять build.rs и proc-macro.
         #[arg(long)]
         run_clippy: bool,
-        /// Номер PR для навигации внутри локального review workspace.
+        /// Проверить namespace PR baseline; при отсутствии параметра namespace наследуется.
         #[arg(long, value_name = "NUMBER")]
         pr_number: Option<String>,
     },
@@ -570,7 +570,7 @@ pub enum CodeReviewCommand {
         /// Более новый review.json.
         #[arg(long, value_name = "PACK")]
         after: PathBuf,
-        /// Необязательный путь JSON-отчёта delta.
+        /// Только `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/delta.json` пакета --after.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
@@ -723,13 +723,13 @@ pub enum ReviewQueueCommand {
 pub enum ReviewExecutionCommand {
     /// Подготовить приватный job и detached worktree, не запуская проектный код.
     Prepare {
-        /// Исходный review.json.
+        /// Канонический review.json из `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
         /// Режим проверки или disposable source experiment.
         #[arg(long, value_enum)]
         mode: crate::code_review::execution::ExecutionMode,
-        /// Номер PR только как навигационный сегмент workspace.
+        /// Проверить PR namespace канонического --pack; без параметра namespace наследуется из пути.
         #[arg(long, value_name = "NUMBER")]
         pr_number: Option<String>,
         /// Именованное направление review, например tests, runtime, docs или security.
@@ -787,7 +787,8 @@ pub enum SemanticTriageCommand {
         /// Неизменяемый пакет свидетельств `review.json`.
         #[arg(long, value_name = "PACK")]
         pack: PathBuf,
-        /// Путь нового JSON-документа семантического разбора.
+        /// Только `semantic-triage.input.json` в
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/` пакета --pack.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
@@ -803,9 +804,9 @@ pub enum SemanticTriageCommand {
         /// Заполненный JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
-        /// Необязательный путь для отсортированного канонического JSON.
-        /// Запись запрещена под `decks/**`, в служебные каталоги Git и по
-        /// символьным ссылкам.
+        /// Только `semantic-triage.json` в
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/` пакета --pack.
+        /// Валидный собственный документ можно атомарно обновить.
         #[arg(long = "canonical-out", value_name = "PATH")]
         canonical_out: Option<PathBuf>,
     },
@@ -830,7 +831,8 @@ pub enum SemanticTriageCommand {
         /// JSON-документ семантического разбора.
         #[arg(long, value_name = "PATH")]
         triage: PathBuf,
-        /// Путь нового Markdown-отчёта.
+        /// Только `review-report.md` в
+        /// `.anki-repo/review/<PR|local>/<FULL_HEAD_SHA>/` пакета --pack.
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },

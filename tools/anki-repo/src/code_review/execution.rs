@@ -55,7 +55,10 @@ pub struct ExecutionSource {
 pub struct PrepareOptions {
     pub mode: ExecutionMode,
     pub scope: String,
-    pub namespace: String,
+    /// Канонический исходный review.json; относительный путь считается от root.
+    pub source_pack: PathBuf,
+    /// Необязательное утверждение номера PR; namespace наследуется из source_pack.
+    pub pr_number: Option<String>,
 }
 
 /// Значения переменных не наследуются без явного выбора политики.
@@ -250,6 +253,124 @@ struct State {
     workspace_removed: bool,
 }
 
+/// Проверяет identity исходного evidence до любых операций с runtime-каталогами.
+fn source_pack_namespace(
+    root: &Path,
+    pack: &ReviewPack,
+    bytes: &[u8],
+    options: &PrepareOptions,
+) -> Result<String, DomainError> {
+    // Path::components нормализует внутренние "."; проверяем исходное написание тоже.
+    if options
+        .source_pack
+        .as_os_str()
+        .as_encoded_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|component| component == b"." || component == b"..")
+    {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "alias path, . и .. в исходном review.json запрещены",
+        ));
+    }
+    let source_path = if options.source_pack.is_absolute() {
+        options.source_pack.clone()
+    } else {
+        root.join(&options.source_pack)
+    };
+    let relative = source_path.strip_prefix(root).map_err(|_| {
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "исходный review.json вне канонического repository workspace",
+        )
+    })?;
+    let components: Vec<_> = relative.components().collect();
+    let [
+        Component::Normal(owner),
+        Component::Normal(review),
+        Component::Normal(namespace),
+        Component::Normal(head),
+        Component::Normal(filename),
+    ] = components.as_slice()
+    else {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "исходный пакет должен быть .anki-repo/review/<PR|local>/<full-head-sha>/review.json",
+        ));
+    };
+    if *owner != ".anki-repo" || *review != "review" || *filename != "review.json" {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "исходный пакет должен быть каноническим review.json",
+        ));
+    }
+    let namespace = namespace.to_str().ok_or_else(|| {
+        DomainError::new(ErrorCode::InvalidRequest, "namespace не является UTF-8")
+    })?;
+    if namespace != "local"
+        && namespace.parse::<u64>().map_or(true, |number| {
+            number == 0 || number.to_string() != namespace
+        })
+    {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "namespace должен быть local или каноническим положительным номером PR",
+        ));
+    }
+    if let Some(number) = &options.pr_number {
+        if number
+            .parse::<u64>()
+            .map_or(true, |value| value == 0 || value.to_string() != *number)
+        {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "pr_number должен быть каноническим положительным номером PR",
+            ));
+        }
+        if number != namespace {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "номер PR не совпадает с namespace исходного review.json",
+            ));
+        }
+    }
+    if head.to_str() != Some(pack.target.head_sha.as_str()) {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "HEAD каталога исходного review.json не совпадает с source pack",
+        ));
+    }
+    let canonical = root
+        .join(".anki-repo/review")
+        .join(namespace)
+        .join(&pack.target.head_sha)
+        .join("review.json");
+    if source_path.as_os_str() != canonical.as_os_str() {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "alias исходного review.json вместо канонического пути запрещён",
+        ));
+    }
+    let directory = safe_dir(canonical.parent().expect("review.json имеет каталог"))?;
+    let stored = read_optional_file_at(
+        &directory,
+        "review.json",
+        super::workflow::MAX_REVIEW_ARTIFACT_BYTES,
+    )?
+    .ok_or_else(|| {
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "канонический исходный review.json отсутствует",
+        )
+    })?;
+    if stored != bytes {
+        return Err(invalid(
+            "байты исходного review.json не совпадают с каноническим evidence",
+        ));
+    }
+    Ok(namespace.to_owned())
+}
+
 /// Создаёт unique job и точный detached worktree; код проекта не запускается.
 pub fn prepare_job(
     root: &Path,
@@ -266,15 +387,6 @@ pub fn prepare_job(
             "байты review.json не соответствуют переданному пакету",
         ));
     }
-    valid_component(&options.namespace)?;
-    if options.namespace != "local"
-        && (!options.namespace.bytes().all(|b| b.is_ascii_digit())
-            || options.namespace.parse::<u64>().map_or(true, |number| {
-                number == 0 || number.to_string() != options.namespace
-            }))
-    {
-        return Err(invalid("namespace должен быть local или номером PR"));
-    }
     if options.scope.trim().is_empty() || options.scope.len() > 128 || options.scope.contains('\0')
     {
         return Err(invalid("scope job не может быть пустым"));
@@ -288,17 +400,18 @@ pub fn prepare_job(
     }
     let root = root.canonicalize().map_err(io_error)?;
     safe_dir(&root)?;
+    let namespace = source_pack_namespace(&root, pack, bytes, &options)?;
     verify_snapshot(&root, &pack.target)?;
     let parent = root
         .join(".anki-repo/review")
-        .join(&options.namespace)
+        .join(&namespace)
         .join(&pack.target.head_sha)
         .join("runs");
     super::workflow::reject_tracked_review_workspace(
         &root,
         Path::new(".anki-repo")
             .join("review")
-            .join(&options.namespace)
+            .join(&namespace)
             .join(&pack.target.head_sha)
             .as_path(),
     )?;
@@ -314,7 +427,7 @@ pub fn prepare_job(
         },
         mode: options.mode,
         scope: options.scope,
-        namespace: options.namespace,
+        namespace,
         owner_nonce,
     };
     let job = PreparedJob {
@@ -1805,7 +1918,27 @@ mod tests {
                 tool_runs: vec![],
             };
             let bytes = serde_json::to_vec(&pack).unwrap();
-            Self { root, pack, bytes }
+            let repo = Self { root, pack, bytes };
+            repo.store_pack("local", &repo.pack, &repo.bytes);
+            repo
+        }
+        fn store_pack(&self, namespace: &str, pack: &ReviewPack, bytes: &[u8]) -> PathBuf {
+            let directory = self
+                .root
+                .join(".anki-repo/review")
+                .join(namespace)
+                .join(&pack.target.head_sha);
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("review.json");
+            fs::write(&path, bytes).unwrap();
+            path
+        }
+        fn source_path(&self, namespace: &str) -> PathBuf {
+            self.root
+                .join(".anki-repo/review")
+                .join(namespace)
+                .join(&self.pack.target.head_sha)
+                .join("review.json")
         }
         fn prepare(&self, mode: ExecutionMode) -> PreparedJob {
             prepare_job(
@@ -1815,7 +1948,8 @@ mod tests {
                 PrepareOptions {
                     mode,
                     scope: "regression".into(),
-                    namespace: "local".into(),
+                    source_pack: self.source_path("local"),
+                    pr_number: None,
                 },
             )
             .unwrap()
@@ -1966,6 +2100,144 @@ mod tests {
         assert!(run_job(&job, &request("pass"), &AtomicBool::new(false)).is_err());
     }
 
+    fn prepare_source(
+        repo: &Repo,
+        source_pack: PathBuf,
+        pr_number: Option<&str>,
+    ) -> Result<PreparedJob, DomainError> {
+        prepare_job(
+            &repo.root,
+            &repo.pack,
+            &repo.bytes,
+            PrepareOptions {
+                mode: ExecutionMode::IsolatedChecks,
+                scope: "namespace-contract".into(),
+                source_pack,
+                pr_number: pr_number.map(str::to_owned),
+            },
+        )
+    }
+    fn assert_no_runtime(repo: &Repo) {
+        assert!(!repo.root.join(".git/worktrees").exists());
+        for namespace in ["local", "17", "18"] {
+            assert!(
+                !repo
+                    .root
+                    .join(".anki-repo/review")
+                    .join(namespace)
+                    .join(&repo.pack.target.head_sha)
+                    .join("runs")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_inherits_local_and_pr_from_source_workspace() {
+        for (namespace, assertion) in [("local", None), ("17", None), ("17", Some("17"))] {
+            let repo = Repo::new();
+            let source = repo.store_pack(namespace, &repo.pack, &repo.bytes);
+            let job = prepare_source(&repo, source, assertion).unwrap();
+            assert_eq!(job.metadata.namespace, namespace);
+            assert_eq!(
+                job.directory.parent().unwrap(),
+                repo.root
+                    .join(".anki-repo/review")
+                    .join(namespace)
+                    .join(&repo.pack.target.head_sha)
+                    .join("runs")
+            );
+            assert_eq!(
+                fs::read(job.directory.join("source-review.json")).unwrap(),
+                repo.bytes
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_assertions_fail_before_runtime_side_effects() {
+        for (namespace, assertion) in [
+            ("local", "17"),
+            ("17", "18"),
+            ("17", "local"),
+            ("17", "017"),
+        ] {
+            let repo = Repo::new();
+            let source = repo.store_pack(namespace, &repo.pack, &repo.bytes);
+            let error = prepare_source(&repo, source, Some(assertion)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert_no_runtime(&repo);
+        }
+    }
+
+    #[test]
+    fn noncanonical_source_paths_fail_before_runtime_side_effects() {
+        let repo = Repo::new();
+        let head = &repo.pack.target.head_sha;
+        let paths = [
+            repo.root.join("review.json"),
+            repo.root
+                .join(format!(".anki-repo/review/017/{head}/review.json")),
+            repo.root.join(format!(
+                ".anki-repo/review/local/{}/review.json",
+                &head[..12]
+            )),
+            repo.root.join(format!(
+                ".anki-repo/review/local/{}/review.json",
+                "0".repeat(head.len())
+            )),
+            repo.root
+                .join(format!(".anki-repo/review/local/{head}/queue.json")),
+            repo.root.join(format!(
+                ".anki-repo/review/local/../local/{head}/review.json"
+            )),
+            repo.root
+                .join(format!(".anki-repo/review/local/./{head}/review.json")),
+            repo.root
+                .join(format!(".anki-repo/review//local/{head}/review.json")),
+        ];
+        for source in paths {
+            let error = prepare_source(&repo, source, None).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert_no_runtime(&repo);
+        }
+    }
+
+    #[test]
+    fn symlink_source_pack_or_workspace_fails_before_runtime_side_effects() {
+        use std::os::unix::fs::symlink;
+        for directory_link in [false, true] {
+            let repo = Repo::new();
+            let source = repo.source_path("local");
+            if directory_link {
+                let workspace = source.parent().unwrap();
+                let moved = repo.root.join("evidence-directory");
+                fs::rename(workspace, &moved).unwrap();
+                symlink(&moved, workspace).unwrap();
+            } else {
+                let moved = repo.root.join("evidence.json");
+                fs::rename(&source, &moved).unwrap();
+                symlink(&moved, &source).unwrap();
+            }
+            let error = prepare_source(&repo, source, None).unwrap_err();
+            assert!(matches!(
+                error.code,
+                ErrorCode::InvalidRequest | ErrorCode::ReviewArtifactConflict
+            ));
+            assert_no_runtime(&repo);
+        }
+    }
+
+    #[test]
+    fn source_bytes_are_verified_against_existing_canonical_evidence() {
+        let repo = Repo::new();
+        let source = repo.source_path("local");
+        fs::write(&source, b"unrelated evidence").unwrap();
+        let error = prepare_source(&repo, source, None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ReviewArtifactInvalid);
+        assert_no_runtime(&repo);
+    }
+
     #[test]
     fn preparation_ignores_source_checkout_filters_and_hooks() {
         let repo = Repo::new();
@@ -2010,7 +2282,8 @@ mod tests {
             PrepareOptions {
                 mode: ExecutionMode::IsolatedChecks,
                 scope: "filters".into(),
-                namespace: "local".into(),
+                source_pack: repo.store_pack("local", &pack, &bytes),
+                pr_number: None,
             },
         )
         .unwrap();

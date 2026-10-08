@@ -8,9 +8,58 @@
 - если названа ветка или диапазон коммитов — используй их;
 - иначе работай с текущей рабочей копией и её PR, если он есть.
 
-Зафиксируй точные SHA проверяемых HEAD/base. Если невозможно разрешить
-ревизию, явно отметь ограничение вместо обозначения плавающей ссылки как
-точного снимка.
+До создания артефактов установи PR identity. Номер из явного запроса проверь
+структурированным `gh pr view <number> --repo <owner/repo> --json ...` либо
+эквивалентным GitHub API. Для запроса «текущий PR на текущем checkout» сначала
+прочитай remote/upstream и текущую ветку Git, затем найди связанные PR по точному
+head branch и head repository через GitHub. Сверь владельца репозитория, ветку
+и HEAD; имя ветки служит ключом поиска, но не источником догадки о номере PR.
+Однозначная подтверждённая связь определяет `PR_NUMBER`. Если найдено несколько
+подходящих PR, не выбирай один произвольно. Для обычного checkout с настроенным
+GitHub remote начни с `gh pr view --json number,url,headRefName,headRefOid,baseRefOid`:
+при успешном ответе возьми `PR_NUMBER` из `.number` и проверь связь с checkout по
+полученным полям и remote/upstream. Это чтение связанного PR текущей ветки, а не
+извлечение номера из названия ветки. Ошибка этой команды требует отдельного
+установления причины и не разрешает переключаться на `local`.
+
+Чтобы достоверно подтвердить отсутствие PR, используй успешный полный список,
+а не трактуй ошибку `gh pr view` как пустой результат. Получи текущую ветку,
+upstream remote и GitHub-репозитории этого remote и базового checkout. Затем
+выполни, подставив фактические значения:
+
+```bash
+PULLS=$(gh pr list --repo "$BASE_REPOSITORY" --head "$BRANCH" --state all --limit 1000 \
+  --json number,url,state,headRefName,headRefOid,baseRefOid,headRepository)
+MATCHES=$(jq --arg branch "$BRANCH" --arg head_repo "$HEAD_REPOSITORY" \
+  '[.[] | select(.headRefName == $branch and .headRepository.nameWithOwner == $head_repo)]' \
+  <<<"$PULLS")
+UNRESOLVED=$(jq --arg branch "$BRANCH" \
+  '[.[] | select(.headRefName == $branch and .headRepository.nameWithOwner == null)] | length' \
+  <<<"$PULLS")
+```
+
+`gh pr list --head` фильтрует по имени ветки, поэтому проверь каждый результат
+также по точному `headRepository.nameWithOwner`, полученному из GitHub remote
+текущего checkout; не сопоставляй только owner или имя ветки. Один результат
+устанавливает `PR_NUMBER` из его `.number` только если `UNRESOLVED` равен нулю.
+Пустой `MATCHES` подтверждает отсутствие только если запрос успешен, identity
+обоих remote установлена, `UNRESOLVED` равен нулю и получено меньше 1000 строк.
+При 1000 строках считай выборку потенциально усечённой и статус PR неизвестным.
+Несколько совпадений, результат с неопределённым `headRepository`, отсутствие
+upstream или репозитория head, ошибка GitHub либо другая неполнота также не
+разрешают `local`.
+
+Только успешный структурированный запрос без связанных PR доказывает их
+отсутствие и разрешает явно обозначенный режим `local`. Ошибка доступа к GitHub,
+неизвестный remote, detached checkout без подтверждённой связи или неоднозначный
+ответ не разрешают считать, что PR отсутствует. В этом случае сообщи ограничение
+установления PR и продолжай доступный анализ без подмены ревью PR пакетом `local`.
+
+Зафиксируй точные полные SHA проверяемых HEAD/base. Для текущего PR на текущем
+checkout сверь `git rev-parse HEAD` с `headRefOid`; при расхождении явно установи,
+какой из этих снимков запрошен, и не называй старый checkout текущим HEAD PR.
+Если невозможно разрешить ревизию, явно отметь ограничение вместо обозначения
+плавающей ссылки как точного снимка.
 Не переключай рабочую копию только ради ревью и не смешивай изменения другого PR.
 Пакет и очередь свидетельств рассматривай как общий неизменяемый вход всех
 ревьюеров; точные source images при необходимости читай из Git-объектов этого
@@ -111,13 +160,107 @@
 
 Собери `code-review collect` для выбранных base/HEAD по публичному контракту
 [anki-repo](../../../../tools/anki-repo/README.md#code-review-collectverifydeltaqueuetriage).
-Сохрани пакет ревью в локальном review workspace вне `decks/**`. Не добавляй
-артефакты ревью в индекс и не публикуй их автоматически.
+Для известного PR обязательно передай `--pr-number "$PR_NUMBER"` каждому
+`collect` и `verify`. Все локальные результаты этого ревью хранятся только в
+`<repo-root>/.anki-repo/review/<PR_NUMBER>/<FULL_HEAD_SHA>/`. При доказанном
+отсутствии PR опусти `--pr-number` и явно обозначь единственный допустимый
+workspace `.anki-repo/review/local/<FULL_HEAD_SHA>/`. `local` не служит запасным
+вариантом для известного PR или ошибки определения PR.
+
+Прими `result.artifact_dir` из успешного JSON-envelope CLI, разрешив относительный
+путь от корня репозитория; не конструируй каталог на стороне LLM повторно.
+`PACK`, `QUEUE`, `TRIAGE`, `CANONICAL_TRIAGE`, `REPORT`, delta и остальные
+результаты относятся к этому workspace. `--out-dir` не выбирает произвольное
+место: CLI разрешает только точный канонический каталог данного namespace и HEAD.
+Не сохраняй постоянные результаты в `/tmp`, корне проекта, `decks/**` или ином
+каталоге. Весь `/.anki-repo/review/` gitignored; не добавляй артефакты ревью
+в индекс и не публикуй их автоматически.
 Проверь, что разрешённые SHA относятся к выбранному объекту ревью. Полный
 пакет содержит идентичность снимка, область изменений, диагностики и кандидатов;
 полные версии релевантных файлов после изменений при необходимости восстанавливаются
 из зафиксированных Git-объектов этого снимка. Краткое представление помогает
 навигации. Требования и архитектурный контекст восстанавливаются отдельно.
+
+Ниже связный Bash-пример для известного PR на текущем checkout. `PR_NUMBER`
+заранее получен из запроса или подтверждённого GitHub-ответа; `anki-repo`, `gh`
+и `jq` должны быть доступны. Пример прекращается при ошибке или несовпадении
+checkout с HEAD PR. JSON ответов держится в shell-переменных, а файлы результатов
+создаются только в возвращённом workspace:
+
+```bash
+set -euo pipefail
+: "${PR_NUMBER:?Укажи достоверно установленный номер PR}"
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+REPOSITORY=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json number,url,baseRefOid,headRefOid)
+test "$(jq -er '.number | tostring' <<<"$PR_JSON")" = "$PR_NUMBER"
+HEAD_SHA=$(git rev-parse HEAD)
+BASE_SHA=$(jq -er '.baseRefOid' <<<"$PR_JSON")
+test "$HEAD_SHA" = "$(jq -er '.headRefOid' <<<"$PR_JSON")"
+git cat-file -e "$BASE_SHA^{commit}"
+
+SNAPSHOT_JSON=$(anki-repo --json code-review collect --base "$BASE_SHA" --head "$HEAD_SHA" --pr-number "$PR_NUMBER")
+WORKSPACE=$(jq -er '.result.artifact_dir' <<<"$SNAPSHOT_JSON")
+PACK="$WORKSPACE/review.json"
+QUEUE="$WORKSPACE/review-queue.json"
+TRIAGE="$WORKSPACE/semantic-triage.input.json"
+CANONICAL_TRIAGE="$WORKSPACE/semantic-triage.json"
+REPORT="$WORKSPACE/review-report.md"
+anki-repo code-review queue validate --pack "$PACK" --queue "$QUEUE"
+anki-repo code-review queue summary --pack "$PACK" --queue "$QUEUE"
+anki-repo code-review triage init --pack "$PACK" --out "$TRIAGE"
+
+# Каждый делегированный reviewer получает собственный job этого же снимка.
+JOB_JSON=$(anki-repo --json code-review execution prepare --pack "$PACK" --mode isolated_checks --scope tests --pr-number "$PR_NUMBER")
+JOB_PATH=$(jq -er '.result.job_directory' <<<"$JOB_JSON")
+DIRECTION_REPORT="$JOB_PATH/outputs/direction-report.json"
+# Передай PACK, QUEUE, JOB_PATH и DIRECTION_REPORT назначенному reviewer'у.
+
+# Рассмотри diff/очередь и результаты направлений; редактируй только TRIAGE.
+read -r -p 'После анализа и сохранения TRIAGE введи reviewed: ' TRIAGE_READY
+test "$TRIAGE_READY" = reviewed
+anki-repo code-review triage validate --pack "$PACK" --triage "$TRIAGE" --canonical-out "$CANONICAL_TRIAGE"
+anki-repo code-review triage summary --pack "$PACK" --triage "$CANONICAL_TRIAGE"
+anki-repo code-review triage report --pack "$PACK" --triage "$CANONICAL_TRIAGE" --out "$REPORT"
+
+git check-ignore -- "$PACK" "$QUEUE" "$TRIAGE" "$CANONICAL_TRIAGE" "$REPORT" "$JOB_PATH"
+git status --short
+```
+
+Пауза `read` требует содержательного анализа ревьюером перед генерацией отчёта;
+пустой triage не означает завершённый разбор. Для результатов
+других направлений приготовь отдельные jobs и передай их собственные
+`outputs/direction-report.json`. Пример `run` ниже применяй только после выбора
+проверок и подтверждения доверия к исполняемому коду.
+
+После нового коммита того же PR используй старый `PACK` как baseline, явно сохрани
+тот же PR identity и снова получи все пути из ответа `verify`:
+
+```bash
+BASELINE_PACK="$PACK"
+NEXT_PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json headRefOid)
+NEXT_HEAD_SHA=$(git rev-parse HEAD)
+test "$NEXT_HEAD_SHA" = "$(jq -er '.headRefOid' <<<"$NEXT_PR_JSON")"
+NEXT_SNAPSHOT_JSON=$(anki-repo --json code-review verify --baseline "$BASELINE_PACK" --head "$NEXT_HEAD_SHA" --pr-number "$PR_NUMBER")
+WORKSPACE=$(jq -er '.result.artifact_dir' <<<"$NEXT_SNAPSHOT_JSON")
+PACK="$WORKSPACE/review.json"
+QUEUE="$WORKSPACE/review-queue.json"
+TRIAGE="$WORKSPACE/semantic-triage.input.json"
+CANONICAL_TRIAGE="$WORKSPACE/semantic-triage.json"
+REPORT="$WORKSPACE/review-report.md"
+DELTA="$WORKSPACE/delta.json"
+anki-repo code-review queue validate --pack "$PACK" --queue "$QUEUE"
+anki-repo code-review triage init --pack "$PACK" --out "$TRIAGE"
+# Повтори содержательную проверку и validate/summary/report для нового PACK.
+```
+
+Новый полный HEAD создаёт отдельный workspace в прежнем PR namespace. Старые
+`review.json`, очередь, triage и отчёт не переписываются и не смешиваются с
+новыми. Если нужна отдельная запись результата `delta --before ... --after ...`,
+используй только `--out "$DELTA"` нового workspace; команда не разрешает
+произвольный файл. Повторная генерация собственных валидных canonical triage и
+отчёта обновляет их, сохраняя неизменяемые evidence.
 
 Если сборщик недоступен или завершился ошибкой, зафиксируй причину и собери
 доступные свидетельства вручную. Не останавливай независимое ревью, которое можно
@@ -188,14 +331,17 @@ syntax-authenticity verification либо явно помеченная как s
   не API конкретного агентского фреймворка:
 
   ```bash
-  anki-repo --json code-review execution prepare --pack "$PACK" --mode isolated_checks --scope tests
-  # Возьми job_directory из результата prepare и передай его как JOB_PATH.
+  # JOB_PATH уже получен из result.job_directory в связном примере выше.
   anki-repo code-review execution run "$JOB_PATH" --timeout-seconds 900 --cwd . -- cargo test --workspace --locked
   anki-repo --json code-review execution inspect "$JOB_PATH"
   ```
 
-  `prepare` получает `review.json`, режим, именованное направление `--scope` и,
-  при наличии, `--pr-number` как навигацию. `run` принимает timeout, относительный
+  `prepare` получает канонический `review.json`, режим и именованное направление
+  `--scope`. PR/local identity наследуется из пути подтверждённого source pack.
+  Необязательный `--pr-number` является только проверкой совпадения namespace:
+  другой PR или PR для `local` отвергается typed error до создания job. Job
+  располагается в `runs/<unique-job-id>/` того же PR/local/HEAD workspace.
+  `run` принимает timeout, относительный
   рабочий каталог и explicit argv после `--`. Environment policy по умолчанию
   minimal; повторяемый `--env KEY=VALUE` включает explicit policy. Приватные
   build/tmp/home paths нельзя переопределить. `inspect` показывает сохранённый
@@ -217,7 +363,8 @@ syntax-authenticity verification либо явно помеченная как s
 Codex CLI, DSH и другие системы делегирования используют собственные механизмы
 запуска субагентов. Не предполагается общий `spawn`/`delegate` API или MCP.
 Каждому субагенту передай один и тот же snapshot, точное направление и свой
-output namespace. Он может писать в собственные scratch/build/log/result области,
+`runs/<unique-job-id>/outputs/` внутри workspace того же PR/local/HEAD.
+Он может писать в собственные scratch/build/log/result области job,
 но не в общий evidence, `review.json`, `review-queue.json`, результаты соседей
 или canonical triage. Сохраняй в его результате проверенный snapshot, задачу,
 фактически выполненные проверки и ссылки на jobs/доказательства, потенциальные
@@ -225,7 +372,7 @@ output namespace. Он может писать в собственные scratch
 относятся только к независимому code review.
 
 Для одинакового handoff Codex CLI, DSH или другой reviewer записывает
-`outputs/direction-report.json` в собственный job namespace со следующими
+`$JOB_PATH/outputs/direction-report.json` в собственный job namespace со следующими
 полями: `schema_version`, `snapshot` (`base_sha`, `head_sha`,
 `review_pack_sha256`), `direction`, `task`, `completion` (`complete`,
 `incomplete`, `interrupted`, `not_started`, `unverified`), `checks` с `job_id`,
@@ -243,8 +390,7 @@ output namespace. Он может писать в собственные scratch
 семантических решений:
 
 ```bash
-WORKSPACE=$(dirname "$PACK")
-TRIAGE="$WORKSPACE/semantic-triage.input.json"
+# TRIAGE уже привязан к result.artifact_dir выбранного collect/verify.
 anki-repo code-review triage init --pack "$PACK" --out "$TRIAGE"
 ```
 
@@ -356,10 +502,7 @@ HEAD.
 создай производный Markdown-отчёт в этом порядке:
 
 ```bash
-WORKSPACE=$(dirname "$PACK")
-TRIAGE="$WORKSPACE/semantic-triage.input.json"
-CANONICAL_TRIAGE="$WORKSPACE/semantic-triage.json"
-REPORT="$WORKSPACE/review-report.md"
+# Используй пути из result.artifact_dir выбранного collect/verify.
 anki-repo code-review triage validate --pack "$PACK" --triage "$TRIAGE" --canonical-out "$CANONICAL_TRIAGE" &&
 anki-repo code-review triage summary --pack "$PACK" --triage "$CANONICAL_TRIAGE" &&
 anki-repo code-review triage report --pack "$PACK" --triage "$CANONICAL_TRIAGE" --out "$REPORT"

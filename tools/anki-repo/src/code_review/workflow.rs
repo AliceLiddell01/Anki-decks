@@ -217,6 +217,27 @@ pub fn verify(
         "исходный пакет ревью",
     )?;
     delta::validate_review_pack(&baseline)?;
+    let baseline_namespace = review_workspace_namespace(&root, baseline_path, &baseline)?;
+    if pr_number.is_some_and(|requested| {
+        !is_canonical_pr_number(requested)
+            || baseline_namespace
+                .as_deref()
+                .is_some_and(|namespace| namespace != requested)
+    }) {
+        return Err(DomainError::with_details(
+            ErrorCode::InvalidRequest,
+            "--pr-number должен совпадать с namespace baseline review.json",
+            crate::details! {
+                "baseline_namespace" => baseline_namespace.as_deref().unwrap_or("external"),
+                "requested_pr_number" => pr_number.unwrap_or_default(),
+            },
+        ));
+    }
+    let effective_pr_number = match (pr_number, baseline_namespace.as_deref()) {
+        (Some(number), _) => Some(number),
+        (None, Some("local") | None) => None,
+        (None, Some(number)) => Some(number),
+    };
     let collected =
         scope::collect_scope(&root, &baseline.target.base_sha, head).map_err(scope_error)?;
     if collected.target.repository_id != baseline.target.repository_id
@@ -235,14 +256,26 @@ pub fn verify(
             },
         ));
     }
-    review_workspace_directory(&root, out_dir, pr_number, &collected.target.head_sha)?;
+    review_workspace_directory(
+        &root,
+        out_dir,
+        effective_pr_number,
+        &collected.target.head_sha,
+    )?;
     let (post_sources, base_sources) = rust_sources_from_scope(&collected);
     let post = RustImages::new(post_sources);
     let base = RustImages::new(base_sources);
     let pack = build_pack(&root, collected, run_clippy);
     let changes = delta::compare(&baseline, &pack)?;
     let contexts = syntax_contexts(&pack, &post, &base);
-    save_snapshot(&root, out_dir, &pack, Some(changes), &contexts, pr_number)
+    save_snapshot(
+        &root,
+        out_dir,
+        &pack,
+        Some(changes),
+        &contexts,
+        effective_pr_number,
+    )
 }
 
 /// Подготавливает job на pinned snapshot, не исполняя проектный код.
@@ -254,7 +287,6 @@ pub fn prepare_execution_job(
 ) -> Result<ExecutionPreparedSummary, DomainError> {
     let root = repository_root(Path::new("."))?;
     let (pack, bytes) = read_review_pack(pack_path)?;
-    let namespace = pr_number.unwrap_or("local").to_owned();
     let job = super::execution::prepare_job(
         &root,
         &pack,
@@ -262,7 +294,8 @@ pub fn prepare_execution_job(
         super::execution::PrepareOptions {
             mode,
             scope: scope.to_owned(),
-            namespace,
+            source_pack: pack_path.to_path_buf(),
+            pr_number: pr_number.map(str::to_owned),
         },
     )?;
     Ok(ExecutionPreparedSummary {
@@ -2213,15 +2246,7 @@ fn review_workspace_directory(
         ));
     }
     let namespace = match pr_number {
-        Some(number)
-            if !number.is_empty()
-                && number
-                    .parse::<u64>()
-                    .is_ok_and(|value| value > 0 && value.to_string() == number)
-                && number.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            number
-        }
+        Some(number) if is_canonical_pr_number(number) => number,
         Some(_) => {
             return Err(DomainError::new(
                 ErrorCode::InvalidRequest,
@@ -2257,6 +2282,14 @@ fn review_workspace_directory(
     }
     ensure_workspace_directory(root, &expected)?;
     Ok(expected)
+}
+
+fn is_canonical_pr_number(number: &str) -> bool {
+    !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && number
+            .parse::<u64>()
+            .is_ok_and(|value| value > 0 && value.to_string() == number)
 }
 
 fn ensure_workspace_directory(root: &Path, workspace: &Path) -> Result<(), DomainError> {
@@ -2380,6 +2413,39 @@ fn workspace_for_pack(
         ));
     }
     Ok(expected)
+}
+
+/// Возвращает PR/local namespace, если входной пакет уже лежит в каноническом workspace.
+/// Внешний read-only baseline допустим, но для PR-ревью вызывающая сторона должна
+/// передать подтверждённый номер PR; такой input не используется для вывода namespace.
+fn review_workspace_namespace(
+    root: &Path,
+    pack_path: &Path,
+    pack: &ReviewPack,
+) -> Result<Option<String>, DomainError> {
+    let absolute = if pack_path.is_absolute() {
+        pack_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| artifact_write_error(pack_path, &error))?
+            .join(pack_path)
+    };
+    let review_root = root.join(".anki-repo").join("review");
+    if !normalize_without_parent(&absolute).starts_with(&review_root) {
+        return Ok(None);
+    }
+    let workspace = workspace_for_pack(root, pack_path, pack)?;
+    let namespace = workspace
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::InvalidRequest,
+                "не удалось определить namespace исходного review workspace",
+            )
+        })?;
+    Ok(Some(namespace.to_owned()))
 }
 
 fn reject_symlink_path(root: &Path, requested: &Path) -> Result<(), DomainError> {
