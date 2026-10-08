@@ -2188,6 +2188,12 @@ fn write_directory_once(
         let file_type = entry
             .file_type()
             .map_err(|error| artifact_write_error(&entry.path(), &error))?;
+        if name == "delta.json" && !documents.contains_key(name.as_str()) {
+            if !file_type.is_file() || file_type.is_symlink() {
+                return Err(artifact_conflict(&entry.path()));
+            }
+            continue;
+        }
         if matches!(
             name.as_str(),
             "runs"
@@ -3715,6 +3721,38 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             ErrorCode::InvalidRequest
         );
         assert!(!newly_created.exists());
+    }
+
+    #[test]
+    fn snapshot_without_delta_preserves_a_prior_delta_file() {
+        let owner = TempWorkspace::create("anki-snapshot-prior-delta")
+            .expect("временная рабочая область проекта должна создаваться");
+        let directory = owner.path().join("snapshot");
+        fs::create_dir(&directory).unwrap();
+        let delta = b"previous delta bytes\n";
+        fs::write(directory.join("delta.json"), delta).unwrap();
+
+        let without_delta = BTreeMap::from([("review.json", b"{}\n".to_vec())]);
+        write_directory_once(&directory, &without_delta).unwrap();
+        assert_eq!(fs::read(directory.join("delta.json")).unwrap(), delta);
+
+        let with_same_delta = BTreeMap::from([
+            ("review.json", b"{}\n".to_vec()),
+            ("delta.json", delta.to_vec()),
+        ]);
+        write_directory_once(&directory, &with_same_delta).unwrap();
+
+        let with_changed_delta = BTreeMap::from([
+            ("review.json", b"{}\n".to_vec()),
+            ("delta.json", b"different delta bytes\n".to_vec()),
+        ]);
+        assert_eq!(
+            write_directory_once(&directory, &with_changed_delta)
+                .unwrap_err()
+                .code,
+            ErrorCode::ReviewArtifactConflict
+        );
+        assert_eq!(fs::read(directory.join("delta.json")).unwrap(), delta);
     }
 
     #[test]

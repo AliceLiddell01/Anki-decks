@@ -1318,9 +1318,11 @@ fn output_evidence(
         .take(read_limit as u64)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    let utf8_lossy = std::str::from_utf8(&bytes).is_err();
+    let cutoff = output_evidence_cutoff(&bytes, limit, sensitive_values);
+    let bytes = &bytes[..cutoff];
+    let utf8_lossy = std::str::from_utf8(bytes).is_err();
     let truncated = total_bytes > limit as u64;
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
     for value in sensitive_values.iter().filter(|value| !value.is_empty()) {
         text = text.replace(value, "<redacted>");
     }
@@ -1338,6 +1340,28 @@ fn output_evidence(
         utf8_lossy,
         log: format!("logs/{name}"),
     })
+}
+
+fn output_evidence_cutoff(bytes: &[u8], limit: usize, sensitive_values: &[String]) -> usize {
+    let mut cutoff = bytes.len().min(limit);
+    loop {
+        let previous = cutoff;
+        for value in sensitive_values.iter().filter(|value| !value.is_empty()) {
+            let pattern = value.as_bytes();
+            if pattern.len() > bytes.len() {
+                continue;
+            }
+            for (start, window) in bytes.windows(pattern.len()).enumerate() {
+                let end = start + pattern.len();
+                if start < cutoff && cutoff < end && window == pattern {
+                    cutoff = start;
+                }
+            }
+        }
+        if cutoff == previous {
+            return cutoff;
+        }
+    }
 }
 
 fn sensitive_environment_values(environment: &EnvironmentPolicy) -> Vec<String> {
@@ -2403,7 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn output_redaction_includes_sensitive_values_crossing_the_limit() {
+    fn output_redaction_drops_sensitive_values_crossing_the_limit() {
         let repo = Repo::new();
         let job = repo.prepare(ExecutionMode::IsolatedChecks);
         let logs = job.directory.join("logs");
@@ -2414,11 +2438,31 @@ mod tests {
         let secret = "local-secret-value".to_owned();
         let evidence = output_evidence(&job, "stdout.log", 18, &[secret]).unwrap();
 
-        assert_eq!(evidence.text, "visible:<redacted>");
+        assert_eq!(evidence.text, "visible:");
         assert!(!evidence.text.contains("loc"));
         assert_eq!(evidence.total_bytes, source.len() as u64);
         assert!(evidence.truncated);
         assert!(evidence.text.len() <= 18);
+    }
+
+    #[test]
+    fn output_redaction_does_not_include_bytes_past_the_original_limit() {
+        let repo = Repo::new();
+        let job = repo.prepare(ExecutionMode::IsolatedChecks);
+        let logs = job.directory.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let source = b"token=local-secret-value; boundary=DO_NOT_INCLUDE";
+        fs::write(logs.join("stdout.log"), source).unwrap();
+
+        let secret = "local-secret-value".to_owned();
+        let limit = 30;
+        let evidence =
+            output_evidence(&job, "stdout.log", limit, std::slice::from_ref(&secret)).unwrap();
+        let expected = String::from_utf8_lossy(&source[..limit]).replace(&secret, "<redacted>");
+
+        assert_eq!(evidence.text, expected);
+        assert!(!evidence.text.contains("boundary="));
+        assert!(evidence.truncated);
     }
 
     #[test]

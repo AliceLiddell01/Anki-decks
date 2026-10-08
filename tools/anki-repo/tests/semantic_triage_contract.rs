@@ -977,4 +977,17 @@ fn triage_rejects_symlink_at_canonical_artifact_without_changing_target() {
     assert_eq!(fs::read(&target).unwrap(), b"protected bytes");
     assert_eq!(fs::read_link(canonical).unwrap(), target);
     assert_eq!(fs::read_link(report).unwrap(), target);
+
+    let parent = outside.path().join("artifact-parent");
+    fs::create_dir(&parent).unwrap();
+    let parent_target = parent.join("semantic-triage.json");
+    fs::write(&parent_target, b"parent protected bytes").unwrap();
+    let parent_alias = fixture.artifacts.join("parent-alias");
+    symlink(&parent, &parent_alias).unwrap();
+    failure(
+        fixture.canonicalize(&parent_alias.join("semantic-triage.json")),
+        "invalid_request",
+    );
+    assert_eq!(fs::read(&parent_target).unwrap(), b"parent protected bytes");
+    assert_eq!(fs::read_link(parent_alias).unwrap(), parent);
 }
