@@ -501,7 +501,7 @@ pub fn open_job(root: &Path, directory: &Path) -> Result<PreparedJob, DomainErro
     {
         return Err(DomainError::new(
             ErrorCode::NotFound,
-            "Каталог execution job не найден",
+            "Каталог задания исполнения не найден",
         ));
     }
     safe_dir(&directory)?;
@@ -572,7 +572,7 @@ pub fn run_job(
     verify_worktree_head(job)?;
     if job.metadata.mode == ExecutionMode::IsolatedChecks && source_changed(job)? {
         return Err(conflict(
-            "isolated checks требует неизменённого pinned source; создайте новый job или disposable experiment",
+            "Режим `isolated_checks` требует неизменённых закреплённых исходников; создайте новое задание или выберите `disposable_source_experiment`.",
         ));
     }
     let stdout = open_file(&safe_dir(&job.directory.join("logs"))?, "stdout.log", true)?;
@@ -756,7 +756,7 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
     {
         return Err(DomainError::new(
             ErrorCode::NotFound,
-            "Каталог execution job не найден",
+            "Каталог задания исполнения не найден",
         ));
     }
     let root = directory
@@ -1850,7 +1850,9 @@ fn stop_child(
         enforcement.process_cleanup = "direct_child_only".into();
     }
     if let Err(error) = child.kill() {
-        *failure = Some(format!("direct-child kill: {error}"));
+        *failure = Some(format!(
+            "Не удалось завершить непосредственный дочерний процесс: {error}"
+        ));
     }
 }
 
@@ -2351,7 +2353,7 @@ fn execution_slot(root: &Path, limit: usize) -> Result<File, DomainError> {
         return Err(busy(
             "repository",
             "execution_capacity",
-            "Достигнут предел одновременных execution jobs; повторите после завершения другого job",
+            "Достигнут предел одновременных заданий исполнения; повторите после завершения другого задания",
         ));
     }
     let (_, slot) = available

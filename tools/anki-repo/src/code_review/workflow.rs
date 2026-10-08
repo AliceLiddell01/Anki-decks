@@ -57,7 +57,7 @@ pub struct SnapshotSummary {
     pub delta: Option<ReviewDelta>,
 }
 
-/// Краткая ссылка на подготовленное isolated execution job.
+/// Краткая ссылка на подготовленное задание изолированной проверки.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecutionPreparedSummary {
     pub job_id: String,
@@ -319,14 +319,14 @@ pub fn run_execution_job(
     super::execution::run_job(&job, request, cancel)
 }
 
-/// Читает lifecycle/result execution job без изменений.
+/// Без изменений читает состояние жизненного цикла и результат задания.
 pub fn inspect_execution_job(
     job_path: &Path,
 ) -> Result<super::execution::JobInspection, DomainError> {
     super::execution::inspect_job(job_path)
 }
 
-/// Запрашивает отмену активного execution job.
+/// Запрашивает отмену активного задания.
 pub fn cancel_execution_job(
     job_path: &Path,
 ) -> Result<super::execution::JobInspection, DomainError> {
@@ -2278,7 +2278,7 @@ fn review_workspace_directory(
     {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "review workspace требует полный hexadecimal HEAD SHA",
+            "Рабочая область ревью требует полный HEAD SHA в шестнадцатеричной форме",
         ));
     }
     let namespace = match pr_number {
@@ -2512,7 +2512,7 @@ fn reject_symlink_path(root: &Path, requested: &Path) -> Result<(), DomainError>
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(DomainError::with_details(
                     ErrorCode::InvalidRequest,
-                    "symlink/junction traversal для review artifact запрещён",
+                    "Переход по символическим ссылкам или точкам подключения запрещён для артефакта ревью",
                     crate::details! { "path" => current.display().to_string() },
                 ));
             }
@@ -4206,7 +4206,7 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             )
             .unwrap_err();
             assert_eq!(error.code, ErrorCode::ReviewArtifactConflict);
-            assert!(error.message.contains("symlink"));
+            assert!(error.message.contains("символическ"));
             assert_eq!(fs::read(&target).unwrap(), b"protected bytes");
             fs::remove_file(output).unwrap();
         }
@@ -4226,7 +4226,7 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
-        assert!(error.message.contains("symlink"));
+        assert!(error.message.contains("символическ"));
         assert_eq!(
             fs::read(protected.join("semantic-triage.json")).unwrap(),
             b"protected bytes"
@@ -4288,7 +4288,7 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ReviewArtifactConflict);
-        assert!(error.message.contains("symlink"));
+        assert!(error.message.contains("символическ"));
         assert!(!output.exists());
         assert_eq!(fs::read(protected).unwrap(), bytes);
     }

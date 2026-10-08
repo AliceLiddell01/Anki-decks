@@ -127,7 +127,7 @@ fn code_review_namespace_does_not_replace_card_review_commands() {
     assert_eq!(code, 0, "{stderr}");
     assert!(help.contains(".anki-repo/review/"), "{help}");
     assert!(help.contains("--pr-number"), "{help}");
-    assert!(help.contains("namespace"), "{help}");
+    assert!(help.contains("пространство"), "{help}");
     assert!(help.contains("наслед"), "{help}");
 
     for (args, expected) in [
