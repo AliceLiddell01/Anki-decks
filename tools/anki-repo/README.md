@@ -2396,7 +2396,7 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `unknown_field` | 3 | Указанного поля нет ни в одной модели экспорта; для `edit` — также если поля нет в модели целевой заметки |
 | `unknown_deck` | 3 | Указанная колода не найдена |
 | `unknown_qa_code` | 3 | Указанного кода QA нет в реестре правил (`qa --code`, `review --qa-code`) |
-| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id`, чужая `schema_version`, пустой `guid` (`empty_guid`) или пустое имя поля (`empty_field`); `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large`, `duplicate_proposal_id`, `empty_guid` или `empty_field`; `code-review`/`language`: некорректный путь артефакта, включая путь внутри `decks/**` или служебных каталогов Git |
+| `invalid_request` | 3 | `edit`: пустой, слишком большой или структурно некорректный документ запроса, повторяющийся `edit_id`, чужая `schema_version`, пустой `guid` (`empty_guid`) или пустое имя поля (`empty_field`); `review-check`: те же проблемы документа предложений — `details.reason` равен `malformed_proposals`, `unsupported_schema_version`, `empty_proposals`, `too_many_proposals`, `proposals_too_large`, `duplicate_proposal_id`, `empty_guid` или `empty_field`; `code-review queue list`: недопустимая метка `--detector`; `code-review`/`language`: некорректный путь артефакта, включая путь внутри `decks/**` или служебных каталогов Git |
 | `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды (отдельный код, а не `details.reason` внутри `invalid_request`) |
 | `proposal_not_executable` (`details.reason`) | — | Не отдельный код: `review-check` сообщает о неисполнимом предложении статусом `invalid` внутри отчёта, а не ошибкой команды |
 | `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме; `review-check`: тот же блокер в `source_blockers`, запрос не выпущен |
@@ -2408,8 +2408,8 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `write_failed` | 8 | `edit`: не удалось записать кандидат или заменить `deck.json`; также сбой сохранения артефакта ревью кода или публикации языковых замен |
 | `invalid_git_ref` | 3 | `code-review collect`/`verify`: ссылка Git не разрешается в коммит |
 | `git_evidence_failed` | 3 | `code-review`: у коммитов нет общего предка, область изменений Git недоступна или машинный ответ Git некорректен |
-| `review_artifact_invalid` | 3 | `code-review`/`language`: JSON, версия схемы либо лимит размера артефакта не прошли проверку |
-| `baseline_mismatch` | 3 | `verify`/`delta`: идентичность диапазона, base SHA или merge-base отличаются от исходного пакета |
+| `review_artifact_invalid` | 3 | `code-review`/`language`: JSON, версия схемы либо лимит размера артефакта не прошли проверку; `code-review queue validate`/`summary`/`list`/`group`/`candidate`: структура очереди недействительна либо указанный в очереди SHA-256 исходного пакета не совпадает с хэшем точных байтов `review.json` |
+| `baseline_mismatch` | 3 | `verify`/`delta`: идентичность диапазона, base SHA или merge-base отличаются от исходного пакета; `code-review queue validate`/`summary`/`list`/`group`/`candidate`: Git-снимок очереди не совпадает со снимком исходного `review.json` |
 | `language_decision_invalid` | 3 | `language apply`: решение, якорь или ограничение замены не прошли предварительную проверку |
 | `not_found` | 4 | `find` и `review --guid`: нет совпадений по заданному критерию; `code-review queue group` / `candidate`: указанный unit или candidate ID отсутствует |
 | `note_not_found` | 4 | `edit`: в экспорте нет заметки с указанным `guid`; в отчёте `review-check` — код проблемы предложения (доменной ошибкой не является) |

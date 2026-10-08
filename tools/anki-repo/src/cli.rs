@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::code_review::review_queue::{
-    CodeRole, QueueExecutionFilter, QueueSurfaceFilter, ReviewPriority, StructuralRole, TextRole,
+    CodeRole, DEFAULT_QUEUE_LIST_LIMIT, MAX_QUEUE_LIST_LIMIT, QueueExecutionFilter,
+    QueueSurfaceFilter, ReviewPriority, StructuralRole, TextRole,
 };
 
 /// Предел результата `find` по умолчанию.
@@ -603,8 +604,8 @@ pub enum ReviewQueueCommand {
         /// Число элементов на странице (от 1 до 200).
         #[arg(
             long,
-            default_value_t = 50,
-            value_parser = clap::value_parser!(u64).range(1..=200),
+            default_value_t = DEFAULT_QUEUE_LIST_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_QUEUE_LIST_LIMIT),
         )]
         limit: u64,
         /// Смещение от начала отсортированной очереди.

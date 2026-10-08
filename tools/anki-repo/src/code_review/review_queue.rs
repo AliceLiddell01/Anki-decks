@@ -17,6 +17,10 @@ use super::semantic_triage::{self, TriageSource};
 
 /// Версия самостоятельного контракта структурной очереди.
 pub const QUEUE_SCHEMA_VERSION: u32 = 1;
+/// Размер страницы `queue list` по умолчанию.
+pub const DEFAULT_QUEUE_LIST_LIMIT: u64 = 50;
+/// Максимальный размер страницы `queue list`.
+pub const MAX_QUEUE_LIST_LIMIT: u64 = 200;
 /// Представители ограничены тремя разными местами; остальные идентификаторы раскрываются отдельно.
 pub const REPRESENTATIVE_LIMIT: usize = 3;
 
@@ -921,12 +925,9 @@ fn matches_list_filters(unit: &ReviewUnit, filters: &QueueListFilters) -> bool {
         && filters
             .role
             .is_none_or(|role| classification.role.as_str() == role.as_str())
-        && filters.text_role.is_none_or(|role| {
-            classification
-                .text_role
-                .map_or(TextRole::Unknown.as_str(), TextRole::as_str)
-                == role.as_str()
-        })
+        && filters
+            .text_role
+            .is_none_or(|role| classification.text_role == Some(role))
         && filters
             .code_role
             .is_none_or(|role| classification.code_role.as_str() == role.as_str())
@@ -1795,12 +1796,7 @@ mod tests {
                 text_role: Some(TextRole::Unknown),
                 ..QueueListFilters::default()
             }),
-            BTreeSet::from([
-                group_id.clone(),
-                unknown_id,
-                config_id,
-                ids_for_candidate("high-security"),
-            ])
+            BTreeSet::new()
         );
         assert_eq!(
             get_ids(QueueListFilters {
@@ -1809,6 +1805,36 @@ mod tests {
             }),
             BTreeSet::from([group_id])
         );
+    }
+
+    #[test]
+    fn text_role_unknown_filter_excludes_missing_roles() {
+        let pack = pack(vec![
+            candidate("non-text", "src/lib.rs", 1),
+            text_candidate(
+                "unknown-text",
+                "Failed to read configuration file",
+                TextContext::StringLiteral,
+            ),
+        ]);
+        let queue = build(&pack, DIGEST, &contexts(&pack)).unwrap();
+        assert_eq!(queue.classifications["non-text"].text_role, None);
+        assert_eq!(
+            queue.classifications["unknown-text"].text_role,
+            Some(TextRole::Unknown)
+        );
+
+        let page = list_units(
+            &queue,
+            &QueueListFilters {
+                text_role: Some(TextRole::Unknown),
+                ..QueueListFilters::default()
+            },
+            0,
+            20,
+        );
+        assert_eq!(page.matched_units, 1);
+        assert_eq!(page.units[0].candidate_id.as_deref(), Some("unknown-text"));
     }
 
     #[test]

@@ -266,7 +266,7 @@ pub fn list_review_queue(
     options: &ReviewQueueListOptions,
 ) -> Result<QueueListPage, DomainError> {
     let (_, queue, _) = load_validated_review_queue(pack_path, queue_path)?;
-    if !(1..=200).contains(&options.limit) {
+    if !(1..=review_queue::MAX_QUEUE_LIST_LIMIT).contains(&options.limit) {
         return Err(invalid_queue_list_filter(
             "limit",
             &options.limit.to_string(),
