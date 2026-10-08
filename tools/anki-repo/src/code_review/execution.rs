@@ -1,6 +1,6 @@
 //! Явное исполнение проверок в отдельной рабочей копии точного Git-снимка.
 //!
-//! Это изоляция ресурсов сотрудничающих исполнителей, а не security sandbox:
+//! Изоляция ресурсов сотрудничающих исполнителей не ограничивает права кода:
 //! произвольный код имеет права пользователя, доступ к сети и может покинуть
 //! собственную процессную группу. Такие ограничения входят в результат.
 
@@ -55,9 +55,9 @@ pub struct ExecutionSource {
 pub struct PrepareOptions {
     pub mode: ExecutionMode,
     pub scope: String,
-    /// Канонический исходный review.json; относительный путь считается от root.
+    /// Канонический исходный review.json; относительный путь считается от корня репозитория.
     pub source_pack: PathBuf,
-    /// Необязательное утверждение номера PR; namespace наследуется из source_pack.
+    /// Необязательное утверждение номера PR; пространство имён наследуется из source_pack.
     pub pr_number: Option<String>,
 }
 
@@ -65,10 +65,10 @@ pub struct PrepareOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnvironmentPolicy {
-    /// PATH и местоположение rustup; секреты, Git overrides и Cargo flags не наследуются.
+    /// PATH и местоположение rustup; секреты и настройки Git/Cargo не наследуются.
     #[default]
     Minimal,
-    /// Явно переданные значения; job-private переменные остаются обязательными.
+    /// Явно переданные значения; переменные собственных путей задания остаются обязательными.
     Explicit {
         #[serde(serialize_with = "serialize_redacted_environment")]
         values: BTreeMap<String, String>,
@@ -81,7 +81,7 @@ pub struct RunOptions {
     pub timeout_ms: Option<u64>,
     pub output_limit_bytes: usize,
     pub environment: EnvironmentPolicy,
-    /// Верхняя граница конкурентных job в данном репозитории, 1..=64.
+    /// Общий предел активных заданий в данном репозитории, 1..=64.
     pub max_parallel_jobs: usize,
 }
 impl Default for RunOptions {
@@ -98,10 +98,10 @@ impl Default for RunOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandRequest {
-    /// Уже разобранные argv; shell не добавляется. Shell возможен только как явный argv[0].
+    /// Уже разобранные argv; оболочка возможна только как явный argv[0].
     #[serde(serialize_with = "serialize_safe_argv")]
     pub argv: Vec<String>,
-    /// Переносимый путь от корня job worktree; "." означает сам worktree.
+    /// Относительный путь от корня worktree задания; "." означает сам worktree.
     pub cwd: String,
     pub options: RunOptions,
 }
@@ -142,7 +142,7 @@ pub struct OutputEvidence {
     pub total_bytes: u64,
     pub truncated: bool,
     pub utf8_lossy: bool,
-    /// Относительно job directory, полное содержимое хранится только здесь.
+    /// Относительно каталога задания; полное содержимое хранится только здесь.
     pub log: String,
 }
 
@@ -162,8 +162,8 @@ impl Default for Enforcement {
             process_cleanup: "not_started".into(),
             limitations: vec![
                 "Код исполняется с правами пользователя; файловая система и сеть не ограничены security sandbox.".into(),
-                "Изоляция source обеспечена отдельным detached worktree; запрещённые записи вне job не блокируются ОС.".into(),
-                "Git objects и metadata общие; проверяемому коду не запрещён прямой доступ к ним.".into(),
+                "Изоляция исходников обеспечена отдельным worktree с detached HEAD; записи вне задания не блокируются ОС.".into(),
+                "Объекты и метаданные Git общие; проверяемому коду не запрещён прямой доступ к ним.".into(),
                 "Потомки могут уйти из процессной группы; их завершение не гарантируется.".into(),
                 "Полные логи хранятся на диске без лимита и без маскирования секретов; распознанные значения маскируются только в ограниченном выводе внутри JSON.".into(),
             ],
@@ -181,7 +181,7 @@ pub struct ExecutionResult {
     pub scope: String,
     pub namespace: String,
     pub request: CommandRequest,
-    /// Digest фактического argv до безопасного представления в JSON result.
+    /// Хеш фактического argv до безопасного представления в JSON результата.
     pub argv_sha256: String,
     pub lifecycle: LifecycleStatus,
     pub status: ExecutionStatus,
@@ -203,7 +203,7 @@ pub struct JobMetadata {
     pub mode: ExecutionMode,
     pub scope: String,
     pub namespace: String,
-    /// Случайный nonce подтверждает владение directory; он не является секретом.
+    /// Случайный nonce подтверждает владение каталогом; он не является секретом.
     pub owner_nonce: String,
 }
 
@@ -226,7 +226,7 @@ pub struct CleanupResult {
     pub limitation: Option<String>,
 }
 
-/// Handle нельзя конструировать с произвольным путем; open_job проверяет identity.
+/// Объект нельзя конструировать с произвольным путём; open_job проверяет идентичность.
 #[derive(Debug, Clone)]
 pub struct PreparedJob {
     root: PathBuf,
@@ -253,7 +253,7 @@ struct State {
     workspace_removed: bool,
 }
 
-/// Проверяет identity исходного evidence до любых операций с runtime-каталогами.
+/// Проверяет идентичность исходных свидетельств до любых операций с временными каталогами.
 fn source_pack_namespace(
     root: &Path,
     pack: &ReviewPack,
@@ -371,7 +371,7 @@ fn source_pack_namespace(
     Ok(namespace.to_owned())
 }
 
-/// Создаёт unique job и точный detached worktree; код проекта не запускается.
+/// Создаёт уникальное задание и точный worktree с detached HEAD; код проекта не запускается.
 pub fn prepare_job(
     root: &Path,
     pack: &ReviewPack,
@@ -398,7 +398,7 @@ pub fn prepare_job(
     ] {
         validate_sha(sha)?;
     }
-    let root = root.canonicalize().map_err(io_error)?;
+    let root = root.canonicalize().map_err(read_error)?;
     safe_dir(&root)?;
     let namespace = source_pack_namespace(&root, pack, bytes, &options)?;
     verify_snapshot(&root, &pack.target)?;
@@ -494,8 +494,16 @@ pub fn prepare_job(
 /// Открытие существующего job не исполняет код и не возобновляет незавершённый запуск.
 pub fn open_job(root: &Path, directory: &Path) -> Result<PreparedJob, DomainError> {
     platform_supported()?;
-    let root = root.canonicalize().map_err(io_error)?;
+    let root = root.canonicalize().map_err(read_error)?;
     let directory = absolute_path(directory)?;
+    if fs::symlink_metadata(&directory)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(DomainError::new(
+            ErrorCode::NotFound,
+            "Каталог execution job не найден",
+        ));
+    }
     safe_dir(&directory)?;
     let metadata: JobMetadata = read_document(&directory, "job.json")?;
     let expected = root
@@ -544,7 +552,7 @@ pub fn open_job(root: &Path, directory: &Path) -> Result<PreparedJob, DomainErro
     Ok(job)
 }
 
-/// Исполняет один explicit argv; повторный запуск того же job запрещён.
+/// Исполняет один явно переданный argv; повторный запуск задания запрещён.
 pub fn run_job(
     job: &PreparedJob,
     request: &CommandRequest,
@@ -567,7 +575,6 @@ pub fn run_job(
             "isolated checks требует неизменённого pinned source; создайте новый job или disposable experiment",
         ));
     }
-    save_state(job, LifecycleStatus::Running, false)?;
     let stdout = open_file(&safe_dir(&job.directory.join("logs"))?, "stdout.log", true)?;
     let stderr = open_file(&safe_dir(&job.directory.join("logs"))?, "stderr.log", true)?;
     let mut command = Command::new(&request.argv[0]);
@@ -583,11 +590,13 @@ pub fn run_job(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    let cancelled = cancel.load(Ordering::SeqCst) || cancel_requested(job)?;
+    // До этой записи ошибки доказуемо предшествуют запуску процесса.
+    save_state(job, LifecycleStatus::Running, false)?;
     let start = Instant::now();
     let mut enforcement = Enforcement::default();
     let mut failure = None;
     let mut exit = None;
-    let cancelled = cancel.load(Ordering::SeqCst) || cancel_requested(job)?;
     let status = if cancelled {
         ExecutionStatus::Cancelled
     } else {
@@ -598,8 +607,8 @@ pub fn run_job(
             }
             Ok(mut child) => {
                 let mut status = ExecutionStatus::Incomplete;
-                // PID остаётся живым до kill группы: это защищает от повторного
-                // назначения идентификатора, пока выполняется остановка owned группы.
+                // PID остаётся живым до остановки группы: это защищает от повторного
+                // назначения идентификатора, пока выполняется остановка собственной группы.
                 loop {
                     if cancel.load(Ordering::SeqCst) || cancel_requested(job).unwrap_or(true) {
                         status = ExecutionStatus::Cancelled;
@@ -624,13 +633,15 @@ pub fn run_job(
                             };
                             #[cfg(target_os = "linux")]
                             {
-                                // waitid(NOWAIT) оставляет leader waitable: его PID
-                                // нельзя повторно назначить до kill owned группы.
+                                // waitid(NOWAIT) сохраняет ведущий процесс до получения его статуса: PID
+                                // нельзя повторно назначить до остановки собственной группы.
                                 stop_child(&mut child, &mut enforcement, &mut failure);
                                 match child.wait() {
                                     Ok(waited) => exit = Some(exit_summary(waited)),
                                     Err(error) => {
-                                        failure = Some(format!("reap после завершения: {error}"));
+                                        failure = Some(format!(
+                                            "не удалось получить статус завершения процесса: {error}"
+                                        ));
                                         status = ExecutionStatus::Incomplete;
                                     }
                                 }
@@ -658,7 +669,8 @@ pub fn run_job(
                     match child.wait() {
                         Ok(observed) => exit = Some(exit_summary(observed)),
                         Err(error) => {
-                            failure = Some(format!("не удалось reap процесс: {error}"));
+                            failure =
+                                Some(format!("не удалось дождаться завершения процесса: {error}"));
                             status = ExecutionStatus::Incomplete;
                         }
                     }
@@ -670,7 +682,7 @@ pub fn run_job(
     let status = if job.metadata.mode == ExecutionMode::IsolatedChecks
         && source_changed(job).unwrap_or(true)
     {
-        failure = Some("Проверка изменила source собственного worktree; isolated check не может считаться воспроизводимо завершённой.".into());
+        failure = Some("Проверка изменила исходники собственного worktree; изолированную проверку нельзя считать воспроизводимо завершённой.".into());
         if matches!(status, ExecutionStatus::Passed | ExecutionStatus::Failed) {
             ExecutionStatus::Incomplete
         } else {
@@ -705,17 +717,22 @@ pub fn run_job(
             &sensitive_values,
         )?,
         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-        enforcement,
         failure,
-        cleanup: "evidence_and_workspace_retained; descendants_may_still_exist".into(),
+        cleanup: if enforcement.process_cleanup == "not_started" {
+            "evidence_retained; workspace_cleanup_allowed"
+        } else {
+            "evidence_and_workspace_retained; descendant_confirmation_required"
+        }
+        .into(),
+        enforcement,
     };
     write_document(&job.directory, "result.json", &result, false)?;
     save_state(job, LifecycleStatus::Completed, false)?;
-    fs2::FileExt::unlock(&active_lock).map_err(io_error)?;
+    fs2::FileExt::unlock(&active_lock).map_err(process_error)?;
     Ok(result)
 }
 
-/// Cancel marker создаётся атомарно, независимо от удерживаемого active lock.
+/// Маркер отмены создаётся атомарно, независимо от блокировки активного задания.
 pub fn request_cancel(directory: &Path) -> Result<JobInspection, DomainError> {
     let inspection = inspect_job(directory)?;
     if inspection.lifecycle == LifecycleStatus::Prepared
@@ -725,15 +742,23 @@ pub fn request_cancel(directory: &Path) -> Result<JobInspection, DomainError> {
         match write_new_fd(&dir, "cancel.json", inspection.job.owner_nonce.as_bytes()) {
             Ok(()) => (),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(io_error(error)),
+            Err(error) => return Err(write_error(error)),
         }
     }
     inspect_job(directory)
 }
 
-/// Read-only observation: Running без живого lock означает Interrupted, а не success.
+/// Наблюдение без записи: Running без активной блокировки означает Interrupted.
 pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
     let directory = absolute_path(directory)?;
+    if fs::symlink_metadata(&directory)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(DomainError::new(
+            ErrorCode::NotFound,
+            "Каталог execution job не найден",
+        ));
+    }
     let root = directory
         .ancestors()
         .nth(6)
@@ -748,7 +773,11 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
     let mut limitations = Vec::new();
     if lifecycle == LifecycleStatus::Running && !lock_is_active(&directory)? {
         lifecycle = LifecycleStatus::Interrupted;
-        limitations.push("Исполнитель не удерживает lock; потомки и полнота evidence не проверены, автоматическая очистка запрещена.".into());
+        limitations.push(if state.workspace_removed {
+            "Исполнитель не удерживает lock; исполнение прервано. Ресурсы удалены по подтверждению оператора, отсутствие потомков инструментом не доказано."
+        } else {
+            "Исполнитель не удерживает lock; потомки и полнота evidence не проверены, автоматическая очистка запрещена."
+        }.into());
     }
     let result = match read_document::<ExecutionResult>(&directory, "result.json") {
         Ok(result) => {
@@ -767,7 +796,9 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
         Err(error) => return Err(error),
     };
     if lifecycle == LifecycleStatus::Completed && result.is_none() {
-        return Err(invalid("completed job не имеет typed result"));
+        return Err(invalid(
+            "Завершённое задание не имеет типизированного результата",
+        ));
     }
     Ok(JobInspection {
         job: metadata,
@@ -778,7 +809,7 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
     })
 }
 
-/// Читает только завершённый result; не исполняет повторно и не меняет artifacts.
+/// Читает только завершённый результат; не исполняет повторно и не меняет артефакты.
 pub fn read_result(directory: &Path) -> Result<ExecutionResult, DomainError> {
     let inspection = inspect_job(directory)?;
     if inspection.lifecycle != LifecycleStatus::Completed {
@@ -789,84 +820,317 @@ pub fn read_result(directory: &Path) -> Result<ExecutionResult, DomainError> {
         .ok_or_else(|| invalid("отсутствует result.json"))
 }
 
-/// По умолчанию evidence и непроверенные процессы сохраняются.
-/// Удаление runtime разрешено только для job, у которого процесс вообще не запускался.
-/// Для executed job отсутствие escaped descendants невозможно доказать этими safe APIs.
+/// Подтверждение оператора не доказывает технически отсутствие потомков.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CleanupOptions {
+    pub confirm_no_live_descendants: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupAttestation {
+    schema_version: u32,
+    owner_nonce: String,
+    limitation: String,
+}
+
+const CLEANUP_ATTESTATION: &str = "cleanup-attestation.json";
+const OPERATOR_CLEANUP_LIMITATION: &str = "Ресурсы удалены по явному подтверждению оператора об отсутствии живых потомков. Инструмент не доказывает отсутствие процессов, покинувших группу; оператор отвечает за их предварительную остановку.";
+
+/// По умолчанию ресурсы после возможного запуска процесса сохраняются.
 pub fn cleanup_workspace(job: &PreparedJob) -> Result<CleanupResult, DomainError> {
-    let _lock = job_lock(&job.directory)?;
-    let state = verify_owner(job)?;
+    cleanup_workspace_with_options(job, &CleanupOptions::default())
+}
+
+/// Сохраняет результаты и свидетельства при удалении принадлежащих job ресурсов.
+pub fn cleanup_workspace_with_options(
+    job: &PreparedJob,
+    options: &CleanupOptions,
+) -> Result<CleanupResult, DomainError> {
+    let directory = safe_dir(&job.directory)?;
+    let _lock = job_lock_at(&directory)?;
+    let state = verify_owner_at(job, &directory)?;
+    let not_started = match state.lifecycle {
+        LifecycleStatus::Prepared | LifecycleStatus::PreparationFailed => true,
+        LifecycleStatus::Completed => {
+            let result: ExecutionResult = read_document_at(&directory, "result.json")?;
+            validate_result(&job.metadata, &result)?;
+            result.exit.is_none() && result.enforcement.process_cleanup == "not_started"
+        }
+        // Блокировка прежнего исполнителя отсутствует, но потомки могли сохраниться.
+        LifecycleStatus::Running | LifecycleStatus::Interrupted => false,
+    };
     if state.workspace_removed {
+        let limitation = read_cleanup_attestation(job, &directory)?;
+        if !not_started && limitation.is_none() {
+            return Err(conflict(
+                "После операторской очистки отсутствует принадлежащее заданию подтверждение",
+            ));
+        }
         return Ok(CleanupResult {
             job_id: job.metadata.job_id.clone(),
             workspace_removed: true,
             evidence_retained: true,
-            limitation: None,
+            limitation,
         });
     }
-    let not_started = matches!(
-        state.lifecycle,
-        LifecycleStatus::Prepared | LifecycleStatus::PreparationFailed
-    );
-    if !not_started && state.lifecycle != LifecycleStatus::Completed {
-        return Err(conflict("очистка active или interrupted job запрещена"));
+    if !not_started && !options.confirm_no_live_descendants {
+        if matches!(
+            state.lifecycle,
+            LifecycleStatus::Running | LifecycleStatus::Interrupted
+        ) {
+            return Err(conflict(
+                "Очистка прерванного job запрещена без проверки потомков. Остановите всех его потомков, затем явно передайте --confirm-no-live-descendants; это подтверждение оператора, а не гарантия инструмента.",
+            ));
+        }
+        return Ok(CleanupResult {
+            job_id: job.metadata.job_id.clone(),
+            workspace_removed: false,
+            evidence_retained: true,
+            limitation: Some("Workspace сохранён: отсутствие потомков, покинувших группу, не доказано. Остановите всех потомков и явно передайте cleanup --confirm-no-live-descendants; подтверждение оператора не является технической гарантией.".into()),
+        });
     }
-    if !not_started {
-        let result = read_result(&job.directory)?;
-        if result.exit.is_some() || result.enforcement.process_cleanup != "not_started" {
-            return Ok(CleanupResult { job_id: job.metadata.job_id.clone(), workspace_removed: false, evidence_retained: true,
-                limitation: Some("Workspace сохранён: невозможно доказать отсутствие потомков, покинувших группу. Завершение direct child не является разрешением удалить их ресурсы.".into()) });
+    // Проверяем все поверхности до первой записи или удаления.
+    let surfaces = cleanup_preflight(job, &directory)?;
+    let worktree_exists = surfaces.iter().any(|(name, _)| name == "worktree");
+    let owned_path = cleanup_descriptor_path(&directory)?;
+    if worktree_exists && state.lifecycle == LifecycleStatus::Prepared {
+        let mut command = Command::new("git");
+        command
+            .current_dir(owned_path.join("worktree"))
+            .args(["rev-parse", "HEAD"]);
+        let output = command.output().map_err(process_error)?;
+        if !output.status.success() {
+            return Err(DomainError::new(
+                ErrorCode::ProcessOperationFailed,
+                "Git не смог проверить HEAD перед очисткой",
+            ));
+        }
+        if String::from_utf8_lossy(&output.stdout).trim() != job.metadata.source.snapshot.head_sha {
+            return Err(conflict("HEAD собственного worktree изменён до запуска"));
         }
     }
-    match fs::symlink_metadata(job.worktree()) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(conflict("owned worktree заменён symlink или не-каталогом"));
-        }
-        Ok(_) => {
-            if state.lifecycle == LifecycleStatus::Prepared {
-                verify_worktree_head(job)?;
-            }
-            safe_dir(&job.worktree())?;
-            let mut command = trusted_git(&job.root, &job.directory.join("hooks"))?;
-            command
-                .args(["worktree", "remove", "--force"])
-                .arg(job.worktree());
-            if let Err(error) = git_success(command, "очистка owned worktree") {
-                return Ok(CleanupResult {
-                    job_id: job.metadata.job_id.clone(),
-                    workspace_removed: false,
-                    evidence_retained: true,
-                    limitation: Some(error.message),
-                });
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        Err(error) => return Err(io_error(error)),
+    let limitation = (!not_started).then(|| OPERATOR_CLEANUP_LIMITATION.to_owned());
+    if !not_started && read_cleanup_attestation(job, &directory)?.is_none() {
+        write_document_at(
+            &directory,
+            CLEANUP_ATTESTATION,
+            &CleanupAttestation {
+                schema_version: EXECUTION_SCHEMA_VERSION,
+                owner_nonce: job.metadata.owner_nonce.clone(),
+                limitation: OPERATOR_CLEANUP_LIMITATION.into(),
+            },
+            false,
+        )?;
     }
-    // Не удаляем job directory, логи, result и marker. Runtime без процессов
-    // может быть удалён только после проверки каждого exact surface.
-    for name in SURFACES.iter().filter(|name| **name != "logs") {
-        let path = job.directory.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(conflict(
-                    "owned runtime surface заменена symlink или не-каталогом",
-                ));
-            }
-            Ok(_) => {
-                safe_dir(&path)?;
-                fs::remove_dir_all(&path).map_err(io_error)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(io_error(error)),
-        }
+    if worktree_exists && let Err(error) = remove_cleanup_worktree(job, &directory, &surfaces) {
+        return Ok(CleanupResult {
+            job_id: job.metadata.job_id.clone(),
+            workspace_removed: false,
+            evidence_retained: true,
+            limitation: Some(match limitation {
+                Some(limit) => {
+                    format!("{limit} Удаление worktree не завершено: {}", error.message)
+                }
+                None => error.message,
+            }),
+        });
     }
-    save_state(job, state.lifecycle, true)?;
+    for (name, _) in &surfaces {
+        if matches!(name.as_str(), "worktree" | "logs" | "outputs") {
+            continue;
+        }
+        remove_cleanup_runtime(&directory, name, &surfaces)?;
+    }
+    write_document_at(
+        &directory,
+        "state.json",
+        &State {
+            owner_nonce: job.metadata.owner_nonce.clone(),
+            lifecycle: state.lifecycle,
+            workspace_removed: true,
+        },
+        true,
+    )?;
     Ok(CleanupResult {
         job_id: job.metadata.job_id.clone(),
         workspace_removed: true,
         evidence_retained: true,
-        limitation: None,
+        limitation,
     })
+}
+
+fn read_cleanup_attestation(
+    job: &PreparedJob,
+    directory: &File,
+) -> Result<Option<String>, DomainError> {
+    let Some(bytes) = read_optional_file_at(directory, CLEANUP_ATTESTATION, MAX_DOCUMENT_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let attestation: CleanupAttestation = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("Повреждено подтверждение очистки: {error}")))?;
+    if attestation.schema_version != EXECUTION_SCHEMA_VERSION
+        || attestation.owner_nonce != job.metadata.owner_nonce
+        || attestation.limitation != OPERATOR_CLEANUP_LIMITATION
+    {
+        return Err(conflict(
+            "Подтверждение очистки не принадлежит этому job или изменено",
+        ));
+    }
+    Ok(Some(attestation.limitation))
+}
+
+fn cleanup_preflight(
+    job: &PreparedJob,
+    directory: &File,
+) -> Result<Vec<(String, File)>, DomainError> {
+    let owned_path = cleanup_descriptor_path(directory)?;
+    for entry in fs::read_dir(&owned_path).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(conflict(
+                "Каталог job содержит неизвестное имя; ресурсы сохранены",
+            ));
+        };
+        if SURFACES.contains(&name) || name == "worktree" {
+            continue;
+        }
+        if !matches!(
+            name,
+            "job.json"
+                | "state.json"
+                | "source-review.json"
+                | "result.json"
+                | "active.lock"
+                | "cancel.json"
+                | CLEANUP_ATTESTATION
+        ) || !entry.file_type().map_err(read_error)?.is_file()
+        {
+            return Err(conflict(
+                "Каталог job содержит неизвестный файл или symlink; ресурсы сохранены",
+            ));
+        }
+        drop(open_file(directory, name, false)?);
+    }
+    read_cleanup_attestation(job, directory)?;
+    let mut surfaces = Vec::new();
+    for name in std::iter::once("worktree").chain(SURFACES.iter().copied()) {
+        if let Some(surface) = open_cleanup_surface(directory, name)? {
+            surfaces.push((name.to_owned(), surface));
+        }
+    }
+    Ok(surfaces)
+}
+
+fn verify_cleanup_surface_identity(
+    directory: &File,
+    name: &str,
+    surfaces: &[(String, File)],
+) -> Result<(), DomainError> {
+    let original = surfaces
+        .iter()
+        .find(|(surface, _)| surface == name)
+        .ok_or_else(|| conflict("Поверхность отсутствует в проверенном плане очистки"))?;
+    let current = open_cleanup_surface(directory, name)?
+        .ok_or_else(|| conflict("Поверхность исчезла после проверки очистки"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let before = original.1.metadata().map_err(read_error)?;
+        let after = current.metadata().map_err(read_error)?;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(conflict(
+                "Поверхность job подменена после проверки; очистка остановлена",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_cleanup_worktree(
+    job: &PreparedJob,
+    directory: &File,
+    surfaces: &[(String, File)],
+) -> Result<(), DomainError> {
+    verify_cleanup_surface_identity(directory, "worktree", surfaces)?;
+    let source = surfaces
+        .iter()
+        .find(|(name, _)| name == "worktree")
+        .ok_or_else(|| conflict("Нет закреплённого worktree для очистки"))?;
+    let path = cleanup_descriptor_path(&source.1)?;
+    let hooks = cleanup_descriptor_path(directory)?.join("hooks");
+    let mut command = trusted_git(&job.root, &hooks)?;
+    command.args(["worktree", "remove", "--force"]).arg(path);
+    git_success(command, "очистка собственного worktree")
+}
+fn remove_cleanup_runtime(
+    directory: &File,
+    name: &str,
+    surfaces: &[(String, File)],
+) -> Result<(), DomainError> {
+    verify_cleanup_surface_identity(directory, name, surfaces)?;
+    // На Linux std удаляет относительно открытых каталогов и не проходит
+    // по symlink. Закреплён и родитель: его исходный путь может быть заменён.
+    fs::remove_dir_all(cleanup_descriptor_path(directory)?.join(name)).map_err(write_error)
+}
+
+fn cleanup_descriptor_path(directory: &File) -> Result<PathBuf, DomainError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        // PID относится к исполнителю: дочерний Git может читать descriptor
+        // родителя, хотя его собственные descriptors закрываются при exec.
+        let path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            directory.as_raw_fd()
+        ));
+        let direct = directory.metadata().map_err(read_error)?;
+        let anchored = fs::metadata(&path).map_err(read_error)?;
+        if direct.dev() != anchored.dev() || direct.ino() != anchored.ino() {
+            return Err(conflict(
+                "Закреплённый каталог /proc не соответствует descriptor",
+            ));
+        }
+        Ok(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        Err(invalid(
+            "Безопасная очистка ресурсов требует Linux и доступного /proc; исходные пути не используются как fallback",
+        ))
+    }
+}
+#[cfg(unix)]
+fn open_cleanup_surface(directory: &File, name: &str) -> Result<Option<File>, DomainError> {
+    use rustix::fs::{Mode, OFlags, openat};
+    match openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => Err(conflict(
+            "Принадлежащая job поверхность заменена symlink или не-каталогом; ресурсы сохранены",
+        )),
+        Err(error) => Err(read_error(error.into())),
+    }
+}
+#[cfg(not(unix))]
+fn open_cleanup_surface(_directory: &File, _name: &str) -> Result<Option<File>, DomainError> {
+    platform_supported()?;
+    unreachable!()
+}
+#[cfg(not(unix))]
+fn job_lock_at(_directory: &File) -> Result<File, DomainError> {
+    platform_supported()?;
+    unreachable!()
 }
 
 fn validate_result(metadata: &JobMetadata, result: &ExecutionResult) -> Result<(), DomainError> {
@@ -881,7 +1145,7 @@ fn validate_result(metadata: &JobMetadata, result: &ExecutionResult) -> Result<(
         || result.stderr.log != "logs/stderr.log"
     {
         return Err(invalid(
-            "result identity или portable log paths не соответствуют job",
+            "Идентичность результата или относительные пути логов не соответствуют заданию",
         ));
     }
     validate_request(&result.request)?;
@@ -1075,7 +1339,9 @@ fn validate_request(request: &CommandRequest) -> Result<(), DomainError> {
         || request.argv.iter().any(|arg| arg.contains('\0'))
         || argument_bytes > MAX_REQUEST_ARGUMENT_BYTES
     {
-        return Err(invalid("нужен ограниченный explicit argv без NUL"));
+        return Err(invalid(
+            "Нужен явно переданный argv ограниченного размера без NUL",
+        ));
     }
     if request.options.output_limit_bytes > MAX_OUTPUT_BYTES
         || !(1..=64).contains(&request.options.max_parallel_jobs)
@@ -1084,7 +1350,9 @@ fn validate_request(request: &CommandRequest) -> Result<(), DomainError> {
             .timeout_ms
             .is_none_or(|timeout| timeout == 0)
     {
-        return Err(invalid("неверный output limit, timeout или parallel limit"));
+        return Err(invalid(
+            "Неверный предел вывода, время выполнения или предел параллелизма",
+        ));
     }
     relative_path(&request.cwd)?;
     if let EnvironmentPolicy::Explicit { values } = &request.options.environment {
@@ -1127,7 +1395,7 @@ fn configure_environment(
             command.env(name, value);
         }
     }
-    // rustup proxies должны найти установленный toolchain, даже при private HOME.
+    // Прокси rustup должны найти установленный набор инструментов даже с отдельным HOME.
     if std::env::var_os("RUSTUP_HOME").is_none()
         && let Some(home) = std::env::var_os("HOME")
     {
@@ -1215,7 +1483,9 @@ fn validate_sha(value: &str) -> Result<(), DomainError> {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
-        return Err(invalid("нужен полный Git SHA в lowercase hex"));
+        return Err(invalid(
+            "Нужен полный Git SHA в шестнадцатеричной форме со строчными буквами",
+        ));
     }
     Ok(())
 }
@@ -1232,7 +1502,7 @@ fn unique_directory(parent: &Path) -> Result<(PathBuf, String), DomainError> {
         match mkdir_fd(&dir, &id) {
             Ok(()) => return Ok((parent.join(&id), id)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(io_error(error)),
+            Err(error) => return Err(write_error(error)),
         }
     }
     Err(conflict("не удалось зарезервировать unique job directory"))
@@ -1241,7 +1511,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, DomainError> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().map_err(io_error)?.join(path)
+        std::env::current_dir().map_err(read_error)?.join(path)
     };
     if path
         .components()
@@ -1268,10 +1538,17 @@ fn verify_worktree_head(job: &PreparedJob) -> Result<(), DomainError> {
         .current_dir(job.worktree())
         .args(["rev-parse", "HEAD"])
         .output()
-        .map_err(io_error)?;
-    if !output.status.success()
-        || String::from_utf8_lossy(&output.stdout).trim() != job.metadata.source.snapshot.head_sha
-    {
+        .map_err(process_error)?;
+    if !output.status.success() {
+        return Err(DomainError::new(
+            ErrorCode::ProcessOperationFailed,
+            format!(
+                "Git не смог прочитать HEAD worktree: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    if String::from_utf8_lossy(&output.stdout).trim() != job.metadata.source.snapshot.head_sha {
         return Err(invalid("job worktree больше не соответствует pinned HEAD"));
     }
     Ok(())
@@ -1287,9 +1564,12 @@ fn source_changed(job: &PreparedJob) -> Result<bool, DomainError> {
             "--untracked-files=all",
         ])
         .output()
-        .map_err(io_error)?;
+        .map_err(process_error)?;
     if !output.status.success() {
-        return Err(invalid("не удалось проверить source после исполнения"));
+        return Err(DomainError::new(
+            ErrorCode::ProcessOperationFailed,
+            "Git не смог проверить изменения исходников",
+        ));
     }
     Ok(!output.stdout.is_empty() || verify_worktree_head(job).is_err())
 }
@@ -1313,12 +1593,15 @@ fn trusted_git(root: &Path, hooks: &Path) -> Result<Command, DomainError> {
             r"^filter\..*\.(smudge|process|required)$",
         ])
         .output()
-        .map_err(io_error)?;
+        .map_err(process_error)?;
     if !output.status.success() && output.status.code() != Some(1) {
-        return Err(invalid("не удалось проверить Git checkout filters"));
+        return Err(DomainError::new(
+            ErrorCode::ProcessOperationFailed,
+            "Git не смог проверить фильтры checkout",
+        ));
     }
     let names = String::from_utf8(output.stdout)
-        .map_err(|e| invalid(format!("Git filter names не UTF-8: {e}")))?;
+        .map_err(|e| invalid(format!("Имена фильтров Git не в UTF-8: {e}")))?;
     for name in names.lines() {
         if name.contains(['\n', '\r', '\0', '=']) {
             return Err(invalid("небезопасное имя Git filter"));
@@ -1335,28 +1618,32 @@ fn trusted_git(root: &Path, hooks: &Path) -> Result<Command, DomainError> {
     Ok(command)
 }
 fn git_success(mut command: Command, operation: &str) -> Result<(), DomainError> {
-    let output = command.output().map_err(io_error)?;
+    let output = command.output().map_err(process_error)?;
     if !output.status.success() {
         return Err(DomainError::new(
-            ErrorCode::GitEvidenceFailed,
+            ErrorCode::ProcessOperationFailed,
             format!("{operation}: {}", String::from_utf8_lossy(&output.stderr)),
         ));
     }
     Ok(())
 }
 fn verify_owner(job: &PreparedJob) -> Result<State, DomainError> {
-    let metadata: JobMetadata = read_document(&job.directory, "job.json")?;
-    let state: State = read_document(&job.directory, "state.json")?;
+    verify_owner_at(job, &safe_dir(&job.directory)?)
+}
+fn verify_owner_at(job: &PreparedJob, directory: &File) -> Result<State, DomainError> {
+    let metadata: JobMetadata = read_document_at(directory, "job.json")?;
+    let state: State = read_document_at(directory, "state.json")?;
     if metadata != job.metadata || metadata.owner_nonce != state.owner_nonce {
-        return Err(invalid("job ownership изменился"));
+        return Err(invalid("Владелец задания изменился"));
     }
-    let bytes = read_bytes(
-        &job.directory,
+    let bytes = read_optional_file_at(
+        directory,
         "source-review.json",
         super::workflow::MAX_REVIEW_ARTIFACT_BYTES,
-    )?;
+    )?
+    .ok_or_else(|| read_error(std::io::Error::from(std::io::ErrorKind::NotFound)))?;
     if format!("{:x}", Sha256::digest(&bytes)) != metadata.source.review_pack_sha256 {
-        return Err(invalid("source pack bytes identity изменился"));
+        return Err(invalid("Идентичность байтов исходного пакета изменилась"));
     }
     let pack: ReviewPack = serde_json::from_slice(&bytes)
         .map_err(|error| invalid(format!("source-review.json повреждён: {error}")))?;
@@ -1408,7 +1695,7 @@ fn output_evidence(
 ) -> Result<OutputEvidence, DomainError> {
     let directory = safe_dir(&job.directory.join("logs"))?;
     let mut file = open_file(&directory, name, false)?;
-    let total_bytes = file.metadata().map_err(io_error)?.len();
+    let total_bytes = file.metadata().map_err(read_error)?.len();
     let redaction_context_bytes = sensitive_values
         .iter()
         .filter(|value| !value.is_empty())
@@ -1420,7 +1707,7 @@ fn output_evidence(
     Read::by_ref(&mut file)
         .take(read_limit as u64)
         .read_to_end(&mut bytes)
-        .map_err(io_error)?;
+        .map_err(read_error)?;
     let intervals = sensitive_output_intervals(&bytes, sensitive_values);
     let mut cutoff = bytes.len().min(limit);
     for &(begin, end) in &intervals {
@@ -1584,7 +1871,7 @@ fn platform_supported() -> Result<(), DomainError> {
 pub(super) fn safe_dir(path: &Path) -> Result<File, DomainError> {
     use rustix::fs::{Mode, OFlags, openat};
     let path = absolute_path(path)?;
-    let mut directory = File::open("/").map_err(io_error)?;
+    let mut directory = File::open("/").map_err(read_error)?;
     for component in path.components() {
         match component {
             Component::RootDir => (),
@@ -1601,7 +1888,7 @@ pub(super) fn safe_dir(path: &Path) -> Result<File, DomainError> {
                             ErrorCode::InvalidRequest,
                             "review workspace path содержит symlink или не-каталог",
                         ),
-                        _ => io_error(error.into()),
+                        _ => read_error(error.into()),
                     })?,
                 )
             }
@@ -1620,12 +1907,12 @@ pub(super) fn safe_dir(_path: &Path) -> Result<File, DomainError> {
 pub(super) fn ensure_dir(path: &Path) -> Result<(), DomainError> {
     use rustix::fs::{Mode, OFlags, openat};
     let path = absolute_path(path)?;
-    let mut directory = File::open("/").map_err(io_error)?;
+    let mut directory = File::open("/").map_err(write_error)?;
     for component in path.components() {
         if let Component::Normal(name) = component {
             match rustix::fs::mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
                 Ok(()) | Err(rustix::io::Errno::EXIST) => (),
-                Err(error) => return Err(io_error(error.into())),
+                Err(error) => return Err(write_error(error.into())),
             }
             directory = File::from(
                 openat(
@@ -1639,7 +1926,7 @@ pub(super) fn ensure_dir(path: &Path) -> Result<(), DomainError> {
                         ErrorCode::InvalidRequest,
                         "review workspace path содержит symlink или не-каталог",
                     ),
-                    _ => io_error(error.into()),
+                    _ => write_error(error.into()),
                 })?,
             );
         }
@@ -1679,9 +1966,15 @@ fn open_file(directory: &File, name: &str, create: bool) -> Result<File, DomainE
             flags | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::from_raw_mode(0o600),
         )
-        .map_err(|e| io_error(e.into()))?,
+        .map_err(|error| {
+            if create {
+                write_error(error.into())
+            } else {
+                read_error(error.into())
+            }
+        })?,
     );
-    if !file.metadata().map_err(io_error)?.is_file() {
+    if !file.metadata().map_err(read_error)?.is_file() {
         return Err(invalid("job artifact должен быть regular file"));
     }
     Ok(file)
@@ -1694,19 +1987,43 @@ fn open_file(_directory: &File, _name: &str, _create: bool) -> Result<File, Doma
 
 fn read_bytes(directory: &Path, name: &str, max: u64) -> Result<Vec<u8>, DomainError> {
     let mut file = open_file(&safe_dir(directory)?, name, false)?;
-    if file.metadata().map_err(io_error)?.len() > max {
+    if file.metadata().map_err(read_error)?.len() > max {
         return Err(invalid("job artifact превышает лимит чтения"));
     }
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(max + 1)
         .read_to_end(&mut bytes)
-        .map_err(io_error)?;
+        .map_err(read_error)?;
     if bytes.len() as u64 > max {
         return Err(invalid("job artifact вырос при чтении"));
     }
     Ok(bytes)
 }
+fn read_document_at<T: serde::de::DeserializeOwned>(
+    directory: &File,
+    name: &str,
+) -> Result<T, DomainError> {
+    let bytes = read_optional_file_at(directory, name, MAX_DOCUMENT_BYTES)?
+        .ok_or_else(|| read_error(std::io::Error::from(std::io::ErrorKind::NotFound)))?;
+    serde_json::from_slice(&bytes).map_err(|error| invalid(format!("Невалидный {name}: {error}")))
+}
+fn write_document_at<T: Serialize>(
+    directory: &File,
+    name: &str,
+    value: &T,
+    replace: bool,
+) -> Result<(), DomainError> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| invalid(format!("Не удалось сериализовать {name}: {error}")))?;
+    bytes.push(b'\n');
+    if replace {
+        replace_file_at(directory, name, &bytes).map_err(write_error)
+    } else {
+        write_new_fd(directory, name, &bytes).map_err(write_error)
+    }
+}
+
 fn read_document<T: serde::de::DeserializeOwned>(
     directory: &Path,
     name: &str,
@@ -1715,7 +2032,7 @@ fn read_document<T: serde::de::DeserializeOwned>(
         .map_err(|e| invalid(format!("невалидный {name}: {e}")))
 }
 fn write_new(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), DomainError> {
-    write_new_fd(&safe_dir(directory)?, name, bytes).map_err(io_error)
+    write_new_fd(&safe_dir(directory)?, name, bytes).map_err(write_error)
 }
 pub(super) fn write_new_fd(directory: &File, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     if !valid_artifact_name(name) {
@@ -1794,9 +2111,9 @@ pub(super) fn read_optional_file_at(
             Err(rustix::io::Errno::LOOP) => {
                 return Err(conflict("review artifact не может быть symlink"));
             }
-            Err(error) => return Err(io_error(error.into())),
+            Err(error) => return Err(read_error(error.into())),
         };
-        let metadata = file.metadata().map_err(io_error)?;
+        let metadata = file.metadata().map_err(read_error)?;
         if !metadata.is_file() {
             return Err(conflict("review artifact должен быть regular file"));
         }
@@ -1807,7 +2124,7 @@ pub(super) fn read_optional_file_at(
         Read::by_ref(&mut file)
             .take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
-            .map_err(io_error)?;
+            .map_err(read_error)?;
         if bytes.len() as u64 > max_bytes {
             return Err(invalid("review artifact вырос при чтении"));
         }
@@ -1859,8 +2176,8 @@ fn remove_partial_job_directory(parent: &Path, job_id: &str) -> Result<(), Domai
     let job_path = parent.join(job_id);
     let job_fd = safe_dir(&job_path)?;
     let mut files = BTreeSet::new();
-    for entry in fs::read_dir(&job_path).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
+    for entry in fs::read_dir(&job_path).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
         let name = entry
             .file_name()
             .into_string()
@@ -1868,7 +2185,7 @@ fn remove_partial_job_directory(parent: &Path, job_id: &str) -> Result<(), Domai
         if !matches!(
             name.as_str(),
             "job.json" | "source-review.json" | "state.json" | "active.lock"
-        ) || !entry.file_type().map_err(io_error)?.is_file()
+        ) || !entry.file_type().map_err(read_error)?.is_file()
         {
             return Err(conflict(
                 "частичный job содержит неизвестный файл или symlink; каталог сохранён",
@@ -1880,9 +2197,9 @@ fn remove_partial_job_directory(parent: &Path, job_id: &str) -> Result<(), Domai
         // open_file использует O_NOFOLLOW и подтверждает regular file перед unlinkat.
         drop(open_file(&job_fd, &name, false)?);
         unlinkat(&job_fd, name.as_str(), AtFlags::empty())
-            .map_err(|error| io_error(error.into()))?;
+            .map_err(|error| write_error(error.into()))?;
     }
-    unlinkat(&parent_fd, job_id, AtFlags::REMOVEDIR).map_err(|error| io_error(error.into()))?;
+    unlinkat(&parent_fd, job_id, AtFlags::REMOVEDIR).map_err(|error| write_error(error.into()))?;
     Ok(())
 }
 #[cfg(not(unix))]
@@ -1900,18 +2217,18 @@ fn write_document<T: Serialize>(
     bytes.push(b'\n');
     let dir = safe_dir(directory)?;
     if !replace {
-        return write_new_fd(&dir, name, &bytes).map_err(io_error);
+        return write_new_fd(&dir, name, &bytes).map_err(write_error);
     }
     let temporary = format!(".publish-{}", random_id()?);
-    write_new_fd(&dir, &temporary, &bytes).map_err(io_error)?;
+    write_new_fd(&dir, &temporary, &bytes).map_err(write_error)?;
     #[cfg(unix)]
     {
         use rustix::fs::{AtFlags, renameat, unlinkat};
         if let Err(error) = renameat(&dir, temporary.as_str(), &dir, name) {
             let _ = unlinkat(&dir, temporary.as_str(), AtFlags::empty());
-            return Err(io_error(error.into()));
+            return Err(write_error(error.into()));
         }
-        dir.sync_all().map_err(io_error)?;
+        dir.sync_all().map_err(write_error)?;
     }
     #[cfg(not(unix))]
     {
@@ -1920,17 +2237,25 @@ fn write_document<T: Serialize>(
     Ok(())
 }
 
-/// Advisory locks сериализуют cooperating writers; не являются security boundary.
+/// Рекомендательные блокировки упорядочивают согласованные записи, не ограничивая права кода.
 #[cfg(unix)]
 fn job_lock(directory: &Path) -> Result<File, DomainError> {
+    job_lock_at(&safe_dir(directory)?)
+}
+#[cfg(unix)]
+fn job_lock_at(directory: &File) -> Result<File, DomainError> {
     use fs2::FileExt;
-    let file = lock_file(&safe_dir(directory)?, "active.lock")?;
+    let file = lock_file(directory, "active.lock")?;
     match file.try_lock_exclusive() {
         Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Err(conflict("job уже активен или очищается"));
+            return Err(busy(
+                "job",
+                "job_active",
+                "Job уже активен или очищается; повторите позже",
+            ));
         }
-        Err(error) => return Err(io_error(error)),
+        Err(error) => return Err(process_error(error)),
     }
     Ok(file)
 }
@@ -1952,9 +2277,9 @@ pub(super) fn lock_file(directory: &File, name: &str) -> Result<File, DomainErro
             OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::from_raw_mode(0o600),
         )
-        .map_err(|e| io_error(e.into()))?,
+        .map_err(|e| write_error(e.into()))?,
     );
-    if !file.metadata().map_err(io_error)?.is_file() {
+    if !file.metadata().map_err(write_error)?.is_file() {
         return Err(invalid("lock должен быть regular file"));
     }
     Ok(file)
@@ -1967,7 +2292,7 @@ fn lock_is_active(directory: &Path) -> Result<bool, DomainError> {
     match file.try_lock_exclusive() {
         Ok(()) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
-        Err(error) => Err(io_error(error)),
+        Err(error) => Err(process_error(error)),
     }
 }
 #[cfg(not(unix))]
@@ -1981,18 +2306,67 @@ fn execution_slot(root: &Path, limit: usize) -> Result<File, DomainError> {
     let path = root.join(".anki-repo/review/execution-locks");
     ensure_dir(&path)?;
     let dir = safe_dir(&path)?;
-    for index in 0..limit {
+    // Блокировка упорядочивает проверку общей политики и занятие слота.
+    let allocation = lock_file(&dir, "allocation.lock")?;
+    allocation.lock_exclusive().map_err(process_error)?;
+    let mut available = Vec::new();
+    let mut active = 0;
+    for index in 0..64 {
         let file = lock_file(&dir, &format!("slot-{index}.lock"))?;
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(error) => return Err(io_error(error)),
+            Ok(()) => available.push((index, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => active += 1,
+            Err(error) => return Err(process_error(error)),
         }
     }
-    Err(conflict(
-        "достигнут предел конкурентных execution jobs; повторите после завершения другого job",
-    ))
+    let policy = read_optional_file_at(&dir, "parallel-policy.json", MAX_DOCUMENT_BYTES)?;
+    let old_limit = policy
+        .map(|bytes| {
+            serde_json::from_slice::<usize>(&bytes).map_err(|error| {
+                invalid(format!(
+                    "Повреждена репозиторная политика параллелизма: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+    if active > 0 && old_limit != Some(limit) {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "Запрошенный max-parallel-jobs несовместим с пределом активных jobs этого репозитория; дождитесь их завершения или используйте текущий предел",
+        ));
+    }
+    if active == 0 {
+        replace_file_at(
+            &dir,
+            "parallel-policy.json",
+            &serde_json::to_vec(&limit).map_err(|error| {
+                invalid(format!(
+                    "Не удалось сохранить политику параллелизма: {error}"
+                ))
+            })?,
+        )
+        .map_err(write_error)?;
+    }
+    if active >= limit {
+        return Err(busy(
+            "repository",
+            "execution_capacity",
+            "Достигнут предел одновременных execution jobs; повторите после завершения другого job",
+        ));
+    }
+    let (_, slot) = available
+        .into_iter()
+        .find(|(index, _)| *index < limit)
+        .ok_or_else(|| {
+            busy(
+                "repository",
+                "execution_capacity",
+                "Свободный слот исполнения временно недоступен",
+            )
+        })?;
+    Ok(slot)
 }
+
 #[cfg(not(unix))]
 fn execution_slot(_root: &Path, _limit: usize) -> Result<File, DomainError> {
     platform_supported()?;
@@ -2005,10 +2379,31 @@ fn invalid(message: impl Into<String>) -> DomainError {
 fn conflict(message: impl Into<String>) -> DomainError {
     DomainError::new(ErrorCode::ReviewArtifactConflict, message)
 }
-fn io_error(error: std::io::Error) -> DomainError {
+fn read_error(error: std::io::Error) -> DomainError {
+    DomainError::new(
+        ErrorCode::InputUnreadable,
+        format!("Не удалось прочитать ресурс job: {error}"),
+    )
+}
+fn write_error(error: std::io::Error) -> DomainError {
     DomainError::new(
         ErrorCode::WriteFailed,
-        format!("job filesystem/process operation: {error}"),
+        format!("Не удалось записать ресурс job: {error}"),
+    )
+}
+fn process_error(error: std::io::Error) -> DomainError {
+    DomainError::new(
+        ErrorCode::ProcessOperationFailed,
+        format!("Не удалось выполнить процессную операцию job: {error}"),
+    )
+}
+fn busy(resource: &str, reason: &str, message: &str) -> DomainError {
+    DomainError::with_details(
+        ErrorCode::ExecutionBusy,
+        message,
+        crate::details! {
+            "retryable" => true, "resource" => resource, "reason" => reason,
+        },
     )
 }
 
@@ -2994,18 +3389,62 @@ mod tests {
         assert!(run_job(&job, &request("pass"), &AtomicBool::new(false)).is_err());
         assert_eq!(
             inspect_job(job.directory()).unwrap().lifecycle,
-            LifecycleStatus::Interrupted
+            LifecycleStatus::Prepared
         );
         assert!(cleanup_workspace(&job).is_err());
         assert!(unrelated.is_dir());
         let job = repo.prepare(ExecutionMode::IsolatedChecks);
         save_state(&job, LifecycleStatus::Running, false).unwrap();
-        assert_eq!(
-            inspect_job(job.directory()).unwrap().lifecycle,
-            LifecycleStatus::Interrupted
-        );
+        // Соседний spawn может кратко унаследовать CLOEXEC descriptor до exec.
+        // В этом окне flock действительно активен; ждём его освобождения,
+        // сохраняя проверку того, что прерванное задание распознаётся.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while inspect_job(job.directory()).unwrap().lifecycle != LifecycleStatus::Interrupted {
+            assert!(
+                Instant::now() < deadline,
+                "Блокировка прерванного задания осталась активной"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         assert!(read_result(job.directory()).is_err());
         assert!(cleanup_workspace(&job).is_err());
+    }
+
+    #[test]
+    fn pinned_cleanup_never_follows_replaced_job_parent() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        let owned = repo.prepare(ExecutionMode::DisposableSourceExperiment);
+        let neighbor = repo.prepare(ExecutionMode::DisposableSourceExperiment);
+        let directory = safe_dir(owned.directory()).unwrap();
+        let surfaces = cleanup_preflight(&owned, &directory).unwrap();
+        fs::write(owned.directory.join("target/owned-marker"), b"owned").unwrap();
+        fs::write(neighbor.directory.join("target/foreign-marker"), b"foreign").unwrap();
+        let external_source = fs::read(neighbor.worktree().join("source.txt")).unwrap();
+        let moved = owned.directory.with_extension("moved");
+        fs::rename(owned.directory(), &moved).unwrap();
+        symlink(neighbor.directory(), owned.directory()).unwrap();
+
+        // Даже перечисление после подмены читает исходный закреплённый каталог.
+        cleanup_preflight(&owned, &directory).unwrap();
+        remove_cleanup_runtime(&directory, "target", &surfaces).unwrap();
+        assert!(!moved.join("target").exists());
+        assert_eq!(
+            fs::read(neighbor.directory.join("target/foreign-marker")).unwrap(),
+            b"foreign"
+        );
+        // Git получает descriptor исходного worktree. После перемещения
+        // регистрация не совпадает: ожидается отказ, сосед не удаляется.
+        assert!(remove_cleanup_worktree(&owned, &directory, &surfaces).is_err());
+        assert_eq!(
+            fs::read(neighbor.worktree().join("source.txt")).unwrap(),
+            external_source
+        );
+        assert!(neighbor.worktree().is_dir());
+        fs::remove_file(owned.directory()).unwrap();
+        fs::rename(moved, owned.directory()).unwrap();
+        cleanup_workspace(&owned).unwrap();
+        cleanup_workspace(&neighbor).unwrap();
     }
 
     #[test]

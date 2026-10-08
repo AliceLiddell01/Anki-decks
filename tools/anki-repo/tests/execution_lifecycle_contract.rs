@@ -339,8 +339,20 @@ fn independent_processes_obey_stable_repository_parallel_policy() {
     let first = fixture.prepare("isolated_checks");
     let second = fixture.prepare("isolated_checks");
     let third = fixture.prepare("isolated_checks");
-    let first_run = ActiveRun::spawn(&fixture, &first, "2");
-    let second_run = ActiveRun::spawn(&fixture, &second, "2");
+    // Барьер одновременно запускает независимые CLI-процессы; они конкурируют
+    // за общую политику и разные слоты, затем оба удерживают свои ресурсы.
+    let barrier = std::sync::Barrier::new(2);
+    let (first_run, second_run) = std::thread::scope(|scope| {
+        let first_thread = scope.spawn(|| {
+            barrier.wait();
+            ActiveRun::spawn(&fixture, &first, "2")
+        });
+        let second_thread = scope.spawn(|| {
+            barrier.wait();
+            ActiveRun::spawn(&fixture, &second, "2")
+        });
+        (first_thread.join().unwrap(), second_thread.join().unwrap())
+    });
     let busy = run_cli_in(
         Some(fixture.root()),
         &[
@@ -420,7 +432,7 @@ fn missing_job_and_missing_manifest_are_read_errors() {
     assert_eq!(parse_json(&stdout)["error"]["code"], "not_found");
     fs::remove_file(job.join("job.json")).unwrap();
     let (code, stdout, _) = fixture.operation("inspect", &job);
-    assert_eq!(code, 2, "{stdout}");
+    assert_eq!(code, 3, "{stdout}");
     assert_eq!(parse_json(&stdout)["error"]["code"], "input_unreadable");
 }
 
@@ -613,4 +625,116 @@ fn timeout_and_cancelled_disposable_jobs_preserve_evidence_during_confirmed_clea
     );
     assert!(cancelled.join("result.json").is_file());
     assert!(cancelled.join("outputs/ready").is_file());
+}
+
+#[test]
+fn git_operation_failure_is_distinct_from_snapshot_mismatch() {
+    let fixture = Fixture::new();
+    let broken = fixture.prepare("isolated_checks");
+    fs::write(broken.join("worktree/.git"), "невалидные Git metadata\n").unwrap();
+    let (code, stdout, _) = fixture.run(&broken, &["/bin/true"]);
+    assert_eq!(code, 14, "{stdout}");
+    assert_eq!(
+        parse_json(&stdout)["error"]["code"],
+        "process_operation_failed"
+    );
+    assert_eq!(
+        success(fixture.operation("inspect", &broken))["lifecycle"],
+        "prepared"
+    );
+
+    let mismatch = fixture.prepare("isolated_checks");
+    git(
+        &mismatch.join("worktree"),
+        &["checkout", "--detach", "HEAD^"],
+    );
+    let (code, stdout, _) = fixture.run(&mismatch, &["/bin/true"]);
+    assert_eq!(code, 3, "{stdout}");
+    assert_eq!(
+        parse_json(&stdout)["error"]["code"],
+        "review_artifact_invalid"
+    );
+    assert_eq!(
+        success(fixture.operation("inspect", &mismatch))["lifecycle"],
+        "prepared"
+    );
+}
+
+#[test]
+fn cleanup_rejects_foreign_attestation_and_preserves_operator_limitation() {
+    let fixture = Fixture::new();
+    let first = fixture.prepare("disposable_source_experiment");
+    let second = fixture.prepare("disposable_source_experiment");
+    success(fixture.run(&first, &["/bin/true"]));
+    success(fixture.run(&second, &["/bin/true"]));
+    let initial = confirmed_cleanup(&fixture, &first);
+    let repeated = success(fixture.operation("cleanup", &first));
+    assert_eq!(repeated["limitation"], initial["limitation"]);
+    assert!(
+        repeated["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("оператор")
+    );
+    let attestation = fs::read(first.join("cleanup-attestation.json")).unwrap();
+    fs::remove_file(first.join("cleanup-attestation.json")).unwrap();
+    let (code, stdout, _) = fixture.operation("cleanup", &first);
+    assert_eq!(code, 7, "{stdout}");
+    fs::write(first.join("cleanup-attestation.json"), attestation).unwrap();
+    fs::copy(
+        first.join("cleanup-attestation.json"),
+        second.join("cleanup-attestation.json"),
+    )
+    .unwrap();
+    let (code, stdout, _) = run_cli_in(
+        Some(fixture.root()),
+        &[
+            "--json",
+            "code-review",
+            "execution",
+            "cleanup",
+            second.to_str().unwrap(),
+            "--confirm-no-live-descendants",
+        ],
+    );
+    assert_eq!(code, 7, "{stdout}");
+    assert_eq!(
+        parse_json(&stdout)["error"]["code"],
+        "review_artifact_conflict"
+    );
+    assert!(second.join("worktree").is_dir());
+    assert!(second.join("target").is_dir());
+    fs::remove_file(second.join("cleanup-attestation.json")).unwrap();
+    confirmed_cleanup(&fixture, &second);
+}
+
+#[test]
+fn cleanup_rejects_unexpected_job_entries_before_any_mutation() {
+    let fixture = Fixture::new();
+    let job = fixture.prepare("isolated_checks");
+    fs::write(job.join("foreign.txt"), b"unchanged").unwrap();
+    let (code, stdout, _) = fixture.operation("cleanup", &job);
+    assert_eq!(code, 7, "{stdout}");
+    assert_eq!(fs::read(job.join("foreign.txt")).unwrap(), b"unchanged");
+    assert!(job.join("worktree").is_dir());
+    assert!(job.join("target").is_dir());
+    assert!(!job.join("cleanup-attestation.json").exists());
+}
+
+#[test]
+fn runtime_cleanup_does_not_follow_nested_symlink_targets() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    let outside = TempDir::new("execution-nested-symlink");
+    fs::write(outside.path().join("sentinel"), b"outside preserved").unwrap();
+    let job = fixture.prepare("isolated_checks");
+    symlink(outside.path(), job.join("tmp/external-link")).unwrap();
+    assert_eq!(
+        success(fixture.operation("cleanup", &job))["workspace_removed"],
+        true
+    );
+    assert_eq!(
+        fs::read(outside.path().join("sentinel")).unwrap(),
+        b"outside preserved"
+    );
 }
