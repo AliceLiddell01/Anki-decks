@@ -396,7 +396,8 @@ fn derived_overwrite_rejects_live_and_dangling_canonical_symlinks() {
                 document["error"]["message"]
                     .as_str()
                     .unwrap()
-                    .contains("symlink"),
+                    .to_lowercase()
+                    .contains("символическ"),
                 "{document}"
             );
             assert_eq!(fs::read_link(&output).unwrap(), *target);

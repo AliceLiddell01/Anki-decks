@@ -226,7 +226,7 @@ pub fn verify(
     }) {
         return Err(DomainError::with_details(
             ErrorCode::InvalidRequest,
-            "--pr-number должен совпадать с namespace baseline review.json",
+            "Параметр --pr-number должен совпадать с пространством имён baseline-файла review.json",
             crate::details! {
                 "baseline_namespace" => baseline_namespace.as_deref().unwrap_or("external"),
                 "requested_pr_number" => pr_number.unwrap_or_default(),
@@ -278,7 +278,7 @@ pub fn verify(
     )
 }
 
-/// Подготавливает job на pinned snapshot, не исполняя проектный код.
+/// Подготавливает задание на закреплённом снимке, не исполняя проектный код.
 pub fn prepare_execution_job(
     pack_path: &Path,
     mode: super::execution::ExecutionMode,
@@ -308,7 +308,7 @@ pub fn prepare_execution_job(
     })
 }
 
-/// Исполняет одну команду в уже подготовленном job.
+/// Исполняет одну команду в уже подготовленном задании.
 pub fn run_execution_job(
     job_path: &Path,
     request: &super::execution::CommandRequest,
@@ -617,7 +617,7 @@ fn validate_queue_authenticity_in_repository(
     {
         return Err(DomainError::new(
             ErrorCode::BaselineMismatch,
-            "точные Git images не соответствуют идентичности исходного review pack",
+            "Точные снимки Git не соответствуют идентичности исходного пакета ревью",
         ));
     }
     let (post_sources, base_sources) = rust_sources_from_scope(&collected);
@@ -2267,7 +2267,7 @@ fn write_directory_once(
     Ok(())
 }
 
-/// Возвращает workspace конкретного PR/local HEAD, не разрешая произвольный --out-dir.
+/// Возвращает рабочую область для конкретного PR/local HEAD, не разрешая произвольный --out-dir.
 fn review_workspace_directory(
     root: &Path,
     requested: Option<&Path>,
@@ -2308,7 +2308,7 @@ fn review_workspace_directory(
         if normalize_without_parent(&absolute) != expected {
             return Err(DomainError::with_details(
                 ErrorCode::InvalidRequest,
-                "--out-dir должен точно указывать на workspace выбранного PR и полного HEAD SHA",
+                "--out-dir должен точно указывать на рабочую область выбранного PR и полного HEAD SHA",
                 crate::details! {
                     "expected" => expected.display().to_string(),
                     "requested" => absolute.display().to_string(),
@@ -2333,13 +2333,13 @@ fn ensure_workspace_directory(root: &Path, workspace: &Path) -> Result<(), Domai
     if !workspace.starts_with(&expected_root) {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "review workspace должен находиться под .anki-repo/review",
+            "Рабочая область ревью должна находиться под .anki-repo/review",
         ));
     }
     let relative = workspace.strip_prefix(root).map_err(|_| {
         DomainError::new(
             ErrorCode::InvalidRequest,
-            "review workspace вышел за пределы корня репозитория",
+            "Рабочая область ревью вышла за пределы корня репозитория",
         )
     })?;
     reject_tracked_review_workspace(root, relative)?;
@@ -2360,12 +2360,12 @@ pub(super) fn reject_tracked_review_workspace(
     if !output.status.success() {
         return Err(DomainError::new(
             ErrorCode::GitEvidenceFailed,
-            "не удалось проверить index перед записью review workspace",
+            "Не удалось проверить индекс перед записью рабочей области ревью",
         ));
     }
-    let prefix = relative_workspace
-        .to_str()
-        .ok_or_else(|| DomainError::new(ErrorCode::InvalidRequest, "путь workspace не UTF-8"))?;
+    let prefix = relative_workspace.to_str().ok_or_else(|| {
+        DomainError::new(ErrorCode::InvalidRequest, "Путь рабочей области не в UTF-8")
+    })?;
     let prefix_with_slash = format!("{}/", prefix.trim_end_matches('/'));
     if output.stdout.split(|byte| *byte == 0).any(|path| {
         let path = String::from_utf8_lossy(path);
@@ -2373,7 +2373,7 @@ pub(super) fn reject_tracked_review_workspace(
     }) {
         return Err(DomainError::with_details(
             ErrorCode::InvalidRequest,
-            "review workspace содержит отслеживаемые Git-файлы и не допускает запись",
+            "Рабочая область ревью содержит отслеживаемые Git-файлы и не допускает запись",
             crate::details! { "workspace" => relative_workspace.display().to_string() },
         ));
     }
@@ -2429,7 +2429,7 @@ fn workspace_for_pack(
     let workspace = pack_path.parent().ok_or_else(|| {
         DomainError::new(
             ErrorCode::InvalidRequest,
-            "у review.json нет каталога workspace",
+            "У review.json нет каталога рабочей области",
         )
     })?;
     let namespace = workspace
@@ -2437,7 +2437,10 @@ fn workspace_for_pack(
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
-            DomainError::new(ErrorCode::InvalidRequest, "нет namespace review workspace")
+            DomainError::new(
+                ErrorCode::InvalidRequest,
+                "Нет пространства имён рабочей области ревью",
+            )
         })?;
     let pr_number = (namespace != "local").then_some(namespace);
     let expected =
@@ -2445,13 +2448,13 @@ fn workspace_for_pack(
     if expected != workspace {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
-            "review.json не принадлежит workspace этого HEAD",
+            "review.json не принадлежит рабочей области этого HEAD",
         ));
     }
     Ok(expected)
 }
 
-/// Возвращает PR/local namespace, если входной пакет уже лежит в каноническом workspace.
+/// Возвращает пространство имён PR/local, если входной пакет уже лежит в канонической рабочей области.
 /// Внешний read-only baseline допустим, но для PR-ревью вызывающая сторона должна
 /// передать подтверждённый номер PR; такой input не используется для вывода namespace.
 fn review_workspace_namespace(
@@ -2478,7 +2481,7 @@ fn review_workspace_namespace(
         .ok_or_else(|| {
             DomainError::new(
                 ErrorCode::InvalidRequest,
-                "не удалось определить namespace исходного review workspace",
+                "Не удалось определить пространство имён исходной рабочей области ревью",
             )
         })?;
     Ok(Some(namespace.to_owned()))
@@ -2496,7 +2499,7 @@ fn reject_symlink_path(root: &Path, requested: &Path) -> Result<(), DomainError>
     let relative = normalized.strip_prefix(root).map_err(|_| {
         DomainError::new(
             ErrorCode::InvalidRequest,
-            "путь review artifact должен находиться в текущем репозитории",
+            "Путь артефакта ревью должен находиться в текущем репозитории",
         )
     })?;
     let mut current = root.to_path_buf();
@@ -2504,7 +2507,7 @@ fn reject_symlink_path(root: &Path, requested: &Path) -> Result<(), DomainError>
         let Component::Normal(name) = component else {
             return Err(DomainError::new(
                 ErrorCode::InvalidRequest,
-                "путь review artifact содержит недопустимый компонент",
+                "Путь артефакта ревью содержит недопустимый компонент",
             ));
         };
         current.push(name);
@@ -2614,7 +2617,10 @@ fn replace_derived_document(
         }
     }
     let workspace = output.parent().ok_or_else(|| {
-        DomainError::new(ErrorCode::InvalidRequest, "у review artifact нет workspace")
+        DomainError::new(
+            ErrorCode::InvalidRequest,
+            "У артефакта ревью нет рабочей области",
+        )
     })?;
     let workspace_fd = super::execution::safe_dir(workspace)?;
     let _lock = lock_review_workspace(&workspace_fd, workspace)?;
@@ -2628,7 +2634,7 @@ fn replace_derived_document(
     if current_pack.as_deref() != Some(*pack_bytes) {
         return Err(DomainError::new(
             ErrorCode::SourceChanged,
-            "исходный пакет в закреплённом review workspace изменился",
+            "Исходный пакет в закреплённой рабочей области ревью изменился",
         ));
     }
     for (source_path, expected_bytes) in sources {
@@ -2733,7 +2739,9 @@ fn review_workspace_file(
     if normalize_without_parent(&absolute) != expected {
         return Err(DomainError::with_details(
             ErrorCode::InvalidRequest,
-            format!("путь review artifact должен указывать на {expected_name} в своём workspace"),
+            format!(
+                "Путь артефакта ревью должен указывать на {expected_name} в своей рабочей области"
+            ),
             crate::details! {
                 "expected" => expected.display().to_string(),
                 "requested" => absolute.display().to_string(),
@@ -4206,7 +4214,7 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             )
             .unwrap_err();
             assert_eq!(error.code, ErrorCode::ReviewArtifactConflict);
-            assert!(error.message.contains("символическ"));
+            assert!(error.message.to_lowercase().contains("символическ"));
             assert_eq!(fs::read(&target).unwrap(), b"protected bytes");
             fs::remove_file(output).unwrap();
         }
@@ -4226,7 +4234,7 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
-        assert!(error.message.contains("символическ"));
+        assert!(error.message.to_lowercase().contains("символическ"));
         assert_eq!(
             fs::read(protected.join("semantic-triage.json")).unwrap(),
             b"protected bytes"
@@ -4288,7 +4296,7 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ReviewArtifactConflict);
-        assert!(error.message.contains("символическ"));
+        assert!(error.message.to_lowercase().contains("символическ"));
         assert!(!output.exists());
         assert_eq!(fs::read(protected).unwrap(), bytes);
     }

@@ -3254,7 +3254,10 @@ fn queue_validation_requires_git_images_unless_structure_only_is_requested() {
     explicit.remove(0);
     let (code, stdout, stderr) = run_cli_in(Some(outside.path()), &explicit);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(stdout.contains("structure_only"), "{stdout}");
+    assert!(
+        stdout.contains("проверена только структура и digest"),
+        "{stdout}"
+    );
 }
 
 #[test]

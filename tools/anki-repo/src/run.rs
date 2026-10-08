@@ -1145,12 +1145,12 @@ fn execution_exit(status: crate::code_review::execution::ExecutionStatus) -> u8 
 fn execution_status_label(status: crate::code_review::execution::ExecutionStatus) -> &'static str {
     use crate::code_review::execution::ExecutionStatus;
     match status {
-        ExecutionStatus::Passed => "успешно (passed)",
-        ExecutionStatus::Failed => "ошибка проверки (failed)",
-        ExecutionStatus::TimedOut => "истёк срок выполнения (timed_out)",
-        ExecutionStatus::Cancelled => "отменено (cancelled)",
-        ExecutionStatus::Unavailable => "исполнение недоступно (unavailable)",
-        ExecutionStatus::Incomplete => "результат неполон (incomplete)",
+        ExecutionStatus::Passed => "успешно",
+        ExecutionStatus::Failed => "ошибка проверки",
+        ExecutionStatus::TimedOut => "истёк срок выполнения",
+        ExecutionStatus::Cancelled => "отменено",
+        ExecutionStatus::Unavailable => "исполнение недоступно",
+        ExecutionStatus::Incomplete => "результат неполон",
     }
 }
 
@@ -1159,21 +1159,19 @@ fn execution_lifecycle_label(
 ) -> &'static str {
     use crate::code_review::execution::LifecycleStatus;
     match status {
-        LifecycleStatus::Prepared => "подготовлено (prepared)",
-        LifecycleStatus::Running => "выполняется (running)",
-        LifecycleStatus::Completed => "завершено (completed)",
-        LifecycleStatus::PreparationFailed => "ошибка подготовки (preparation_failed)",
-        LifecycleStatus::Interrupted => "прервано (interrupted)",
+        LifecycleStatus::Prepared => "подготовлено",
+        LifecycleStatus::Running => "выполняется",
+        LifecycleStatus::Completed => "завершено",
+        LifecycleStatus::PreparationFailed => "ошибка подготовки",
+        LifecycleStatus::Interrupted => "прервано",
     }
 }
 
 fn execution_mode_label(mode: crate::code_review::execution::ExecutionMode) -> &'static str {
     use crate::code_review::execution::ExecutionMode;
     match mode {
-        ExecutionMode::IsolatedChecks => "изолированные проверки (isolated_checks)",
-        ExecutionMode::DisposableSourceExperiment => {
-            "эксперимент с отдельной копией исходников (disposable_source_experiment)"
-        }
+        ExecutionMode::IsolatedChecks => "изолированные проверки",
+        ExecutionMode::DisposableSourceExperiment => "эксперимент с отдельной копией исходников",
     }
 }
 
@@ -1190,7 +1188,7 @@ fn process_cleanup_label(value: &str) -> String {
         }
         _ => "состояние очистки процессов",
     };
-    format!("{label} ({value})")
+    label.to_owned()
 }
 
 fn human_execution_result(result: &crate::code_review::execution::ExecutionResult) -> String {
@@ -1210,7 +1208,7 @@ fn human_execution_result(result: &crate::code_review::execution::ExecutionResul
         .and_then(|exit| exit.signal)
         .map_or_else(|| "отсутствует".to_owned(), |value| value.to_string());
     let sandbox = if result.enforcement.security_sandbox == "absent" {
-        "отсутствует (absent)"
+        "отсутствует"
     } else {
         &result.enforcement.security_sandbox
     };
@@ -1266,7 +1264,7 @@ fn human_execution_result(result: &crate::code_review::execution::ExecutionResul
         }
         _ => "политика сохранённого результата",
     };
-    let _ = writeln!(text, "Очистка: {cleanup} ({}).", result.cleanup);
+    let _ = writeln!(text, "Очистка: {cleanup}.");
     text
 }
 
@@ -1314,8 +1312,12 @@ fn queue_authenticity_label(
     status: crate::code_review::workflow::SyntaxAuthenticityStatus,
 ) -> &'static str {
     match status {
-        crate::code_review::workflow::SyntaxAuthenticityStatus::Verified => "verified",
-        crate::code_review::workflow::SyntaxAuthenticityStatus::StructureOnly => "structure_only",
+        crate::code_review::workflow::SyntaxAuthenticityStatus::Verified => {
+            "синтаксическая подлинность подтверждена"
+        }
+        crate::code_review::workflow::SyntaxAuthenticityStatus::StructureOnly => {
+            "проверена только структура и digest"
+        }
     }
 }
 
@@ -2159,7 +2161,7 @@ mod tests {
         let inspection = execution_inspection_fixture();
         let rendered = human_execution_inspection(&inspection);
         assert!(
-            rendered.starts_with("Задание fixture-job: состояние прервано (interrupted)"),
+            rendered.starts_with("Задание fixture-job: состояние прервано"),
             "{rendered}"
         );
         assert!(rendered.contains("Запись конечного состояния прервана."));
@@ -2178,14 +2180,23 @@ mod tests {
     }
 
     #[test]
-    fn execution_human_uses_canonical_values_and_readable_exit() {
+    fn execution_human_uses_russian_labels_and_readable_exit() {
         let inspection = execution_inspection_fixture();
         let rendered = human_execution_result(inspection.result.as_ref().unwrap());
-        assert!(rendered.contains("успешно (passed)"), "{rendered}");
-        assert!(rendered.contains("завершено (completed)"));
-        assert!(rendered.contains("изолированные проверки (isolated_checks)"));
+        assert!(rendered.contains("результат успешно"), "{rendered}");
+        assert!(rendered.contains("сохранённое состояние завершено"));
+        assert!(rendered.contains("Режим: изолированные проверки"));
         assert!(rendered.contains("Код завершения: 0; сигнал: отсутствует"));
-        for debug_form in ["Some(0)", "None", "Passed", "Completed", "IsolatedChecks"] {
+        for debug_form in [
+            "Some(0)",
+            "None",
+            "Passed",
+            "Completed",
+            "IsolatedChecks",
+            "(passed)",
+            "(completed)",
+            "(isolated_checks)",
+        ] {
             assert!(!rendered.contains(debug_form), "{rendered}");
         }
     }
@@ -2198,12 +2209,12 @@ mod tests {
         inspection.limitations.clear();
         assert!(
             human_execution_inspection(&inspection)
-                .starts_with("Задание fixture-job: состояние завершено (completed)")
+                .starts_with("Задание fixture-job: состояние завершено")
         );
         inspection.lifecycle = LifecycleStatus::Prepared;
         inspection.result = None;
         let rendered = human_execution_inspection(&inspection);
-        assert!(rendered.contains("подготовлено (prepared)"));
+        assert!(rendered.contains("состояние подготовлено"));
         assert!(rendered.contains("Сохранённого результата команды нет."));
         assert!(!rendered.contains("успешно (passed)"));
     }
@@ -2259,7 +2270,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_authenticity_machine_fields_match_human_canonical_value() {
+    fn queue_authenticity_keeps_machine_fields_and_localizes_human_labels() {
         use crate::code_review::workflow::{QueueAuthenticityEnvelope, SyntaxAuthenticityStatus};
         for (status, canonical) in [
             (SyntaxAuthenticityStatus::StructureOnly, "structure_only"),
@@ -2276,8 +2287,15 @@ mod tests {
             assert_eq!(json["result"]["source_digest_valid"], true);
             assert_eq!(json["result"]["syntax_authenticity"], canonical);
             assert!(json["result"]["units"].is_array());
-            assert_eq!(queue_authenticity_label(status), canonical);
         }
+        assert_eq!(
+            queue_authenticity_label(SyntaxAuthenticityStatus::Verified),
+            "синтаксическая подлинность подтверждена"
+        );
+        assert_eq!(
+            queue_authenticity_label(SyntaxAuthenticityStatus::StructureOnly),
+            "проверена только структура и digest"
+        );
     }
 
     fn review_queue_candidate_detail() -> crate::code_review::workflow::ReviewQueueCandidateDetail {
