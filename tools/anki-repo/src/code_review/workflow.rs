@@ -2238,6 +2238,14 @@ fn write_directory_once(
         }
         if let Err(error) = super::execution::write_new_fd(&directory_fd, name, bytes) {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let existing = super::execution::read_optional_file_at(
+                    &directory_fd,
+                    name,
+                    MAX_REVIEW_ARTIFACT_BYTES,
+                )?;
+                if existing.as_deref() == Some(bytes.as_slice()) {
+                    continue;
+                }
                 return Err(artifact_conflict(&directory.join(name)));
             }
             return Err(artifact_write_error(&directory.join(name), &error));
@@ -3784,7 +3792,7 @@ fn unknown_context() { custom_test_macro!("Unknown macro text"); }
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect();
-        assert!(results.iter().any(Result::is_ok));
+        assert!(results.iter().all(Result::is_ok));
         write_directory_once(&directory, &documents).unwrap();
         for (name, expected) in documents {
             assert_eq!(fs::read(directory.join(name)).unwrap(), expected);

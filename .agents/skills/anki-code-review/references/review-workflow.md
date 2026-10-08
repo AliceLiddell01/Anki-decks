@@ -29,25 +29,31 @@ upstream remote и GitHub-репозитории этого remote и базов
 
 ```bash
 PULLS=$(gh pr list --repo "$BASE_REPOSITORY" --head "$BRANCH" --state all --limit 1000 \
-  --json number,url,state,headRefName,headRefOid,baseRefOid,headRepository)
+  --json number,url,state,headRefName,headRefOid,baseRefOid,headRepositoryOwner,headRepository)
 MATCHES=$(jq --arg branch "$BRANCH" --arg head_repo "$HEAD_REPOSITORY" \
-  '[.[] | select(.headRefName == $branch and .headRepository.nameWithOwner == $head_repo)]' \
+  '[.[] | select(.headRefName == $branch and
+    (.headRepositoryOwner.login // "") != "" and (.headRepository.name // "") != "" and
+    (((.headRepositoryOwner.login + "/" + .headRepository.name) | ascii_downcase) ==
+      ($head_repo | ascii_downcase)))]' \
   <<<"$PULLS")
 UNRESOLVED=$(jq --arg branch "$BRANCH" \
-  '[.[] | select(.headRefName == $branch and .headRepository.nameWithOwner == null)] | length' \
+  '[.[] | select(.headRefName == $branch and
+    ((.headRepositoryOwner.login // "") == "" or (.headRepository.name // "") == ""))] | length' \
   <<<"$PULLS")
 ```
 
 `gh pr list --head` фильтрует по имени ветки, поэтому проверь каждый результат
-также по точному `headRepository.nameWithOwner`, полученному из GitHub remote
-текущего checkout; не сопоставляй только owner или имя ветки. Один результат
+также по полному identity, составленному из `headRepositoryOwner.login` и
+`headRepository.name`; сравни его без учёта регистра с identity GitHub remote
+текущего checkout. Не сопоставляй только owner или имя ветки. Отсутствующий
+owner login или имя репозитория делает identity неопределённым. Один результат
 устанавливает `PR_NUMBER` из его `.number` только если `UNRESOLVED` равен нулю.
 Пустой `MATCHES` подтверждает отсутствие только если запрос успешен, identity
 обоих remote установлена, `UNRESOLVED` равен нулю и получено меньше 1000 строк.
 При 1000 строках считай выборку потенциально усечённой и статус PR неизвестным.
-Несколько совпадений, результат с неопределённым `headRepository`, отсутствие
-upstream или репозитория head, ошибка GitHub либо другая неполнота также не
-разрешают `local`.
+Несколько совпадений, результат без owner login или имени head-репозитория,
+отсутствие upstream или репозитория head, ошибка GitHub либо другая неполнота
+также не разрешают `local`.
 
 Только успешный структурированный запрос без связанных PR доказывает их
 отсутствие и разрешает явно обозначенный режим `local`. Ошибка доступа к GitHub,
@@ -216,10 +222,16 @@ JOB_JSON=$(anki-repo --json code-review execution prepare --pack "$PACK" --mode 
 JOB_PATH=$(jq -er '.result.job_directory' <<<"$JOB_JSON")
 DIRECTION_REPORT="$JOB_PATH/outputs/direction-report.json"
 # Передай PACK, QUEUE, JOB_PATH и DIRECTION_REPORT назначенному reviewer'у.
+```
 
-# Рассмотри diff/очередь и результаты направлений; редактируй только TRIAGE.
-read -r -p 'После анализа и сохранения TRIAGE введи reviewed: ' TRIAGE_READY
-test "$TRIAGE_READY" = reviewed
+Перед публикацией выполни содержательный анализ diff и очереди свидетельств,
+учти результаты направлений и сохрани проверенные решения только в `$TRIAGE`.
+Заверши анализ до запуска следующего блока: подготовка артефактов сама по себе не
+означает, что кандидаты рассмотрены.
+
+После завершения анализа опубликуй canonical triage и отчёт:
+
+```bash
 anki-repo code-review triage validate --pack "$PACK" --triage "$TRIAGE" --canonical-out "$CANONICAL_TRIAGE"
 anki-repo code-review triage summary --pack "$PACK" --triage "$CANONICAL_TRIAGE"
 anki-repo code-review triage report --pack "$PACK" --triage "$CANONICAL_TRIAGE" --out "$REPORT"
@@ -228,9 +240,8 @@ git check-ignore -- "$PACK" "$QUEUE" "$TRIAGE" "$CANONICAL_TRIAGE" "$REPORT" "$J
 git status --short
 ```
 
-Пауза `read` требует содержательного анализа ревьюером перед генерацией отчёта;
-пустой triage не означает завершённый разбор. Для результатов
-других направлений приготовь отдельные jobs и передай их собственные
+Пустой triage не означает завершённый разбор. Для результатов других направлений
+приготовь отдельные jobs и передай их собственные
 `outputs/direction-report.json`. Пример `run` ниже применяй только после выбора
 проверок и подтверждения доверия к исполняемому коду.
 
