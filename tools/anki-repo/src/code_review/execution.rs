@@ -273,11 +273,7 @@ fn source_pack_namespace(
             "Псевдонимы пути, . и .. в исходном review.json запрещены",
         ));
     }
-    let source_path = if options.source_pack.is_absolute() {
-        options.source_pack.clone()
-    } else {
-        root.join(&options.source_pack)
-    };
+    let source_path = absolute_path(&options.source_pack)?;
     let relative = source_path.strip_prefix(root).map_err(|_| {
         DomainError::new(
             ErrorCode::InvalidRequest,
@@ -1872,14 +1868,14 @@ fn stop_child(
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn platform_supported() -> Result<(), DomainError> {
     Ok(())
 }
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn platform_supported() -> Result<(), DomainError> {
     Err(invalid(
-        "Запуск задания недоступен: на платформе не реализованы безопасная блокировка по владельцу и граница файловой системы",
+        "Выполнение задания доступно только на Linux с доступным /proc для безопасной очистки ресурсов",
     ))
 }
 

@@ -2290,7 +2290,7 @@ fn collect_pr_workspace(root: &Path, base: &str, head: &str, pr: &str) -> PathBu
     root.join(relative)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn pr_review_pipeline_keeps_all_artifacts_and_job_in_returned_workspace() {
     let (repo, base, head) = ignored_review_fixture("pr-review-pipeline");
@@ -2446,7 +2446,7 @@ fn pr_review_pipeline_keeps_all_artifacts_and_job_in_returned_workspace() {
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn execution_run_exit_codes_distinguish_failed_incomplete_timeout_and_unavailable() {
     let (repo, base, head) = ignored_review_fixture("execution-exit-codes");
@@ -2487,7 +2487,7 @@ fn execution_run_exit_codes_distinguish_failed_incomplete_timeout_and_unavailabl
     assert_eq!(parse_json(&stdout)["result"]["status"], "unavailable");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn execution_run_sigterm_cancels_and_stops_the_child_process_group() {
     use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
@@ -2726,22 +2726,24 @@ fn verify_new_head_uses_separate_pr_workspace_and_keeps_previous_documents() {
     assert!(git(repo.path(), &["status", "--porcelain=v1"]).is_empty());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn execution_prepare_inherits_local_namespace_when_source_has_no_pr() {
     let (repo, base, head) = ignored_review_fixture("execution-inherit-local");
     let artifacts = review_workspace(repo.path(), &head);
     collect_pack(repo.path(), &base, &head, &artifacts, false);
     let pack = artifacts.join("review.json");
+    let cwd = repo.path().join(".anki-repo");
+    let relative_pack = pack.strip_prefix(&cwd).unwrap();
     let prepared = review_success(run_cli_in(
-        Some(repo.path()),
+        Some(&cwd),
         &[
             "--json",
             "code-review",
             "execution",
             "prepare",
             "--pack",
-            pack.to_str().unwrap(),
+            relative_pack.to_str().unwrap(),
             "--mode",
             "isolated_checks",
             "--scope",
@@ -2766,7 +2768,7 @@ fn execution_prepare_inherits_local_namespace_when_source_has_no_pr() {
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn execution_rejects_namespace_and_pack_path_mismatch_before_creating_any_job() {
     let (repo, base, head) = ignored_review_fixture("execution-source-namespace");
