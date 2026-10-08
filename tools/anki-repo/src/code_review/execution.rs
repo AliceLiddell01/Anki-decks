@@ -539,7 +539,7 @@ pub fn open_job(root: &Path, directory: &Path) -> Result<PreparedJob, DomainErro
         || metadata.owner_nonce.len() != 32
     {
         return Err(invalid(
-            "job path или ownership identity не соответствует manifest",
+            "Путь задания или идентификатор владельца не соответствует манифесту",
         ));
     }
     let job = PreparedJob {
@@ -1081,8 +1081,8 @@ fn cleanup_descriptor_path(directory: &File) -> Result<PathBuf, DomainError> {
     {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
-        // PID относится к исполнителю: дочерний Git может читать descriptor
-        // родителя, хотя его собственные descriptors закрываются при exec.
+        // PID относится к исполнителю: дочерний Git может читать дескриптор
+        // родителя, хотя его собственные дескрипторы закрываются при exec.
         let path = PathBuf::from(format!(
             "/proc/{}/fd/{}",
             std::process::id(),
@@ -1092,7 +1092,7 @@ fn cleanup_descriptor_path(directory: &File) -> Result<PathBuf, DomainError> {
         let anchored = fs::metadata(&path).map_err(read_error)?;
         if direct.dev() != anchored.dev() || direct.ino() != anchored.ino() {
             return Err(conflict(
-                "Закреплённый каталог /proc не соответствует descriptor",
+                "Закреплённый каталог /proc не соответствует дескриптору",
             ));
         }
         Ok(path)
@@ -1358,11 +1358,11 @@ fn validate_request(request: &CommandRequest) -> Result<(), DomainError> {
     if let EnvironmentPolicy::Explicit { values } = &request.options.environment {
         for (key, value) in values {
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
-                return Err(invalid("неверная environment variable"));
+                return Err(invalid("Неверная переменная окружения"));
             }
             if PRIVATE_ENV.contains(&key.as_str()) {
                 return Err(invalid(format!(
-                    "job-private variable {key} не переопределяется"
+                    "Переменная собственного пути задания {key} не переопределяется"
                 )));
             }
             if key.len().saturating_add(value.len()) > MAX_REQUEST_ARGUMENT_BYTES {
@@ -1527,7 +1527,7 @@ fn verify_snapshot(root: &Path, target: &GitTarget) -> Result<(), DomainError> {
         .map_err(|e| invalid(format!("Git snapshot недоступен: {e}")))?;
     if collected.target != *target {
         return Err(invalid(
-            "repository/base/head/merge-base identity не соответствует Git objects",
+            "Идентичность репозитория и base/head/merge-base не соответствует объектам Git",
         ));
     }
     Ok(())
@@ -1867,7 +1867,7 @@ fn platform_supported() -> Result<(), DomainError> {
     ))
 }
 
-// Все собственные файлы открываются через directory descriptors и O_NOFOLLOW.
+// Все собственные файлы открываются через дескрипторы каталогов и O_NOFOLLOW.
 // Это исключает чтение/публикацию по symlink, включая последний компонент.
 #[cfg(unix)]
 pub(super) fn safe_dir(path: &Path) -> Result<File, DomainError> {
@@ -1888,7 +1888,7 @@ pub(super) fn safe_dir(path: &Path) -> Result<File, DomainError> {
                     .map_err(|error| match error {
                         rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => DomainError::new(
                             ErrorCode::InvalidRequest,
-                            "review workspace path содержит symlink или не-каталог",
+                            "Путь пространства ревью содержит symlink или не-каталог",
                         ),
                         _ => read_error(error.into()),
                     })?,
@@ -1926,7 +1926,7 @@ pub(super) fn ensure_dir(path: &Path) -> Result<(), DomainError> {
                 .map_err(|error| match error {
                     rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => DomainError::new(
                         ErrorCode::InvalidRequest,
-                        "review workspace path содержит symlink или не-каталог",
+                        "Путь пространства ревью содержит symlink или не-каталог",
                     ),
                     _ => write_error(error.into()),
                 })?,
@@ -1953,7 +1953,7 @@ fn open_file(directory: &File, name: &str, create: bool) -> Result<File, DomainE
     use rustix::fs::{Mode, OFlags, openat};
     if !valid_artifact_name(name) {
         return Err(invalid(
-            "имя job artifact должно быть одним безопасным компонентом",
+            "Имя артефакта задания должно быть одним безопасным компонентом",
         ));
     }
     let flags = if create {
@@ -1977,7 +1977,7 @@ fn open_file(directory: &File, name: &str, create: bool) -> Result<File, DomainE
         })?,
     );
     if !file.metadata().map_err(read_error)?.is_file() {
-        return Err(invalid("job artifact должен быть regular file"));
+        return Err(invalid("Артефакт задания должен быть обычным файлом"));
     }
     Ok(file)
 }
@@ -1990,7 +1990,7 @@ fn open_file(_directory: &File, _name: &str, _create: bool) -> Result<File, Doma
 fn read_bytes(directory: &Path, name: &str, max: u64) -> Result<Vec<u8>, DomainError> {
     let mut file = open_file(&safe_dir(directory)?, name, false)?;
     if file.metadata().map_err(read_error)?.len() > max {
-        return Err(invalid("job artifact превышает лимит чтения"));
+        return Err(invalid("Артефакт задания превышает лимит чтения"));
     }
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
@@ -1998,7 +1998,7 @@ fn read_bytes(directory: &Path, name: &str, max: u64) -> Result<Vec<u8>, DomainE
         .read_to_end(&mut bytes)
         .map_err(read_error)?;
     if bytes.len() as u64 > max {
-        return Err(invalid("job artifact вырос при чтении"));
+        return Err(invalid("Артефакт задания вырос при чтении"));
     }
     Ok(bytes)
 }
@@ -2040,7 +2040,7 @@ pub(super) fn write_new_fd(directory: &File, name: &str, bytes: &[u8]) -> std::i
     if !valid_artifact_name(name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "имя artifact должно быть одним безопасным компонентом",
+            "Имя артефакта должно быть одним безопасным компонентом",
         ));
     }
     #[cfg(unix)]
@@ -2096,7 +2096,7 @@ pub(super) fn read_optional_file_at(
 ) -> Result<Option<Vec<u8>>, DomainError> {
     if !valid_artifact_name(name) {
         return Err(invalid(
-            "имя review artifact должно быть одним безопасным компонентом",
+            "Имя артефакта ревью должно быть одним безопасным компонентом",
         ));
     }
     #[cfg(unix)]
@@ -2111,16 +2111,16 @@ pub(super) fn read_optional_file_at(
             Ok(file) => File::from(file),
             Err(rustix::io::Errno::NOENT) => return Ok(None),
             Err(rustix::io::Errno::LOOP) => {
-                return Err(conflict("review artifact не может быть symlink"));
+                return Err(conflict("Артефакт ревью не может быть symlink"));
             }
             Err(error) => return Err(read_error(error.into())),
         };
         let metadata = file.metadata().map_err(read_error)?;
         if !metadata.is_file() {
-            return Err(conflict("review artifact должен быть regular file"));
+            return Err(conflict("Артефакт ревью должен быть обычным файлом"));
         }
         if metadata.len() > max_bytes {
-            return Err(invalid("review artifact превышает лимит чтения"));
+            return Err(invalid("Артефакт ревью превышает лимит чтения"));
         }
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
@@ -2128,7 +2128,7 @@ pub(super) fn read_optional_file_at(
             .read_to_end(&mut bytes)
             .map_err(read_error)?;
         if bytes.len() as u64 > max_bytes {
-            return Err(invalid("review artifact вырос при чтении"));
+            return Err(invalid("Артефакт ревью вырос при чтении"));
         }
         Ok(Some(bytes))
     }
@@ -2145,7 +2145,7 @@ pub(super) fn replace_file_at(directory: &File, name: &str, bytes: &[u8]) -> std
     if !valid_artifact_name(name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "имя review artifact должно быть одним безопасным компонентом",
+            "Имя артефакта ревью должно быть одним безопасным компонентом",
         ));
     }
     #[cfg(unix)]
@@ -2215,7 +2215,7 @@ fn write_document<T: Serialize>(
     replace: bool,
 ) -> Result<(), DomainError> {
     let mut bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| invalid(format!("не удалось сериализовать job artifact: {e}")))?;
+        .map_err(|e| invalid(format!("Не удалось сериализовать артефакт задания: {e}")))?;
     bytes.push(b'\n');
     let dir = safe_dir(directory)?;
     if !replace {
@@ -3397,7 +3397,7 @@ mod tests {
         assert!(unrelated.is_dir());
         let job = repo.prepare(ExecutionMode::IsolatedChecks);
         save_state(&job, LifecycleStatus::Running, false).unwrap();
-        // Соседний spawn может кратко унаследовать CLOEXEC descriptor до exec.
+        // Соседний spawn может кратко унаследовать дескриптор CLOEXEC до exec.
         // В этом окне flock действительно активен; ждём его освобождения,
         // сохраняя проверку того, что прерванное задание распознаётся.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3435,7 +3435,7 @@ mod tests {
             fs::read(neighbor.directory.join("target/foreign-marker")).unwrap(),
             b"foreign"
         );
-        // Git получает descriptor исходного worktree. После перемещения
+        // Git получает дескриптор исходного worktree. После перемещения
         // регистрация не совпадает: ожидается отказ, сосед не удаляется.
         assert!(remove_cleanup_worktree(&owned, &directory, &surfaces).is_err());
         assert_eq!(
