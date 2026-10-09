@@ -2745,15 +2745,7 @@ fn search_distinguishes_match_kinds_and_paginates() {
         },
     )
     .unwrap();
-    if exact.cases.len() != 1 {
-        for case in &exact.cases {
-            eprintln!(
-                "EXACT {} kind={:?} finding={:?} disposition={:?}",
-                case.case_id, case.match_kind, case.finding_id, case.disposition
-            );
-        }
-    }
-    assert_eq!(exact.cases.len(), 1);
+    assert_eq!(exact.cases.len(), 1, "{:#?}", exact.cases);
     assert_eq!(
         exact.cases[0].match_kind,
         learning::search::SearchMatchKind::ExactStructural

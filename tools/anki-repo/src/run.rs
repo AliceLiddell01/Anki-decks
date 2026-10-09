@@ -2782,7 +2782,7 @@ mod learning_cli {
             Ok(existing) => {
                 if same_feedback_content(&existing, &event) {
                     if feedback::is_event_active(&store, &existing.event_id)? {
-                        return Ok(noop_feedback_result(&store, &event));
+                        return noop_feedback_result(&store, &event);
                     }
                     return Err(DomainError::with_details(
                         ErrorCode::LearningConflict,
@@ -3336,18 +3336,20 @@ mod learning_cli {
     }
 
     /// Идемпотентный повтор: событие уже записано с тем же содержанием.
-    fn noop_feedback_result(store: &LearningStore, event: &FeedbackEvent) -> FeedbackResult {
-        FeedbackResult {
+    fn noop_feedback_result(
+        store: &LearningStore,
+        event: &FeedbackEvent,
+    ) -> Result<FeedbackResult, DomainError> {
+        Ok(FeedbackResult {
             schema_version: FEEDBACK_SCHEMA_VERSION,
             event_id: event.event_id.clone(),
             superseded_event_id: None,
             retracted_event_id: None,
-            outcome: feedback::outcome(store, &event.review_id, &event.unit_id)
-                .unwrap_or_else(|_| feedback::empty_outcome()),
+            outcome: feedback::outcome(store, &event.review_id, &event.unit_id)?,
             limitations: vec![
                 "Событие с тем же содержанием уже записано: повтор не создал дубликата.".to_owned(),
             ],
-        }
+        })
     }
 
     fn accumulate(target: &mut ObservationCounts, source: &ObservationCounts) {
@@ -3370,7 +3372,63 @@ mod learning_cli {
     }
 
     fn short_sha(sha: &str) -> &str {
-        &sha[..sha.len().min(12)]
+        let end = sha
+            .char_indices()
+            .nth(12)
+            .map_or(sha.len(), |(index, _)| index);
+        &sha[..end]
+    }
+
+    #[cfg(test)]
+    mod unit_tests {
+        use super::*;
+
+        #[test]
+        fn short_sha_truncates_at_utf8_character_boundaries() {
+            assert_eq!(short_sha("12345678901日語"), "12345678901日");
+        }
+
+        #[test]
+        fn noop_feedback_result_propagates_outcome_read_errors() {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "anki-learning-feedback-outcome-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let store =
+                LearningStore::open(StoreOptions::at(directory.join("state.sqlite"))).unwrap();
+            store
+                .connection()
+                .execute_batch("DROP TABLE learning_feedback")
+                .unwrap();
+            let event = FeedbackEvent {
+                schema_version: FEEDBACK_SCHEMA_VERSION,
+                event_id: "repeated-event".into(),
+                review_id: "review".into(),
+                unit_id: "unit".into(),
+                candidate_id: None,
+                kind: FeedbackKind::SemanticOutcomeRevision,
+                action: FeedbackAction::Append,
+                supersedes_event_id: None,
+                effective_disposition: Some("confirmed".into()),
+                usefulness: None,
+                explanation: "synthetic event".into(),
+                provenance: "reviewer".into(),
+                recorded_at: 1,
+            };
+
+            let error = noop_feedback_result(&store, &event).unwrap_err();
+            assert_eq!(error.code, ErrorCode::LearningStorageUnavailable);
+
+            drop(store);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     fn feature_key(key: &BTreeMap<String, String>) -> String {

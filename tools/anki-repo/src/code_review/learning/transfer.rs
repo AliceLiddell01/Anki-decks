@@ -349,8 +349,7 @@ fn verify_review_lineage(review_ids: &BTreeMap<&str, &ImportRecord>) -> Result<(
                 || parent.base_sha != current.base_sha
                 || parent.merge_base_sha != current.merge_base_sha
                 || parent.workspace_variant != current.workspace_variant
-                || (current.trust == TrustLevel::AstAuthenticated
-                    && parent.trust != TrustLevel::AstAuthenticated)
+                || parent.trust != current.trust
             {
                 return Err(invalid(
                     "Преемственность ревью пересекает Git-случаи или границу доверия",

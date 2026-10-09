@@ -773,6 +773,11 @@ pub fn map_error(error: &rusqlite::Error, context: &str) -> DomainError {
             busy(error)
         }
         Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => corrupt(),
+        Some(rusqlite::ErrorCode::ConstraintViolation) => DomainError::with_details(
+            ErrorCode::LearningConflict,
+            format!("{context}: {error}"),
+            crate::details! { "sqlite_error" => error.to_string() },
+        ),
         None if matches!(
             error,
             rusqlite::Error::FromSqlConversionFailure(..) | rusqlite::Error::InvalidColumnType(..)

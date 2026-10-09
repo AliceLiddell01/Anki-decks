@@ -2126,26 +2126,8 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
     );
     review_commands(&fixture);
 
-    // Недоступная база: запись невозможна, обычное ревью продолжает работать.
-    assert_error(
-        &fixture,
-        &[
-            "code-review",
-            "learning",
-            "import",
-            "--db",
-            "src/lib.rs/unavailable.sqlite",
-            "--pack",
-            &fixture.pack(&head),
-            "--queue",
-            &fixture.queue(&head),
-        ],
-        "learning_storage_unavailable",
-    );
-    review_commands(&fixture);
-
-    // Путь базы под обычным файлом не может стать каталогом ни под root,
-    // ни при иных режимах доступа.
+    // Путь к базе проходит через обычный файл: запись невозможна, обычное
+    // ревью продолжает работать.
     assert_error(
         &fixture,
         &[

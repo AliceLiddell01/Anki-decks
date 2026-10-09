@@ -364,6 +364,17 @@ fn invalid_archives_with_valid_digest_fail_without_changing_existing_history() {
         event("second", FeedbackAction::Retract, Some("semantic")),
     ];
     mutations.push(archive);
+    let mut archive = original.clone();
+    let mut quarantined_revision = archive.reviews[0].clone();
+    quarantined_revision.review_id = "quarantined-revision".into();
+    quarantined_revision.trust = TrustLevel::StructureOnlyQuarantine;
+    quarantined_revision.revision_of = Some("review".into());
+    quarantined_revision.superseded_by = None;
+    quarantined_revision.head_sha = "quarantined-head".into();
+    quarantined_revision.inputs.review_pack_sha256 = "quarantined-pack".into();
+    archive.reviews[0].superseded_by = Some(quarantined_revision.review_id.clone());
+    archive.reviews.push(quarantined_revision);
+    mutations.push(archive);
     for mut invalid in mutations {
         seal(&mut invalid);
         assert_eq!(
@@ -417,7 +428,12 @@ fn global_feedback_collision_rolls_back_all_new_reviews_and_preserves_local_audi
     let before = learning::transfer::export_history(&destination)
         .unwrap()
         .archive;
-    assert!(learning::transfer::restore_history(&destination, &archive).is_err());
+    assert_eq!(
+        learning::transfer::restore_history(&destination, &archive)
+            .unwrap_err()
+            .code,
+        ErrorCode::LearningConflict
+    );
     assert_eq!(
         before,
         learning::transfer::export_history(&destination)
