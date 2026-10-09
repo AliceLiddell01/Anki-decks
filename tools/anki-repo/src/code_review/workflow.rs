@@ -583,31 +583,77 @@ fn load_validated_review_queue(
     Ok((pack, queue, summary, syntax_authenticity))
 }
 
-fn validate_queue_authenticity(
-    queue: &ReviewQueue,
+/// Проверенная очередь вместе с точными байтами пакета, сводкой и контекстами.
+pub(crate) type LoadedReviewQueue = (
+    ReviewPack,
+    Vec<u8>,
+    ReviewQueue,
+    QueueSummary,
+    SyntaxAuthenticityStatus,
+    BTreeMap<String, review_queue::SyntaxContext>,
+);
+
+/// Проверенное чтение очереди вместе с точными байтами пакета и контекстами.
+///
+/// Отдельная точка входа нужна вызывающим, которым кроме сводки требуются точные
+/// байты `review.json` и авторитетные контексты разбора. Доверенный путь с
+/// `structure_only = false` восстанавливает контексты по точным Git-образам
+/// снимка; при их недоступности возвращается `syntax_authenticity_unavailable`,
+/// а не молчаливый переход к структурной проверке.
+pub(crate) fn load_validated_review_queue_with_contexts(
+    pack_path: &Path,
+    queue_path: &Path,
+    structure_only: bool,
+) -> Result<LoadedReviewQueue, DomainError> {
+    let (pack, pack_bytes) = read_review_pack(pack_path)?;
+    let queue = read_json(
+        queue_path,
+        MAX_REVIEW_ARTIFACT_BYTES,
+        "структурная очередь code-review",
+    )?;
+    let source_pack_sha256 = sha256_hex(&pack_bytes);
+    if structure_only {
+        let summary = review_queue::validate(&queue, &pack, &source_pack_sha256)?;
+        return Ok((
+            pack,
+            pack_bytes,
+            queue,
+            summary,
+            SyntaxAuthenticityStatus::StructureOnly,
+            BTreeMap::new(),
+        ));
+    }
+    let contexts = queue_contexts_for_pack(&pack)?;
+    let summary =
+        review_queue::validate_with_syntax(&queue, &pack, &source_pack_sha256, &contexts)?;
+    Ok((
+        pack,
+        pack_bytes,
+        queue,
+        summary,
+        SyntaxAuthenticityStatus::Verified,
+        contexts,
+    ))
+}
+
+/// Восстанавливает авторитетные контексты классификации по точным Git-образам.
+///
+/// Публикуется внутри crate, чтобы независимые от CLI потребители (например
+/// импорт истории learning) проверяли очередь той же самой логикой, а не второй
+/// расходящейся копией.
+pub(crate) fn queue_contexts_for_pack(
     pack: &ReviewPack,
-    source_pack_sha256: &str,
-) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+) -> Result<BTreeMap<String, review_queue::SyntaxContext>, DomainError> {
     let root = repository_root(Path::new("."))
         .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
-    validate_queue_authenticity_in_repository(&root, queue, pack, source_pack_sha256)
+    queue_contexts_in_repository(&root, pack)
 }
 
-fn syntax_authenticity_unavailable(detail: String) -> DomainError {
-    DomainError::new(
-        ErrorCode::SyntaxAuthenticityUnavailable,
-        format!(
-            "точные образы Git для проверки подлинности синтаксической классификации недоступны: {detail}; используйте явный --structure-only, если достаточно проверки структуры и digest"
-        ),
-    )
-}
-
-fn validate_queue_authenticity_in_repository(
+/// Восстанавливает контексты из указанного корня репозитория.
+pub(crate) fn queue_contexts_in_repository(
     root: &Path,
-    queue: &ReviewQueue,
     pack: &ReviewPack,
-    source_pack_sha256: &str,
-) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+) -> Result<BTreeMap<String, review_queue::SyntaxContext>, DomainError> {
     let collected = scope::collect_scope(root, &pack.target.base_sha, &pack.target.head_sha)
         .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
     if collected.target.repository_id != pack.target.repository_id
@@ -633,6 +679,35 @@ fn validate_queue_authenticity_in_repository(
             "AST одного из исходников Rust разобрать не удалось; используйте явный --structure-only, если достаточно проверки структуры и digest",
         ));
     }
+    Ok(contexts)
+}
+
+fn validate_queue_authenticity(
+    queue: &ReviewQueue,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+    let root = repository_root(Path::new("."))
+        .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
+    validate_queue_authenticity_in_repository(&root, queue, pack, source_pack_sha256)
+}
+
+fn syntax_authenticity_unavailable(detail: String) -> DomainError {
+    DomainError::new(
+        ErrorCode::SyntaxAuthenticityUnavailable,
+        format!(
+            "точные образы Git для проверки подлинности синтаксической классификации недоступны: {detail}; используйте явный --structure-only, если достаточно проверки структуры и digest"
+        ),
+    )
+}
+
+fn validate_queue_authenticity_in_repository(
+    root: &Path,
+    queue: &ReviewQueue,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+    let contexts = queue_contexts_in_repository(root, pack)?;
     let summary = review_queue::validate_with_syntax(queue, pack, source_pack_sha256, &contexts)?;
     Ok((summary, SyntaxAuthenticityStatus::Verified))
 }
@@ -2595,7 +2670,7 @@ fn reject_symlink_path(root: &Path, requested: &Path) -> Result<(), DomainError>
 }
 
 /// Сохраняет исходный артефакт однократно; повтор допустим только с теми же байтами.
-fn write_review_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainError> {
+pub(crate) fn write_review_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -2786,7 +2861,7 @@ fn lock_review_workspace(
     Ok(file)
 }
 
-fn review_workspace_file(
+pub(crate) fn review_workspace_file(
     root: &Path,
     pack_path: &Path,
     pack: &ReviewPack,
@@ -2834,7 +2909,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn safe_output_path(
+pub(crate) fn safe_output_path(
     root: &Path,
     requested: &Path,
     directory: bool,

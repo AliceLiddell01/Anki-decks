@@ -16,6 +16,10 @@ mod edit_contract;
 mod edit_source_preservation;
 #[path = "export_contract.rs"]
 mod export_contract;
+#[path = "learning_cli_contract.rs"]
+mod learning_cli_contract;
+#[path = "learning_contract.rs"]
+mod learning_contract;
 #[path = "note_lifecycle_contract.rs"]
 mod note_lifecycle_contract;
 #[path = "qa_contract.rs"]

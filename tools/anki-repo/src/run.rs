@@ -970,6 +970,9 @@ fn execute_with_cancellation(
                     })
                 }
             },
+            CodeReviewCommand::Learning { db, command } => {
+                learning_cli::execute(db.as_deref(), command, cli.json)
+            }
         },
 
         Command::Language { command } => match command {
@@ -1159,6 +1162,7 @@ fn execution_lifecycle_label(
 ) -> &'static str {
     use crate::code_review::execution::LifecycleStatus;
     match status {
+        LifecycleStatus::Preparing => "идёт подготовка",
         LifecycleStatus::Prepared => "подготовлено",
         LifecycleStatus::Running => "выполняется",
         LifecycleStatus::Completed => "завершено",
@@ -2067,6 +2071,2189 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
                 code = error.code.as_str(),
                 message = error.message
             ),
+        )
+    }
+}
+
+/// Реализация подкоманды `code-review learning`.
+///
+/// Здесь только CLI-слой: разбор аргументов, вызов публичного API
+/// `code_review::learning`, ограничение вывода и подготовка русского human
+/// output либо JSON DTO. Доменные решения — поддержка, карантин, guardrails и
+/// допустимые исходы — остаются в `code_review::learning`: CLI не пересчитывает
+/// статистику, не создаёт семантических решений и не меняет исходные артефакты
+/// ревью.
+///
+/// Читающие команды не создают базу: отсутствие истории — это состояние
+/// обычного ревью, а не ошибка. Производные артефакты публикуются по правилам
+/// набора: `recommend --out` — только как `recommendations.json` в рабочей
+/// области своего пакета, `export` и `policy approve` — только по явному
+/// безопасному пути внутри репозитория; чужие байты не перезаписываются.
+mod learning_cli {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Component, Path, PathBuf};
+    use std::process::Command;
+
+    use serde::Serialize;
+    use serde_json::Value;
+
+    use crate::cli::{
+        LearningCommand, LearningDispositionArg, LearningFeedbackActionArg,
+        LearningFeedbackCommand, LearningFeedbackKindArg, LearningPolicyCommand,
+        LearningUsefulnessArg,
+    };
+    use crate::code_review::learning::feedback::{
+        self, CaseAudit, FEEDBACK_SCHEMA_VERSION, POLICY_SCHEMA_VERSION,
+    };
+    use crate::code_review::learning::import::{self, ImportRequest};
+    use crate::code_review::learning::lifecycle::ForgetOutcome;
+    use crate::code_review::learning::model::{
+        CaseRef, FeedbackAction, FeedbackEvent, FeedbackKind, FeedbackResult, HistoryGeneration,
+        ImportRecord, ImportStatus, LearningExport, LearningExportManifest, LearningStatus,
+        ObservationCounts, PatternReport, PolicyProposal, Recommendation, Recommendations,
+        SupportSummary, TrustLevel,
+    };
+    use crate::code_review::learning::patterns::{self, PatternQuery};
+    use crate::code_review::learning::recommend::{self, RecommendRequest};
+    use crate::code_review::learning::search::{self, SearchQuery};
+    use crate::code_review::learning::store::{self, LearningStore, StoreOptions};
+    use crate::code_review::learning::transfer::{self, RestoreSummary};
+    use crate::code_review::learning::{LEARNING_POLICY_VERSION, LEARNING_SCHEMA_VERSION};
+    use crate::code_review::workflow::{
+        review_workspace_file, safe_output_path, write_review_document_once,
+    };
+    use crate::error::{DomainError, ErrorCode};
+    use crate::render::json;
+
+    use super::Rendered;
+
+    /// Имя производного документа рекомендаций в рабочей области ревью.
+    const RECOMMENDATIONS_ARTIFACT: &str = "recommendations.json";
+    /// Предел числа идентификаторов кандидатов в одном элементе вывода.
+    const OUTPUT_CANDIDATE_LIMIT: usize = 3;
+    /// Предел числа противоречащих единиц в одном правиле вывода.
+    const OUTPUT_CONTRADICTING_LIMIT: usize = 10;
+    /// Предел числа исторических случаев в одной подсказке вывода.
+    const OUTPUT_CASE_LIMIT: usize = 5;
+
+    /// Выполняет выбранную операцию learning и готовит её вывод.
+    pub(super) fn execute(
+        db: Option<&Path>,
+        command: &LearningCommand,
+        json_mode: bool,
+    ) -> Result<Rendered, DomainError> {
+        dispatch(db, command, json_mode).map_err(mark_temporary)
+    }
+
+    /// Помечает временную занятость базы как повторяемую операцию.
+    ///
+    /// Код `learning_storage_busy` остаётся кодом `t1`; добавка только называет
+    /// причину в терминах набора: удержанная транзакция заканчивается сама, а
+    /// постоянный конфликт артефакта — нет.
+    fn mark_temporary(mut error: DomainError) -> DomainError {
+        if error.code == ErrorCode::LearningStorageBusy
+            && let Value::Object(details) = &mut error.details
+        {
+            details.insert("retryable".to_owned(), Value::Bool(true));
+            details.insert("resource".to_owned(), Value::String("learning".to_owned()));
+        }
+        error
+    }
+
+    fn dispatch(
+        db: Option<&Path>,
+        command: &LearningCommand,
+        json_mode: bool,
+    ) -> Result<Rendered, DomainError> {
+        let root = repository_root()?;
+        match command {
+            LearningCommand::Import {
+                pack,
+                queue,
+                triage,
+                execution,
+                structure_only,
+                variant,
+                label,
+            } => {
+                let options = ImportOptions {
+                    pack,
+                    queue,
+                    triage: triage.as_deref(),
+                    execution,
+                    structure_only: *structure_only,
+                    variant,
+                    label: label.as_deref(),
+                };
+                let outcome = import_history(&root, db, &options)?;
+                let human = human_import(&outcome);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &outcome,
+                    human,
+                ))
+            }
+            LearningCommand::Status => {
+                let status = read_status(&root, db)?;
+                let human = human_status(&status, false);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &status,
+                    human,
+                ))
+            }
+            LearningCommand::Validate => {
+                let status = validate(&root, db)?;
+                let human = human_status(&status, true);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &status,
+                    human,
+                ))
+            }
+            LearningCommand::Stats {
+                include_quarantine,
+                limit,
+            } => {
+                let output = stats(&root, db, *include_quarantine, to_usize(*limit))?;
+                let human = human_stats(&output);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningCommand::Patterns {
+                detector,
+                role,
+                code_role,
+                origin,
+                include_quarantine,
+                limit,
+                require_supported,
+            } => {
+                let query = PatternQuery {
+                    limit: to_usize(*limit),
+                    detector: detector.clone(),
+                    role: role.map(|value| value.as_str().to_owned()),
+                    code_role: code_role.map(|value| value.as_str().to_owned()),
+                    origin: origin.clone(),
+                    include_quarantine: *include_quarantine,
+                    now: None,
+                };
+                let output = patterns_report(&root, db, &query, *require_supported)?;
+                let human = human_patterns(&output);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningCommand::Search {
+                text,
+                detector,
+                surface,
+                origin,
+                role,
+                code_role,
+                disposition,
+                provenance,
+                severity,
+                repository,
+                include_quarantine,
+                limit,
+                offset,
+            } => {
+                let query = SearchQuery {
+                    text: text.clone(),
+                    detector: detector.clone(),
+                    surface: surface.map(|value| value.as_str().to_owned()),
+                    origin: origin.clone(),
+                    role: role.map(|value| value.as_str().to_owned()),
+                    code_role: code_role.map(|value| value.as_str().to_owned()),
+                    disposition: disposition.map(|value| value.as_str().to_owned()),
+                    provenance: provenance.clone(),
+                    severity: severity.clone(),
+                    repository_id: repository.clone(),
+                    include_quarantine: *include_quarantine,
+                    offset: to_usize(*offset),
+                    limit: to_usize(*limit),
+                };
+                let page = search_history(&root, db, &query)?;
+                let human = human_search(&page);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &page,
+                    human,
+                ))
+            }
+            LearningCommand::Recommend {
+                pack,
+                queue,
+                triage,
+                structure_only,
+                variant,
+                label,
+                limit,
+                case_limit,
+                history_revision,
+                policy_version,
+                without_learning,
+                require_history,
+                out,
+            } => {
+                let options = RecommendOptions {
+                    pack,
+                    queue,
+                    triage: triage.as_deref(),
+                    structure_only: *structure_only,
+                    variant,
+                    label: label.as_deref(),
+                    limit: to_usize(*limit),
+                    case_limit: to_usize(*case_limit),
+                    history_revision: *history_revision,
+                    policy_version: *policy_version,
+                    without_learning: *without_learning,
+                    require_history: *require_history,
+                    out: out.as_deref(),
+                };
+                let output = recommendations(&root, db, &options)?;
+                let human = human_recommendations(&output);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningCommand::Feedback { command } => {
+                feedback_command(&root, db, command, json_mode)
+            }
+            LearningCommand::Export { out } => {
+                let output = export(&root, db, out)?;
+                let human = human_export(&output);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningCommand::Backup { out } => {
+                let output = backup(&root, db, out)?;
+                let human = human_backup(&output);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningCommand::Restore { archive } => {
+                let output = restore(&root, db, archive)?;
+                let human = human_restore(&output);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningCommand::Forget { review_id, confirm } => {
+                if !confirm {
+                    return Err(invalid_request(
+                        "удаление истории необратимо: повторите команду с явным --confirm",
+                    ));
+                }
+                let store = open_required(&root, db)?;
+                let output = crate::code_review::learning::forget_review(&store, review_id)?;
+                let human = human_forget(&output);
+                Ok(rendered_output(
+                    command.command_name(),
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningCommand::Policy { command } => policy_command(&root, db, command, json_mode),
+        }
+    }
+
+    /// Собирает готовый к печати результат команды.
+    fn rendered_output<T: Serialize>(
+        name: &'static str,
+        json_mode: bool,
+        value: &T,
+        human: String,
+    ) -> Rendered {
+        Rendered {
+            command: name,
+            stdout: if json_mode {
+                json::generic_json(name, value)
+            } else {
+                human
+            },
+            exit: 0,
+        }
+    }
+
+    // ---- команды ----
+
+    /// Вход импорта одного ревью.
+    struct ImportOptions<'a> {
+        pack: &'a Path,
+        queue: &'a Path,
+        triage: Option<&'a Path>,
+        execution: &'a [PathBuf],
+        structure_only: bool,
+        variant: &'a str,
+        label: Option<&'a str>,
+    }
+
+    fn import_history(
+        root: &Path,
+        db: Option<&Path>,
+        options: &ImportOptions<'_>,
+    ) -> Result<import::ImportOutcome, DomainError> {
+        if options.execution.len() > 1 {
+            return Err(invalid_request(
+                "допускается не более одного --execution: запись истории хранит один завершённый результат изоляции",
+            ));
+        }
+        let variant = crate::code_review::learning::workspace_variant(options.variant)?;
+        let store = LearningStore::open(database_options(root, db, true)?)?;
+        let loaded = import::load_review_with_execution(
+            options.pack,
+            options.queue,
+            options.triage,
+            options.execution.first().map(PathBuf::as_path),
+            options.structure_only,
+        )?;
+        let request = ImportRequest {
+            workspace_variant: variant,
+            workspace_label: options.label.map(str::to_owned),
+        };
+        import::import_with_outcome(&store, &loaded, &request)
+    }
+
+    /// Состояние хранилища без создания базы.
+    fn read_status(root: &Path, db: Option<&Path>) -> Result<LearningStatus, DomainError> {
+        let options = database_options(root, db, false)?;
+        if !options.database.is_file() {
+            return Ok(absent_status(&options));
+        }
+        LearningStore::open(options)?.status()
+    }
+
+    /// Проверка схемы, целостности и поиска без изменения данных.
+    fn validate(root: &Path, db: Option<&Path>) -> Result<LearningStatus, DomainError> {
+        let options = database_options(root, db, false)?;
+        if !options.database.is_file() {
+            return Err(DomainError::with_details(
+                ErrorCode::NotFound,
+                "Локальная база learning не найдена: проверять нечего",
+                crate::details! {
+                    "database" => options.display_path.clone(),
+                    "recovery" => store::recovery_paths(&options.display_path),
+                },
+            ));
+        }
+        let store = LearningStore::open(options)?;
+        let status = store.status()?;
+        if status.user_version != LEARNING_SCHEMA_VERSION {
+            return Err(DomainError::with_details(
+                ErrorCode::LearningSchemaUnsupported,
+                format!(
+                    "Версия схемы базы learning {} не поддерживается этой сборкой: ожидается {LEARNING_SCHEMA_VERSION}",
+                    status.user_version
+                ),
+                crate::details! { "database" => status.database_path.clone() },
+            ));
+        }
+        // Проверка целостности вызывается явно: `status` сообщает только факт.
+        store.integrity_check()?;
+        Ok(status)
+    }
+
+    /// Агрегированная статистика по ограниченной странице истории.
+    fn stats(
+        root: &Path,
+        db: Option<&Path>,
+        include_quarantine: bool,
+        limit: usize,
+    ) -> Result<StatsOutput, DomainError> {
+        let store = open_required(root, db)?;
+        let generation = import::generation(&store)?;
+        let mut records =
+            import::list_imports(&store, include_quarantine, limit.saturating_add(1))?;
+        let truncated = records.len() > limit;
+        records.truncate(limit);
+        let mut observations = ObservationCounts::default();
+        for record in &records {
+            accumulate(&mut observations, &record.observations);
+        }
+        let dispositions = feedback::outcome_distribution(&store)?;
+        // Итог считает ровно тот набор записей, из которого строится страница:
+        // иначе «показано N из M» называло бы причину, которой нет.
+        let reviews_total = if include_quarantine {
+            generation.trusted_reviews + generation.quarantined_reviews
+        } else {
+            generation.trusted_reviews
+        };
+        Ok(StatsOutput {
+            schema_version: LEARNING_SCHEMA_VERSION,
+            policy_version: LEARNING_POLICY_VERSION,
+            database_path: store.options().display_path.clone(),
+            generation,
+            reviews_total,
+            reviews_shown: records.len(),
+            reviews_truncated: truncated,
+            observations,
+            dispositions,
+            reviews: records,
+            limitations: vec![
+                "Статистика опирается на независимые единицы наблюдения, а не на число кандидатов."
+                    .to_owned(),
+                "Доли исходов не являются precision/recall: история собрана выборочно.".to_owned(),
+                "Агрегат наблюдений посчитан по показанной странице записей, а не по всей истории."
+                    .to_owned(),
+            ],
+        })
+    }
+
+    /// Отчёт по объяснимым паттернам с фильтрами и лимитом.
+    fn patterns_report(
+        root: &Path,
+        db: Option<&Path>,
+        query: &PatternQuery,
+        require_supported: bool,
+    ) -> Result<PatternsOutput, DomainError> {
+        let store = open_required(root, db)?;
+        let report = patterns::pattern_report(&store, query)?;
+        patterns::require_supported(&report)?;
+        if require_supported && report.abstained {
+            return Err(DomainError::with_details(
+                ErrorCode::InsufficientEvidence,
+                "Ни один паттерн не имеет достаточной поддержки: вывод воздерживается",
+                crate::details! {
+                    "min_support_units" => report.min_support_units,
+                    "trusted_units" => report.generation.trusted_units,
+                },
+            ));
+        }
+        Ok(PatternsOutput::from_report(&report))
+    }
+
+    /// Локальный поиск исторических случаев.
+    fn search_history(
+        root: &Path,
+        db: Option<&Path>,
+        query: &SearchQuery,
+    ) -> Result<search::SearchPage, DomainError> {
+        let store = open_required(root, db)?;
+        search::search_history(&store, query)
+    }
+
+    /// Вход построения рекомендаций.
+    struct RecommendOptions<'a> {
+        pack: &'a Path,
+        queue: &'a Path,
+        triage: Option<&'a Path>,
+        structure_only: bool,
+        variant: &'a str,
+        label: Option<&'a str>,
+        limit: usize,
+        case_limit: usize,
+        history_revision: Option<u64>,
+        policy_version: Option<u32>,
+        without_learning: bool,
+        require_history: bool,
+        out: Option<&'a Path>,
+    }
+
+    fn recommendations(
+        root: &Path,
+        db: Option<&Path>,
+        options: &RecommendOptions<'_>,
+    ) -> Result<RecommendOutput, DomainError> {
+        if let Some(requested) = options.policy_version
+            && requested != LEARNING_POLICY_VERSION
+        {
+            return Err(DomainError::with_details(
+                ErrorCode::LearningSchemaUnsupported,
+                format!(
+                    "Запрошена версия политики learning {requested}: эта сборка реализует {LEARNING_POLICY_VERSION}"
+                ),
+                crate::details! { "policy_version" => LEARNING_POLICY_VERSION },
+            ));
+        }
+        let variant = crate::code_review::learning::workspace_variant(options.variant)?;
+        let store = if options.without_learning {
+            None
+        } else {
+            open_optional(root, db)?
+        };
+        let history = match store.as_ref() {
+            Some(store) => Some(import::generation(store)?),
+            None => None,
+        };
+        if let Some(expected) = options.history_revision {
+            let actual = history.as_ref().ok_or_else(|| {
+                DomainError::with_details(
+                    ErrorCode::SourceChanged,
+                    "Ожидалась конкретная ревизия истории learning, но история недоступна",
+                    crate::details! { "expected_revision" => expected },
+                )
+            })?;
+            if actual.revision != expected {
+                return Err(DomainError::with_details(
+                    ErrorCode::SourceChanged,
+                    format!(
+                        "Ожидалась ревизия истории {expected}, действующая — {}",
+                        actual.revision
+                    ),
+                    crate::details! {
+                        "expected_revision" => expected,
+                        "actual_revision" => actual.revision,
+                    },
+                ));
+            }
+        }
+        if options.require_history {
+            match history.as_ref() {
+                None => {
+                    return Err(DomainError::with_details(
+                        ErrorCode::NotFound,
+                        "Проверенная история learning недоступна, а она требуется явно",
+                        crate::details! {
+                            "database" => database_options(root, db, false)?.display_path,
+                        },
+                    ));
+                }
+                Some(actual) if actual.trusted_units == 0 => {
+                    return Err(DomainError::with_details(
+                        ErrorCode::InsufficientEvidence,
+                        "Проверенная история пуста: рекомендации не могут опираться на накопленные случаи",
+                        crate::details! { "trusted_units" => actual.trusted_units },
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        let loaded = import::load_review(
+            options.pack,
+            options.queue,
+            options.triage,
+            options.structure_only,
+        )?;
+        let request = RecommendRequest {
+            workspace_variant: variant,
+            workspace_label: options.label.map(str::to_owned),
+            limit: options.limit,
+            case_limit: options.case_limit,
+            now: 0,
+        };
+        let document = recommend::recommend(store.as_ref(), &loaded, &request)?;
+        let mut output = RecommendOutput::from_document(&document, loaded.queue.units.len());
+        if let Some(out) = options.out {
+            let bytes = to_json_bytes(&document)?;
+            let expected = review_workspace_file(
+                root,
+                options.pack,
+                &loaded.pack,
+                out,
+                RECOMMENDATIONS_ARTIFACT,
+            )?;
+            output.artifact = Some(publish_document(root, &expected, &bytes)?);
+        }
+        Ok(output)
+    }
+
+    fn feedback_command(
+        root: &Path,
+        db: Option<&Path>,
+        command: &LearningFeedbackCommand,
+        json_mode: bool,
+    ) -> Result<Rendered, DomainError> {
+        match command {
+            LearningFeedbackCommand::Record {
+                review_id,
+                unit_id,
+                candidate_id,
+                kind,
+                action,
+                disposition,
+                usefulness,
+                supersedes_event_id,
+                explanation,
+                provenance,
+                event_id,
+            } => {
+                let options = FeedbackRecordOptions {
+                    review_id,
+                    unit_id,
+                    candidate_id: candidate_id.as_deref(),
+                    kind: *kind,
+                    action: *action,
+                    disposition: *disposition,
+                    usefulness: *usefulness,
+                    supersedes_event_id: supersedes_event_id.as_deref(),
+                    explanation,
+                    provenance,
+                    event_id: event_id.as_deref(),
+                };
+                let result = record_feedback(root, db, &options)?;
+                let human = human_feedback_result(&result);
+                Ok(rendered_output(
+                    "code-review learning feedback record",
+                    json_mode,
+                    &result,
+                    human,
+                ))
+            }
+            LearningFeedbackCommand::List { review_id, unit_id } => {
+                let store = open_required(root, db)?;
+                let audit = feedback::audit_case(&store, review_id, unit_id)?;
+                let human = human_feedback_audit(&audit);
+                Ok(rendered_output(
+                    "code-review learning feedback list",
+                    json_mode,
+                    &audit,
+                    human,
+                ))
+            }
+            LearningFeedbackCommand::Show { event_id } => {
+                let store = open_required(root, db)?;
+                let event = feedback::show_event(&store, event_id)?;
+                let human = human_feedback_event(&event);
+                Ok(rendered_output(
+                    "code-review learning feedback show",
+                    json_mode,
+                    &event,
+                    human,
+                ))
+            }
+        }
+    }
+
+    /// Вход записи события обратной связи.
+    struct FeedbackRecordOptions<'a> {
+        review_id: &'a str,
+        unit_id: &'a str,
+        candidate_id: Option<&'a str>,
+        kind: LearningFeedbackKindArg,
+        action: LearningFeedbackActionArg,
+        disposition: Option<LearningDispositionArg>,
+        usefulness: Option<LearningUsefulnessArg>,
+        supersedes_event_id: Option<&'a str>,
+        explanation: &'a str,
+        provenance: &'a str,
+        event_id: Option<&'a str>,
+    }
+
+    fn record_feedback(
+        root: &Path,
+        db: Option<&Path>,
+        options: &FeedbackRecordOptions<'_>,
+    ) -> Result<FeedbackResult, DomainError> {
+        let store = LearningStore::open(database_options(root, db, true)?)?;
+        let kind = match options.kind {
+            LearningFeedbackKindArg::Usefulness => FeedbackKind::RecommendationUsefulness,
+            LearningFeedbackKindArg::SemanticOutcomeRevision => {
+                FeedbackKind::SemanticOutcomeRevision
+            }
+        };
+        let action = match options.action {
+            LearningFeedbackActionArg::Append => FeedbackAction::Append,
+            LearningFeedbackActionArg::Retract => FeedbackAction::Retract,
+            LearningFeedbackActionArg::Supersede => FeedbackAction::Supersede,
+        };
+        let effective_disposition = options.disposition.map(LearningDispositionArg::as_str);
+        let usefulness = options.usefulness.map(LearningUsefulnessArg::as_str);
+        if explanation_is_empty(options.explanation) {
+            return Err(invalid_request(
+                "Объяснение утверждения не может быть пустым",
+            ));
+        }
+        let event_id = match options.event_id {
+            Some(id) => id.to_owned(),
+            None => feedback::event_id_for(&format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                options.review_id,
+                options.unit_id,
+                options.candidate_id.unwrap_or_default(),
+                kind.as_str(),
+                action_name(action),
+                effective_disposition.unwrap_or_default(),
+                usefulness.unwrap_or_default(),
+                options.supersedes_event_id.unwrap_or_default(),
+                options.explanation,
+                options.provenance,
+            )),
+        };
+        let event = FeedbackEvent {
+            schema_version: FEEDBACK_SCHEMA_VERSION,
+            event_id: event_id.clone(),
+            review_id: options.review_id.to_owned(),
+            unit_id: options.unit_id.to_owned(),
+            candidate_id: options.candidate_id.map(str::to_owned),
+            kind,
+            action,
+            supersedes_event_id: options.supersedes_event_id.map(str::to_owned),
+            effective_disposition: effective_disposition.map(str::to_owned),
+            usefulness: usefulness.map(str::to_owned),
+            explanation: options.explanation.to_owned(),
+            provenance: options.provenance.to_owned(),
+            recorded_at: unix_now(),
+        };
+        match feedback::show_event(&store, &event_id) {
+            Ok(existing) => {
+                if same_feedback_content(&existing, &event) {
+                    return Ok(noop_feedback_result(&store, &event));
+                }
+                return Err(DomainError::with_details(
+                    ErrorCode::LearningConflict,
+                    format!(
+                        "Событие обратной связи {event_id} уже существует с другим содержанием"
+                    ),
+                    crate::details! { "event_id" => event_id },
+                ));
+            }
+            Err(error) if error.code == ErrorCode::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        feedback::record_feedback(&store, &event)
+    }
+
+    fn export(root: &Path, db: Option<&Path>, out: &Path) -> Result<ExportOutput, DomainError> {
+        let store = open_required(root, db)?;
+        let summary = transfer::export_history(&store)?;
+        let bytes = to_json_bytes(&summary.archive)?;
+        let artifact = publish_derived_document(root, out, &bytes)?;
+        Ok(ExportOutput {
+            manifest: summary.manifest,
+            artifact,
+        })
+    }
+
+    fn backup(root: &Path, db: Option<&Path>, out: &Path) -> Result<BackupOutput, DomainError> {
+        let store = open_required(root, db)?;
+        let target = local_output_path(root, out)?;
+        if target.exists() {
+            return Err(DomainError::with_details(
+                ErrorCode::ReviewArtifactConflict,
+                "Файл назначения backup уже существует; перезапись не выполняется",
+                crate::details! { "path" => display_path(root, &target) },
+            ));
+        }
+        store.backup_to(&target)?;
+        let bytes = fs::metadata(&target)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        Ok(BackupOutput {
+            database_path: store.options().display_path.clone(),
+            destination: display_path(root, &target),
+            bytes,
+        })
+    }
+
+    fn restore(
+        root: &Path,
+        db: Option<&Path>,
+        archive: &Path,
+    ) -> Result<RestoreOutput, DomainError> {
+        let store = LearningStore::open(database_options(root, db, true)?)?;
+        let bytes = fs::read(archive).map_err(|error| {
+            DomainError::new(
+                ErrorCode::InputUnreadable,
+                format!("не удалось прочитать архив learning: {error}"),
+            )
+        })?;
+        let document: LearningExport = serde_json::from_slice(&bytes).map_err(|error| {
+            DomainError::new(
+                ErrorCode::LearningExportInvalid,
+                format!("Некорректный JSON архива learning: {error}"),
+            )
+        })?;
+        let summary = transfer::restore_history(&store, &document)?;
+        Ok(RestoreOutput {
+            archive: display_path(root, archive),
+            summary,
+        })
+    }
+
+    fn policy_command(
+        root: &Path,
+        db: Option<&Path>,
+        command: &LearningPolicyCommand,
+        json_mode: bool,
+    ) -> Result<Rendered, DomainError> {
+        match command {
+            LearningPolicyCommand::Propose { signature, rule_id } => {
+                let store = LearningStore::open(database_options(root, db, true)?)?;
+                if patterns::support_for_signature(&store, signature, unix_now())?.is_none() {
+                    return Err(DomainError::with_details(
+                        ErrorCode::NotFound,
+                        "Паттерн с такой подписью не найден в проверенной истории",
+                        crate::details! { "signature" => signature.clone() },
+                    ));
+                }
+                let proposal = feedback::propose_policy(&store, signature, rule_id, unix_now())?;
+                let human = human_policy_proposal(&proposal);
+                Ok(rendered_output(
+                    "code-review learning policy propose",
+                    json_mode,
+                    &proposal,
+                    human,
+                ))
+            }
+            LearningPolicyCommand::List { limit } => {
+                let store = open_required(root, db)?;
+                let proposals = feedback::list_proposals(&store, to_usize(*limit))?;
+                let output = PolicyListOutput {
+                    proposals: proposals.iter().map(PolicySummary::from).collect(),
+                    limitations: vec![
+                        "Предложения не применяются автоматически и не выполняют suppression."
+                            .to_owned(),
+                    ],
+                };
+                let human = human_policy_list(&output);
+                Ok(rendered_output(
+                    "code-review learning policy list",
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+            LearningPolicyCommand::Show { id } => {
+                let store = open_required(root, db)?;
+                let proposal = feedback::show_proposal(&store, id)?;
+                let human = human_policy_proposal(&proposal);
+                Ok(rendered_output(
+                    "code-review learning policy show",
+                    json_mode,
+                    &proposal,
+                    human,
+                ))
+            }
+            LearningPolicyCommand::Approve { id, out, note } => {
+                let store = open_required(root, db)?;
+                let proposal = feedback::show_proposal(&store, id)?;
+                if proposal.supporting_cases.is_empty() {
+                    return Err(DomainError::with_details(
+                        ErrorCode::InsufficientEvidence,
+                        "У предложения нет подтверждающих случаев: утверждать нечего",
+                        crate::details! { "proposal_id" => proposal.proposal_id.clone() },
+                    ));
+                }
+                let document = ApprovedPolicyArtifact {
+                    schema_version: POLICY_SCHEMA_VERSION,
+                    policy_version: LEARNING_POLICY_VERSION,
+                    generation: proposal.generation,
+                    approved: true,
+                    auto_applied: false,
+                    proposal: &proposal,
+                    note: note.as_deref(),
+                    limitations: vec![
+                        "Артефакт материализован человеком и попадает в Git только его решением."
+                            .to_owned(),
+                        "SQLite не является владельцем утверждённой политики: база хранит только предложение."
+                            .to_owned(),
+                        "Автоматическое применение правила и автоматический suppression не выполняются."
+                            .to_owned(),
+                    ],
+                };
+                let bytes = to_json_bytes(&document)?;
+                let artifact = publish_derived_document(root, out, &bytes)?;
+                let output = PolicyApproveOutput {
+                    proposal_id: proposal.proposal_id.clone(),
+                    rule_id: proposal.rule_id.clone(),
+                    auto_applied: false,
+                    artifact,
+                };
+                let human = human_policy_approve(&output);
+                Ok(rendered_output(
+                    "code-review learning policy approve",
+                    json_mode,
+                    &output,
+                    human,
+                ))
+            }
+        }
+    }
+
+    // ---- хранилище и пути ----
+
+    /// Корень текущего репозитория: путь базы и рабочих областей не зависит от cwd.
+    fn repository_root() -> Result<PathBuf, DomainError> {
+        let cwd = std::env::current_dir().map_err(|error| {
+            DomainError::new(
+                ErrorCode::GitEvidenceFailed,
+                format!("не удалось определить текущий каталог: {error}"),
+            )
+        })?;
+        let output = Command::new("git")
+            .current_dir(&cwd)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|error| {
+                DomainError::new(
+                    ErrorCode::GitEvidenceFailed,
+                    format!("не удалось запустить Git: {error}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(DomainError::new(
+                ErrorCode::GitEvidenceFailed,
+                "команды learning работают только внутри Git-репозитория",
+            ));
+        }
+        let text = String::from_utf8(output.stdout).map_err(|_| {
+            DomainError::new(
+                ErrorCode::GitEvidenceFailed,
+                "Git вернул некорректный путь корня репозитория",
+            )
+        })?;
+        fs::canonicalize(text.trim()).map_err(|error| {
+            DomainError::new(
+                ErrorCode::GitEvidenceFailed,
+                format!("не удалось разрешить корень репозитория: {error}"),
+            )
+        })
+    }
+
+    /// Параметры открытия базы: относительный `--db` разрешается от корня репозитория.
+    fn database_options(
+        root: &Path,
+        db: Option<&Path>,
+        create: bool,
+    ) -> Result<StoreOptions, DomainError> {
+        let options = match db {
+            None => StoreOptions::in_repository(root),
+            Some(requested) => {
+                if requested.as_os_str().is_empty() {
+                    return Err(invalid_request("путь базы learning не может быть пустым"));
+                }
+                if requested
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                {
+                    return Err(invalid_request(
+                        "компонент `..` в пути базы learning запрещён",
+                    ));
+                }
+                let resolved = if requested.is_absolute() {
+                    requested.to_path_buf()
+                } else {
+                    root.join(requested)
+                };
+                reject_protected_path(root, &resolved, "базы learning")?;
+                StoreOptions::at(resolved)
+            }
+        };
+        Ok(StoreOptions { create, ..options })
+    }
+
+    /// Открывает существующую базу; отсутствие файла — различимый `not_found`.
+    fn open_required(root: &Path, db: Option<&Path>) -> Result<LearningStore, DomainError> {
+        let options = database_options(root, db, false)?;
+        if !options.database.is_file() {
+            return Err(DomainError::with_details(
+                ErrorCode::NotFound,
+                "Локальная база learning не найдена; импортируйте проверенную историю или укажите --db",
+                crate::details! {
+                    "database" => options.display_path.clone(),
+                    "recovery" => store::recovery_paths(&options.display_path),
+                },
+            ));
+        }
+        LearningStore::open(options)
+    }
+
+    /// Открывает базу, если она существует: штатный режим без learning.
+    fn open_optional(root: &Path, db: Option<&Path>) -> Result<Option<LearningStore>, DomainError> {
+        let options = database_options(root, db, false)?;
+        if !options.database.is_file() {
+            return Ok(None);
+        }
+        LearningStore::open(options).map(Some)
+    }
+
+    /// Состояние отсутствующей истории без создания базы.
+    fn absent_status(options: &StoreOptions) -> LearningStatus {
+        LearningStatus {
+            schema_version: LEARNING_SCHEMA_VERSION,
+            policy_version: LEARNING_POLICY_VERSION,
+            present: false,
+            database_path: options.display_path.clone(),
+            user_version: 0,
+            journal_mode: "none".to_owned(),
+            journal_mode_reason: "файл базы learning отсутствует: режим журнала не выбирался"
+                .to_owned(),
+            busy_timeout_ms: options.busy_timeout_ms,
+            fts5_available: false,
+            foreign_keys: false,
+            generation: HistoryGeneration {
+                revision: 0,
+                trusted_reviews: 0,
+                quarantined_reviews: 0,
+                trusted_units: 0,
+            },
+            integrity_ok: false,
+            unavailable_reason: Some(
+                "История learning отсутствует: обычное ревью продолжает работать без неё."
+                    .to_owned(),
+            ),
+            recovery_paths: store::recovery_paths(&options.display_path),
+        }
+    }
+
+    /// Запрещает служебные каталоги репозитория и выход за его пределы.
+    ///
+    /// Проверка структурная и не ограничивается строкой запрошенного пути: он
+    /// разрешается до существующего предка, поэтому символическая ссылка на
+    /// `decks/**`, на служебные данные Git или на каталог вне клона не обходит
+    /// запрет.
+    fn reject_protected_path(root: &Path, path: &Path, label: &str) -> Result<(), DomainError> {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            DomainError::with_details(
+                ErrorCode::InvalidRequest,
+                format!("путь {label} должен находиться в текущем репозитории"),
+                crate::details! { "path" => display_path(root, path) },
+            )
+        })?;
+        reject_service_components(root, relative, path, label)?;
+        let mut ancestor = path.to_path_buf();
+        while !ancestor.exists() {
+            if !ancestor.pop() {
+                return Ok(());
+            }
+        }
+        let canonical = fs::canonicalize(&ancestor).map_err(|error| {
+            DomainError::with_details(
+                ErrorCode::InvalidRequest,
+                format!("путь {label} не удалось разрешить: {error}"),
+                crate::details! { "path" => display_path(root, path) },
+            )
+        })?;
+        let canonical_relative = canonical.strip_prefix(root).map_err(|_| {
+            DomainError::with_details(
+                ErrorCode::InvalidRequest,
+                format!("путь {label} должен находиться в текущем репозитории"),
+                crate::details! { "path" => display_path(root, path) },
+            )
+        })?;
+        reject_service_components(root, canonical_relative, path, label)
+    }
+
+    /// Запрещает первый компонент пути в служебных каталогах репозитория.
+    fn reject_service_components(
+        root: &Path,
+        relative: &Path,
+        path: &Path,
+        label: &str,
+    ) -> Result<(), DomainError> {
+        let first = relative.components().next();
+        let protected =
+            matches!(first, Some(Component::Normal(name)) if name == "decks" || name == ".git");
+        if protected {
+            return Err(DomainError::with_details(
+                ErrorCode::InvalidRequest,
+                format!("путь {label} не может находиться в служебном каталоге репозитория"),
+                crate::details! { "path" => display_path(root, path) },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Публикует производный документ learning по безопасному пути набора.
+    ///
+    /// Проверка пути (служебные каталоги, симлинки, тип существующего файла)
+    /// принадлежит каноническому помощнику `workflow::safe_output_path`, а
+    /// запись — `workflow::write_review_document_once`: у политики путей один
+    /// владелец, а не копия в CLI. Дополнительное условие локальности —
+    /// требование самой learning-подсистемы: история, архив и снимок базы
+    /// живут в клоне, поэтому разрешённый путь не может вести за его пределы.
+    fn publish_derived_document(
+        root: &Path,
+        requested: &Path,
+        bytes: &[u8],
+    ) -> Result<PublishedArtifact, DomainError> {
+        let target = local_output_path(root, requested)?;
+        publish_document(root, &target, bytes)
+    }
+
+    /// Разрешает путь производного артефакта learning внутри клона.
+    ///
+    /// Общая часть `export`, `policy approve` и `backup`: у политики путей один
+    /// владелец — канонический `workflow::safe_output_path`, а требование
+    /// локальности принадлежит learning-подсистеме.
+    fn local_output_path(root: &Path, requested: &Path) -> Result<PathBuf, DomainError> {
+        let target = safe_output_path(root, requested, false)?;
+        if !target.starts_with(root) {
+            return Err(DomainError::with_details(
+                ErrorCode::InvalidRequest,
+                "артефакт learning должен находиться внутри текущего репозитория",
+                crate::details! { "path" => display_path(root, &target) },
+            ));
+        }
+        Ok(target)
+    }
+
+    /// Публикует производный документ в уже разрешённый путь.
+    ///
+    /// Повтор тех же байтов идемпотентен, другие байты дают конфликт артефакта;
+    /// путь записи разрешает вызывающая сторона.
+    fn publish_document(
+        root: &Path,
+        target: &Path,
+        bytes: &[u8],
+    ) -> Result<PublishedArtifact, DomainError> {
+        let created = !target.exists();
+        write_review_document_once(target, bytes)?;
+        Ok(PublishedArtifact {
+            path: display_path(root, target),
+            bytes: bytes.len(),
+            created,
+        })
+    }
+
+    /// Показывает путь в выводе относительно корня репозитория.
+    ///
+    /// Абсолютный путь клона в вывод не попадает: он бесполезен при переносе и
+    /// запрещён правилами репозитория. Путь вне корня показывается как есть —
+    /// скрывать его нельзя, иначе человек не поймёт, куда записан артефакт.
+    fn display_path(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root).map_or_else(
+            |_| path.display().to_string(),
+            |relative| relative.to_string_lossy().replace('\\', "/"),
+        )
+    }
+
+    /// Доменная ошибка некорректного запроса к CLI.
+    fn invalid_request(message: impl Into<String>) -> DomainError {
+        DomainError::new(ErrorCode::InvalidRequest, message)
+    }
+
+    fn to_usize(value: u64) -> usize {
+        usize::try_from(value).unwrap_or(usize::MAX)
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or_default()
+    }
+
+    fn to_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, DomainError> {
+        serde_json::to_vec_pretty(value).map_err(|error| {
+            DomainError::new(
+                ErrorCode::Internal,
+                format!("не удалось сериализовать документ learning: {error}"),
+            )
+        })
+    }
+
+    fn explanation_is_empty(explanation: &str) -> bool {
+        explanation.trim().is_empty()
+    }
+
+    fn action_name(action: FeedbackAction) -> &'static str {
+        match action {
+            FeedbackAction::Append => "append",
+            FeedbackAction::Retract => "retract",
+            FeedbackAction::Supersede => "supersede",
+        }
+    }
+
+    /// Сравнивает содержание событий без метки времени записи.
+    fn same_feedback_content(left: &FeedbackEvent, right: &FeedbackEvent) -> bool {
+        left.event_id == right.event_id
+            && left.review_id == right.review_id
+            && left.unit_id == right.unit_id
+            && left.candidate_id == right.candidate_id
+            && left.kind == right.kind
+            && left.action == right.action
+            && left.supersedes_event_id == right.supersedes_event_id
+            && left.effective_disposition == right.effective_disposition
+            && left.usefulness == right.usefulness
+            && left.explanation == right.explanation
+            && left.provenance == right.provenance
+    }
+
+    /// Идемпотентный повтор: событие уже записано с тем же содержанием.
+    fn noop_feedback_result(store: &LearningStore, event: &FeedbackEvent) -> FeedbackResult {
+        FeedbackResult {
+            schema_version: FEEDBACK_SCHEMA_VERSION,
+            event_id: event.event_id.clone(),
+            superseded_event_id: None,
+            retracted_event_id: None,
+            outcome: feedback::outcome(store, &event.review_id, &event.unit_id)
+                .unwrap_or_else(|_| feedback::empty_outcome()),
+            limitations: vec![
+                "Событие с тем же содержанием уже записано: повтор не создал дубликата.".to_owned(),
+            ],
+        }
+    }
+
+    fn accumulate(target: &mut ObservationCounts, source: &ObservationCounts) {
+        target.raw_candidates += source.raw_candidates;
+        target.covered_candidates += source.covered_candidates;
+        target.individual_decisions += source.individual_decisions;
+        target.group_decisions += source.group_decisions;
+        target.reviewed_units += source.reviewed_units;
+        target.unresolved_units += source.unresolved_units;
+        target.findings += source.findings;
+        target.findings_direct_candidate += source.findings_direct_candidate;
+        target.findings_candidate_assisted += source.findings_candidate_assisted;
+        target.findings_independent += source.findings_independent;
+        target.unreviewed_candidates += source.unreviewed_candidates;
+        target.uncertain_candidates += source.uncertain_candidates;
+        target.not_applicable_candidates += source.not_applicable_candidates;
+        target.confirmed_candidates += source.confirmed_candidates;
+        target.acceptable_candidates += source.acceptable_candidates;
+        target.false_positive_candidates += source.false_positive_candidates;
+    }
+
+    fn short_sha(sha: &str) -> &str {
+        &sha[..sha.len().min(12)]
+    }
+
+    fn feature_key(key: &BTreeMap<String, String>) -> String {
+        key.iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn push_list(out: &mut String, title: &str, items: &[String]) {
+        if items.is_empty() {
+            return;
+        }
+        out.push_str(&format!("{title}:\n"));
+        for item in items {
+            out.push_str(&format!("  - {item}\n"));
+        }
+    }
+
+    fn import_status_label(status: ImportStatus) -> &'static str {
+        match status {
+            ImportStatus::Imported => "сохранено",
+            ImportStatus::NoopExisting => "точный повтор: ничего не удвоено",
+            ImportStatus::RevisionCreated => "сохранена аудируемая ревизия",
+            ImportStatus::Quarantined => "сохранено с карантином",
+        }
+    }
+
+    // ---- JSON DTO вывода ----
+
+    /// Статистика по ограниченной странице истории.
+    #[derive(Serialize)]
+    struct StatsOutput {
+        schema_version: u32,
+        policy_version: u32,
+        database_path: String,
+        generation: HistoryGeneration,
+        reviews_total: usize,
+        reviews_shown: usize,
+        reviews_truncated: bool,
+        observations: ObservationCounts,
+        dispositions: BTreeMap<String, usize>,
+        reviews: Vec<ImportRecord>,
+        limitations: Vec<String>,
+    }
+
+    /// Отчёт по паттернам с ограниченными списками.
+    #[derive(Serialize)]
+    struct PatternsOutput {
+        schema_version: u32,
+        policy_version: u32,
+        generation: HistoryGeneration,
+        min_support_units: usize,
+        policy: String,
+        abstained: bool,
+        rules_total: usize,
+        rules: Vec<PatternRuleView>,
+        limitations: Vec<String>,
+    }
+
+    impl PatternsOutput {
+        fn from_report(report: &PatternReport) -> Self {
+            Self {
+                schema_version: report.schema_version,
+                policy_version: report.policy_version,
+                generation: report.generation,
+                min_support_units: report.min_support_units,
+                policy: report.policy.clone(),
+                abstained: report.abstained,
+                rules_total: report.rules.len(),
+                rules: report.rules.iter().map(PatternRuleView::from).collect(),
+                limitations: report.limitations.clone(),
+            }
+        }
+    }
+
+    /// Одно правило отчёта с ограниченным срезом поддержки.
+    #[derive(Serialize)]
+    struct PatternRuleView {
+        key: BTreeMap<String, String>,
+        signature: String,
+        support: SupportView,
+    }
+
+    impl PatternRuleView {
+        fn from(rule: &crate::code_review::learning::model::PatternRule) -> Self {
+            Self {
+                key: rule.key.clone(),
+                signature: rule.signature.clone(),
+                support: SupportView::from(&rule.support),
+            }
+        }
+    }
+
+    /// Срез поддержки с явной отметкой усечения списка противоречащих единиц.
+    #[derive(Serialize)]
+    struct SupportView {
+        summary: SupportSummary,
+        contradicting_unit_ids_truncated: bool,
+    }
+
+    impl SupportView {
+        fn from(summary: &SupportSummary) -> Self {
+            let mut bounded = summary.clone();
+            let truncated = bounded.contradicting_unit_ids.len() > OUTPUT_CONTRADICTING_LIMIT;
+            bounded
+                .contradicting_unit_ids
+                .truncate(OUTPUT_CONTRADICTING_LIMIT);
+            Self {
+                summary: bounded,
+                contradicting_unit_ids_truncated: truncated,
+            }
+        }
+    }
+
+    /// Опубликованный производный артефакт.
+    #[derive(Serialize)]
+    struct PublishedArtifact {
+        path: String,
+        bytes: usize,
+        created: bool,
+    }
+
+    /// Документ рекомендаций без полных списков candidate_ids.
+    #[derive(Serialize)]
+    struct RecommendOutput {
+        schema_version: u32,
+        policy_version: u32,
+        generation: HistoryGeneration,
+        repository_id: String,
+        base_sha: String,
+        head_sha: String,
+        merge_base_sha: String,
+        workspace_variant: String,
+        review_pack_sha256: String,
+        queue_sha256: String,
+        input_trust: TrustLevel,
+        learning_disabled: bool,
+        units_total: usize,
+        recommendations_shown: usize,
+        recommendations_truncated: bool,
+        suggested_order: Vec<String>,
+        recommendations: Vec<RecommendationView>,
+        limitations: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifact: Option<PublishedArtifact>,
+    }
+
+    impl RecommendOutput {
+        fn from_document(document: &Recommendations, units_total: usize) -> Self {
+            let recommendations: Vec<RecommendationView> = document
+                .recommendations
+                .iter()
+                .map(RecommendationView::from)
+                .collect();
+            Self {
+                schema_version: document.schema_version,
+                policy_version: document.policy_version,
+                generation: document.generation,
+                repository_id: document.repository_id.clone(),
+                base_sha: document.base_sha.clone(),
+                head_sha: document.head_sha.clone(),
+                merge_base_sha: document.merge_base_sha.clone(),
+                workspace_variant: document.workspace_variant.clone(),
+                review_pack_sha256: document.review_pack_sha256.clone(),
+                queue_sha256: document.queue_sha256.clone(),
+                input_trust: document.input_trust,
+                learning_disabled: document.learning_disabled,
+                units_total,
+                recommendations_shown: recommendations.len(),
+                recommendations_truncated: units_total > recommendations.len(),
+                suggested_order: document.suggested_order.clone(),
+                recommendations,
+                limitations: document.limitations.clone(),
+                artifact: None,
+            }
+        }
+    }
+
+    /// Одна подсказка: счётчик кандидатов вместо их полного списка.
+    #[derive(Serialize)]
+    struct RecommendationView {
+        unit_id: String,
+        candidate_count: usize,
+        representative_candidate_ids: Vec<String>,
+        queue_priority: String,
+        suggested_position: String,
+        granularity: String,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern_signature: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        support: Option<SupportView>,
+        historical_cases: Vec<CaseRefView>,
+        limitations: Vec<String>,
+        source_reference: String,
+    }
+
+    impl RecommendationView {
+        fn from(item: &Recommendation) -> Self {
+            Self {
+                unit_id: item.unit_id.clone(),
+                candidate_count: item.candidate_ids.len(),
+                representative_candidate_ids: item.representative_candidate_ids.clone(),
+                queue_priority: item.queue_priority.clone(),
+                suggested_position: item.suggested_position.clone(),
+                granularity: item.granularity.clone(),
+                reason: item.reason.clone(),
+                pattern_signature: item.pattern_signature.clone(),
+                support: item.support.as_ref().map(SupportView::from),
+                historical_cases: item
+                    .historical_cases
+                    .iter()
+                    .take(OUTPUT_CASE_LIMIT)
+                    .map(CaseRefView::from)
+                    .collect(),
+                limitations: item.limitations.clone(),
+                source_reference: item.source_reference.clone(),
+            }
+        }
+    }
+
+    /// Исторический случай с ограниченным списком кандидатов.
+    #[derive(Serialize)]
+    struct CaseRefView {
+        review_id: String,
+        unit_id: String,
+        candidate_count: usize,
+        candidate_ids: Vec<String>,
+        candidate_ids_truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snippet: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disposition: Option<String>,
+        trust: TrustLevel,
+        age_days: u64,
+    }
+
+    impl CaseRefView {
+        fn from(case: &CaseRef) -> Self {
+            Self {
+                review_id: case.review_id.clone(),
+                unit_id: case.unit_id.clone(),
+                candidate_count: case.candidate_ids.len(),
+                candidate_ids: case
+                    .candidate_ids
+                    .iter()
+                    .take(OUTPUT_CANDIDATE_LIMIT)
+                    .cloned()
+                    .collect(),
+                candidate_ids_truncated: case.candidate_ids.len() > OUTPUT_CANDIDATE_LIMIT,
+                path: case.path.clone(),
+                snippet: case.snippet.clone(),
+                disposition: case.disposition.clone(),
+                trust: case.trust,
+                age_days: case.age_days,
+            }
+        }
+    }
+
+    /// Результат экспорта переносимого архива.
+    #[derive(Serialize)]
+    struct ExportOutput {
+        manifest: LearningExportManifest,
+        artifact: PublishedArtifact,
+    }
+
+    /// Результат транзакционного backup.
+    #[derive(Serialize)]
+    struct BackupOutput {
+        database_path: String,
+        destination: String,
+        bytes: u64,
+    }
+
+    /// Результат восстановления архива.
+    #[derive(Serialize)]
+    struct RestoreOutput {
+        archive: String,
+        summary: RestoreSummary,
+    }
+
+    /// Компактное представление предложения политики.
+    #[derive(Serialize)]
+    struct PolicySummary {
+        proposal_id: String,
+        rule_id: String,
+        generation: HistoryGeneration,
+        key: BTreeMap<String, String>,
+        supporting_cases: usize,
+        contradicting_cases: usize,
+        cautions: Vec<String>,
+        auto_applied: bool,
+        artifact_path: String,
+    }
+
+    impl PolicySummary {
+        fn from(proposal: &PolicyProposal) -> Self {
+            Self {
+                proposal_id: proposal.proposal_id.clone(),
+                rule_id: proposal.rule_id.clone(),
+                generation: proposal.generation,
+                key: proposal.key.clone(),
+                supporting_cases: proposal.supporting_cases.len(),
+                contradicting_cases: proposal.contradicting_cases.len(),
+                cautions: proposal.cautions.clone(),
+                auto_applied: proposal.auto_applied,
+                artifact_path: proposal.artifact_path.clone(),
+            }
+        }
+    }
+
+    /// Список предложений политики.
+    #[derive(Serialize)]
+    struct PolicyListOutput {
+        proposals: Vec<PolicySummary>,
+        limitations: Vec<String>,
+    }
+
+    /// Утверждённый артефакт политики, который коммитит человек.
+    #[derive(Serialize)]
+    struct ApprovedPolicyArtifact<'a> {
+        schema_version: u32,
+        policy_version: u32,
+        generation: HistoryGeneration,
+        approved: bool,
+        auto_applied: bool,
+        proposal: &'a PolicyProposal,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<&'a str>,
+        limitations: Vec<String>,
+    }
+
+    /// Итог утверждения политики.
+    #[derive(Serialize)]
+    struct PolicyApproveOutput {
+        proposal_id: String,
+        rule_id: String,
+        auto_applied: bool,
+        artifact: PublishedArtifact,
+    }
+
+    // ---- русский human output ----
+
+    fn human_status(status: &LearningStatus, validated: bool) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("База learning: {}\n", status.database_path));
+        out.push_str(&format!(
+            "Состояние: {}\n",
+            if status.present {
+                "присутствует"
+            } else {
+                "отсутствует"
+            }
+        ));
+        out.push_str(&format!(
+            "Схема: user_version {}, документ {}, политика {}\n",
+            status.user_version, status.schema_version, status.policy_version
+        ));
+        out.push_str(&format!(
+            "Журнал: {} ({})\n",
+            status.journal_mode, status.journal_mode_reason
+        ));
+        out.push_str(&format!(
+            "Целостность: {}\n",
+            if status.integrity_ok {
+                "ok"
+            } else {
+                "не проверена"
+            }
+        ));
+        out.push_str(&format!(
+            "Поиск FTS5: {}\n",
+            if status.fts5_available {
+                "доступен"
+            } else {
+                "недоступен; используется подстрочный fallback"
+            }
+        ));
+        out.push_str(&format!(
+            "История: ревизия {}, проверенных записей {}, карантинных {}, независимых единиц {}\n",
+            status.generation.revision,
+            status.generation.trusted_reviews,
+            status.generation.quarantined_reviews,
+            status.generation.trusted_units
+        ));
+        if let Some(reason) = status.unavailable_reason.as_deref() {
+            out.push_str(&format!("Недоступность: {reason}\n"));
+        }
+        if validated {
+            out.push_str("Проверка: успешно\n");
+        }
+        if !status.present {
+            push_list(&mut out, "Восстановление", &status.recovery_paths);
+        }
+        out
+    }
+
+    fn human_import(outcome: &import::ImportOutcome) -> String {
+        let record = &outcome.record;
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Импорт: {} — {}\n",
+            import_status_label(outcome.status),
+            record.review_id
+        ));
+        out.push_str(&format!(
+            "Снимок: {}@{} (вариант {})\n",
+            record.repository_id,
+            short_sha(&record.head_sha),
+            record.workspace_variant
+        ));
+        out.push_str(&format!(
+            "Доверие: {}; итог рассмотрения: {}\n",
+            record.trust.as_str(),
+            record.outcome.as_str()
+        ));
+        let revision_note = match record.revision_of.as_deref() {
+            Some(previous) => format!(", аудируемая ревизия записи {previous}"),
+            None => String::new(),
+        };
+        out.push_str(&format!("Ревизия: {}{revision_note}\n", record.revision));
+        out.push_str(&format!(
+            "Наблюдения: кандидатов {}, рассмотрено единиц {}, нерассмотренных {}, замечаний {} (independent {})\n",
+            record.observations.raw_candidates,
+            record.observations.reviewed_units,
+            record.observations.unresolved_units,
+            record.observations.findings,
+            record.observations.findings_independent
+        ));
+        push_list(&mut out, "Ограничения", &record.limitations);
+        out
+    }
+
+    fn human_stats(output: &StatsOutput) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("История learning: {}\n", output.database_path));
+        out.push_str(&format!(
+            "Ревизия {}: проверенных записей {}, карантинных {}, независимых единиц {}\n",
+            output.generation.revision,
+            output.generation.trusted_reviews,
+            output.generation.quarantined_reviews,
+            output.generation.trusted_units
+        ));
+        out.push_str(&format!(
+            "Записи: показано {} из {}{}\n",
+            output.reviews_shown,
+            output.reviews_total,
+            if output.reviews_truncated {
+                " (увеличьте --limit, чтобы увидеть остальные)"
+            } else {
+                ""
+            }
+        ));
+        for record in &output.reviews {
+            out.push_str(&format!(
+                "  {} {} {} {}: кандидатов {}, единиц {}, замечаний {}\n",
+                record.review_id,
+                short_sha(&record.head_sha),
+                record.workspace_variant,
+                record.trust.as_str(),
+                record.observations.raw_candidates,
+                record.observations.reviewed_units,
+                record.observations.findings
+            ));
+        }
+        out.push_str(&format!(
+            "Наблюдения по показанным записям: кандидатов {}, individual {}, group {}, reviewed {}, unresolved {}, замечаний {} (independent {})\n",
+            output.observations.raw_candidates,
+            output.observations.individual_decisions,
+            output.observations.group_decisions,
+            output.observations.reviewed_units,
+            output.observations.unresolved_units,
+            output.observations.findings,
+            output.observations.findings_independent
+        ));
+        out.push_str("Действующие исходы независимых единиц:\n");
+        if output.dispositions.is_empty() {
+            out.push_str("  нет данных\n");
+        }
+        for (disposition, count) in &output.dispositions {
+            out.push_str(&format!("  {disposition}: {count}\n"));
+        }
+        push_list(&mut out, "Ограничения", &output.limitations);
+        out
+    }
+
+    fn human_patterns(output: &PatternsOutput) -> String {
+        let mut out = String::new();
+        let supported = output
+            .rules
+            .iter()
+            .filter(|rule| rule.support.summary.level.as_str() == "supported")
+            .count();
+        out.push_str(&format!(
+            "Паттерны: правил {}, подтверждённых {}, воздержание: {}\n",
+            output.rules_total,
+            supported,
+            if output.abstained { "да" } else { "нет" }
+        ));
+        out.push_str(&format!(
+            "Политика {}: минимум поддержки {} независимых единиц; история: проверенных записей {}, единиц {}\n",
+            output.policy_version,
+            output.min_support_units,
+            output.generation.trusted_reviews,
+            output.generation.trusted_units
+        ));
+        for rule in &output.rules {
+            let summary = &rule.support.summary;
+            out.push_str(&format!(
+                "  {} [{}] независимых единиц {}, записей {}, свёрнутых повторов {}, без решения {}, confirmed {}, acceptable {}, false_positive {}, уровень {}\n",
+                short_sha(&rule.signature),
+                rule.key.get("detector").map_or("unknown", String::as_str),
+                summary.support_units,
+                summary.support_reviews,
+                summary.revised_units,
+                summary.unresolved_units,
+                summary.confirmed_units,
+                summary.acceptable_units,
+                summary.false_positive_units,
+                summary.level.as_str()
+            ));
+            out.push_str(&format!("    ключ: {}\n", feature_key(&rule.key)));
+            out.push_str(&format!("    {}\n", summary.explanation));
+            if rule.support.contradicting_unit_ids_truncated {
+                out.push_str(&format!(
+                    "    противоречащие единицы: показаны первые {OUTPUT_CONTRADICTING_LIMIT}\n"
+                ));
+            }
+        }
+        push_list(&mut out, "Ограничения", &output.limitations);
+        out
+    }
+
+    /// Поясняет доверие возвращённого случая: карантин не выдаётся за историю.
+    fn trust_marker(trust: &str) -> &'static str {
+        match trust {
+            "ast_authenticated" => " — проверенная история",
+            _ => " — карантин, не полноценное основание",
+        }
+    }
+
+    fn human_search(page: &search::SearchPage) -> String {
+        let mut out = String::new();
+        let first = if page.cases.is_empty() {
+            0
+        } else {
+            page.offset + 1
+        };
+        out.push_str(&format!(
+            "Поиск: найдено {}, страница {}..{}, продолжение: {}, FTS5: {}\n",
+            page.matched,
+            first,
+            page.offset + page.cases.len(),
+            if page.has_more { "да" } else { "нет" },
+            if page.fts5_used { "да" } else { "нет" }
+        ));
+        // Доверие — часть смысла результата, а не деталь: найденная аналогия
+        // используется как вспомогательный контекст, поэтому ни фильтр, ни
+        // статус возвращённого случая не скрываются.
+        out.push_str(&format!(
+            "Карантин: {}\n",
+            if page.include_quarantine {
+                "включён по явному --include-quarantine: такие записи не являются полноценным основанием"
+            } else {
+                "исключён по умолчанию (включить: --include-quarantine)"
+            }
+        ));
+        for case in &page.cases {
+            out.push_str(&format!(
+                "  {} [{}] {} {} — {}\n",
+                case.case_id,
+                case.match_kind.as_str(),
+                case.path.as_deref().unwrap_or("путь не сохранён"),
+                case.disposition.as_deref().unwrap_or("без решения"),
+                case.snippet
+            ));
+            out.push_str(&format!(
+                "    доверие: {}{}\n",
+                case.trust,
+                trust_marker(&case.trust)
+            ));
+            out.push_str(&format!("    источник: {}\n", case.source_reference));
+        }
+        if page.has_more {
+            out.push_str(&format!(
+                "Показаны не все совпадения: увеличьте --limit (не более {}) или сдвиньте --offset.\n",
+                search::MAX_SEARCH_LIMIT
+            ));
+        }
+        out
+    }
+
+    fn human_recommendations(output: &RecommendOutput) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Рекомендации: {}@{} (вариант {}), политика {}, история ревизии {}\n",
+            output.repository_id,
+            short_sha(&output.head_sha),
+            output.workspace_variant,
+            output.policy_version,
+            output.generation.revision
+        ));
+        out.push_str(&format!(
+            "История: проверенных записей {}, независимых единиц {}; режим без learning: {}\n",
+            output.generation.trusted_reviews,
+            output.generation.trusted_units,
+            if output.learning_disabled {
+                "да"
+            } else {
+                "нет"
+            }
+        ));
+        out.push_str(&format!(
+            "Подсказки: показано {} из {} единиц очереди{}\n",
+            output.recommendations_shown,
+            output.units_total,
+            if output.recommendations_truncated {
+                " (остальные не печатаются: увеличьте --limit)"
+            } else {
+                ""
+            }
+        ));
+        for item in &output.recommendations {
+            out.push_str(&format!(
+                "  {}: priority {} → {}, гранулярность {}, кандидатов {}\n",
+                item.unit_id,
+                item.queue_priority,
+                item.suggested_position,
+                item.granularity,
+                item.candidate_count
+            ));
+            out.push_str(&format!("    причина: {}\n", item.reason));
+            if let Some(support) = item.support.as_ref() {
+                out.push_str(&format!(
+                    "    поддержка: единиц {}, записей {}, unresolved {}, уровень {}\n",
+                    support.summary.support_units,
+                    support.summary.support_reviews,
+                    support.summary.unresolved_units,
+                    support.summary.level.as_str()
+                ));
+            }
+            for case in &item.historical_cases {
+                out.push_str(&format!(
+                    "    случай: {}/{} {} {}\n",
+                    case.review_id,
+                    case.unit_id,
+                    case.disposition.as_deref().unwrap_or("без решения"),
+                    case.path.as_deref().unwrap_or("")
+                ));
+            }
+            out.push_str(&format!(
+                "    первичный контекст: {}\n",
+                item.source_reference
+            ));
+            push_list(&mut out, "    Ограничения подсказки", &item.limitations);
+        }
+        push_list(&mut out, "Ограничения документа", &output.limitations);
+        if let Some(artifact) = output.artifact.as_ref() {
+            out.push_str(&format!(
+                "Артефакт: {} ({}, {} байт)\n",
+                artifact.path,
+                if artifact.created {
+                    "создан"
+                } else {
+                    "уже существовал с теми же байтами"
+                },
+                artifact.bytes
+            ));
+        }
+        out
+    }
+
+    fn human_feedback_result(result: &FeedbackResult) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("Обратная связь: {}\n", result.event_id));
+        if let Some(id) = result.superseded_event_id.as_deref() {
+            out.push_str(&format!("Заменено утверждение: {id}\n"));
+        }
+        if let Some(id) = result.retracted_event_id.as_deref() {
+            out.push_str(&format!("Отозвано утверждение: {id}\n"));
+        }
+        out.push_str(&format!(
+            "Исход: исходный {}, действующий {}\n",
+            result
+                .outcome
+                .original_disposition
+                .as_deref()
+                .unwrap_or("нет"),
+            result
+                .outcome
+                .effective_disposition
+                .as_deref()
+                .unwrap_or("нет")
+        ));
+        if result.outcome.has_conflict {
+            out.push_str("Внимание: по случаю есть противоречащие утверждения.\n");
+        }
+        push_list(&mut out, "Ограничения", &result.limitations);
+        out
+    }
+
+    fn human_feedback_audit(audit: &CaseAudit) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("Случай: {}/{}\n", audit.review_id, audit.unit_id));
+        out.push_str(&format!(
+            "Исход: исходный {}, действующий {}\n",
+            audit
+                .outcome
+                .original_disposition
+                .as_deref()
+                .unwrap_or("нет"),
+            audit
+                .outcome
+                .effective_disposition
+                .as_deref()
+                .unwrap_or("нет")
+        ));
+        if audit.outcome.has_conflict {
+            out.push_str("Внимание: по случаю есть противоречащие утверждения.\n");
+        }
+        out.push_str(&format!("Утверждений: {}\n", audit.events.len()));
+        for event in &audit.events {
+            out.push_str(&format!(
+                "  {} {} {} {} — {}\n",
+                event.event_id,
+                event.kind.as_str(),
+                action_name(event.action),
+                event
+                    .effective_disposition
+                    .as_deref()
+                    .unwrap_or(if event.usefulness.is_some() {
+                        "оценка полезности"
+                    } else {
+                        "без нового исхода"
+                    }),
+                event.explanation
+            ));
+        }
+        out
+    }
+
+    fn human_feedback_event(event: &FeedbackEvent) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("Событие: {}\n", event.event_id));
+        out.push_str(&format!(
+            "Случай: {}/{} (кандидат {})\n",
+            event.review_id,
+            event.unit_id,
+            event.candidate_id.as_deref().unwrap_or("не указан")
+        ));
+        out.push_str(&format!(
+            "Вид: {}, действие: {}\n",
+            event.kind.as_str(),
+            action_name(event.action)
+        ));
+        if let Some(disposition) = event.effective_disposition.as_deref() {
+            out.push_str(&format!("Новый исход: {disposition}\n"));
+        }
+        if let Some(usefulness) = event.usefulness.as_deref() {
+            out.push_str(&format!("Полезность рекомендации: {usefulness}\n"));
+        }
+        if let Some(id) = event.supersedes_event_id.as_deref() {
+            out.push_str(&format!("Ссылается на утверждение: {id}\n"));
+        }
+        out.push_str(&format!(
+            "Источник: {}; объяснение: {}\n",
+            event.provenance, event.explanation
+        ));
+        out
+    }
+
+    fn human_export(output: &ExportOutput) -> String {
+        let manifest = &output.manifest;
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Экспорт истории: {} ({}, {} байт)\n",
+            output.artifact.path,
+            if output.artifact.created {
+                "создан"
+            } else {
+                "уже существовал с теми же байтами"
+            },
+            output.artifact.bytes
+        ));
+        out.push_str(&format!(
+            "Архив: схема {}, политика {}, ревизия истории {}, записей {}, единиц {}, замечаний {}, утверждений {}, предложений {}\n",
+            manifest.schema_version,
+            manifest.policy_version,
+            manifest.generation.revision,
+            manifest.reviews,
+            manifest.units,
+            manifest.findings,
+            manifest.feedback_events,
+            manifest.policy_proposals
+        ));
+        out.push_str(&format!("Digest тела: {}\n", manifest.payload_sha256));
+        out.push_str(
+            "Архив не содержит сырых execution logs, credentials и содержимого временных worktrees.\n",
+        );
+        out
+    }
+
+    fn human_backup(output: &BackupOutput) -> String {
+        format!(
+            "Снимок базы: {} → {} ({} байт)\n",
+            output.database_path, output.destination, output.bytes
+        )
+    }
+
+    fn human_restore(output: &RestoreOutput) -> String {
+        let summary = &output.summary;
+        let mut out = String::new();
+        out.push_str(&format!("Восстановление из {}\n", output.archive));
+        out.push_str(&format!(
+            "Восстановлено записей: {}, без изменений: {}\n",
+            summary.restored_reviews, summary.unchanged_reviews
+        ));
+        out.push_str(&format!(
+            "История: ревизия {}, проверенных записей {}, карантинных {}, независимых единиц {}\n",
+            summary.generation.revision,
+            summary.generation.trusted_reviews,
+            summary.generation.quarantined_reviews,
+            summary.generation.trusted_units
+        ));
+        push_list(&mut out, "Ограничения", &summary.limitations);
+        out
+    }
+
+    fn human_forget(output: &ForgetOutcome) -> String {
+        let removed = &output.removed;
+        format!(
+            "Удалена запись {}: ревью {}, единиц {}, кандидатов {}, решений {}, замечаний {}, поисковых случаев {}, feedback-событий {}, предложений политики {}.\nУтверждённые policy files и исходные review artifacts не изменены.\n",
+            output.review_id,
+            removed.reviews,
+            removed.units,
+            removed.candidates,
+            removed.decisions,
+            removed.findings,
+            removed.search_cases,
+            removed.feedback_events,
+            removed.policy_proposals,
+        )
+    }
+
+    fn human_policy_proposal(proposal: &PolicyProposal) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Предложение политики: {} (правило {})\n",
+            proposal.proposal_id, proposal.rule_id
+        ));
+        out.push_str(&format!("Ключ признаков: {}\n", feature_key(&proposal.key)));
+        out.push_str(&format!(
+            "История: ревизия {}, проверенных записей {}, единиц {}\n",
+            proposal.generation.revision,
+            proposal.generation.trusted_reviews,
+            proposal.generation.trusted_units
+        ));
+        out.push_str(&format!(
+            "Подтверждающих случаев: {}, противоречащих: {}\n",
+            proposal.supporting_cases.len(),
+            proposal.contradicting_cases.len()
+        ));
+        for case in &proposal.contradicting_cases {
+            out.push_str(&format!(
+                "  противоречит: {}/{}\n",
+                case.review_id, case.unit_id
+            ));
+        }
+        out.push_str(&format!(
+            "Автоприменение: {}\n",
+            if proposal.auto_applied {
+                "да"
+            } else {
+                "нет"
+            }
+        ));
+        out.push_str(&format!(
+            "Путь утверждённого артефакта: {}\n",
+            proposal.artifact_path
+        ));
+        push_list(&mut out, "Предупреждения", &proposal.cautions);
+        out
+    }
+
+    fn human_policy_list(output: &PolicyListOutput) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Предложений политики: {}\n",
+            output.proposals.len()
+        ));
+        for proposal in &output.proposals {
+            out.push_str(&format!(
+                "  {} (правило {}): подтверждающих {}, противоречащих {}, автоприменение {}\n",
+                proposal.proposal_id,
+                proposal.rule_id,
+                proposal.supporting_cases,
+                proposal.contradicting_cases,
+                if proposal.auto_applied {
+                    "да"
+                } else {
+                    "нет"
+                }
+            ));
+        }
+        push_list(&mut out, "Ограничения", &output.limitations);
+        out
+    }
+
+    fn human_policy_approve(output: &PolicyApproveOutput) -> String {
+        format!(
+            "Утверждено предложение {} (правило {}): артефакт {} ({}, {} байт); автоприменение: {}\n",
+            output.proposal_id,
+            output.rule_id,
+            output.artifact.path,
+            if output.artifact.created {
+                "создан"
+            } else {
+                "уже существовал с теми же байтами"
+            },
+            output.artifact.bytes,
+            if output.auto_applied {
+                "да"
+            } else {
+                "нет"
+            }
         )
     }
 }

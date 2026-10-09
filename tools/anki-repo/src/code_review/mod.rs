@@ -8,6 +8,7 @@ pub mod detectors;
 pub mod diagnostics;
 pub mod execution;
 pub mod language;
+pub mod learning;
 pub mod model;
 pub mod review_queue;
 pub mod rust_context;
