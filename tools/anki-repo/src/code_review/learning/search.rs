@@ -2,7 +2,7 @@
 //!
 //! Базовый путь — индексированные SQL-запросы и локальный FTS5. Если сборка
 //! SQLite не поддерживает FTS5, используется документированный воспроизводимый
-//! fallback на подстрочный поиск (`instr`) по тому же тексту — без сети, LLM,
+//! fallback на подстрочный поиск с Unicode-свёрткой регистра — без сети, LLM,
 //! embeddings и внешних индексов. Все запросы параметризованы: сохранённый текст
 //! остаётся данными и никогда не превращается в SQL или команду.
 
@@ -294,25 +294,27 @@ fn text_matches(
         }
         return Ok(hits);
     }
+    let needle = text.to_lowercase();
     let mut statement = read
         .transaction()
         .prepare(
-            "SELECT s.case_id
+            "SELECT s.case_id, s.text
              FROM learning_search AS s
              JOIN learning_import AS i ON i.review_id = s.review_id
-             WHERE instr(lower(s.text), lower(?1)) > 0
-               AND (?2 = 1 OR i.trust = 'ast_authenticated')",
+             WHERE (?1 = 1 OR i.trust = 'ast_authenticated')",
         )
         .map_err(|error| map_error(&error, "не удалось подготовить текстовый поиск"))?;
     let rows = statement
-        .query_map(params![text, i64::from(query.include_quarantine)], |row| {
-            row.get::<_, String>(0)
+        .query_map(params![i64::from(query.include_quarantine)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| map_error(&error, "не удалось выполнить текстовый поиск"))?;
     for row in rows {
-        hits.insert(
-            row.map_err(|error| map_error(&error, "не удалось выполнить текстовый поиск"))?,
-        );
+        let (case_id, stored_text) =
+            row.map_err(|error| map_error(&error, "не удалось выполнить текстовый поиск"))?;
+        if stored_text.to_lowercase().contains(&needle) {
+            hits.insert(case_id);
+        }
     }
     Ok(hits)
 }

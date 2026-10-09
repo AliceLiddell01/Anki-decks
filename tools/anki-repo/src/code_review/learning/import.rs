@@ -99,20 +99,36 @@ pub fn import_history(
     let outcome = outcome_of(loaded);
     let identity_key = identity_key(loaded, &variant);
     let review_id = review_id(loaded, &variant);
+    let legacy_review_id = legacy_review_id(loaded, &variant);
     let observations = observation_counts(loaded);
 
     // Сначала ищем точный повтор вне транзакции записи: чтение дешевле.
-    let repeated =
-        store.read(|read| existing_exact(read, &review_id, &identity_key, &inputs, loaded))?;
+    let repeated = store.read(|read| {
+        existing_exact(
+            read,
+            &review_id,
+            &legacy_review_id,
+            &identity_key,
+            &inputs,
+            loaded,
+        )
+    })?;
     if let Some(record) = repeated {
         return Ok(record);
     }
     store.write(|write| {
-        let existing = existing_exact(&write.as_tx(), &review_id, &identity_key, &inputs, loaded)?;
+        let existing = existing_exact(
+            &write.as_tx(),
+            &review_id,
+            &legacy_review_id,
+            &identity_key,
+            &inputs,
+            loaded,
+        )?;
         if let Some(record) = existing {
             return Ok(record);
         }
-        let previous = previous_head(write, &identity_key, &review_id)?;
+        let previous = previous_head(write, &identity_key, &review_id, loaded.trust)?;
         let revision = next_revision(write)?;
         let mut limitations = loaded.limitations.clone();
         if let Some(previous_id) = previous.as_deref() {
@@ -170,8 +186,17 @@ pub fn import_with_outcome(
     let inputs = inputs_of(loaded)?;
     let identity_key = identity_key(loaded, &variant);
     let review_id = review_id(loaded, &variant);
-    let repeated =
-        store.read(|read| existing_exact(read, &review_id, &identity_key, &inputs, loaded))?;
+    let legacy_review_id = legacy_review_id(loaded, &variant);
+    let repeated = store.read(|read| {
+        existing_exact(
+            read,
+            &review_id,
+            &legacy_review_id,
+            &identity_key,
+            &inputs,
+            loaded,
+        )
+    })?;
     let record = import_history(store, loaded, request)?;
     let status = if repeated.is_some() {
         ImportStatus::NoopExisting
@@ -190,18 +215,20 @@ pub fn generation(store: &LearningStore) -> Result<HistoryGeneration, DomainErro
     store.read(generation_of)
 }
 
-fn generation_of(read: &super::store::LearningRead<'_>) -> Result<HistoryGeneration, DomainError> {
-    let (revision, trusted, quarantined): (i64, i64, i64) = read
+pub(super) fn generation_of(
+    read: &super::store::LearningRead<'_>,
+) -> Result<HistoryGeneration, DomainError> {
+    let (trusted, quarantined): (i64, i64) = read
         .transaction()
         .query_row(
-            "SELECT COALESCE(MAX(revision), 0),
-                    COALESCE(SUM(CASE WHEN trust = 'ast_authenticated' THEN 1 ELSE 0 END), 0),
+            "SELECT COALESCE(SUM(CASE WHEN trust = 'ast_authenticated' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN trust = 'structure_only_quarantine' THEN 1 ELSE 0 END), 0)
              FROM learning_import",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать генерацию"))?;
+    let revision = super::schema::read_history_generation(read.transaction())?;
     let trusted_units: i64 = read
         .transaction()
         .query_row(
@@ -215,7 +242,7 @@ fn generation_of(read: &super::store::LearningRead<'_>) -> Result<HistoryGenerat
         )
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать генерацию"))?;
     Ok(HistoryGeneration {
-        revision: u64::try_from(revision.max(0)).unwrap_or(u64::MAX),
+        revision,
         trusted_reviews: usize::try_from(trusted.max(0)).unwrap_or(usize::MAX),
         quarantined_reviews: usize::try_from(quarantined.max(0)).unwrap_or(usize::MAX),
         trusted_units: usize::try_from(trusted_units.max(0)).unwrap_or(usize::MAX),
@@ -484,6 +511,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     text
 }
 
+pub(crate) fn serialize_json<T: Serialize + ?Sized>(
+    value: &T,
+    context: &str,
+) -> Result<String, DomainError> {
+    serde_json::to_string(value)
+        .map_err(|error| DomainError::new(ErrorCode::Internal, format!("{context}: {error}")))
+}
+
+/// Source identity сохраняет прежнюю форму для совместимости с уже импортированной историей.
 fn identity_key(loaded: &LoadedReview, variant: &str) -> String {
     let target = &loaded.pack.target;
     sha256_hex(
@@ -500,6 +536,35 @@ fn identity_key(loaded: &LoadedReview, variant: &str) -> String {
 }
 
 fn review_id(loaded: &LoadedReview, variant: &str) -> String {
+    let target = &loaded.pack.target;
+    let digest = sha256_hex(
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            target.repository_id,
+            target.base_sha,
+            target.head_sha,
+            target.merge_base_sha,
+            variant,
+            analyzer_digest(&loaded.pack),
+            classifier_digest(&loaded.pack, &loaded.queue),
+            loaded.queue_sha256,
+            loaded
+                .triage
+                .as_ref()
+                .map_or("", |(_, digest)| digest.as_str()),
+            loaded
+                .inputs_hint
+                .execution_result_sha256
+                .as_deref()
+                .unwrap_or(""),
+            loaded.trust.as_str()
+        )
+        .as_bytes(),
+    );
+    format!("review-{}", &digest[..32])
+}
+
+fn legacy_review_id(loaded: &LoadedReview, variant: &str) -> String {
     let target = &loaded.pack.target;
     let digest = sha256_hex(
         format!(
@@ -551,6 +616,7 @@ fn timestamp() -> u64 {
 fn existing_exact(
     read: &super::store::LearningTx<'_>,
     review_id: &str,
+    legacy_review_id: &str,
     identity_key: &str,
     inputs: &ImportInputs,
     loaded: &LoadedReview,
@@ -558,12 +624,15 @@ fn existing_exact(
     let found: Option<String> = read
         .transaction()
         .query_row(
-            "SELECT review_id FROM learning_import WHERE review_id = ?1 AND identity_key = ?2
-             AND review_pack_sha256 = ?3 AND queue_sha256 = ?4
-             AND COALESCE(triage_sha256, '') = ?5 AND analyzer_digest = ?6
-             AND classifier_digest = ?7 AND trust = ?8",
+            "SELECT review_id FROM learning_import
+             WHERE review_id IN (?1, ?2) AND identity_key = ?3
+             AND review_pack_sha256 = ?4 AND queue_sha256 = ?5
+             AND COALESCE(triage_sha256, '') = ?6 AND analyzer_digest = ?7
+             AND classifier_digest = ?8 AND trust = ?9
+             ORDER BY CASE WHEN review_id = ?1 THEN 0 ELSE 1 END LIMIT 1",
             params![
                 review_id,
+                legacy_review_id,
                 identity_key,
                 inputs.review_pack_sha256,
                 inputs.queue_sha256,
@@ -578,7 +647,7 @@ fn existing_exact(
         .map_err(|error| super::store::map_error(&error, "не удалось проверить повтор импорта"))?;
     match found {
         None => Ok(None),
-        Some(_) => Ok(Some(show_import_in_write(read, review_id)?)),
+        Some(found_review_id) => Ok(Some(show_import_in_write(read, &found_review_id)?)),
     }
 }
 
@@ -603,22 +672,24 @@ fn show_import_in_write(
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать запись истории"))
 }
 
-/// Предыдущая не вытесненная запись той же identity: её вытесняет новая ревизия.
+/// Предыдущая не вытесненная запись той же identity и того же доверия.
+/// Карантин и доверенная история ведут отдельные ревизионные цепочки.
 fn previous_head(
     read: &super::store::LearningWrite<'_>,
     identity_key: &str,
     review_id: &str,
+    trust: TrustLevel,
 ) -> Result<Option<String>, DomainError> {
     let mut statement = read
         .transaction()
         .prepare(
             "SELECT review_id FROM learning_import
-             WHERE identity_key = ?1 AND review_id <> ?2 AND superseded_by IS NULL
+             WHERE identity_key = ?1 AND review_id <> ?2 AND superseded_by IS NULL AND trust = ?3
              ORDER BY revision DESC LIMIT 1",
         )
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
     let mut rows = statement
-        .query(params![identity_key, review_id])
+        .query(params![identity_key, review_id, trust.as_str()])
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
     match rows
         .next()
@@ -649,10 +720,14 @@ fn insert_import(
     record: &ImportRecord,
     identity_key: &str,
 ) -> Result<(), DomainError> {
-    let limitations =
-        serde_json::to_string(&record.limitations).unwrap_or_else(|_| "[]".to_owned());
-    let observations =
-        serde_json::to_string(&record.observations).unwrap_or_else(|_| "{}".to_owned());
+    let limitations = serialize_json(
+        &record.limitations,
+        "не удалось сериализовать ограничения импорта",
+    )?;
+    let observations = serialize_json(
+        &record.observations,
+        "не удалось сериализовать счётчики наблюдений",
+    )?;
     let execution_evidence = record
         .inputs
         .execution_evidence
@@ -816,6 +891,21 @@ fn write_units(
             .find_map(|id| dispositions.get(id.as_str()).cloned())
             .unwrap_or((None, None));
         let features = super::patterns::unit_features(&unit.signature);
+        let representatives = serialize_json(
+            unit.representative_candidate_ids(),
+            "не удалось сериализовать представителей единицы",
+        )?;
+        let surfaces = serialize_json(
+            &unit
+                .signature
+                .classification
+                .surfaces
+                .iter()
+                .map(crate::code_review::review_queue::surface_name)
+                .collect::<Vec<_>>(),
+            "не удалось сериализовать поверхности единицы",
+        )?;
+        let feature_json = serialize_json(&features, "не удалось сериализовать признаки единицы")?;
         write.execute(
             "INSERT INTO learning_unit (
                 review_id, unit_id, kind, candidate_count, priority, representatives_json,
@@ -828,26 +918,16 @@ fn write_units(
                 kind.as_str(),
                 unit.candidate_ids().len() as i64,
                 unit.priority.as_str(),
-                serde_json::to_string(unit.representative_candidate_ids())
-                    .unwrap_or_else(|_| "[]".to_owned()),
+                representatives,
                 disposition,
                 reason_code,
                 unit.signature.detector,
                 unit.signature.source,
                 unit.signature.classification.role.as_str(),
                 unit.signature.classification.code_role.as_str(),
-                serde_json::to_string(
-                    &unit
-                        .signature
-                        .classification
-                        .surfaces
-                        .iter()
-                        .map(crate::code_review::review_queue::surface_name)
-                        .collect::<Vec<_>>()
-                )
-                .unwrap_or_else(|_| "[]".to_owned()),
+                surfaces,
                 super::patterns::feature_signature(&features),
-                serde_json::to_string(&features).unwrap_or_else(|_| "{}".to_owned()),
+                feature_json,
             ],
         )?;
     }
@@ -889,12 +969,12 @@ fn write_candidates(
     let owner = unit_of_candidate(loaded);
     for candidate in loaded.pack.all_candidates() {
         let unit_id = owner.get(candidate.id.as_str()).copied().unwrap_or("");
-        let classification = loaded
-            .queue
-            .classifications
-            .get(&candidate.id)
-            .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()))
-            .unwrap_or_else(|| "{}".to_owned());
+        let classification = match loaded.queue.classifications.get(&candidate.id) {
+            Some(value) => {
+                serialize_json(value, "не удалось сериализовать классификацию кандидата")?
+            }
+            None => "{}".to_owned(),
+        };
         let execution = loaded
             .queue
             .classifications
@@ -943,6 +1023,10 @@ fn write_decisions(
         return Ok(());
     };
     for decision in &triage.individual_decisions {
+        let covered = serialize_json(
+            std::slice::from_ref(&decision.candidate_id),
+            "не удалось сериализовать покрытие индивидуального решения",
+        )?;
         write.execute(
             "INSERT INTO learning_decision (
                 review_id, decision_id, kind, disposition, reason_code, explanation,
@@ -954,12 +1038,15 @@ fn write_decisions(
                 decision.disposition.as_str(),
                 decision.reason_code.as_str(),
                 sanitize_text(&decision.explanation),
-                serde_json::to_string(std::slice::from_ref(&decision.candidate_id))
-                    .unwrap_or_else(|_| "[]".to_owned()),
+                covered,
             ],
         )?;
     }
     for group in &triage.group_decisions {
+        let covered = serialize_json(
+            &group.candidate_ids,
+            "не удалось сериализовать покрытие группового решения",
+        )?;
         write.execute(
             "INSERT INTO learning_decision (
                 review_id, decision_id, kind, disposition, reason_code, explanation,
@@ -972,7 +1059,7 @@ fn write_decisions(
                 group.reason_code.as_str(),
                 sanitize_text(&group.explanation),
                 group.candidate_ids.len() as i64,
-                serde_json::to_string(&group.candidate_ids).unwrap_or_else(|_| "[]".to_owned()),
+                covered,
             ],
         )?;
     }
@@ -996,6 +1083,10 @@ fn write_findings(
             .filter_map(|id| owner.get(id.as_str()).map(|unit| (*unit).to_owned()))
             .collect();
         let signature = finding_signature(finding, &features);
+        let linked_units = serialize_json(
+            &units,
+            "не удалось сериализовать связанные единицы замечания",
+        )?;
         write.execute(
             "INSERT INTO learning_finding (
                 review_id, finding_id, severity, provenance, title, description, signature,
@@ -1009,7 +1100,7 @@ fn write_findings(
                 sanitize_text(&finding.title),
                 sanitize_text(&finding.description),
                 signature,
-                serde_json::to_string(&units).unwrap_or_else(|_| "[]".to_owned()),
+                linked_units,
             ],
         )?;
         for candidate_id in &finding.candidate_ids {
@@ -1730,4 +1821,31 @@ fn load_triage(
         })?;
     crate::code_review::semantic_triage::validate(&triage, pack, review_pack_sha256)?;
     Ok((triage, sha256_hex(&bytes)))
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+    use serde::Serializer;
+    use serde::ser::Error as _;
+
+    struct BrokenSerialization;
+
+    impl Serialize for BrokenSerialization {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(S::Error::custom("synthetic serialization failure"))
+        }
+    }
+
+    #[test]
+    fn serialization_failure_is_returned_instead_of_empty_json() {
+        let error = serialize_json(&BrokenSerialization, "serialization context").unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.message.contains("synthetic serialization failure"));
+        assert!(!error.message.ends_with("{}"));
+        assert!(!error.message.ends_with("[]"));
+    }
 }

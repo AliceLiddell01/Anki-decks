@@ -1506,15 +1506,24 @@ fn remove_locked_own_worktree(
     let unlocked = command.output().map_err(process_error)?;
     let mut command = trusted_git(&job.root, hooks)?;
     command.args(["worktree", "remove", "--force"]).arg(path);
-    if command.output().map_err(process_error)?.status.success() {
+    let removed = command.output().map_err(process_error)?;
+    if removed.status.success() {
         return Ok(());
     }
+    let detail = if unlocked.status.success() {
+        format!(
+            "блокировка снята, но повторное удаление не выполнено: {}. Повторите очистку.",
+            stable_message(&String::from_utf8_lossy(&removed.stderr), &[path])
+        )
+    } else {
+        format!(
+            "снятие блокировки не подтверждено (unlock: {}). Проверьте блокировку и при необходимости снимите её вручную (`git worktree unlock` для рабочего дерева этого задания), затем повторите очистку.",
+            stable_message(&String::from_utf8_lossy(&unlocked.stderr), &[path])
+        )
+    };
     Err(DomainError::new(
         ErrorCode::ProcessOperationFailed,
-        format!(
-            "Удаление рабочего дерева не завершено: {reason}; собственная запись рабочего дерева осталась заблокированной (unlock: {}). Снимите блокировку вручную (`git worktree unlock` для рабочего дерева этого задания) и повторите очистку.",
-            stable_message(&String::from_utf8_lossy(&unlocked.stderr), &[path])
-        ),
+        format!("Удаление рабочего дерева не завершено: {reason}; {detail}"),
     ))
 }
 

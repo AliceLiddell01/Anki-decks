@@ -18,15 +18,20 @@ fn git(root: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(
         output.status.success(),
-        "тестовая команда Git завершилась с кодом {:?}",
-        output.status.code()
+        "тестовая команда Git завершилась с кодом {:?}: stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 fn success(output: (i32, String, String)) -> Value {
-    let (code, stdout, _stderr) = output;
-    assert!(code == 0, "CLI завершился с кодом {code}");
+    let (code, stdout, stderr) = output;
+    assert_eq!(
+        code, 0,
+        "CLI завершился с кодом {code}: stdout={stdout} stderr={stderr}"
+    );
     parse_json(&stdout)["result"].clone()
 }
 
@@ -210,7 +215,10 @@ fn cleanup_preflights_all_surfaces_before_removing_worktree() {
             fs::write(job.join("scratch"), "не каталог".as_bytes()).unwrap();
         }
         let (code, stdout, _) = fixture.operation("cleanup", &job);
-        assert_ne!(code, 0, "запуск при конфликте должен завершиться ошибкой");
+        assert_ne!(
+            code, 0,
+            "очистка при подменённой поверхности должна завершиться ошибкой"
+        );
         assert_eq!(
             parse_json(&stdout)["error"]["code"],
             "review_artifact_conflict"
@@ -263,7 +271,7 @@ fn failures_before_spawn_leave_proven_not_started_job_inspectable() {
             &job,
             &["/bin/sh", "-c", "printf started > ../outputs/started"],
         );
-        assert_ne!(code, 0, "cleanup должен завершиться ошибкой");
+        assert_ne!(code, 0, "запуск до spawn должен завершиться ошибкой");
         assert!(!job.join("outputs/started").exists());
         let inspection = success(fixture.operation("inspect", &job));
         assert_eq!(
@@ -760,7 +768,7 @@ fn cleanup_rejects_foreign_attestation_and_preserves_operator_limitation() {
     let (code, _stdout, _) = fixture.operation("cleanup", &first);
     assert_eq!(
         code, 7,
-        "неподтверждённая очистка должна завершиться с кодом 7"
+        "очистка с посторонним файлом задания должна завершиться с кодом 7"
     );
     fs::write(first.join("cleanup-attestation.json"), attestation).unwrap();
     fs::copy(

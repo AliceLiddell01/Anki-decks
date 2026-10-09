@@ -151,12 +151,50 @@ pub fn verify_export(
     if review_ids.len() != archive.reviews.len() {
         return Err(invalid("Повтор review_id в архиве learning"));
     }
+    let unit_ids: BTreeSet<(&str, &str)> = archive
+        .units
+        .iter()
+        .map(|unit| (unit.review_id.as_str(), unit.unit_id.as_str()))
+        .collect();
+    let candidate_ids: BTreeSet<(&str, &str)> = archive
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.review_id.as_str(),
+                candidate.candidate_id.as_str(),
+            )
+        })
+        .collect();
+    let finding_ids: BTreeSet<(&str, &str)> = archive
+        .findings
+        .iter()
+        .map(|finding| (finding.review_id.as_str(), finding.finding_id.as_str()))
+        .collect();
     for unit in &archive.units {
         if !review_ids.contains_key(unit.review_id.as_str()) {
             return Err(invalid(format!(
                 "Единица архива ссылается на отсутствующую запись: {}",
                 unit.review_id
             )));
+        }
+    }
+    for finding in &archive.findings {
+        if !review_ids.contains_key(finding.review_id.as_str()) {
+            return Err(invalid(format!(
+                "Замечание архива ссылается на отсутствующую запись: {}",
+                finding.review_id
+            )));
+        }
+    }
+    for link in &archive.finding_links {
+        if !review_ids.contains_key(link.review_id.as_str())
+            || !candidate_ids.contains(&(link.review_id.as_str(), link.candidate_id.as_str()))
+            || !finding_ids.contains(&(link.review_id.as_str(), link.finding_id.as_str()))
+        {
+            return Err(invalid(
+                "Связь кандидата и замечания архива ссылается на отсутствующую запись, кандидата или замечание",
+            ));
         }
     }
     for candidate in &archive.candidates {
@@ -180,9 +218,33 @@ pub fn verify_export(
     for link in &archive.case_links {
         if !review_ids.contains_key(link.review_id.as_str())
             || !review_ids.contains_key(link.linked_review_id.as_str())
+            || !finding_ids.contains(&(link.review_id.as_str(), link.finding_id.as_str()))
+            || !finding_ids.contains(&(
+                link.linked_review_id.as_str(),
+                link.linked_finding_id.as_str(),
+            ))
         {
             return Err(invalid(
                 "Связь случаев архива ссылается на отсутствующую запись",
+            ));
+        }
+    }
+    let mut feedback_ids = BTreeSet::new();
+    for event in &archive.feedback_events {
+        if !feedback_ids.insert(event.event_id.as_str()) {
+            return Err(invalid(format!(
+                "Повтор event_id в событиях обратной связи архива: {}",
+                event.event_id
+            )));
+        }
+        if !review_ids.contains_key(event.review_id.as_str())
+            || !unit_ids.contains(&(event.review_id.as_str(), event.unit_id.as_str()))
+            || event.candidate_id.as_deref().is_some_and(|candidate_id| {
+                !candidate_ids.contains(&(event.review_id.as_str(), candidate_id))
+            })
+        {
+            return Err(invalid(
+                "Событие обратной связи архива ссылается на отсутствующую запись, единицу или кандидата",
             ));
         }
     }
@@ -318,6 +380,7 @@ pub fn restore_history(
     let summary = store.write(|write| {
         let mut restored = 0usize;
         let mut unchanged = 0usize;
+        let mut restored_ids = BTreeSet::new();
         for record in &archive.reviews {
             let existing: Option<String> = super::import::write_optional_row(
                 write,
@@ -330,78 +393,92 @@ pub fn restore_history(
                 continue;
             }
             insert_record(write, record)?;
+            restored_ids.insert(record.review_id.as_str());
             restored += 1;
         }
-        let wanted: BTreeMap<&str, &str> = archive
-            .reviews
-            .iter()
-            .map(|record| (record.review_id.as_str(), record.review_pack_sha256()))
-            .collect();
         for unit in &archive.units {
-            if wanted.contains_key(unit.review_id.as_str()) {
+            if restored_ids.contains(unit.review_id.as_str()) {
                 insert_unit(write, unit)?;
             }
         }
         for candidate in &archive.candidates {
-            insert_candidate(write, candidate)?;
+            if restored_ids.contains(candidate.review_id.as_str()) {
+                insert_candidate(write, candidate)?;
+            }
         }
         for finding in &archive.findings {
-            insert_finding(write, finding, archive)?;
+            if restored_ids.contains(finding.review_id.as_str()) {
+                insert_finding(write, finding, archive)?;
+            }
         }
         for link in &archive.finding_links {
-            write.execute(
-                "INSERT OR REPLACE INTO learning_finding_link (review_id, candidate_id, finding_id)
-                 VALUES (?1, ?2, ?3)",
-                params![link.review_id, link.candidate_id, link.finding_id],
-            )?;
+            if restored_ids.contains(link.review_id.as_str()) {
+                write.execute(
+                    "INSERT OR REPLACE INTO learning_finding_link (review_id, candidate_id, finding_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![link.review_id, link.candidate_id, link.finding_id],
+                )?;
+            }
         }
         for link in &archive.case_links {
-            write.execute(
-                "INSERT OR REPLACE INTO learning_case_link
-                    (review_id, finding_id, linked_review_id, linked_finding_id, kind, basis)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    link.review_id,
-                    link.finding_id,
-                    link.linked_review_id,
-                    link.linked_finding_id,
-                    link.kind.as_str(),
-                    link.basis,
-                ],
-            )?;
+            if restored_ids.contains(link.review_id.as_str()) {
+                write.execute(
+                    "INSERT OR REPLACE INTO learning_case_link
+                        (review_id, finding_id, linked_review_id, linked_finding_id, kind, basis)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        link.review_id,
+                        link.finding_id,
+                        link.linked_review_id,
+                        link.linked_finding_id,
+                        link.kind.as_str(),
+                        link.basis,
+                    ],
+                )?;
+            }
         }
         for event in &archive.feedback_events {
-            write.execute(
-                "INSERT OR REPLACE INTO learning_feedback (
-                    event_id, review_id, unit_id, candidate_id, kind, action,
-                    supersedes_event_id, retracted_event_id, effective_disposition, usefulness,
-                    explanation, provenance, recorded_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    event.event_id,
-                    event.review_id,
-                    event.unit_id,
-                    event.candidate_id,
-                    event.kind.as_str(),
-                    match event.action {
-                        super::model::FeedbackAction::Retract => "retract",
-                        super::model::FeedbackAction::Supersede => "supersede",
-                        super::model::FeedbackAction::Append => "append",
-                    },
-                    event.supersedes_event_id,
-                    event
-                        .supersedes_event_id
-                        .clone()
-                        .filter(|_| event.action == super::model::FeedbackAction::Retract),
-                    event.effective_disposition,
-                    event.usefulness,
-                    event.explanation,
-                    event.provenance,
-                    event.recorded_at as i64,
-                ],
-            )?;
+            if restored_ids.contains(event.review_id.as_str()) {
+                write.execute(
+                    "INSERT OR REPLACE INTO learning_feedback (
+                        event_id, review_id, unit_id, candidate_id, kind, action,
+                        supersedes_event_id, retracted_event_id, effective_disposition, usefulness,
+                        explanation, provenance, recorded_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        event.event_id,
+                        event.review_id,
+                        event.unit_id,
+                        event.candidate_id,
+                        event.kind.as_str(),
+                        match event.action {
+                            super::model::FeedbackAction::Retract => "retract",
+                            super::model::FeedbackAction::Supersede => "supersede",
+                            super::model::FeedbackAction::Append => "append",
+                        },
+                        event.supersedes_event_id,
+                        event
+                            .supersedes_event_id
+                            .clone()
+                            .filter(|_| event.action == super::model::FeedbackAction::Retract),
+                        event.effective_disposition,
+                        event.usefulness,
+                        event.explanation,
+                        event.provenance,
+                        event.recorded_at as i64,
+                    ],
+                )?;
+            }
         }
         for proposal in &archive.policy_proposals {
+            let feature_json = super::import::serialize_json(
+                &proposal.key,
+                "не удалось сериализовать признаки предложения",
+            )?;
+            let document_json = super::import::serialize_json(
+                proposal,
+                "не удалось сериализовать предложение политики",
+            )?;
             write.execute(
                 "INSERT OR REPLACE INTO learning_policy_proposal
                     (proposal_id, rule_id, feature_json, document_json)
@@ -409,27 +486,29 @@ pub fn restore_history(
                 params![
                     proposal.proposal_id,
                     proposal.rule_id,
-                    serde_json::to_string(&proposal.key).unwrap_or_else(|_| "{}".to_owned()),
-                    serde_json::to_string(proposal).unwrap_or_else(|_| "{}".to_owned()),
+                    feature_json,
+                    document_json,
                 ],
             )?;
         }
         for case in &archive.search {
-            super::import::insert_search(
-                write,
-                &super::import::SearchRow {
-                    case_id: &case.case_id,
-                    review_id: &case.review_id,
-                    unit_id: &case.unit_id,
-                    candidate_id: case.candidate_id.as_deref(),
-                    finding_id: case.finding_id.as_deref(),
-                    kind: &case.kind,
-                    disposition: case.disposition.as_deref(),
-                    severity: case.severity.as_deref(),
-                    provenance: case.provenance.as_deref(),
-                    text: &case.text,
-                },
-            )?;
+            if restored_ids.contains(case.review_id.as_str()) {
+                super::import::insert_search(
+                    write,
+                    &super::import::SearchRow {
+                        case_id: &case.case_id,
+                        review_id: &case.review_id,
+                        unit_id: &case.unit_id,
+                        candidate_id: case.candidate_id.as_deref(),
+                        finding_id: case.finding_id.as_deref(),
+                        kind: &case.kind,
+                        disposition: case.disposition.as_deref(),
+                        severity: case.severity.as_deref(),
+                        provenance: case.provenance.as_deref(),
+                        text: &case.text,
+                    },
+                )?;
+            }
         }
         Ok((restored, unchanged))
     })?;
@@ -462,6 +541,25 @@ fn insert_record(
         )
         .as_bytes(),
     );
+    let execution_evidence = record
+        .inputs
+        .execution_evidence
+        .as_ref()
+        .map(|evidence| {
+            super::import::serialize_json(
+                evidence,
+                "не удалось сериализовать execution evidence из архива",
+            )
+        })
+        .transpose()?;
+    let limitations = super::import::serialize_json(
+        &record.limitations,
+        "не удалось сериализовать ограничения импорта из архива",
+    )?;
+    let observations = super::import::serialize_json(
+        &record.observations,
+        "не удалось сериализовать счётчики наблюдений из архива",
+    )?;
     write.execute(
         "INSERT OR REPLACE INTO learning_import (
             review_id, repository_id, base_sha, head_sha, merge_base_sha, workspace_variant,
@@ -491,28 +589,17 @@ fn insert_record(
             record.inputs.queue_schema_version,
             record.inputs.triage_schema_version,
             record.inputs.execution_schema_version,
-            record
-                .inputs
-                .execution_evidence
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|error| {
-                    DomainError::new(
-                        ErrorCode::LearningExportInvalid,
-                        format!("не удалось сериализовать execution evidence: {error}"),
-                    )
-                })?,
+            execution_evidence,
             record.inputs.analyzer_digest,
             record.inputs.classifier_digest,
             record.trust.as_str(),
             record.outcome.as_str(),
-            serde_json::to_string(&record.limitations).unwrap_or_else(|_| "[]".to_owned()),
+            limitations,
             record.revision_of,
             record.superseded_by,
             record.revision as i64,
             record.imported_at as i64,
-            serde_json::to_string(&record.observations).unwrap_or_else(|_| "{}".to_owned()),
+            observations,
             identity_key,
         ],
     )?;
@@ -523,6 +610,18 @@ fn insert_unit(
     write: &super::store::LearningWrite<'_>,
     unit: &ReviewUnitRecord,
 ) -> Result<(), DomainError> {
+    let representatives = super::import::serialize_json(
+        &unit.representative_candidate_ids,
+        "не удалось сериализовать представителей единицы из архива",
+    )?;
+    let surfaces = super::import::serialize_json(
+        &unit.surfaces,
+        "не удалось сериализовать поверхности единицы из архива",
+    )?;
+    let feature_json = super::import::serialize_json(
+        unit.feature_map(),
+        "не удалось сериализовать признаки единицы из архива",
+    )?;
     write.execute(
         "INSERT OR REPLACE INTO learning_unit (
             review_id, unit_id, kind, candidate_count, priority, representatives_json,
@@ -535,17 +634,16 @@ fn insert_unit(
             unit.kind.as_str(),
             unit.candidate_count as i64,
             unit.priority,
-            serde_json::to_string(&unit.representative_candidate_ids)
-                .unwrap_or_else(|_| "[]".to_owned()),
+            representatives,
             unit.disposition,
             unit.reason_code,
             unit.detector,
             unit.source,
             unit.role,
             unit.code_role,
-            serde_json::to_string(&unit.surfaces).unwrap_or_else(|_| "[]".to_owned()),
+            surfaces,
             unit.signature(),
-            serde_json::to_string(unit.feature_map()).unwrap_or_else(|_| "{}".to_owned()),
+            feature_json,
         ],
     )?;
     Ok(())
@@ -613,6 +711,10 @@ fn insert_finding(
     let mut units: Vec<String> = units;
     units.sort();
     units.dedup();
+    let linked_units = super::import::serialize_json(
+        &units,
+        "не удалось сериализовать связанные единицы замечания из архива",
+    )?;
     write.execute(
         "INSERT OR REPLACE INTO learning_finding (
             review_id, finding_id, severity, provenance, title, description, signature,
@@ -626,7 +728,7 @@ fn insert_finding(
             finding.title,
             finding.description,
             finding.signature,
-            serde_json::to_string(&units).unwrap_or_else(|_| "[]".to_owned()),
+            linked_units,
         ],
     )?;
     Ok(())
@@ -1134,6 +1236,79 @@ mod tests {
         archive
     }
 
+    fn archive_with_valid_references() -> LearningExport {
+        let mut archive = archive_with_candidate("src/lib.rs");
+        archive.reviews.push(ImportRecord {
+            review_id: "review-1".into(),
+            repository_id: "repository-1".into(),
+            base_sha: "base".into(),
+            head_sha: "head".into(),
+            merge_base_sha: "merge-base".into(),
+            workspace_variant: "root".into(),
+            workspace_label: None,
+            inputs: ImportInputs::default(),
+            trust: TrustLevel::AstAuthenticated,
+            outcome: ReviewedOutcome::FullyReviewed,
+            limitations: Vec::new(),
+            revision_of: None,
+            superseded_by: None,
+            revision: 1,
+            imported_at: 1,
+            observations: ObservationCounts::default(),
+        });
+        archive.units.push(ReviewUnitRecord {
+            unit_id: "unit-1".into(),
+            review_id: "review-1".into(),
+            kind: ReviewUnitKind::Individual,
+            candidate_count: 1,
+            priority: "normal".into(),
+            representative_candidate_ids: vec!["candidate-1".into()],
+            disposition: None,
+            reason_code: None,
+            detector: "error_path".into(),
+            source: "synthetic".into(),
+            role: "production".into(),
+            code_role: "implementation".into(),
+            surfaces: vec!["production".into()],
+            feature_map: BTreeMap::new(),
+        });
+        archive.findings.push(ExportedFinding {
+            review_id: "review-1".into(),
+            finding_id: "finding-1".into(),
+            severity: "minor".into(),
+            provenance: "independent".into(),
+            title: "Finding".into(),
+            description: "Finding description".into(),
+            signature: "signature".into(),
+        });
+        archive.finding_links.push(ExportedFindingLink {
+            review_id: "review-1".into(),
+            candidate_id: "candidate-1".into(),
+            finding_id: "finding-1".into(),
+        });
+        archive.feedback_events.push(FeedbackEvent {
+            schema_version: super::super::feedback::FEEDBACK_SCHEMA_VERSION,
+            event_id: "event-1".into(),
+            review_id: "review-1".into(),
+            unit_id: "unit-1".into(),
+            candidate_id: Some("candidate-1".into()),
+            kind: super::super::model::FeedbackKind::SemanticOutcomeRevision,
+            action: super::super::model::FeedbackAction::Append,
+            supersedes_event_id: None,
+            effective_disposition: Some("confirmed".into()),
+            usefulness: None,
+            explanation: "Reviewer's explanation".into(),
+            provenance: "reviewer".into(),
+            recorded_at: 1,
+        });
+        archive.manifest.reviews = archive.reviews.len();
+        archive.manifest.units = archive.units.len();
+        archive.manifest.findings = archive.findings.len();
+        archive.manifest.feedback_events = archive.feedback_events.len();
+        archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
+        archive
+    }
+
     #[test]
     fn archive_paths_are_validated_by_components_not_substrings() {
         // Законные repo-relative пути, включая компонент `home`.
@@ -1161,6 +1336,60 @@ mod tests {
             let error = reject_unportable_path(path).unwrap_err();
             assert_eq!(error.code, ErrorCode::LearningExportInvalid, "путь: {path}");
         }
+    }
+
+    #[test]
+    fn archive_rejects_dangling_findings_links_and_feedback_references() {
+        let valid = archive_with_valid_references();
+        verify_export(None, &valid).unwrap();
+
+        let mut archive = valid.clone();
+        archive.findings[0].review_id = "missing-review".into();
+        archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
+        assert_eq!(
+            verify_export(None, &archive).unwrap_err().code,
+            ErrorCode::LearningExportInvalid
+        );
+
+        let mut archive = valid.clone();
+        archive.finding_links[0].candidate_id = "missing-candidate".into();
+        archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
+        assert_eq!(
+            verify_export(None, &archive).unwrap_err().code,
+            ErrorCode::LearningExportInvalid
+        );
+
+        let mut archive = valid.clone();
+        archive.finding_links[0].finding_id = "missing-finding".into();
+        archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
+        assert_eq!(
+            verify_export(None, &archive).unwrap_err().code,
+            ErrorCode::LearningExportInvalid
+        );
+
+        let mut archive = valid.clone();
+        archive.feedback_events[0].review_id = "missing-review".into();
+        archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
+        assert_eq!(
+            verify_export(None, &archive).unwrap_err().code,
+            ErrorCode::LearningExportInvalid
+        );
+
+        let mut archive = valid.clone();
+        archive.feedback_events[0].unit_id = "missing-unit".into();
+        archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
+        assert_eq!(
+            verify_export(None, &archive).unwrap_err().code,
+            ErrorCode::LearningExportInvalid
+        );
+
+        let mut archive = valid;
+        archive.feedback_events[0].candidate_id = Some("missing-candidate".into());
+        archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
+        assert_eq!(
+            verify_export(None, &archive).unwrap_err().code,
+            ErrorCode::LearningExportInvalid
+        );
     }
 
     #[test]

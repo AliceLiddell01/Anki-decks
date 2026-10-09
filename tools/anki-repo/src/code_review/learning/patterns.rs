@@ -220,6 +220,17 @@ pub fn pattern_report(
         let abstained = rules
             .iter()
             .all(|rule| rule.support.level != SupportLevel::Supported);
+        let quarantine_limitation = if query.include_quarantine {
+            format!(
+                "Карантинные записи включены по явному --include-quarantine; всего карантинных записей в истории: {}.",
+                generation.quarantined_reviews
+            )
+        } else {
+            format!(
+                "В срез входят только записи с доверием ast_authenticated; карантинных записей в истории: {}.",
+                generation.quarantined_reviews
+            )
+        };
         Ok(PatternReport {
             schema_version: PATTERN_SCHEMA_VERSION,
             policy_version: LEARNING_POLICY_VERSION,
@@ -232,10 +243,7 @@ pub fn pattern_report(
                     .to_owned(),
                 "Паттерн — наблюдение и материал для рекомендации, а не правило автоматического suppression."
                     .to_owned(),
-                format!(
-                    "В срез входят только записи с доверием ast_authenticated; карантинных записей: {}.",
-                    generation.quarantined_reviews
-                ),
+                quarantine_limitation,
             ],
             rules,
         })

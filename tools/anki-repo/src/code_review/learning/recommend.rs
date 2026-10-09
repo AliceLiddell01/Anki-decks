@@ -130,20 +130,36 @@ pub fn recommend(
     request: &RecommendRequest,
 ) -> Result<Recommendations, DomainError> {
     let variant = super::import::normalize_variant(&request.workspace_variant)?;
-    let now = if request.now == 0 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_secs())
-            .unwrap_or_default()
-    } else {
-        request.now
-    };
-    let (generation, limitations, learning_disabled) = match store {
-        Some(store) => (
-            super::import::generation(store)?,
-            Vec::new(),
-            !loaded.trust.participates_in_learning(),
-        ),
+    let (generation, limitations, learning_disabled, history_reference_time) = match store {
+        Some(store) => {
+            let (generation, history_reference_time) = store.read(|read| {
+                let generation = super::import::generation_of(read)?;
+                let imported_at: i64 = read
+                    .transaction()
+                    .query_row(
+                        "SELECT COALESCE(MAX(imported_at), 0)
+                         FROM learning_import WHERE trust = 'ast_authenticated'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        super::store::map_error(
+                            &error,
+                            "не удалось прочитать опорное время истории",
+                        )
+                    })?;
+                Ok((
+                    generation,
+                    u64::try_from(imported_at.max(0)).unwrap_or(u64::MAX),
+                ))
+            })?;
+            (
+                generation,
+                Vec::new(),
+                !loaded.trust.participates_in_learning(),
+                history_reference_time,
+            )
+        }
         None => (
             HistoryGeneration {
                 revision: 0,
@@ -153,7 +169,13 @@ pub fn recommend(
             },
             vec!["Обычный режим без learning: рекомендации не опираются на историю.".to_owned()],
             true,
+            0,
         ),
+    };
+    let now = if request.now == 0 {
+        history_reference_time
+    } else {
+        request.now
     };
     let case_limit = request.case_limit.max(1);
     let signatures: BTreeSet<String> = loaded

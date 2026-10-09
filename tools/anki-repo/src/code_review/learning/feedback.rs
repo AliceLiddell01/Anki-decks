@@ -797,6 +797,34 @@ pub fn propose_policy(
     };
     let _ = schema_version();
     store.write(|write| {
+        let existing_json: Option<String> = super::import::write_optional_row(
+            write,
+            "SELECT document_json FROM learning_policy_proposal WHERE proposal_id = ?1",
+            params![document.proposal_id],
+            |row| row.get(0),
+        )?;
+        if let Some(existing_json) = existing_json {
+            let existing: PolicyProposal =
+                serde_json::from_str(&existing_json).map_err(|error| {
+                    DomainError::new(
+                        ErrorCode::LearningCorrupt,
+                        format!("Сохранённое предложение политики повреждено: {error}"),
+                    )
+                })?;
+            let mut comparable = document.clone();
+            comparable.generation.revision = existing.generation.revision;
+            if comparable == existing {
+                return Ok(existing);
+            }
+        }
+        let feature_json = super::import::serialize_json(
+            &document.key,
+            "не удалось сериализовать признаки предложения политики",
+        )?;
+        let document_json = super::import::serialize_json(
+            &document,
+            "не удалось сериализовать предложение политики",
+        )?;
         write.execute(
             "INSERT OR REPLACE INTO learning_policy_proposal
                 (proposal_id, rule_id, feature_json, document_json)
@@ -804,13 +832,12 @@ pub fn propose_policy(
             params![
                 document.proposal_id,
                 document.rule_id,
-                serde_json::to_string(&document.key).unwrap_or_else(|_| "{}".to_owned()),
-                serde_json::to_string(&document).unwrap_or_else(|_| "{}".to_owned()),
+                feature_json,
+                document_json,
             ],
         )?;
-        Ok(())
-    })?;
-    Ok(document)
+        Ok(document.clone())
+    })
 }
 
 fn key_for_signature(

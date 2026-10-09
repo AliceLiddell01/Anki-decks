@@ -226,9 +226,14 @@ impl LearningStore {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| map_error(&error, "не удалось включить foreign_keys"))?;
-        connection
-            .execute_batch(&format!("PRAGMA journal_mode = {}", decision.mode))
-            .map_err(|error| map_error(&error, "не удалось выбрать режим журнала SQLite"))?;
+        let current_journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|error| map_error(&error, "не удалось прочитать режим журнала SQLite"))?;
+        if !current_journal_mode.eq_ignore_ascii_case(&decision.mode) {
+            connection
+                .execute_batch(&format!("PRAGMA journal_mode = {}", decision.mode))
+                .map_err(|error| map_error(&error, "не удалось выбрать режим журнала SQLite"))?;
+        }
         let fts5_available = schema::fts5_available(&connection)?;
         let mut store = Self {
             connection,
@@ -236,15 +241,20 @@ impl LearningStore {
             journal_mode: decision,
             fts5_available,
         };
-        let _ = schema::apply_migrations(&mut store.connection)?;
+        let current_schema_version = schema::read_schema_version(&store.connection)?;
+        let schema_changed = current_schema_version != LEARNING_SCHEMA_VERSION;
+        if schema_changed {
+            let _ = schema::apply_migrations(&mut store.connection)?;
+        }
         store
             .connection
             .busy_timeout(std::time::Duration::from_millis(
                 store.options.busy_timeout_ms,
             ))
             .map_err(|error| map_error(&error, "не удалось настроить busy_timeout"))?;
-        schema::ensure_fts_index(&store.connection)?;
-        store.write(|_| Ok(()))?;
+        if schema_changed {
+            schema::ensure_fts_index(&store.connection)?;
+        }
         Ok(store)
     }
 
@@ -254,14 +264,20 @@ impl LearningStore {
         action: impl FnOnce(&LearningWrite<'_>) -> Result<T, DomainError>,
     ) -> Result<T, DomainError> {
         let connection = &self.connection;
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| map_error(&error, "не удалось начать транзакцию записи"))?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| map_error(&error, "не удалось начать транзакцию записи"))?;
+        let changes_before = transaction.total_changes();
         let write = LearningWrite {
             transaction: &transaction,
             busy_timeout_ms: self.options.busy_timeout_ms,
         };
         let value = action(&write)?;
+        if transaction.total_changes() > changes_before {
+            schema::increment_history_generation(&transaction)?;
+        }
         transaction
             .commit()
             .map_err(|error| map_error(&error, "не удалось зафиксировать транзакцию записи"))?;
@@ -433,8 +449,8 @@ impl LearningStore {
 #[must_use]
 pub fn recovery_paths(database: &str) -> Vec<String> {
     vec![
-        format!("code-review learning export --database {database}"),
-        "code-review learning backup".to_owned(),
+        format!("code-review learning export --database {database} --out <archive>"),
+        format!("code-review learning backup --database {database} --out <snapshot>"),
         "code-review learning restore --from <archive>".to_owned(),
     ]
 }
@@ -547,7 +563,11 @@ pub type LearningRead<'a> = LearningTx<'a>;
 #[must_use]
 pub fn journal_mode_decision(database: &Path) -> JournalModeDecision {
     let probe = probe_directory(database);
-    match filesystem_type(&probe) {
+    journal_mode_decision_for_type(filesystem_type(&probe))
+}
+
+fn journal_mode_decision_for_type(file_type: Option<i64>) -> JournalModeDecision {
+    match file_type {
         Some(file_type) => {
             if let Some((_, name)) = NETWORK_FILESYSTEMS
                 .iter()
@@ -686,18 +706,28 @@ mod tests {
 
     #[test]
     fn known_local_filesystem_selects_wal_and_reports_reason() {
-        let directory = temp_directory("wal-local");
-        let decision = journal_mode_decision(&directory.join("state.sqlite"));
+        let decision = journal_mode_decision_for_type(Some(0xEF53));
         assert_eq!(decision.mode, "wal");
         assert!(decision.reason.contains("локальная"));
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
     fn missing_directory_falls_back_to_delete_honestly() {
-        let decision = journal_mode_decision(Path::new("/nonexistent-learning-probe/state.sqlite"));
+        let decision = journal_mode_decision_for_type(None);
         assert_eq!(decision.mode, "delete");
         assert!(decision.reason.contains("определить не удалось"));
+    }
+
+    #[test]
+    fn recovery_commands_include_required_output_paths() {
+        let paths = recovery_paths(".anki-repo/learning/state.sqlite");
+        assert!(
+            paths[0].contains("export --database .anki-repo/learning/state.sqlite --out <archive>")
+        );
+        assert!(
+            paths[1]
+                .contains("backup --database .anki-repo/learning/state.sqlite --out <snapshot>")
+        );
     }
 
     #[test]
@@ -738,6 +768,31 @@ mod tests {
         assert!(status.fts5_available);
         assert_eq!(status.generation.revision, 0);
         assert!(!status.database_path.contains("/home/"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn opening_current_schema_for_read_does_not_commit_database_changes() {
+        let directory = temp_directory("store-read-only-open");
+        let database = directory.join("state.sqlite");
+        drop(LearningStore::open(StoreOptions::at(&database)).unwrap());
+        let observer = Connection::open(&database).unwrap();
+        let version = || {
+            observer
+                .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = version();
+        let mut options = StoreOptions::at(&database);
+        options.create = false;
+        let store = LearningStore::open(options).unwrap();
+        store.status().unwrap();
+        drop(store);
+        assert_eq!(
+            version(),
+            before,
+            "читающее открытие не фиксирует запись в БД"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

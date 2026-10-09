@@ -14,7 +14,7 @@ use crate::error::{DomainError, ErrorCode};
 use super::LEARNING_POLICY_VERSION;
 
 /// Текущая версия схемы базы learning.
-pub const LEARNING_SCHEMA_VERSION: u32 = 2;
+pub const LEARNING_SCHEMA_VERSION: u32 = 3;
 
 /// Имя таблицы журнала миграций.
 pub const MIGRATION_TABLE: &str = "learning_migration";
@@ -237,6 +237,9 @@ pub fn apply_migrations(connection: &mut Connection) -> Result<u32, DomainError>
             },
         ));
     }
+    if current == LEARNING_SCHEMA_VERSION {
+        return Ok(current);
+    }
     let transaction = connection
         .transaction()
         .map_err(|error| schema_error("не удалось начать транзакцию миграции", &error))?;
@@ -250,6 +253,7 @@ pub fn apply_migrations(connection: &mut Connection) -> Result<u32, DomainError>
             2 => transaction
                 .execute_batch(SCHEMA_V2)
                 .map_err(|error| schema_error("не удалось добавить сводку execution", &error))?,
+            3 => apply_v3(&transaction)?,
             _ => {
                 return Err(DomainError::new(
                     ErrorCode::LearningSchemaUnsupported,
@@ -316,6 +320,49 @@ fn apply_v1(transaction: &Transaction<'_>) -> Result<(), DomainError> {
             .map_err(|error| schema_error("не удалось создать таблицу схемы learning", &error))?;
     }
     Ok(())
+}
+
+fn apply_v3(transaction: &Transaction<'_>) -> Result<(), DomainError> {
+    let initial_generation: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM learning_import",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| schema_error("не удалось прочитать исходную генерацию истории", &error))?;
+    set_meta(
+        transaction,
+        "history_generation",
+        &initial_generation.max(0).to_string(),
+    )
+}
+
+/// Читает поколение истории, которое сохраняется между удалениями записей.
+pub fn read_history_generation(connection: &Connection) -> Result<u64, DomainError> {
+    let value = read_meta(connection, "history_generation")?.ok_or_else(|| {
+        DomainError::new(
+            ErrorCode::LearningCorrupt,
+            "В базе learning отсутствует служебная генерация истории",
+        )
+    })?;
+    value.parse::<u64>().map_err(|error| {
+        DomainError::new(
+            ErrorCode::LearningCorrupt,
+            format!("Служебная генерация истории повреждена: {error}"),
+        )
+    })
+}
+
+/// Увеличивает поколение истории в той же транзакции, что и изменение данных.
+pub fn increment_history_generation(connection: &Connection) -> Result<(), DomainError> {
+    let current = read_history_generation(connection)?;
+    let next = current.checked_add(1).ok_or_else(|| {
+        DomainError::new(
+            ErrorCode::LearningStorageUnavailable,
+            "Счётчик генерации истории исчерпан",
+        )
+    })?;
+    set_meta(connection, "history_generation", &next.to_string())
 }
 
 /// Создаёт FTS5-индекс и наполняет его уже сохранённым текстом.
@@ -490,11 +537,14 @@ mod tests {
             read_schema_version(&connection).unwrap(),
             LEARNING_SCHEMA_VERSION
         );
+        assert_eq!(read_history_generation(&connection).unwrap(), 0);
         // Повторный вызов идемпотентен и не плодит записей журнала.
+        let changes_before_repeat = connection.total_changes();
         assert_eq!(
             apply_migrations(&mut connection).unwrap(),
             LEARNING_SCHEMA_VERSION
         );
+        assert_eq!(connection.total_changes(), changes_before_repeat);
         let recorded: i64 = connection
             .query_row(
                 &format!("SELECT COUNT(*) FROM {MIGRATION_TABLE}"),

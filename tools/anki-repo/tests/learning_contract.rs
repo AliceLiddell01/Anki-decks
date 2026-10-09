@@ -578,24 +578,14 @@ fn concurrent_exact_imports_commit_one_review_and_one_finding() {
     barrier.wait();
     let mut records = Vec::new();
     for handle in handles {
-        match handle.join().expect("импортёр не должен паниковать") {
-            Ok(record) => records.push(record),
-            Err(error) if error.code == ErrorCode::LearningStorageBusy => {
-                // Если SQLite корректно отказал одному писателю, повторяем его
-                // после завершения конкурирующей транзакции и требуем увидеть
-                // точный идемпотентный результат.
-                let retry_loaded = load_in_repo(&repo, &artifacts, false).unwrap();
-                records.push(
-                    learning::import::import_history(
-                        &verification_store,
-                        &retry_loaded,
-                        &learning::ImportRequest::default(),
-                    )
-                    .unwrap(),
-                );
-            }
-            Err(error) => panic!("ошибка конкурентного импорта: {error:?}"),
-        }
+        records.push(
+            handle
+                .join()
+                .expect("импортёр не должен паниковать")
+                .unwrap_or_else(|error| {
+                    panic!("конкурентный импорт должен дождаться записи: {error:?}")
+                }),
+        );
     }
     assert_eq!(records[0].review_id, records[1].review_id);
     assert_eq!(records[0].revision, records[1].revision);
@@ -1560,6 +1550,7 @@ fn export_and_restore_preserve_provenance_versions_and_no_absolute_paths() {
     let restored_store = open_store(restore_dir.path());
     let summary = learning::transfer::restore_history(&restored_store, &exported.archive).unwrap();
     assert_eq!(summary.restored_reviews, 1);
+    let generation_after_restore = summary.generation.revision;
     let restored = learning::import::list_imports(&restored_store, true, 10).unwrap();
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].review_id, record.review_id);
@@ -1599,10 +1590,48 @@ fn export_and_restore_preserve_provenance_versions_and_no_absolute_paths() {
             .contains(&"event-correction".to_owned())
     );
 
-    // Повторное восстановление идемпотентно.
+    // Повторное восстановление не затирает более новую локальную дочернюю строку.
+    restored_store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_candidate SET path = 'src/local-update.rs'
+                 WHERE review_id = ?1 AND candidate_id = 'production-0'",
+                rusqlite::params![record.review_id],
+            )?;
+            write.execute(
+                "UPDATE learning_feedback SET explanation = 'локальное обновление'
+                 WHERE event_id = 'event-correction'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let generation_after_local_update = learning::import::generation(&restored_store)
+        .unwrap()
+        .revision;
+    assert!(generation_after_local_update > generation_after_restore);
     let repeated = learning::transfer::restore_history(&restored_store, &exported.archive).unwrap();
     assert_eq!(repeated.unchanged_reviews, 1);
     assert_eq!(repeated.restored_reviews, 0);
+    assert_eq!(repeated.generation.revision, generation_after_local_update);
+    let preserved_path: String = restored_store
+        .connection()
+        .query_row(
+            "SELECT path FROM learning_candidate WHERE review_id = ?1 AND candidate_id = 'production-0'",
+            rusqlite::params![record.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let preserved_explanation: String = restored_store
+        .connection()
+        .query_row(
+            "SELECT explanation FROM learning_feedback WHERE event_id = 'event-correction'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved_path, "src/local-update.rs");
+    assert_eq!(preserved_explanation, "локальное обновление");
 }
 
 #[test]
@@ -1621,6 +1650,7 @@ fn forget_removes_one_review_run_and_its_derived_history_atomically() {
     let store = open_store(store_dir.path());
     let loaded = load_in_repo(&repo, &artifacts, false).unwrap();
     let record = import(&loaded, &store);
+    let generation_after_import = learning::import::generation(&store).unwrap().revision;
     let event = FeedbackEvent {
         schema_version: learning::feedback::FEEDBACK_SCHEMA_VERSION,
         event_id: "forget-feedback-event".into(),
@@ -1637,8 +1667,12 @@ fn forget_removes_one_review_run_and_its_derived_history_atomically() {
         recorded_at: 1,
     };
     learning::feedback::record_feedback(&store, &event).unwrap();
+    let generation_after_feedback = learning::import::generation(&store).unwrap().revision;
+    assert!(generation_after_feedback > generation_after_import);
 
     let forgotten = learning::forget_review(&store, &record.review_id).unwrap();
+    let generation_after_forget = learning::import::generation(&store).unwrap().revision;
+    assert!(generation_after_forget > generation_after_feedback);
     assert_eq!(forgotten.removed.reviews, 1);
     assert_eq!(forgotten.removed.units, queue.units.len());
     assert!(forgotten.removed.candidates > 0);
@@ -1680,6 +1714,8 @@ fn forget_removes_one_review_run_and_its_derived_history_atomically() {
             .code,
         ErrorCode::NotFound
     );
+    import(&loaded, &store);
+    assert!(learning::import::generation(&store).unwrap().revision > generation_after_forget);
 }
 
 #[test]
@@ -1698,6 +1734,7 @@ fn feedback_correction_and_retraction_remove_wrong_label_after_recompute() {
     let store = open_store(store_dir.path());
     let loaded = load_in_repo(&repo, &artifacts, false).unwrap();
     let record = import(&loaded, &store);
+    let generation_after_import = learning::import::generation(&store).unwrap().revision;
     let unit_id = "individual-production-0".to_owned();
 
     let correction = FeedbackEvent {
@@ -1716,6 +1753,8 @@ fn feedback_correction_and_retraction_remove_wrong_label_after_recompute() {
         recorded_at: 1,
     };
     let applied = learning::feedback::record_feedback(&store, &correction).unwrap();
+    let generation_after_correction = learning::import::generation(&store).unwrap().revision;
+    assert!(generation_after_correction > generation_after_import);
     assert_eq!(
         applied.outcome.effective_disposition.as_deref(),
         Some("false_positive")
@@ -1726,6 +1765,11 @@ fn feedback_correction_and_retraction_remove_wrong_label_after_recompute() {
     conflicting.event_id = "event-2".into();
     conflicting.effective_disposition = Some("acceptable".into());
     let error = learning::feedback::record_feedback(&store, &conflicting).unwrap_err();
+    assert_eq!(
+        learning::import::generation(&store).unwrap().revision,
+        generation_after_correction,
+        "отклонённое событие не меняет поколение"
+    );
     assert_eq!(error.code, ErrorCode::LearningConflict);
     assert!(
         error.details["conflicting_event_ids"]
@@ -1750,6 +1794,7 @@ fn feedback_correction_and_retraction_remove_wrong_label_after_recompute() {
         recorded_at: 2,
     };
     let retracted = learning::feedback::record_feedback(&store, &retraction).unwrap();
+    assert!(learning::import::generation(&store).unwrap().revision > generation_after_correction);
     assert_eq!(retracted.outcome.effective_disposition, None);
     assert_eq!(
         retracted.outcome.original_disposition.as_deref(),
@@ -2123,6 +2168,8 @@ fn policy_proposal_is_never_auto_applied() {
         0,
     )
     .unwrap();
+    let generation_after_proposal = learning::import::generation(&store).unwrap().revision;
+    assert!(generation_after_proposal > proposal.generation.revision);
     assert!(!proposal.auto_applied);
     assert_eq!(
         proposal.artifact_path,
@@ -2152,6 +2199,11 @@ fn policy_proposal_is_never_auto_applied() {
     )
     .unwrap();
     assert_eq!(repeated.proposal_id, proposal.proposal_id);
+    assert_eq!(
+        learning::import::generation(&store).unwrap().revision,
+        generation_after_proposal,
+        "точный повтор предложения не меняет поколение"
+    );
     assert_eq!(
         learning::feedback::list_proposals(&store, 10)
             .unwrap()
@@ -2239,6 +2291,40 @@ fn recommendations_are_deterministic_and_guardrailed() {
     assert_eq!(first.queue_sha256, loaded.queue_sha256);
     assert!(!first.learning_disabled);
     assert_eq!(first.generation.trusted_reviews, 1);
+
+    // Если вызывающая сторона не передала now, возраст считается от самой
+    // позднейшей доверенной записи, а не от часов процесса.
+    store
+        .write(|write| write.execute("UPDATE learning_import SET imported_at = 1_000_000", []))
+        .unwrap();
+    let stable_default_time = learning::recommend(
+        Some(&store),
+        &loaded,
+        &learning::recommend::RecommendRequest::default(),
+    )
+    .unwrap();
+    assert!(
+        stable_default_time
+            .recommendations
+            .iter()
+            .any(|item| !item.historical_cases.is_empty())
+    );
+    for item in &stable_default_time.recommendations {
+        assert!(item.historical_cases.iter().all(|case| case.age_days == 0));
+        if let Some(support) = &item.support {
+            assert_eq!(support.freshest_age_days, 0);
+            assert_eq!(support.oldest_age_days, 0);
+        }
+    }
+    assert_eq!(
+        stable_default_time,
+        learning::recommend(
+            Some(&store),
+            &loaded,
+            &learning::recommend::RecommendRequest::default(),
+        )
+        .unwrap()
+    );
 
     // Каждая рекомендация ссылается на первичный контекст и не теряет кандидатов.
     let queue_units: BTreeSet<&str> = queue.units.iter().map(|unit| unit.id.as_str()).collect();
@@ -2490,7 +2576,8 @@ fn search_falls_back_reproducibly_without_the_fts_index() {
         id: "finding-fallback".into(),
         severity: Severity::Major,
         title: "Замечание для проверки fallback".into(),
-        description: "src/lib.rs:2: локальный поиск без FTS5 обязан дать тот же результат.".into(),
+        description:
+            "src/lib.rs:2: локальный поиск без FTS5 и парсинг обязаны дать тот же результат.".into(),
         provenance: FindingProvenance::CandidateAssisted,
         candidate_ids: vec!["production-0".into()],
     };
@@ -2517,6 +2604,18 @@ fn search_falls_back_reproducibly_without_the_fts_index() {
     assert!(with_fts.fts5_used);
     assert_eq!(with_fts.cases.len(), 1);
 
+    let cyrillic_short_query = learning::search_history(
+        &store,
+        &learning::search::SearchQuery {
+            text: Some("Па".into()),
+            limit: 5,
+            ..learning::search::SearchQuery::default()
+        },
+    )
+    .unwrap();
+    assert!(!cyrillic_short_query.fts5_used);
+    assert!(!cyrillic_short_query.cases.is_empty());
+
     // Тот же корпус без FTS5-таблицы: результат воспроизводится через `instr`.
     store
         .write(|write| write.execute("DROP TABLE learning_search_fts", []))
@@ -2532,6 +2631,20 @@ fn search_falls_back_reproducibly_without_the_fts_index() {
     assert_eq!(
         without_fts.cases[0].match_kind,
         learning::search::SearchMatchKind::Textual
+    );
+    let cyrillic_without_fts = learning::search_history(
+        &store,
+        &learning::search::SearchQuery {
+            text: Some("Па".into()),
+            limit: 5,
+            ..learning::search::SearchQuery::default()
+        },
+    )
+    .unwrap();
+    assert!(!cyrillic_without_fts.fts5_used);
+    assert_eq!(
+        cyrillic_without_fts.cases, cyrillic_short_query.cases,
+        "fallback сохраняет Unicode-поиск без учёта регистра"
     );
 
     // Индекс можно восстановить из таблицы поиска без потери случаев.
@@ -2549,8 +2662,14 @@ fn schema_and_policy_versions_are_recorded_with_the_history() {
     let status = store.status().unwrap();
     assert_eq!(status.user_version, learning::LEARNING_SCHEMA_VERSION);
     assert_eq!(status.policy_version, learning::LEARNING_POLICY_VERSION);
-    assert_eq!(status.journal_mode, "wal");
-    assert!(status.journal_mode_reason.contains("локальная"));
+    match status.journal_mode.as_str() {
+        "wal" => assert!(status.journal_mode_reason.contains("локальная")),
+        "delete" => {
+            assert!(status.journal_mode_reason.contains("DELETE"));
+            assert!(status.journal_mode_reason.contains("выбран"));
+        }
+        mode => panic!("неизвестный режим журнала SQLite: {mode}"),
+    }
     assert_eq!(
         status.busy_timeout_ms,
         learning::store::DEFAULT_BUSY_TIMEOUT_MS
@@ -3159,7 +3278,6 @@ fn search_does_not_mix_quarantine_with_trusted_history() {
     let repo = SyntheticRepo::create("learning-search-trust");
     let pack = synthetic_pack(&repo, 3, 2);
     let authoritative = build_authoritative_queue(&repo, &pack);
-    let structure_only = build_structure_only_queue(&pack);
     let digest = digest_of(&pack);
     let mut triage = semantic_triage::initialize(&pack, &digest);
     for candidate in ["production-0", "production-1", "production-2"] {
@@ -3176,18 +3294,46 @@ fn search_does_not_mix_quarantine_with_trusted_history() {
         Artifacts::write(&repo.path().join("trusted"), &pack, &authoritative, &triage);
     let trusted = load_in_repo(&repo, &trusted_artifacts, false).unwrap();
     assert_eq!(trusted.trust, TrustLevel::AstAuthenticated);
-    import(&trusted, &store);
+    let trusted_record = import(&trusted, &store);
     let quarantine_artifacts = Artifacts::write(
         &repo.path().join("quarantine"),
         &pack,
-        &structure_only,
+        &authoritative,
         &triage,
     );
     let quarantined = expect_quarantine(&repo, &quarantine_artifacts);
-    import(&quarantined, &store);
+    let quarantined_record = import(&quarantined, &store);
+    assert_ne!(trusted_record.review_id, quarantined_record.review_id);
+    assert!(trusted_record.revision_of.is_none());
+    assert!(quarantined_record.revision_of.is_none());
+    assert_eq!(trusted_record.superseded_by, None);
+    assert_eq!(quarantined_record.superseded_by, None);
     let generation = learning::import::generation(&store).unwrap();
     assert_eq!(generation.trusted_reviews, 1);
     assert_eq!(generation.quarantined_reviews, 1);
+    let trusted_patterns =
+        learning::pattern_report(&store, &learning::patterns::PatternQuery::default()).unwrap();
+    assert!(trusted_patterns.limitations[2].contains("только записи с доверием ast_authenticated"));
+    let patterns_with_quarantine = learning::pattern_report(
+        &store,
+        &learning::patterns::PatternQuery {
+            include_quarantine: true,
+            ..learning::patterns::PatternQuery::default()
+        },
+    )
+    .unwrap();
+    assert!(patterns_with_quarantine.limitations[2].contains("Карантинные записи включены"));
+    assert!(patterns_with_quarantine.limitations[2].contains("1"));
+
+    // Порядок импорта не позволяет карантину вытеснить доверенную запись.
+    let reverse_store_dir = TempDir::new("learning-search-trust-reverse-store");
+    let reverse_store = open_store(reverse_store_dir.path());
+    let reverse_quarantine = import(&quarantined, &reverse_store);
+    let reverse_trusted = import(&trusted, &reverse_store);
+    assert!(reverse_quarantine.revision_of.is_none());
+    assert!(reverse_trusted.revision_of.is_none());
+    assert_eq!(reverse_quarantine.superseded_by, None);
+    assert_eq!(reverse_trusted.superseded_by, None);
 
     // По умолчанию поиск возвращает только доверенную историю.
     let trusted_page = learning::search_history(&store, &learning::SearchQuery::default())
