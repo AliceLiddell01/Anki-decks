@@ -1,5 +1,6 @@
 //! Регрессии принадлежности обратной связи и поиска по действующим исходам.
 
+use anki_repo::code_review::learning::model::{ObservationCounts, ReviewedOutcome};
 use anki_repo::code_review::learning::store::{LearningStore, StoreOptions};
 use anki_repo::code_review::learning::{self, FeedbackAction, FeedbackEvent, FeedbackKind};
 use anki_repo::error::ErrorCode;
@@ -17,9 +18,12 @@ fn fixture() -> (TempDir, LearningStore) {
                 review_schema_version, queue_schema_version, analyzer_digest, classifier_digest,
                 trust, outcome, limitations_json, revision, imported_at, observations_json, identity_key
              ) VALUES ('review', 'repository', 'base', 'head', 'base', 'root', 'pack', 'queue',
-                       1, 1, 'analyzer', 'classifier', 'ast_authenticated', 'imported', '[]',
-                       1, 1, '{}', 'identity')",
-            [],
+                       1, 1, 'analyzer', 'classifier', 'ast_authenticated', ?1, '[]',
+                       1, 1, ?2, 'identity')",
+            rusqlite::params![
+                ReviewedOutcome::FullyReviewed.as_str(),
+                serde_json::to_string(&ObservationCounts::default()).unwrap(),
+            ],
         )?;
         for unit in ["first", "second"] {
             write.execute(

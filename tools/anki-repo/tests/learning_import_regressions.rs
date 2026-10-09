@@ -301,6 +301,7 @@ fn only_proven_git_ancestry_creates_a_revision_line() {
     let base = commit(root, "base");
     let first_head = commit(root, "first");
     let second_head = commit(root, "descendant");
+    let third_head = commit(root, "second descendant");
     git(root, &["checkout", "-q", "--detach", &base]);
     let sibling_head = commit(root, "sibling");
     let store = store(storage.path());
@@ -310,9 +311,16 @@ fn only_proven_git_ancestry_creates_a_revision_line() {
     let mut second = loaded(&second_head, None, true);
     second.inputs_hint.repository_root = Some(root.to_path_buf());
     let second_record = import(&store, &second);
+    let mut third = loaded(&third_head, None, true);
+    third.inputs_hint.repository_root = Some(root.to_path_buf());
+    let third_record = import(&store, &third);
     assert_eq!(
         second_record.revision_of.as_deref(),
         Some(first_record.review_id.as_str())
+    );
+    assert_eq!(
+        third_record.revision_of.as_deref(),
+        Some(second_record.review_id.as_str())
     );
     let mut sibling = loaded(&sibling_head, None, true);
     sibling.inputs_hint.repository_root = Some(root.to_path_buf());
@@ -325,11 +333,28 @@ fn only_proven_git_ancestry_creates_a_revision_line() {
             .as_deref(),
         Some(second_record.review_id.as_str())
     );
-    assert!(
+    assert_eq!(
         learning::show_import(&store, &second_record.review_id)
             .unwrap()
             .superseded_by
-            .is_none()
+            .as_deref(),
+        Some(third_record.review_id.as_str())
+    );
+
+    learning::forget_review(&store, &second_record.review_id).unwrap();
+    assert_eq!(
+        learning::show_import(&store, &first_record.review_id)
+            .unwrap()
+            .superseded_by
+            .as_deref(),
+        Some(third_record.review_id.as_str())
+    );
+    assert_eq!(
+        learning::show_import(&store, &third_record.review_id)
+            .unwrap()
+            .revision_of
+            .as_deref(),
+        Some(first_record.review_id.as_str())
     );
 }
 

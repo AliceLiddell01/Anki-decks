@@ -368,6 +368,16 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
 /// Преемственность ревью переносится как проверяемая связь одного Git-случая.
 fn verify_review_lineage(review_ids: &BTreeMap<&str, &ImportRecord>) -> Result<(), DomainError> {
     for record in review_ids.values() {
+        if let Some(child_id) = record.superseded_by.as_deref() {
+            let child = review_ids
+                .get(child_id)
+                .ok_or_else(|| invalid("superseded_by ссылается на отсутствующее ревью"))?;
+            if child.revision_of.as_deref() != Some(record.review_id.as_str()) {
+                return Err(invalid(
+                    "superseded_by не совпадает с revision_of дочерней ревизии",
+                ));
+            }
+        }
         let mut current = *record;
         let mut seen = BTreeSet::new();
         while let Some(parent_id) = current.revision_of.as_deref() {
@@ -382,9 +392,13 @@ fn verify_review_lineage(review_ids: &BTreeMap<&str, &ImportRecord>) -> Result<(
                 || parent.merge_base_sha != current.merge_base_sha
                 || parent.workspace_variant != current.workspace_variant
                 || parent.trust != current.trust
+                || parent
+                    .superseded_by
+                    .as_deref()
+                    .is_some_and(|child_id| child_id != current.review_id)
             {
                 return Err(invalid(
-                    "Преемственность ревью пересекает Git-случаи или границу доверия",
+                    "Преемственность ревью пересекает Git-случаи, границу доверия или противоречивую связь",
                 ));
             }
             current = parent;
@@ -612,6 +626,47 @@ pub fn restore_history(
             available_review_ids.insert(record.review_id.as_str());
             restored += 1;
         }
+        for record in &archive.reviews {
+            if !restored_ids.contains(record.review_id.as_str()) {
+                continue;
+            }
+            let Some(parent_id) = record.revision_of.as_deref() else {
+                continue;
+            };
+            let parent_link: Option<Option<String>> = super::import::write_optional_row(
+                write,
+                "SELECT superseded_by FROM learning_import WHERE review_id = ?1",
+                params![parent_id],
+                |row| row.get(0),
+            )?;
+            let parent_link = parent_link.ok_or_else(|| {
+                DomainError::with_details(
+                    ErrorCode::LearningConflict,
+                    "Родительская ревизия отсутствует в локальной истории при восстановлении",
+                    crate::details! { "parent_review_id" => parent_id, "review_id" => record.review_id.clone() },
+                )
+            })?;
+            match parent_link {
+                None => {
+                    write.execute(
+                        "UPDATE learning_import SET superseded_by = ?1 WHERE review_id = ?2",
+                        params![record.review_id, parent_id],
+                    )?;
+                }
+                Some(existing_child) if existing_child == record.review_id => {}
+                Some(existing_child) => {
+                    return Err(DomainError::with_details(
+                        ErrorCode::LearningConflict,
+                        "Родительская ревизия уже вытеснена другой записью истории",
+                        crate::details! {
+                            "parent_review_id" => parent_id,
+                            "existing_child_review_id" => existing_child,
+                            "incoming_child_review_id" => record.review_id.clone(),
+                        },
+                    ));
+                }
+            }
+        }
         for unit in &archive.units {
             if restored_ids.contains(unit.review_id.as_str()) {
                 insert_unit(write, unit)?;
@@ -660,6 +715,23 @@ pub fn restore_history(
         }
         for event in &archive.feedback_events {
             if restored_ids.contains(event.review_id.as_str()) {
+                let existing_review: Option<String> = super::import::write_optional_row(
+                    write,
+                    "SELECT review_id FROM learning_feedback WHERE event_id = ?1",
+                    params![event.event_id],
+                    |row| row.get(0),
+                )?;
+                if let Some(existing_review) = existing_review {
+                    return Err(DomainError::with_details(
+                        ErrorCode::LearningConflict,
+                        "Архив learning повторно использует локальный event_id",
+                        crate::details! {
+                            "event_id" => event.event_id.clone(),
+                            "existing_review_id" => existing_review,
+                            "incoming_review_id" => event.review_id.clone(),
+                        },
+                    ));
+                }
                 write.execute(
                     "INSERT INTO learning_feedback (
                         event_id, review_id, unit_id, candidate_id, kind, action,
@@ -766,8 +838,8 @@ pub fn restore_history(
         }
         // Проверяем объединённую историю до commit: глобальный event_id не
         // должен молча заменить локальное событие другого ревью.
-        super::feedback::validate_event_history(&read_feedback(write.transaction())?)
-            .map_err(|error| invalid(error.message))?;
+        let merged_feedback = read_feedback(write.transaction())?;
+        super::feedback::validate_event_history(&merged_feedback)?;
         Ok((restored, unchanged))
     })?;
     Ok(RestoreSummary {

@@ -24,7 +24,7 @@ use super::store::LearningStore;
 use super::{LEARNING_POLICY_VERSION, ROOT_WORKSPACE_VARIANT};
 
 /// Версия схемы recommendations artifact.
-pub const RECOMMENDATIONS_SCHEMA_VERSION: u32 = 1;
+pub const RECOMMENDATIONS_SCHEMA_VERSION: u32 = 2;
 
 type RecommendationOrderKey = (u8, u8, u8, usize, String);
 
@@ -247,10 +247,19 @@ pub fn recommend(
             queue_index,
             unit.id.clone(),
         ));
+        let representative_candidate_ids = unit.representative_candidate_ids().to_vec();
+        let candidate_count = unit.candidate_ids().len();
+        let candidate_ids = if is_group {
+            representative_candidate_ids.clone()
+        } else {
+            unit.candidate_ids().to_vec()
+        };
         recommendations.push(Recommendation {
             unit_id: unit.id.clone(),
-            candidate_ids: unit.candidate_ids().to_vec(),
-            representative_candidate_ids: unit.representative_candidate_ids().to_vec(),
+            candidate_ids_truncated: candidate_count > candidate_ids.len(),
+            candidate_count,
+            candidate_ids,
+            representative_candidate_ids,
             queue_priority: unit.priority.as_str().to_owned(),
             suggested_position: suggested_position(unit.priority.as_str()).to_owned(),
             granularity: granularity.to_owned(),
@@ -372,8 +381,14 @@ fn require_generation(
 /// Уровень приоритета подсказки: меньше — раньше.
 fn support_rank(support: Option<&SupportSummary>, granularity: &str) -> u8 {
     match (support, granularity) {
-        (Some(summary), _) if summary.level == SupportLevel::Supported => 0,
+        (Some(summary), "inspect_first" | "inspect_each_candidate" | "inspect_individually")
+            if summary.level == SupportLevel::Supported =>
+        {
+            0
+        }
+        (Some(_), "look_for_related_finding") => 1,
         (Some(summary), _) if summary.level == SupportLevel::Contradictory => 2,
+        (Some(summary), _) if summary.level == SupportLevel::Supported => 4,
         (Some(_), _) => 3,
         (None, _) => 4,
     }
@@ -413,7 +428,7 @@ fn reason_for(
             "В истории по этим признакам есть подтверждённые случаи: имеет смысл посмотреть единицу раньше обычного порядка."
         }
         _ => {
-            "Недостаточно проверенной истории по этим признакам: единица остаётся в обычном порядке без подсказки."
+            "История не даёт положительной подсказки к порядку: единица остаётся в обычной очереди."
         }
     };
     let mut reason = base.to_owned();
@@ -549,5 +564,34 @@ mod tests {
                 .any(|entry| entry.4 == "protected-tail"),
             "низкая поддержка истории не должна вытеснять защищённую единицу из лимита"
         );
+    }
+
+    #[test]
+    fn supported_history_without_a_positive_hint_does_not_outrank_no_history() {
+        let mut support = supported_summary();
+        support.confirmed_units = 0;
+        support.acceptable_units = 3;
+        support.confirmed_share_lower_bound = None;
+        assert_eq!(support_rank(Some(&support), "no_recommendation"), 4);
+        assert_eq!(support_rank(None, "no_recommendation"), 4);
+
+        let mut entries = [
+            recommendation_order_key(
+                "normal",
+                false,
+                support_rank(Some(&support), "no_recommendation"),
+                1,
+                "supported-but-neutral".to_owned(),
+            ),
+            recommendation_order_key(
+                "normal",
+                false,
+                support_rank(None, "no_recommendation"),
+                0,
+                "no-history".to_owned(),
+            ),
+        ];
+        entries.sort();
+        assert_eq!(entries[0].4, "no-history");
     }
 }

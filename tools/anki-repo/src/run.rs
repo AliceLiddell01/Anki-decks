@@ -2264,7 +2264,7 @@ mod learning_cli {
             LearningCommand::Search {
                 text,
                 detector,
-                surface,
+                execution,
                 origin,
                 role,
                 code_role,
@@ -2279,7 +2279,7 @@ mod learning_cli {
                 let query = SearchQuery {
                     text: text.clone(),
                     detector: detector.clone(),
-                    surface: surface.map(|value| value.as_str().to_owned()),
+                    surface: execution.map(|value| value.as_str().to_owned()),
                     origin: origin.clone(),
                     role: role.map(|value| value.as_str().to_owned()),
                     code_role: code_role.map(|value| value.as_str().to_owned()),
@@ -3613,6 +3613,7 @@ mod learning_cli {
     struct RecommendationView {
         unit_id: String,
         candidate_count: usize,
+        candidate_ids_truncated: bool,
         representative_candidate_ids: Vec<String>,
         queue_priority: String,
         suggested_position: String,
@@ -3631,7 +3632,8 @@ mod learning_cli {
         fn from(item: &Recommendation) -> Self {
             Self {
                 unit_id: item.unit_id.clone(),
-                candidate_count: item.candidate_ids.len(),
+                candidate_count: item.candidate_count,
+                candidate_ids_truncated: item.candidate_ids_truncated,
                 representative_candidate_ids: item.representative_candidate_ids.clone(),
                 queue_priority: item.queue_priority.clone(),
                 suggested_position: item.suggested_position.clone(),

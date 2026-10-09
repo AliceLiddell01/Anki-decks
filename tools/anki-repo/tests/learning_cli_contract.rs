@@ -971,6 +971,8 @@ fn status_validate_stats_patterns_and_search_bound_their_output() {
             "code-review",
             "learning",
             "search",
+            "--execution",
+            "production",
             "--detector",
             "error_path",
             "--limit",
@@ -999,6 +1001,8 @@ fn status_validate_stats_patterns_and_search_bound_their_output() {
             "code-review",
             "learning",
             "search",
+            "--execution",
+            "production",
             "--detector",
             "error_path",
             "--limit",
@@ -1010,6 +1014,21 @@ fn status_validate_stats_patterns_and_search_bound_their_output() {
     assert_ne!(
         first_page["result"]["cases"], second_page["result"]["cases"],
         "смещение обязано менять страницу"
+    );
+
+    let (code, _, _) = cli(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "search",
+            "--surface",
+            "production",
+        ],
+    );
+    assert_eq!(
+        code, 2,
+        "learning search must use --execution for this filter"
     );
 
     // Текстовая подстрока короче двух символов — это `invalid_request`.
@@ -1092,6 +1111,15 @@ fn recommendations_are_deterministic_guardrailed_and_publish_safely() {
     assert_eq!(result["generation"]["trusted_reviews"], json!(1));
     assert!(result["policy_version"].is_number());
     assert_bounded_candidate_ids(&first);
+    assert!(
+        result["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| {
+                item["candidate_count"].is_u64() && item["candidate_ids_truncated"].is_boolean()
+            })
+    );
 
     // Ни одна единица очереди не исчезает из подсказок и не теряет приоритет.
     let queue: Value = serde_json::from_slice(&queue_bytes).expect("очередь фикстуры");

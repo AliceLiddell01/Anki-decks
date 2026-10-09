@@ -111,15 +111,18 @@ pub fn forget_review(store: &LearningStore, review_id: &str) -> Result<ForgetOut
                 params![proposal_id],
             )?;
         }
-        // Разрываем ссылки ревизий на удалённую запись. При удалении новой
-        // ревизии прежняя запись становится текущей; при удалении старой
-        // ревизии остаётся новый результат без ссылки на исходную запись.
+        // Сшиваем соседей линии ревизий через удаляемую запись. Это сохраняет
+        // одну текущую запись и при удалении середины цепочки A ← B ← C.
         write.execute(
-            "UPDATE learning_import SET superseded_by = NULL WHERE superseded_by = ?1",
+            "UPDATE learning_import
+             SET superseded_by = (SELECT superseded_by FROM learning_import WHERE review_id = ?1)
+             WHERE superseded_by = ?1",
             params![review_id],
         )?;
         write.execute(
-            "UPDATE learning_import SET revision_of = NULL WHERE revision_of = ?1",
+            "UPDATE learning_import
+             SET revision_of = (SELECT revision_of FROM learning_import WHERE review_id = ?1)
+             WHERE revision_of = ?1",
             params![review_id],
         )?;
         let reviews = write.execute(

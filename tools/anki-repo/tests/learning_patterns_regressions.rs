@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 
+use anki_repo::code_review::learning::model::ReviewedOutcome;
 use anki_repo::code_review::learning::model::{SupportLevel, TrustLevel};
 use anki_repo::code_review::learning::{
     self, ImportInputsHint, LearningStore, LoadedReview, StoreOptions,
@@ -18,6 +19,10 @@ use rusqlite::params;
 use crate::common::TempDir;
 
 fn loaded_fixture() -> LoadedReview {
+    loaded_fixture_with_candidates(2)
+}
+
+fn loaded_fixture_with_candidates(candidate_count: usize) -> LoadedReview {
     let pack = ReviewPack {
         schema_version: 1,
         target: GitTarget {
@@ -49,7 +54,7 @@ fn loaded_fixture() -> LoadedReview {
             }],
         },
         diagnostics: Vec::new(),
-        candidates: (0..2)
+        candidates: (0..candidate_count)
             .map(|index| CandidateEvidence {
                 id: format!("case-{index}"),
                 detector: "error_path".into(),
@@ -93,6 +98,26 @@ fn loaded_fixture() -> LoadedReview {
     }
 }
 
+#[test]
+fn recommendation_artifact_bounds_group_candidate_ids_and_reports_the_full_count() {
+    let loaded = loaded_fixture_with_candidates(5);
+    let document =
+        learning::recommend(None, &loaded, &learning::RecommendRequest::default()).unwrap();
+    assert_eq!(document.schema_version, 2);
+    let recommendation = &document.recommendations[0];
+    assert_eq!(recommendation.candidate_count, 5);
+    assert!(recommendation.candidate_ids.len() <= 3);
+    assert_eq!(
+        recommendation.candidate_ids,
+        recommendation.representative_candidate_ids
+    );
+    assert!(recommendation.candidate_ids_truncated);
+    let serialized = serde_json::to_value(recommendation).unwrap();
+    assert_eq!(serialized["candidate_count"], 5);
+    assert_eq!(serialized["candidate_ids_truncated"], true);
+    assert!(serialized["candidate_ids"].as_array().unwrap().len() <= 3);
+}
+
 fn fixture_contexts(pack: &ReviewPack) -> BTreeMap<String, SyntaxContext> {
     pack.candidates
         .iter()
@@ -133,8 +158,16 @@ fn seed_case(
     store.write(|write| {
         write.execute(
             "INSERT INTO learning_import (review_id,repository_id,base_sha,head_sha,merge_base_sha,workspace_variant,review_pack_sha256,queue_sha256,review_schema_version,queue_schema_version,analyzer_digest,classifier_digest,trust,outcome,limitations_json,revision_of,revision,imported_at,observations_json,identity_key)
-             VALUES (?1,'shared-repository','base',?2,'base','root','pack','queue',1,?5,'analyzer',?3,'ast_authenticated','complete','[]',?4,1,86400,'{}',?1)",
-            params![id, head, compatibility, revision_of, loaded.queue.schema_version],
+             VALUES (?1,'shared-repository','base',?2,'base','root','pack','queue',1,?5,'analyzer',?3,'ast_authenticated',?6,'[]',?4,1,86400,?7,?1)",
+            params![
+                id,
+                head,
+                compatibility,
+                revision_of,
+                loaded.queue.schema_version,
+                ReviewedOutcome::FullyReviewed.as_str(),
+                serde_json::to_string(&learning::model::ObservationCounts::default()).unwrap(),
+            ],
         )?;
         write.execute(
             "INSERT INTO learning_unit (review_id,unit_id,kind,candidate_count,priority,representatives_json,disposition,detector,source,role,code_role,surfaces_json,signature,feature_json)

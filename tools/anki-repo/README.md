@@ -895,7 +895,8 @@ state и source snapshot. В историю попадает компактна�
 возвращаться как контекст `patterns`/`recommend`; текстовый поиск их не
 индексирует, а архивы версий 3/4 их не включают. `review.json` остаётся
 источником исходных свидетельств. Фильтры: `--text` (не короче двух символов),
-`--detector`, `--surface`, `--origin`, `--role`, `--code-role`, `--disposition`,
+`--detector`, `--execution` (production, tests или unknown), `--origin`, `--role`,
+`--code-role`, `--disposition`,
 `--provenance`, `--severity`, `--repository`, страница — `--limit` и `--offset`.
 
 Поиск — читатель истории, а не основание для вывода, поэтому карантинные записи

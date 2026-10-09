@@ -996,8 +996,8 @@ pub enum LearningCommand {
         #[arg(long, value_name = "DETECTOR")]
         detector: Option<String>,
         /// Ограничение по исполняемой поверхности: production, tests или unknown.
-        #[arg(long, value_name = "SURFACE")]
-        surface: Option<QueueExecutionFilter>,
+        #[arg(long, value_name = "EXECUTION")]
+        execution: Option<QueueExecutionFilter>,
         /// Ограничение по происхождению сигнала.
         #[arg(long, value_name = "ORIGIN")]
         origin: Option<String>,

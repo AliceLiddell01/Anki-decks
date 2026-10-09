@@ -247,7 +247,8 @@ pub struct ImportRecord {
     pub revision_of: Option<String>,
     /// Запись, которая вытеснена этой ревизией.
     pub superseded_by: Option<String>,
-    /// Монотонная авторитетная ревизия накопления истории.
+    /// Номер, назначенный исходной историей; локально может повториться после удаления
+    /// записи или восстановления архива.
     pub revision: u64,
     /// Детерминированная метка времени импорта в секундах Unix.
     pub imported_at: u64,
@@ -676,8 +677,12 @@ pub struct FeedbackEvent {
 pub struct Recommendation {
     /// Идентификатор единицы очереди текущего снимка.
     pub unit_id: String,
-    /// Все кандидаты единицы, чтобы открыть первичный контекст.
+    /// Ограниченный набор candidate IDs: кандидат для individual или представители группы.
     pub candidate_ids: Vec<String>,
+    /// Полный размер единицы.
+    pub candidate_count: usize,
+    /// Не все candidate IDs перечислены в `candidate_ids`.
+    pub candidate_ids_truncated: bool,
     /// Представители единицы в детерминированном порядке очереди.
     pub representative_candidate_ids: Vec<String>,
     /// Детерминированный приоритет очереди; learning его не изменяет.

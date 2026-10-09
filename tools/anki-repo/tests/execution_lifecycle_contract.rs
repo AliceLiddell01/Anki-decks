@@ -1536,11 +1536,9 @@ fn cleanup_removes_only_own_stale_worktree_record() {
     assert_eq!(git(fixture.root(), &["rev-parse", "HEAD"]), fixture.head);
 }
 
-/// Собственное рабочее дерево, помеченное `locked`, тоже очищается: запись
-/// подтверждена по `gitdir` и по закреплённому каталогу, поэтому Git снимает
-/// блокировку двойным `--force` только у своего дерева.
+/// Операторская блокировка сохраняется до явного `git worktree unlock`.
 #[test]
-fn cleanup_removes_own_locked_worktree_record() {
+fn cleanup_preserves_operator_locked_worktree_until_unlocked() {
     let fixture = Fixture::new();
     let foreign_worktree = fixture.root().join("foreign-worktree");
     git(
@@ -1581,6 +1579,27 @@ fn cleanup_removes_own_locked_worktree_record() {
     let owned_record = admin_record(fixture.root(), &owned);
     assert!(owned_record.join("locked").is_file());
 
+    let locked_cleanup = success(fixture.operation("cleanup", &job));
+    assert_eq!(
+        locked_cleanup["workspace_removed"], false,
+        "очистка не должна снимать операторскую блокировку"
+    );
+    assert!(
+        locked_cleanup["limitation"]
+            .as_str()
+            .is_some_and(|text| text.contains("явной блокировкой Git")),
+        "результат должен объяснить сохранение блокировки: {locked_cleanup}"
+    );
+    assert!(owned.exists(), "заблокированное рабочее дерево удалено");
+    assert!(
+        owned_record.join("locked").is_file(),
+        "блокировка Git снята"
+    );
+
+    git(
+        fixture.root(),
+        &["worktree", "unlock", owned.to_str().unwrap()],
+    );
     let result = success(fixture.operation("cleanup", &job));
     assert_eq!(
         result["workspace_removed"], true,

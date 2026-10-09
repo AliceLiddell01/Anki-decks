@@ -377,6 +377,9 @@ fn invalid_archives_with_valid_digest_fail_without_changing_existing_history() {
     archive.reviews[0].superseded_by = Some(quarantined_revision.review_id.clone());
     archive.reviews.push(quarantined_revision);
     mutations.push(archive);
+    let mut archive = original.clone();
+    archive.reviews[0].superseded_by = Some("missing-revision".into());
+    mutations.push(archive);
     for mut invalid in mutations {
         seal(&mut invalid);
         assert_eq!(
@@ -430,17 +433,76 @@ fn global_feedback_collision_rolls_back_all_new_reviews_and_preserves_local_audi
     let before = learning::transfer::export_history(&destination)
         .unwrap()
         .archive;
-    assert_eq!(
-        learning::transfer::restore_history(&destination, &archive)
-            .unwrap_err()
-            .code,
-        ErrorCode::LearningConflict
-    );
+    let error = learning::transfer::restore_history(&destination, &archive).unwrap_err();
+    assert_eq!(error.code, ErrorCode::LearningConflict);
+    assert_eq!(error.exit_code(), 7);
     assert_eq!(
         before,
         learning::transfer::export_history(&destination)
             .unwrap()
             .archive
+    );
+}
+
+#[test]
+fn restore_links_a_new_revision_to_an_unchanged_local_parent() {
+    let destination_dir = TempDir::new("transfer-revision-destination");
+    let destination = open(destination_dir.path());
+    let mut archive = fixture(&destination, "parent");
+    learning::transfer::restore_history(&destination, &archive).unwrap();
+
+    let source_dir = TempDir::new("transfer-revision-source");
+    let source = open(source_dir.path());
+    let child_archive = fixture(&source, "child");
+    let parent_id = archive.reviews[0].review_id.clone();
+    let child_id = child_archive.reviews[0].review_id.clone();
+    let parent = archive.reviews.first_mut().unwrap();
+    parent.superseded_by = Some(child_id.clone());
+
+    let mut child = child_archive.reviews[0].clone();
+    child.repository_id = parent.repository_id.clone();
+    child.base_sha = parent.base_sha.clone();
+    child.merge_base_sha = parent.merge_base_sha.clone();
+    child.revision = 2;
+    child.revision_of = Some(parent_id.clone());
+    archive.reviews.push(child);
+    archive.units.extend(child_archive.units);
+    archive.candidates.extend(child_archive.candidates);
+    archive.decisions.extend(child_archive.decisions);
+    archive.findings.extend(child_archive.findings);
+    archive.finding_links.extend(child_archive.finding_links);
+    archive.case_links.extend(child_archive.case_links);
+    archive
+        .feedback_events
+        .extend(child_archive.feedback_events);
+    archive
+        .policy_proposals
+        .extend(child_archive.policy_proposals);
+    archive.search.extend(child_archive.search);
+    archive.manifest.generation.revision = 2;
+    archive.manifest.generation.trusted_reviews = 2;
+    archive.manifest.generation.trusted_units = archive.units.len();
+    seal(&mut archive);
+    learning::transfer::verify_export(&archive).unwrap();
+
+    let restored = learning::transfer::restore_history(&destination, &archive).unwrap();
+    assert_eq!(restored.unchanged_reviews, 1);
+    assert_eq!(restored.restored_reviews, 1);
+    let local = learning::transfer::export_history(&destination)
+        .unwrap()
+        .archive;
+    let by_id: std::collections::BTreeMap<_, _> = local
+        .reviews
+        .iter()
+        .map(|record| (record.review_id.as_str(), record))
+        .collect();
+    assert_eq!(
+        by_id[parent_id.as_str()].superseded_by.as_deref(),
+        Some(child_id.as_str())
+    );
+    assert_eq!(
+        by_id[child_id.as_str()].revision_of.as_deref(),
+        Some(parent_id.as_str())
     );
 }
 
@@ -478,8 +540,9 @@ fn export_generation_and_tables_share_a_snapshot_during_concurrent_writes() {
             archive.manifest.generation.revision,
             archive.reviews.len() as u64
         );
-        if finished_rx.try_recv().is_ok() {
-            break;
+        match finished_rx.try_recv() {
+            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
     writer.join().unwrap();

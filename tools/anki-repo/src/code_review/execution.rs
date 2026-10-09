@@ -1317,6 +1317,15 @@ fn remove_cleanup_worktree(
         .ok_or_else(|| conflict("Нет закреплённого рабочего дерева для очистки"))?;
     let path = cleanup_descriptor_path(&source.1)?;
     let hooks = cleanup_hooks(directory)?;
+    if worktree_marker_present(&source.1)? {
+        let records = own_worktree_records(job, &source.1, &hooks)?;
+        if records.iter().any(|record| record.locked) {
+            return Err(DomainError::new(
+                ErrorCode::ProcessOperationFailed,
+                "Удаление рабочего дерева не выполнено: оно защищено явной блокировкой Git. Снимите её вручную командой `git worktree unlock` для рабочего дерева этого задания, затем повторите очистку.",
+            ));
+        }
+    }
     let mut command = trusted_git(&job.root, &hooks)?;
     command.args(["worktree", "remove", "--force"]).arg(&path);
     let output = command.output().map_err(process_error)?;
@@ -1333,10 +1342,15 @@ fn remove_cleanup_worktree(
     if worktree_marker_present(&source.1)? {
         // Каталог остаётся рабочим деревом Git: расхождение регистрации
         // (например, перемещённый каталог задания) — честный отказ, чужие
-        // ресурсы и записи Git не трогаются. Исключение — собственная запись,
-        // помеченная `locked`: её Git не удаляет даже с одним `--force`.
+        // ресурсы и записи Git не трогаются. Явную блокировку Git не снимаем:
+        // её мог поставить оператор, чтобы сохранить рабочее дерево.
         if records.iter().any(|record| record.locked) {
-            return remove_locked_own_worktree(job, &path, &hooks, &reason);
+            return Err(DomainError::new(
+                ErrorCode::ProcessOperationFailed,
+                format!(
+                    "Удаление рабочего дерева не выполнено: {reason}; оно защищено явной блокировкой Git. Снимите её вручную командой `git worktree unlock` для рабочего дерева этого задания, затем повторите очистку."
+                ),
+            ));
         }
         return Err(DomainError::new(
             ErrorCode::ProcessOperationFailed,
@@ -1470,17 +1484,9 @@ fn worktree_admin_directory(job: &PreparedJob, hooks: &Path) -> Result<PathBuf, 
     })
 }
 
-/// Сверяет путь из записи с ожидаемым `.git` задания; символические ссылки в
-/// записанном пути допускаются, если оба пути ведут в одно место.
+/// Сверяет точный путь из административной записи с ожидаемым `.git` задания.
 fn same_record_target(recorded: &str, expected: &Path) -> bool {
-    let recorded = Path::new(recorded.trim());
-    if recorded == expected {
-        return true;
-    }
-    match (fs::canonicalize(recorded), fs::canonicalize(expected)) {
-        (Ok(recorded), Ok(expected)) => recorded == expected,
-        _ => false,
-    }
+    Path::new(recorded.trim()) == expected
 }
 
 /// Совпадают ли два каталога: подтверждение принадлежности записи заданию.
@@ -1506,47 +1512,6 @@ fn remove_own_worktree_record(record: &OwnWorktreeRecord) -> Result<(), DomainEr
         ));
     }
     fs::remove_dir_all(&record.directory).map_err(write_error)
-}
-
-/// Удаляет собственное рабочее дерево, помеченное `locked`: сначала двойной
-/// `--force` (Git снимает им только блокировку), затем явный `unlock` с обычным
-/// удалением. Путь закреплён дескриптором, а запись подтверждена как запись
-/// задания, поэтому чужие рабочие деревья здесь недостижимы.
-fn remove_locked_own_worktree(
-    job: &PreparedJob,
-    path: &Path,
-    hooks: &Path,
-    reason: &str,
-) -> Result<(), DomainError> {
-    let mut command = trusted_git(&job.root, hooks)?;
-    command.args(["worktree", "remove", "-f", "-f"]).arg(path);
-    if command.output().map_err(process_error)?.status.success() {
-        return Ok(());
-    }
-    let mut command = trusted_git(&job.root, hooks)?;
-    command.args(["worktree", "unlock"]).arg(path);
-    let unlocked = command.output().map_err(process_error)?;
-    let mut command = trusted_git(&job.root, hooks)?;
-    command.args(["worktree", "remove", "--force"]).arg(path);
-    let removed = command.output().map_err(process_error)?;
-    if removed.status.success() {
-        return Ok(());
-    }
-    let detail = if unlocked.status.success() {
-        format!(
-            "блокировка снята, но повторное удаление не выполнено: {}. Повторите очистку.",
-            stable_message(&String::from_utf8_lossy(&removed.stderr), &[path])
-        )
-    } else {
-        format!(
-            "снятие блокировки не подтверждено (unlock: {}). Проверьте блокировку и при необходимости снимите её вручную (`git worktree unlock` для рабочего дерева этого задания), затем повторите очистку.",
-            stable_message(&String::from_utf8_lossy(&unlocked.stderr), &[path])
-        )
-    };
-    Err(DomainError::new(
-        ErrorCode::ProcessOperationFailed,
-        format!("Удаление рабочего дерева не завершено: {reason}; {detail}"),
-    ))
 }
 
 /// Есть ли у закреплённого каталога признак рабочего дерева Git: без него Git о
