@@ -1365,7 +1365,15 @@ pub fn sanitize_text(raw: &str) -> String {
             break;
         }
     }
-    text.chars().filter(|c| !c.is_control()).collect()
+    let mut text: String = text.chars().filter(|c| !c.is_control()).collect();
+    if text.len() > MAX_STORED_TEXT_BYTES {
+        let mut end = MAX_STORED_TEXT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// Верхняя граница сохранённого текста одного поля.

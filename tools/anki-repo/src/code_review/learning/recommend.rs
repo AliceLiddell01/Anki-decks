@@ -26,6 +26,8 @@ use super::{LEARNING_POLICY_VERSION, ROOT_WORKSPACE_VARIANT};
 /// Версия схемы recommendations artifact.
 pub const RECOMMENDATIONS_SCHEMA_VERSION: u32 = 1;
 
+type RecommendationOrderKey = (u8, u8, u8, usize, String);
+
 /// Гранулярность проверки, предлагаемая для единицы.
 #[must_use]
 pub fn granularity_for(
@@ -72,6 +74,22 @@ fn priority_rank(priority: &str) -> u8 {
         "normal" => 1,
         _ => 2,
     }
+}
+
+fn recommendation_order_key(
+    priority: &str,
+    guardrailed: bool,
+    support: u8,
+    queue_index: usize,
+    unit_id: String,
+) -> RecommendationOrderKey {
+    (
+        priority_rank(priority),
+        u8::from(!guardrailed),
+        support,
+        queue_index,
+        unit_id,
+    )
 }
 
 /// Запрос генерации рекомендаций.
@@ -152,8 +170,8 @@ pub fn recommend(
         BTreeMap::new()
     };
     let mut recommendations = Vec::new();
-    let mut order: Vec<(u8, u8, String)> = Vec::new();
-    for unit in &loaded.queue.units {
+    let mut order: Vec<RecommendationOrderKey> = Vec::new();
+    for (queue_index, unit) in loaded.queue.units.iter().enumerate() {
         let features = unit_features(&unit.signature);
         let signature = feature_signature(&features);
         let is_group = unit.is_group();
@@ -201,9 +219,11 @@ pub fn recommend(
         }
         let reason = reason_for(unit, support.as_ref(), granularity, guardrailed);
         let historical_cases: Vec<CaseRef> = cases.into_iter().map(|case| case.case).collect();
-        order.push((
-            priority_rank(unit.priority.as_str()),
+        order.push(recommendation_order_key(
+            unit.priority.as_str(),
+            guardrailed,
             support_rank(support.as_ref(), granularity),
+            queue_index,
             unit.id.clone(),
         ));
         recommendations.push(Recommendation {
@@ -231,7 +251,7 @@ pub fn recommend(
     let positions: BTreeMap<String, usize> = order
         .into_iter()
         .enumerate()
-        .map(|(position, (_, _, unit_id))| (unit_id, position))
+        .map(|(position, (_, _, _, _, unit_id))| (unit_id, position))
         .collect();
     recommendations.sort_by_key(|item| positions.get(&item.unit_id).copied().unwrap_or(usize::MAX));
     recommendations.truncate(limit);
@@ -419,6 +439,46 @@ mod tests {
         assert_eq!(
             granularity_for(true, true, Some(&support), 1),
             "look_for_related_finding"
+        );
+    }
+
+    #[test]
+    fn guardrails_precede_history_and_equal_ranks_keep_queue_order() {
+        let mut entries = [
+            recommendation_order_key("normal", false, 0, 0, "supported".to_owned()),
+            recommendation_order_key("normal", false, 4, 1, "a-later".to_owned()),
+            recommendation_order_key("normal", false, 4, 0, "z-earlier".to_owned()),
+            recommendation_order_key("normal", true, 4, 50, "protected-tail".to_owned()),
+        ];
+        entries.sort();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, _, _, _, id)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["protected-tail", "supported", "z-earlier", "a-later"]
+        );
+
+        let mut long_queue: Vec<RecommendationOrderKey> = (0..50)
+            .map(|index| {
+                recommendation_order_key("normal", false, 0, index, format!("supported-{index}"))
+            })
+            .collect();
+        long_queue.push(recommendation_order_key(
+            "normal",
+            true,
+            4,
+            50,
+            "protected-tail".to_owned(),
+        ));
+        long_queue.sort();
+        assert_eq!(long_queue[0].4, "protected-tail");
+        assert!(
+            long_queue
+                .into_iter()
+                .take(50)
+                .any(|entry| entry.4 == "protected-tail"),
+            "низкая поддержка истории не должна вытеснять защищённую единицу из лимита"
         );
     }
 }

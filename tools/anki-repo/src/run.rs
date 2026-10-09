@@ -2816,7 +2816,16 @@ mod learning_cli {
         match feedback::show_event(&store, &event_id) {
             Ok(existing) => {
                 if same_feedback_content(&existing, &event) {
-                    return Ok(noop_feedback_result(&store, &event));
+                    if feedback::is_event_active(&store, &existing.event_id)? {
+                        return Ok(noop_feedback_result(&store, &event));
+                    }
+                    return Err(DomainError::with_details(
+                        ErrorCode::LearningConflict,
+                        format!(
+                            "Событие обратной связи {event_id} уже отозвано или заменено; задайте новый --event-id"
+                        ),
+                        crate::details! { "event_id" => event_id },
+                    ));
                 }
                 return Err(DomainError::with_details(
                     ErrorCode::LearningConflict,

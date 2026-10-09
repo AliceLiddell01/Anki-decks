@@ -1663,6 +1663,101 @@ fn feedback_and_policy_lifecycle_is_audited_and_never_auto_applied() {
         repeated_approval["result"]["artifact"]["created"],
         json!(false)
     );
+
+    // Повтор уже отозванного содержания требует нового event_id вместо ложного noop.
+    assert_error(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "feedback",
+            "record",
+            "--review-id",
+            &review_id,
+            "--unit-id",
+            &unit_id,
+            "--candidate-id",
+            &candidate,
+            "--kind",
+            "semantic-outcome-revision",
+            "--disposition",
+            "false-positive",
+            "--explanation",
+            "Синтетическая метка подтверждения оказалась ошибочной.",
+        ],
+        "learning_conflict",
+    );
+
+    // Повтор утверждения, которое заменили через supersede, тоже не должен быть noop.
+    let appended = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "feedback",
+            "record",
+            "--review-id",
+            &review_id,
+            "--unit-id",
+            &unit_id,
+            "--candidate-id",
+            &candidate,
+            "--kind",
+            "semantic-outcome-revision",
+            "--disposition",
+            "acceptable",
+            "--explanation",
+            "Новое содержательное утверждение.",
+        ],
+    );
+    let appended_event_id = appended["result"]["event_id"].as_str().unwrap();
+    ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "feedback",
+            "record",
+            "--review-id",
+            &review_id,
+            "--unit-id",
+            &unit_id,
+            "--candidate-id",
+            &candidate,
+            "--kind",
+            "semantic-outcome-revision",
+            "--action",
+            "supersede",
+            "--supersedes-event-id",
+            appended_event_id,
+            "--disposition",
+            "uncertain",
+            "--explanation",
+            "Уточнённое утверждение заменяет прежнее.",
+        ],
+    );
+    assert_error(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "feedback",
+            "record",
+            "--review-id",
+            &review_id,
+            "--unit-id",
+            &unit_id,
+            "--candidate-id",
+            &candidate,
+            "--kind",
+            "semantic-outcome-revision",
+            "--disposition",
+            "acceptable",
+            "--explanation",
+            "Новое содержательное утверждение.",
+        ],
+        "learning_conflict",
+    );
 }
 
 #[test]
@@ -2693,11 +2788,7 @@ fn repeated_variants_of_one_snapshot_are_one_observation_line() {
         "действует одно наблюдение линии"
     );
     assert_eq!(rule["confirmed_findings"], json!(1));
-    assert_eq!(
-        rule["confirmed_units"],
-        json!(1),
-        "действует одно наблюдение линии"
-    );
+    assert_eq!(rule["false_positive_units"], json!(0));
 }
 
 #[test]

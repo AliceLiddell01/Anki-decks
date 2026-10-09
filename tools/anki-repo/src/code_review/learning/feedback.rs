@@ -387,6 +387,43 @@ pub fn outcome(
     store.read(|read| outcome_for(read, review_id, unit_id))
 }
 
+/// Проверяет, сохраняет ли событие действующий эффект в аудируемом журнале.
+pub fn is_event_active(store: &LearningStore, event_id: &str) -> Result<bool, DomainError> {
+    store.read(|read| {
+        let active: Option<(String, bool)> = read
+            .transaction()
+            .query_row(
+                "SELECT event.action,
+                        NOT EXISTS (
+                            SELECT 1 FROM learning_feedback AS correction
+                            WHERE correction.review_id = event.review_id
+                              AND correction.unit_id = event.unit_id
+                              AND correction.kind = event.kind
+                              AND (
+                                  (correction.action = 'retract'
+                                   AND correction.retracted_event_id = event.event_id)
+                                  OR
+                                  (correction.action = 'supersede'
+                                   AND correction.supersedes_event_id = event.event_id)
+                              )
+                        )
+                 FROM learning_feedback AS event
+                 WHERE event.event_id = ?1",
+                params![event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| map_error(&error, "не удалось проверить действие события"))?;
+        match active {
+            Some((action, active)) => Ok(action == "retract" || active),
+            None => Err(DomainError::new(
+                ErrorCode::NotFound,
+                format!("Событие обратной связи не найдено: {event_id}"),
+            )),
+        }
+    })
+}
+
 /// Публичное чтение события по идентификатору.
 pub fn show_event(store: &LearningStore, event_id: &str) -> Result<FeedbackEvent, DomainError> {
     store.read(|read| {

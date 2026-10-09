@@ -1112,11 +1112,9 @@ fn corrupted_and_newer_databases_fail_without_destroying_data() {
     let database = directory.path().join("state.sqlite");
     fs::write(&database, "это не база SQLite").unwrap();
     let error = learning::LearningStore::open(learning::StoreOptions::at(&database)).unwrap_err();
-    assert!(
-        matches!(
-            error.code,
-            ErrorCode::LearningCorrupt | ErrorCode::LearningStorageUnavailable
-        ),
+    assert_eq!(
+        error.code,
+        ErrorCode::LearningCorrupt,
         "неожиданный код отказа: {error:?}"
     );
     assert!(database.is_file(), "исходный файл не удаляется");
@@ -1204,7 +1202,7 @@ fn concurrent_readers_and_writer_keep_history_consistent() {
 }
 
 #[test]
-fn differing_evidence_at_same_identity_is_an_audited_revision_not_overwrite() {
+fn queue_with_wrong_order_is_rejected_without_changing_history() {
     let _guard = guard();
     let repo = SyntheticRepo::create("learning-queue-revision");
     let pack = synthetic_pack(&repo, 2, 1);
@@ -1218,9 +1216,8 @@ fn differing_evidence_at_same_identity_is_an_audited_revision_not_overwrite() {
     let loaded = load_in_repo(&repo, &artifacts, false).unwrap();
     let first = import(&loaded, &store);
 
-    // Другая версия очереди при той же identity пакета: аудируемая ревизия.
+    // Неверный порядок очереди отвергается до записи ревизии.
     let mut second_queue = queue.clone();
-    second_queue.schema_version = review_queue::QUEUE_SCHEMA_VERSION;
     let mut resorted = second_queue.units.clone();
     resorted.reverse();
     second_queue.units = resorted;
@@ -1496,6 +1493,14 @@ fn export_and_restore_preserve_provenance_versions_and_no_absolute_paths() {
     let digest = digest_of(&pack);
     let mut triage = semantic_triage::initialize(&pack, &digest);
     resolve_individual(&mut triage, "production-0", Disposition::Confirmed, None);
+    let long_comment = "界".repeat(400);
+    assert!(long_comment.len() > learning::import::MAX_STORED_TEXT_BYTES);
+    triage
+        .individual_decisions
+        .iter_mut()
+        .find(|decision| decision.candidate_id == "production-0")
+        .unwrap()
+        .explanation = long_comment;
     semantic_triage::canonicalize(&mut triage);
     semantic_triage::validate(&triage, &pack, &digest).unwrap();
     let artifacts = Artifacts::write(&repo.path().join("artifacts"), &pack, &queue, &triage);
@@ -1535,12 +1540,20 @@ fn export_and_restore_preserve_provenance_versions_and_no_absolute_paths() {
             .all(|candidate| candidate.snippet.is_none()),
         "переносимый архив содержит ссылки, но не фрагменты исходного кода"
     );
+    assert!(exported.archive.search.iter().any(|case| {
+        case.kind == "decision" && case.text.len() <= learning::import::MAX_STORED_TEXT_BYTES
+    }));
     let encoded = serde_json::to_vec(&exported.archive).unwrap();
     let text = String::from_utf8(encoded).unwrap();
-    assert!(
-        !text.contains("/home/"),
-        "переносимый архив не содержит абсолютных путей клона"
-    );
+    for absolute in [repo.path(), source_dir.path()] {
+        let absolute = absolute.to_str().unwrap();
+        let encoded_absolute = serde_json::to_string(absolute).unwrap();
+        let encoded_absolute = &encoded_absolute[1..encoded_absolute.len() - 1];
+        assert!(
+            !text.contains(encoded_absolute),
+            "переносимый архив не содержит абсолютный путь фикстуры"
+        );
+    }
     assert!(!text.contains("\\Users\\"));
 
     let restore_dir = TempDir::new("learning-transfer-restore");
