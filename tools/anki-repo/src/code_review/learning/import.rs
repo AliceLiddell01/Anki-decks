@@ -377,12 +377,13 @@ pub(super) fn trust_level_of(raw: &str) -> Option<TrustLevel> {
 }
 
 /// Полнота рассмотрения по сохранённой метке.
-fn reviewed_outcome_of(raw: &str) -> ReviewedOutcome {
+pub(super) fn reviewed_outcome_of(raw: &str) -> Option<ReviewedOutcome> {
     match raw {
-        "fully_reviewed" => ReviewedOutcome::FullyReviewed,
-        "no_triage" => ReviewedOutcome::NoTriage,
-        "quarantined" => ReviewedOutcome::Quarantined,
-        _ => ReviewedOutcome::PartiallyReviewed,
+        "fully_reviewed" => Some(ReviewedOutcome::FullyReviewed),
+        "partially_reviewed" => Some(ReviewedOutcome::PartiallyReviewed),
+        "no_triage" => Some(ReviewedOutcome::NoTriage),
+        "quarantined" => Some(ReviewedOutcome::Quarantined),
+        _ => None,
     }
 }
 
@@ -442,7 +443,16 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRecord> {
                 )),
             )
         })?,
-        outcome: reviewed_outcome_of(&outcome),
+        outcome: reviewed_outcome_of(&outcome).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                19,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("неизвестный исход записи learning: {outcome}"),
+                )),
+            )
+        })?,
         limitations: parse_json(&limitations_json, "ограничения записи")?,
         revision_of: row.get(21)?,
         superseded_by: row.get(22)?,
@@ -500,7 +510,11 @@ pub(crate) fn normalize_variant(raw: &str) -> Result<String, DomainError> {
             ),
         ));
     };
-    if digest.len() == 32 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if digest.len() == 32
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         Ok(format!("{SNAPSHOT_WORKSPACE_VARIANT_PREFIX}{digest}"))
     } else {
         Err(DomainError::new(
@@ -1659,20 +1673,18 @@ pub fn sanitize_snippet(raw: Option<&str>) -> Option<String> {
 /// Приводит путь к repo-relative виду без абсолютных и временных компонентов.
 #[must_use]
 pub fn sanitize_path(raw: &str) -> String {
-    let mut text = raw.replace('\\', "/");
-    text = text.strip_prefix('/').map_or(text.clone(), str::to_owned);
+    let text = raw.replace('\\', "/");
+    let is_absolute = text.starts_with('/')
+        || text
+            .as_bytes()
+            .get(1)
+            .is_some_and(|colon| *colon == b':' && text.as_bytes()[0].is_ascii_alphabetic());
     let normalized = text
         .split('/')
         .filter(|part| !part.is_empty() && *part != "." && *part != "..")
         .collect::<Vec<_>>()
         .join("/");
-    let noisy = normalized.is_empty()
-        || normalized.contains("home/")
-        || normalized.starts_with("tmp/")
-        || normalized.starts_with("Users/")
-        || normalized.contains("AppData/")
-        || normalized.contains(':');
-    if noisy {
+    if is_absolute || normalized.is_empty() {
         return safe_file_name(&normalized);
     }
     normalized
@@ -1992,5 +2004,37 @@ mod serialization_tests {
         assert!(error.message.contains("synthetic serialization failure"));
         assert!(!error.message.ends_with("{}"));
         assert!(!error.message.ends_with("[]"));
+    }
+
+    #[test]
+    fn snapshot_variant_requires_lowercase_hex() {
+        let lowercase = format!("snapshot-{}", "a1".repeat(16));
+        assert_eq!(normalize_variant(&lowercase).unwrap(), lowercase);
+        assert_eq!(
+            normalize_variant(&format!("snapshot-{}", "A1".repeat(16)))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn path_sanitizing_preserves_relative_home_and_tmp_components() {
+        assert_eq!(sanitize_path("src/home/mod.rs"), "src/home/mod.rs");
+        assert_eq!(sanitize_path("tmp/generated.rs"), "tmp/generated.rs");
+        assert_eq!(sanitize_path("/home/alice/project/src/lib.rs"), "lib.rs");
+        assert_eq!(
+            sanitize_path("C:\\Users\\alice\\project\\src\\lib.rs"),
+            "lib.rs"
+        );
+    }
+
+    #[test]
+    fn reviewed_outcome_rejects_unknown_persisted_values() {
+        assert_eq!(
+            reviewed_outcome_of("partially_reviewed"),
+            Some(ReviewedOutcome::PartiallyReviewed)
+        );
+        assert_eq!(reviewed_outcome_of("complete"), None);
     }
 }

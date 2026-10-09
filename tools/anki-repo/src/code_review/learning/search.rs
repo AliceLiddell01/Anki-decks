@@ -454,12 +454,15 @@ fn load_case(
 
 /// Ограничивает фрагмент текста вывода.
 fn compact_snippet(text: &str) -> String {
-    let mut snippet = text.trim().to_owned();
-    if snippet.chars().count() > MAX_STORED_SNIPPET_BYTES {
-        snippet = snippet.chars().take(MAX_STORED_SNIPPET_BYTES).collect();
-        snippet.push('…');
+    let text = text.trim();
+    if text.len() <= MAX_STORED_SNIPPET_BYTES {
+        return text.to_owned();
     }
-    snippet
+    let mut end = MAX_STORED_SNIPPET_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 #[cfg(test)]
@@ -477,7 +480,13 @@ mod tests {
     fn snippet_is_bounded() {
         let long = "я".repeat(MAX_STORED_SNIPPET_BYTES + 10);
         let snippet = compact_snippet(&long);
-        assert_eq!(snippet.chars().count(), MAX_STORED_SNIPPET_BYTES + 1);
+        assert!(
+            snippet
+                .strip_suffix('…')
+                .expect("длинный текст должен получить многоточие")
+                .len()
+                <= MAX_STORED_SNIPPET_BYTES
+        );
         assert!(snippet.ends_with('…'));
     }
 }

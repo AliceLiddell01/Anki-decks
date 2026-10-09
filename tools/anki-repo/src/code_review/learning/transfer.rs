@@ -27,7 +27,7 @@ use super::model::{
     ExportedCandidate, ExportedCaseLink, ExportedDecision, ExportedFinding, ExportedFindingLink,
     ExportedSearchCase, FeedbackEvent, HistoryGeneration, ImportInputs, ImportRecord,
     LearningExport, LearningExportManifest, ObservationCounts, PolicyProposal, ReviewUnitKind,
-    ReviewUnitRecord, ReviewedOutcome, TrustLevel,
+    ReviewUnitRecord,
 };
 use super::schema::LEARNING_SCHEMA_VERSION;
 use super::store::{LearningRead, LearningStore, map_error};
@@ -64,6 +64,22 @@ pub struct RestoreSummary {
     pub generation: HistoryGeneration,
     /// Ограничения доверия к восстановленной истории.
     pub limitations: Vec<String>,
+}
+
+fn candidate_unit_index(archive: &LearningExport) -> BTreeMap<(&str, &str), &str> {
+    archive
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                (
+                    candidate.review_id.as_str(),
+                    candidate.candidate_id.as_str(),
+                ),
+                candidate.unit_id.as_str(),
+            )
+        })
+        .collect()
 }
 
 /// Собирает переносимый архив проверенной истории.
@@ -179,23 +195,14 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
         .iter()
         .map(|unit| (unit.review_id.as_str(), unit.unit_id.as_str()))
         .collect();
-    let candidate_ids: BTreeSet<(&str, &str)> = archive
-        .candidates
-        .iter()
-        .map(|candidate| {
-            (
-                candidate.review_id.as_str(),
-                candidate.candidate_id.as_str(),
-            )
-        })
-        .collect();
+    let candidate_units = candidate_unit_index(archive);
     let finding_ids: BTreeSet<(&str, &str)> = archive
         .findings
         .iter()
         .map(|finding| (finding.review_id.as_str(), finding.finding_id.as_str()))
         .collect();
     if unit_ids.len() != archive.units.len()
-        || candidate_ids.len() != archive.candidates.len()
+        || candidate_units.len() != archive.candidates.len()
         || finding_ids.len() != archive.findings.len()
     {
         return Err(invalid(
@@ -258,7 +265,7 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
     }
     for link in &archive.finding_links {
         if !review_ids.contains_key(link.review_id.as_str())
-            || !candidate_ids.contains(&(link.review_id.as_str(), link.candidate_id.as_str()))
+            || !candidate_units.contains_key(&(link.review_id.as_str(), link.candidate_id.as_str()))
             || !finding_ids.contains(&(link.review_id.as_str(), link.finding_id.as_str()))
         {
             return Err(invalid(
@@ -314,11 +321,10 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
         if !review_ids.contains_key(event.review_id.as_str())
             || !unit_ids.contains(&(event.review_id.as_str(), event.unit_id.as_str()))
             || event.candidate_id.as_deref().is_some_and(|candidate_id| {
-                !archive.candidates.iter().any(|candidate| {
-                    candidate.review_id == event.review_id
-                        && candidate.unit_id == event.unit_id
-                        && candidate.candidate_id == candidate_id
-                })
+                candidate_units
+                    .get(&(event.review_id.as_str(), candidate_id))
+                    .copied()
+                    != Some(event.unit_id.as_str())
             })
         {
             return Err(invalid(
@@ -329,7 +335,7 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
     verify_decisions(archive, &review_ids)?;
     super::feedback::validate_event_history(&archive.feedback_events)
         .map_err(|error| invalid(error.message))?;
-    verify_search_cases(archive, &review_ids)?;
+    verify_search_cases(archive, &review_ids, &candidate_units)?;
     Ok(())
 }
 
@@ -473,21 +479,12 @@ fn reject_unportable_path(raw: &str) -> Result<(), DomainError> {
 fn verify_search_cases(
     archive: &LearningExport,
     review_ids: &BTreeMap<&str, &ImportRecord>,
+    candidate_units: &BTreeMap<(&str, &str), &str>,
 ) -> Result<(), DomainError> {
     let units: BTreeSet<(&str, &str)> = archive
         .units
         .iter()
         .map(|unit| (unit.review_id.as_str(), unit.unit_id.as_str()))
-        .collect();
-    let candidates: BTreeSet<(&str, &str)> = archive
-        .candidates
-        .iter()
-        .map(|candidate| {
-            (
-                candidate.review_id.as_str(),
-                candidate.candidate_id.as_str(),
-            )
-        })
         .collect();
     let findings: BTreeSet<(&str, &str)> = archive
         .findings
@@ -523,13 +520,10 @@ fn verify_search_cases(
             )));
         }
         if let Some(candidate_id) = case.candidate_id.as_deref()
-            && (!candidates.contains(&(case.review_id.as_str(), candidate_id))
-                || (!case.unit_id.is_empty()
-                    && !archive.candidates.iter().any(|candidate| {
-                        candidate.review_id == case.review_id
-                            && candidate.unit_id == case.unit_id
-                            && candidate.candidate_id == candidate_id
-                    })))
+            && (candidate_units
+                .get(&(case.review_id.as_str(), candidate_id))
+                .copied()
+                .is_none_or(|unit_id| !case.unit_id.is_empty() && unit_id != case.unit_id))
         {
             return Err(invalid(format!(
                 "Поисковый случай архива ссылается на отсутствующего кандидата: {candidate_id}"
@@ -557,6 +551,8 @@ pub fn restore_history(
     archive: &LearningExport,
 ) -> Result<RestoreSummary, DomainError> {
     verify_export(archive)?;
+    let candidate_units = candidate_unit_index(archive);
+    let finding_units = finding_unit_index(archive, &candidate_units);
     let summary = store.write(|write| {
         let mut restored = 0usize;
         let mut unchanged = 0usize;
@@ -604,7 +600,7 @@ pub fn restore_history(
         }
         for finding in &archive.findings {
             if restored_ids.contains(finding.review_id.as_str()) {
-                insert_finding(write, finding, archive)?;
+                insert_finding(write, finding, &finding_units)?;
             }
         }
         for link in &archive.finding_links {
@@ -924,24 +920,14 @@ fn classification_execution(classification_json: &str) -> String {
 fn insert_finding(
     write: &super::store::LearningWrite<'_>,
     finding: &ExportedFinding,
-    archive: &LearningExport,
+    finding_units: &BTreeMap<(&str, &str), Vec<&str>>,
 ) -> Result<(), DomainError> {
-    let units: Vec<String> = archive
-        .finding_links
-        .iter()
-        .filter(|link| link.review_id == finding.review_id && link.finding_id == finding.finding_id)
-        .filter_map(|link| {
-            archive
-                .candidates
-                .iter()
-                .find(|candidate| {
-                    candidate.review_id == link.review_id
-                        && candidate.candidate_id == link.candidate_id
-                })
-                .map(|candidate| candidate.unit_id.clone())
-        })
+    let mut units: Vec<String> = finding_units
+        .get(&(finding.review_id.as_str(), finding.finding_id.as_str()))
+        .into_iter()
+        .flatten()
+        .map(|unit_id| (*unit_id).to_owned())
         .collect();
-    let mut units: Vec<String> = units;
     units.sort();
     units.dedup();
     let linked_units = super::import::serialize_json(
@@ -965,6 +951,24 @@ fn insert_finding(
         ],
     )?;
     Ok(())
+}
+
+fn finding_unit_index<'a>(
+    archive: &'a LearningExport,
+    candidate_units: &BTreeMap<(&'a str, &'a str), &'a str>,
+) -> BTreeMap<(&'a str, &'a str), Vec<&'a str>> {
+    let mut finding_units = BTreeMap::new();
+    for link in &archive.finding_links {
+        if let Some(unit_id) =
+            candidate_units.get(&(link.review_id.as_str(), link.candidate_id.as_str()))
+        {
+            finding_units
+                .entry((link.review_id.as_str(), link.finding_id.as_str()))
+                .or_insert_with(Vec::new)
+                .push(*unit_id);
+        }
+    }
+    finding_units
 }
 
 fn payload_digest(archive: &LearningExport) -> Result<String, DomainError> {
@@ -1102,17 +1106,18 @@ fn read_tables(
                 analyzer_digest: row.16,
                 classifier_digest: row.17,
             },
-            trust: if row.18 == TrustLevel::StructureOnlyQuarantine.as_str() {
-                TrustLevel::StructureOnlyQuarantine
-            } else {
-                TrustLevel::AstAuthenticated
-            },
-            outcome: match row.19.as_str() {
-                "fully_reviewed" => ReviewedOutcome::FullyReviewed,
-                "no_triage" => ReviewedOutcome::NoTriage,
-                "quarantined" => ReviewedOutcome::Quarantined,
-                _ => ReviewedOutcome::PartiallyReviewed,
-            },
+            trust: super::import::trust_level_of(&row.18).ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::LearningCorrupt,
+                    format!("Неизвестный уровень доверия записи истории: {}", row.18),
+                )
+            })?,
+            outcome: super::import::reviewed_outcome_of(&row.19).ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::LearningCorrupt,
+                    format!("Неизвестный исход записи истории: {}", row.19),
+                )
+            })?,
             limitations: parse_domain_json(&row.20, "ограничения записи")?,
             revision_of: row.21,
             superseded_by: row.22,
@@ -1490,6 +1495,63 @@ fn invalid(message: impl Into<String>) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_review::learning::model::{ReviewedOutcome, TrustLevel};
+
+    #[test]
+    fn export_rejects_unknown_persisted_trust_and_outcome() {
+        use super::super::store::{LearningStore, StoreOptions};
+
+        let directory = std::env::temp_dir().join(format!(
+            "anki-repo-transfer-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = LearningStore::open(StoreOptions::at(directory.join("state.sqlite"))).unwrap();
+        let record = archive_with_valid_references().reviews.remove(0);
+        store.write(|write| insert_record(write, &record)).unwrap();
+
+        for (column, value) in [("trust", "future_trust"), ("outcome", "complete")] {
+            store
+                .write(|write| {
+                    write
+                        .execute(
+                            &format!(
+                                "UPDATE learning_import SET {column} = ?1 WHERE review_id = ?2"
+                            ),
+                            params![value, record.review_id],
+                        )
+                        .map(|_| ())
+                })
+                .unwrap();
+            let error = export_history(&store).unwrap_err();
+            assert_eq!(error.code, ErrorCode::LearningCorrupt, "column: {column}");
+            store
+                .write(|write| {
+                    write
+                        .execute(
+                            &format!(
+                                "UPDATE learning_import SET {column} = ?1 WHERE review_id = ?2"
+                            ),
+                            params![
+                                if column == "trust" {
+                                    TrustLevel::AstAuthenticated.as_str()
+                                } else {
+                                    ReviewedOutcome::FullyReviewed.as_str()
+                                },
+                                record.review_id
+                            ],
+                        )
+                        .map(|_| ())
+                })
+                .unwrap();
+        }
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// Кандидат архива с заданным путём: остальные поля для проверки не важны.
     fn candidate_with_path(path: &str) -> ExportedCandidate {

@@ -6,6 +6,7 @@
 //! сигналов code review: база создаётся и меняется только явными вызовами.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, OpenFlags, params};
 
@@ -182,7 +183,6 @@ impl LearningStore {
     /// Более новая версия схемы отвергается до любых изменений; повреждённый
     /// файл не удаляется и не перезаписывается.
     pub fn open(options: StoreOptions) -> Result<Self, DomainError> {
-        let mut newly_created = false;
         if !options.database.exists() && !options.create {
             return Err(unavailable(&options, "файл базы learning отсутствует"));
         }
@@ -210,27 +210,9 @@ impl LearningStore {
             }
         }
         if !options.database.exists() {
-            // Атомарное создание исключает превращение появившейся между
-            // проверками чужой базы в «новую». Уже существующий пустой файл
-            // нельзя инициализировать даже при create=true.
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&options.database)
-            {
-                Ok(_) => newly_created = true,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(unavailable(
-                        &options,
-                        &format!("не удалось создать файл базы learning: {error}"),
-                    ));
-                }
-            }
+            initialize_database_atomically(&options)?;
         }
-        if !newly_created {
-            validate_existing_file(&options)?;
-        }
+        validate_existing_file(&options)?;
         let decision = journal_mode_decision(&options.database);
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut connection =
@@ -244,20 +226,15 @@ impl LearningStore {
         connection
             .busy_timeout(std::time::Duration::from_millis(OPEN_BUSY_TIMEOUT_MS))
             .map_err(|error| map_error(&error, "не удалось настроить busy_timeout"))?;
-        let current_schema_version = if newly_created {
-            0
-        } else {
-            // Повторная проверка на фактическом соединении защищает переход
-            // между read-only проверкой и открытием для законной миграции.
-            let transaction = connection
-                .unchecked_transaction()
-                .map_err(|error| map_error(&error, "не удалось проверить базу learning"))?;
-            let version = schema::validate_existing_database(&transaction)?;
-            transaction.commit().map_err(|error| {
-                map_error(&error, "не удалось завершить проверку базы learning")
-            })?;
-            version
-        };
+        // Повторная проверка на фактическом соединении защищает переход
+        // между read-only проверкой и открытием для законной миграции.
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| map_error(&error, "не удалось проверить базу learning"))?;
+        let current_schema_version = schema::validate_existing_database(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| map_error(&error, "не удалось завершить проверку базы learning"))?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| map_error(&error, "не удалось включить foreign_keys"))?;
@@ -479,6 +456,107 @@ impl LearningStore {
     }
 }
 
+struct InitializationFile {
+    path: PathBuf,
+}
+
+impl Drop for InitializationFile {
+    fn drop(&mut self) {
+        remove_file_and_sidecars(&self.path);
+    }
+}
+
+fn initialize_database_atomically(options: &StoreOptions) -> Result<(), DomainError> {
+    let temporary = reserve_initialization_file(options)?;
+    let mut connection = Connection::open(&temporary.path).map_err(|error| {
+        map_open_error(
+            options,
+            &error,
+            "не удалось создать временную базу learning",
+        )
+    })?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(OPEN_BUSY_TIMEOUT_MS))
+        .map_err(|error| map_error(&error, "не удалось настроить busy_timeout"))?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| map_error(&error, "не удалось включить foreign_keys"))?;
+    schema::apply_migrations(&mut connection)?;
+    schema::ensure_fts_index(&connection)?;
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(|error| map_error(&error, "не удалось прочитать режим журнала SQLite"))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        connection
+            .execute_batch("PRAGMA journal_mode = DELETE")
+            .map_err(|error| {
+                map_error(&error, "не удалось подготовить базу learning к публикации")
+            })?;
+    }
+    drop(connection);
+    match std::fs::hard_link(&temporary.path, &options.database) {
+        Ok(()) => Ok(()),
+        // Другой процесс опубликовал полностью подготовленную базу первым.
+        // Обычный путь ниже проверит именно её перед открытием.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(unavailable(
+            options,
+            &format!("не удалось атомарно опубликовать базу learning: {error}"),
+        )),
+    }
+}
+
+fn reserve_initialization_file(options: &StoreOptions) -> Result<InitializationFile, DomainError> {
+    static NEXT_INITIALIZATION_ID: AtomicU64 = AtomicU64::new(0);
+    let parent = options
+        .database
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    for _ in 0..128 {
+        let sequence = NEXT_INITIALIZATION_ID.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            ".anki-repo-learning-init-{}-{timestamp}-{sequence}.sqlite",
+            std::process::id()
+        );
+        let path = parent.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(InitializationFile { path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(unavailable(
+                    options,
+                    &format!("не удалось зарезервировать временный файл базы learning: {error}"),
+                ));
+            }
+        }
+    }
+    Err(unavailable(
+        options,
+        "не удалось подобрать уникальное имя временной базы learning",
+    ))
+}
+
+fn remove_file_and_sidecars(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+}
+
 /// Чужие, частичные и будущие базы проверяются через read-only соединение:
 /// SQLite не меняет их журнал и не восстанавливает незавершённую запись.
 fn validate_existing_file(options: &StoreOptions) -> Result<(), DomainError> {
@@ -549,7 +627,7 @@ pub fn recovery_paths(database: &str) -> Vec<String> {
     vec![
         format!("code-review learning export --database {database} --out <archive>"),
         format!("code-review learning backup --database {database} --out <snapshot>"),
-        "code-review learning restore --from <archive>".to_owned(),
+        "code-review learning restore --archive <archive>".to_owned(),
     ]
 }
 
@@ -717,12 +795,10 @@ fn probe_directory(database: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
+#[allow(clippy::useless_conversion)] // `f_type` — c_long: i32 на 32-битных и i64 на 64-битных Unix.
 fn filesystem_type(path: &Path) -> Option<i64> {
     match rustix::fs::statfs(path) {
-        Ok(status) => {
-            let value: i64 = status.f_type;
-            Some(value)
-        }
+        Ok(status) => Some(i64::from(status.f_type)),
         Err(_) => None,
     }
 }
@@ -839,6 +915,7 @@ mod tests {
             paths[1]
                 .contains("backup --database .anki-repo/learning/state.sqlite --out <snapshot>")
         );
+        assert_eq!(paths[2], "code-review learning restore --archive <archive>");
     }
 
     #[test]
@@ -879,6 +956,16 @@ mod tests {
         assert!(status.fts5_available);
         assert_eq!(status.generation.revision, 0);
         assert!(!status.database_path.contains("/home/"));
+        let files: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            files.iter().all(|name| !name
+                .to_string_lossy()
+                .starts_with(".anki-repo-learning-init-")),
+            "временная база и её sidecar-файлы удаляются: {files:?}"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

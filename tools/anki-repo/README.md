@@ -2941,7 +2941,7 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `process_operation_failed` | 14 | Не удалось выполнить операцию с процессом; это не ошибка записи review artifact |
 | `syntax_authenticity_unavailable` | 3 | `code-review queue validate`/`summary`/`list`/`group`/`candidate`: exact Git images или AST недоступны; для явной ограниченной проверки структуры и digest передай `--structure-only` |
 | `language_decision_invalid` | 3 | `language apply`: решение, якорь или ограничение замены не прошли предварительную проверку |
-| `not_found` | 4 | `find` и `review --guid`: нет совпадений по заданному критерию; `code-review queue group` / `candidate`: указанный unit или candidate ID отсутствует |
+| `not_found` | 4 | `find` и `review --guid`: нет совпадений по заданному критерию; `code-review queue group` / `candidate`: указанный unit или candidate ID отсутствует; `code-review learning`: нет локальной базы, случая, события или предложения |
 | `note_not_found` | 4 | `edit`: в экспорте нет заметки с указанным `guid`; в отчёте `review-check` — код проблемы предложения (доменной ошибкой не является) |
 | `ambiguous` | 5 | `find --guid` и `review --guid`: `guid` не разрешается однозначно. Для `edit` и `review-check` эта ветка недостижима как *код возврата*: повтор `guid` отсекается раньше как `export_invalid` (6), а в отчёте `review-check` он остаётся статусом предложения `invalid`/`ambiguous_guid` |
 | `unknown_model` | 3 | `create`: подходящей модели нет — ни явно указанной, ни совместимой с набором полей запроса в режиме `auto` (сообщение перечисляет фактически запрошенные имена полей) |
