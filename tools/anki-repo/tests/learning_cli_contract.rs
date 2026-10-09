@@ -14,6 +14,7 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 use crate::common::{TempDir, run_cli_in};
+use anki_repo::code_review::learning::{LearningStore, StoreOptions};
 
 /// Синтетический Git-репозиторий с production- и test-исходником.
 struct Fixture {
@@ -80,8 +81,9 @@ fn cli_json(fixture: &Fixture, args: &[&str]) -> (i32, Value, String) {
     let mut argv = vec!["--json"];
     argv.extend_from_slice(args);
     let (code, stdout, stderr) = run_cli_in(Some(fixture.path()), &argv);
-    let value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|error| panic!("вывод не является JSON: {error}"));
+    let value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("вывод не является JSON для {args:?}: {error}; stdout={stdout:?}; stderr={stderr:?}")
+    });
     (code, value, stderr)
 }
 
@@ -109,7 +111,8 @@ fn assert_error(fixture: &Fixture, args: &[&str], expected: &str) {
     );
     assert!(
         error_code(&value) == expected,
-        "код ошибки команды не совпал с ожидаемым"
+        "код ошибки команды не совпал с ожидаемым: ожидался {expected}, получен {}; response={value}; stderr={stderr}",
+        error_code(&value)
     );
 }
 
@@ -332,6 +335,38 @@ fn assert_bounded_candidate_ids(value: &Value) {
 
 fn read(path: &Path) -> Vec<u8> {
     fs::read(path).expect("файл фикстуры должен читаться")
+}
+
+/// Пересчитывает digest тела по формату архива до версии 4.
+fn legacy_archive_digest(
+    archive: &anki_repo::code_review::learning::model::LearningExport,
+) -> String {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        reviews: &'a [anki_repo::code_review::learning::model::ImportRecord],
+        units: &'a [anki_repo::code_review::learning::model::ReviewUnitRecord],
+        candidates: &'a [anki_repo::code_review::learning::model::ExportedCandidate],
+        findings: &'a [anki_repo::code_review::learning::model::ExportedFinding],
+        finding_links: &'a [anki_repo::code_review::learning::model::ExportedFindingLink],
+        case_links: &'a [anki_repo::code_review::learning::model::ExportedCaseLink],
+        feedback_events: &'a [anki_repo::code_review::learning::model::FeedbackEvent],
+        policy_proposals: &'a [anki_repo::code_review::learning::model::PolicyProposal],
+        search: &'a [anki_repo::code_review::learning::model::ExportedSearchCase],
+    }
+    let body = Body {
+        reviews: &archive.reviews,
+        units: &archive.units,
+        candidates: &archive.candidates,
+        findings: &archive.findings,
+        finding_links: &archive.finding_links,
+        case_links: &archive.case_links,
+        feedback_events: &archive.feedback_events,
+        policy_proposals: &archive.policy_proposals,
+        search: &archive.search,
+    };
+    anki_repo::code_review::learning::import::sha256_hex(
+        &serde_json::to_vec(&body).expect("legacy body сериализуется"),
+    )
 }
 
 #[test]
@@ -1996,9 +2031,28 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
     let learning_dir = fixture.path().join(".anki-repo/learning");
     fs::create_dir_all(&learning_dir).unwrap();
 
-    // Пустая база: состояние читается, обычное ревью не меняется.
+    // Произвольный пустой файл не удостоверяет формат learning и не меняется.
+    let foreign_empty = learning_dir.join("foreign-empty.sqlite");
+    fs::write(&foreign_empty, b"").unwrap();
+    for command in ["status", "stats"] {
+        assert_error(
+            &fixture,
+            &[
+                "code-review",
+                "learning",
+                command,
+                "--db",
+                ".anki-repo/learning/foreign-empty.sqlite",
+            ],
+            "learning_corrupt",
+        );
+    }
+    assert_eq!(read(&foreign_empty), b"");
+    review_commands(&fixture);
+
+    // Состояние корректно созданной пустой learning-базы остаётся доступно.
     let empty = learning_dir.join("empty.sqlite");
-    fs::write(&empty, b"").unwrap();
+    drop(LearningStore::open(StoreOptions::at(&empty)).unwrap());
     let status = ok_json(
         &fixture,
         &[
@@ -2091,26 +2145,20 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
     );
     review_commands(&fixture);
 
-    // Недоступность каталога под обычным файлом детерминирована и при запуске
-    // под root, где mode-биты read-only не запрещают запись.
-    let readonly = learning_dir.join("readonly.sqlite");
-    fs::write(&readonly, b"").unwrap();
-    let mut permissions = fs::metadata(&readonly).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o444);
-    fs::set_permissions(&readonly, permissions).unwrap();
-    let readonly_database = if fs::OpenOptions::new().write(true).open(&readonly).is_err() {
-        ".anki-repo/learning/readonly.sqlite"
-    } else {
-        "src/lib.rs/unavailable.sqlite"
-    };
+    // Путь базы под обычным файлом не может стать каталогом ни под root,
+    // ни при иных режимах доступа.
     assert_error(
         &fixture,
         &[
             "code-review",
             "learning",
-            "status",
+            "import",
             "--db",
-            readonly_database,
+            "src/lib.rs/unavailable.sqlite",
+            "--pack",
+            &fixture.pack(&head),
+            "--queue",
+            &fixture.queue(&head),
         ],
         "learning_storage_unavailable",
     );
@@ -2388,6 +2436,10 @@ fn restore_returns_the_same_search_cases_and_stays_honest_for_old_archives() {
         .unwrap()
         .remove("search_cases");
     document.as_object_mut().unwrap().remove("search");
+    document.as_object_mut().unwrap().remove("decisions");
+    let legacy: anki_repo::code_review::learning::model::LearningExport =
+        serde_json::from_value(document.clone()).expect("legacy v1 archive shape");
+    document["manifest"]["payload_sha256"] = json!(legacy_archive_digest(&legacy));
     fs::write(
         plain.path().join(old_archive),
         serde_json::to_vec_pretty(&document).unwrap(),
@@ -3015,5 +3067,317 @@ fn search_hides_quarantine_until_explicitly_requested() {
     assert_eq!(
         alias["result"]["matched"], trusted_page["result"]["matched"],
         "псевдоним обязан соблюдать тот же фильтр"
+    );
+}
+
+#[test]
+fn complete_learning_lifecycle_preserves_decisions_feedback_and_independent_findings() {
+    let fixture = Fixture::create("learning-lifecycle-transfer");
+    let head = fixture.head_sha.clone();
+    let candidate = fixture.candidate_ids(&head, "error_path")[0].clone();
+    fixture.write_triage(&head, &[(candidate.clone(), "confirmed")]);
+
+    // Независимая находка имеет место и обоснование в собственном evidence,
+    // но не получает выдуманную связь с одним из кандидатов очереди.
+    let triage_input = fixture.workspace(&head).join("semantic-triage.input.json");
+    let mut triage: Value = serde_json::from_slice(&read(&triage_input)).unwrap();
+    triage["findings"].as_array_mut().unwrap().push(json!({
+        "id": "finding-independent",
+        "severity": "major",
+        "title": "Независимая ошибка на границе разбора",
+        "description": "src/lib.rs:2 — значение теряется при ошибке разбора; место и краткое основание проверены по исходнику.",
+        "provenance": "independent",
+        "candidate_ids": [],
+    }));
+    fs::write(&triage_input, serde_json::to_vec_pretty(&triage).unwrap()).unwrap();
+    let (code, _, stderr) = cli(
+        &fixture,
+        &[
+            "code-review",
+            "triage",
+            "validate",
+            "--pack",
+            &fixture.pack(&head),
+            "--triage",
+            &fixture.artifact(&head, "semantic-triage.input.json"),
+            "--canonical-out",
+            &fixture.triage(&head),
+        ],
+    );
+    assert_eq!(code, 0, "triage с independent finding проходит: {stderr}");
+
+    // Навигация показывает очередь, а semantic summary отдельно показывает,
+    // что рассмотрен только один кандидат и остальные явно остались открыты.
+    let queue: Value =
+        serde_json::from_slice(&read(&fixture.path().join(fixture.queue(&head)))).unwrap();
+    assert!(!queue["units"].as_array().unwrap().is_empty());
+    let triage_summary = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "triage",
+            "summary",
+            "--pack",
+            &fixture.pack(&head),
+            "--triage",
+            &fixture.triage(&head),
+        ],
+    );
+    let summary = &triage_summary["result"];
+    assert_eq!(summary["reviewed_candidates"], json!(1));
+    assert!(summary["unreviewed_candidates"].as_u64().unwrap() > 0);
+    assert_eq!(
+        summary["findings"]["by_provenance"]["independent"],
+        json!(1)
+    );
+
+    let imported = fixture.import(&head);
+    assert_eq!(imported["status"], json!("imported"));
+    assert_eq!(
+        imported["record"]["observations"]["individual_decisions"],
+        json!(1)
+    );
+    assert_eq!(
+        imported["record"]["observations"]["findings_independent"],
+        json!(1)
+    );
+    let review_id = imported["record"]["review_id"].as_str().unwrap().to_owned();
+
+    let queue_unit = queue["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| {
+            unit["members"]["candidate_id"].as_str() == Some(candidate.as_str())
+                || unit["members"]["candidate_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(candidate.as_str())))
+        })
+        .expect("кандидат принадлежит ровно одной единице очереди");
+    let unit_id = queue_unit["id"].as_str().unwrap().to_owned();
+
+    let search = |database: Option<&str>,
+                  text: &str,
+                  disposition: Option<&str>,
+                  provenance: Option<&str>| {
+        let mut args = vec!["code-review", "learning", "search"];
+        if let Some(database) = database {
+            args.extend(["--db", database]);
+        }
+        args.extend(["--text", text]);
+        if let Some(disposition) = disposition {
+            args.extend(["--disposition", disposition]);
+        }
+        if let Some(provenance) = provenance {
+            args.extend(["--provenance", provenance]);
+        }
+        args.extend(["--limit", "20"]);
+        ok_json(&fixture, &args)
+    };
+
+    let decision_text = "Синтетическое решение для контракта CLI learning.";
+    let before_revision = search(None, decision_text, Some("confirmed"), None);
+    assert_eq!(before_revision["result"]["matched"], json!(1));
+    let independent_before = search(None, "src/lib.rs:2", None, Some("independent"));
+    assert_eq!(independent_before["result"]["matched"], json!(1));
+    let independent_case = &independent_before["result"]["cases"][0];
+    assert_eq!(independent_case["finding_id"], json!("finding-independent"));
+    assert_eq!(independent_case["candidate_id"], Value::Null);
+    assert_eq!(independent_case["provenance"], json!("independent"));
+    assert!(
+        independent_case["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("src/lib.rs:2")
+    );
+
+    // Feedback меняет effective disposition, сохраняя исходное решение и audit event.
+    let correction = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "feedback",
+            "record",
+            "--review-id",
+            &review_id,
+            "--unit-id",
+            &unit_id,
+            "--candidate-id",
+            &candidate,
+            "--kind",
+            "semantic-outcome-revision",
+            "--disposition",
+            "false-positive",
+            "--explanation",
+            "Повторно проверена синтетическая метка.",
+        ],
+    );
+    assert_eq!(
+        correction["result"]["outcome"]["original_disposition"],
+        json!("confirmed")
+    );
+    assert_eq!(
+        correction["result"]["outcome"]["effective_disposition"],
+        json!("false_positive")
+    );
+    assert_eq!(
+        search(None, decision_text, Some("confirmed"), None)["result"]["matched"],
+        json!(0)
+    );
+    assert_eq!(
+        search(None, decision_text, Some("false-positive"), None)["result"]["matched"],
+        json!(1)
+    );
+
+    let source_stats = ok_json(&fixture, &["code-review", "learning", "stats"]);
+    assert_eq!(
+        source_stats["result"]["observations"]["findings_independent"],
+        json!(1)
+    );
+    let history_revision = source_stats["result"]["generation"]["revision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let source_patterns = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "patterns",
+            "--detector",
+            "error_path",
+        ],
+    );
+    let source_recommendations = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "recommend",
+            "--pack",
+            &fixture.pack(&head),
+            "--queue",
+            &fixture.queue(&head),
+            "--triage",
+            &fixture.triage(&head),
+            "--history-revision",
+            &history_revision,
+            "--require-history",
+        ],
+    );
+
+    let archive_path = ".anki-repo/learning/exports/full-lifecycle.json";
+    let exported = ok_json(
+        &fixture,
+        &["code-review", "learning", "export", "--out", archive_path],
+    );
+    assert_eq!(
+        exported["result"]["manifest"]["export_schema_version"],
+        json!(anki_repo::code_review::learning::transfer::EXPORT_SCHEMA_VERSION)
+    );
+    let archive: Value = serde_json::from_slice(&read(&fixture.path().join(archive_path))).unwrap();
+    assert_eq!(archive["decisions"].as_array().unwrap().len(), 1);
+    assert_eq!(archive["feedback_events"].as_array().unwrap().len(), 1);
+    assert!(
+        archive["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["finding_id"] == json!("finding-independent")
+                    && finding["provenance"] == json!("independent")
+            })
+    );
+
+    let restored_db = ".anki-repo/learning/restored-lifecycle.sqlite";
+    let restored = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "restore",
+            "--db",
+            restored_db,
+            "--archive",
+            archive_path,
+        ],
+    );
+    assert_eq!(restored["result"]["summary"]["restored_reviews"], json!(1));
+    let restored_stats = ok_json(
+        &fixture,
+        &["code-review", "learning", "stats", "--db", restored_db],
+    );
+    assert_eq!(
+        restored_stats["result"]["observations"],
+        source_stats["result"]["observations"]
+    );
+    let restored_history_revision = restored_stats["result"]["generation"]["revision"]
+        .as_u64()
+        .expect("восстановленная база публикует собственную ревизию")
+        .to_string();
+
+    let independent_after = search(Some(restored_db), "src/lib.rs:2", None, Some("independent"));
+    assert_eq!(
+        case_ids(&independent_after),
+        case_ids(&independent_before),
+        "independent finding сохраняется и находится после restore"
+    );
+    assert_eq!(
+        search(Some(restored_db), decision_text, Some("confirmed"), None)["result"]["matched"],
+        json!(0)
+    );
+    assert_eq!(
+        search(
+            Some(restored_db),
+            decision_text,
+            Some("false-positive"),
+            None
+        )["result"]["matched"],
+        json!(1)
+    );
+
+    let restored_patterns = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "patterns",
+            "--db",
+            restored_db,
+            "--detector",
+            "error_path",
+        ],
+    );
+    assert_eq!(
+        restored_patterns["result"]["rules"],
+        source_patterns["result"]["rules"]
+    );
+    let restored_recommendations = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "recommend",
+            "--db",
+            restored_db,
+            "--pack",
+            &fixture.pack(&head),
+            "--queue",
+            &fixture.queue(&head),
+            "--triage",
+            &fixture.triage(&head),
+            "--history-revision",
+            &restored_history_revision,
+            "--require-history",
+        ],
+    );
+    assert_eq!(
+        restored_recommendations["result"]["recommendations"],
+        source_recommendations["result"]["recommendations"]
+    );
+    assert_eq!(
+        restored_recommendations["result"]["suggested_order"],
+        source_recommendations["result"]["suggested_order"]
     );
 }

@@ -24,16 +24,18 @@ use crate::error::{DomainError, ErrorCode};
 use super::LEARNING_POLICY_VERSION;
 use super::import::{parse_domain_json, sha256_hex};
 use super::model::{
-    ExportedCandidate, ExportedCaseLink, ExportedFinding, ExportedFindingLink, ExportedSearchCase,
-    FeedbackEvent, HistoryGeneration, ImportInputs, ImportRecord, LearningExport,
-    LearningExportManifest, ObservationCounts, PolicyProposal, ReviewUnitKind, ReviewUnitRecord,
-    ReviewedOutcome, TrustLevel,
+    ExportedCandidate, ExportedCaseLink, ExportedDecision, ExportedFinding, ExportedFindingLink,
+    ExportedSearchCase, FeedbackEvent, HistoryGeneration, ImportInputs, ImportRecord,
+    LearningExport, LearningExportManifest, ObservationCounts, PolicyProposal, ReviewUnitKind,
+    ReviewUnitRecord, ReviewedOutcome, TrustLevel,
 };
 use super::schema::LEARNING_SCHEMA_VERSION;
 use super::store::{LearningRead, LearningStore, map_error};
 
-/// Третья версия сохраняет структурные ссылки кандидатов, но исключает source snippets.
-pub const EXPORT_SCHEMA_VERSION: u32 = 3;
+/// Четвёртая версия переносит исходные решения ревьюера и их полное покрытие.
+pub const EXPORT_SCHEMA_VERSION: u32 = 4;
+/// Третья версия исключила source snippets из переносимой истории.
+const EXPORT_SCHEMA_VERSION_WITHOUT_SNIPPETS: u32 = 3;
 
 /// Первая версия архива: переносятся только исходные записи, без поиска.
 const EXPORT_SCHEMA_VERSION_WITHOUT_SEARCH: u32 = 1;
@@ -66,9 +68,22 @@ pub struct RestoreSummary {
 
 /// Собирает переносимый архив проверенной истории.
 pub fn export_history(store: &LearningStore) -> Result<ExportSummary, DomainError> {
-    let generation = super::import::generation(store)?;
-    let (reviews, units, candidates, findings, links, case_links, feedback, proposals, search) =
-        store.read(read_tables)?;
+    let (generation, tables) = store.read(|read| {
+        let generation = super::import::generation_of(read)?;
+        Ok((generation, read_tables(read)?))
+    })?;
+    let (
+        reviews,
+        units,
+        candidates,
+        decisions,
+        findings,
+        links,
+        case_links,
+        feedback,
+        proposals,
+        search,
+    ) = tables;
     let mut archive = LearningExport {
         manifest: LearningExportManifest {
             export_schema_version: EXPORT_SCHEMA_VERSION,
@@ -86,6 +101,7 @@ pub fn export_history(store: &LearningStore) -> Result<ExportSummary, DomainErro
         reviews,
         units,
         candidates,
+        decisions,
         findings,
         finding_links: links,
         case_links,
@@ -94,6 +110,7 @@ pub fn export_history(store: &LearningStore) -> Result<ExportSummary, DomainErro
         search,
     };
     archive.manifest.payload_sha256 = payload_digest(&archive)?;
+    verify_export(&archive)?;
     Ok(ExportSummary {
         manifest: archive.manifest.clone(),
         archive,
@@ -105,6 +122,7 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
     if !matches!(
         archive.manifest.export_schema_version,
         EXPORT_SCHEMA_VERSION
+            | EXPORT_SCHEMA_VERSION_WITHOUT_SNIPPETS
             | EXPORT_SCHEMA_VERSION_WITH_SEARCH
             | EXPORT_SCHEMA_VERSION_WITHOUT_SEARCH
     ) {
@@ -120,6 +138,13 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
                 "Архив создан более новой схемой learning ({}); эта сборка поддерживает {LEARNING_SCHEMA_VERSION}",
                 archive.manifest.schema_version
             ),
+        ));
+    }
+    if archive.manifest.export_schema_version < EXPORT_SCHEMA_VERSION
+        && !archive.decisions.is_empty()
+    {
+        return Err(invalid(
+            "Архив старой версии не может содержать решения версии 4",
         ));
     }
     let expected = payload_digest(archive)?;
@@ -148,6 +173,7 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
     if review_ids.len() != archive.reviews.len() {
         return Err(invalid("Повтор review_id в архиве learning"));
     }
+    verify_review_lineage(&review_ids)?;
     let unit_ids: BTreeSet<(&str, &str)> = archive
         .units
         .iter()
@@ -168,12 +194,58 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
         .iter()
         .map(|finding| (finding.review_id.as_str(), finding.finding_id.as_str()))
         .collect();
+    if unit_ids.len() != archive.units.len()
+        || candidate_ids.len() != archive.candidates.len()
+        || finding_ids.len() != archive.findings.len()
+    {
+        return Err(invalid(
+            "Повтор ID единицы, кандидата или замечания в архиве learning",
+        ));
+    }
+    let finding_links: BTreeSet<_> = archive
+        .finding_links
+        .iter()
+        .map(|link| (&link.review_id, &link.candidate_id, &link.finding_id))
+        .collect();
+    let case_links: BTreeSet<_> = archive
+        .case_links
+        .iter()
+        .map(|link| {
+            (
+                &link.review_id,
+                &link.finding_id,
+                &link.linked_review_id,
+                &link.linked_finding_id,
+                link.kind.as_str(),
+            )
+        })
+        .collect();
+    let proposal_ids: BTreeSet<_> = archive
+        .policy_proposals
+        .iter()
+        .map(|proposal| &proposal.proposal_id)
+        .collect();
+    if finding_links.len() != archive.finding_links.len()
+        || case_links.len() != archive.case_links.len()
+        || proposal_ids.len() != archive.policy_proposals.len()
+    {
+        return Err(invalid(
+            "Повтор связи или предложения политики в архиве learning",
+        ));
+    }
     for unit in &archive.units {
         if !review_ids.contains_key(unit.review_id.as_str()) {
             return Err(invalid(format!(
                 "Единица архива ссылается на отсутствующую запись: {}",
                 unit.review_id
             )));
+        }
+        if let Some(marker) = unit.feature_map().get("classifier_compatibility")
+            && marker != &review_ids[unit.review_id.as_str()].inputs.classifier_digest
+        {
+            return Err(invalid(
+                "Версия classifier в признаках единицы не совпадает с ревью",
+            ));
         }
     }
     for finding in &archive.findings {
@@ -204,7 +276,12 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
                 candidate.review_id
             )));
         }
-        if archive.manifest.export_schema_version >= EXPORT_SCHEMA_VERSION
+        if !unit_ids.contains(&(candidate.review_id.as_str(), candidate.unit_id.as_str())) {
+            return Err(invalid(
+                "Кандидат архива ссылается на отсутствующую единицу",
+            ));
+        }
+        if archive.manifest.export_schema_version >= EXPORT_SCHEMA_VERSION_WITHOUT_SNIPPETS
             && candidate.snippet.is_some()
         {
             return Err(invalid(
@@ -237,7 +314,11 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
         if !review_ids.contains_key(event.review_id.as_str())
             || !unit_ids.contains(&(event.review_id.as_str(), event.unit_id.as_str()))
             || event.candidate_id.as_deref().is_some_and(|candidate_id| {
-                !candidate_ids.contains(&(event.review_id.as_str(), candidate_id))
+                !archive.candidates.iter().any(|candidate| {
+                    candidate.review_id == event.review_id
+                        && candidate.unit_id == event.unit_id
+                        && candidate.candidate_id == candidate_id
+                })
             })
         {
             return Err(invalid(
@@ -245,7 +326,105 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
             ));
         }
     }
+    verify_decisions(archive, &review_ids)?;
+    super::feedback::validate_event_history(&archive.feedback_events)
+        .map_err(|error| invalid(error.message))?;
     verify_search_cases(archive, &review_ids)?;
+    Ok(())
+}
+
+/// Преемственность ревью переносится как проверяемая связь одного Git-случая.
+fn verify_review_lineage(review_ids: &BTreeMap<&str, &ImportRecord>) -> Result<(), DomainError> {
+    for record in review_ids.values() {
+        let mut current = *record;
+        let mut seen = BTreeSet::new();
+        while let Some(parent_id) = current.revision_of.as_deref() {
+            if !seen.insert(current.review_id.as_str()) {
+                return Err(invalid("Цикл преемственности ревью в архиве learning"));
+            }
+            let parent = review_ids
+                .get(parent_id)
+                .ok_or_else(|| invalid("Преемственность ревью ссылается на отсутствующее ревью"))?;
+            if parent.repository_id != current.repository_id
+                || parent.base_sha != current.base_sha
+                || parent.merge_base_sha != current.merge_base_sha
+                || parent.workspace_variant != current.workspace_variant
+                || (current.trust == TrustLevel::AstAuthenticated
+                    && parent.trust != TrustLevel::AstAuthenticated)
+            {
+                return Err(invalid(
+                    "Преемственность ревью пересекает Git-случаи или границу доверия",
+                ));
+            }
+            current = parent;
+        }
+    }
+    Ok(())
+}
+
+/// Проверяет покрытие исходных решений, не выводя их из итогов единиц.
+fn verify_decisions(
+    archive: &LearningExport,
+    review_ids: &BTreeMap<&str, &ImportRecord>,
+) -> Result<(), DomainError> {
+    use crate::code_review::semantic_triage::{Disposition, ReasonCode};
+    let candidates: BTreeMap<(&str, &str), &ExportedCandidate> = archive
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                (
+                    candidate.review_id.as_str(),
+                    candidate.candidate_id.as_str(),
+                ),
+                candidate,
+            )
+        })
+        .collect();
+    let mut decision_ids = BTreeSet::new();
+    let mut covered_ids = BTreeSet::new();
+    for decision in &archive.decisions {
+        if decision.decision_id.trim().is_empty()
+            || !review_ids.contains_key(decision.review_id.as_str())
+            || !decision_ids.insert((decision.review_id.as_str(), decision.decision_id.as_str()))
+        {
+            return Err(invalid(
+                "Решение архива имеет пустой/повторный ID или отсутствующее ревью",
+            ));
+        }
+        if !matches!(decision.kind.as_str(), "individual" | "group")
+            || decision.candidate_count != decision.covered_candidate_ids.len()
+            || (decision.kind == "individual" && decision.candidate_count != 1)
+            || (decision.kind == "group" && decision.candidate_count < 2)
+        {
+            return Err(invalid(
+                "Вид или размер покрытия решения архива некорректен",
+            ));
+        }
+        serde_json::from_value::<Disposition>(serde_json::Value::String(
+            decision.disposition.clone(),
+        ))
+        .map_err(|_| invalid("Неизвестный семантический исход решения архива"))?;
+        serde_json::from_value::<ReasonCode>(serde_json::Value::String(
+            decision.reason_code.clone(),
+        ))
+        .map_err(|_| invalid("Неизвестная причина решения архива"))?;
+        if decision.explanation.trim().is_empty()
+            || decision.explanation.len() > super::import::MAX_STORED_TEXT_BYTES
+        {
+            return Err(invalid(
+                "Объяснение решения архива пусто или превышает предел хранения",
+            ));
+        }
+        for candidate_id in &decision.covered_candidate_ids {
+            let key = (decision.review_id.as_str(), candidate_id.as_str());
+            if !candidates.contains_key(&key) || !covered_ids.insert(key) {
+                return Err(invalid(
+                    "Решение архива покрывает отсутствующего или повторно покрытого кандидата",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -345,7 +524,13 @@ fn verify_search_cases(
             )));
         }
         if let Some(candidate_id) = case.candidate_id.as_deref()
-            && !candidates.contains(&(case.review_id.as_str(), candidate_id))
+            && (!candidates.contains(&(case.review_id.as_str(), candidate_id))
+                || (!case.unit_id.is_empty()
+                    && !archive.candidates.iter().any(|candidate| {
+                        candidate.review_id == case.review_id
+                            && candidate.unit_id == case.unit_id
+                            && candidate.candidate_id == candidate_id
+                    })))
         {
             return Err(invalid(format!(
                 "Поисковый случай архива ссылается на отсутствующего кандидата: {candidate_id}"
@@ -413,6 +598,11 @@ pub fn restore_history(
                 insert_candidate(write, candidate)?;
             }
         }
+        for decision in &archive.decisions {
+            if restored_ids.contains(decision.review_id.as_str()) {
+                insert_decision(write, decision)?;
+            }
+        }
         for finding in &archive.findings {
             if restored_ids.contains(finding.review_id.as_str()) {
                 insert_finding(write, finding, archive)?;
@@ -447,7 +637,7 @@ pub fn restore_history(
         for event in &archive.feedback_events {
             if restored_ids.contains(event.review_id.as_str()) {
                 write.execute(
-                    "INSERT OR REPLACE INTO learning_feedback (
+                    "INSERT INTO learning_feedback (
                         event_id, review_id, unit_id, candidate_id, kind, action,
                         supersedes_event_id, retracted_event_id, effective_disposition, usefulness,
                         explanation, provenance, recorded_at
@@ -500,6 +690,15 @@ pub fn restore_history(
         }
         for case in &archive.search {
             if restored_ids.contains(case.review_id.as_str()) {
+                let local_case: Option<String> = super::import::write_optional_row(
+                    write,
+                    "SELECT review_id FROM learning_search WHERE case_id = ?1",
+                    params![case.case_id],
+                    |row| row.get(0),
+                )?;
+                if local_case.is_some() {
+                    return Err(invalid("Поисковый case_id архива конфликтует с локальной историей"));
+                }
                 super::import::insert_search(
                     write,
                     &super::import::SearchRow {
@@ -517,6 +716,10 @@ pub fn restore_history(
                 )?;
             }
         }
+        // Проверяем объединённую историю до commit: глобальный event_id не
+        // должен молча заменить локальное событие другого ревью.
+        super::feedback::validate_event_history(&read_feedback(write.transaction())?)
+            .map_err(|error| invalid(error.message))?;
         Ok((restored, unchanged))
     })?;
     Ok(RestoreSummary {
@@ -529,6 +732,7 @@ pub fn restore_history(
             "Путь прежнего клона не требуется: архив содержит только repo-relative пути и Git identity."
                 .to_owned(),
             search_limitation(archive).to_owned(),
+            decisions_limitation(archive).to_owned(),
         ],
     })
 }
@@ -564,7 +768,7 @@ fn insert_record(
         "не удалось сериализовать счётчики наблюдений из архива",
     )?;
     write.execute(
-        "INSERT OR REPLACE INTO learning_import (
+        "INSERT INTO learning_import (
             review_id, repository_id, base_sha, head_sha, merge_base_sha, workspace_variant,
             workspace_label, review_pack_sha256, queue_sha256, triage_sha256,
             execution_result_sha256, review_schema_version, queue_schema_version,
@@ -647,6 +851,33 @@ fn insert_unit(
             surfaces,
             unit.signature(),
             feature_json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_decision(
+    write: &super::store::LearningWrite<'_>,
+    decision: &ExportedDecision,
+) -> Result<(), DomainError> {
+    let covered = super::import::serialize_json(
+        &decision.covered_candidate_ids,
+        "не удалось сериализовать покрытие решения из архива",
+    )?;
+    write.execute(
+        "INSERT INTO learning_decision (
+            review_id, decision_id, kind, disposition, reason_code, explanation,
+            candidate_count, covered_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            decision.review_id,
+            decision.decision_id,
+            decision.kind,
+            decision.disposition,
+            decision.reason_code,
+            decision.explanation,
+            decision.candidate_count as i64,
+            covered
         ],
     )?;
     Ok(())
@@ -743,6 +974,8 @@ fn payload_digest(archive: &LearningExport) -> Result<String, DomainError> {
         reviews: &'a [ImportRecord],
         units: &'a [ReviewUnitRecord],
         candidates: &'a [ExportedCandidate],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decisions: Option<&'a [ExportedDecision]>,
         findings: &'a [ExportedFinding],
         finding_links: &'a [ExportedFindingLink],
         case_links: &'a [ExportedCaseLink],
@@ -754,6 +987,8 @@ fn payload_digest(archive: &LearningExport) -> Result<String, DomainError> {
         reviews: &archive.reviews,
         units: &archive.units,
         candidates: &archive.candidates,
+        decisions: (archive.manifest.export_schema_version >= EXPORT_SCHEMA_VERSION)
+            .then_some(archive.decisions.as_slice()),
         findings: &archive.findings,
         finding_links: &archive.finding_links,
         case_links: &archive.case_links,
@@ -778,6 +1013,7 @@ fn read_tables(
         Vec<ImportRecord>,
         Vec<ReviewUnitRecord>,
         Vec<ExportedCandidate>,
+        Vec<ExportedDecision>,
         Vec<ExportedFinding>,
         Vec<ExportedFindingLink>,
         Vec<ExportedCaseLink>,
@@ -888,6 +1124,7 @@ fn read_tables(
     }
     let units = read_units(transaction)?;
     let candidates = read_candidates(transaction)?;
+    let decisions = read_decisions(transaction)?;
     let findings = read_findings(transaction)?;
     let finding_links = read_finding_links(transaction)?;
     let case_links = read_case_links(transaction)?;
@@ -926,6 +1163,7 @@ fn read_tables(
         reviews,
         units,
         candidates,
+        decisions,
         findings,
         finding_links,
         case_links,
@@ -942,6 +1180,59 @@ fn search_limitation(archive: &LearningExport) -> &'static str {
     } else {
         "Поисковые случаи переносятся вместе с архивом как есть, включая тексты объяснений ревьюера; индекс FTS5 пересобирается из них."
     }
+}
+
+/// Старые архивы не содержали learning_decision; потерю нельзя исправлять догадкой.
+fn decisions_limitation(archive: &LearningExport) -> &'static str {
+    if archive.manifest.export_schema_version < EXPORT_SCHEMA_VERSION {
+        "Архив версии 1–3 не содержит исходных semantic decisions и покрытых ID: решения не фабрикуются; подтверждённые структурные паттерны могут быть неполны до повторного импорта исходного triage."
+    } else {
+        "Исходные индивидуальные и групповые semantic decisions переносятся вместе с полным покрытием candidate IDs."
+    }
+}
+
+fn read_decisions(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<Vec<ExportedDecision>, DomainError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT review_id, decision_id, kind, disposition, reason_code, explanation,
+                candidate_count, covered_json
+         FROM learning_decision ORDER BY review_id ASC, decision_id ASC",
+        )
+        .map_err(|error| map_error(&error, "не удалось прочитать решения истории"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|error| map_error(&error, "не удалось прочитать решения истории"))?;
+    let mut decisions = Vec::new();
+    for row in rows {
+        let (review_id, decision_id, kind, disposition, reason_code, explanation, count, covered) =
+            row.map_err(|error| map_error(&error, "не удалось прочитать решение истории"))?;
+        let candidate_count = usize::try_from(count)
+            .map_err(|_| invalid("Некорректное число кандидатов в сохранённом решении"))?;
+        decisions.push(ExportedDecision {
+            review_id,
+            decision_id,
+            kind,
+            disposition,
+            reason_code,
+            explanation,
+            candidate_count,
+            covered_candidate_ids: parse_domain_json(&covered, "покрытие решения истории")?,
+        });
+    }
+    Ok(decisions)
 }
 
 fn read_units(
@@ -1136,6 +1427,19 @@ fn read_case_links(
 fn read_feedback(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<Vec<FeedbackEvent>, DomainError> {
+    let invalid_time: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM learning_feedback WHERE recorded_at < 0)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| map_error(&error, "не удалось проверить время событий обратной связи"))?;
+    if invalid_time {
+        return Err(DomainError::new(
+            ErrorCode::LearningCorrupt,
+            "История обратной связи содержит отрицательное recorded_at",
+        ));
+    }
     let mut statement = transaction
         .prepare(
             "SELECT event_id, review_id, unit_id, candidate_id, kind, action,
@@ -1228,6 +1532,7 @@ mod tests {
             reviews: Vec::new(),
             units: Vec::new(),
             candidates: vec![candidate_with_path(path)],
+            decisions: Vec::new(),
             findings: Vec::new(),
             finding_links: Vec::new(),
             case_links: Vec::new(),

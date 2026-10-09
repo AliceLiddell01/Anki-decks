@@ -44,6 +44,9 @@ pub struct LoadedReview {
 /// Дополнительная identity входов, которую можно передать вместе с загрузкой.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportInputsHint {
+    /// Корень Git, использованный доверенной проверкой входа. Не переносится
+    /// в архив и не участвует в identity; нужен только для доказательства ancestry.
+    pub repository_root: Option<std::path::PathBuf>,
     /// SHA-256 точных байтов `result.json` завершённого задания.
     pub execution_result_sha256: Option<String>,
     /// Версия схемы результата изолированной проверки.
@@ -75,6 +78,36 @@ pub struct ImportRequest {
     pub workspace_label: Option<String>,
 }
 
+/// Проверяет параметры импорта до открытия или создания базы.
+///
+/// Загруженный документ содержит уже проверенные значения и digest точных
+/// байтов. Эта проверка не перечитывает пути и не создаёт окно между проверкой
+/// входа и импортом: запись использует тот же `LoadedReview`.
+pub fn validate_import_request(
+    loaded: &LoadedReview,
+    request: &ImportRequest,
+) -> Result<(), DomainError> {
+    let variant = normalize_variant(&request.workspace_variant)?;
+    if let Some(declared) = loaded.inputs_hint.workspace_variant.as_deref()
+        && declared != variant
+    {
+        return Err(DomainError::new(
+            ErrorCode::BaselineMismatch,
+            "result.json изолированной проверки относится к другому варианту рабочего пространства",
+        ));
+    }
+    verify_declared_source(&loaded.queue, &loaded.review_pack_sha256)?;
+    if let Some((triage, _)) = loaded.triage.as_ref() {
+        verify_triage_identity(triage, &loaded.pack, &loaded.review_pack_sha256)?;
+        crate::code_review::semantic_triage::validate(
+            triage,
+            &loaded.pack,
+            &loaded.review_pack_sha256,
+        )?;
+    }
+    Ok(())
+}
+
 /// Импортирует проверенный набор свидетельств в локальную историю.
 ///
 /// Повторный импорт того же exact source не удваивает ни случаи, ни статистику:
@@ -86,15 +119,8 @@ pub fn import_history(
     loaded: &LoadedReview,
     request: &ImportRequest,
 ) -> Result<ImportRecord, DomainError> {
+    validate_import_request(loaded, request)?;
     let variant = normalize_variant(&request.workspace_variant)?;
-    if let Some(declared) = loaded.inputs_hint.workspace_variant.as_deref()
-        && declared != variant
-    {
-        return Err(DomainError::new(
-            ErrorCode::BaselineMismatch,
-            "result.json изолированной проверки относится к другому варианту рабочего пространства",
-        ));
-    }
     let inputs = inputs_of(loaded)?;
     let outcome = outcome_of(loaded);
     let identity_key = identity_key(loaded, &variant);
@@ -128,9 +154,17 @@ pub fn import_history(
         if let Some(record) = existing {
             return Ok(record);
         }
-        let previous = previous_head(write, &identity_key, &review_id, loaded.trust)?;
+        let previous = previous_head(write, &identity_key, &review_id, loaded, &variant)?;
         let revision = next_revision(write)?;
         let mut limitations = loaded.limitations.clone();
+        let truncated_findings = loaded.triage.as_ref().map_or(0, |(triage, _)| {
+            triage.findings.iter().filter(|finding| finding_evidence_may_be_truncated(finding)).count()
+        });
+        if truncated_findings > 0 {
+            limitations.push(format!(
+                "У {truncated_findings} замечаний title/description превышает предел {MAX_STORED_TEXT_BYTES} байт: сохраняется ограниченный текст; полное свидетельство сверяется по исходному triage digest. Такие замечания не связываются автоматически как повторные случаи."
+            ));
+        }
         if let Some(previous_id) = previous.as_deref() {
             limitations.push(format!(
                 "Запись является аудируемой ревизией ранее импортированного ревью {previous_id}: прежняя запись сохранена и помечена как вытесненная."
@@ -182,6 +216,7 @@ pub fn import_with_outcome(
     loaded: &LoadedReview,
     request: &ImportRequest,
 ) -> Result<ImportOutcome, DomainError> {
+    validate_import_request(loaded, request)?;
     let variant = normalize_variant(&request.workspace_variant)?;
     let inputs = inputs_of(loaded)?;
     let identity_key = identity_key(loaded, &variant);
@@ -517,10 +552,16 @@ pub fn classifier_digest(
     pack: &crate::code_review::model::ReviewPack,
     queue: &crate::code_review::review_queue::ReviewQueue,
 ) -> String {
-    let mut entries = [
+    let mut entries = vec![
         format!("review_schema={}", pack.schema_version),
         format!("queue_schema={}", queue.schema_version),
     ];
+    // Старые очереди не объявляли версию правил. Их прежний digest сохраняется
+    // для совместимого чтения; он отличается от всех явно версионированных
+    // очередей и не объявляет старые признаки текущей классификацией.
+    if let Some(version) = queue.classifier_rules_version {
+        entries.push(format!("classifier_rules={version}"));
+    }
     entries.sort();
     sha256_hex(entries.join("\n").as_bytes())
 }
@@ -603,6 +644,9 @@ fn review_id(loaded: &LoadedReview, variant: &str) -> String {
     format!("review-{}", &digest[..32])
 }
 
+/// Формула раннего формата истории: trust ещё не входил в review_id.
+/// Для очереди без версии правил воспроизводится и прежний digest схем.
+/// Старая запись остаётся аудируемой; lookup никогда не повышает её доверие.
 fn legacy_review_id(loaded: &LoadedReview, variant: &str) -> String {
     let target = &loaded.pack.target;
     let digest = sha256_hex(
@@ -711,35 +755,71 @@ fn show_import_in_write(
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать запись истории"))
 }
 
-/// Предыдущая не вытесненная запись той же identity и того же доверия.
-/// Карантин и доверенная история ведут отдельные ревизионные цепочки.
+/// Предыдущая не вытесненная запись той же доказанной линии наблюдения.
+/// Один диапазон допускает ревизию свидетельств. Изменение head требует
+/// доказанного Git ancestry при совпадающей базе, варианте и анализаторах.
+/// Общая база у независимых sibling-веток не является таким доказательством.
 fn previous_head(
     read: &super::store::LearningWrite<'_>,
     identity_key: &str,
     review_id: &str,
-    trust: TrustLevel,
+    loaded: &LoadedReview,
+    variant: &str,
 ) -> Result<Option<String>, DomainError> {
+    let target = &loaded.pack.target;
     let mut statement = read
         .transaction()
         .prepare(
-            "SELECT review_id FROM learning_import
-             WHERE identity_key = ?1 AND review_id <> ?2 AND superseded_by IS NULL AND trust = ?3
-             ORDER BY revision DESC LIMIT 1",
+            "SELECT review_id, identity_key, head_sha FROM learning_import
+             WHERE review_id <> ?1 AND superseded_by IS NULL AND trust = ?2
+               AND repository_id = ?3 AND base_sha = ?4 AND merge_base_sha = ?5
+               AND workspace_variant = ?6 AND analyzer_digest = ?7
+             ORDER BY revision DESC, review_id ASC",
         )
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
-    let mut rows = statement
-        .query(params![identity_key, review_id, trust.as_str()])
+    let rows = statement
+        .query_map(
+            params![
+                review_id,
+                loaded.trust.as_str(),
+                target.repository_id,
+                target.base_sha,
+                target.merge_base_sha,
+                variant,
+                analyzer_digest(&loaded.pack),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
-    match rows
-        .next()
-        .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?
-    {
-        Some(row) => row
-            .get::<_, String>(0)
-            .map(Some)
-            .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии")),
-        None => Ok(None),
+    for row in rows {
+        let (prior_id, prior_identity, prior_head) =
+            row.map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
+        if prior_identity == identity_key {
+            return Ok(Some(prior_id));
+        }
+        if loaded.trust.participates_in_learning()
+            && loaded
+                .inputs_hint
+                .repository_root
+                .as_deref()
+                .is_some_and(|root| {
+                    std::process::Command::new("git")
+                        .current_dir(root)
+                        .args(["merge-base", "--is-ancestor", &prior_head, &target.head_sha])
+                        .output()
+                        .is_ok_and(|output| output.status.success())
+                })
+        {
+            return Ok(Some(prior_id));
+        }
     }
+    Ok(None)
 }
 
 fn next_revision(read: &super::store::LearningWrite<'_>) -> Result<u64, DomainError> {
@@ -918,6 +998,7 @@ fn write_units(
     review_id: &str,
 ) -> Result<(), DomainError> {
     let dispositions = decision_index(loaded);
+    let classifier = classifier_digest(&loaded.pack, &loaded.queue);
     for unit in &loaded.queue.units {
         let kind = if unit.is_group() {
             ReviewUnitKind::Group
@@ -929,7 +1010,7 @@ fn write_units(
             .iter()
             .find_map(|id| dispositions.get(id.as_str()).cloned())
             .unwrap_or((None, None));
-        let features = super::patterns::unit_features(&unit.signature);
+        let features = super::patterns::unit_features_with_classifier(&unit.signature, &classifier);
         let representatives = serialize_json(
             unit.representative_candidate_ids(),
             "не удалось сериализовать представителей единицы",
@@ -1115,13 +1196,27 @@ fn write_findings(
     };
     let owner = unit_of_candidate(loaded);
     let features = unit_features_by_candidate(loaded);
+    let evidence: BTreeMap<String, String> = loaded
+        .pack
+        .all_candidates()
+        .into_iter()
+        .map(|candidate| {
+            let location = serde_json::json!({
+                "path": sanitize_path(&candidate.path),
+                "line": candidate.line,
+                "column": candidate.column,
+                "snippet": candidate.snippet,
+            });
+            (candidate.id.clone(), location.to_string())
+        })
+        .collect();
     for finding in &triage.findings {
         let units: BTreeSet<String> = finding
             .candidate_ids
             .iter()
             .filter_map(|id| owner.get(id.as_str()).map(|unit| (*unit).to_owned()))
             .collect();
-        let signature = finding_signature(finding, &features);
+        let signature = finding_signature(finding, &features, &evidence);
         let linked_units = serialize_json(
             &units,
             "не удалось сериализовать связанные единицы замечания",
@@ -1155,15 +1250,11 @@ fn write_findings(
 
 /// Точный ключ признаков связанных единиц для структурного сопоставления.
 fn unit_features_by_candidate(loaded: &LoadedReview) -> BTreeMap<&str, String> {
-    let dispositions = decision_index(loaded);
     let mut features = BTreeMap::new();
+    let classifier = classifier_digest(&loaded.pack, &loaded.queue);
     for unit in &loaded.queue.units {
-        let (_disposition, _) = unit
-            .candidate_ids()
-            .iter()
-            .find_map(|id| dispositions.get(id.as_str()).cloned())
-            .unwrap_or((None, None));
-        let unit_features = super::patterns::unit_features(&unit.signature);
+        let unit_features =
+            super::patterns::unit_features_with_classifier(&unit.signature, &classifier);
         let signature = super::patterns::feature_signature(&unit_features);
         for id in unit.candidate_ids() {
             features.insert(id.as_str(), signature.clone());
@@ -1172,9 +1263,16 @@ fn unit_features_by_candidate(loaded: &LoadedReview) -> BTreeMap<&str, String> {
     features
 }
 
+fn finding_evidence_may_be_truncated(
+    finding: &crate::code_review::semantic_triage::SemanticFinding,
+) -> bool {
+    finding.title.len() > MAX_STORED_TEXT_BYTES || finding.description.len() > MAX_STORED_TEXT_BYTES
+}
+
 fn finding_signature(
     finding: &crate::code_review::semantic_triage::SemanticFinding,
     features: &BTreeMap<&str, String>,
+    evidence: &BTreeMap<String, String>,
 ) -> String {
     let mut unit_signatures: Vec<&str> = finding
         .candidate_ids
@@ -1183,15 +1281,32 @@ fn finding_signature(
         .collect();
     unit_signatures.sort_unstable();
     unit_signatures.dedup();
-    sha256_hex(
-        format!(
-            "{}\n{}\n{}",
-            finding.severity.as_str(),
-            finding.provenance.as_str(),
-            unit_signatures.join(",")
-        )
-        .as_bytes(),
-    )
+    let mut locations: Vec<&str> = finding
+        .candidate_ids
+        .iter()
+        .filter_map(|id| evidence.get(id.as_str()).map(String::as_str))
+        .collect();
+    locations.sort_unstable();
+    locations.dedup();
+    // Структурный класс сам по себе не доказывает повтор замечания. Ключ
+    // включает полное свидетельство ревьюера до ограничения поискового текста
+    // и точные места связанных кандидатов. Независимому замечанию произвольная
+    // привязка к кандидату не требуется: его свидетельство — title/description.
+    let identity = serde_json::json!({
+        "signature_version": 2,
+        "severity": finding.severity.as_str(),
+        "provenance": finding.provenance.as_str(),
+        "title": finding.title,
+        "description": finding.description,
+        "unit_signatures": unit_signatures,
+        "candidate_evidence": locations,
+    });
+    let prefix = if finding_evidence_may_be_truncated(finding) {
+        "finding-incomplete-v2"
+    } else {
+        "finding-v2"
+    };
+    format!("{prefix}-{}", sha256_hex(identity.to_string().as_bytes()))
 }
 
 fn write_search(
@@ -1421,14 +1536,20 @@ fn write_case_links(
     drop(statement);
     let current = current_findings(write, review_id)?;
     for (finding_id, signature) in &current {
+        // Старый структурный ключ и усечённое свидетельство не дают достаточно
+        // доказательств для автоматической связи повторного случая.
+        if !signature.starts_with("finding-v2-") {
+            continue;
+        }
         for (prior_review, prior_finding, prior_signature, prior_head, prior_base) in &prior {
             if prior_signature != signature {
                 continue;
             }
-            let (kind, basis) = if prior_head == &target.head_sha {
+            let (kind, basis) = if prior_head == &target.head_sha && prior_base == &target.base_sha
+            {
                 (
                     CaseLinkKind::SameIteration,
-                    "совпадает точный ключ структурных признаков и один и тот же head: повторное чтение неизменного случая",
+                    "совпадают полные свидетельства ревьюера, места кандидатов и точный Git-диапазон: повторное наблюдение свидетельства",
                 )
             } else if prior_base == &target.base_sha
                 || prior_head == &target.base_sha
@@ -1436,7 +1557,7 @@ fn write_case_links(
             {
                 (
                     CaseLinkKind::StructuralRepeat,
-                    "совпадает точный ключ структурных признаков и связана история версий одного диапазона: тот же структурный дефект в другой версии",
+                    "совпадают полные свидетельства ревьюера и места кандидатов в сопоставимых Git-диапазонах; связь отражает повтор свидетельства, а не доказанную идентичность дефекта",
                 )
             } else {
                 (CaseLinkKind::Unknown, "связь истории версий не доказана")
@@ -1682,7 +1803,14 @@ pub fn load_review(
         triage,
         trust,
         limitations,
-        inputs_hint: ImportInputsHint::default(),
+        inputs_hint: ImportInputsHint {
+            repository_root: if trust.participates_in_learning() {
+                std::env::current_dir().ok()
+            } else {
+                None
+            },
+            ..ImportInputsHint::default()
+        },
     })
 }
 
@@ -1771,6 +1899,7 @@ pub fn load_review_with_execution(
         ));
     }
     loaded.inputs_hint = ImportInputsHint {
+        repository_root: loaded.inputs_hint.repository_root.clone(),
         execution_result_sha256: Some(sha256_hex(&bytes)),
         execution_schema_version: Some(result.schema_version),
         execution_evidence: Some(ExecutionEvidenceSummary::from_result(&result)),

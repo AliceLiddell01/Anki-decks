@@ -6,7 +6,7 @@
 //! embeddings и внешних индексов. Все запросы параметризованы: сохранённый текст
 //! остаётся данными и никогда не превращается в SQL или команду.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -177,6 +177,7 @@ pub fn search_history(
         .as_deref()
         .is_some_and(|text| !text.trim().is_empty());
     store.read(|read| {
+        let dispositions = super::feedback::effective_revision_dispositions(read)?;
         let fts5_used = text_present
             && query
                 .text
@@ -191,7 +192,7 @@ pub fn search_history(
             text_hits = text_matches(read, query, fts5_used)?;
         }
         if structural || !text_present {
-            structural_hits = structural_matches(read, query)?;
+            structural_hits = structural_matches(read, query, &dispositions)?;
         }
         let mut cases: Vec<String> = match (text_present, structural) {
             (true, true) => text_hits.intersection(&structural_hits).cloned().collect(),
@@ -215,7 +216,7 @@ pub fn search_history(
             } else {
                 SearchMatchKind::Thematic
             };
-            if let Some(case) = load_case(read, case_id, kind)? {
+            if let Some(case) = load_case(read, case_id, kind, &dispositions)? {
                 results.push(case);
             }
         }
@@ -332,28 +333,27 @@ fn fts_query(text: &str) -> String {
 fn structural_matches(
     read: &super::store::LearningRead<'_>,
     query: &SearchQuery,
+    dispositions: &BTreeMap<(String, String), Option<String>>,
 ) -> Result<BTreeSet<String>, DomainError> {
     let mut statement = read
         .transaction()
         .prepare(
-            "SELECT s.case_id
+            "SELECT s.case_id, s.review_id, s.unit_id, s.disposition
              FROM learning_search AS s
              JOIN learning_import AS i ON i.review_id = s.review_id
              LEFT JOIN learning_unit AS u ON u.review_id = s.review_id AND u.unit_id = s.unit_id
              LEFT JOIN learning_candidate AS c
                 ON c.review_id = s.review_id AND c.candidate_id = s.candidate_id
-             LEFT JOIN learning_finding AS f
-                ON f.review_id = s.review_id AND f.finding_id = s.finding_id
+                   AND c.unit_id = s.unit_id
              WHERE (?1 IS NULL OR u.detector = ?1)
                AND (?2 IS NULL OR c.execution = ?2)
                AND (?3 IS NULL OR c.origin = ?3)
                AND (?4 IS NULL OR u.role = ?4)
                AND (?5 IS NULL OR u.code_role = ?5)
-               AND (?6 IS NULL OR s.disposition = ?6)
-               AND (?7 IS NULL OR s.provenance = ?7)
-               AND (?8 IS NULL OR s.severity = ?8)
-               AND (?9 IS NULL OR i.repository_id = ?9)
-               AND (?10 = 1 OR i.trust = 'ast_authenticated')",
+               AND (?6 IS NULL OR s.provenance = ?6)
+               AND (?7 IS NULL OR s.severity = ?7)
+               AND (?8 IS NULL OR i.repository_id = ?8)
+               AND (?9 = 1 OR i.trust = 'ast_authenticated')",
         )
         .map_err(|error| map_error(&error, "не удалось подготовить структурный поиск"))?;
     let rows = statement
@@ -364,20 +364,33 @@ fn structural_matches(
                 query.origin,
                 query.role,
                 query.code_role,
-                query.disposition,
                 query.provenance,
                 query.severity,
                 query.repository_id,
                 i64::from(query.include_quarantine),
             ],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         )
         .map_err(|error| map_error(&error, "не удалось выполнить структурный поиск"))?;
     let mut hits = BTreeSet::new();
     for row in rows {
-        hits.insert(
-            row.map_err(|error| map_error(&error, "не удалось выполнить структурный поиск"))?,
-        );
+        let (case_id, review_id, unit_id, original) =
+            row.map_err(|error| map_error(&error, "не удалось выполнить структурный поиск"))?;
+        let disposition = dispositions.get(&(review_id, unit_id)).unwrap_or(&original);
+        if query
+            .disposition
+            .as_ref()
+            .is_none_or(|filter| disposition.as_ref() == Some(filter))
+        {
+            hits.insert(case_id);
+        }
     }
     Ok(hits)
 }
@@ -386,6 +399,7 @@ fn load_case(
     read: &super::store::LearningRead<'_>,
     case_id: &str,
     match_kind: SearchMatchKind,
+    dispositions: &BTreeMap<(String, String), Option<String>>,
 ) -> Result<Option<SearchCase>, DomainError> {
     read.transaction()
         .query_row(
@@ -395,26 +409,31 @@ fn load_case(
              FROM learning_search AS s
              JOIN learning_import AS i ON i.review_id = s.review_id
              LEFT JOIN learning_unit AS u ON u.review_id = s.review_id AND u.unit_id = s.unit_id
-             LEFT JOIN learning_finding AS f
-                ON f.review_id = s.review_id AND f.finding_id = s.finding_id
              LEFT JOIN learning_candidate AS c
                 ON c.review_id = s.review_id AND c.candidate_id = s.candidate_id
+                   AND c.unit_id = s.unit_id
              WHERE s.case_id = ?1",
             params![case_id],
             |row| {
                 let text: String = row.get(6)?;
                 let repository: String = row.get(7)?;
                 let head: String = row.get(8)?;
+                let review_id: String = row.get(1)?;
+                let unit_id: String = row.get(2)?;
+                let original: Option<String> = row.get(10)?;
+                let disposition = dispositions.get(&(review_id.clone(), unit_id.clone()))
+                    .cloned().unwrap_or(original);
+                let unit_id = (!unit_id.is_empty()).then_some(unit_id);
                 Ok(SearchCase {
                     case_id: row.get(0)?,
-                    review_id: row.get(1)?,
-                    unit_id: row.get(2)?,
+                    review_id,
+                    unit_id,
                     candidate_id: row.get(3)?,
                     finding_id: row.get(4)?,
                     kind: row.get(5)?,
                     match_kind,
                     snippet: compact_snippet(&text),
-                    disposition: row.get(10)?,
+                    disposition,
                     provenance: row.get(11)?,
                     severity: row.get(12)?,
                     detector: row.get(13)?,

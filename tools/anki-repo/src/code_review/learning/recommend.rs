@@ -12,14 +12,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::error::DomainError;
+use crate::error::{DomainError, ErrorCode};
 
 use super::import::LoadedReview;
 use super::model::{
     CaseRef, HistoryGeneration, Recommendation, Recommendations, SupportLevel, SupportSummary,
     TrustLevel,
 };
-use super::patterns::{evidence_for_signatures, feature_signature, unit_features};
+use super::patterns::{evidence_for_signatures, feature_signature, unit_features_with_classifier};
 use super::store::LearningStore;
 use super::{LEARNING_POLICY_VERSION, ROOT_WORKSPACE_VARIANT};
 
@@ -105,6 +105,10 @@ pub struct RecommendRequest {
     pub case_limit: usize,
     /// Опорное время в секундах Unix для оценки свежести истории.
     pub now: u64,
+    /// Ожидаемая ревизия проверяется внутри снимка, из которого строятся подсказки.
+    pub history_revision: Option<u64>,
+    /// Требовать непустую доверенную историю в том же снимке.
+    pub require_history: bool,
 }
 
 impl Default for RecommendRequest {
@@ -115,6 +119,8 @@ impl Default for RecommendRequest {
             limit: 50,
             case_limit: 3,
             now: 0,
+            history_revision: None,
+            require_history: false,
         }
     }
 }
@@ -130,71 +136,67 @@ pub fn recommend(
     request: &RecommendRequest,
 ) -> Result<Recommendations, DomainError> {
     let variant = super::import::normalize_variant(&request.workspace_variant)?;
-    let (generation, limitations, learning_disabled, history_reference_time) = match store {
-        Some(store) => {
-            let (generation, history_reference_time) = store.read(|read| {
-                let generation = super::import::generation_of(read)?;
-                let imported_at: i64 = read
-                    .transaction()
-                    .query_row(
-                        "SELECT COALESCE(MAX(imported_at), 0)
-                         FROM learning_import WHERE trust = 'ast_authenticated'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| {
-                        super::store::map_error(
-                            &error,
-                            "не удалось прочитать опорное время истории",
-                        )
-                    })?;
-                Ok((
-                    generation,
-                    u64::try_from(imported_at.max(0)).unwrap_or(u64::MAX),
-                ))
-            })?;
-            (
-                generation,
-                Vec::new(),
-                !loaded.trust.participates_in_learning(),
-                history_reference_time,
-            )
-        }
-        None => (
-            HistoryGeneration {
-                revision: 0,
-                trusted_reviews: 0,
-                quarantined_reviews: 0,
-                trusted_units: 0,
-            },
-            vec!["Обычный режим без learning: рекомендации не опираются на историю.".to_owned()],
-            true,
-            0,
-        ),
-    };
-    let now = if request.now == 0 {
-        history_reference_time
-    } else {
-        request.now
-    };
+    let classifier_compatibility = super::import::classifier_digest(&loaded.pack, &loaded.queue);
     let case_limit = request.case_limit.max(1);
     let signatures: BTreeSet<String> = loaded
         .queue
         .units
         .iter()
-        .map(|unit| feature_signature(&unit_features(&unit.signature)))
+        .map(|unit| {
+            feature_signature(&unit_features_with_classifier(
+                &unit.signature,
+                &classifier_compatibility,
+            ))
+        })
         .collect();
-    let evidence_by_signature = if learning_disabled {
-        BTreeMap::new()
-    } else if let Some(store) = store {
-        evidence_for_signatures(store, &signatures, case_limit, now)?
-    } else {
-        BTreeMap::new()
+    let learning_disabled = store.is_none() || !loaded.trust.participates_in_learning();
+    let (generation, evidence_by_signature, limitations) = match store {
+        Some(store) => store.read(|read| {
+            let generation = super::import::generation_of(read)?;
+            require_generation(Some(&generation), request)?;
+            let imported_at: i64 = read
+                .transaction()
+                .query_row(
+                    "SELECT COALESCE(MAX(imported_at), 0)
+                 FROM learning_import WHERE trust = 'ast_authenticated'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    super::store::map_error(&error, "не удалось прочитать опорное время истории")
+                })?;
+            let now = if request.now == 0 {
+                u64::try_from(imported_at.max(0)).unwrap_or(u64::MAX)
+            } else {
+                request.now
+            };
+            let evidence = if learning_disabled {
+                BTreeMap::new()
+            } else {
+                evidence_for_signatures(read, &signatures, case_limit, now)?
+            };
+            Ok((generation, evidence, Vec::new()))
+        })?,
+        None => {
+            require_generation(None, request)?;
+            (
+                HistoryGeneration {
+                    revision: 0,
+                    trusted_reviews: 0,
+                    quarantined_reviews: 0,
+                    trusted_units: 0,
+                },
+                BTreeMap::new(),
+                vec![
+                    "Обычный режим без learning: рекомендации не опираются на историю.".to_owned(),
+                ],
+            )
+        }
     };
     let mut recommendations = Vec::new();
     let mut order: Vec<RecommendationOrderKey> = Vec::new();
     for (queue_index, unit) in loaded.queue.units.iter().enumerate() {
-        let features = unit_features(&unit.signature);
+        let features = unit_features_with_classifier(&unit.signature, &classifier_compatibility);
         let signature = feature_signature(&features);
         let is_group = unit.is_group();
         let (support, cases, repeats) = if learning_disabled {
@@ -328,6 +330,48 @@ pub fn recommend(
     })
 }
 
+/// Проверяет ограничения запроса по поколению, прочитанному в текущем снимке.
+fn require_generation(
+    generation: Option<&HistoryGeneration>,
+    request: &RecommendRequest,
+) -> Result<(), DomainError> {
+    if let Some(expected) = request.history_revision {
+        let actual = generation.ok_or_else(|| {
+            DomainError::with_details(
+                ErrorCode::SourceChanged,
+                "Ожидалась конкретная ревизия истории learning, но история недоступна",
+                crate::details! { "expected_revision" => expected },
+            )
+        })?;
+        if actual.revision != expected {
+            return Err(DomainError::with_details(
+                ErrorCode::SourceChanged,
+                format!(
+                    "Ожидалась ревизия истории {expected}, действующая — {}",
+                    actual.revision
+                ),
+                crate::details! { "expected_revision" => expected, "actual_revision" => actual.revision },
+            ));
+        }
+    }
+    if request.require_history {
+        let actual = generation.ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::NotFound,
+                "Проверенная история learning недоступна, а она требуется явно",
+            )
+        })?;
+        if actual.trusted_units == 0 {
+            return Err(DomainError::with_details(
+                ErrorCode::InsufficientEvidence,
+                "Проверенная история пуста: рекомендации не могут опираться на накопленные случаи",
+                crate::details! { "trusted_units" => actual.trusted_units },
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Уровень приоритета подсказки: меньше — раньше.
 fn support_rank(support: Option<&SupportSummary>, granularity: &str) -> u8 {
     match (support, granularity) {
@@ -360,7 +404,7 @@ fn reason_for(
 ) -> String {
     let base = match granularity {
         "look_for_related_finding" => {
-            "В истории есть связанный повтор того же структурного дефекта: сначала проверьте, не повторяется ли он в этом снимке."
+            "В истории есть структурно похожий случай: проверьте его контекст и возможную аналогию в этом снимке. Структурная схожесть не доказывает повтор той же ошибки."
         }
         "inspect_each_candidate" => {
             "По этим структурным признакам есть достаточная поддержка истории: представителей можно использовать для навигации, но проверьте каждого кандидата; сходство не доказывает семантическую однородность."
@@ -378,7 +422,7 @@ fn reason_for(
     let mut reason = base.to_owned();
     if let Some(summary) = support {
         reason.push_str(&format!(
-            " Поддержка: независимых единиц {}, записей {}, unresolved {}.",
+            " Поддержка: независимых единиц {}, записей {}, без решения {}.",
             summary.support_units, summary.support_reviews, summary.unresolved_units
         ));
     }

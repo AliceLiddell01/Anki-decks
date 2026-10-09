@@ -62,6 +62,12 @@ pub struct Rendered {
 
 const LANGUAGE_CHECK_SAMPLE_LIMIT: usize = 20;
 
+/// Предел входного переносимого архива learning: 256 MiB.
+///
+/// Архив хранит много ревью и ограниченные текстовые свидетельства; этот предел
+/// допускает сотни тысяч компактных записей и ограничивает память до декодирования.
+pub const MAX_LEARNING_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Serialize)]
 struct LanguageCheckOutput {
     summary: Option<LanguageSummary>,
@@ -2428,7 +2434,6 @@ mod learning_cli {
             ));
         }
         let variant = crate::code_review::learning::workspace_variant(options.variant)?;
-        let store = LearningStore::open(database_options(root, db, true)?)?;
         let loaded = import::load_review_with_execution(
             options.pack,
             options.queue,
@@ -2440,6 +2445,10 @@ mod learning_cli {
             workspace_variant: variant,
             workspace_label: options.label.map(str::to_owned),
         };
+        // Импорт использует эти проверенные значения и digest, не перечитывая
+        // пути после открытия базы: неверный вход не создаёт SQLite/каталог.
+        import::validate_import_request(&loaded, &request)?;
+        let store = LearningStore::open(database_options(root, db, true)?)?;
         import::import_with_outcome(&store, &loaded, &request)
     }
 
@@ -2600,53 +2609,6 @@ mod learning_cli {
         } else {
             open_optional(root, db)?
         };
-        let history = match store.as_ref() {
-            Some(store) => Some(import::generation(store)?),
-            None => None,
-        };
-        if let Some(expected) = options.history_revision {
-            let actual = history.as_ref().ok_or_else(|| {
-                DomainError::with_details(
-                    ErrorCode::SourceChanged,
-                    "Ожидалась конкретная ревизия истории learning, но история недоступна",
-                    crate::details! { "expected_revision" => expected },
-                )
-            })?;
-            if actual.revision != expected {
-                return Err(DomainError::with_details(
-                    ErrorCode::SourceChanged,
-                    format!(
-                        "Ожидалась ревизия истории {expected}, действующая — {}",
-                        actual.revision
-                    ),
-                    crate::details! {
-                        "expected_revision" => expected,
-                        "actual_revision" => actual.revision,
-                    },
-                ));
-            }
-        }
-        if options.require_history {
-            match history.as_ref() {
-                None => {
-                    return Err(DomainError::with_details(
-                        ErrorCode::NotFound,
-                        "Проверенная история learning недоступна, а она требуется явно",
-                        crate::details! {
-                            "database" => database_options(root, db, false)?.display_path,
-                        },
-                    ));
-                }
-                Some(actual) if actual.trusted_units == 0 => {
-                    return Err(DomainError::with_details(
-                        ErrorCode::InsufficientEvidence,
-                        "Проверенная история пуста: рекомендации не могут опираться на накопленные случаи",
-                        crate::details! { "trusted_units" => actual.trusted_units },
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
         let loaded = import::load_review(
             options.pack,
             options.queue,
@@ -2659,6 +2621,8 @@ mod learning_cli {
             limit: options.limit,
             case_limit: options.case_limit,
             now: 0,
+            history_revision: options.history_revision,
+            require_history: options.require_history,
         };
         let document = recommend::recommend(store.as_ref(), &loaded, &request)?;
         let mut output = RecommendOutput::from_document(&document, loaded.queue.units.len());
@@ -2763,7 +2727,7 @@ mod learning_cli {
         db: Option<&Path>,
         options: &FeedbackRecordOptions<'_>,
     ) -> Result<FeedbackResult, DomainError> {
-        let store = LearningStore::open(database_options(root, db, true)?)?;
+        let store = open_required(root, db)?;
         let kind = match options.kind {
             LearningFeedbackKindArg::Usefulness => FeedbackKind::RecommendationUsefulness,
             LearningFeedbackKindArg::SemanticOutcomeRevision => {
@@ -2874,17 +2838,87 @@ mod learning_cli {
         })
     }
 
+    /// Читает один открытый файл с запасным байтом для обнаружения превышения.
+    /// Metadata даёт быстрый отказ, но take ограничивает и выросший после него файл.
+    fn read_learning_archive(path: &Path, max_bytes: usize) -> Result<Vec<u8>, DomainError> {
+        let file = fs::File::open(path).map_err(|error| {
+            super::document_read_error("архив learning", &path.display().to_string(), &error)
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            super::document_read_error("архив learning", &path.display().to_string(), &error)
+        })?;
+        if metadata.len() > max_bytes as u64 {
+            return Err(archive_too_large(max_bytes));
+        }
+        read_learning_archive_bytes(file, max_bytes)
+    }
+
+    fn read_learning_archive_bytes<R: std::io::Read>(
+        reader: R,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, DomainError> {
+        let bytes = super::read_bounded(reader, super::document_read_limit(max_bytes)).map_err(
+            |error| super::document_read_error("архив learning", "открытый файл", &error),
+        )?;
+        if bytes.len() > max_bytes {
+            return Err(archive_too_large(max_bytes));
+        }
+        Ok(bytes)
+    }
+
+    fn archive_too_large(max_bytes: usize) -> DomainError {
+        DomainError::with_details(
+            ErrorCode::LearningExportInvalid,
+            format!("Размер входного архива learning превышает предел {max_bytes} байт"),
+            crate::details! { "reason" => "archive_too_large", "max_bytes" => max_bytes },
+        )
+    }
+
+    #[cfg(test)]
+    mod archive_read_tests {
+        use super::*;
+
+        #[test]
+        fn valid_archive_at_read_limit_is_preserved() {
+            let workspace =
+                asset_store::temp_workspace::TempWorkspace::create("learning-archive-boundary")
+                    .unwrap();
+            let store =
+                LearningStore::open(StoreOptions::at(workspace.path().join("state.sqlite")))
+                    .unwrap();
+            let archive = transfer::export_history(&store).unwrap().archive;
+            let mut source = serde_json::to_vec(&archive).unwrap();
+            let limit = source.len() + 32;
+            source.resize(limit, b' ');
+            let path = workspace.path().join("archive.json");
+            fs::write(&path, &source).unwrap();
+            let bytes = read_learning_archive(&path, limit).unwrap();
+            assert_eq!(bytes, source);
+            let decoded: LearningExport = serde_json::from_slice(&bytes).unwrap();
+            transfer::verify_export(&decoded).unwrap();
+            source.push(b' ');
+            fs::write(&path, &source).unwrap();
+            assert_eq!(
+                read_learning_archive(&path, limit).unwrap_err().code,
+                ErrorCode::LearningExportInvalid,
+            );
+        }
+
+        #[test]
+        fn reader_growth_after_metadata_cannot_bypass_limit() {
+            // Даже бесконечный источник останавливается после limit + 1.
+            let error = read_learning_archive_bytes(std::io::repeat(b' '), 128).unwrap_err();
+            assert_eq!(error.code, ErrorCode::LearningExportInvalid);
+            assert_eq!(error.details["reason"], "archive_too_large");
+        }
+    }
+
     fn restore(
         root: &Path,
         db: Option<&Path>,
         archive: &Path,
     ) -> Result<RestoreOutput, DomainError> {
-        let bytes = fs::read(archive).map_err(|error| {
-            DomainError::new(
-                ErrorCode::InputUnreadable,
-                format!("не удалось прочитать архив learning: {error}"),
-            )
-        })?;
+        let bytes = read_learning_archive(archive, super::MAX_LEARNING_ARCHIVE_BYTES)?;
         let document: LearningExport = serde_json::from_slice(&bytes).map_err(|error| {
             DomainError::new(
                 ErrorCode::LearningExportInvalid,

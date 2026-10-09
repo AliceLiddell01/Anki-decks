@@ -16,7 +16,11 @@ use super::scope::{FileCategory, FileSurface};
 use super::semantic_triage::{self, TriageSource};
 
 /// Версия самостоятельного контракта структурной очереди.
-pub const QUEUE_SCHEMA_VERSION: u32 = 1;
+pub const QUEUE_SCHEMA_VERSION: u32 = 2;
+/// Предыдущий формат очереди без переносимой версии правил классификации.
+pub const LEGACY_QUEUE_SCHEMA_VERSION: u32 = 1;
+/// Версия совместимости правил классификации; меняется при изменении их смысла.
+pub const CLASSIFIER_RULES_VERSION: u32 = 1;
 /// Размер страницы `queue list` по умолчанию.
 pub const DEFAULT_QUEUE_LIST_LIMIT: u64 = 50;
 /// Максимальный размер страницы `queue list`.
@@ -317,6 +321,9 @@ pub struct QueueSummary {
 #[serde(deny_unknown_fields)]
 pub struct ReviewQueue {
     pub schema_version: u32,
+    /// Отсутствует у старых очередей: совместимость их правил не доказана.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_rules_version: Option<u32>,
     pub source: TriageSource,
     pub classifications: BTreeMap<String, StructuralClassification>,
     pub units: Vec<ReviewUnit>,
@@ -870,6 +877,7 @@ pub fn build(
     units.sort_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)));
     let mut queue = ReviewQueue {
         schema_version: QUEUE_SCHEMA_VERSION,
+        classifier_rules_version: Some(CLASSIFIER_RULES_VERSION),
         source,
         classifications,
         units,
@@ -1039,9 +1047,22 @@ pub fn validate(
     pack: &ReviewPack,
     source_pack_sha256: &str,
 ) -> Result<QueueSummary, DomainError> {
-    if queue.schema_version != QUEUE_SCHEMA_VERSION {
+    if !matches!(
+        queue.schema_version,
+        LEGACY_QUEUE_SCHEMA_VERSION | QUEUE_SCHEMA_VERSION
+    ) {
         return Err(invalid(
             "Значение поля `schema_version` структурной очереди не поддерживается",
+        ));
+    }
+    let classifier_version_valid = match queue.schema_version {
+        LEGACY_QUEUE_SCHEMA_VERSION => queue.classifier_rules_version.is_none(),
+        QUEUE_SCHEMA_VERSION => queue.classifier_rules_version == Some(CLASSIFIER_RULES_VERSION),
+        _ => false,
+    };
+    if !classifier_version_valid {
+        return Err(invalid(
+            "Версия правил классификации не соответствует формату структурной очереди",
         ));
     }
     semantic_triage::validate_source(&queue.source, pack, source_pack_sha256)?;
@@ -1148,7 +1169,12 @@ pub fn validate_with_syntax(
     authoritative_contexts: &BTreeMap<String, SyntaxContext>,
 ) -> Result<QueueSummary, DomainError> {
     let summary = validate(queue, pack, source_pack_sha256)?;
-    let expected = build(pack, source_pack_sha256, authoritative_contexts)?;
+    let mut expected = build(pack, source_pack_sha256, authoritative_contexts)?;
+    // Старые артефакты не содержат версии правил. Их классификации всё равно
+    // проверяются по точным образам, но отсутствие метки не заменяется текущей
+    // версией и остаётся отдельным режимом совместимости в learning.
+    expected.schema_version = queue.schema_version;
+    expected.classifier_rules_version = queue.classifier_rules_version;
     if queue != &expected {
         return Err(invalid(
             "Очередь не соответствует классификации и построению по точным исходным Git images",

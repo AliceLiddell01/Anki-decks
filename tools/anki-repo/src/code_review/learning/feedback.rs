@@ -25,7 +25,6 @@ use super::model::{
     HistoryGeneration, PolicyProposal, SupportLevel, TrustLevel,
 };
 use super::patterns::{cases_for_signature, feature_signature, support_for_signature};
-use super::schema::LEARNING_SCHEMA_VERSION;
 use super::store::{LearningStore, map_error};
 
 /// Версия схемы событий обратной связи.
@@ -132,6 +131,28 @@ fn validate_event(event: &FeedbackEvent) -> Result<(), DomainError> {
             ));
         }
     }
+    match (event.action, event.supersedes_event_id.as_deref()) {
+        (FeedbackAction::Append, None) => {}
+        (FeedbackAction::Append, Some(_)) => {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "Действие append не может ссылаться на заменяемое событие",
+            ));
+        }
+        (_, Some(target)) if !target.trim().is_empty() && target != event.event_id => {}
+        _ => {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "Действие supersede/retract требует непустой цели, отличной от самого события",
+            ));
+        }
+    }
+    if event.recorded_at > i64::MAX as u64 {
+        return Err(DomainError::new(
+            ErrorCode::InvalidRequest,
+            "Время события обратной связи превышает диапазон SQLite",
+        ));
+    }
     match event.kind {
         FeedbackKind::RecommendationUsefulness => {
             match (event.action, event.usefulness.as_deref()) {
@@ -196,6 +217,83 @@ fn validate_event(event: &FeedbackEvent) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// Проверяет полный журнал перед восстановлением: связи не зависят от порядка
+/// архива или часов автора. Погашение необратимо: отзыв замены не оживляет её цель.
+pub(crate) fn validate_event_history(events: &[FeedbackEvent]) -> Result<(), DomainError> {
+    let mut by_id = BTreeMap::new();
+    for event in events {
+        validate_event(event)?;
+        if by_id.insert(event.event_id.as_str(), event).is_some() {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "В журнале обратной связи повторяется event_id",
+            ));
+        }
+    }
+    let mut retired = BTreeSet::new();
+    for event in events {
+        let Some(target_id) = event.supersedes_event_id.as_deref() else {
+            continue;
+        };
+        let target = by_id.get(target_id).ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::NotFound,
+                "Цель события обратной связи отсутствует",
+            )
+        })?;
+        if event.review_id != target.review_id
+            || event.unit_id != target.unit_id
+            || event.kind != target.kind
+            || target.action == FeedbackAction::Retract
+        {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "Цель должна быть утверждением того же review_id, unit_id и kind",
+            ));
+        }
+        if !retired.insert(target_id) {
+            return Err(DomainError::new(
+                ErrorCode::InvalidRequest,
+                "Утверждение обратной связи уже погашено другим событием",
+            ));
+        }
+    }
+    // Каждая вершина имеет не больше одной цели. Завершённые пути посещаются
+    // однократно, чтобы длинная корректная цепочка не обходилась заново для каждой вершины.
+    let mut complete = BTreeSet::new();
+    for event in events {
+        let mut path = BTreeSet::new();
+        let mut current = Some(event.event_id.as_str());
+        while let Some(id) = current {
+            if complete.contains(id) {
+                break;
+            }
+            if !path.insert(id) {
+                return Err(DomainError::new(
+                    ErrorCode::InvalidRequest,
+                    "Цепочка событий обратной связи содержит цикл",
+                ));
+            }
+            current = by_id[id].supersedes_event_id.as_deref();
+        }
+        complete.extend(path);
+    }
+    let mut active = BTreeMap::new();
+    for event in events {
+        if event.action == FeedbackAction::Retract || retired.contains(event.event_id.as_str()) {
+            continue;
+        }
+        let key = (&event.review_id, &event.unit_id, event.kind.as_str());
+        if active.insert(key, event).is_some() {
+            return Err(DomainError::new(
+                ErrorCode::LearningConflict,
+                "Журнал содержит несколько действующих утверждений одного случая и kind",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_case_exists(
     write: &super::store::LearningWrite<'_>,
     review_id: &str,
@@ -222,8 +320,8 @@ fn ensure_case_exists(
             .transaction()
             .query_row(
                 "SELECT candidate_id FROM learning_candidate
-                 WHERE review_id = ?1 AND candidate_id = ?2",
-                params![review_id, candidate_id],
+                 WHERE review_id = ?1 AND candidate_id = ?2 AND unit_id = ?3",
+                params![review_id, candidate_id, unit_id],
                 |row| row.get(0),
             )
             .optional()
@@ -231,7 +329,9 @@ fn ensure_case_exists(
         if found.is_none() {
             return Err(DomainError::new(
                 ErrorCode::NotFound,
-                format!("Кандидат learning не найден: {candidate_id}"),
+                format!(
+                    "Кандидат learning не принадлежит указанному случаю: {review_id}/{unit_id}/{candidate_id}"
+                ),
             ));
         }
     }
@@ -566,20 +666,31 @@ fn outcome_for(
         data.push(row.map_err(|error| map_error(&error, "не удалось прочитать исход случая"))?);
     }
     drop(statement);
+    let targets: BTreeMap<&str, (&str, &str)> = data
+        .iter()
+        .map(|(id, kind, action, _, _, _)| (id.as_str(), (kind.as_str(), action.as_str())))
+        .collect();
+    let valid_target = |kind: &str, target: &str| {
+        targets
+            .get(target)
+            .is_some_and(|(target_kind, action)| *target_kind == kind && *action != "retract")
+    };
     let retracted: BTreeSet<&str> = data
         .iter()
-        .filter_map(|(_, _, action, _, retracted, _)| {
+        .filter_map(|(_, kind, action, _, retracted, _)| {
             (action == "retract")
                 .then_some(retracted.as_deref())
                 .flatten()
+                .filter(|id| valid_target(kind, id))
         })
         .collect();
     let superseded: BTreeSet<&str> = data
         .iter()
-        .filter_map(|(_, _, action, supersedes, _, _)| {
+        .filter_map(|(_, kind, action, supersedes, _, _)| {
             (action == "supersede")
                 .then_some(supersedes.as_deref())
                 .flatten()
+                .filter(|id| valid_target(kind, id))
         })
         .collect();
     let original = original_disposition(transaction, review_id, unit_id)?;
@@ -635,6 +746,21 @@ fn original_disposition(
 /// Отсутствие действующей правки означает, что сохраняется исход разбора.
 pub(super) fn effective_dispositions(
     read: &super::store::LearningTx<'_>,
+) -> Result<BTreeMap<(String, String), Option<String>>, DomainError> {
+    disposition_map(read, true)
+}
+
+/// Только действующие правки: поисковый случай без правки сохраняет собственный
+/// исход решения/замечания, который может отличаться от агрегата всей единицы.
+pub(super) fn effective_revision_dispositions(
+    read: &super::store::LearningTx<'_>,
+) -> Result<BTreeMap<(String, String), Option<String>>, DomainError> {
+    disposition_map(read, false)
+}
+
+fn disposition_map(
+    read: &super::store::LearningTx<'_>,
+    include_original: bool,
 ) -> Result<BTreeMap<(String, String), Option<String>>, DomainError> {
     let transaction = read.transaction();
     let mut original = BTreeMap::new();
@@ -694,6 +820,9 @@ pub(super) fn effective_dispositions(
                 disposition,
                 recorded_at,
             ) = row.map_err(|error| map_error(&error, "не удалось прочитать правки исходов"))?;
+            if kind != FeedbackKind::SemanticOutcomeRevision.as_str() {
+                continue;
+            }
             let key = (review_id, unit_id);
             if action == "retract" {
                 if let Some(retracted_event) = retracted_event {
@@ -710,7 +839,7 @@ pub(super) fn effective_dispositions(
                     .or_default()
                     .insert(superseded_event);
             }
-            if kind != FeedbackKind::SemanticOutcomeRevision.as_str() || action == "retract" {
+            if action == "retract" {
                 continue;
             }
             if let Some(disposition) = disposition {
@@ -732,7 +861,11 @@ pub(super) fn effective_dispositions(
             .filter(|(_, event_id, _)| !inactive_for_case.contains(event_id))
             .map(|(_, _, disposition)| disposition)
             .next_back();
-        effective.insert(key, active.or(original_disposition));
+        if include_original {
+            effective.insert(key, active.or(original_disposition));
+        } else if active.is_some() {
+            effective.insert(key, active);
+        }
     }
     Ok(effective)
 }
@@ -819,7 +952,6 @@ pub fn propose_policy(
         artifact_path: POLICY_ARTIFACT_PATH.to_owned(),
         auto_applied: false,
     };
-    let _ = schema_version();
     store.write(|write| {
         let existing_json: Option<String> = super::import::write_optional_row(
             write,
@@ -965,12 +1097,6 @@ pub fn list_proposals(
     })
 }
 
-/// Версия схемы предложений политики.
-#[must_use]
-pub const fn schema_version() -> u32 {
-    LEARNING_SCHEMA_VERSION
-}
-
 /// Сериализуемое представление аудита по одному случаю.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1067,4 +1193,99 @@ pub fn outcome_distribution(store: &LearningStore) -> Result<BTreeMap<String, us
 
 pub fn generation_of(store: &LearningStore) -> Result<HistoryGeneration, DomainError> {
     super::import::generation(store)
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn assertion(id: &str, target: Option<&str>) -> FeedbackEvent {
+        FeedbackEvent {
+            schema_version: FEEDBACK_SCHEMA_VERSION,
+            event_id: id.to_owned(),
+            review_id: "review".to_owned(),
+            unit_id: "unit".to_owned(),
+            candidate_id: None,
+            kind: FeedbackKind::SemanticOutcomeRevision,
+            action: if target.is_some() {
+                FeedbackAction::Supersede
+            } else {
+                FeedbackAction::Append
+            },
+            supersedes_event_id: target.map(str::to_owned),
+            effective_disposition: Some("acceptable".to_owned()),
+            usefulness: None,
+            explanation: "Содержательная правка".to_owned(),
+            provenance: "reviewer".to_owned(),
+            recorded_at: 1,
+        }
+    }
+
+    #[test]
+    fn history_validation_is_independent_of_order_and_clock() {
+        let first = assertion("first", None);
+        let second = assertion("second", Some("first"));
+        let mut last = assertion("last", Some("second"));
+        last.action = FeedbackAction::Retract;
+        last.effective_disposition = None;
+        last.recorded_at = 0;
+        validate_event_history(&[last, second, first]).unwrap();
+    }
+
+    #[test]
+    fn history_rejects_cycles_missing_targets_and_double_retirement() {
+        assert!(
+            validate_event_history(&[assertion("a", Some("b")), assertion("b", Some("a"))])
+                .is_err()
+        );
+        assert!(validate_event_history(&[assertion("a", Some("missing"))]).is_err());
+        assert!(
+            validate_event_history(&[
+                assertion("a", None),
+                assertion("b", Some("a")),
+                assertion("c", Some("a")),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn history_rejects_foreign_owner_kind_and_retraction_targets() {
+        let original = assertion("original", None);
+        for field in ["review", "unit", "kind"] {
+            let mut replacement = assertion("replacement", Some("original"));
+            match field {
+                "review" => replacement.review_id = "other-review".to_owned(),
+                "unit" => replacement.unit_id = "other-unit".to_owned(),
+                _ => {
+                    replacement.kind = FeedbackKind::RecommendationUsefulness;
+                    replacement.effective_disposition = None;
+                    replacement.usefulness = Some("useful".to_owned());
+                }
+            }
+            assert!(validate_event_history(&[original.clone(), replacement]).is_err());
+        }
+        let mut retract = assertion("retract", Some("original"));
+        retract.action = FeedbackAction::Retract;
+        retract.effective_disposition = None;
+        assert!(
+            validate_event_history(
+                &[original, retract, assertion("replacement", Some("retract")),]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn history_rejects_parallel_assertions_and_illegal_append_targets() {
+        assert_eq!(
+            validate_event_history(&[assertion("a", None), assertion("b", None)])
+                .unwrap_err()
+                .code,
+            ErrorCode::LearningConflict
+        );
+        let mut append = assertion("b", Some("a"));
+        append.action = FeedbackAction::Append;
+        assert!(validate_event_history(&[assertion("a", None), append]).is_err());
+    }
 }

@@ -182,9 +182,17 @@ impl LearningStore {
     /// Более новая версия схемы отвергается до любых изменений; повреждённый
     /// файл не удаляется и не перезаписывается.
     pub fn open(options: StoreOptions) -> Result<Self, DomainError> {
-        let parent = options.database.parent().map(Path::to_path_buf);
+        let mut newly_created = false;
+        if !options.database.exists() && !options.create {
+            return Err(unavailable(&options, "файл базы learning отсутствует"));
+        }
+        let parent = options
+            .database
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(Path::to_path_buf);
         if let Some(parent) = parent.as_deref() {
-            if options.create {
+            if options.create && !options.database.exists() {
                 std::fs::create_dir_all(parent).map_err(|error| {
                     DomainError::with_details(
                         ErrorCode::LearningStorageUnavailable,
@@ -201,18 +209,31 @@ impl LearningStore {
                 ));
             }
         }
-        if !options.create && !options.database.is_file() {
-            return Err(unavailable(&options, "файл базы learning отсутствует"));
+        if !options.database.exists() {
+            // Атомарное создание исключает превращение появившейся между
+            // проверками чужой базы в «новую». Уже существующий пустой файл
+            // нельзя инициализировать даже при create=true.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&options.database)
+            {
+                Ok(_) => newly_created = true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(unavailable(
+                        &options,
+                        &format!("не удалось создать файл базы learning: {error}"),
+                    ));
+                }
+            }
+        }
+        if !newly_created {
+            validate_existing_file(&options)?;
         }
         let decision = journal_mode_decision(&options.database);
-        let flags = if options.create {
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        } else {
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        };
-        let connection =
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut connection =
             Connection::open_with_flags(&options.database, flags).map_err(|error| {
                 map_open_error(
                     &options,
@@ -223,22 +244,27 @@ impl LearningStore {
         connection
             .busy_timeout(std::time::Duration::from_millis(OPEN_BUSY_TIMEOUT_MS))
             .map_err(|error| map_error(&error, "не удалось настроить busy_timeout"))?;
-        let current_schema_version = schema::read_schema_version(&connection)?;
-        if current_schema_version > LEARNING_SCHEMA_VERSION {
-            return Err(DomainError::with_details(
-                ErrorCode::LearningSchemaUnsupported,
-                format!(
-                    "База learning создана более новой схемой ({current_schema_version}); эта сборка поддерживает {LEARNING_SCHEMA_VERSION}"
-                ),
-                crate::details! {
-                    "database_user_version" => current_schema_version,
-                    "supported_schema_version" => LEARNING_SCHEMA_VERSION,
-                },
-            ));
-        }
+        let current_schema_version = if newly_created {
+            0
+        } else {
+            // Повторная проверка на фактическом соединении защищает переход
+            // между read-only проверкой и открытием для законной миграции.
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(|error| map_error(&error, "не удалось проверить базу learning"))?;
+            let version = schema::validate_existing_database(&transaction)?;
+            transaction.commit().map_err(|error| {
+                map_error(&error, "не удалось завершить проверку базы learning")
+            })?;
+            version
+        };
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| map_error(&error, "не удалось включить foreign_keys"))?;
+        let schema_changed = current_schema_version != LEARNING_SCHEMA_VERSION;
+        if schema_changed {
+            schema::apply_migrations(&mut connection)?;
+        }
         let current_journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .map_err(|error| map_error(&error, "не удалось прочитать режим журнала SQLite"))?;
@@ -248,16 +274,12 @@ impl LearningStore {
                 .map_err(|error| map_error(&error, "не удалось выбрать режим журнала SQLite"))?;
         }
         let fts5_available = schema::fts5_available(&connection)?;
-        let mut store = Self {
+        let store = Self {
             connection,
             options,
             journal_mode: decision,
             fts5_available,
         };
-        let schema_changed = current_schema_version != LEARNING_SCHEMA_VERSION;
-        if schema_changed {
-            let _ = schema::apply_migrations(&mut store.connection)?;
-        }
         store
             .connection
             .busy_timeout(std::time::Duration::from_millis(
@@ -455,6 +477,70 @@ impl LearningStore {
             },
         )
     }
+}
+
+/// Чужие, частичные и будущие базы проверяются через read-only соединение:
+/// SQLite не меняет их журнал и не восстанавливает незавершённую запись.
+fn validate_existing_file(options: &StoreOptions) -> Result<(), DomainError> {
+    {
+        // Даже mode=ro способен создать WAL/SHM для закрытого файла в WAL-
+        // режиме. Сначала проверяем устойчивую схему checkpoint через
+        // immutable-соединение, которое не создаёт служебных файлов. Затем
+        // обычная транзакция проверяет актуальный снимок, включая активный WAL.
+        let absolute = std::fs::canonicalize(&options.database).map_err(|error| {
+            unavailable(
+                options,
+                &format!("не удалось разрешить путь базы learning: {error}"),
+            )
+        })?;
+        let mut uri = String::from("file:");
+        for byte in absolute.as_os_str().as_encoded_bytes() {
+            use std::fmt::Write as _;
+            if byte.is_ascii_alphanumeric()
+                || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~')
+            {
+                uri.push(char::from(*byte));
+            } else {
+                write!(uri, "%{byte:02X}").expect("запись в String не может завершиться ошибкой");
+            }
+        }
+        uri.push_str("?mode=ro&immutable=1");
+        let checkpoint = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            map_open_error(
+                options,
+                &error,
+                "не удалось проверить checkpoint базы learning",
+            )
+        })?;
+        schema::validate_existing_database(&checkpoint)?;
+    }
+    let connection = Connection::open_with_flags(
+        &options.database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        map_open_error(
+            options,
+            &error,
+            "не удалось проверить локальную базу learning",
+        )
+    })?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(OPEN_BUSY_TIMEOUT_MS))
+        .map_err(|error| map_error(&error, "не удалось настроить проверку базы learning"))?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| map_error(&error, "не удалось начать проверку базы learning"))?;
+    schema::validate_existing_database(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| map_error(&error, "не удалось завершить проверку базы learning"))
 }
 
 /// Возможные пути восстановления без удаления исходных данных.

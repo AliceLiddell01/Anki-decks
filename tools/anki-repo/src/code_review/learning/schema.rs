@@ -8,6 +8,7 @@
 //! запуск той же версии ничего не меняет.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use std::collections::BTreeMap;
 
 use crate::error::{DomainError, ErrorCode};
 
@@ -18,6 +19,9 @@ pub const LEARNING_SCHEMA_VERSION: u32 = 3;
 
 /// Имя таблицы журнала миграций.
 pub const MIGRATION_TABLE: &str = "learning_migration";
+
+/// Устойчивая метка новых файлов learning (`ANKL`); старые схемы имеют значение 0.
+pub const LEARNING_APPLICATION_ID: u32 = 0x414E_4B4C;
 
 /// Базовый DDL версии 1.
 ///
@@ -201,6 +205,136 @@ pub fn read_schema_version(connection: &Connection) -> Result<u32, DomainError> 
     })
 }
 
+/// Проверяет идентичность существующей базы до любых миграций и pragmas записи.
+///
+/// Старые файлы без `application_id` принимаются только по полной схеме,
+/// согласованным метаданным и журналу миграций. Один `user_version` или одна
+/// таблица с именем learning не подтверждают принадлежность файла.
+pub fn validate_existing_database(connection: &Connection) -> Result<u32, DomainError> {
+    let version = read_schema_version(connection)?;
+    reject_future_schema(version)?;
+    if version == 0 {
+        return Err(identity_error(
+            "Существующий файл не содержит версионированную базу learning",
+        ));
+    }
+    let application_id: i64 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(|error| schema_error("не удалось прочитать идентичность базы", &error))?;
+    if application_id != 0 && application_id != i64::from(LEARNING_APPLICATION_ID) {
+        return Err(identity_error("Файл SQLite принадлежит другому приложению"));
+    }
+    let actual = schema_objects(connection)?;
+    let expected = expected_schema_objects(version)?;
+    if actual != expected {
+        return Err(identity_error(
+            "Набор объектов или структура базы не соответствует полной схеме learning",
+        ));
+    }
+    let mut statement = connection
+        .prepare("SELECT version FROM learning_migration ORDER BY version")
+        .map_err(|error| schema_error("не удалось проверить журнал миграций", &error))?;
+    let migrations = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| schema_error("не удалось проверить журнал миграций", &error))?;
+    if migrations != (1..=i64::from(version)).collect::<Vec<_>>() {
+        return Err(identity_error(
+            "Журнал миграций learning не соответствует версии схемы",
+        ));
+    }
+    if read_meta(connection, "schema_version")?.as_deref() != Some(&version.to_string())
+        || !read_meta(connection, "policy_version")?
+            .is_some_and(|value| value.parse::<u32>().is_ok_and(|value| value > 0))
+    {
+        return Err(identity_error(
+            "Служебные метаданные learning отсутствуют или не соответствуют версии",
+        ));
+    }
+    if version >= 3 {
+        read_history_generation(connection)?;
+    }
+    Ok(version)
+}
+
+fn identity_error(message: &str) -> DomainError {
+    DomainError::new(ErrorCode::LearningCorrupt, message)
+}
+
+fn reject_future_schema(version: u32) -> Result<(), DomainError> {
+    if version > LEARNING_SCHEMA_VERSION {
+        return Err(DomainError::with_details(
+            ErrorCode::LearningSchemaUnsupported,
+            format!(
+                "База learning создана более новой схемой ({version}); эта сборка поддерживает {LEARNING_SCHEMA_VERSION}"
+            ),
+            crate::details! {
+                "database_user_version" => version,
+                "supported_schema_version" => LEARNING_SCHEMA_VERSION,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn schema_objects(
+    connection: &Connection,
+) -> Result<BTreeMap<String, (String, String)>, DomainError> {
+    let mut statement = connection
+        .prepare("SELECT name, type, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
+        .map_err(|error| schema_error("не удалось прочитать структуру SQLite", &error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| schema_error("не удалось прочитать структуру SQLite", &error))?;
+    let mut objects = BTreeMap::new();
+    for row in rows {
+        let (name, kind, sql) =
+            row.map_err(|error| schema_error("не удалось прочитать объект SQLite", &error))?;
+        // FTS5 — производный, необязательный индекс. Его shadow-таблицы не
+        // являются частью основной схемы и зависят от версии SQLite.
+        if matches!(
+            name.as_str(),
+            "learning_search_fts"
+                | "learning_search_fts_data"
+                | "learning_search_fts_idx"
+                | "learning_search_fts_content"
+                | "learning_search_fts_docsize"
+                | "learning_search_fts_config"
+        ) {
+            continue;
+        }
+        objects.insert(
+            name,
+            (kind, sql.split_whitespace().collect::<Vec<_>>().join(" ")),
+        );
+    }
+    Ok(objects)
+}
+
+fn expected_schema_objects(
+    version: u32,
+) -> Result<BTreeMap<String, (String, String)>, DomainError> {
+    let mut expected = Connection::open_in_memory()
+        .map_err(|error| schema_error("не удалось подготовить проверку схемы learning", &error))?;
+    let transaction = expected
+        .transaction()
+        .map_err(|error| schema_error("не удалось подготовить проверку схемы learning", &error))?;
+    create_migration_table(&transaction)?;
+    apply_v1(&transaction)?;
+    if version >= 2 {
+        transaction
+            .execute_batch(SCHEMA_V2)
+            .map_err(|error| schema_error("не удалось подготовить схему learning v2", &error))?;
+    }
+    schema_objects(&transaction)
+}
+
 /// Определяет доступность FTS5 в текущей сборке SQLite.
 pub fn fts5_available(connection: &Connection) -> Result<bool, DomainError> {
     let mut statement = connection
@@ -224,25 +358,28 @@ pub fn fts5_available(connection: &Connection) -> Result<bool, DomainError> {
 /// Возвращает фактическую версию схемы после работы. Более новая версия schema
 /// отвергается до любых изменений.
 pub fn apply_migrations(connection: &mut Connection) -> Result<u32, DomainError> {
-    let current = read_schema_version(connection)?;
-    if current > LEARNING_SCHEMA_VERSION {
-        return Err(DomainError::with_details(
-            ErrorCode::LearningSchemaUnsupported,
-            format!(
-                "База learning создана более новой схемой ({current}); эта сборка поддерживает {LEARNING_SCHEMA_VERSION}"
-            ),
-            crate::details! {
-                "database_user_version" => current,
-                "supported_schema_version" => LEARNING_SCHEMA_VERSION,
-            },
-        ));
+    let transaction = connection
+        .transaction()
+        .map_err(|error| schema_error("не удалось начать транзакцию миграции", &error))?;
+    let current = read_schema_version(&transaction)?;
+    reject_future_schema(current)?;
+    if current == 0 {
+        let application_id: i64 = transaction
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .map_err(|error| {
+                schema_error("не удалось прочитать идентичность новой базы", &error)
+            })?;
+        if application_id != 0 || !schema_objects(&transaction)?.is_empty() {
+            return Err(identity_error(
+                "Создание learning возможно только в новой пустой базе",
+            ));
+        }
+    } else {
+        validate_existing_database(&transaction)?;
     }
     if current == LEARNING_SCHEMA_VERSION {
         return Ok(current);
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|error| schema_error("не удалось начать транзакцию миграции", &error))?;
     create_migration_table(&transaction)?;
     for version in current.saturating_add(1)..=LEARNING_SCHEMA_VERSION {
         if migration_applied(&transaction, version)? {
@@ -281,6 +418,9 @@ pub fn apply_migrations(connection: &mut Connection) -> Result<u32, DomainError>
     transaction
         .pragma_update(None, "user_version", LEARNING_SCHEMA_VERSION)
         .map_err(|error| schema_error("не удалось записать PRAGMA user_version", &error))?;
+    transaction
+        .pragma_update(None, "application_id", LEARNING_APPLICATION_ID)
+        .map_err(|error| schema_error("не удалось записать идентичность базы learning", &error))?;
     transaction
         .commit()
         .map_err(|error| schema_error("не удалось зафиксировать транзакцию миграции", &error))?;
@@ -554,8 +694,8 @@ mod tests {
             .unwrap();
         assert_eq!(recorded, i64::from(LEARNING_SCHEMA_VERSION));
         assert_eq!(
-            read_meta(&connection, "policy_version").unwrap().as_deref(),
-            Some("1")
+            read_meta(&connection, "policy_version").unwrap(),
+            Some(LEARNING_POLICY_VERSION.to_string())
         );
     }
 
@@ -567,6 +707,8 @@ mod tests {
             let transaction = connection.transaction().unwrap();
             create_migration_table(&transaction).unwrap();
             apply_v1(&transaction).unwrap();
+            set_meta(&transaction, "schema_version", "1").unwrap();
+            set_meta(&transaction, "policy_version", "1").unwrap();
             transaction
                 .execute(
                     &format!("INSERT INTO {MIGRATION_TABLE} (version, applied_at) VALUES (1, 0)"),
@@ -602,6 +744,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migrations, i64::from(LEARNING_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn opening_supported_legacy_schemas_preserves_history_and_migrates() {
+        for version in [1u32, 2] {
+            let directory =
+                asset_store::temp_workspace::TempWorkspace::create("learning-legacy-schema")
+                    .unwrap();
+            let database = directory.path().join("state.sqlite");
+            {
+                let mut connection = Connection::open(&database).unwrap();
+                let transaction = connection.transaction().unwrap();
+                create_migration_table(&transaction).unwrap();
+                apply_v1(&transaction).unwrap();
+                if version == 2 {
+                    transaction.execute_batch(SCHEMA_V2).unwrap();
+                }
+                for migration in 1..=version {
+                    transaction
+                        .execute(
+                            "INSERT INTO learning_migration(version, applied_at) VALUES (?1, 0)",
+                            params![migration],
+                        )
+                        .unwrap();
+                }
+                set_meta(&transaction, "schema_version", &version.to_string()).unwrap();
+                set_meta(&transaction, "policy_version", "1").unwrap();
+                transaction
+                    .execute_batch(
+                        "INSERT INTO learning_import (
+                        review_id, repository_id, base_sha, head_sha, merge_base_sha,
+                        workspace_variant, review_pack_sha256, queue_sha256,
+                        review_schema_version, queue_schema_version, analyzer_digest,
+                        classifier_digest, trust, outcome, limitations_json,
+                        revision, imported_at, observations_json, identity_key
+                     ) VALUES (
+                        'legacy-review', 'legacy-repository', 'base', 'head', 'base',
+                        'committed', 'pack', 'queue', 1, 1, 'analyzer', 'classifier',
+                        'trusted', 'reviewed', '[]', 7, 0, '[]', 'identity'
+                     )",
+                    )
+                    .unwrap();
+                if version == 2 {
+                    transaction
+                        .execute(
+                            "UPDATE learning_import SET execution_evidence_json = ?1",
+                            params![r#"{"retained":true}"#],
+                        )
+                        .unwrap();
+                }
+                transaction
+                    .pragma_update(None, "user_version", version)
+                    .unwrap();
+                transaction.commit().unwrap();
+                assert_eq!(validate_existing_database(&connection).unwrap(), version);
+            }
+            let mut options = super::super::store::StoreOptions::at(&database);
+            options.create = false;
+            let store = super::super::store::LearningStore::open(options).unwrap();
+            assert_eq!(
+                read_schema_version(store.connection()).unwrap(),
+                LEARNING_SCHEMA_VERSION
+            );
+            assert_eq!(read_history_generation(store.connection()).unwrap(), 7);
+            let review: (String, i64, Option<String>) = store
+                .connection()
+                .query_row(
+                    "SELECT review_id, revision, execution_evidence_json FROM learning_import",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(review.0, "legacy-review");
+            assert_eq!(review.1, 7);
+            assert_eq!(
+                review.2.as_deref(),
+                (version == 2).then_some(r#"{"retained":true}"#)
+            );
+            assert_eq!(
+                validate_existing_database(store.connection()).unwrap(),
+                LEARNING_SCHEMA_VERSION
+            );
+        }
     }
 
     #[test]

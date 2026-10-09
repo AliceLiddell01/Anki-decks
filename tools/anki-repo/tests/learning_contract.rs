@@ -2398,8 +2398,13 @@ fn policy_proposal_is_never_auto_applied() {
     // Ключ политики находится и у паттерна за пределами стандартной страницы отчёта.
     let synthetic_patterns: Vec<(String, String)> = (0..24)
         .map(|index| {
-            let features =
-                BTreeMap::from([("fixture_pattern".to_owned(), format!("pattern-{index:02}"))]);
+            let features = BTreeMap::from([
+                (
+                    "classifier_compatibility".to_owned(),
+                    record.inputs.classifier_digest.clone(),
+                ),
+                ("fixture_pattern".to_owned(), format!("pattern-{index:02}")),
+            ]);
             let signature = learning::patterns::feature_signature(&features);
             let feature_json = serde_json::to_string(&features).unwrap();
             (signature, feature_json)
@@ -3042,17 +3047,16 @@ fn unit_of(queue: &review_queue::ReviewQueue, candidate_id: &str) -> review_queu
         .unwrap_or_else(|| panic!("кандидат {candidate_id} обязан входить в единицу очереди"))
 }
 
-/// Ключ признаков структурного среза, к которому относится единица.
-fn slice_signature(unit: &review_queue::ReviewUnit) -> String {
-    learning::patterns::feature_signature(&learning::patterns::unit_features(&unit.signature))
-}
-
 /// Сводка поддержки среза единицы.
 fn support_of(
     store: &learning::LearningStore,
     unit: &review_queue::ReviewUnit,
 ) -> learning::model::SupportSummary {
-    learning::patterns::support_for_signature(store, &slice_signature(unit), 0)
+    let candidate_id = unit
+        .candidate_ids()
+        .first()
+        .unwrap_or_else(|| panic!("единица {} обязана содержать кандидата", unit.id));
+    learning::patterns::support_for_signature(store, &stored_unit_signature(store, candidate_id), 0)
         .unwrap()
         .unwrap_or_else(|| panic!("срез единицы {} обязан существовать", unit.id))
 }
@@ -3201,12 +3205,16 @@ fn findings_are_linked_to_a_slice_by_units_and_confirmed_by_decisions() {
         signature, unit_signature,
         "подпись находки и подпись среза обязаны оставаться разными доменами"
     );
-    assert_eq!(
-        signature,
-        learning::import::sha256_hex(
-            format!("minor\ncandidate_assisted\n{unit_signature}").as_bytes()
-        ),
-        "подпись находки остаётся отпечатком наблюдения"
+    let classifier_compatibility = learning::import::classifier_digest(&pack, &queue);
+    let current_slice_signature =
+        learning::patterns::feature_signature(&learning::patterns::unit_features_with_classifier(
+            &unit_of(&queue, "production-0").signature,
+            &classifier_compatibility,
+        ));
+    assert_eq!(unit_signature, current_slice_signature);
+    assert!(
+        signature.starts_with("finding-v2-"),
+        "подпись находки включает полное свидетельство и версию контракта"
     );
 
     // Повторный импорт того же источника не удваивает счётчики среза.

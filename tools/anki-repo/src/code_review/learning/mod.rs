@@ -80,7 +80,7 @@ pub fn workspace_variant(raw: &str) -> Result<String, crate::error::DomainError>
 /// Изменение любой калиброванной константы или правила агрегации обязано
 /// увеличивать эту версию: recommendations artifact и срез паттерна фиксируют
 /// её, чтобы смысл накопленных примеров не менялся молча.
-pub const LEARNING_POLICY_VERSION: u32 = 1;
+pub const LEARNING_POLICY_VERSION: u32 = 2;
 
 /// Относительный путь базы learning по умолчанию от корня репозитория.
 pub const DEFAULT_LEARNING_DIRECTORY: &str = ".anki-repo/learning";

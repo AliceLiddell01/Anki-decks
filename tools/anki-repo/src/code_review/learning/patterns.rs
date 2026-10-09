@@ -23,7 +23,6 @@ use super::model::{
     CaseLinkKind, CaseRef, HistoryGeneration, PatternCaseRef, PatternReport, PatternRule,
     SupportLevel, SupportSummary, TrustLevel,
 };
-use super::schema::LEARNING_SCHEMA_VERSION;
 use super::store::{LearningRead, LearningStore};
 
 /// Версия схемы отчёта по паттернам.
@@ -41,8 +40,8 @@ const Z_95: f64 = 1.959_963_984_540_054;
 
 /// Описание применённой политики агрегации для машинного вывода.
 pub const PATTERN_POLICY: &str = "Точное сопоставление по ключу признаков StructuralClassification, \
-CandidateOrigin, detector/source и версиям схем; независимая единица — единица очереди, \
-а не кандидат; минимум поддержки — 3 независимые единицы; доля единиц с решением confirmed \
+CandidateOrigin, detector/source и совместимости правил классификации; независимая единица — \
+единица очереди внутри точного Git-среза или доказанной линии его ревизий, а не кандидат; минимум поддержки — 3 независимые единицы; доля единиц с решением confirmed \
 сопровождается нижней границей Wilson для 95 % уровня только как мера согласованности наблюдений.";
 
 /// Точный ключ признаков единицы наблюдения.
@@ -112,6 +111,21 @@ pub fn unit_features(
     features
 }
 
+/// Ключ признаков с доказанной совместимостью применённых правил классификации.
+/// Digest описывает версии правил и форматов, а не содержимое ревью или его исход.
+#[must_use]
+pub fn unit_features_with_classifier(
+    signature: &crate::code_review::review_queue::GroupingSignature,
+    classifier_compatibility: &str,
+) -> BTreeMap<String, String> {
+    let mut features = unit_features(signature);
+    features.insert(
+        "classifier_compatibility".to_owned(),
+        classifier_compatibility.to_owned(),
+    );
+    features
+}
+
 fn file_category_name(category: Option<&crate::code_review::scope::FileCategory>) -> &'static str {
     match category {
         Some(crate::code_review::scope::FileCategory::Rust) => "rust",
@@ -159,8 +173,8 @@ pub struct PatternQuery {
 #[derive(Debug, Clone)]
 struct StoredUnit {
     review_id: String,
-    /// Линия наблюдения: идентичность Git-базы, в которой импортирован случай.
-    repository_id: String,
+    /// Канонический корень точного Git-среза и доказанных ревизий этого случая.
+    observation_lineage: String,
     /// Монотонная ревизия накопления истории: порядок импорта записей.
     revision: u64,
     unit_id: String,
@@ -212,8 +226,7 @@ pub fn pattern_report(
         let mut rules = Vec::new();
         for (signature, members) in groups {
             let support = support_summary(&members, &findings, &confirmed_findings, now);
-            let mut key = members[0].feature.clone();
-            key.remove("disposition");
+            let key = members[0].feature.clone();
             rules.push(PatternRule {
                 key,
                 signature,
@@ -294,12 +307,13 @@ fn load_units(
     read: &LearningRead<'_>,
     query: &PatternQuery,
 ) -> Result<Vec<StoredUnit>, DomainError> {
+    let lineages = observation_lineages(read, query.include_quarantine)?;
     let mut statement = read
         .transaction()
         .prepare(
             "SELECT u.review_id, u.unit_id, u.disposition, u.candidate_count,
                     u.representatives_json, u.feature_json, i.imported_at, i.trust,
-                    i.repository_id, i.revision
+                    i.classifier_digest, i.revision
              FROM learning_unit AS u
              JOIN learning_import AS i ON i.review_id = u.review_id
              WHERE (?1 = 1 OR i.trust = 'ast_authenticated')
@@ -342,7 +356,7 @@ fn load_units(
         feature,
         imported_at,
         trust,
-        repository_id,
+        classifier_digest,
         revision,
     ) in rows_data
     {
@@ -350,7 +364,23 @@ fn load_units(
             .get(&(review_id.clone(), unit_id.clone()))
             .cloned()
             .unwrap_or(disposition);
-        let feature: BTreeMap<String, String> = parse_domain_json(&feature, "признаки единицы")?;
+        let mut feature: BTreeMap<String, String> =
+            parse_domain_json(&feature, "признаки единицы")?;
+        feature.remove("disposition");
+        // Старую историю не объявляем совместимой с текущими правилами: берём
+        // версию из её сохранённой provenance, независимо от текущей сборки.
+        if feature
+            .get("classifier_compatibility")
+            .is_some_and(|stamp| stamp != &classifier_digest)
+        {
+            return Err(DomainError::new(
+                ErrorCode::LearningCorrupt,
+                "Метка совместимости признаков не соответствует сохранённой версии классификатора",
+            ));
+        }
+        feature
+            .entry("classifier_compatibility".to_owned())
+            .or_insert(classifier_digest);
         if !matches_filters(&feature, query) {
             continue;
         }
@@ -368,8 +398,13 @@ fn load_units(
             )
         })?;
         units.push(StoredUnit {
-            review_id,
-            repository_id,
+            review_id: review_id.clone(),
+            observation_lineage: lineages.get(&review_id).cloned().ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::LearningCorrupt,
+                    "Единица истории не связана с записью импорта",
+                )
+            })?,
             revision: u64::try_from(revision.max(0)).unwrap_or(0),
             unit_id,
             disposition,
@@ -384,6 +419,93 @@ fn load_units(
         });
     }
     Ok(units)
+}
+
+/// Канонические компоненты связности истории: повтор точного диапазона либо
+/// явная аудируемая ревизия. Общая база разных head не доказывает одну линию.
+fn observation_lineages(
+    read: &LearningRead<'_>,
+    include_quarantine: bool,
+) -> Result<BTreeMap<String, String>, DomainError> {
+    let mut statement = read.transaction().prepare(
+        "SELECT review_id, repository_id, base_sha, head_sha, merge_base_sha, revision_of, trust
+         FROM learning_import WHERE (?1 = 1 OR trust = 'ast_authenticated') ORDER BY review_id",
+    ).map_err(|error| super::store::map_error(&error, "не удалось прочитать линии наблюдения"))?;
+    let rows = statement
+        .query_map([i64::from(include_quarantine)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|error| {
+            super::store::map_error(&error, "не удалось прочитать линии наблюдения")
+        })?;
+    let records = rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+        super::store::map_error(&error, "не удалось прочитать линии наблюдения")
+    })?;
+    let repositories: BTreeMap<&str, (&str, &str)> = records
+        .iter()
+        .map(|record| (record.0.as_str(), (record.1.as_str(), record.6.as_str())))
+        .collect();
+    let mut parents: BTreeMap<String, String> = records
+        .iter()
+        .map(|record| (record.0.clone(), record.0.clone()))
+        .collect();
+    let mut ranges: BTreeMap<(&str, &str, &str, &str, &str), &str> = BTreeMap::new();
+    for (id, repository, base, head, merge_base, previous, trust) in &records {
+        let range = (
+            repository.as_str(),
+            base.as_str(),
+            head.as_str(),
+            merge_base.as_str(),
+            trust.as_str(),
+        );
+        if let Some(first) = ranges.insert(range, id) {
+            join_lineages(&mut parents, id, first);
+        }
+        if let Some(previous) = previous {
+            if repositories.get(previous.as_str()).copied()
+                != Some((repository.as_str(), trust.as_str()))
+            {
+                return Err(DomainError::new(
+                    ErrorCode::LearningCorrupt,
+                    "Ревизия истории ссылается на отсутствующий или чужой Git-репозиторий",
+                ));
+            }
+            join_lineages(&mut parents, id, previous);
+        }
+    }
+    Ok(parents
+        .keys()
+        .map(|id| (id.clone(), lineage_root(&parents, id)))
+        .collect())
+}
+
+fn lineage_root(parents: &BTreeMap<String, String>, id: &str) -> String {
+    let mut root = id;
+    while let Some(parent) = parents.get(root) {
+        if parent == root {
+            break;
+        }
+        root = parent;
+    }
+    root.to_owned()
+}
+
+fn join_lineages(parents: &mut BTreeMap<String, String>, left: &str, right: &str) {
+    let left = lineage_root(parents, left);
+    let right = lineage_root(parents, right);
+    if left < right {
+        parents.insert(right, left);
+    } else if right < left {
+        parents.insert(left, right);
+    }
 }
 
 fn matches_filters(feature: &BTreeMap<String, String>, query: &PatternQuery) -> bool {
@@ -485,15 +607,13 @@ fn support_summary(
     confirmed_findings: &BTreeSet<(String, String)>,
     now: u64,
 ) -> SupportSummary {
-    // Линия наблюдения — идентичность Git-базы (`repository_id`), а не head и не
-    // workspace_variant: смена версии или снимка внутри одного диапазона — это
-    // повторное чтение того же случая, а не новое независимое наблюдение.
-    // Внутри одного запуска `unit_id` уникален, поэтому сворачиваются ровно
-    // кросс-версионные и повторные записи одного и того же дефекта.
+    // Структурный unit_id уникален лишь внутри очереди. Независимая линия
+    // определяется точным Git-срезом и сохранёнными доказанными revision_of,
+    // поэтому одинаковая структура независимых PR не схлопывается.
     let mut representatives: BTreeMap<(String, String), &StoredUnit> = BTreeMap::new();
     for unit in members {
         representatives
-            .entry((unit.repository_id.clone(), unit.unit_id.clone()))
+            .entry((unit.observation_lineage.clone(), unit.unit_id.clone()))
             .and_modify(|current| {
                 // Линию представляет последнее наблюдение: если ревьюер изменил
                 // решение в следующей версии, действует именно оно. Порядок
@@ -788,7 +908,7 @@ fn load_case_links(
         let units: Vec<String> = parse_domain_json(&units, "связанные единицы повтора")?;
         for unit_id in units {
             let entry = links.entry((review_id.clone(), unit_id)).or_insert(kind);
-            // Явно доказанный повтор дефекта сильнее прочих связей той же единицы.
+            // Структурный аналог полезен для навигации, но не доказывает тот же дефект.
             if kind == CaseLinkKind::StructuralRepeat {
                 *entry = kind;
             }
@@ -903,7 +1023,7 @@ pub fn cases_for_signature(
 /// Рекомендации строятся для всей очереди разом, поэтому отдельный полный запрос
 /// на каждую единицу делал стоимость пропорциональной `очередь × история`.
 pub(super) fn evidence_for_signatures(
-    store: &LearningStore,
+    read: &LearningRead<'_>,
     signatures: &BTreeSet<String>,
     case_limit: usize,
     now: u64,
@@ -911,86 +1031,84 @@ pub(super) fn evidence_for_signatures(
     if signatures.is_empty() {
         return Ok(BTreeMap::new());
     }
-    store.read(|read| {
-        let units = load_units(read, &PatternQuery::default())?;
-        let findings = load_findings(read)?;
-        let confirmed_findings = load_confirmed_findings(read)?;
-        let links = load_case_links(read)?;
-        let mut members_by_signature: BTreeMap<String, Vec<StoredUnit>> = BTreeMap::new();
-        let mut signatures_by_unit: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-        for unit in units {
-            let signature = feature_signature(&unit.feature);
-            if signatures.contains(&signature) {
-                signatures_by_unit
-                    .entry((unit.review_id.clone(), unit.unit_id.clone()))
-                    .or_default()
-                    .insert(signature.clone());
-                members_by_signature
-                    .entry(signature)
-                    .or_default()
-                    .push(unit);
-            }
+    let units = load_units(read, &PatternQuery::default())?;
+    let findings = load_findings(read)?;
+    let confirmed_findings = load_confirmed_findings(read)?;
+    let links = load_case_links(read)?;
+    let mut members_by_signature: BTreeMap<String, Vec<StoredUnit>> = BTreeMap::new();
+    let mut signatures_by_unit: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for unit in units {
+        let signature = feature_signature(&unit.feature);
+        if signatures.contains(&signature) {
+            signatures_by_unit
+                .entry((unit.review_id.clone(), unit.unit_id.clone()))
+                .or_default()
+                .insert(signature.clone());
+            members_by_signature
+                .entry(signature)
+                .or_default()
+                .push(unit);
         }
+    }
 
-        let mut findings_by_signature: BTreeMap<String, Vec<StoredFinding>> = BTreeMap::new();
-        for finding in findings {
-            let linked_signatures: BTreeSet<&str> = finding
-                .units
-                .iter()
-                .filter_map(|unit_id| {
-                    signatures_by_unit.get(&(finding.review_id.clone(), unit_id.clone()))
-                })
-                .flat_map(|values| values.iter().map(String::as_str))
-                .collect();
-            for signature in linked_signatures {
-                findings_by_signature
-                    .entry(signature.to_owned())
-                    .or_default()
-                    .push(finding.clone());
-            }
+    let mut findings_by_signature: BTreeMap<String, Vec<StoredFinding>> = BTreeMap::new();
+    for finding in findings {
+        let linked_signatures: BTreeSet<&str> = finding
+            .units
+            .iter()
+            .filter_map(|unit_id| {
+                signatures_by_unit.get(&(finding.review_id.clone(), unit_id.clone()))
+            })
+            .flat_map(|values| values.iter().map(String::as_str))
+            .collect();
+        for signature in linked_signatures {
+            findings_by_signature
+                .entry(signature.to_owned())
+                .or_default()
+                .push(finding.clone());
         }
+    }
 
-        let mut evidence = BTreeMap::new();
-        for (signature, members) in members_by_signature {
-            let support = support_summary(
-                &members,
-                findings_by_signature
-                    .get(&signature)
-                    .map_or(&[], Vec::as_slice),
-                &confirmed_findings,
-                now,
-            );
-            let cases = members
-                .into_iter()
-                .take(case_limit)
-                .map(|unit| {
-                    let link = links
-                        .get(&(unit.review_id.clone(), unit.unit_id.clone()))
-                        .copied()
-                        .unwrap_or(CaseLinkKind::Unknown);
-                    PatternCaseRef {
-                        case: CaseRef {
-                            review_id: unit.review_id,
-                            unit_id: unit.unit_id,
-                            candidate_ids: if unit.sample_candidate.is_some() {
-                                unit.sample_candidate.into_iter().collect()
-                            } else {
-                                unit.representatives
-                            },
-                            path: unit.sample_path,
-                            snippet: unit.snippet,
-                            disposition: unit.disposition,
-                            trust: unit.trust,
-                            age_days: now.saturating_sub(unit.imported_at) / 86_400,
+    let mut evidence = BTreeMap::new();
+    for (signature, members) in members_by_signature {
+        let support = support_summary(
+            &members,
+            findings_by_signature
+                .get(&signature)
+                .map_or(&[], Vec::as_slice),
+            &confirmed_findings,
+            now,
+        );
+        let cases = members
+            .into_iter()
+            .take(case_limit)
+            .map(|unit| {
+                let link = links
+                    .get(&(unit.review_id.clone(), unit.unit_id.clone()))
+                    .copied()
+                    .unwrap_or(CaseLinkKind::Unknown);
+                PatternCaseRef {
+                    case: CaseRef {
+                        review_id: unit.review_id,
+                        unit_id: unit.unit_id,
+                        candidate_ids: if unit.sample_candidate.is_some() {
+                            unit.sample_candidate.into_iter().collect()
+                        } else {
+                            unit.representatives
                         },
-                        link,
-                    }
-                })
-                .collect();
-            evidence.insert(signature, SignatureEvidence { support, cases });
-        }
-        Ok(evidence)
-    })
+                        path: unit.sample_path,
+                        snippet: unit.snippet,
+                        disposition: unit.disposition,
+                        trust: unit.trust,
+                        age_days: now.saturating_sub(unit.imported_at) / 86_400,
+                    },
+                    link,
+                }
+            })
+            .collect();
+        evidence.insert(signature, SignatureEvidence { support, cases });
+    }
+    Ok(evidence)
 }
 
 /// Пустая заготовка отчёта без обращений к хранилищу.
@@ -1024,12 +1142,6 @@ pub fn require_supported(report: &PatternReport) -> Result<(), DomainError> {
         ));
     }
     Ok(())
-}
-
-/// Версия схемы, зафиксированная в отчёте.
-#[must_use]
-pub const fn schema_version() -> u32 {
-    LEARNING_SCHEMA_VERSION
 }
 
 /// Сериализуемое представление связи случая с текущим ревью.

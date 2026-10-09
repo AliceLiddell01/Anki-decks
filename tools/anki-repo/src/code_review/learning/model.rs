@@ -780,6 +780,10 @@ pub struct LearningExport {
     pub units: Vec<ReviewUnitRecord>,
     /// Кандидаты с сохранённой структурной классификацией.
     pub candidates: Vec<ExportedCandidate>,
+    /// Решения ревьюера с исходными покрытыми ID (с версии архива 4).
+    /// Старые архивы решений не сохраняли; они не восстанавливаются из эвристик.
+    #[serde(default)]
+    pub decisions: Vec<ExportedDecision>,
     /// Замечания в детерминированном порядке.
     pub findings: Vec<ExportedFinding>,
     /// Ссылки «кандидат — замечание».
@@ -796,6 +800,28 @@ pub struct LearningExport {
     /// находил те же случаи. Архивы первой версии поля не содержат.
     #[serde(default)]
     pub search: Vec<ExportedSearchCase>,
+}
+
+/// Исходное семантическое решение ревьюера в переносимом архиве.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportedDecision {
+    /// Ревью, которому принадлежит решение.
+    pub review_id: String,
+    /// Исходный ID решения, без изменения при переносе.
+    pub decision_id: String,
+    /// Вид: `individual` либо `group`.
+    pub kind: String,
+    /// Исходный семантический результат.
+    pub disposition: String,
+    /// Причина семантического решения.
+    pub reason_code: String,
+    /// Объяснение ревьюера.
+    pub explanation: String,
+    /// Число покрытых кандидатов.
+    pub candidate_count: usize,
+    /// Полное покрытие решения; порядок сохраняется при переносе.
+    pub covered_candidate_ids: Vec<String>,
 }
 
 /// Поисковый случай, перенесённый вместе с историей.
