@@ -111,6 +111,14 @@ pub struct CommandRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleStatus {
+    /// Подготовка идёт и ещё не подтвердила рабочее дерево.
+    ///
+    /// Состояние записывается под удержанной блокировкой задания до создания
+    /// runtime-каталогов и до `git worktree add`. Пока оно опубликовано,
+    /// задание не считается готовым к запуску: `Prepared` появляется только
+    /// последним шагом подготовки. Вариант добавлен аддитивно, поэтому
+    /// `EXECUTION_SCHEMA_VERSION` не меняется и прежние артефакты читаются.
+    Preparing,
     Prepared,
     Running,
     Completed,
@@ -469,28 +477,41 @@ pub fn prepare_job(
         directory,
         metadata,
     };
-    let initialized: Result<(), DomainError> = (|| {
+    let initialized: Result<File, DomainError> = (|| {
+        // Блокировка берётся сразу после создания каталога и до записи любых его
+        // файлов: иначе конкурентная операция успела бы «увести» блокировку у
+        // только что созданного задания, а `inspect` увидел бы каталог без
+        // `job.json`. Дальше блокировка удерживается на всём критическом участке
+        // подготовки: пока не опубликовано `Prepared`, никто не может ни
+        // запустить задание, ни удалить его ресурсы (конкурентный `cleanup`
+        // получает `ExecutionBusy`).
+        let lock = job_lock(&job.directory)?;
         write_document(&job.directory, "job.json", &job.metadata, false)?;
         write_new(&job.directory, "source-review.json", bytes)?;
-        let _lock = job_lock(&job.directory)?;
-        save_state(&job, LifecycleStatus::Prepared, false)
+        // `Preparing` публикуется до создания runtime-каталогов и до
+        // `git worktree add`: даже падение на этом шаге не оставит ложное `Prepared`.
+        save_state(&job, LifecycleStatus::Preparing, false)?;
+        Ok(lock)
     })();
-    if let Err(error) = initialized {
-        if let Err(cleanup_error) = remove_partial_job_directory(
-            &job_runs_directory(&job.root, &job.metadata.namespace, &job.metadata.source),
-            &job.metadata.job_id,
-        ) {
-            return Err(DomainError::with_details(
-                error.code,
-                format!(
-                    "{}; не удалось удалить частично созданное задание: {}",
-                    error.message, cleanup_error.message
-                ),
-                crate::details! { "job_dir" => job.directory.display().to_string(), "job_id" => job.metadata.job_id },
-            ));
+    let active_lock = match initialized {
+        Ok(lock) => lock,
+        Err(error) => {
+            if let Err(cleanup_error) = remove_partial_job_directory(
+                &job_runs_directory(&job.root, &job.metadata.namespace, &job.metadata.source),
+                &job.metadata.job_id,
+            ) {
+                return Err(DomainError::with_details(
+                    error.code,
+                    format!(
+                        "{}; не удалось удалить частично созданное задание: {}",
+                        error.message, cleanup_error.message
+                    ),
+                    crate::details! { "job_dir" => job.directory.display().to_string(), "job_id" => job.metadata.job_id },
+                ));
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     let preparation: Result<(), DomainError> = (|| {
         for surface in SURFACES {
             ensure_dir(&job.directory.join(surface))?;
@@ -500,25 +521,87 @@ pub fn prepare_job(
         command
             .arg(job.worktree())
             .arg(&job.metadata.source.snapshot.head_sha);
-        git_success(command, "создание рабочего дерева с detached HEAD")?;
+        git_success_redacting(
+            command,
+            "создание рабочего дерева с detached HEAD",
+            &[&job.directory, &job.worktree()],
+        )?;
         let mut command = trusted_git(&job.worktree(), &job.directory.join("hooks"))?;
         command.args([
             "checkout",
             "--detach",
             &job.metadata.source.snapshot.head_sha,
         ]);
-        git_success(command, "извлечение точного source")?;
-        Ok(())
+        git_success_redacting(
+            command,
+            "извлечение точного source",
+            &[&job.directory, &job.worktree()],
+        )?;
+        verify_prepared_worktree(&job)
     })();
     if let Err(error) = preparation {
-        save_state(&job, LifecycleStatus::PreparationFailed, false)?;
+        let state_error = save_state(&job, LifecycleStatus::PreparationFailed, false).err();
+        let unlock_error = fs2::FileExt::unlock(&active_lock).err().map(process_error);
+        drop(active_lock);
+        let mut message = error.message;
+        if let Some(state_error) = &state_error {
+            message.push_str(&format!(
+                "; не удалось сохранить состояние PreparationFailed: {}",
+                state_error.message
+            ));
+        }
+        if let Some(unlock_error) = &unlock_error {
+            message.push_str(&format!(
+                "; не удалось освободить блокировку: {}",
+                unlock_error.message
+            ));
+        }
         return Err(DomainError::with_details(
             error.code,
-            error.message,
-            crate::details! { "job_dir" => job.directory.display().to_string(), "job_id" => job.metadata.job_id },
+            message,
+            crate::details! {
+                "job_dir" => job.directory.display().to_string(),
+                "job_id" => job.metadata.job_id,
+                "state_save_error" => state_error.map_or_else(String::new, |error| error.message),
+                "unlock_error" => unlock_error.map_or_else(String::new, |error| error.message),
+            },
         ));
     }
+    // Последний шаг подготовки: `Prepared` публикуется только после полного
+    // создания и проверки рабочего дерева и всё ещё под той же блокировкой.
+    let published = save_state(&job, LifecycleStatus::Prepared, false);
+    // Освобождение явное, а не закрытием дескриптора: копия дескриптора,
+    // унаследованная параллельным fork, иначе удерживала бы flock до своего exec.
+    let unlocked = fs2::FileExt::unlock(&active_lock).map_err(process_error);
+    drop(active_lock);
+    published?;
+    unlocked?;
     Ok(job)
+}
+
+/// Подтверждает, что созданное рабочее дерево стоит на закреплённом HEAD.
+fn verify_prepared_worktree(job: &PreparedJob) -> Result<(), DomainError> {
+    let mut command = trusted_git(&job.worktree(), &job.directory.join("hooks"))?;
+    command.args(["rev-parse", "HEAD"]);
+    let output = command.output().map_err(process_error)?;
+    if !output.status.success() {
+        return Err(DomainError::new(
+            ErrorCode::ProcessOperationFailed,
+            format!(
+                "Git не смог подтвердить HEAD подготовленного рабочего дерева: {}",
+                stable_message(
+                    &String::from_utf8_lossy(&output.stderr),
+                    &[&job.directory, &job.worktree()],
+                )
+            ),
+        ));
+    }
+    if String::from_utf8_lossy(&output.stdout).trim() != job.metadata.source.snapshot.head_sha {
+        return Err(invalid(
+            "Подготовленное рабочее дерево не соответствует закреплённому HEAD",
+        ));
+    }
+    Ok(())
 }
 
 /// Открытие существующего задания не исполняет код и не возобновляет незавершённый запуск.
@@ -598,9 +681,11 @@ pub fn run_job(
     let active_lock = job_lock(&job.directory)?;
     let state = verify_owner(job)?;
     if state.lifecycle != LifecycleStatus::Prepared || state.workspace_removed {
-        return Err(conflict(
-            "Задание уже исполнялось, не готово или его рабочая область удалена",
-        ));
+        return Err(conflict(if state.lifecycle == LifecycleStatus::Preparing {
+            "Подготовка задания не завершена: рабочее дерево не подтверждено, запуск запрещён"
+        } else {
+            "Задание уже исполнялось, не готово или его рабочая область удалена"
+        }));
     }
     let _slot = execution_slot(&job.root, request.options.max_parallel_jobs)?;
     let cwd = source_cwd(job, &request.cwd)?;
@@ -787,7 +872,10 @@ pub fn run_job(
 /// Маркер отмены создаётся атомарно, независимо от блокировки активного задания.
 pub fn request_cancel(directory: &Path) -> Result<JobInspection, DomainError> {
     let inspection = inspect_job(directory)?;
-    if inspection.lifecycle == LifecycleStatus::Prepared
+    // `Preparing` тоже принимает маркер: иначе отмена идущей подготовки молча
+    // ничего не делала бы, а завершённое задание сразу увидело бы её при запуске.
+    if inspection.lifecycle == LifecycleStatus::Preparing
+        || inspection.lifecycle == LifecycleStatus::Prepared
         || inspection.lifecycle == LifecycleStatus::Running
     {
         let dir = safe_dir(&absolute_path(directory)?)?;
@@ -828,22 +916,31 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
             "Исполнитель не удерживает lock; потомки и полнота evidence не проверены, автоматическая очистка запрещена."
         }.into());
     }
-    let result = match read_document::<ExecutionResult>(&directory, "result.json") {
-        Ok(result) => {
-            validate_result(&metadata, &result)?;
-            Some(result)
-        }
-        Err(error)
-            if directory
-                .join("result.json")
-                .symlink_metadata()
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            let _ = error;
-            None
-        }
-        Err(error) => return Err(error),
-    };
+    if lifecycle == LifecycleStatus::Preparing {
+        // `Preparing` никогда не выдаётся за готовое задание: различаем идущую,
+        // брошенную и уже очищенную подготовку по той же блокировке, которой
+        // пользуется cleanup.
+        limitations.push(
+            match (lock_is_active(&directory)?, state.workspace_removed) {
+                (true, _) => "Подготовка задания выполняется другим процессом: рабочее дерево и runtime-каталоги ещё не подтверждены, запуск и очистка недоступны до её завершения.",
+                (false, true) => "Подготовка задания не завершена, ресурсы частичного задания удалены очисткой: код не запускался, рабочее дерево не подтверждено, запуск запрещён.",
+                (false, false) => "Подготовка задания не завершена и её никто не удерживает: исполнитель прерван до публикации готового состояния. Рабочее дерево не подтверждено, запуск запрещён; очистка допустима, потому что код этого задания не запускался.",
+            }
+            .into(),
+        );
+    }
+    // Отсутствие результата определяет один `openat`: повторная проверка пути после
+    // ошибки чтения гонится с исполнителем, публикующим `result.json` в этот момент.
+    let result =
+        match read_optional_file_at(&safe_dir(&directory)?, "result.json", MAX_DOCUMENT_BYTES)? {
+            Some(bytes) => {
+                let result: ExecutionResult = serde_json::from_slice(&bytes)
+                    .map_err(|e| invalid(format!("невалидный result.json: {e}")))?;
+                validate_result(&metadata, &result)?;
+                Some(result)
+            }
+            None => None,
+        };
     if lifecycle == LifecycleStatus::Completed && result.is_none() {
         return Err(invalid(
             "Завершённое задание не имеет типизированного результата",
@@ -943,7 +1040,12 @@ pub fn cleanup_workspace_with_options(
     let _lock = job_lock_at(&directory)?;
     let state = verify_owner_at(job, &directory)?;
     let not_started = match state.lifecycle {
-        LifecycleStatus::Prepared | LifecycleStatus::PreparationFailed => true,
+        // Блокировка задания удержана этим вызовом, поэтому `Preparing` здесь
+        // доказуемо означает брошенную подготовку: код этого задания не запускался.
+        // Идущую подготовку сюда не пропускает `job_lock_at` (ExecutionBusy).
+        LifecycleStatus::Preparing
+        | LifecycleStatus::Prepared
+        | LifecycleStatus::PreparationFailed => true,
         LifecycleStatus::Completed => {
             let result: ExecutionResult = read_document_at(&directory, "result.json")?;
             validate_result(&job.metadata, &result)?;
@@ -958,6 +1060,25 @@ pub fn cleanup_workspace_with_options(
             return Err(conflict(
                 "После операторской очистки отсутствует принадлежащее заданию подтверждение",
             ));
+        }
+        // Повторная очистка обязана убрать собственную застарелую запись Git:
+        // иначе она рапортует успех, оставляя запись навсегда.
+        if let Err(error) = remove_stale_own_worktree_records(job, &cleanup_hooks(&directory)?) {
+            return Ok(CleanupResult {
+                job_id: job.metadata.job_id.clone(),
+                workspace_removed: false,
+                evidence_retained: true,
+                limitation: Some(match limitation {
+                    Some(limit) => format!(
+                        "{limit} Застарелая запись рабочего дерева не удалена: {}",
+                        error.message
+                    ),
+                    None => format!(
+                        "Застарелая запись рабочего дерева не удалена: {}",
+                        error.message
+                    ),
+                }),
+            });
         }
         return Ok(CleanupResult {
             job_id: job.metadata.job_id.clone(),
@@ -986,6 +1107,10 @@ pub fn cleanup_workspace_with_options(
     let surfaces = cleanup_preflight(job, &directory)?;
     let worktree_exists = surfaces.iter().any(|(name, _)| name == "worktree");
     let owned_path = cleanup_descriptor_path(&directory)?;
+    // Проверка HEAD относится только к завершённой подготовке: у `Preparing`
+    // рабочее дерево могло быть создано частично, а запуск кода доказанно
+    // невозможен (состояние и удержанная блокировка). Удаление идёт по
+    // закреплённому дескриптору поверхности, а не по внешнему пути.
     if worktree_exists && state.lifecycle == LifecycleStatus::Prepared {
         let mut command = Command::new("git");
         command
@@ -1030,6 +1155,29 @@ pub fn cleanup_workspace_with_options(
                     )
                 }
                 None => error.message,
+            }),
+        });
+    }
+    // Каталога рабочего дерева может уже не быть: прежняя очистка успела удалить
+    // каталог и была прервана до удаления административной записи, либо запись
+    // не удалилась с первого раза. Свою запись убираем и в этом состоянии, чтобы
+    // очистка не отчитывалась об успехе, оставляя prunable-запись навсегда.
+    if !worktree_exists
+        && let Err(error) = remove_stale_own_worktree_records(job, &cleanup_hooks(&directory)?)
+    {
+        return Ok(CleanupResult {
+            job_id: job.metadata.job_id.clone(),
+            workspace_removed: false,
+            evidence_retained: true,
+            limitation: Some(match limitation {
+                Some(limit) => format!(
+                    "{limit} Застарелая запись рабочего дерева не удалена: {}",
+                    error.message
+                ),
+                None => format!(
+                    "Застарелая запись рабочего дерева не удалена: {}",
+                    error.message
+                ),
             }),
         });
     }
@@ -1164,10 +1312,213 @@ fn remove_cleanup_worktree(
         .find(|(name, _)| name == "worktree")
         .ok_or_else(|| conflict("Нет закреплённого рабочего дерева для очистки"))?;
     let path = cleanup_descriptor_path(&source.1)?;
-    let hooks = cleanup_descriptor_path(directory)?.join("hooks");
+    let hooks = cleanup_hooks(directory)?;
+    if worktree_marker_present(&source.1)? {
+        let records = own_worktree_records(job, &source.1, &hooks)?;
+        if records.iter().any(|record| record.locked) {
+            return Err(DomainError::new(
+                ErrorCode::ProcessOperationFailed,
+                "Удаление рабочего дерева не выполнено: оно защищено явной блокировкой Git. Снимите её вручную командой `git worktree unlock` для рабочего дерева этого задания, затем повторите очистку.",
+            ));
+        }
+    }
     let mut command = trusted_git(&job.root, &hooks)?;
-    command.args(["worktree", "remove", "--force"]).arg(path);
-    git_success(command, "очистка собственного рабочего дерева")
+    command.args(["worktree", "remove", "--force"]).arg(&path);
+    let output = command.output().map_err(process_error)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let reason = stable_message(
+        &String::from_utf8_lossy(&output.stderr),
+        &[&path, &job.directory, &job.worktree(), &job.root],
+    );
+    // Административные записи Git, указывающие ровно на рабочее дерево этого
+    // задания: чужие записи не перечисляются и не удаляются.
+    let records = own_worktree_records(job, &source.1, &hooks)?;
+    if worktree_marker_present(&source.1)? {
+        // Каталог остаётся рабочим деревом Git: расхождение регистрации
+        // (например, перемещённый каталог задания) — честный отказ, чужие
+        // ресурсы и записи Git не трогаются. Явную блокировку Git не снимаем:
+        // её мог поставить оператор, чтобы сохранить рабочее дерево.
+        if records.iter().any(|record| record.locked) {
+            return Err(DomainError::new(
+                ErrorCode::ProcessOperationFailed,
+                format!(
+                    "Удаление рабочего дерева не выполнено: {reason}; оно защищено явной блокировкой Git. Снимите её вручную командой `git worktree unlock` для рабочего дерева этого задания, затем повторите очистку."
+                ),
+            ));
+        }
+        return Err(DomainError::new(
+            ErrorCode::ProcessOperationFailed,
+            format!("Удаление рабочего дерева не завершено: {reason}"),
+        ));
+    }
+    // Git о каталоге не знает (авария внутри `git worktree add`): удаляем
+    // собственный каталог тем же путём, что и остальные поверхности, и ровно
+    // свою застарелую запись. Репозиторий целиком не чистится: чужие записи,
+    // включая prunable, остаются на месте.
+    remove_cleanup_runtime(directory, "worktree", surfaces)?;
+    for record in &records {
+        remove_own_worktree_record(record)?;
+    }
+    Ok(())
+}
+
+/// Административная запись Git о рабочем дереве, принадлежащая заданию.
+struct OwnWorktreeRecord {
+    directory: PathBuf,
+    locked: bool,
+}
+
+/// Перечисляет административные записи Git, которые указывают на `.git` именно
+/// закреплённого рабочего дерева задания.
+///
+/// Принадлежность подтверждается дважды: содержимым файла `gitdir` записи и
+/// совпадением каталога по внешнему пути с закреплённым дескриптором. Записи
+/// чужих рабочих деревьев не возвращаются.
+fn own_worktree_records(
+    job: &PreparedJob,
+    worktree: &File,
+    hooks: &Path,
+) -> Result<Vec<OwnWorktreeRecord>, DomainError> {
+    let pinned = worktree.metadata().map_err(read_error)?;
+    match fs::metadata(job.worktree()) {
+        Ok(actual) if same_directory(&pinned, &actual) => (),
+        // Каталог задания подменён, перемещён или недоступен: записи не трогаем.
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(read_error(error)),
+    }
+    own_worktree_records_by_gitdir(job, hooks)
+}
+
+/// Убирает собственную административную запись Git, когда каталога рабочего
+/// дерева уже нет.
+///
+/// Прерванная очистка (или разовый отказ удаления записи после удаления
+/// каталога) оставляет нашу запись без каталога: Git считает её prunable и
+/// удаляет без ожидания grace period, а инструмент обязан убрать свой мусор сам,
+/// иначе повторная очистка рапортует успех, оставляя запись навсегда.
+///
+/// Владение подтверждается двумя независимыми фактами: запись
+/// зарегистрирована в административном каталоге ЭТОГО репозитория, а её файл
+/// `gitdir` точно указывает на `<job>/worktree/.git` — путь, которым владеет
+/// только это задание и который берётся из манифеста задания, а не из
+/// файловой системы. Признак закреплённого дескриптора здесь недоступен:
+/// каталога уже нет. Его отсутствие не превращается в отказ от удаления
+/// собственной записи — но и живой каталог на пути задания не трогается.
+fn remove_stale_own_worktree_records(job: &PreparedJob, hooks: &Path) -> Result<(), DomainError> {
+    // Пока каталог на месте, за запись отвечает `remove_cleanup_worktree`:
+    // там владение подтверждается закреплённым дескриптором.
+    match fs::symlink_metadata(job.worktree()) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(read_error(error)),
+    }
+    for record in own_worktree_records_by_gitdir(job, hooks)? {
+        remove_own_worktree_record(&record)?;
+    }
+    Ok(())
+}
+
+/// Перечисляет записи административного каталога этого репозитория, чей `gitdir`
+/// указывает на `<job>/worktree/.git`. Совпадение пути обязательно: записи чужих
+/// рабочих деревьев не возвращаются.
+fn own_worktree_records_by_gitdir(
+    job: &PreparedJob,
+    hooks: &Path,
+) -> Result<Vec<OwnWorktreeRecord>, DomainError> {
+    let expected = job.worktree().join(".git");
+    let admin = worktree_admin_directory(job, hooks)?;
+    let entries = match fs::read_dir(&admin) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(read_error(error)),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(read_error)?;
+        let directory = entry.path();
+        if !entry.file_type().map_err(read_error)?.is_dir() {
+            continue;
+        }
+        let Ok(gitdir) = fs::read_to_string(directory.join("gitdir")) else {
+            continue;
+        };
+        if !same_record_target(&gitdir, &expected) {
+            continue;
+        }
+        records.push(OwnWorktreeRecord {
+            locked: directory.join("locked").is_file(),
+            directory,
+        });
+    }
+    Ok(records)
+}
+
+/// Каталог hooks, который передаётся Git во время очистки задания.
+fn cleanup_hooks(directory: &File) -> Result<PathBuf, DomainError> {
+    Ok(cleanup_descriptor_path(directory)?.join("hooks"))
+}
+
+/// Каталог административных записей рабочих деревьев репозитория задания.
+fn worktree_admin_directory(job: &PreparedJob, hooks: &Path) -> Result<PathBuf, DomainError> {
+    let mut command = trusted_git(&job.root, hooks)?;
+    command.args(["rev-parse", "--git-path", "worktrees"]);
+    let output = command.output().map_err(process_error)?;
+    if !output.status.success() {
+        return Err(DomainError::new(
+            ErrorCode::ProcessOperationFailed,
+            "Git не смог определить каталог административных записей рабочих деревьев",
+        ));
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        job.root.join(path)
+    })
+}
+
+/// Сверяет точный путь из административной записи с ожидаемым `.git` задания.
+fn same_record_target(recorded: &str, expected: &Path) -> bool {
+    Path::new(recorded.trim()) == expected
+}
+
+/// Совпадают ли два каталога: подтверждение принадлежности записи заданию.
+#[cfg(unix)]
+fn same_directory(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_directory(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
+}
+
+/// Удаляет административную запись, принадлежащую заданию. Чужие записи сюда не
+/// попадают: путь получен перечислением каталога записей, а принадлежность
+/// подтверждена содержимым `gitdir` и закреплённым каталогом.
+fn remove_own_worktree_record(record: &OwnWorktreeRecord) -> Result<(), DomainError> {
+    let metadata = fs::symlink_metadata(&record.directory).map_err(read_error)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(conflict(
+            "Административная запись рабочего дерева заменена не каталогом; ресурсы сохранены",
+        ));
+    }
+    fs::remove_dir_all(&record.directory).map_err(write_error)
+}
+
+/// Есть ли у закреплённого каталога признак рабочего дерева Git: без него Git о
+/// каталоге не знает и административной записи быть не может.
+fn worktree_marker_present(worktree: &File) -> Result<bool, DomainError> {
+    let marker = cleanup_descriptor_path(worktree)?.join(".git");
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(read_error(error)),
+    }
 }
 fn remove_cleanup_runtime(
     directory: &File,
@@ -1653,7 +2004,10 @@ fn verify_worktree_head(job: &PreparedJob) -> Result<(), DomainError> {
             ErrorCode::ProcessOperationFailed,
             format!(
                 "Git не смог прочитать HEAD рабочего дерева: {}",
-                String::from_utf8_lossy(&output.stderr)
+                stable_message(
+                    &String::from_utf8_lossy(&output.stderr),
+                    &[&job.directory, &job.worktree()],
+                )
             ),
         ));
     }
@@ -1728,15 +2082,57 @@ fn trusted_git(root: &Path, hooks: &Path) -> Result<Command, DomainError> {
     }
     Ok(command)
 }
-fn git_success(mut command: Command, operation: &str) -> Result<(), DomainError> {
+/// Сообщения Git не должны раскрывать сырые локальные пути: `paths` — известные
+/// вызывающему пути задания, которые заменяются стабильным описанием.
+fn git_success_redacting(
+    mut command: Command,
+    operation: &str,
+    paths: &[&Path],
+) -> Result<(), DomainError> {
     let output = command.output().map_err(process_error)?;
     if !output.status.success() {
         return Err(DomainError::new(
             ErrorCode::ProcessOperationFailed,
-            format!("{operation}: {}", String::from_utf8_lossy(&output.stderr)),
+            format!(
+                "{operation}: {}",
+                stable_message(&String::from_utf8_lossy(&output.stderr), paths)
+            ),
         ));
     }
     Ok(())
+}
+
+/// Заменяет сырые локальные пути стабильным описанием: и перечисленные пути
+/// задания, и закреплённые дескрипторы вида `/proc/<pid>/fd/<n>`.
+fn stable_message(message: &str, paths: &[&Path]) -> String {
+    let mut text = message.to_owned();
+    for path in paths {
+        let raw = path.display().to_string();
+        if raw.len() > 1 {
+            text = text.replace(&raw, "<путь задания>");
+        }
+    }
+    redact_descriptor_paths(&text)
+}
+
+/// Дескриптор вида `/proc/<pid>/fd/<n>` заменяется описанием без номера процесса.
+fn redact_descriptor_paths(message: &str) -> String {
+    const MARKER: &str = "/proc/";
+    let mut text = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(index) = rest.find(MARKER) {
+        text.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        let end = tail
+            .find(|symbol: char| {
+                symbol.is_whitespace() || matches!(symbol, '\'' | '"' | ',' | ')' | ']' | ':' | ';')
+            })
+            .unwrap_or(tail.len());
+        text.push_str("<закреплённый дескриптор задания>");
+        rest = &tail[end..];
+    }
+    text.push_str(rest);
+    text
 }
 fn verify_owner(job: &PreparedJob) -> Result<State, DomainError> {
     verify_owner_at(job, &safe_dir(&job.directory)?)
@@ -1782,20 +2178,10 @@ fn save_state(
     )
 }
 fn cancel_requested(job: &PreparedJob) -> Result<bool, DomainError> {
-    match read_bytes(&job.directory, "cancel.json", 128) {
-        Ok(bytes) if bytes == job.metadata.owner_nonce.as_bytes() => Ok(true),
-        Ok(_) => Err(invalid("Владелец маркера отмены не совпадает с заданием")),
-        Err(error)
-            if job
-                .directory
-                .join("cancel.json")
-                .symlink_metadata()
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            let _ = error;
-            Ok(false)
-        }
-        Err(error) => Err(error),
+    match read_optional_file_at(&safe_dir(&job.directory)?, "cancel.json", 128)? {
+        None => Ok(false),
+        Some(bytes) if bytes == job.metadata.owner_nonce.as_bytes() => Ok(true),
+        Some(_) => Err(invalid("Владелец маркера отмены не совпадает с заданием")),
     }
 }
 fn output_evidence(
@@ -3613,6 +3999,29 @@ mod tests {
                 .limitations
                 .iter()
                 .any(|text| text.contains("групп"))
+        );
+    }
+
+    #[test]
+    fn stable_message_hides_descriptor_and_workspace_paths() {
+        let directory = Path::new("/корень/задания/текущее");
+        let message = format!(
+            "fatal: '{}' is not a working tree; /proc/4242/fd/17 недоступен",
+            directory.display()
+        );
+        let stable = stable_message(&message, &[directory]);
+        assert!(stable.contains("<путь задания>"), "{stable}");
+        assert!(
+            stable.contains("<закреплённый дескриптор задания>"),
+            "{stable}"
+        );
+        assert!(!stable.contains("/proc/"), "{stable}");
+        assert!(!stable.contains("4242"), "{stable}");
+        assert!(!stable.contains("/корень"), "{stable}");
+        // Сообщение без локальных путей остаётся дословным.
+        assert_eq!(
+            stable_message("fatal: not a git repository", &[]),
+            "fatal: not a git repository"
         );
     }
 }

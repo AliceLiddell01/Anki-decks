@@ -31,6 +31,27 @@ pub const MAX_REVIEW_LIMIT: u64 = 200;
 /// Смещение страницы `review` по умолчанию.
 pub const DEFAULT_REVIEW_OFFSET: u64 = 0;
 
+/// Предел страницы команд `code-review learning` по умолчанию.
+///
+/// Значение берётся у владельца страницы очереди: у `learning` нет собственного
+/// «разумного» предела, а расходиться с уже принятыми границами набора он не
+/// должен.
+pub const DEFAULT_LEARNING_LIMIT: u64 = DEFAULT_QUEUE_LIST_LIMIT;
+/// Жёсткий максимум страницы команд `code-review learning`.
+pub const MAX_LEARNING_LIMIT: u64 = MAX_QUEUE_LIST_LIMIT;
+/// Предел числа паттернов в отчёте `learning patterns` по умолчанию.
+pub const DEFAULT_LEARNING_PATTERN_LIMIT: u64 = 20;
+/// Жёсткий максимум числа паттернов в отчёте `learning patterns`.
+pub const MAX_LEARNING_PATTERN_LIMIT: u64 = 200;
+/// Предел числа подсказок `learning recommend` по умолчанию.
+pub const DEFAULT_LEARNING_RECOMMEND_LIMIT: u64 = 50;
+/// Жёсткий максимум числа подсказок `learning recommend`.
+pub const MAX_LEARNING_RECOMMEND_LIMIT: u64 = 200;
+/// Предел исторических случаев на одну подсказку `learning recommend` по умолчанию.
+pub const DEFAULT_LEARNING_CASE_LIMIT: u64 = 3;
+/// Жёсткий максимум исторических случаев на одну подсказку.
+pub const MAX_LEARNING_CASE_LIMIT: u64 = 10;
+
 /// Предел выборки свидетельств `models` по умолчанию.
 ///
 /// Значение берётся у владельца операции, чтобы CLI-умолчание не разошлось с
@@ -134,6 +155,7 @@ impl Cli {
                     SemanticTriageCommand::Summary { .. } => "code-review triage summary",
                     SemanticTriageCommand::Report { .. } => "code-review triage report",
                 },
+                CodeReviewCommand::Learning { command, .. } => command.command_name(),
             },
             Command::Language { command } => match command {
                 LanguageCommand::Scan { .. } => "language scan",
@@ -592,6 +614,26 @@ pub enum CodeReviewCommand {
         #[command(subcommand)]
         command: SemanticTriageCommand,
     },
+
+    /// Локальная адаптивная память ревью: импорт истории, статистика, поиск, рекомендации, feedback и перенос.
+    ///
+    /// Learning — добавочный слой, а не источник семантической истины: он не
+    /// меняет `review.json`, `review-queue.json` и `semantic-triage.json` и не
+    /// создаёт семантических решений. Отсутствие истории не мешает обычному
+    /// ревью: `collect`, `verify`, `queue validate`, `triage validate` и
+    /// `execution` работают без базы learning и не создают её.
+    Learning {
+        /// Путь к локальной базе learning; по умолчанию .anki-repo/learning/state.sqlite от корня репозитория.
+        #[arg(
+            long = "db",
+            visible_alias = "database",
+            global = true,
+            value_name = "PATH"
+        )]
+        db: Option<PathBuf>,
+        #[command(subcommand)]
+        command: LearningCommand,
+    },
 }
 
 /// Операции чтения над очередью, привязанной к точным байтам `review.json`.
@@ -840,6 +882,491 @@ pub enum SemanticTriageCommand {
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
+}
+
+/// Операции локальной адаптивной памяти ревью.
+///
+/// Ни одна операция не создаёт семантических решений, не меняет исходные
+/// артефакты ревью и не обращается в сеть. Читающие операции не создают базу:
+/// отсутствие истории — это состояние, а не ошибка обычного ревью.
+#[derive(Debug, Subcommand)]
+pub enum LearningCommand {
+    /// Импортировать проверенную завершённую историю одного ревью.
+    #[command(
+        visible_alias = "ingest",
+        long_about = "Проверяет review.json, review-queue.json и необязательный semantic-triage.json \
+                      теми же валидаторами, что обычное ревью, и сохраняет историю локально.\n\
+                      Повторный импорт того же точного набора свидетельств не удваивает статистику; \
+                      другие байты при той же идентичности снимка оформляются как аудируемая ревизия. \
+                      --structure-only — явно маркированный ослабленный режим: запись помечается \
+                      карантином и исключается из обучения."
+    )]
+    Import {
+        /// Путь к исходному пакету свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Путь к структурной очереди `review-queue.json` для того же пакета.
+        #[arg(long, value_name = "QUEUE")]
+        queue: PathBuf,
+        /// Проверенный документ семантического разбора `semantic-triage.json`.
+        #[arg(long, value_name = "PATH")]
+        triage: Option<PathBuf>,
+        /// Результат завершённого изолированного задания; допускается не более одного файла.
+        #[arg(long = "execution", value_name = "PATH", action = clap::ArgAction::Append)]
+        execution: Vec<PathBuf>,
+        /// Ослабленный импорт по структурной проверке: запись помечается карантином.
+        #[arg(long)]
+        structure_only: bool,
+        /// Явный вариант источника: `root` либо `snapshot-<32 hex>`.
+        #[arg(long, default_value = "root", value_name = "VARIANT")]
+        variant: String,
+        /// Метка каталога ревью для аудита; путь клона в историю не попадает.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+
+    /// Показать состояние локальной истории learning, ничего не создавая.
+    Status,
+
+    /// Проверить схему, целостность и доступность поиска в локальной истории.
+    ///
+    /// Отсутствующая база — это `not_found`, более новая схема —
+    /// `learning_schema_unsupported`, повреждённый файл — `learning_corrupt`.
+    Validate,
+
+    /// Показать агрегированную статистику накопленной истории.
+    Stats {
+        /// Включать карантинные записи (по умолчанию исключены).
+        #[arg(long)]
+        include_quarantine: bool,
+        /// Предел числа записей истории в выводе.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_LEARNING_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_LEARNING_LIMIT),
+        )]
+        limit: u64,
+    },
+
+    /// Показать объяснимые структурные паттерны с фильтрами и лимитом.
+    Patterns {
+        /// Ограничение по детектору исходного сигнала.
+        #[arg(long, value_name = "DETECTOR")]
+        detector: Option<String>,
+        /// Ограничение по структурной роли.
+        #[arg(long, value_name = "ROLE")]
+        role: Option<StructuralRole>,
+        /// Ограничение по роли кода.
+        #[arg(long = "code-role", value_name = "CODE_ROLE")]
+        code_role: Option<CodeRole>,
+        /// Ограничение по происхождению сигнала.
+        #[arg(long, value_name = "ORIGIN")]
+        origin: Option<String>,
+        /// Включать карантинные записи (по умолчанию исключены).
+        #[arg(long)]
+        include_quarantine: bool,
+        /// Предел числа паттернов в отчёте.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_LEARNING_PATTERN_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_LEARNING_PATTERN_LIMIT),
+        )]
+        limit: u64,
+        /// Отказать с `insufficient_evidence`, если ни один паттерн не подтверждён поддержкой.
+        #[arg(long)]
+        require_supported: bool,
+    },
+
+    /// Найти аналогичные исторические случаи локальным поиском.
+    #[command(
+        visible_alias = "similar",
+        long_about = "Ищет исторические случаи структурными фильтрами и локальной текстовой подстрокой.\n\
+                      FTS5 используется, если он собран и проиндексирован; иначе выполняется \
+                      воспроизводимый подстрочный поиск по тому же тексту. Карантинные записи \
+                      пониженного доверия по умолчанию исключены и включаются только явным \
+                      --include-quarantine: найденная аналогия — вспомогательный контекст, а не \
+                      основание, поэтому доверие возвращённого случая видно в выводе. Вывод всегда \
+                      ограничен страницей и не печатает полные списки candidate_ids."
+    )]
+    Search {
+        /// Текстовая подстрока (не менее двух символов).
+        #[arg(long, value_name = "TEXT")]
+        text: Option<String>,
+        /// Ограничение по детектору исходного сигнала.
+        #[arg(long, value_name = "DETECTOR")]
+        detector: Option<String>,
+        /// Ограничение по исполняемой поверхности: production, tests или unknown.
+        #[arg(long, value_name = "EXECUTION")]
+        execution: Option<QueueExecutionFilter>,
+        /// Ограничение по происхождению сигнала.
+        #[arg(long, value_name = "ORIGIN")]
+        origin: Option<String>,
+        /// Ограничение по структурной роли.
+        #[arg(long, value_name = "ROLE")]
+        role: Option<StructuralRole>,
+        /// Ограничение по роли кода.
+        #[arg(long = "code-role", value_name = "CODE_ROLE")]
+        code_role: Option<CodeRole>,
+        /// Ограничение по решению ревьюера.
+        #[arg(long, value_name = "DISPOSITION")]
+        disposition: Option<LearningDispositionArg>,
+        /// Ограничение по происхождению замечания.
+        #[arg(long, value_name = "PROVENANCE")]
+        provenance: Option<String>,
+        /// Ограничение по серьёзности замечания.
+        #[arg(long, value_name = "SEVERITY")]
+        severity: Option<String>,
+        /// Ограничение по `repository_id`.
+        #[arg(long = "repository", value_name = "ID")]
+        repository: Option<String>,
+        /// Включать карантинные записи (по умолчанию исключены).
+        #[arg(long)]
+        include_quarantine: bool,
+        /// Предел числа случаев на странице.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_LEARNING_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_LEARNING_LIMIT),
+        )]
+        limit: u64,
+        /// Смещение от начала отсортированных совпадений.
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+    },
+
+    /// Построить версионируемый документ рекомендаций для конкретного снимка.
+    #[command(
+        long_about = "Строит производный recommendations artifact по текущему review.json + \
+                      review-queue.json и явно выбранной версии истории и политики.\n\
+                      Baseline priority и review-queue.json не изменяются; ни одна единица не \
+                      исключается из обязательного просмотра. Без доступной истории документ \
+                      явно помечается как режим без learning, а не выдаёт прошлую статистику за \
+                      доказанную безопасность. --out публикует только recommendations.json в \
+                      рабочей области пакета."
+    )]
+    Recommend {
+        /// Путь к исходному пакету свидетельств `review.json`.
+        #[arg(long, value_name = "PACK")]
+        pack: PathBuf,
+        /// Путь к структурной очереди `review-queue.json` для того же пакета.
+        #[arg(long, value_name = "QUEUE")]
+        queue: PathBuf,
+        /// Проверенный документ семантического разбора `semantic-triage.json`.
+        #[arg(long, value_name = "PATH")]
+        triage: Option<PathBuf>,
+        /// Ослабленная структурная проверка входа: подсказки не опираются на историю.
+        #[arg(long)]
+        structure_only: bool,
+        /// Явный вариант источника: `root` либо `snapshot-<32 hex>`.
+        #[arg(long, default_value = "root", value_name = "VARIANT")]
+        variant: String,
+        /// Метка каталога ревью для аудита.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+        /// Предел числа подсказок в документе.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_LEARNING_RECOMMEND_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_LEARNING_RECOMMEND_LIMIT),
+        )]
+        limit: u64,
+        /// Предел исторических случаев на одну подсказку.
+        #[arg(
+            long = "case-limit",
+            default_value_t = DEFAULT_LEARNING_CASE_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_LEARNING_CASE_LIMIT),
+        )]
+        case_limit: u64,
+        /// Ожидаемая ревизия истории; несовпадение — `source_changed`.
+        #[arg(long = "history-revision", value_name = "N")]
+        history_revision: Option<u64>,
+        /// Ожидаемая версия политики learning; несовпадение — `learning_schema_unsupported`.
+        #[arg(long = "policy-version", value_name = "N")]
+        policy_version: Option<u32>,
+        /// Штатный режим без истории: рекомендации не опираются на learning.
+        #[arg(long = "without-learning")]
+        without_learning: bool,
+        /// Требовать непустую проверенную историю; иначе — различимый отказ.
+        #[arg(long = "require-history")]
+        require_history: bool,
+        /// Только recommendations.json в рабочей области `.anki-repo/review/<PR|local>/<HEAD>[/snapshot-<32 hex>]/` пакета --pack.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
+    /// Обратная связь: оценка полезности рекомендации или аудируемая правка исхода.
+    Feedback {
+        #[command(subcommand)]
+        command: LearningFeedbackCommand,
+    },
+
+    /// Собрать переносимый архив проверенной истории.
+    Export {
+        /// Путь архива learning; существующий чужой файл не перезаписывается.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+
+    /// Создать транзакционный снимок базы (`VACUUM INTO`).
+    Backup {
+        /// Путь файла backup; существующий файл не перезаписывается.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+
+    /// Восстановить историю из переносимого архива с повторной проверкой digest.
+    Restore {
+        /// Архив, созданный `code-review learning export`.
+        #[arg(long = "archive", visible_alias = "from", value_name = "PATH")]
+        archive: PathBuf,
+    },
+
+    /// Удалить одну запись истории вместе с её производными данными.
+    #[command(
+        long_about = "Удаляет один review run и его дочерние записи из локальной SQLite-транзакции.\n\
+                      Операция необратима и требует явного --confirm. Review artifacts, исходники \
+                      и утверждённые файлы политики на диске не удаляются."
+    )]
+    Forget {
+        /// Идентификатор записи из `learning stats`.
+        #[arg(long = "review-id", value_name = "ID")]
+        review_id: String,
+        /// Подтвердить необратимое удаление указанного review run.
+        #[arg(long)]
+        confirm: bool,
+    },
+
+    /// Предложить, показать и утвердить версионируемую политику.
+    Policy {
+        #[command(subcommand)]
+        command: LearningPolicyCommand,
+    },
+}
+
+impl LearningCommand {
+    /// Стабильное имя подкоманды для JSON envelope.
+    #[must_use]
+    pub const fn command_name(&self) -> &'static str {
+        match self {
+            Self::Import { .. } => "code-review learning import",
+            Self::Status => "code-review learning status",
+            Self::Validate => "code-review learning validate",
+            Self::Stats { .. } => "code-review learning stats",
+            Self::Patterns { .. } => "code-review learning patterns",
+            Self::Search { .. } => "code-review learning search",
+            Self::Recommend { .. } => "code-review learning recommend",
+            Self::Feedback { command } => match command {
+                LearningFeedbackCommand::Record { .. } => "code-review learning feedback record",
+                LearningFeedbackCommand::List { .. } => "code-review learning feedback list",
+                LearningFeedbackCommand::Show { .. } => "code-review learning feedback show",
+            },
+            Self::Export { .. } => "code-review learning export",
+            Self::Backup { .. } => "code-review learning backup",
+            Self::Restore { .. } => "code-review learning restore",
+            Self::Forget { .. } => "code-review learning forget",
+            Self::Policy { command } => match command {
+                LearningPolicyCommand::Propose { .. } => "code-review learning policy propose",
+                LearningPolicyCommand::List { .. } => "code-review learning policy list",
+                LearningPolicyCommand::Show { .. } => "code-review learning policy show",
+                LearningPolicyCommand::Approve { .. } => "code-review learning policy approve",
+            },
+        }
+    }
+}
+
+/// Обратная связь по конкретному случаю истории.
+#[derive(Debug, Subcommand)]
+pub enum LearningFeedbackCommand {
+    /// Записать событие обратной связи.
+    #[command(visible_alias = "revise")]
+    Record {
+        /// Запись ревью, к которой относится утверждение.
+        #[arg(long = "review-id", value_name = "ID")]
+        review_id: String,
+        /// Единица очереди, к которой относится утверждение.
+        #[arg(long = "unit-id", value_name = "ID")]
+        unit_id: String,
+        /// Кандидат, если утверждение относится к нему.
+        #[arg(long = "candidate-id", value_name = "ID")]
+        candidate_id: Option<String>,
+        /// Вид утверждения: оценка полезности либо содержательная правка исхода.
+        #[arg(long, value_enum)]
+        kind: LearningFeedbackKindArg,
+        /// Действие по отношению к прежним утверждениям.
+        #[arg(long, value_enum, default_value_t = LearningFeedbackActionArg::Append)]
+        action: LearningFeedbackActionArg,
+        /// Новый действующий исход для содержательной правки.
+        #[arg(long, value_enum, value_name = "DISPOSITION")]
+        disposition: Option<LearningDispositionArg>,
+        /// Оценка полезности рекомендации.
+        #[arg(long, value_enum, value_name = "USEFULNESS")]
+        usefulness: Option<LearningUsefulnessArg>,
+        /// Заменяемое или отзываемое утверждение; обязательно для `supersede` и `retract`.
+        #[arg(long = "supersedes-event-id", value_name = "ID")]
+        supersedes_event_id: Option<String>,
+        /// Объяснение утверждения.
+        #[arg(long, value_name = "TEXT")]
+        explanation: String,
+        /// Источник утверждения: reviewer, operator, automation.
+        #[arg(long, default_value = "reviewer", value_name = "SOURCE")]
+        provenance: String,
+        /// Явный идентификатор события; без него идентификатор выводится из содержания.
+        #[arg(long = "event-id", value_name = "ID")]
+        event_id: Option<String>,
+    },
+
+    /// Показать аудит утверждений по одному случаю.
+    List {
+        /// Запись ревью.
+        #[arg(long = "review-id", value_name = "ID")]
+        review_id: String,
+        /// Единица очереди.
+        #[arg(long = "unit-id", value_name = "ID")]
+        unit_id: String,
+    },
+
+    /// Показать одно сохранённое событие обратной связи.
+    Show {
+        /// Идентификатор события.
+        #[arg(long = "event-id", value_name = "ID")]
+        event_id: String,
+    },
+}
+
+/// Жизненный цикл предложенного постоянного правила.
+#[derive(Debug, Subcommand)]
+pub enum LearningPolicyCommand {
+    /// Создать объяснимое предложение постоянного правила.
+    ///
+    /// Предложение никогда не применяется автоматически: оно перечисляет
+    /// подтверждающие и противоречащие случаи и требует явного утверждения
+    /// человеком через обычный контроль изменений.
+    Propose {
+        /// Точная подпись ключа признаков из `learning patterns`.
+        #[arg(long, value_name = "SIGNATURE")]
+        signature: String,
+        /// Идентификатор предлагаемого правила.
+        #[arg(long = "rule-id", value_name = "ID")]
+        rule_id: String,
+    },
+
+    /// Перечислить сохранённые предложения политики.
+    List {
+        /// Предел числа предложений в выводе.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_LEARNING_LIMIT,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_LEARNING_LIMIT),
+        )]
+        limit: u64,
+    },
+
+    /// Показать сохранённое предложение политики.
+    Show {
+        /// Идентификатор предложения.
+        #[arg(long = "id", value_name = "ID")]
+        id: String,
+    },
+
+    /// Материализовать утверждённый артефакт политики для ручного коммита.
+    ///
+    /// Команда не меняет базу как владельца политики и не выполняет
+    /// автопромоцию: утверждённый JSON пишется по явному пути и попадает в Git
+    /// только решением человека.
+    Approve {
+        /// Идентификатор утверждаемого предложения.
+        #[arg(long = "id", value_name = "ID")]
+        id: String,
+        /// Путь утверждённого артефакта политики внутри репозитория.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Пояснение к утверждению, сохраняемое в артефакте.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+}
+
+/// Вид утверждения обратной связи на уровне CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LearningFeedbackKindArg {
+    /// Оценка полезности сгенерированной рекомендации.
+    Usefulness,
+    /// Содержательная правка исхода семантического рассмотрения.
+    SemanticOutcomeRevision,
+}
+
+impl LearningFeedbackKindArg {
+    /// Значение для истории learning.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Usefulness => "recommendation_usefulness",
+            Self::SemanticOutcomeRevision => "semantic_outcome_revision",
+        }
+    }
+}
+
+/// Действие обратной связи на уровне CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LearningFeedbackActionArg {
+    /// Новое утверждение; при конфликте запись отклоняется.
+    Append,
+    /// Отзыв ранее сохранённого утверждения.
+    Retract,
+    /// Явная замена ранее сохранённого утверждения.
+    Supersede,
+}
+
+/// Содержательное решение ревьюера на уровне CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LearningDispositionArg {
+    /// Подтверждённый дефект.
+    Confirmed,
+    /// Допустимое поведение.
+    Acceptable,
+    /// Ложное срабатывание.
+    FalsePositive,
+    /// Неприменимое замечание.
+    NotApplicable,
+    /// Неопределённый исход.
+    Uncertain,
+}
+
+impl LearningDispositionArg {
+    /// Значение, принятое историей learning.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Acceptable => "acceptable",
+            Self::FalsePositive => "false_positive",
+            Self::NotApplicable => "not_applicable",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+/// Оценка полезности рекомендации на уровне CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LearningUsefulnessArg {
+    /// Подсказка помогла.
+    Useful,
+    /// Подсказка не помогла.
+    NotUseful,
+    /// Подсказка помогла частично.
+    PartiallyUseful,
+}
+
+impl LearningUsefulnessArg {
+    /// Значение, принятое историей learning.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Useful => "useful",
+            Self::NotUseful => "not_useful",
+            Self::PartiallyUseful => "partially_useful",
+        }
+    }
 }
 
 /// Подкоманды языковой проверки.

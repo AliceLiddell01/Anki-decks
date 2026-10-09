@@ -16,6 +16,22 @@ mod edit_contract;
 mod edit_source_preservation;
 #[path = "export_contract.rs"]
 mod export_contract;
+#[path = "learning_cli_contract.rs"]
+mod learning_cli_contract;
+#[path = "learning_cli_regressions.rs"]
+mod learning_cli_regressions;
+#[path = "learning_contract.rs"]
+mod learning_contract;
+#[path = "learning_feedback_search_regressions.rs"]
+mod learning_feedback_search_regressions;
+#[path = "learning_import_regressions.rs"]
+mod learning_import_regressions;
+#[path = "learning_patterns_regressions.rs"]
+mod learning_patterns_regressions;
+#[path = "learning_store_regressions.rs"]
+mod learning_store_regressions;
+#[path = "learning_transfer_regressions.rs"]
+mod learning_transfer_regressions;
 #[path = "note_lifecycle_contract.rs"]
 mod note_lifecycle_contract;
 #[path = "qa_contract.rs"]

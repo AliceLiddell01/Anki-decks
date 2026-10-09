@@ -583,31 +583,74 @@ fn load_validated_review_queue(
     Ok((pack, queue, summary, syntax_authenticity))
 }
 
-fn validate_queue_authenticity(
-    queue: &ReviewQueue,
+/// Проверенная очередь вместе с точными байтами обоих документов, сводкой и контекстами.
+pub(crate) type LoadedReviewQueue = (
+    ReviewPack,
+    Vec<u8>,
+    ReviewQueue,
+    Vec<u8>,
+    QueueSummary,
+    SyntaxAuthenticityStatus,
+    BTreeMap<String, review_queue::SyntaxContext>,
+);
+
+/// Валидирует уже прочитанные документы, сохраняя связь между разобранным
+/// содержимым, точными байтами, по которым вычисляются digest, и контекстами.
+/// Доверенный путь с `structure_only = false` восстанавливает контексты по
+/// точным Git-образам; при их недоступности возвращается
+/// `syntax_authenticity_unavailable`, а не молчаливый переход к структурной проверке.
+pub(crate) fn validate_review_queue_with_contexts(
+    pack: ReviewPack,
+    pack_bytes: Vec<u8>,
+    queue: ReviewQueue,
+    queue_bytes: Vec<u8>,
+    structure_only: bool,
+) -> Result<LoadedReviewQueue, DomainError> {
+    let source_pack_sha256 = sha256_hex(&pack_bytes);
+    if structure_only {
+        let summary = review_queue::validate(&queue, &pack, &source_pack_sha256)?;
+        return Ok((
+            pack,
+            pack_bytes,
+            queue,
+            queue_bytes,
+            summary,
+            SyntaxAuthenticityStatus::StructureOnly,
+            BTreeMap::new(),
+        ));
+    }
+    let contexts = queue_contexts_for_pack(&pack)?;
+    let summary =
+        review_queue::validate_with_syntax(&queue, &pack, &source_pack_sha256, &contexts)?;
+    Ok((
+        pack,
+        pack_bytes,
+        queue,
+        queue_bytes,
+        summary,
+        SyntaxAuthenticityStatus::Verified,
+        contexts,
+    ))
+}
+
+/// Восстанавливает авторитетные контексты классификации по точным Git-образам.
+///
+/// Публикуется внутри crate, чтобы независимые от CLI потребители (например
+/// импорт истории learning) проверяли очередь той же самой логикой, а не второй
+/// расходящейся копией.
+pub(crate) fn queue_contexts_for_pack(
     pack: &ReviewPack,
-    source_pack_sha256: &str,
-) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+) -> Result<BTreeMap<String, review_queue::SyntaxContext>, DomainError> {
     let root = repository_root(Path::new("."))
         .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
-    validate_queue_authenticity_in_repository(&root, queue, pack, source_pack_sha256)
+    queue_contexts_in_repository(&root, pack)
 }
 
-fn syntax_authenticity_unavailable(detail: String) -> DomainError {
-    DomainError::new(
-        ErrorCode::SyntaxAuthenticityUnavailable,
-        format!(
-            "точные образы Git для проверки подлинности синтаксической классификации недоступны: {detail}; используйте явный --structure-only, если достаточно проверки структуры и digest"
-        ),
-    )
-}
-
-fn validate_queue_authenticity_in_repository(
+/// Восстанавливает контексты из указанного корня репозитория.
+pub(crate) fn queue_contexts_in_repository(
     root: &Path,
-    queue: &ReviewQueue,
     pack: &ReviewPack,
-    source_pack_sha256: &str,
-) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+) -> Result<BTreeMap<String, review_queue::SyntaxContext>, DomainError> {
     let collected = scope::collect_scope(root, &pack.target.base_sha, &pack.target.head_sha)
         .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
     if collected.target.repository_id != pack.target.repository_id
@@ -633,6 +676,35 @@ fn validate_queue_authenticity_in_repository(
             "AST одного из исходников Rust разобрать не удалось; используйте явный --structure-only, если достаточно проверки структуры и digest",
         ));
     }
+    Ok(contexts)
+}
+
+fn validate_queue_authenticity(
+    queue: &ReviewQueue,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+    let root = repository_root(Path::new("."))
+        .map_err(|error| syntax_authenticity_unavailable(error.to_string()))?;
+    validate_queue_authenticity_in_repository(&root, queue, pack, source_pack_sha256)
+}
+
+fn syntax_authenticity_unavailable(detail: String) -> DomainError {
+    DomainError::new(
+        ErrorCode::SyntaxAuthenticityUnavailable,
+        format!(
+            "точные образы Git для проверки подлинности синтаксической классификации недоступны: {detail}; используйте явный --structure-only, если достаточно проверки структуры и digest"
+        ),
+    )
+}
+
+fn validate_queue_authenticity_in_repository(
+    root: &Path,
+    queue: &ReviewQueue,
+    pack: &ReviewPack,
+    source_pack_sha256: &str,
+) -> Result<(QueueSummary, SyntaxAuthenticityStatus), DomainError> {
+    let contexts = queue_contexts_in_repository(root, pack)?;
     let summary = review_queue::validate_with_syntax(queue, pack, source_pack_sha256, &contexts)?;
     Ok((summary, SyntaxAuthenticityStatus::Verified))
 }
@@ -2104,7 +2176,7 @@ fn read_json<T: DeserializeOwned>(path: &Path, limit: u64, what: &str) -> Result
     read_json_with_bytes(path, limit, what).map(|(document, _)| document)
 }
 
-fn read_review_pack(path: &Path) -> Result<(ReviewPack, Vec<u8>), DomainError> {
+pub(crate) fn read_review_pack(path: &Path) -> Result<(ReviewPack, Vec<u8>), DomainError> {
     let (pack, bytes) = read_json_with_bytes(
         path,
         MAX_REVIEW_ARTIFACT_BYTES,
@@ -2114,11 +2186,26 @@ fn read_review_pack(path: &Path) -> Result<(ReviewPack, Vec<u8>), DomainError> {
     Ok((pack, bytes))
 }
 
-fn read_json_with_bytes<T: DeserializeOwned>(
+pub(crate) fn read_json_with_bytes<T: DeserializeOwned>(
     path: &Path,
     limit: u64,
     what: &str,
 ) -> Result<(T, Vec<u8>), DomainError> {
+    let bytes = read_limited_bytes(path, limit, what)?;
+    let document = serde_json::from_slice(&bytes).map_err(|error| {
+        DomainError::new(
+            ErrorCode::ReviewArtifactInvalid,
+            format!("некорректный JSON в {what}: {error}"),
+        )
+    })?;
+    Ok((document, bytes))
+}
+
+pub(crate) fn read_limited_bytes(
+    path: &Path,
+    limit: u64,
+    what: &str,
+) -> Result<Vec<u8>, DomainError> {
     let metadata = fs::metadata(path).map_err(|error| {
         DomainError::new(
             ErrorCode::InputUnreadable,
@@ -2146,13 +2233,7 @@ fn read_json_with_bytes<T: DeserializeOwned>(
             format!("{what} превышает лимит {limit} байт"),
         ));
     }
-    let document = serde_json::from_slice(&bytes).map_err(|error| {
-        DomainError::new(
-            ErrorCode::ReviewArtifactInvalid,
-            format!("некорректный JSON в {what}: {error}"),
-        )
-    })?;
-    Ok((document, bytes))
+    Ok(bytes)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2220,6 +2301,7 @@ fn write_directory_once(
                 | "semantic-triage.input.json"
                 | "semantic-triage.json"
                 | "review-report.md"
+                | "recommendations.json"
         ) {
             let expected_type = if name == "runs" {
                 file_type.is_dir()
@@ -2595,7 +2677,7 @@ fn reject_symlink_path(root: &Path, requested: &Path) -> Result<(), DomainError>
 }
 
 /// Сохраняет исходный артефакт однократно; повтор допустим только с теми же байтами.
-fn write_review_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainError> {
+pub(crate) fn write_review_document_once(path: &Path, bytes: &[u8]) -> Result<(), DomainError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -2786,7 +2868,7 @@ fn lock_review_workspace(
     Ok(file)
 }
 
-fn review_workspace_file(
+pub(crate) fn review_workspace_file(
     root: &Path,
     pack_path: &Path,
     pack: &ReviewPack,
@@ -2834,7 +2916,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn safe_output_path(
+pub(crate) fn safe_output_path(
     root: &Path,
     requested: &Path,
     directory: bool,
@@ -3192,6 +3274,29 @@ fn artifact_write_error(path: &Path, error: &std::io::Error) -> DomainError {
 mod tests {
     use super::*;
     use asset_store::temp_workspace::TempWorkspace;
+
+    #[test]
+    fn bounded_document_reads_reject_oversized_and_non_regular_files() {
+        let owner = TempWorkspace::create("anki-bounded-artifact-read").unwrap();
+        let oversized = owner.path().join("oversized.json");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(9).unwrap();
+        assert_eq!(
+            read_limited_bytes(&oversized, 8, "fixture")
+                .unwrap_err()
+                .code,
+            ErrorCode::ReviewArtifactInvalid
+        );
+
+        let directory = owner.path().join("directory.json");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            read_limited_bytes(&directory, 8, "fixture")
+                .unwrap_err()
+                .code,
+            ErrorCode::ReviewArtifactInvalid
+        );
+    }
 
     struct GitFixture(PathBuf, #[allow(dead_code)] TempWorkspace);
 

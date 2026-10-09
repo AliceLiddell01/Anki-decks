@@ -307,7 +307,7 @@ pub fn run_cli_in(cwd: Option<&Path>, args: &[&str]) -> (i32, String, String) {
 
 /// Разбирает JSON из stdout.
 pub fn parse_json(text: &str) -> Value {
-    serde_json::from_str(text).unwrap_or_else(|error| panic!("stdout не JSON: {error}\n{text}"))
+    serde_json::from_str(text).unwrap_or_else(|error| panic!("stdout не JSON: {error}"))
 }
 
 /// Запускает CLI с заданным stdin и возвращает (exit code, stdout, stderr).

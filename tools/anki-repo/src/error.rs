@@ -72,6 +72,8 @@ pub enum ErrorCode {
     ExecutionBusy,
     /// Не удалось выполнить операцию управления процессом.
     ProcessOperationFailed,
+    /// Результат изолированной проверки не завершён и не может быть источником истории.
+    ExecutionNotCompleted,
     /// Решения для языковой проверки не прошли безопасную проверку предусловий.
     LanguageDecisionInvalid,
     /// `find` по идентичности не нашёл ни одного совпадения.
@@ -96,6 +98,20 @@ pub enum ErrorCode {
     SourceChanged,
     /// `edit`: не удалось атомарно заменить `deck.json`.
     WriteFailed,
+    /// Локальная база learning создана более новой версией схемы, чем поддерживает эта сборка.
+    LearningSchemaUnsupported,
+    /// Локальное хранилище learning недоступно: каталог, права или файловая система.
+    LearningStorageUnavailable,
+    /// SQLite удерживает блокировку записи дольше настроенного `busy_timeout`.
+    LearningStorageBusy,
+    /// Файл базы learning повреждён или не является базой SQLite.
+    LearningCorrupt,
+    /// Утверждение конфликтует с уже сохранённым и не объявлено заменой явно.
+    LearningConflict,
+    /// Переносимый архив learning не прошёл проверку manifest или digest.
+    LearningExportInvalid,
+    /// Накопленной проверенной истории недостаточно для вывода.
+    InsufficientEvidence,
     /// Непредвиденный внутренний сбой.
     Internal,
 }
@@ -132,6 +148,7 @@ impl ErrorCode {
             Self::SyntaxAuthenticityUnavailable => "syntax_authenticity_unavailable",
             Self::ReviewArtifactConflict => "review_artifact_conflict",
             Self::ExecutionBusy => "execution_busy",
+            Self::ExecutionNotCompleted => "execution_not_completed",
             Self::ProcessOperationFailed => "process_operation_failed",
             Self::LanguageDecisionInvalid => "language_decision_invalid",
             Self::NotFound => "not_found",
@@ -145,6 +162,13 @@ impl ErrorCode {
             Self::ExpectedMismatch => "expected_mismatch",
             Self::SourceChanged => "source_changed",
             Self::WriteFailed => "write_failed",
+            Self::LearningSchemaUnsupported => "learning_schema_unsupported",
+            Self::LearningStorageUnavailable => "learning_storage_unavailable",
+            Self::LearningStorageBusy => "learning_storage_busy",
+            Self::LearningCorrupt => "learning_corrupt",
+            Self::LearningConflict => "learning_conflict",
+            Self::LearningExportInvalid => "learning_export_invalid",
+            Self::InsufficientEvidence => "insufficient_evidence",
             Self::Internal => "internal_error",
         }
     }
@@ -176,7 +200,10 @@ impl ErrorCode {
             | Self::UnknownQaCode
             | Self::SourceNotCanonical
             | Self::InvalidRequest
-            | Self::DuplicateEditTarget => 3,
+            | Self::DuplicateEditTarget
+            | Self::LearningSchemaUnsupported
+            | Self::LearningExportInvalid
+            | Self::InsufficientEvidence => 3,
             Self::NotFound | Self::NoteNotFound => 4,
             Self::Ambiguous | Self::AmbiguousDeck | Self::AmbiguousModel => 5,
             Self::ExportInvalid
@@ -187,7 +214,12 @@ impl ErrorCode {
             Self::ExpectedMismatch | Self::SourceChanged => 7,
             Self::WriteFailed => 8,
             Self::ReviewArtifactConflict => 7,
+            Self::LearningConflict => 7,
+            Self::LearningStorageUnavailable => 9,
+            Self::LearningCorrupt => 10,
             Self::ExecutionBusy => 13,
+            Self::ExecutionNotCompleted => 3,
+            Self::LearningStorageBusy => 13,
             Self::ProcessOperationFailed => 14,
             Self::Internal => 70,
         }
@@ -368,6 +400,7 @@ mod tests {
             ErrorCode::SyntaxAuthenticityUnavailable,
             ErrorCode::ReviewArtifactConflict,
             ErrorCode::ExecutionBusy,
+            ErrorCode::ExecutionNotCompleted,
             ErrorCode::ProcessOperationFailed,
             ErrorCode::LanguageDecisionInvalid,
             ErrorCode::NotFound,
@@ -381,6 +414,13 @@ mod tests {
             ErrorCode::ExpectedMismatch,
             ErrorCode::SourceChanged,
             ErrorCode::WriteFailed,
+            ErrorCode::LearningSchemaUnsupported,
+            ErrorCode::LearningStorageUnavailable,
+            ErrorCode::LearningStorageBusy,
+            ErrorCode::LearningCorrupt,
+            ErrorCode::LearningConflict,
+            ErrorCode::LearningExportInvalid,
+            ErrorCode::InsufficientEvidence,
             ErrorCode::Internal,
         ];
         for code in codes {
@@ -391,6 +431,49 @@ mod tests {
             );
             assert!(!text.is_empty());
         }
+    }
+
+    #[test]
+    fn learning_codes_are_distinguishable() {
+        for (code, text) in [
+            (
+                ErrorCode::LearningSchemaUnsupported,
+                "learning_schema_unsupported",
+            ),
+            (
+                ErrorCode::LearningStorageUnavailable,
+                "learning_storage_unavailable",
+            ),
+            (ErrorCode::LearningStorageBusy, "learning_storage_busy"),
+            (ErrorCode::LearningCorrupt, "learning_corrupt"),
+            (ErrorCode::LearningConflict, "learning_conflict"),
+            (ErrorCode::LearningExportInvalid, "learning_export_invalid"),
+            (ErrorCode::InsufficientEvidence, "insufficient_evidence"),
+        ] {
+            assert_eq!(code.as_str(), text);
+        }
+        // Отказ при более новой схеме отличается от временной блокировки SQLite
+        // и от конфликта утверждений, хотя часть кодов делит exit code.
+        assert_ne!(
+            ErrorCode::LearningSchemaUnsupported,
+            ErrorCode::LearningStorageBusy
+        );
+        assert_ne!(
+            ErrorCode::LearningStorageBusy.as_str(),
+            ErrorCode::ExecutionBusy.as_str()
+        );
+        assert_eq!(ErrorCode::LearningSchemaUnsupported.exit_code(), 3);
+        assert_eq!(ErrorCode::LearningStorageUnavailable.exit_code(), 9);
+        assert_eq!(ErrorCode::LearningCorrupt.exit_code(), 10);
+        assert_eq!(ErrorCode::LearningConflict.exit_code(), 7);
+        assert_eq!(ErrorCode::LearningExportInvalid.exit_code(), 3);
+        assert_eq!(ErrorCode::InsufficientEvidence.exit_code(), 3);
+        assert_eq!(ErrorCode::LearningStorageBusy.exit_code(), 13);
+        // Временная блокировка не совпадает с конфликтом артефакта и с SourceChanged.
+        assert_ne!(
+            ErrorCode::LearningStorageBusy.exit_code(),
+            ErrorCode::ReviewArtifactConflict.exit_code()
+        );
     }
 
     #[test]
