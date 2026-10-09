@@ -749,10 +749,12 @@ anki-repo --json code-review triage summary --pack "$PACK" --triage "$CANONICAL_
 Отсутствие истории — штатное состояние, а не ошибка. `collect`, `verify`,
 `delta`, `queue validate|summary|list|group|candidate`,
 `triage validate|summary|report` и `execution prepare|run|inspect|cancel|cleanup`
-работают без базы learning и не создают её. Базу создаёт только записывающая
-команда (`import`, `feedback record`, `policy propose`, `restore`) либо
-`backup`/`export` по уже существующей истории. Операции, которым нужна
-существующая база, завершаются различимым `not_found` (exit 4): `validate`,
+работают без базы learning и не создают её. Базу создают записывающие команды
+(`import`, `feedback record`, `policy propose`, `restore`); `forget` изменяет
+уже существующую базу. `backup` и `export` требуют существующую базу и создают
+отдельные файлы, не добавляя и не удаляя записи истории. Открытие базы при этом
+может применить поддерживаемую миграцию или настроить режим журнала. Операции,
+которым нужна существующая база, завершаются различимым `not_found` (exit 4): `validate`,
 `stats`, `patterns`, `search`, `feedback list|show`, `policy list|show|approve`,
 `export`, `backup` и `forget`. `status` сообщает об отсутствующей базе с exit 0.
 `recommend` без `--require-history` также завершается с exit 0 и строит документ

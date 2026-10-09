@@ -1146,9 +1146,8 @@ fn concurrent_readers_and_writer_keep_history_consistent() {
     let loaded = load_in_repo(&repo, &artifacts, false).unwrap();
     import(&loaded, &store);
 
-    // Открытие существующей базы проверяет/обслуживает схему и индекс; делаем
-    // его до конкурентного участка, чтобы одновременно тестировать чтение, а
-    // не конкурирующий старт CLI-команд.
+    // Открываем соединения заранее, чтобы проверять параллельные транзакции
+    // чтения и записи, а не гонки старта команд.
     let readers: Vec<_> = (0..3)
         .map(|_| {
             learning::LearningStore::open(learning::StoreOptions {
@@ -1160,13 +1159,18 @@ fn concurrent_readers_and_writer_keep_history_consistent() {
         .collect();
     let writer = learning::LearningStore::open(learning::StoreOptions::at(&database)).unwrap();
 
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(readers.len() + 1));
     let mut handles = Vec::new();
     for reader in readers {
+        let barrier = std::sync::Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut previous_count = 0;
             for _ in 0..20 {
                 let records = learning::import::list_imports(&reader, true, 50).unwrap();
-                // Читатель всегда видит согласованный снимок: одну целую запись.
-                assert_eq!(records.len(), 1);
+                assert!((1..=11).contains(&records.len()));
+                assert!(records.len() >= previous_count, "число записей не убывает");
+                previous_count = records.len();
                 for record in records {
                     assert_eq!(record.observations.raw_candidates, 3);
                     assert!(!record.review_id.is_empty());
@@ -1175,17 +1179,25 @@ fn concurrent_readers_and_writer_keep_history_consistent() {
             }
         }));
     }
-    for _ in 0..10 {
-        let record =
-            learning::import::import_history(&writer, &loaded, &learning::ImportRequest::default())
-                .unwrap();
+    barrier.wait();
+    for index in 0..10 {
+        let variant = format!("snapshot-{index:032x}");
+        let record = learning::import::import_history(
+            &writer,
+            &loaded,
+            &learning::ImportRequest {
+                workspace_variant: variant.clone(),
+                workspace_label: Some(variant),
+            },
+        )
+        .unwrap();
         assert!(!record.review_id.is_empty());
     }
     for handle in handles {
         handle.join().expect("читатель не должен падать");
     }
     let records = learning::import::list_imports(&store, true, 50).unwrap();
-    assert_eq!(records.len(), 1, "частичных импортов не остаётся");
+    assert_eq!(records.len(), 11, "все неповторные импорты сохранены");
     for record in &records {
         assert_eq!(record.observations.raw_candidates, 3);
     }
@@ -2512,6 +2524,12 @@ fn search_distinguishes_match_kinds_and_paginates() {
         exact.cases[0].match_kind,
         learning::search::SearchMatchKind::ExactStructural
     );
+    assert_eq!(exact.cases[0].disposition.as_deref(), Some("confirmed"));
+    assert_eq!(
+        exact.cases[0].provenance.as_deref(),
+        Some("candidate_assisted")
+    );
+    assert_eq!(exact.cases[0].severity.as_deref(), Some("minor"));
 
     // Постраничный вывод ограничен и сообщает о продолжении.
     let page = learning::search_history(
@@ -3186,9 +3204,8 @@ fn one_observation_line_counts_once_across_versions() {
         "повторы не набирают независимую поддержку"
     );
     assert!(
-        summary.confirmed_share_lower_bound.is_none()
-            || summary.confirmed_share_lower_bound.unwrap() < 0.25,
-        "повтор не даёт границу как у двух независимых наблюдений: {:?}",
+        summary.confirmed_share_lower_bound.is_none(),
+        "при недостатке независимых данных нижняя граница отсутствует: {:?}",
         summary.confirmed_share_lower_bound
     );
     assert!(

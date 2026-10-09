@@ -768,7 +768,7 @@ fn cleanup_rejects_foreign_attestation_and_preserves_operator_limitation() {
     let (code, _stdout, _) = fixture.operation("cleanup", &first);
     assert_eq!(
         code, 7,
-        "очистка с посторонним файлом задания должна завершиться с кодом 7"
+        "очистка без подтверждения после удаления attestation должна завершиться с кодом 7"
     );
     fs::write(first.join("cleanup-attestation.json"), attestation).unwrap();
     fs::copy(
@@ -789,7 +789,7 @@ fn cleanup_rejects_foreign_attestation_and_preserves_operator_limitation() {
     );
     assert_eq!(
         code, 7,
-        "неподтверждённая очистка должна завершиться с кодом 7"
+        "очистка с чужим cleanup-attestation должна завершиться с кодом 7"
     );
     assert_eq!(
         parse_json(&stdout)["error"]["code"],
@@ -809,7 +809,7 @@ fn cleanup_rejects_unexpected_job_entries_before_any_mutation() {
     let (code, _stdout, _) = fixture.operation("cleanup", &job);
     assert_eq!(
         code, 7,
-        "неподтверждённая очистка должна завершиться с кодом 7"
+        "очистка с посторонним файлом задания должна завершиться с кодом 7"
     );
     assert_eq!(fs::read(job.join("foreign.txt")).unwrap(), b"unchanged");
     assert!(job.join("worktree").is_dir());

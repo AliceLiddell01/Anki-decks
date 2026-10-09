@@ -2777,7 +2777,8 @@ mod learning_cli {
         };
         let effective_disposition = options.disposition.map(LearningDispositionArg::as_str);
         let usefulness = options.usefulness.map(LearningUsefulnessArg::as_str);
-        if explanation_is_empty(options.explanation) {
+        let explanation = crate::code_review::learning::import::sanitize_text(options.explanation);
+        if explanation_is_empty(&explanation) {
             return Err(invalid_request(
                 "Объяснение утверждения не может быть пустым",
             ));
@@ -2794,7 +2795,7 @@ mod learning_cli {
                 effective_disposition.unwrap_or_default(),
                 usefulness.unwrap_or_default(),
                 options.supersedes_event_id.unwrap_or_default(),
-                options.explanation,
+                explanation,
                 options.provenance,
             )),
         };
@@ -2809,7 +2810,7 @@ mod learning_cli {
             supersedes_event_id: options.supersedes_event_id.map(str::to_owned),
             effective_disposition: effective_disposition.map(str::to_owned),
             usefulness: usefulness.map(str::to_owned),
-            explanation: options.explanation.to_owned(),
+            explanation,
             provenance: options.provenance.to_owned(),
             recorded_at: unix_now(),
         };

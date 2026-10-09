@@ -102,10 +102,10 @@ fn error_code(value: &Value) -> String {
 
 /// Проверяет, что команда отказывает с ожидаемым кодом ошибки.
 fn assert_error(fixture: &Fixture, args: &[&str], expected: &str) {
-    let (code, value, _stderr) = cli_json(fixture, args);
+    let (code, value, stderr) = cli_json(fixture, args);
     assert!(
         code != 0,
-        "команда должна была завершиться с ошибкой, код: {code}"
+        "команда должна была завершиться с ошибкой, код: {code}; args: {args:?}; response: {value}; stderr: {stderr}"
     );
     assert!(
         error_code(&value) == expected,
@@ -1112,6 +1112,12 @@ fn recommendations_are_deterministic_guardrailed_and_publish_safely() {
         "повтор с теми же байтами идемпотентен"
     );
     assert_eq!(read(&fixture.path().join(&expected)), artifact_bytes);
+    fixture.collect(&fixture.base_sha, &head);
+    assert_eq!(
+        read(&fixture.path().join(&expected)),
+        artifact_bytes,
+        "повторный collect сохраняет рекомендации"
+    );
 
     // Произвольный --out не перезаписывает чужие файлы.
     fs::write(fixture.path().join(&expected), b"{\"foreign\": true}").unwrap();
@@ -1333,7 +1339,7 @@ fn feedback_and_policy_lifecycle_is_audited_and_never_auto_applied() {
             "--disposition",
             "false-positive",
             "--explanation",
-            "Синтетическая метка подтверждения оказалась ошибочной.",
+            "Синтетическая метка подтверждения оказалась ошибочной.\nУточнение во второй строке.",
         ],
     );
     let event_id = revised["result"]["event_id"].as_str().unwrap().to_owned();
@@ -1361,7 +1367,7 @@ fn feedback_and_policy_lifecycle_is_audited_and_never_auto_applied() {
             "--disposition",
             "false-positive",
             "--explanation",
-            "Синтетическая метка подтверждения оказалась ошибочной.",
+            "Синтетическая метка подтверждения оказалась ошибочной.\nУточнение во второй строке.",
         ],
     );
     assert_eq!(repeated["result"]["event_id"], json!(event_id));
@@ -1683,7 +1689,7 @@ fn feedback_and_policy_lifecycle_is_audited_and_never_auto_applied() {
             "--disposition",
             "false-positive",
             "--explanation",
-            "Синтетическая метка подтверждения оказалась ошибочной.",
+            "Синтетическая метка подтверждения оказалась ошибочной.\nУточнение во второй строке.",
         ],
         "learning_conflict",
     );
@@ -2028,13 +2034,18 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
     );
     review_commands(&fixture);
 
-    // База только для чтения: миграция не может писать, и это недоступность
-    // хранилища, а не повреждение файла.
+    // Недоступность каталога под обычным файлом детерминирована и при запуске
+    // под root, где mode-биты read-only не запрещают запись.
     let readonly = learning_dir.join("readonly.sqlite");
     fs::write(&readonly, b"").unwrap();
     let mut permissions = fs::metadata(&readonly).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o444);
     fs::set_permissions(&readonly, permissions).unwrap();
+    let readonly_database = if fs::OpenOptions::new().write(true).open(&readonly).is_err() {
+        ".anki-repo/learning/readonly.sqlite"
+    } else {
+        "src/lib.rs/unavailable.sqlite"
+    };
     assert_error(
         &fixture,
         &[
@@ -2042,7 +2053,7 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
             "learning",
             "status",
             "--db",
-            ".anki-repo/learning/readonly.sqlite",
+            readonly_database,
         ],
         "learning_storage_unavailable",
     );

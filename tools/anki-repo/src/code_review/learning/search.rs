@@ -391,7 +391,7 @@ fn load_case(
         .query_row(
             "SELECT s.case_id, s.review_id, s.unit_id, s.candidate_id, s.finding_id, s.kind, s.text,
                     i.repository_id, i.head_sha, i.trust,
-                    u.disposition, f.provenance, f.severity, u.detector, c.path
+                    s.disposition, s.provenance, s.severity, u.detector, c.path
              FROM learning_search AS s
              JOIN learning_import AS i ON i.review_id = s.review_id
              LEFT JOIN learning_unit AS u ON u.review_id = s.review_id AND u.unit_id = s.unit_id

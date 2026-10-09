@@ -530,16 +530,12 @@ fn insert_record(
     write: &super::store::LearningWrite<'_>,
     record: &ImportRecord,
 ) -> Result<(), DomainError> {
-    let identity_key = sha256_hex(
-        format!(
-            "{}\n{}\n{}\n{}\n{}",
-            record.repository_id,
-            record.merge_base_sha,
-            record.head_sha,
-            record.workspace_variant,
-            record.inputs.analyzer_digest
-        )
-        .as_bytes(),
+    let identity_key = super::import::identity_key_for(
+        &record.repository_id,
+        &record.merge_base_sha,
+        &record.head_sha,
+        &record.workspace_variant,
+        &record.inputs.analyzer_digest,
     );
     let execution_evidence = record
         .inputs

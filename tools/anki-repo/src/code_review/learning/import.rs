@@ -522,14 +522,26 @@ pub(crate) fn serialize_json<T: Serialize + ?Sized>(
 /// Source identity сохраняет прежнюю форму для совместимости с уже импортированной историей.
 fn identity_key(loaded: &LoadedReview, variant: &str) -> String {
     let target = &loaded.pack.target;
+    identity_key_for(
+        &target.repository_id,
+        &target.merge_base_sha,
+        &target.head_sha,
+        variant,
+        &analyzer_digest(&loaded.pack),
+    )
+}
+
+pub(crate) fn identity_key_for(
+    repository_id: &str,
+    merge_base_sha: &str,
+    head_sha: &str,
+    variant: &str,
+    analyzer_digest: &str,
+) -> String {
     sha256_hex(
         format!(
             "{}\n{}\n{}\n{}\n{}",
-            target.repository_id,
-            target.merge_base_sha,
-            target.head_sha,
-            variant,
-            analyzer_digest(&loaded.pack)
+            repository_id, merge_base_sha, head_sha, variant, analyzer_digest
         )
         .as_bytes(),
     )
@@ -1591,29 +1603,27 @@ pub fn load_review(
 ) -> Result<LoadedReview, DomainError> {
     // Сначала сверяются сами документы: несовпадающий digest источника — это
     // отдельная различимая ошибка, а не «недоступность точных Git-образов».
-    let pack_bytes = std::fs::read(pack_path).map_err(|error| {
-        DomainError::new(
-            ErrorCode::InputUnreadable,
-            format!("не удалось прочитать review.json: {error}"),
-        )
-    })?;
+    let (pack, pack_bytes) = crate::code_review::workflow::read_review_pack(pack_path)?;
     let review_pack_sha256 = sha256_hex(&pack_bytes);
-    let declared_queue = read_queue_document(queue_path)?;
+    let (declared_queue, queue_bytes) = crate::code_review::workflow::read_json_with_bytes::<
+        crate::code_review::review_queue::ReviewQueue,
+    >(
+        queue_path,
+        crate::code_review::workflow::MAX_REVIEW_ARTIFACT_BYTES,
+        "структурная очередь code-review",
+    )?;
     verify_declared_source(&declared_queue, &review_pack_sha256)?;
 
     // Дальше очередь проверяется ровно той же логикой, что и в CLI: молчаливого
     // ослабления до структурной проверки при недоступных образах Git нет.
-    let (pack, pack_bytes, queue, queue_bytes, _summary, authenticity, _contexts) =
-        crate::code_review::workflow::load_validated_review_queue_with_contexts(
-            pack_path,
-            queue_path,
+    let (pack, _pack_bytes, queue, queue_bytes, _summary, authenticity, _contexts) =
+        crate::code_review::workflow::validate_review_queue_with_contexts(
+            pack,
+            pack_bytes,
+            declared_queue,
+            queue_bytes,
             structure_only,
         )?;
-    let review_pack_sha256 = {
-        let recomputed = sha256_hex(&pack_bytes);
-        debug_assert_eq!(recomputed, review_pack_sha256);
-        recomputed
-    };
     let mut limitations = Vec::new();
     let trust = match authenticity {
         crate::code_review::workflow::SyntaxAuthenticityStatus::Verified => {
@@ -1697,12 +1707,11 @@ pub fn load_review_with_execution(
             "result.json изолированной проверки должен быть обычным файлом",
         ));
     }
-    let bytes = std::fs::read(execution_path).map_err(|error| {
-        DomainError::new(
-            ErrorCode::InputUnreadable,
-            format!("не удалось прочитать result.json изолированной проверки: {error}"),
-        )
-    })?;
+    let bytes = crate::code_review::workflow::read_limited_bytes(
+        execution_path,
+        crate::code_review::workflow::MAX_REVIEW_ARTIFACT_BYTES,
+        "result.json изолированной проверки",
+    )?;
     let parsed: crate::code_review::execution::ExecutionResult = serde_json::from_slice(&bytes)
         .map_err(|error| {
             DomainError::new(
@@ -1759,24 +1768,6 @@ fn verify_declared_source(
     Ok(())
 }
 
-/// Читает документ структурной очереди.
-fn read_queue_document(
-    path: &std::path::Path,
-) -> Result<crate::code_review::review_queue::ReviewQueue, DomainError> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        DomainError::new(
-            ErrorCode::InputUnreadable,
-            format!("не удалось прочитать review-queue.json: {error}"),
-        )
-    })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        DomainError::new(
-            ErrorCode::ReviewArtifactInvalid,
-            format!("некорректный JSON в review-queue.json: {error}"),
-        )
-    })
-}
-
 /// Проверяет identity документа семантического разбора.
 fn verify_triage_identity(
     triage: &crate::code_review::semantic_triage::SemanticTriage,
@@ -1806,19 +1797,12 @@ fn load_triage(
     pack: &crate::code_review::model::ReviewPack,
     review_pack_sha256: &str,
 ) -> Result<(crate::code_review::semantic_triage::SemanticTriage, String), DomainError> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        DomainError::new(
-            ErrorCode::InputUnreadable,
-            format!("не удалось прочитать semantic-triage.json: {error}"),
-        )
-    })?;
-    let triage: crate::code_review::semantic_triage::SemanticTriage =
-        serde_json::from_slice(&bytes).map_err(|error| {
-            DomainError::new(
-                ErrorCode::ReviewArtifactInvalid,
-                format!("некорректный JSON в semantic-triage.json: {error}"),
-            )
-        })?;
+    let (triage, bytes): (crate::code_review::semantic_triage::SemanticTriage, Vec<u8>) =
+        crate::code_review::workflow::read_json_with_bytes(
+            path,
+            crate::code_review::workflow::MAX_REVIEW_ARTIFACT_BYTES,
+            "semantic-triage.json",
+        )?;
     crate::code_review::semantic_triage::validate(&triage, pack, review_pack_sha256)?;
     Ok((triage, sha256_hex(&bytes)))
 }

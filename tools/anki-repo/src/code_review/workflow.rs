@@ -594,24 +594,18 @@ pub(crate) type LoadedReviewQueue = (
     BTreeMap<String, review_queue::SyntaxContext>,
 );
 
-/// Проверенное чтение очереди вместе с точными байтами пакета и очереди, сводкой и контекстами.
-///
-/// Отдельная точка входа нужна вызывающим, которым кроме сводки требуются точные
-/// байты `review.json` и авторитетные контексты разбора. Доверенный путь с
-/// `structure_only = false` восстанавливает контексты по точным Git-образам
-/// снимка; при их недоступности возвращается `syntax_authenticity_unavailable`,
-/// а не молчаливый переход к структурной проверке.
-pub(crate) fn load_validated_review_queue_with_contexts(
-    pack_path: &Path,
-    queue_path: &Path,
+/// Валидирует уже прочитанные документы, сохраняя связь между разобранным
+/// содержимым, точными байтами, по которым вычисляются digest, и контекстами.
+/// Доверенный путь с `structure_only = false` восстанавливает контексты по
+/// точным Git-образам; при их недоступности возвращается
+/// `syntax_authenticity_unavailable`, а не молчаливый переход к структурной проверке.
+pub(crate) fn validate_review_queue_with_contexts(
+    pack: ReviewPack,
+    pack_bytes: Vec<u8>,
+    queue: ReviewQueue,
+    queue_bytes: Vec<u8>,
     structure_only: bool,
 ) -> Result<LoadedReviewQueue, DomainError> {
-    let (pack, pack_bytes) = read_review_pack(pack_path)?;
-    let (queue, queue_bytes) = read_json_with_bytes(
-        queue_path,
-        MAX_REVIEW_ARTIFACT_BYTES,
-        "структурная очередь code-review",
-    )?;
     let source_pack_sha256 = sha256_hex(&pack_bytes);
     if structure_only {
         let summary = review_queue::validate(&queue, &pack, &source_pack_sha256)?;
@@ -2182,7 +2176,7 @@ fn read_json<T: DeserializeOwned>(path: &Path, limit: u64, what: &str) -> Result
     read_json_with_bytes(path, limit, what).map(|(document, _)| document)
 }
 
-fn read_review_pack(path: &Path) -> Result<(ReviewPack, Vec<u8>), DomainError> {
+pub(crate) fn read_review_pack(path: &Path) -> Result<(ReviewPack, Vec<u8>), DomainError> {
     let (pack, bytes) = read_json_with_bytes(
         path,
         MAX_REVIEW_ARTIFACT_BYTES,
@@ -2192,11 +2186,26 @@ fn read_review_pack(path: &Path) -> Result<(ReviewPack, Vec<u8>), DomainError> {
     Ok((pack, bytes))
 }
 
-fn read_json_with_bytes<T: DeserializeOwned>(
+pub(crate) fn read_json_with_bytes<T: DeserializeOwned>(
     path: &Path,
     limit: u64,
     what: &str,
 ) -> Result<(T, Vec<u8>), DomainError> {
+    let bytes = read_limited_bytes(path, limit, what)?;
+    let document = serde_json::from_slice(&bytes).map_err(|error| {
+        DomainError::new(
+            ErrorCode::ReviewArtifactInvalid,
+            format!("некорректный JSON в {what}: {error}"),
+        )
+    })?;
+    Ok((document, bytes))
+}
+
+pub(crate) fn read_limited_bytes(
+    path: &Path,
+    limit: u64,
+    what: &str,
+) -> Result<Vec<u8>, DomainError> {
     let metadata = fs::metadata(path).map_err(|error| {
         DomainError::new(
             ErrorCode::InputUnreadable,
@@ -2224,13 +2233,7 @@ fn read_json_with_bytes<T: DeserializeOwned>(
             format!("{what} превышает лимит {limit} байт"),
         ));
     }
-    let document = serde_json::from_slice(&bytes).map_err(|error| {
-        DomainError::new(
-            ErrorCode::ReviewArtifactInvalid,
-            format!("некорректный JSON в {what}: {error}"),
-        )
-    })?;
-    Ok((document, bytes))
+    Ok(bytes)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2298,6 +2301,7 @@ fn write_directory_once(
                 | "semantic-triage.input.json"
                 | "semantic-triage.json"
                 | "review-report.md"
+                | "recommendations.json"
         ) {
             let expected_type = if name == "runs" {
                 file_type.is_dir()
@@ -3270,6 +3274,29 @@ fn artifact_write_error(path: &Path, error: &std::io::Error) -> DomainError {
 mod tests {
     use super::*;
     use asset_store::temp_workspace::TempWorkspace;
+
+    #[test]
+    fn bounded_document_reads_reject_oversized_and_non_regular_files() {
+        let owner = TempWorkspace::create("anki-bounded-artifact-read").unwrap();
+        let oversized = owner.path().join("oversized.json");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(9).unwrap();
+        assert_eq!(
+            read_limited_bytes(&oversized, 8, "fixture")
+                .unwrap_err()
+                .code,
+            ErrorCode::ReviewArtifactInvalid
+        );
+
+        let directory = owner.path().join("directory.json");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            read_limited_bytes(&directory, 8, "fixture")
+                .unwrap_err()
+                .code,
+            ErrorCode::ReviewArtifactInvalid
+        );
+    }
 
     struct GitFixture(PathBuf, #[allow(dead_code)] TempWorkspace);
 
