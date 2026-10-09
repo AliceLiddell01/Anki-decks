@@ -26,7 +26,7 @@ use super::model::{
 use super::store::{LearningRead, LearningStore};
 
 /// Версия схемы отчёта по паттернам.
-pub const PATTERN_SCHEMA_VERSION: u32 = 1;
+pub const PATTERN_SCHEMA_VERSION: u32 = 2;
 
 /// Минимум независимых единиц, при котором вывод по паттерну не воздерживается.
 ///
@@ -194,6 +194,7 @@ struct StoredUnit {
 pub(super) struct SignatureEvidence {
     pub support: SupportSummary,
     pub cases: Vec<PatternCaseRef>,
+    pub related_repeats: usize,
 }
 
 /// Строит отчёт по паттернам на текущем снимке истории.
@@ -240,11 +241,12 @@ pub fn pattern_report(
                 .then_with(|| b.support.support_reviews.cmp(&a.support.support_reviews))
                 .then_with(|| a.signature.cmp(&b.signature))
         });
-        let limit = if query.limit == 0 { 20 } else { query.limit };
-        rules.truncate(limit);
         let abstained = rules
             .iter()
             .all(|rule| rule.support.level != SupportLevel::Supported);
+        let rules_total = rules.len();
+        let limit = if query.limit == 0 { 20 } else { query.limit };
+        rules.truncate(limit);
         let quarantine_limitation = if query.include_quarantine {
             format!(
                 "Карантинные записи включены по явному --include-quarantine; всего карантинных записей в истории: {}.",
@@ -263,6 +265,7 @@ pub fn pattern_report(
             min_support_units: MIN_SUPPORT_UNITS,
             policy: PATTERN_POLICY.to_owned(),
             abstained,
+            rules_total,
             limitations: vec![
                 "История собрана выборочно: доли решений отражают отбор ревью, а не свойства детектора."
                     .to_owned(),
@@ -802,11 +805,11 @@ fn classify_support(
 fn load_confirmed_findings(
     read: &LearningRead<'_>,
 ) -> Result<BTreeSet<(String, String)>, DomainError> {
+    let effective_dispositions = super::feedback::effective_dispositions(read)?;
     let mut decisions_statement = read
         .transaction()
         .prepare(
             "SELECT review_id, covered_json FROM learning_decision
-             WHERE disposition = 'confirmed'
              ORDER BY review_id ASC, decision_id ASC",
         )
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать решения"))?;
@@ -822,6 +825,34 @@ fn load_confirmed_findings(
         );
     }
     drop(decisions_statement);
+    let mut candidates_statement = read
+        .transaction()
+        .prepare(
+            "SELECT review_id, candidate_id, unit_id FROM learning_candidate
+             ORDER BY review_id ASC, candidate_id ASC",
+        )
+        .map_err(|error| {
+            super::store::map_error(&error, "не удалось прочитать единицы кандидатов")
+        })?;
+    let candidates = candidates_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| {
+            super::store::map_error(&error, "не удалось прочитать единицы кандидатов")
+        })?;
+    let mut units_of_candidate = BTreeMap::new();
+    for row in candidates {
+        let (review_id, candidate_id, unit_id) = row.map_err(|error| {
+            super::store::map_error(&error, "не удалось прочитать единицы кандидатов")
+        })?;
+        units_of_candidate.insert((review_id, candidate_id), unit_id);
+    }
+    drop(candidates_statement);
     let mut links_statement = read
         .transaction()
         .prepare(
@@ -853,6 +884,17 @@ fn load_confirmed_findings(
     for (review_id, covered) in confirmed_decisions {
         let covered: Vec<String> = parse_domain_json(&covered, "покрытые кандидаты решения")?;
         for candidate_id in covered {
+            let Some(unit_id) = units_of_candidate.get(&(review_id.clone(), candidate_id.clone()))
+            else {
+                continue;
+            };
+            if effective_dispositions
+                .get(&(review_id.clone(), unit_id.clone()))
+                .and_then(Option::as_deref)
+                != Some("confirmed")
+            {
+                continue;
+            }
             if let Some(finding_ids) = findings_of_candidate.get(&(review_id.clone(), candidate_id))
             {
                 for finding_id in finding_ids {
@@ -1071,6 +1113,13 @@ pub(super) fn evidence_for_signatures(
 
     let mut evidence = BTreeMap::new();
     for (signature, members) in members_by_signature {
+        let related_repeats = members
+            .iter()
+            .filter(|unit| {
+                links.get(&(unit.review_id.clone(), unit.unit_id.clone()))
+                    == Some(&CaseLinkKind::StructuralRepeat)
+            })
+            .count();
         let support = support_summary(
             &members,
             findings_by_signature
@@ -1106,7 +1155,14 @@ pub(super) fn evidence_for_signatures(
                 }
             })
             .collect();
-        evidence.insert(signature, SignatureEvidence { support, cases });
+        evidence.insert(
+            signature,
+            SignatureEvidence {
+                support,
+                cases,
+                related_repeats,
+            },
+        );
     }
     Ok(evidence)
 }
@@ -1126,6 +1182,7 @@ pub fn empty_report() -> PatternReport {
         min_support_units: MIN_SUPPORT_UNITS,
         policy: PATTERN_POLICY.to_owned(),
         abstained: true,
+        rules_total: 0,
         limitations: vec!["История пуста: обучение воздерживается.".to_owned()],
         rules: Vec::new(),
     }

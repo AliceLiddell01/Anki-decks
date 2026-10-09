@@ -3498,7 +3498,7 @@ mod learning_cli {
                 min_support_units: report.min_support_units,
                 policy: report.policy.clone(),
                 abstained: report.abstained,
-                rules_total: report.rules.len(),
+                rules_total: report.rules_total,
                 rules: report.rules.iter().map(PatternRuleView::from).collect(),
                 limitations: report.limitations.clone(),
             }

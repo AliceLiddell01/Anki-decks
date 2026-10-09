@@ -1006,24 +1006,26 @@ fn key_for_signature(
             .prepare(
                 "SELECT u.feature_json FROM learning_unit AS u
                  JOIN learning_import AS i ON i.review_id = u.review_id
-                 WHERE i.trust = 'ast_authenticated'
-                 ORDER BY u.review_id ASC, u.unit_id ASC",
+                 WHERE i.trust = 'ast_authenticated' AND u.signature = ?1
+                 ORDER BY u.review_id ASC, u.unit_id ASC LIMIT 1",
             )
             .map_err(|error| map_error(&error, "не удалось прочитать ключ признаков политики"))?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+        let feature_json: Option<String> = statement
+            .query_row([signature], |row| row.get(0))
+            .optional()
             .map_err(|error| map_error(&error, "не удалось прочитать ключ признаков политики"))?;
-        for row in rows {
-            let feature_json = row.map_err(|error| {
-                map_error(&error, "не удалось прочитать ключ признаков политики")
-            })?;
-            let key: BTreeMap<String, String> =
-                super::import::parse_domain_json(&feature_json, "признаки единицы")?;
-            if super::patterns::feature_signature(&key) == signature {
-                return Ok(key);
-            }
+        let Some(feature_json) = feature_json else {
+            return Ok(BTreeMap::new());
+        };
+        let key: BTreeMap<String, String> =
+            super::import::parse_domain_json(&feature_json, "признаки единицы")?;
+        if super::patterns::feature_signature(&key) != signature {
+            return Err(DomainError::new(
+                ErrorCode::LearningConflict,
+                "Подпись признаков единицы не совпадает с сохранённым ключом",
+            ));
         }
-        Ok(BTreeMap::new())
+        Ok(key)
     })
 }
 

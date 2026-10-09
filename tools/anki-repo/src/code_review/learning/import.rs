@@ -119,6 +119,14 @@ pub fn import_history(
     loaded: &LoadedReview,
     request: &ImportRequest,
 ) -> Result<ImportRecord, DomainError> {
+    import_history_with_status(store, loaded, request).map(|(record, _)| record)
+}
+
+fn import_history_with_status(
+    store: &LearningStore,
+    loaded: &LoadedReview,
+    request: &ImportRequest,
+) -> Result<(ImportRecord, bool), DomainError> {
     validate_import_request(loaded, request)?;
     let variant = normalize_variant(&request.workspace_variant)?;
     let inputs = inputs_of(loaded)?;
@@ -140,8 +148,9 @@ pub fn import_history(
         )
     })?;
     if let Some(record) = repeated {
-        return Ok(record);
+        return Ok((record, true));
     }
+    let previous_candidate = previous_head(store, &identity_key, &review_id, loaded, &variant)?;
     store.write(|write| {
         let existing = existing_exact(
             &write.as_tx(),
@@ -152,9 +161,25 @@ pub fn import_history(
             loaded,
         )?;
         if let Some(record) = existing {
-            return Ok(record);
+            return Ok((record, true));
         }
-        let previous = previous_head(write, &identity_key, &review_id, loaded, &variant)?;
+        let previous = match previous_candidate.as_deref() {
+            Some(previous_id) => {
+                let active: bool = write
+                    .transaction()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM learning_import
+                         WHERE review_id = ?1 AND superseded_by IS NULL)",
+                        [previous_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        super::store::map_error(&error, "не удалось проверить предыдущую ревизию")
+                    })?;
+                active.then(|| previous_id.to_owned())
+            }
+            None => None,
+        };
         let revision = next_revision(write)?;
         let mut limitations = loaded.limitations.clone();
         let truncated_findings = loaded.triage.as_ref().map_or(0, |(triage, _)| {
@@ -201,7 +226,7 @@ pub fn import_history(
         if loaded.trust.participates_in_learning() {
             write_case_links(write, loaded, &review_id)?;
         }
-        Ok(record)
+        Ok((record, false))
     })
 }
 
@@ -216,24 +241,8 @@ pub fn import_with_outcome(
     loaded: &LoadedReview,
     request: &ImportRequest,
 ) -> Result<ImportOutcome, DomainError> {
-    validate_import_request(loaded, request)?;
-    let variant = normalize_variant(&request.workspace_variant)?;
-    let inputs = inputs_of(loaded)?;
-    let identity_key = identity_key(loaded, &variant);
-    let review_id = review_id(loaded, &variant);
-    let legacy_review_id = legacy_review_id(loaded, &variant);
-    let repeated = store.read(|read| {
-        existing_exact(
-            read,
-            &review_id,
-            &legacy_review_id,
-            &identity_key,
-            &inputs,
-            loaded,
-        )
-    })?;
-    let record = import_history(store, loaded, request)?;
-    let status = if repeated.is_some() {
+    let (record, was_existing) = import_history_with_status(store, loaded, request)?;
+    let status = if was_existing {
         ImportStatus::NoopExisting
     } else if !record.trust.participates_in_learning() {
         ImportStatus::Quarantined
@@ -774,61 +783,68 @@ fn show_import_in_write(
 /// доказанного Git ancestry при совпадающей базе, варианте и анализаторах.
 /// Общая база у независимых sibling-веток не является таким доказательством.
 fn previous_head(
-    read: &super::store::LearningWrite<'_>,
+    store: &LearningStore,
     identity_key: &str,
     review_id: &str,
     loaded: &LoadedReview,
     variant: &str,
 ) -> Result<Option<String>, DomainError> {
     let target = &loaded.pack.target;
-    let mut statement = read
-        .transaction()
-        .prepare(
-            "SELECT review_id, identity_key, head_sha FROM learning_import
-             WHERE review_id <> ?1 AND superseded_by IS NULL AND trust = ?2
-               AND repository_id = ?3 AND base_sha = ?4 AND merge_base_sha = ?5
-               AND workspace_variant = ?6 AND analyzer_digest = ?7
-             ORDER BY revision DESC, review_id ASC",
-        )
-        .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
-    let rows = statement
-        .query_map(
-            params![
-                review_id,
-                loaded.trust.as_str(),
-                target.repository_id,
-                target.base_sha,
-                target.merge_base_sha,
-                variant,
-                analyzer_digest(&loaded.pack),
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
-    for row in rows {
-        let (prior_id, prior_identity, prior_head) =
-            row.map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
+    let candidates = store.read(|read| {
+        let mut statement = read
+            .transaction()
+            .prepare(
+                "SELECT review_id, identity_key, head_sha FROM learning_import
+                 WHERE review_id <> ?1 AND superseded_by IS NULL AND trust = ?2
+                   AND repository_id = ?3 AND base_sha = ?4 AND merge_base_sha = ?5
+                   AND workspace_variant = ?6 AND analyzer_digest = ?7
+                 ORDER BY revision DESC, review_id ASC",
+            )
+            .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    review_id,
+                    loaded.trust.as_str(),
+                    target.repository_id,
+                    target.base_sha,
+                    target.merge_base_sha,
+                    variant,
+                    analyzer_digest(&loaded.pack),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| super::store::map_error(&error, "не удалось прочитать ревизии"))
+    })?;
+    for (prior_id, prior_identity, prior_head) in candidates {
         if prior_identity == identity_key {
             return Ok(Some(prior_id));
         }
-        if loaded.trust.participates_in_learning()
-            && loaded
-                .inputs_hint
-                .repository_root
-                .as_deref()
-                .is_some_and(|root| {
-                    std::process::Command::new("git")
-                        .current_dir(root)
-                        .args(["merge-base", "--is-ancestor", &prior_head, &target.head_sha])
-                        .output()
-                        .is_ok_and(|output| output.status.success())
-                })
+        if !loaded.trust.participates_in_learning() {
+            continue;
+        }
+        let Some(root) = loaded.inputs_hint.repository_root.as_deref() else {
+            continue;
+        };
+        if std::process::Command::new("git")
+            .current_dir(root)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                "--end-of-options",
+                &prior_head,
+                &target.head_sha,
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
         {
             return Ok(Some(prior_id));
         }

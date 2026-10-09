@@ -540,20 +540,42 @@ pub fn prepare_job(
         verify_prepared_worktree(&job)
     })();
     if let Err(error) = preparation {
-        save_state(&job, LifecycleStatus::PreparationFailed, false)?;
+        let state_error = save_state(&job, LifecycleStatus::PreparationFailed, false).err();
+        let unlock_error = fs2::FileExt::unlock(&active_lock).err().map(process_error);
+        drop(active_lock);
+        let mut message = error.message;
+        if let Some(state_error) = &state_error {
+            message.push_str(&format!(
+                "; не удалось сохранить состояние PreparationFailed: {}",
+                state_error.message
+            ));
+        }
+        if let Some(unlock_error) = &unlock_error {
+            message.push_str(&format!(
+                "; не удалось освободить блокировку: {}",
+                unlock_error.message
+            ));
+        }
         return Err(DomainError::with_details(
             error.code,
-            error.message,
-            crate::details! { "job_dir" => job.directory.display().to_string(), "job_id" => job.metadata.job_id },
+            message,
+            crate::details! {
+                "job_dir" => job.directory.display().to_string(),
+                "job_id" => job.metadata.job_id,
+                "state_save_error" => state_error.map_or_else(String::new, |error| error.message),
+                "unlock_error" => unlock_error.map_or_else(String::new, |error| error.message),
+            },
         ));
     }
     // Последний шаг подготовки: `Prepared` публикуется только после полного
     // создания и проверки рабочего дерева и всё ещё под той же блокировкой.
-    save_state(&job, LifecycleStatus::Prepared, false)?;
+    let published = save_state(&job, LifecycleStatus::Prepared, false);
     // Освобождение явное, а не закрытием дескриптора: копия дескриптора,
     // унаследованная параллельным fork, иначе удерживала бы flock до своего exec.
-    fs2::FileExt::unlock(&active_lock).map_err(process_error)?;
+    let unlocked = fs2::FileExt::unlock(&active_lock).map_err(process_error);
     drop(active_lock);
+    published?;
+    unlocked?;
     Ok(job)
 }
 

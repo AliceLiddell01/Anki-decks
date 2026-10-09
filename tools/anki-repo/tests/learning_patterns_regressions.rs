@@ -227,6 +227,52 @@ fn three_independent_ranges_reach_the_support_threshold() {
 }
 
 #[test]
+fn report_abstention_and_total_rules_use_the_unlimited_rule_set() {
+    let dir = TempDir::new("patterns-report-limit");
+    let store = LearningStore::open(StoreOptions::at(dir.path().join("state.sqlite"))).unwrap();
+    let loaded = loaded_fixture();
+    for index in 0..4 {
+        seed_case(
+            &store,
+            &loaded,
+            &format!("contradictory-{index}"),
+            &format!("head-c{index}"),
+            None,
+            if index == 3 {
+                "false_positive"
+            } else {
+                "confirmed"
+            },
+            Some("contradictory-classifier"),
+        );
+    }
+    for index in 0..3 {
+        seed_case(
+            &store,
+            &loaded,
+            &format!("supported-{index}"),
+            &format!("head-s{index}"),
+            None,
+            "confirmed",
+            Some("supported-classifier"),
+        );
+    }
+
+    let report = learning::pattern_report(
+        &store,
+        &learning::patterns::PatternQuery {
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.rules.len(), 1);
+    assert_eq!(report.rules_total, 2);
+    assert_eq!(report.rules[0].support.level, SupportLevel::Contradictory);
+    assert!(!report.abstained);
+}
+
+#[test]
 fn classifier_versions_partition_identical_structure_and_legacy_provenance() {
     let dir = TempDir::new("patterns-classifier-version");
     let store = LearningStore::open(StoreOptions::at(dir.path().join("state.sqlite"))).unwrap();
@@ -438,24 +484,43 @@ fn structural_repeat_recommendation_explains_similarity_without_claiming_bug_ide
     let dir = TempDir::new("recommend-structural-analogy");
     let store = LearningStore::open(StoreOptions::at(dir.path().join("state.sqlite"))).unwrap();
     let loaded = loaded_fixture();
-    seed_case(&store, &loaded, "first", "head-a", None, "confirmed", None);
-    seed_case(&store, &loaded, "second", "head-b", None, "confirmed", None);
+    for id in [
+        "a-first", "b-second", "c-third", "d-fourth", "z-repeat", "zz-other",
+    ] {
+        seed_case(
+            &store,
+            &loaded,
+            id,
+            &format!("head-{id}"),
+            None,
+            "confirmed",
+            None,
+        );
+    }
     let units = serde_json::to_string(&vec![loaded.queue.units[0].id.clone()]).unwrap();
     store.write(|write| {
-        for id in ["first", "second"] {
+        for id in ["z-repeat", "zz-other"] {
             write.execute("INSERT INTO learning_finding (review_id,finding_id,severity,provenance,title,description,signature,linked_unit_ids_json) VALUES (?1,'finding','P2','independent',?1,'Разные ошибки одного класса','similar',?2)", params![id, units])?;
         }
-        write.execute("INSERT INTO learning_case_link (review_id,finding_id,linked_review_id,linked_finding_id,kind,basis) VALUES ('first','finding','second','finding','structural_repeat','Структурная аналогия; идентичность ошибки не доказана')", [])?;
+        write.execute("INSERT INTO learning_case_link (review_id,finding_id,linked_review_id,linked_finding_id,kind,basis) VALUES ('z-repeat','finding','zz-other','finding','structural_repeat','Структурная аналогия; идентичность ошибки не доказана')", [])?;
         Ok(())
     }).unwrap();
-    let document = learning::recommend(
-        Some(&store),
-        &loaded,
-        &learning::RecommendRequest::default(),
-    )
-    .unwrap();
-    let recommendation = &document.recommendations[0];
+    let limited_request = learning::RecommendRequest {
+        case_limit: 1,
+        ..Default::default()
+    };
+    let limited = learning::recommend(Some(&store), &loaded, &limited_request).unwrap();
+    let full_request = learning::RecommendRequest {
+        case_limit: 10,
+        ..Default::default()
+    };
+    let full = learning::recommend(Some(&store), &loaded, &full_request).unwrap();
+    let recommendation = &limited.recommendations[0];
     assert_eq!(recommendation.granularity, "look_for_related_finding");
+    assert_eq!(
+        recommendation.granularity, full.recommendations[0].granularity,
+        "case_limit не меняет гранулярность рекомендации"
+    );
     assert!(recommendation.reason.contains("структурно похожий случай"));
     assert!(
         recommendation

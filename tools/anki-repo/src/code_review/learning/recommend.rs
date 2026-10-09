@@ -205,10 +205,7 @@ pub fn recommend(
             let evidence = evidence_by_signature.get(&signature);
             let support = evidence.map(|item| item.support.clone());
             let cases = evidence.map_or_else(Vec::new, |item| item.cases.clone());
-            let repeats = cases
-                .iter()
-                .filter(|case| case.link == super::model::CaseLinkKind::StructuralRepeat)
-                .count();
+            let repeats = evidence.map_or(0, |item| item.related_repeats);
             (support, cases, repeats)
         };
         let guardrailed = is_guardrailed(unit);

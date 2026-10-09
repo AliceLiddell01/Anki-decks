@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anki_repo::code_review::learning::model::{
-    ExportedCandidate, ExportedDecision, ExportedFinding, ExportedFindingLink, ExportedSearchCase,
-    FeedbackAction, FeedbackEvent, FeedbackKind, ImportInputs, ImportRecord, LearningExport,
-    ObservationCounts, ReviewUnitKind, ReviewUnitRecord, ReviewedOutcome, TrustLevel,
+    CaseRef, ExportedCandidate, ExportedDecision, ExportedFinding, ExportedFindingLink,
+    ExportedSearchCase, FeedbackAction, FeedbackEvent, FeedbackKind, HistoryGeneration,
+    ImportInputs, ImportRecord, LearningExport, ObservationCounts, PolicyProposal, ReviewUnitKind,
+    ReviewUnitRecord, ReviewedOutcome, TrustLevel,
 };
 use anki_repo::code_review::learning::{self, LearningStore, StoreOptions};
 use anki_repo::error::ErrorCode;
@@ -65,6 +66,7 @@ fn seal(archive: &mut LearningExport) {
     archive.manifest.units = archive.units.len();
     archive.manifest.findings = archive.findings.len();
     archive.manifest.feedback_events = archive.feedback_events.len();
+    archive.manifest.policy_proposals = archive.policy_proposals.len();
     archive.manifest.search_cases = archive.search.len();
 }
 
@@ -519,6 +521,51 @@ fn negative_stored_event_time_is_rejected_without_normalization() {
         ErrorCode::LearningCorrupt
     );
     assert_eq!(generation, learning::import::generation(&store).unwrap());
+}
+
+#[test]
+fn policy_proposal_case_references_must_belong_to_the_archive() {
+    let directory = TempDir::new("transfer-policy-reference");
+    let store = open(directory.path());
+    let mut archive = fixture(&store, "review");
+    archive.policy_proposals.push(PolicyProposal {
+        schema_version: 1,
+        policy_version: 1,
+        generation: HistoryGeneration {
+            revision: 1,
+            trusted_reviews: 1,
+            quarantined_reviews: 0,
+            trusted_units: 2,
+        },
+        proposal_id: "proposal-test".into(),
+        rule_id: "learning.observe.test".into(),
+        key: BTreeMap::new(),
+        supporting_cases: vec![CaseRef {
+            review_id: "review".into(),
+            unit_id: "individual".into(),
+            candidate_ids: vec!["candidate-a".into()],
+            path: Some("src/lib.rs".into()),
+            snippet: None,
+            disposition: Some("confirmed".into()),
+            trust: TrustLevel::AstAuthenticated,
+            age_days: 0,
+        }],
+        contradicting_cases: Vec::new(),
+        cautions: vec!["Не применяется автоматически.".into()],
+        artifact_path: "learning/policy.json".into(),
+        auto_applied: false,
+    });
+    seal(&mut archive);
+    learning::transfer::verify_export(&archive).unwrap();
+
+    archive.policy_proposals[0].supporting_cases[0].review_id = "missing-review".into();
+    seal(&mut archive);
+    assert_eq!(
+        learning::transfer::verify_export(&archive)
+            .unwrap_err()
+            .code,
+        ErrorCode::LearningExportInvalid
+    );
 }
 
 #[test]

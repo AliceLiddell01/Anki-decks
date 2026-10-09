@@ -589,13 +589,17 @@ fn concurrent_exact_imports_commit_one_review_and_one_finding() {
         let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            learning::import::import_history(&store, &loaded, &learning::ImportRequest::default())
+            learning::import::import_with_outcome(
+                &store,
+                &loaded,
+                &learning::ImportRequest::default(),
+            )
         }));
     }
     barrier.wait();
-    let mut records = Vec::new();
+    let mut outcomes = Vec::new();
     for handle in handles {
-        records.push(
+        outcomes.push(
             handle
                 .join()
                 .expect("импортёр не должен паниковать")
@@ -604,8 +608,22 @@ fn concurrent_exact_imports_commit_one_review_and_one_finding() {
                 }),
         );
     }
-    assert_eq!(records[0].review_id, records[1].review_id);
-    assert_eq!(records[0].revision, records[1].revision);
+    assert_eq!(outcomes[0].record.review_id, outcomes[1].record.review_id);
+    assert_eq!(outcomes[0].record.revision, outcomes[1].record.revision);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status == learning::ImportStatus::Imported)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status == learning::ImportStatus::NoopExisting)
+            .count(),
+        1
+    );
     let history = learning::import::list_imports(&verification_store, true, 10).unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].observations.findings, 1);
@@ -2387,12 +2405,12 @@ fn policy_proposal_is_never_auto_applied() {
             Ok(())
         })
         .unwrap();
-    let restored = learning::transfer::restore_history(&store, &exported.archive).unwrap();
-    assert_eq!(restored.unchanged_reviews, 1);
+    let restore_error = learning::transfer::restore_history(&store, &exported.archive).unwrap_err();
+    assert_eq!(restore_error.code, ErrorCode::LearningConflict);
     assert_eq!(
         learning::feedback::show_proposal(&store, &proposal.proposal_id).unwrap(),
         local_proposal,
-        "устаревший архив не заменяет локальное предложение с тем же proposal_id"
+        "конфликт архива не заменяет локальное предложение с тем же proposal_id"
     );
 
     // Ключ политики находится и у паттерна за пределами стандартной страницы отчёта.
@@ -3142,7 +3160,7 @@ fn findings_are_linked_to_a_slice_by_units_and_confirmed_by_decisions() {
     let store_dir = TempDir::new("learning-finding-link-store");
     let store = open_store(store_dir.path());
     let loaded = load_in_repo(&repo, &artifacts, false).unwrap();
-    import(&loaded, &store);
+    let record = import(&loaded, &store);
 
     let production = support_of(&store, &unit_of(&queue, "production-0"));
     assert_eq!(
@@ -3218,6 +3236,25 @@ fn findings_are_linked_to_a_slice_by_units_and_confirmed_by_decisions() {
         Some(&2)
     );
     assert_eq!(repeated.support_units, 2);
+
+    let correction = FeedbackEvent {
+        schema_version: learning::feedback::FEEDBACK_SCHEMA_VERSION,
+        event_id: "finding-outcome-revision".into(),
+        review_id: record.review_id,
+        unit_id: unit_of(&queue, "production-0").id,
+        candidate_id: Some("production-0".into()),
+        kind: FeedbackKind::SemanticOutcomeRevision,
+        action: FeedbackAction::Append,
+        supersedes_event_id: None,
+        effective_disposition: Some("false_positive".into()),
+        usefulness: None,
+        explanation: "Подтверждение было пересмотрено после проверки.".into(),
+        provenance: "reviewer".into(),
+        recorded_at: 1,
+    };
+    learning::feedback::record_feedback(&store, &correction).unwrap();
+    let corrected = support_of(&store, &unit_of(&queue, "production-0"));
+    assert_eq!(corrected.confirmed_findings, 0);
 }
 
 /// Путь базы, открытой в синтетическом каталоге истории.

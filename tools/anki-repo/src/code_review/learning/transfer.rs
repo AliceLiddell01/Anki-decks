@@ -332,6 +332,32 @@ pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
             ));
         }
     }
+    for proposal in &archive.policy_proposals {
+        for case in proposal
+            .supporting_cases
+            .iter()
+            .chain(&proposal.contradicting_cases)
+        {
+            let Some(record) = review_ids.get(case.review_id.as_str()) else {
+                return Err(invalid(
+                    "Случай предложения политики ссылается на отсутствующее ревью",
+                ));
+            };
+            if !unit_ids.contains(&(case.review_id.as_str(), case.unit_id.as_str()))
+                || case.trust != record.trust
+                || case.candidate_ids.iter().any(|candidate_id| {
+                    candidate_units
+                        .get(&(case.review_id.as_str(), candidate_id.as_str()))
+                        .copied()
+                        != Some(case.unit_id.as_str())
+                })
+            {
+                return Err(invalid(
+                    "Случай предложения политики ссылается на отсутствующую единицу, кандидата или уровень доверия",
+                ));
+            }
+        }
+    }
     verify_decisions(archive, &review_ids)?;
     super::feedback::validate_event_history(&archive.feedback_events)
         .map_err(|error| invalid(error.message))?;
@@ -557,6 +583,7 @@ pub fn restore_history(
         let mut restored = 0usize;
         let mut unchanged = 0usize;
         let mut restored_ids = BTreeSet::new();
+        let mut available_review_ids = BTreeSet::new();
         for record in &archive.reviews {
             let existing: Option<String> = super::import::write_optional_row(
                 write,
@@ -567,6 +594,7 @@ pub fn restore_history(
             if let Some(existing_sha) = existing {
                 if existing_sha == record.inputs.review_pack_sha256 {
                     unchanged += 1;
+                    available_review_ids.insert(record.review_id.as_str());
                     continue;
                 }
                 return Err(DomainError::with_details(
@@ -581,6 +609,7 @@ pub fn restore_history(
             }
             insert_record(write, record)?;
             restored_ids.insert(record.review_id.as_str());
+            available_review_ids.insert(record.review_id.as_str());
             restored += 1;
         }
         for unit in &archive.units {
@@ -663,6 +692,14 @@ pub fn restore_history(
             }
         }
         for proposal in &archive.policy_proposals {
+            let is_related = proposal
+                .supporting_cases
+                .iter()
+                .chain(&proposal.contradicting_cases)
+                .any(|case| available_review_ids.contains(case.review_id.as_str()));
+            if !is_related {
+                continue;
+            }
             let feature_json = super::import::serialize_json(
                 &proposal.key,
                 "не удалось сериализовать признаки предложения",
@@ -671,8 +708,24 @@ pub fn restore_history(
                 proposal,
                 "не удалось сериализовать предложение политики",
             )?;
+            let existing_document: Option<String> = super::import::write_optional_row(
+                write,
+                "SELECT document_json FROM learning_policy_proposal WHERE proposal_id = ?1",
+                params![proposal.proposal_id],
+                |row| row.get(0),
+            )?;
+            if let Some(existing_document) = existing_document {
+                if existing_document != document_json {
+                    return Err(DomainError::with_details(
+                        ErrorCode::LearningConflict,
+                        "Предложение политики архива конфликтует с локальным документом",
+                        crate::details! { "proposal_id" => proposal.proposal_id },
+                    ));
+                }
+                continue;
+            }
             write.execute(
-                "INSERT OR IGNORE INTO learning_policy_proposal
+                "INSERT INTO learning_policy_proposal
                     (proposal_id, rule_id, feature_json, document_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -1322,7 +1375,7 @@ fn read_candidates(
                 path: row.get(5)?,
                 path_family: row.get(6)?,
                 origin: row.get(7)?,
-                // Текст кандидата остаётся только в локальной базе; переноситcя
+                // Текст кандидата остаётся только в локальной базе; переносится
                 // ссылка на evidence, но не фрагмент исходного кода.
                 snippet: None,
                 classification_json: row.get(8)?,
