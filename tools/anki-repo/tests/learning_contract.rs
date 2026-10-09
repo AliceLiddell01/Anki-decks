@@ -53,9 +53,8 @@ fn git(root: &Path, args: &[&str]) -> String {
         .expect("не удалось запустить тестовую команду Git");
     assert!(
         output.status.success(),
-        "тестовая команда Git {args:?} завершилась с кодом {:?}: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+        "тестовая команда Git завершилась с кодом {:?}",
+        output.status.code()
     );
     String::from_utf8(output.stdout)
         .expect("вывод синтетического Git-репозитория должен быть UTF-8")
@@ -2408,12 +2407,13 @@ fn schema_and_policy_versions_are_recorded_with_the_history() {
     assert!(!status.database_path.contains("/home/"));
     // Путь по умолчанию лежит внутри каталога learning и не раскрывает клон.
     let options = learning::StoreOptions::in_repository(directory.path());
-    assert_eq!(
-        options.database,
-        directory
-            .path()
-            .join(learning::DEFAULT_LEARNING_DIRECTORY)
-            .join(learning::DEFAULT_LEARNING_DATABASE)
+    assert!(
+        options.database
+            == directory
+                .path()
+                .join(learning::DEFAULT_LEARNING_DIRECTORY)
+                .join(learning::DEFAULT_LEARNING_DATABASE),
+        "база данных должна находиться в каталоге learning репозитория"
     );
     assert_eq!(
         options.display_path,
@@ -3049,8 +3049,7 @@ fn search_does_not_mix_quarantine_with_trusted_history() {
             .cases
             .iter()
             .all(|case| case.trust == "ast_authenticated"),
-        "карантин не возвращается без явного согласия: {:?}",
-        trusted_page.cases
+        "карантин не возвращается без явного согласия"
     );
 
     // Карантин доступен только явно и не подменяет доверенные случаи.

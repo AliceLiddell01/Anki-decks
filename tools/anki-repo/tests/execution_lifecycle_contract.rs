@@ -18,15 +18,15 @@ fn git(root: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(
         output.status.success(),
-        "Git: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "тестовая команда Git завершилась с кодом {:?}",
+        output.status.code()
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 fn success(output: (i32, String, String)) -> Value {
-    let (code, stdout, stderr) = output;
-    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let (code, stdout, _stderr) = output;
+    assert!(code == 0, "CLI завершился с кодом {code}");
     parse_json(&stdout)["result"].clone()
 }
 
@@ -210,7 +210,7 @@ fn cleanup_preflights_all_surfaces_before_removing_worktree() {
             fs::write(job.join("scratch"), "не каталог".as_bytes()).unwrap();
         }
         let (code, stdout, _) = fixture.operation("cleanup", &job);
-        assert_ne!(code, 0, "{stdout}");
+        assert_ne!(code, 0, "запуск при конфликте должен завершиться ошибкой");
         assert_eq!(
             parse_json(&stdout)["error"]["code"],
             "review_artifact_conflict"
@@ -259,14 +259,17 @@ fn failures_before_spawn_leave_proven_not_started_job_inspectable() {
         } else {
             fs::write(&path, "существующее свидетельство".as_bytes()).unwrap();
         }
-        let (code, stdout, _) = fixture.run(
+        let (code, _stdout, _) = fixture.run(
             &job,
             &["/bin/sh", "-c", "printf started > ../outputs/started"],
         );
-        assert_ne!(code, 0, "{stdout}");
+        assert_ne!(code, 0, "cleanup должен завершиться ошибкой");
         assert!(!job.join("outputs/started").exists());
         let inspection = success(fixture.operation("inspect", &job));
-        assert_eq!(inspection["lifecycle"], "prepared", "{inspection}");
+        assert_eq!(
+            inspection["lifecycle"], "prepared",
+            "lifecycle должен быть prepared"
+        );
         assert_eq!(inspection["result"], Value::Null);
         if surface == "home" {
             assert!(!job.join("logs/stdout.log").exists());
@@ -294,7 +297,10 @@ fn unavailable_command_has_not_started_result_and_can_be_cleaned() {
     let fixture = Fixture::new();
     let job = fixture.prepare("disposable_source_experiment");
     let (code, stdout, _) = fixture.run(&job, &["/nonexistent/execution-fixture-command"]);
-    assert_eq!(code, 127, "{stdout}");
+    assert_eq!(
+        code, 127,
+        "отсутствующая команда должна завершиться с кодом 127"
+    );
     let result = &parse_json(&stdout)["result"];
     assert_eq!(result["status"], "unavailable");
     assert_eq!(result["enforcement"]["process_cleanup"], "not_started");
@@ -386,8 +392,8 @@ impl ActiveRun {
         let output = self.child.take().unwrap().wait_with_output().unwrap();
         assert!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
+            "процесс выполнения должен завершиться успешно: {:?}",
+            output.status.code()
         );
     }
 }
@@ -497,11 +503,14 @@ fn missing_job_and_missing_manifest_are_read_errors() {
     let job = fixture.prepare("isolated_checks");
     let absent = job.with_file_name("00000000000000000000000000000000");
     let (code, stdout, _) = fixture.operation("inspect", &absent);
-    assert_eq!(code, 4, "{stdout}");
+    assert_eq!(
+        code, 4,
+        "отсутствующее задание должно завершиться с кодом 4"
+    );
     assert_eq!(parse_json(&stdout)["error"]["code"], "not_found");
     fs::remove_file(job.join("job.json")).unwrap();
     let (code, stdout, _) = fixture.operation("inspect", &job);
-    assert_eq!(code, 3, "{stdout}");
+    assert_eq!(code, 3, "нечитаемое задание должно завершиться с кодом 3");
     assert_eq!(parse_json(&stdout)["error"]["code"], "input_unreadable");
 }
 
@@ -535,12 +544,12 @@ fn private_cargo_home_has_deterministic_offline_behavior() {
     )
     .unwrap();
     let (code, stdout, _) = fixture.run(&registry, &["cargo", "check", "--offline"]);
-    assert_eq!(code, 9, "{stdout}");
+    assert_eq!(code, 9, "ошибка выполнения должна завершиться с кодом 9");
     let result = &parse_json(&stdout)["result"];
     assert_eq!(result["status"], "failed");
     assert!(
         result["stderr"]["text"].as_str().unwrap().contains("serde"),
-        "{result}"
+        "сводка stderr должна содержать диагностику Cargo"
     );
     assert!(!fixture.root().join("target").exists());
 }
@@ -637,7 +646,7 @@ fn active_job_cannot_be_cleaned_even_with_descendant_confirmation() {
             "--confirm-no-live-descendants",
         ],
     );
-    assert_eq!(code, 13, "{stdout}");
+    assert_eq!(code, 13, "занятое задание должно завершиться с кодом 13");
     assert_eq!(parse_json(&stdout)["error"]["code"], "execution_busy");
     assert!(job.join("worktree").is_dir());
     assert!(job.join("outputs/ready").is_file());
@@ -665,7 +674,7 @@ fn timeout_and_cancelled_disposable_jobs_preserve_evidence_during_confirmed_clea
             "printf report > ../outputs/direction-report.json; exec /bin/sleep 30",
         ],
     );
-    assert_eq!(code, 11, "{stdout}");
+    assert_eq!(code, 11, "превышение времени должно завершиться с кодом 11");
     assert_eq!(parse_json(&stdout)["result"]["status"], "timed_out");
     assert_eq!(
         confirmed_cleanup(&fixture, &timed)["workspace_removed"],
@@ -700,7 +709,10 @@ fn git_operation_failure_is_distinct_from_snapshot_mismatch() {
     let broken = fixture.prepare("isolated_checks");
     fs::write(broken.join("worktree/.git"), "невалидные Git metadata\n").unwrap();
     let (code, stdout, _) = fixture.run(&broken, &["/bin/true"]);
-    assert_eq!(code, 14, "{stdout}");
+    assert_eq!(
+        code, 14,
+        "повреждённое задание должно завершиться с кодом 14"
+    );
     assert_eq!(
         parse_json(&stdout)["error"]["code"],
         "process_operation_failed"
@@ -716,7 +728,7 @@ fn git_operation_failure_is_distinct_from_snapshot_mismatch() {
         &["checkout", "--detach", "HEAD^"],
     );
     let (code, stdout, _) = fixture.run(&mismatch, &["/bin/true"]);
-    assert_eq!(code, 3, "{stdout}");
+    assert_eq!(code, 3, "неверное состояние должно завершиться с кодом 3");
     assert_eq!(
         parse_json(&stdout)["error"]["code"],
         "review_artifact_invalid"
@@ -745,8 +757,11 @@ fn cleanup_rejects_foreign_attestation_and_preserves_operator_limitation() {
     );
     let attestation = fs::read(first.join("cleanup-attestation.json")).unwrap();
     fs::remove_file(first.join("cleanup-attestation.json")).unwrap();
-    let (code, stdout, _) = fixture.operation("cleanup", &first);
-    assert_eq!(code, 7, "{stdout}");
+    let (code, _stdout, _) = fixture.operation("cleanup", &first);
+    assert_eq!(
+        code, 7,
+        "неподтверждённая очистка должна завершиться с кодом 7"
+    );
     fs::write(first.join("cleanup-attestation.json"), attestation).unwrap();
     fs::copy(
         first.join("cleanup-attestation.json"),
@@ -764,7 +779,10 @@ fn cleanup_rejects_foreign_attestation_and_preserves_operator_limitation() {
             "--confirm-no-live-descendants",
         ],
     );
-    assert_eq!(code, 7, "{stdout}");
+    assert_eq!(
+        code, 7,
+        "неподтверждённая очистка должна завершиться с кодом 7"
+    );
     assert_eq!(
         parse_json(&stdout)["error"]["code"],
         "review_artifact_conflict"
@@ -780,8 +798,11 @@ fn cleanup_rejects_unexpected_job_entries_before_any_mutation() {
     let fixture = Fixture::new();
     let job = fixture.prepare("isolated_checks");
     fs::write(job.join("foreign.txt"), b"unchanged").unwrap();
-    let (code, stdout, _) = fixture.operation("cleanup", &job);
-    assert_eq!(code, 7, "{stdout}");
+    let (code, _stdout, _) = fixture.operation("cleanup", &job);
+    assert_eq!(
+        code, 7,
+        "неподтверждённая очистка должна завершиться с кодом 7"
+    );
     assert_eq!(fs::read(job.join("foreign.txt")).unwrap(), b"unchanged");
     assert!(job.join("worktree").is_dir());
     assert!(job.join("target").is_dir());
@@ -817,7 +838,10 @@ fn admin_record(root: &Path, worktree: &Path) -> PathBuf {
             found.push(entry.path());
         }
     }
-    assert_eq!(found.len(), 1, "запись Git для {worktree:?}");
+    assert!(
+        found.len() == 1,
+        "должна существовать ровно одна запись Git для worktree"
+    );
     found.pop().unwrap()
 }
 
@@ -1044,7 +1068,10 @@ fn concurrent_cleanup_cannot_remove_resources_while_preparation_creates_worktree
 
     // Подготовка идёт: задание не выдаётся за готовое.
     let inspection = success(fixture.operation("inspect", &job));
-    assert_eq!(inspection["lifecycle"], "preparing", "{inspection}");
+    assert_eq!(
+        inspection["lifecycle"], "preparing",
+        "lifecycle должен быть preparing"
+    );
     assert_eq!(inspection["result"], Value::Null);
     assert_eq!(inspection["workspace_removed"], false);
     assert!(
@@ -1052,7 +1079,7 @@ fn concurrent_cleanup_cannot_remove_resources_while_preparation_creates_worktree
             .as_str()
             .unwrap()
             .contains("другим процессом"),
-        "{inspection}"
+        "ограничение должно указывать на удерживающий процесс"
     );
     assert!(
         !job.join("worktree").exists(),
@@ -1064,19 +1091,19 @@ fn concurrent_cleanup_cannot_remove_resources_while_preparation_creates_worktree
         &job,
         &["/bin/sh", "-c", "printf started > ../outputs/started"],
     );
-    assert_ne!(code, 0, "{stdout}");
+    assert_ne!(code, 0, "операция должна завершиться ошибкой");
     assert!(
         matches!(
             parse_json(&stdout)["error"]["code"].as_str().unwrap(),
             "execution_busy" | "review_artifact_conflict"
         ),
-        "{stdout}"
+        "операция должна сообщить об удерживающем процессе"
     );
     assert!(!job.join("outputs/started").exists());
 
     // Конкурентный cleanup получает явный наблюдаемый отказ и не удаляет ресурсы.
     let (code, stdout, _) = fixture.operation("cleanup", &job);
-    assert_eq!(code, 13, "{stdout}");
+    assert_eq!(code, 13, "занятое задание должно завершиться с кодом 13");
     let error = &parse_json(&stdout)["error"];
     assert_eq!(error["code"], "execution_busy");
     assert_eq!(error["details"]["retryable"], true);
@@ -1095,8 +1122,7 @@ fn concurrent_cleanup_cannot_remove_resources_while_preparation_creates_worktree
     let output = barrier.wait_with_output();
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        "подготовка должна завершиться успешно"
     );
     let prepared = parse_json(&String::from_utf8(output.stdout).unwrap())["result"].clone();
     assert_eq!(
@@ -1106,7 +1132,10 @@ fn concurrent_cleanup_cannot_remove_resources_while_preparation_creates_worktree
 
     // Готовое задание честно подготовлено, целевой HEAD и чужие ресурсы сохранены.
     let inspection = success(fixture.operation("inspect", &job));
-    assert_eq!(inspection["lifecycle"], "prepared", "{inspection}");
+    assert_eq!(
+        inspection["lifecycle"], "prepared",
+        "lifecycle должен быть prepared"
+    );
     assert!(inspection["limitations"].as_array().unwrap().is_empty());
     assert_eq!(
         git(&job.join("worktree"), &["rev-parse", "HEAD"]),
@@ -1157,7 +1186,10 @@ fn preparation_killed_before_publication_stays_unlaunchable_and_cleans_without_c
     );
 
     let inspection = success(fixture.operation("inspect", &job));
-    assert_eq!(inspection["lifecycle"], "preparing", "{inspection}");
+    assert_eq!(
+        inspection["lifecycle"], "preparing",
+        "lifecycle должен быть preparing"
+    );
     assert_eq!(inspection["result"], Value::Null);
     assert_eq!(inspection["workspace_removed"], false);
     assert!(
@@ -1165,7 +1197,7 @@ fn preparation_killed_before_publication_stays_unlaunchable_and_cleans_without_c
             .as_str()
             .unwrap()
             .contains("не удерживает"),
-        "{inspection}"
+        "ограничение должно описывать неактивную подготовку"
     );
 
     // Незапускаемое задание не запускается и не создаёт следов исполнения.
@@ -1173,7 +1205,10 @@ fn preparation_killed_before_publication_stays_unlaunchable_and_cleans_without_c
         &job,
         &["/bin/sh", "-c", "printf started > ../outputs/started"],
     );
-    assert_ne!(code, 0, "{stdout}");
+    assert_ne!(
+        code, 0,
+        "запуск неподготовленного задания должен завершиться ошибкой"
+    );
     assert_eq!(
         parse_json(&stdout)["error"]["code"],
         "review_artifact_conflict"
@@ -1196,7 +1231,10 @@ fn preparation_killed_before_publication_stays_unlaunchable_and_cleans_without_c
     assert!(job.join("source-review.json").is_file());
 
     let inspection = success(fixture.operation("inspect", &job));
-    assert_eq!(inspection["lifecycle"], "preparing", "{inspection}");
+    assert_eq!(
+        inspection["lifecycle"], "preparing",
+        "lifecycle должен быть preparing"
+    );
     assert_eq!(inspection["workspace_removed"], true);
     assert_eq!(git(fixture.root(), &["rev-parse", "HEAD"]), fixture.head);
 }
@@ -1228,26 +1266,42 @@ fn cleanup_recovers_worktree_directory_left_unregistered_by_interrupted_git() {
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
     assert!(
         !worktrees.contains(partial.to_str().unwrap()),
-        "{worktrees}"
+        "частичное worktree не должно быть зарегистрировано"
     );
 
     let inspection = success(fixture.operation("inspect", &job));
-    assert_eq!(inspection["lifecycle"], "preparing", "{inspection}");
+    assert_eq!(
+        inspection["lifecycle"], "preparing",
+        "lifecycle должен быть preparing"
+    );
     assert!(
         inspection["limitations"][0]
             .as_str()
             .unwrap()
             .contains("не удерживает"),
-        "{inspection}"
+        "ограничение должно описывать незарегистрированное worktree"
     );
 
     // Очистка не требует ложного подтверждения об отсутствии потомков и
     // завершается консистентно: код этого задания не запускался.
     let result = success(fixture.operation("cleanup", &job));
-    assert_eq!(result["workspace_removed"], true, "{result}");
-    assert_eq!(result["evidence_retained"], true, "{result}");
-    assert_eq!(result["limitation"], Value::Null, "{result}");
-    assert!(!result.to_string().contains("/proc/"), "{result}");
+    assert_eq!(
+        result["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
+    assert_eq!(
+        result["evidence_retained"], true,
+        "свидетельства должны сохраниться"
+    );
+    assert_eq!(
+        result["limitation"],
+        Value::Null,
+        "ограничение не ожидается"
+    );
+    assert!(
+        !result.to_string().contains("/proc/"),
+        "результат не должен раскрывать /proc"
+    );
     assert!(!job.join("cleanup-attestation.json").exists());
     assert!(
         !partial.exists(),
@@ -1277,17 +1331,23 @@ fn cleanup_recovers_worktree_directory_left_unregistered_by_interrupted_git() {
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
     assert!(
         worktrees.contains(foreign_worktree.to_str().unwrap()),
-        "{worktrees}"
+        "чужое worktree должно остаться зарегистрированным"
     );
     assert!(
         !worktrees.contains(partial.to_str().unwrap()),
-        "{worktrees}"
+        "частичное worktree не должно быть зарегистрировано"
     );
 
     // Повторный inspect консистентен, повторная очистка идемпотентна.
     let inspection = success(fixture.operation("inspect", &job));
-    assert_eq!(inspection["lifecycle"], "preparing", "{inspection}");
-    assert_eq!(inspection["workspace_removed"], true, "{inspection}");
+    assert_eq!(
+        inspection["lifecycle"], "preparing",
+        "lifecycle должен быть preparing"
+    );
+    assert_eq!(
+        inspection["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
     assert_eq!(
         success(fixture.operation("cleanup", &job))["workspace_removed"],
         true
@@ -1328,11 +1388,21 @@ fn cleanup_prunes_stale_git_record_of_broken_owned_worktree() {
     );
     fs::remove_file(owned.join(".git")).unwrap();
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
-    assert!(worktrees.contains(owned.to_str().unwrap()), "{worktrees}");
+    assert!(
+        worktrees.contains(owned.to_str().unwrap()),
+        "worktree должно оставаться зарегистрированным до очистки"
+    );
 
     let result = success(fixture.operation("cleanup", &job));
-    assert_eq!(result["workspace_removed"], true, "{result}");
-    assert_eq!(result["limitation"], Value::Null, "{result}");
+    assert_eq!(
+        result["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
+    assert_eq!(
+        result["limitation"],
+        Value::Null,
+        "ограничение не ожидается"
+    );
     assert!(!owned.exists(), "каталог рабочего дерева не удалён");
     // Логи и outputs сохраняются как свидетельства, остальные поверхности удалены.
     for surface in [
@@ -1351,10 +1421,13 @@ fn cleanup_prunes_stale_git_record_of_broken_owned_worktree() {
 
     // Застарелая запись удалена, чужие worktrees и целевой HEAD сохранены.
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
-    assert!(!worktrees.contains(owned.to_str().unwrap()), "{worktrees}");
+    assert!(
+        !worktrees.contains(owned.to_str().unwrap()),
+        "собственное worktree должно быть удалено из списка"
+    );
     assert!(
         worktrees.contains(foreign_worktree.to_str().unwrap()),
-        "{worktrees}"
+        "чужое worktree должно остаться зарегистрированным"
     );
     assert!(foreign_worktree.is_dir());
     assert_eq!(git(&foreign_worktree, &["rev-parse", "HEAD"]), fixture.head);
@@ -1407,8 +1480,15 @@ fn cleanup_removes_only_own_stale_worktree_record() {
     fs::remove_file(owned.join(".git")).unwrap();
 
     let result = success(fixture.operation("cleanup", &job));
-    assert_eq!(result["workspace_removed"], true, "{result}");
-    assert_eq!(result["limitation"], Value::Null, "{result}");
+    assert_eq!(
+        result["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
+    assert_eq!(
+        result["limitation"],
+        Value::Null,
+        "ограничение не ожидается"
+    );
     assert!(!owned.exists(), "каталог рабочего дерева не удалён");
     assert!(
         !owned_record.exists(),
@@ -1421,15 +1501,18 @@ fn cleanup_removes_only_own_stale_worktree_record() {
         foreign_record.join("gitdir").is_file(),
         "чужая административная запись Git удалена"
     );
-    assert_eq!(
-        fs::read_to_string(foreign_record.join("gitdir")).unwrap(),
-        foreign_gitdir
+    assert!(
+        fs::read_to_string(foreign_record.join("gitdir")).unwrap() == foreign_gitdir,
+        "ссылка чужой записи Git должна сохраниться"
     );
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
-    assert!(worktrees.contains(foreign.to_str().unwrap()), "{worktrees}");
+    assert!(
+        worktrees.contains(foreign.to_str().unwrap()),
+        "чужое worktree должно остаться зарегистрированным"
+    );
     assert!(
         worktrees.contains("prunable"),
-        "чужая запись потеряла признак prunable: {worktrees}"
+        "чужая запись должна сохранить признак prunable"
     );
     fs::create_dir_all(&foreign).unwrap();
     fs::write(
@@ -1491,9 +1574,19 @@ fn cleanup_removes_own_locked_worktree_record() {
     assert!(owned_record.join("locked").is_file());
 
     let result = success(fixture.operation("cleanup", &job));
-    assert_eq!(result["workspace_removed"], true, "{result}");
-    assert_eq!(result["evidence_retained"], true, "{result}");
-    assert_eq!(result["limitation"], Value::Null, "{result}");
+    assert_eq!(
+        result["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
+    assert_eq!(
+        result["evidence_retained"], true,
+        "свидетельства должны сохраниться"
+    );
+    assert_eq!(
+        result["limitation"],
+        Value::Null,
+        "ограничение не ожидается"
+    );
     assert!(
         !owned.exists(),
         "каталог собственного locked worktree не удалён"
@@ -1514,10 +1607,13 @@ fn cleanup_removes_own_locked_worktree_record() {
         assert!(!job.join(surface).exists(), "не удалён {surface}");
     }
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
-    assert!(!worktrees.contains(owned.to_str().unwrap()), "{worktrees}");
+    assert!(
+        !worktrees.contains(owned.to_str().unwrap()),
+        "собственное worktree должно быть удалено из списка"
+    );
     assert!(
         worktrees.contains(foreign_worktree.to_str().unwrap()),
-        "{worktrees}"
+        "чужое worktree должно остаться зарегистрированным"
     );
     assert!(foreign_worktree.is_dir());
     assert_eq!(git(&foreign_worktree, &["rev-parse", "HEAD"]), fixture.head);
@@ -1567,12 +1663,22 @@ fn cleanup_removes_own_record_when_worktree_directory_is_absent() {
     assert!(owned_record.join("gitdir").is_file());
 
     let result = success(fixture.operation("cleanup", &job));
-    assert_eq!(result["workspace_removed"], true, "{result}");
-    assert_eq!(result["limitation"], Value::Null, "{result}");
-    assert!(!result.to_string().contains("/proc/"), "{result}");
+    assert_eq!(
+        result["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
+    assert_eq!(
+        result["limitation"],
+        Value::Null,
+        "ограничение не ожидается"
+    );
+    assert!(
+        !result.to_string().contains("/proc/"),
+        "результат не должен раскрывать /proc"
+    );
     assert!(
         !owned_record.exists(),
-        "собственная застарелая запись осталась: {result}"
+        "собственная застарелая запись осталась"
     );
 
     // Чужие записи, ресурсы и целевой HEAD не тронуты.
@@ -1582,15 +1688,18 @@ fn cleanup_removes_own_record_when_worktree_directory_is_absent() {
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
     assert!(
         worktrees.contains(foreign_worktree.to_str().unwrap()),
-        "{worktrees}"
+        "чужое worktree должно остаться зарегистрированным"
     );
 
     // Повторная очистка идемпотентна и тоже не оставляет своей записи.
     let repeated = success(fixture.operation("cleanup", &job));
-    assert_eq!(repeated["workspace_removed"], true, "{repeated}");
+    assert_eq!(
+        repeated["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
     assert!(
         !owned_record.exists(),
-        "собственная запись вернулась после повторной очистки: {repeated}"
+        "собственная запись вернулась после повторной очистки"
     );
 }
 
@@ -1599,11 +1708,18 @@ fn cleanup_removes_own_record_when_worktree_directory_is_absent() {
 /// на месте.
 fn assert_repeated_cleanup_removes_record(fixture: &Fixture, job: &Path, record: &Path) {
     let repeated = success(fixture.operation("cleanup", job));
-    assert_eq!(repeated["workspace_removed"], true, "{repeated}");
-    assert_eq!(repeated["limitation"], Value::Null, "{repeated}");
+    assert_eq!(
+        repeated["workspace_removed"], true,
+        "workspace должен быть удалён"
+    );
+    assert_eq!(
+        repeated["limitation"],
+        Value::Null,
+        "ограничение не ожидается"
+    );
     assert!(
         !record.exists(),
-        "собственная запись осталась после повторной очистки: {repeated}"
+        "собственная запись осталась после повторной очистки"
     );
 }
 
@@ -1694,6 +1810,6 @@ fn repeated_cleanup_removes_record_left_by_failed_first_pass() {
     let worktrees = git(fixture.root(), &["worktree", "list", "--porcelain"]);
     assert!(
         worktrees.contains(foreign_worktree.to_str().unwrap()),
-        "{worktrees}"
+        "чужое worktree должно остаться зарегистрированным"
     );
 }

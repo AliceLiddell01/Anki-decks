@@ -44,9 +44,8 @@ fn git(root: &Path, args: &[&str]) -> String {
         .expect("не удалось запустить тестовую команду Git");
     assert!(
         output.status.success(),
-        "тестовая команда Git {args:?} завершилась с кодом {:?}: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+        "тестовая команда Git завершилась с кодом {:?}",
+        output.status.code()
     );
     String::from_utf8(output.stdout)
         .expect("вывод синтетического Git-репозитория должен быть UTF-8")
@@ -81,16 +80,15 @@ fn cli_json(fixture: &Fixture, args: &[&str]) -> (i32, Value, String) {
     let mut argv = vec!["--json"];
     argv.extend_from_slice(args);
     let (code, stdout, stderr) = run_cli_in(Some(fixture.path()), &argv);
-    let value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
-        panic!("вывод не является JSON: {error}\nstdout: {stdout}\nstderr: {stderr}")
-    });
+    let value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("вывод не является JSON: {error}"));
     (code, value, stderr)
 }
 
 /// Разбирает машинный JSON успешного ответа.
 fn ok_json(fixture: &Fixture, args: &[&str]) -> Value {
-    let (code, value, stderr) = cli_json(fixture, args);
-    assert_eq!(code, 0, "команда {args:?} завершилась с ошибкой: {stderr}");
+    let (code, value, _stderr) = cli_json(fixture, args);
+    assert!(code == 0, "команда должна завершиться успешно, код: {code}");
     value
 }
 
@@ -98,18 +96,20 @@ fn ok_json(fixture: &Fixture, args: &[&str]) -> Value {
 fn error_code(value: &Value) -> String {
     value["error"]["code"]
         .as_str()
-        .unwrap_or_else(|| panic!("в ответе нет кода ошибки: {value}"))
+        .unwrap_or_else(|| panic!("в ответе нет кода ошибки"))
         .to_owned()
 }
 
 /// Проверяет, что команда отказывает с ожидаемым кодом ошибки.
 fn assert_error(fixture: &Fixture, args: &[&str], expected: &str) {
-    let (code, value, stderr) = cli_json(fixture, args);
-    assert_ne!(code, 0, "команда {args:?} неожиданно прошла: {value}");
-    assert_eq!(
-        error_code(&value),
-        expected,
-        "команда {args:?} отказала не тем кодом (exit {code}, stderr {stderr}): {value}"
+    let (code, value, _stderr) = cli_json(fixture, args);
+    assert!(
+        code != 0,
+        "команда должна была завершиться с ошибкой, код: {code}"
+    );
+    assert!(
+        error_code(&value) == expected,
+        "код ошибки команды не совпал с ожидаемым"
     );
 }
 
@@ -167,11 +167,11 @@ impl Fixture {
     }
 
     fn collect(&self, base: &str, head: &str) {
-        let (code, _, stderr) = cli(
+        let (code, _, _stderr) = cli(
             self,
             &["code-review", "collect", "--base", base, "--head", head],
         );
-        assert_eq!(code, 0, "collect должен проходить: {stderr}");
+        assert_eq!(code, 0, "collect должен проходить");
     }
 
     /// Добавляет второй снимок с той же структурной сигнатурой.
@@ -203,7 +203,7 @@ impl Fixture {
         if input.exists() {
             fs::remove_file(&input).unwrap();
         }
-        let (code, _, stderr) = cli(
+        let (code, _, _stderr) = cli(
             self,
             &[
                 "code-review",
@@ -215,14 +215,14 @@ impl Fixture {
                 &self.artifact(head, "semantic-triage.input.json"),
             ],
         );
-        assert_eq!(code, 0, "triage init должен проходить: {stderr}");
+        assert_eq!(code, 0, "triage init должен проходить");
         let mut document: Value =
             serde_json::from_slice(&fs::read(&input).unwrap()).expect("документ разбора");
         for (candidate_id, disposition) in decisions {
             decide(&mut document, candidate_id, disposition);
         }
         fs::write(&input, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        let (code, _, stderr) = cli(
+        let (code, _, _stderr) = cli(
             self,
             &[
                 "code-review",
@@ -236,7 +236,7 @@ impl Fixture {
                 &self.triage(head),
             ],
         );
-        assert_eq!(code, 0, "triage validate должен проходить: {stderr}");
+        assert_eq!(code, 0, "triage validate должен проходить");
     }
 
     /// Импортирует проверенную историю снимка и возвращает запись истории.
@@ -346,7 +346,7 @@ fn review_workflow_without_learning_is_unchanged_and_creates_no_database() {
     let triage_bytes = read(&fixture.path().join(fixture.triage(&head)));
 
     // Обычные команды ревью работают без базы learning.
-    let (code, _, stderr) = cli(
+    let (code, _, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -358,8 +358,8 @@ fn review_workflow_without_learning_is_unchanged_and_creates_no_database() {
             &fixture.queue(&head),
         ],
     );
-    assert_eq!(code, 0, "queue validate без learning: {stderr}");
-    let (code, _, stderr) = cli(
+    assert_eq!(code, 0, "queue validate без learning должен проходить");
+    let (code, _, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -371,7 +371,7 @@ fn review_workflow_without_learning_is_unchanged_and_creates_no_database() {
             &fixture.triage(&head),
         ],
     );
-    assert_eq!(code, 0, "triage validate без learning: {stderr}");
+    assert_eq!(code, 0, "triage validate без learning должен проходить");
     let before = ok_json(
         &fixture,
         &[
@@ -404,9 +404,9 @@ fn review_workflow_without_learning_is_unchanged_and_creates_no_database() {
         .as_str()
         .unwrap()
         .to_owned();
-    let (code, _, stderr) = cli(&fixture, &["code-review", "execution", "inspect", &job]);
-    assert_eq!(code, 0, "execution inspect без learning: {stderr}");
-    let (code, _, stderr) = cli(
+    let (code, _, _stderr) = cli(&fixture, &["code-review", "execution", "inspect", &job]);
+    assert_eq!(code, 0, "execution inspect без learning должен проходить");
+    let (code, _, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -416,7 +416,7 @@ fn review_workflow_without_learning_is_unchanged_and_creates_no_database() {
             "--confirm-no-live-descendants",
         ],
     );
-    assert_eq!(code, 0, "execution cleanup без learning: {stderr}");
+    assert_eq!(code, 0, "execution cleanup без learning должен проходить");
 
     let database = fixture.path().join(".anki-repo/learning");
     assert!(
@@ -458,9 +458,9 @@ fn review_workflow_without_learning_is_unchanged_and_creates_no_database() {
     );
 
     // Команды работают из любого каталога репозитория: путь базы считается от корня.
-    let (code, stdout, stderr) =
+    let (code, stdout, _stderr) =
         cli_from_subdirectory(&fixture, &["code-review", "learning", "status"]);
-    assert_eq!(code, 0, "status из подкаталога: {stderr}");
+    assert_eq!(code, 0, "status из подкаталога должен проходить");
     let from_subdirectory: Value = serde_json::from_str(&stdout).expect("JSON из подкаталога");
     assert_eq!(from_subdirectory["result"]["present"], json!(true));
     assert_eq!(
@@ -880,7 +880,7 @@ fn status_validate_stats_patterns_and_search_bound_their_output() {
             .contains("повторных наблюдений того же случая исключено"),
         "объяснение обязано называть свёрнутые повторы: {rule}"
     );
-    let (code, human, stderr) = cli(
+    let (code, human, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -890,7 +890,7 @@ fn status_validate_stats_patterns_and_search_bound_their_output() {
             "error_path",
         ],
     );
-    assert_eq!(code, 0, "человекочитаемый вывод паттернов: {stderr}");
+    assert_eq!(code, 0, "человекочитаемый вывод паттернов должен проходить");
     assert!(
         human.contains("независимых единиц") && human.contains("свёрнутых повторов"),
         "человекочитаемый вывод обязан показывать свёрнутые повторы: {human}"
@@ -962,14 +962,11 @@ fn status_validate_stats_patterns_and_search_bound_their_output() {
     );
 
     // Выход за жёсткий максимум страницы отвергается разбором аргументов.
-    let (code, _, stderr) = cli(
+    let (code, _, _stderr) = cli(
         &fixture,
         &["code-review", "learning", "search", "--limit", "100000"],
     );
-    assert_eq!(
-        code, 2,
-        "жёсткий максимум страницы должен отвергаться: {stderr}"
-    );
+    assert_eq!(code, 2, "жёсткий максимум страницы должен отвергаться");
 }
 
 #[test]
@@ -1790,7 +1787,7 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
     fixture.write_triage(&head, &decisions);
 
     let review_commands = |fixture: &Fixture| {
-        let (code, _, stderr) = cli(
+        let (code, _, _stderr) = cli(
             fixture,
             &[
                 "code-review",
@@ -1802,8 +1799,8 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
                 &fixture.queue(&head),
             ],
         );
-        assert_eq!(code, 0, "queue validate: {stderr}");
-        let (code, _, stderr) = cli(
+        assert_eq!(code, 0, "queue validate должен проходить");
+        let (code, _, _stderr) = cli(
             fixture,
             &[
                 "code-review",
@@ -1815,8 +1812,8 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
                 &fixture.queue(&head),
             ],
         );
-        assert_eq!(code, 0, "queue list: {stderr}");
-        let (code, _, stderr) = cli(
+        assert_eq!(code, 0, "queue list должен проходить");
+        let (code, _, _stderr) = cli(
             fixture,
             &[
                 "code-review",
@@ -1828,7 +1825,7 @@ fn absent_empty_corrupt_and_unavailable_databases_do_not_break_review() {
                 &fixture.triage(&head),
             ],
         );
-        assert_eq!(code, 0, "triage validate: {stderr}");
+        assert_eq!(code, 0, "triage validate должен проходить");
     };
 
     // Отсутствующая база: обычное ревью работает, каталог не создаётся.
@@ -1993,7 +1990,7 @@ fn sqlite_lock_contention_is_temporary_and_distinguishable() {
         .busy_timeout(std::time::Duration::from_millis(0))
         .unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let (code, value, stderr) = cli_json(
+    let (code, value, _stderr) = cli_json(
         &fixture,
         &[
             "code-review",
@@ -2014,10 +2011,7 @@ fn sqlite_lock_contention_is_temporary_and_distinguishable() {
             "Проверка временной занятости базы.",
         ],
     );
-    assert_eq!(
-        code, 13,
-        "занятость базы обязана иметь отдельный код: {stderr}"
-    );
+    assert_eq!(code, 13, "занятость базы обязана иметь отдельный код");
     assert_eq!(error_code(&value), "learning_storage_busy");
     assert_eq!(value["error"]["details"]["retryable"], json!(true));
     assert_eq!(value["error"]["details"]["resource"], json!("learning"));
@@ -2478,7 +2472,7 @@ fn snapshot_variant_publishes_into_its_own_workspace() {
         "{}/snapshot-0123456789abcdef0123456789abcdef",
         fixture.workspace(&head).display()
     );
-    let (code, _, stderr) = cli(
+    let (code, _, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -2491,7 +2485,7 @@ fn snapshot_variant_publishes_into_its_own_workspace() {
             &snapshot,
         ],
     );
-    assert_eq!(code, 0, "снимок варианта обязан собираться: {stderr}");
+    assert_eq!(code, 0, "снимок варианта обязан собираться");
     assert!(fixture.path().join(&snapshot).join("review.json").is_file());
 
     // Проверенный разбор и импорт истории снимка.
@@ -2499,7 +2493,7 @@ fn snapshot_variant_publishes_into_its_own_workspace() {
     let queue = format!("{snapshot}/review-queue.json");
     let input = format!("{snapshot}/semantic-triage.input.json");
     let triage = format!("{snapshot}/semantic-triage.json");
-    let (code, _, stderr) = cli(
+    let (code, _, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -2511,7 +2505,7 @@ fn snapshot_variant_publishes_into_its_own_workspace() {
             &input,
         ],
     );
-    assert_eq!(code, 0, "triage init в снимке обязан проходить: {stderr}");
+    assert_eq!(code, 0, "triage init в снимке обязан проходить");
     let mut document: Value =
         serde_json::from_slice(&fs::read(fixture.path().join(&input)).unwrap()).unwrap();
     let candidates = document["unreviewed_candidate_ids"]
@@ -2528,7 +2522,7 @@ fn snapshot_variant_publishes_into_its_own_workspace() {
         serde_json::to_vec_pretty(&document).unwrap(),
     )
     .unwrap();
-    let (code, _, stderr) = cli(
+    let (code, _, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -2542,10 +2536,7 @@ fn snapshot_variant_publishes_into_its_own_workspace() {
             &triage,
         ],
     );
-    assert_eq!(
-        code, 0,
-        "triage validate в снимке обязан проходить: {stderr}"
-    );
+    assert_eq!(code, 0, "triage validate в снимке обязан проходить");
     ok_json(
         &fixture,
         &[
@@ -2794,7 +2785,7 @@ fn search_hides_quarantine_until_explicitly_requested() {
     );
 
     // Человеческий вывод не выдаёт карантин за обычную историю.
-    let (code, human, stderr) = cli(
+    let (code, human, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -2806,7 +2797,7 @@ fn search_hides_quarantine_until_explicitly_requested() {
             "200",
         ],
     );
-    assert_eq!(code, 0, "человекочитаемый поиск: {stderr}");
+    assert_eq!(code, 0, "человекочитаемый поиск должен проходить");
     assert!(
         human.contains("Карантин: исключён по умолчанию"),
         "фильтр обязан быть назван в выводе: {human}"
@@ -2820,7 +2811,7 @@ fn search_hides_quarantine_until_explicitly_requested() {
         "доверие возвращённого случая обязано быть видно: {human}"
     );
 
-    let (code, flagged, stderr) = cli(
+    let (code, flagged, _stderr) = cli(
         &fixture,
         &[
             "code-review",
@@ -2833,7 +2824,7 @@ fn search_hides_quarantine_until_explicitly_requested() {
             "200",
         ],
     );
-    assert_eq!(code, 0, "человекочитаемый поиск с флагом: {stderr}");
+    assert_eq!(code, 0, "человекочитаемый поиск с флагом должен проходить");
     assert!(
         flagged.contains("Карантин: включён по явному --include-quarantine"),
         "явное согласие обязано быть названо: {flagged}"
