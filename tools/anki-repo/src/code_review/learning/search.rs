@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use crate::code_review::review_queue::{DEFAULT_QUEUE_LIST_LIMIT, MAX_QUEUE_LIST_LIMIT};
 use crate::error::{DomainError, ErrorCode};
 
 use super::import::MAX_STORED_SNIPPET_BYTES;
@@ -24,9 +25,9 @@ use super::store::{LearningStore, map_error};
 pub const SEARCH_SCHEMA_VERSION: u32 = 2;
 
 /// Размер страницы поиска по умолчанию.
-pub const DEFAULT_SEARCH_LIMIT: usize = 25;
+pub const DEFAULT_SEARCH_LIMIT: usize = DEFAULT_QUEUE_LIST_LIMIT as usize;
 /// Максимальный размер страницы поиска.
-pub const MAX_SEARCH_LIMIT: usize = 200;
+pub const MAX_SEARCH_LIMIT: usize = MAX_QUEUE_LIST_LIMIT as usize;
 
 /// Вид совпадения: приблизительная схожесть не выдаётся за точную.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,6 +469,29 @@ fn compact_snippet(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_search_limit_matches_the_documented_learning_page_size() {
+        let directory = std::env::temp_dir().join(format!(
+            "anki-repo-search-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = LearningStore::open(super::super::store::StoreOptions::at(
+            directory.join("state.sqlite"),
+        ))
+        .unwrap();
+        let page = search_history(&store, &SearchQuery::default()).unwrap();
+        assert_eq!(DEFAULT_SEARCH_LIMIT, DEFAULT_QUEUE_LIST_LIMIT as usize);
+        assert_eq!(MAX_SEARCH_LIMIT, MAX_QUEUE_LIST_LIMIT as usize);
+        assert_eq!(page.limit, DEFAULT_QUEUE_LIST_LIMIT as usize);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn fts_query_is_escaped_as_a_phrase() {

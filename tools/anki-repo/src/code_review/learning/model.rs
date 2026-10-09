@@ -261,7 +261,7 @@ pub struct ImportRecord {
 pub struct ObservationCounts {
     /// Число исходных кандидатов пакета.
     pub raw_candidates: usize,
-    /// Число кандидатов, получивших решение или явно отнесённых к нерассмотренным.
+    /// Число кандидатов, получивших индивидуальное или групповое решение.
     pub covered_candidates: usize,
     /// Число самостоятельных индивидуальных решений.
     pub individual_decisions: usize,
