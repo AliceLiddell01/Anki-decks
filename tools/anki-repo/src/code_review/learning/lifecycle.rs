@@ -4,6 +4,8 @@
 //! не трогая review artifacts, исходники, другие записи и утверждённые файлы
 //! политики.
 
+use std::collections::BTreeSet;
+
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +152,25 @@ fn proposals_referencing(
     write: &LearningWrite<'_>,
     review_id: &str,
 ) -> Result<Vec<String>, DomainError> {
+    let mut signature_statement = write
+        .transaction()
+        .prepare("SELECT DISTINCT signature FROM learning_unit WHERE review_id = ?1")
+        .map_err(|error| {
+            super::store::map_error(&error, "не удалось прочитать подписи удаляемых единиц")
+        })?;
+    let signature_rows = signature_statement
+        .query_map(params![review_id], |row| row.get::<_, String>(0))
+        .map_err(|error| {
+            super::store::map_error(&error, "не удалось прочитать подписи удаляемых единиц")
+        })?;
+    let mut signatures = BTreeSet::new();
+    for row in signature_rows {
+        signatures.insert(row.map_err(|error| {
+            super::store::map_error(&error, "не удалось прочитать подписи удаляемых единиц")
+        })?);
+    }
+    drop(signature_statement);
+
     const PAGE: i64 = 100;
     let mut offset = 0i64;
     let mut ids = Vec::new();
@@ -191,7 +212,8 @@ fn proposals_referencing(
                 .supporting_cases
                 .iter()
                 .chain(&proposal.contradicting_cases)
-                .any(|case| case.review_id == review_id);
+                .any(|case| case.review_id == review_id)
+                || signatures.contains(&super::patterns::feature_signature(&proposal.key));
             if references {
                 ids.push(proposal_id.clone());
             }

@@ -2879,7 +2879,6 @@ mod learning_cli {
         db: Option<&Path>,
         archive: &Path,
     ) -> Result<RestoreOutput, DomainError> {
-        let store = LearningStore::open(database_options(root, db, true)?)?;
         let bytes = fs::read(archive).map_err(|error| {
             DomainError::new(
                 ErrorCode::InputUnreadable,
@@ -2892,6 +2891,8 @@ mod learning_cli {
                 format!("Некорректный JSON архива learning: {error}"),
             )
         })?;
+        transfer::verify_export(&document)?;
+        let store = LearningStore::open(database_options(root, db, true)?)?;
         let summary = transfer::restore_history(&store, &document)?;
         Ok(RestoreOutput {
             archive: display_path(root, archive),
@@ -2907,7 +2908,7 @@ mod learning_cli {
     ) -> Result<Rendered, DomainError> {
         match command {
             LearningPolicyCommand::Propose { signature, rule_id } => {
-                let store = LearningStore::open(database_options(root, db, true)?)?;
+                let store = open_required(root, db)?;
                 if patterns::support_for_signature(&store, signature, unix_now())?.is_none() {
                     return Err(DomainError::with_details(
                         ErrorCode::NotFound,

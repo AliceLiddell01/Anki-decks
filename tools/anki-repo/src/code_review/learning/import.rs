@@ -218,6 +218,24 @@ pub fn generation(store: &LearningStore) -> Result<HistoryGeneration, DomainErro
 pub(super) fn generation_of(
     read: &super::store::LearningRead<'_>,
 ) -> Result<HistoryGeneration, DomainError> {
+    let unknown_trust: Option<String> = read
+        .transaction()
+        .query_row(
+            "SELECT trust FROM learning_import
+             WHERE trust NOT IN ('ast_authenticated', 'structure_only_quarantine')
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| super::store::map_error(&error, "не удалось проверить метки доверия"))?;
+    if let Some(trust) = unknown_trust {
+        return Err(DomainError::with_details(
+            ErrorCode::LearningCorrupt,
+            "В базе learning обнаружена неизвестная метка доверия",
+            crate::details! { "trust" => trust },
+        ));
+    }
     let (trusted, quarantined): (i64, i64) = read
         .transaction()
         .query_row(
@@ -315,11 +333,11 @@ pub fn show_import(store: &LearningStore, review_id: &str) -> Result<ImportRecor
 }
 
 /// Уровень доверия по сохранённой метке.
-fn trust_level_of(raw: &str) -> TrustLevel {
-    if raw == TrustLevel::StructureOnlyQuarantine.as_str() {
-        TrustLevel::StructureOnlyQuarantine
-    } else {
-        TrustLevel::AstAuthenticated
+pub(super) fn trust_level_of(raw: &str) -> Option<TrustLevel> {
+    match raw {
+        "ast_authenticated" => Some(TrustLevel::AstAuthenticated),
+        "structure_only_quarantine" => Some(TrustLevel::StructureOnlyQuarantine),
+        _ => None,
     }
 }
 
@@ -379,7 +397,16 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRecord> {
             analyzer_digest: row.get(16)?,
             classifier_digest: row.get(17)?,
         },
-        trust: trust_level_of(&trust),
+        trust: trust_level_of(&trust).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                18,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("неизвестная метка доверия learning: {trust}"),
+                )),
+            )
+        })?,
         outcome: reviewed_outcome_of(&outcome),
         limitations: parse_json(&limitations_json, "ограничения записи")?,
         revision_of: row.get(21)?,
@@ -1197,12 +1224,17 @@ fn write_search(
     for finding in &triage.findings {
         let case_id = format!("finding:{review_id}:{}", finding.id);
         let body = sanitize_text(&format!("{} {}", finding.title, finding.description));
+        let unit_id = finding
+            .candidate_ids
+            .iter()
+            .find_map(|id| owner.get(id.as_str()).copied())
+            .unwrap_or("");
         insert_search(
             write,
             &SearchRow {
                 case_id: &case_id,
                 review_id,
-                unit_id: "",
+                unit_id,
                 candidate_id: None,
                 finding_id: Some(&finding.id),
                 kind: "finding",

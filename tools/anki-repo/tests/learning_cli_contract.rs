@@ -635,6 +635,27 @@ fn import_is_idempotent_reports_revisions_and_distinguishable_errors() {
         ],
         "not_found",
     );
+    let absent_policy_database = ".anki-repo/learning/missing-policy.sqlite";
+    assert_error(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "policy",
+            "propose",
+            "--db",
+            absent_policy_database,
+            "--signature",
+            "signature-that-does-not-exist",
+            "--rule-id",
+            "rule-missing-database",
+        ],
+        "not_found",
+    );
+    assert!(
+        !fixture.path().join(absent_policy_database).exists(),
+        "policy propose не создаёт базу до чтения существующей истории"
+    );
 }
 
 #[test]
@@ -1868,6 +1889,42 @@ fn export_backup_restore_roundtrip_and_foreign_files_are_protected() {
             "broken-archive.json",
         ],
         "learning_export_invalid",
+    );
+    assert!(
+        !fixture
+            .path()
+            .join(".anki-repo/learning/other.sqlite")
+            .exists(),
+        "нечитаемый архив не создаёт базу learning"
+    );
+
+    let mut invalid_digest: Value = serde_json::from_slice(&read(&fixture.path().join(archive)))
+        .expect("экспортированный архив должен быть JSON");
+    invalid_digest["manifest"]["payload_sha256"] = json!("0".repeat(64));
+    fs::write(
+        fixture.path().join("invalid-digest-archive.json"),
+        serde_json::to_vec(&invalid_digest).unwrap(),
+    )
+    .unwrap();
+    assert_error(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "restore",
+            "--db",
+            ".anki-repo/learning/invalid-digest.sqlite",
+            "--archive",
+            "invalid-digest-archive.json",
+        ],
+        "learning_export_invalid",
+    );
+    assert!(
+        !fixture
+            .path()
+            .join(".anki-repo/learning/invalid-digest.sqlite")
+            .exists(),
+        "архив с неверным digest не создаёт базу learning"
     );
 
     // Чужой файл на пути архива не перезаписывается и остаётся нетронутым.

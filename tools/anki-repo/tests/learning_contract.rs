@@ -33,13 +33,7 @@ use crate::common::TempDir;
 /// Git-репозиторий, поэтому они не запускаются одновременно.
 static REPOSITORY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Каталог запуска тестов: возврат к нему не зависит от удалённых временных
-/// каталогов, в которых могла остаться рабочая директория процесса.
-static START_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
 fn guard() -> std::sync::MutexGuard<'static, ()> {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let _ = START_DIRECTORY.set(root);
     REPOSITORY_TESTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -280,15 +274,38 @@ fn build_structure_only_queue(pack: &ReviewPack) -> review_queue::ReviewQueue {
         .expect("структурная очередь синтетического фикстура должна строиться")
 }
 
+struct RestoreCurrentDirectory(PathBuf);
+
+impl Drop for RestoreCurrentDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = std::env::set_current_dir(&self.0)
+            && !std::thread::panicking()
+        {
+            panic!("возврат в каталог запуска тестов: {error}");
+        }
+    }
+}
+
 fn in_directory<T>(path: &Path, action: impl FnOnce() -> T) -> T {
+    let original = std::env::current_dir().expect("текущий каталог теста");
     std::env::set_current_dir(path).expect("переход в синтетический репозиторий");
-    let result = action();
-    let home = START_DIRECTORY
-        .get()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::env::set_current_dir(home).expect("возврат в каталог запуска тестов");
-    result
+    let _restore = RestoreCurrentDirectory(original);
+    action()
+}
+
+#[test]
+fn in_directory_restores_current_directory_after_panic() {
+    let _guard = guard();
+    let original = std::env::current_dir().expect("текущий каталог теста");
+    let directory = TempDir::new("learning-directory-panic");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        in_directory(directory.path(), || panic!("синтетическая паника"));
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        std::env::current_dir().expect("каталог после паники"),
+        original
+    );
 }
 
 /// Digest точных байтов пакета: аналог SHA-256 `review.json`.
@@ -1009,6 +1026,24 @@ fn one_finding_with_many_candidates_stays_one_finding() {
     .unwrap();
     assert_eq!(page.cases.len(), 1);
     assert_eq!(page.cases[0].finding_id.as_deref(), Some("finding-shared"));
+
+    let detector_filtered = learning::search_history(
+        &store,
+        &learning::search::SearchQuery {
+            detector: Some("error_path".into()),
+            limit: 10,
+            ..learning::search::SearchQuery::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        detector_filtered.cases.iter().any(|case| {
+            case.finding_id.as_deref() == Some("finding-shared")
+                && case.unit_id.as_deref() == Some(unit.id.as_str())
+                && case.detector.as_deref() == Some("error_path")
+        }),
+        "замечание по кандидату связывается с единицей для фильтра detector"
+    );
 }
 
 #[test]
@@ -1112,6 +1147,9 @@ fn corrupted_and_newer_databases_fail_without_destroying_data() {
     // Будущая версия схемы отвергается до любых изменений.
     let future = directory.path().join("future.sqlite");
     let connection = rusqlite::Connection::open(&future).unwrap();
+    let original_journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
     connection
         .pragma_update(None, "user_version", 99u32)
         .unwrap();
@@ -1129,6 +1167,13 @@ fn corrupted_and_newer_databases_fail_without_destroying_data() {
         .query_row("SELECT value FROM marker", [], |row| row.get(0))
         .unwrap();
     assert_eq!(marker, "preserved", "данные будущей схемы не разрушаются");
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        journal_mode, original_journal_mode,
+        "будущая схема отвергается до смены режима журнала"
+    );
 }
 
 #[test]
@@ -1644,6 +1689,32 @@ fn export_and_restore_preserve_provenance_versions_and_no_absolute_paths() {
         .unwrap();
     assert_eq!(preserved_path, "src/local-update.rs");
     assert_eq!(preserved_explanation, "локальное обновление");
+
+    restored_store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_import SET review_pack_sha256 = ?2 WHERE review_id = ?1",
+                rusqlite::params![record.review_id, "f".repeat(64)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        learning::transfer::restore_history(&restored_store, &exported.archive)
+            .unwrap_err()
+            .code,
+        ErrorCode::LearningConflict,
+        "конфликтующий review_pack_sha256 не заменяет строку импорта поверх дочерних данных"
+    );
+    let preserved_after_conflict: String = restored_store
+        .connection()
+        .query_row(
+            "SELECT path FROM learning_candidate WHERE review_id = ?1 AND candidate_id = 'production-0'",
+            rusqlite::params![record.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved_after_conflict, "src/local-update.rs");
 }
 
 #[test]
@@ -1845,6 +1916,38 @@ fn feedback_correction_and_retraction_remove_wrong_label_after_recompute() {
     let outcome = learning::feedback::outcome(&store, &record.review_id, &unit_id).unwrap();
     assert_eq!(outcome.effective_disposition, None);
 
+    let usefulness_retraction = FeedbackEvent {
+        schema_version: learning::feedback::FEEDBACK_SCHEMA_VERSION,
+        event_id: "event-7".into(),
+        review_id: record.review_id.clone(),
+        unit_id: unit_id.clone(),
+        candidate_id: Some("production-0".into()),
+        kind: FeedbackKind::RecommendationUsefulness,
+        action: FeedbackAction::Retract,
+        supersedes_event_id: Some("event-4".into()),
+        effective_disposition: None,
+        usefulness: None,
+        explanation: "Оценка полезности отозвана.".into(),
+        provenance: "reviewer".into(),
+        recorded_at: 4,
+    };
+    let retracted_usefulness =
+        learning::feedback::record_feedback(&store, &usefulness_retraction).unwrap();
+    assert_eq!(
+        retracted_usefulness.retracted_event_id.as_deref(),
+        Some("event-4")
+    );
+    let mut invalid_usefulness_retraction = usefulness_retraction.clone();
+    invalid_usefulness_retraction.event_id = "event-8".into();
+    invalid_usefulness_retraction.usefulness = Some("useful".into());
+    assert_eq!(
+        learning::feedback::record_feedback(&store, &invalid_usefulness_retraction)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest,
+        "отзыв не может назначить новую оценку полезности"
+    );
+
     // После отзыва прежняя позиция освобождена для нового утверждения.
     let mut appended_after_retraction = correction.clone();
     appended_after_retraction.event_id = "event-5".into();
@@ -1886,6 +1989,37 @@ fn feedback_correction_and_retraction_remove_wrong_label_after_recompute() {
             .unwrap()
             .get("false_positive"),
         Some(&1)
+    );
+
+    store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_feedback SET kind = 'future_feedback_kind' WHERE event_id = 'event-4'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        learning::feedback::show_event(&store, "event-4")
+            .unwrap_err()
+            .code,
+        ErrorCode::LearningCorrupt,
+        "неизвестный kind не подменяется другим видом feedback"
+    );
+    store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_feedback SET kind = 'recommendation_usefulness', action = 'future_feedback_action' WHERE event_id = 'event-4'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        learning::transfer::export_history(&store).unwrap_err().code,
+        ErrorCode::LearningCorrupt,
+        "неизвестный action не экспортируется как append"
     );
 }
 
@@ -2166,8 +2300,22 @@ fn policy_proposal_is_never_auto_applied() {
     let loaded = load_in_repo(&repo, &artifacts, false).unwrap();
     let record = import(&loaded, &store);
 
+    store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_import SET imported_at = 1000000 WHERE review_id = ?1",
+                rusqlite::params![record.review_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let report =
         learning::pattern_report(&store, &learning::patterns::PatternQuery::default()).unwrap();
+    assert!(
+        report.rules.iter().all(|rule| {
+            rule.support.freshest_age_days == 0 && rule.support.oldest_age_days == 0
+        })
+    );
     let rule = report
         .rules
         .iter()
@@ -2223,6 +2371,30 @@ fn policy_proposal_is_never_auto_applied() {
         1
     );
 
+    let exported = learning::transfer::export_history(&store).unwrap();
+    let mut local_proposal =
+        learning::feedback::show_proposal(&store, &proposal.proposal_id).unwrap();
+    local_proposal
+        .cautions
+        .push("Локальное обновление предложения после экспорта.".into());
+    let local_document = serde_json::to_string(&local_proposal).unwrap();
+    store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_policy_proposal SET document_json = ?2 WHERE proposal_id = ?1",
+                rusqlite::params![proposal.proposal_id, local_document],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let restored = learning::transfer::restore_history(&store, &exported.archive).unwrap();
+    assert_eq!(restored.unchanged_reviews, 1);
+    assert_eq!(
+        learning::feedback::show_proposal(&store, &proposal.proposal_id).unwrap(),
+        local_proposal,
+        "устаревший архив не заменяет локальное предложение с тем же proposal_id"
+    );
+
     // Ключ политики находится и у паттерна за пределами стандартной страницы отчёта.
     let synthetic_patterns: Vec<(String, String)> = (0..24)
         .map(|index| {
@@ -2273,6 +2445,47 @@ fn policy_proposal_is_never_auto_applied() {
         hidden_proposal.key,
         serde_json::from_str::<BTreeMap<String, String>>(hidden_feature_json).unwrap()
     );
+
+    let mut truncated = learning::feedback::show_proposal(&store, &proposal.proposal_id).unwrap();
+    let exemplar = truncated
+        .supporting_cases
+        .first()
+        .expect("предложение содержит поддерживающий случай")
+        .clone();
+    truncated.supporting_cases = (0..10)
+        .map(|index| {
+            let mut case = exemplar.clone();
+            case.review_id = format!("unlisted-support-{index}");
+            case
+        })
+        .collect();
+    truncated.contradicting_cases.clear();
+    let truncated_document = serde_json::to_string(&truncated).unwrap();
+    store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_policy_proposal SET document_json = ?2 WHERE proposal_id = ?1",
+                rusqlite::params![proposal.proposal_id, truncated_document],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let forgotten = learning::lifecycle::forget_review(&store, &record.review_id).unwrap();
+    assert_eq!(forgotten.removed.policy_proposals, 2);
+    assert_eq!(
+        learning::feedback::show_proposal(&store, &proposal.proposal_id)
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound,
+        "удаление записи находит proposal по полной подписи, даже если случай не показан"
+    );
+    assert_eq!(
+        learning::feedback::show_proposal(&store, &hidden_proposal.proposal_id)
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound,
+        "предложение вне страницы отчёта также удаляется по подписи"
+    );
 }
 
 #[test]
@@ -2303,6 +2516,22 @@ fn recommendations_are_deterministic_and_guardrailed() {
     assert_eq!(first.queue_sha256, loaded.queue_sha256);
     assert!(!first.learning_disabled);
     assert_eq!(first.generation.trusted_reviews, 1);
+
+    let limited = learning::recommend(
+        Some(&store),
+        &loaded,
+        &learning::recommend::RecommendRequest {
+            limit: 1,
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(limited.recommendations.len(), 1);
+    assert_eq!(limited.suggested_order.len(), queue.units.len());
+    assert_eq!(limited.suggested_order, first.suggested_order);
+    assert!(limited.limitations.iter().any(|limitation| {
+        limitation.contains("единиц остаются в suggested_order")
+    }));
 
     // Если вызывающая сторона не передала now, возраст считается от самой
     // позднейшей доверенной записи, а не от часов процесса.
@@ -3443,5 +3672,29 @@ fn search_does_not_mix_quarantine_with_trusted_history() {
     assert!(
         text_with_quarantine.matched > text_page.matched,
         "карантинная запись с тем же текстом находится только с явным согласием"
+    );
+
+    store
+        .write(|write| {
+            write.execute(
+                "UPDATE learning_import SET trust = 'future_trust_level' WHERE review_id = ?1",
+                rusqlite::params![trusted_record.review_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        learning::show_import(&store, &trusted_record.review_id)
+            .unwrap_err()
+            .code,
+        ErrorCode::LearningCorrupt,
+        "неизвестная метка доверия не считается ast_authenticated"
+    );
+    assert_eq!(
+        learning::pattern_report(&store, &learning::patterns::PatternQuery::default())
+            .unwrap_err()
+            .code,
+        ErrorCode::LearningCorrupt,
+        "отчёт паттернов отвергает неизвестную метку доверия"
     );
 }

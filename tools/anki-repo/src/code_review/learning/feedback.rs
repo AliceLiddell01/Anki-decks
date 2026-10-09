@@ -134,17 +134,27 @@ fn validate_event(event: &FeedbackEvent) -> Result<(), DomainError> {
     }
     match event.kind {
         FeedbackKind::RecommendationUsefulness => {
-            let usefulness = event.usefulness.as_deref().ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::InvalidRequest,
-                    "Для оценки полезности рекомендации нужно указать usefulness",
-                )
-            })?;
-            if !USEFULNESS.contains(&usefulness) {
-                return Err(DomainError::new(
-                    ErrorCode::InvalidRequest,
-                    format!("Недопустимое значение usefulness: «{usefulness}»"),
-                ));
+            match (event.action, event.usefulness.as_deref()) {
+                (FeedbackAction::Retract, None) => {}
+                (FeedbackAction::Retract, Some(_)) => {
+                    return Err(DomainError::new(
+                        ErrorCode::InvalidRequest,
+                        "Отзыв не назначает новую оценку: usefulness должен быть пуст",
+                    ));
+                }
+                (_, None) => {
+                    return Err(DomainError::new(
+                        ErrorCode::InvalidRequest,
+                        "Для оценки полезности рекомендации нужно указать usefulness",
+                    ));
+                }
+                (_, Some(usefulness)) if !USEFULNESS.contains(&usefulness) => {
+                    return Err(DomainError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("Недопустимое значение usefulness: «{usefulness}»"),
+                    ));
+                }
+                _ => {}
             }
             if event.effective_disposition.is_some() {
                 return Err(DomainError::new(
@@ -486,22 +496,25 @@ pub(super) fn event_from_row_for_export(
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedbackEvent> {
     let kind: String = row.get(4)?;
     let action: String = row.get(5)?;
+    let kind = match kind.as_str() {
+        "recommendation_usefulness" => FeedbackKind::RecommendationUsefulness,
+        "semantic_outcome_revision" => FeedbackKind::SemanticOutcomeRevision,
+        _ => return Err(invalid_event_label(4, "kind", &kind)),
+    };
+    let action = match action.as_str() {
+        "append" => FeedbackAction::Append,
+        "retract" => FeedbackAction::Retract,
+        "supersede" => FeedbackAction::Supersede,
+        _ => return Err(invalid_event_label(5, "action", &action)),
+    };
     Ok(FeedbackEvent {
         schema_version: FEEDBACK_SCHEMA_VERSION,
         event_id: row.get(0)?,
         review_id: row.get(1)?,
         unit_id: row.get(2)?,
         candidate_id: row.get(3)?,
-        kind: if kind == "semantic_outcome_revision" {
-            FeedbackKind::SemanticOutcomeRevision
-        } else {
-            FeedbackKind::RecommendationUsefulness
-        },
-        action: match action.as_str() {
-            "retract" => FeedbackAction::Retract,
-            "supersede" => FeedbackAction::Supersede,
-            _ => FeedbackAction::Append,
-        },
+        kind,
+        action,
         supersedes_event_id: row.get(6)?,
         effective_disposition: row.get(7)?,
         usefulness: row.get(8)?,
@@ -509,6 +522,17 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedbackEvent> {
         provenance: row.get(10)?,
         recorded_at: u64::try_from(row.get::<_, i64>(11)?.max(0)).unwrap_or(0),
     })
+}
+
+fn invalid_event_label(column: usize, name: &str, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("неизвестная метка события обратной связи {name}: {value}"),
+        )),
+    )
 }
 
 fn outcome_for(

@@ -223,6 +223,19 @@ impl LearningStore {
         connection
             .busy_timeout(std::time::Duration::from_millis(OPEN_BUSY_TIMEOUT_MS))
             .map_err(|error| map_error(&error, "не удалось настроить busy_timeout"))?;
+        let current_schema_version = schema::read_schema_version(&connection)?;
+        if current_schema_version > LEARNING_SCHEMA_VERSION {
+            return Err(DomainError::with_details(
+                ErrorCode::LearningSchemaUnsupported,
+                format!(
+                    "База learning создана более новой схемой ({current_schema_version}); эта сборка поддерживает {LEARNING_SCHEMA_VERSION}"
+                ),
+                crate::details! {
+                    "database_user_version" => current_schema_version,
+                    "supported_schema_version" => LEARNING_SCHEMA_VERSION,
+                },
+            ));
+        }
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| map_error(&error, "не удалось включить foreign_keys"))?;
@@ -241,7 +254,6 @@ impl LearningStore {
             journal_mode: decision,
             fts5_available,
         };
-        let current_schema_version = schema::read_schema_version(&store.connection)?;
         let schema_changed = current_schema_version != LEARNING_SCHEMA_VERSION;
         if schema_changed {
             let _ = schema::apply_migrations(&mut store.connection)?;
@@ -660,19 +672,27 @@ fn map_open_error(options: &StoreOptions, error: &rusqlite::Error, context: &str
 
 /// Отображает ошибку SQLite в доменную ошибку, не маскируя блокировку успехом.
 pub fn map_error(error: &rusqlite::Error, context: &str) -> DomainError {
+    let corrupt = || {
+        DomainError::with_details(
+            ErrorCode::LearningCorrupt,
+            format!("{context}: {error}"),
+            crate::details! {
+                "database" => DEFAULT_LEARNING_DATABASE,
+                "recovery" => recovery_paths(DEFAULT_LEARNING_DATABASE),
+            },
+        )
+    };
     match error.sqlite_error_code() {
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
             busy(error)
         }
-        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => {
-            DomainError::with_details(
-                ErrorCode::LearningCorrupt,
-                format!("{context}: {error}"),
-                crate::details! {
-                    "database" => DEFAULT_LEARNING_DATABASE,
-                    "recovery" => recovery_paths(DEFAULT_LEARNING_DATABASE),
-                },
-            )
+        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => corrupt(),
+        None if matches!(
+            error,
+            rusqlite::Error::FromSqlConversionFailure(..) | rusqlite::Error::InvalidColumnType(..)
+        ) =>
+        {
+            corrupt()
         }
         _ => DomainError::with_details(
             ErrorCode::LearningStorageUnavailable,

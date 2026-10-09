@@ -276,12 +276,18 @@ pub fn recommend(
         .map(|(position, (_, _, _, _, unit_id))| (unit_id, position))
         .collect();
     recommendations.sort_by_key(|item| positions.get(&item.unit_id).copied().unwrap_or(usize::MAX));
-    recommendations.truncate(limit);
     let suggested_order: Vec<String> = recommendations
         .iter()
         .map(|item| item.unit_id.clone())
         .collect();
     let mut document_limitations = limitations;
+    if recommendations.len() > limit {
+        document_limitations.push(format!(
+            "Подробные подсказки ограничены {limit} единицами; ещё {} единиц остаются в suggested_order и обязательном просмотре без подробной подсказки.",
+            recommendations.len() - limit
+        ));
+        recommendations.truncate(limit);
+    }
     document_limitations.push(
         "Подсказка — дополнительное ранжирование: baseline priority и порядок review-queue.json не изменяются."
             .to_owned(),

@@ -187,8 +187,20 @@ pub fn pattern_report(
     store: &LearningStore,
     query: &PatternQuery,
 ) -> Result<PatternReport, DomainError> {
-    let generation = generation(store)?;
     store.read(|read| {
+        let generation = super::import::generation_of(read)?;
+        let imported_at: i64 = read
+            .transaction()
+            .query_row(
+                "SELECT COALESCE(MAX(imported_at), 0)
+                 FROM learning_import WHERE (?1 = 1 OR trust = 'ast_authenticated')",
+                [i64::from(query.include_quarantine)],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                super::store::map_error(&error, "не удалось прочитать опорное время истории")
+            })?;
+        let history_reference_time = u64::try_from(imported_at.max(0)).unwrap_or(u64::MAX);
         let units = load_units(read, query)?;
         let findings = load_findings(read)?;
         let confirmed_findings = load_confirmed_findings(read)?;
@@ -196,7 +208,7 @@ pub fn pattern_report(
         for unit in units {
             groups.entry(feature_signature(&unit.feature)).or_default().push(unit);
         }
-        let now = query.now.unwrap_or_else(current_time);
+        let now = query.now.unwrap_or(history_reference_time);
         let mut rules = Vec::new();
         for (signature, members) in groups {
             let support = support_summary(&members, &findings, &confirmed_findings, now);
@@ -278,13 +290,6 @@ pub fn pattern_catalog(
     })
 }
 
-fn current_time() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .unwrap_or_default()
-}
-
 fn load_units(
     read: &LearningRead<'_>,
     query: &PatternQuery,
@@ -356,6 +361,12 @@ fn load_units(
             &review_id,
             representatives.first().map(String::as_str),
         )?;
+        let trust = super::import::trust_level_of(&trust).ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::LearningCorrupt,
+                "В базе learning обнаружена неизвестная метка доверия",
+            )
+        })?;
         units.push(StoredUnit {
             review_id,
             repository_id,
@@ -369,11 +380,7 @@ fn load_units(
             snippet,
             feature,
             imported_at: u64::try_from(imported_at.max(0)).unwrap_or(0),
-            trust: if trust == TrustLevel::StructureOnlyQuarantine.as_str() {
-                TrustLevel::StructureOnlyQuarantine
-            } else {
-                TrustLevel::AstAuthenticated
-            },
+            trust,
         });
     }
     Ok(units)

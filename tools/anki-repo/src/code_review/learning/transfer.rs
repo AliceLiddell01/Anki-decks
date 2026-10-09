@@ -100,11 +100,8 @@ pub fn export_history(store: &LearningStore) -> Result<ExportSummary, DomainErro
     })
 }
 
-/// Проверяет manifest и digest архива, включая повторную проверку источника.
-pub fn verify_export(
-    store: Option<&LearningStore>,
-    archive: &LearningExport,
-) -> Result<(), DomainError> {
+/// Проверяет manifest, digest архива и ссылки между его записями.
+pub fn verify_export(archive: &LearningExport) -> Result<(), DomainError> {
     if !matches!(
         archive.manifest.export_schema_version,
         EXPORT_SCHEMA_VERSION
@@ -249,7 +246,6 @@ pub fn verify_export(
         }
     }
     verify_search_cases(archive, &review_ids)?;
-    let _ = store;
     Ok(())
 }
 
@@ -376,7 +372,7 @@ pub fn restore_history(
     store: &LearningStore,
     archive: &LearningExport,
 ) -> Result<RestoreSummary, DomainError> {
-    verify_export(Some(store), archive)?;
+    verify_export(archive)?;
     let summary = store.write(|write| {
         let mut restored = 0usize;
         let mut unchanged = 0usize;
@@ -388,9 +384,20 @@ pub fn restore_history(
                 params![record.review_id],
                 |row| row.get(0),
             )?;
-            if existing.as_deref() == Some(record.inputs.review_pack_sha256.as_str()) {
-                unchanged += 1;
-                continue;
+            if let Some(existing_sha) = existing {
+                if existing_sha == record.inputs.review_pack_sha256 {
+                    unchanged += 1;
+                    continue;
+                }
+                return Err(DomainError::with_details(
+                    ErrorCode::LearningConflict,
+                    "Архив learning содержит конфликтующую ревизию существующего review_id",
+                    crate::details! {
+                        "review_id" => record.review_id.clone(),
+                        "existing_review_pack_sha256" => existing_sha,
+                        "archive_review_pack_sha256" => record.inputs.review_pack_sha256.clone(),
+                    },
+                ));
             }
             insert_record(write, record)?;
             restored_ids.insert(record.review_id.as_str());
@@ -480,7 +487,7 @@ pub fn restore_history(
                 "не удалось сериализовать предложение политики",
             )?;
             write.execute(
-                "INSERT OR REPLACE INTO learning_policy_proposal
+                "INSERT OR IGNORE INTO learning_policy_proposal
                     (proposal_id, rule_id, feature_json, document_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -1337,13 +1344,13 @@ mod tests {
     #[test]
     fn archive_rejects_dangling_findings_links_and_feedback_references() {
         let valid = archive_with_valid_references();
-        verify_export(None, &valid).unwrap();
+        verify_export(&valid).unwrap();
 
         let mut archive = valid.clone();
         archive.findings[0].review_id = "missing-review".into();
         archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
         assert_eq!(
-            verify_export(None, &archive).unwrap_err().code,
+            verify_export(&archive).unwrap_err().code,
             ErrorCode::LearningExportInvalid
         );
 
@@ -1351,7 +1358,7 @@ mod tests {
         archive.finding_links[0].candidate_id = "missing-candidate".into();
         archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
         assert_eq!(
-            verify_export(None, &archive).unwrap_err().code,
+            verify_export(&archive).unwrap_err().code,
             ErrorCode::LearningExportInvalid
         );
 
@@ -1359,7 +1366,7 @@ mod tests {
         archive.finding_links[0].finding_id = "missing-finding".into();
         archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
         assert_eq!(
-            verify_export(None, &archive).unwrap_err().code,
+            verify_export(&archive).unwrap_err().code,
             ErrorCode::LearningExportInvalid
         );
 
@@ -1367,7 +1374,7 @@ mod tests {
         archive.feedback_events[0].review_id = "missing-review".into();
         archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
         assert_eq!(
-            verify_export(None, &archive).unwrap_err().code,
+            verify_export(&archive).unwrap_err().code,
             ErrorCode::LearningExportInvalid
         );
 
@@ -1375,7 +1382,7 @@ mod tests {
         archive.feedback_events[0].unit_id = "missing-unit".into();
         archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
         assert_eq!(
-            verify_export(None, &archive).unwrap_err().code,
+            verify_export(&archive).unwrap_err().code,
             ErrorCode::LearningExportInvalid
         );
 
@@ -1383,7 +1390,7 @@ mod tests {
         archive.feedback_events[0].candidate_id = Some("missing-candidate".into());
         archive.manifest.payload_sha256 = payload_digest(&archive).unwrap();
         assert_eq!(
-            verify_export(None, &archive).unwrap_err().code,
+            verify_export(&archive).unwrap_err().code,
             ErrorCode::LearningExportInvalid
         );
     }
@@ -1391,7 +1398,7 @@ mod tests {
     #[test]
     fn verify_export_rejects_a_relative_escape_but_accepts_a_home_component() {
         let escaped = archive_with_candidate("../escape.rs");
-        let error = verify_export(None, &escaped).unwrap_err();
+        let error = verify_export(&escaped).unwrap_err();
         assert_eq!(error.code, ErrorCode::LearningExportInvalid);
         assert!(
             error.message.contains("repo-relative"),
@@ -1402,7 +1409,7 @@ mod tests {
         // Компонент `home` внутри репозитория больше не считается абсолютным
         // путём: архив отвергается только из-за отсутствующей записи.
         let legitimate = archive_with_candidate("tools/home/x.rs");
-        let error = verify_export(None, &legitimate).unwrap_err();
+        let error = verify_export(&legitimate).unwrap_err();
         assert!(
             !error.message.contains("repo-relative"),
             "законный путь не может считаться абсолютным: {}",
