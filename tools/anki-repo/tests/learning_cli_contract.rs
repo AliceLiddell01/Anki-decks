@@ -81,9 +81,8 @@ fn cli_json(fixture: &Fixture, args: &[&str]) -> (i32, Value, String) {
     let mut argv = vec!["--json"];
     argv.extend_from_slice(args);
     let (code, stdout, stderr) = run_cli_in(Some(fixture.path()), &argv);
-    let value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
-        panic!("вывод не является JSON для {args:?}: {error}; stdout={stdout:?}; stderr={stderr:?}")
-    });
+    let value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("вывод CLI не является JSON: {error}"));
     (code, value, stderr)
 }
 
@@ -104,15 +103,15 @@ fn error_code(value: &Value) -> String {
 
 /// Проверяет, что команда отказывает с ожидаемым кодом ошибки.
 fn assert_error(fixture: &Fixture, args: &[&str], expected: &str) {
-    let (code, value, stderr) = cli_json(fixture, args);
+    let (code, value, _stderr) = cli_json(fixture, args);
     assert!(
         code != 0,
-        "команда должна была завершиться с ошибкой, код: {code}; args: {args:?}; response: {value}; stderr: {stderr}"
+        "команда должна завершиться с ошибкой; код: {code}"
     );
+    let actual = error_code(&value);
     assert!(
-        error_code(&value) == expected,
-        "код ошибки команды не совпал с ожидаемым: ожидался {expected}, получен {}; response={value}; stderr={stderr}",
-        error_code(&value)
+        actual == expected,
+        "код ошибки команды не совпал с ожидаемым: ожидался {expected}, получен {actual}"
     );
 }
 
