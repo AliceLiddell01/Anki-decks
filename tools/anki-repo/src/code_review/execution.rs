@@ -929,22 +929,18 @@ pub fn inspect_job(directory: &Path) -> Result<JobInspection, DomainError> {
             .into(),
         );
     }
-    let result = match read_document::<ExecutionResult>(&directory, "result.json") {
-        Ok(result) => {
-            validate_result(&metadata, &result)?;
-            Some(result)
-        }
-        Err(error)
-            if directory
-                .join("result.json")
-                .symlink_metadata()
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            let _ = error;
-            None
-        }
-        Err(error) => return Err(error),
-    };
+    // Отсутствие результата определяет один `openat`: повторная проверка пути после
+    // ошибки чтения гонится с исполнителем, публикующим `result.json` в этот момент.
+    let result =
+        match read_optional_file_at(&safe_dir(&directory)?, "result.json", MAX_DOCUMENT_BYTES)? {
+            Some(bytes) => {
+                let result: ExecutionResult = serde_json::from_slice(&bytes)
+                    .map_err(|e| invalid(format!("невалидный result.json: {e}")))?;
+                validate_result(&metadata, &result)?;
+                Some(result)
+            }
+            None => None,
+        };
     if lifecycle == LifecycleStatus::Completed && result.is_none() {
         return Err(invalid(
             "Завершённое задание не имеет типизированного результата",
@@ -2182,20 +2178,10 @@ fn save_state(
     )
 }
 fn cancel_requested(job: &PreparedJob) -> Result<bool, DomainError> {
-    match read_bytes(&job.directory, "cancel.json", 128) {
-        Ok(bytes) if bytes == job.metadata.owner_nonce.as_bytes() => Ok(true),
-        Ok(_) => Err(invalid("Владелец маркера отмены не совпадает с заданием")),
-        Err(error)
-            if job
-                .directory
-                .join("cancel.json")
-                .symlink_metadata()
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            let _ = error;
-            Ok(false)
-        }
-        Err(error) => Err(error),
+    match read_optional_file_at(&safe_dir(&job.directory)?, "cancel.json", 128)? {
+        None => Ok(false),
+        Some(bytes) if bytes == job.metadata.owner_nonce.as_bytes() => Ok(true),
+        Some(_) => Err(invalid("Владелец маркера отмены не совпадает с заданием")),
     }
 }
 fn output_evidence(
