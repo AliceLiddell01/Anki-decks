@@ -1504,7 +1504,7 @@ pub fn load_review(
 
     // Дальше очередь проверяется ровно той же логикой, что и в CLI: молчаливого
     // ослабления до структурной проверки при недоступных образах Git нет.
-    let (pack, pack_bytes, queue, _summary, authenticity, _contexts) =
+    let (pack, pack_bytes, queue, queue_bytes, _summary, authenticity, _contexts) =
         crate::code_review::workflow::load_validated_review_queue_with_contexts(
             pack_path,
             queue_path,
@@ -1532,12 +1532,7 @@ pub fn load_review(
     if let Some((triage, _)) = triage.as_ref() {
         verify_triage_identity(triage, &pack, &review_pack_sha256)?;
     }
-    let queue_sha256 = sha256_hex(&serde_json::to_vec(&queue).map_err(|error| {
-        DomainError::new(
-            ErrorCode::Internal,
-            format!("не удалось сериализовать очередь для digest: {error}"),
-        )
-    })?);
+    let queue_sha256 = sha256_hex(&queue_bytes);
     Ok(LoadedReview {
         pack,
         review_pack_sha256,

@@ -751,9 +751,12 @@ anki-repo --json code-review triage summary --pack "$PACK" --triage "$CANONICAL_
 `triage validate|summary|report` и `execution prepare|run|inspect|cancel|cleanup`
 работают без базы learning и не создают её. Базу создаёт только записывающая
 команда (`import`, `feedback record`, `policy propose`, `restore`) либо
-`backup`/`export` по уже существующей истории. Читающие команды на
-отсутствующей базе завершаются различимым `not_found` (exit 4), а не пустым
-успехом.
+`backup`/`export` по уже существующей истории. Операции, которым нужна
+существующая база, завершаются различимым `not_found` (exit 4): `validate`,
+`stats`, `patterns`, `search`, `feedback list|show`, `policy list|show|approve`,
+`export`, `backup` и `forget`. `status` сообщает об отсутствующей базе с exit 0.
+`recommend` без `--require-history` также завершается с exit 0 и строит документ
+в режиме без learning; с `--require-history` отсутствие базы даёт `not_found`.
 
 Локальная база по умолчанию — `.anki-repo/learning/state.sqlite` относительно
 корня репозитория; `--db PATH` (alias `--database`) выбирает другую базу внутри
@@ -941,8 +944,9 @@ artifacts и утверждённые policy files. Уже созданные `e
 `policy` — жизненный цикл предложений постоянных правил: `propose` (по
 `--signature` и `--rule-id`), `list`, `show --id` и `approve --id --out --note`.
 Предложение никогда не применяется само: `auto_applied` всегда `false`, а
-утверждённый артефакт материализуется человеком по явному пути и попадает в Git
-только его решением. SQLite не является владельцем утверждённой политики: база
+утверждённый артефакт по умолчанию материализуется в
+`.anki-repo/policies/learning-policy.json`, вне игнорируемого каталога истории;
+его попадание в Git остаётся решением человека. SQLite не является владельцем утверждённой политики: база
 хранит предложение и историю, а не действующие правила. Предложение без
 подтверждающих случаев утвердить нельзя (`insufficient_evidence`).
 

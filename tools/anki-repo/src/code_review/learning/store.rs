@@ -237,6 +237,12 @@ impl LearningStore {
             fts5_available,
         };
         let _ = schema::apply_migrations(&mut store.connection)?;
+        store
+            .connection
+            .busy_timeout(std::time::Duration::from_millis(
+                store.options.busy_timeout_ms,
+            ))
+            .map_err(|error| map_error(&error, "не удалось настроить busy_timeout"))?;
         schema::ensure_fts_index(&store.connection)?;
         store.write(|_| Ok(()))?;
         Ok(store)
@@ -732,6 +738,20 @@ mod tests {
         assert!(status.fts5_available);
         assert_eq!(status.generation.revision, 0);
         assert!(!status.database_path.contains("/home/"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn configured_busy_timeout_is_restored_after_open_migrations() {
+        let directory = temp_directory("store-busy-timeout");
+        let mut options = StoreOptions::at(directory.join("state.sqlite"));
+        options.busy_timeout_ms = 1_234;
+        let store = LearningStore::open(options).unwrap();
+        let timeout: i64 = store
+            .connection
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 1_234);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

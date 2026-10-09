@@ -933,26 +933,29 @@ fn status_validate_stats_patterns_and_search_bound_their_output() {
     );
     assert!(cases.len() <= 2, "страница поиска не ограничена: {cases:?}");
     assert_bounded_candidate_ids(&first_page);
-    if first_page["result"]["has_more"] == json!(true) {
-        let second_page = ok_json(
-            &fixture,
-            &[
-                "code-review",
-                "learning",
-                "search",
-                "--detector",
-                "error_path",
-                "--limit",
-                "2",
-                "--offset",
-                "2",
-            ],
-        );
-        assert_ne!(
-            first_page["result"]["cases"], second_page["result"]["cases"],
-            "смещение обязано менять страницу"
-        );
-    }
+    assert_eq!(
+        first_page["result"]["has_more"],
+        json!(true),
+        "три подтверждённых кандидата при лимите 2 обязаны давать продолжение"
+    );
+    let second_page = ok_json(
+        &fixture,
+        &[
+            "code-review",
+            "learning",
+            "search",
+            "--detector",
+            "error_path",
+            "--limit",
+            "2",
+            "--offset",
+            "2",
+        ],
+    );
+    assert_ne!(
+        first_page["result"]["cases"], second_page["result"]["cases"],
+        "смещение обязано менять страницу"
+    );
 
     // Текстовая подстрока короче двух символов — это `invalid_request`.
     assert_error(
@@ -2385,7 +2388,10 @@ fn symlinked_paths_never_redirect_learning_artifacts() {
     // Путь вывода рекомендаций ограничен своей рабочей областью: ни ссылка на
     // служебный каталог, ни ссылка на рабочую область не подменяют цель.
     fs::create_dir_all(fixture.workspace(&head)).unwrap();
-    symlink("decks", &fixture.workspace(&head).join("link-decks"));
+    symlink(
+        fixture.path().join("decks"),
+        &fixture.workspace(&head).join("link-decks"),
+    );
     assert_error(
         &fixture,
         &[

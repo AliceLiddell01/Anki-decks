@@ -164,7 +164,7 @@ pub fn search_history(
     if query
         .text
         .as_deref()
-        .is_some_and(|text| text.trim().len() < 2)
+        .is_some_and(|text| text.trim().chars().count() < 2)
     {
         return Err(DomainError::new(
             ErrorCode::InvalidRequest,
@@ -177,11 +177,18 @@ pub fn search_history(
         .as_deref()
         .is_some_and(|text| !text.trim().is_empty());
     store.read(|read| {
+        let fts5_used = text_present
+            && query
+                .text
+                .as_deref()
+                .is_some_and(|text| text.trim().chars().count() >= 3)
+            && store.fts5_available()
+            && fts_index_present(read)?;
         let mut matched: Vec<String> = Vec::new();
         let mut text_hits: BTreeSet<String> = BTreeSet::new();
         let mut structural_hits: BTreeSet<String> = BTreeSet::new();
         if text_present {
-            text_hits = text_matches(store, read, query)?;
+            text_hits = text_matches(read, query, fts5_used)?;
         }
         if structural || !text_present {
             structural_hits = structural_matches(read, query)?;
@@ -216,7 +223,7 @@ pub fn search_history(
             schema_version: SEARCH_SCHEMA_VERSION,
             // Факт, а не предположение: сообщается то, чем поиск действительно
             // пользовался на этом снимке истории.
-            fts5_used: store.fts5_available() && fts_index_present(read)?,
+            fts5_used,
             include_quarantine: query.include_quarantine,
             matched: total,
             offset: query.offset,
@@ -252,9 +259,9 @@ fn fts_index_present(read: &super::store::LearningRead<'_>) -> Result<bool, Doma
 }
 
 fn text_matches(
-    store: &LearningStore,
     read: &super::store::LearningRead<'_>,
     query: &SearchQuery,
+    use_fts5: bool,
 ) -> Result<BTreeSet<String>, DomainError> {
     let Some(text) = query.text.as_deref().map(str::trim) else {
         return Ok(BTreeSet::new());
@@ -262,7 +269,7 @@ fn text_matches(
     let mut hits = BTreeSet::new();
     // Доверие проверяется в том же запросе, что и совпадение: иначе счётчик
     // совпадений и страница расходились бы, а карантин попадал бы в вывод.
-    if store.fts5_available() && fts_index_present(read)? {
+    if use_fts5 {
         let mut statement = read
             .transaction()
             .prepare(

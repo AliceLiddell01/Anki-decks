@@ -7,7 +7,7 @@
 //! транзакции и фиксируется в таблице `learning_migration`, поэтому повторный
 //! запуск той же версии ничего не меняет.
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::error::{DomainError, ErrorCode};
 
@@ -178,10 +178,11 @@ const SCHEMA_V1: &[&str] = &[
         ON learning_search (review_id)",
 ];
 
-/// FTS5-индекс текстового поиска; создаётся, если сборка SQLite поддерживает FTS5.
+/// FTS5-индекс подстрочного поиска; создаётся, если сборка SQLite поддерживает FTS5.
 const SEARCH_FTS5: &str = r"CREATE VIRTUAL TABLE IF NOT EXISTS learning_search_fts USING fts5 (
     case_id UNINDEXED,
-    body
+    body,
+    tokenize = 'trigram'
 )";
 
 /// Миграция v2: сохраняет минимизированную сводку проверенного ExecutionResult.
@@ -325,6 +326,11 @@ pub fn ensure_fts_index(connection: &Connection) -> Result<bool, DomainError> {
     if !fts5_available(connection)? {
         return Ok(false);
     }
+    if !fts_index_uses_trigram(connection)? {
+        connection
+            .execute_batch("DROP TABLE IF EXISTS learning_search_fts")
+            .map_err(|error| schema_error("не удалось заменить FTS5-индекс learning", &error))?;
+    }
     connection
         .execute_batch(SEARCH_FTS5)
         .map_err(|error| schema_error("не удалось создать FTS5-индекс learning", &error))?;
@@ -339,14 +345,24 @@ pub fn ensure_fts_index(connection: &Connection) -> Result<bool, DomainError> {
     Ok(true)
 }
 
+fn fts_index_uses_trigram(connection: &Connection) -> Result<bool, DomainError> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'learning_search_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| schema_error("не удалось проверить tokenizer FTS5 learning", &error))?;
+    Ok(sql.is_some_and(|sql| sql.to_ascii_lowercase().contains("trigram")))
+}
+
 /// Пересобирает FTS5-индекс из таблицы `learning_search`.
 pub fn rebuild_fts_index(connection: &Connection) -> Result<bool, DomainError> {
-    if !fts5_available(connection)? {
+    if !ensure_fts_index(connection)? {
         return Ok(false);
     }
-    connection
-        .execute_batch(SEARCH_FTS5)
-        .map_err(|error| schema_error("не удалось создать FTS5-индекс learning", &error))?;
     connection
         .execute("DELETE FROM learning_search_fts", [])
         .map_err(|error| schema_error("не удалось очистить FTS5-индекс learning", &error))?;
@@ -560,5 +576,42 @@ mod tests {
         assert!(available, "bundled libsqlite3 должен объявлять ENABLE_FTS5");
         assert!(ensure_fts_index(&connection).unwrap());
         assert!(rebuild_fts_index(&connection).unwrap());
+    }
+
+    #[test]
+    fn legacy_tokenized_fts_index_is_rebuilt_as_substring_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection).unwrap();
+        assert!(fts5_available(&connection).unwrap());
+        connection
+            .execute(
+                "INSERT INTO learning_search (
+                    case_id, review_id, unit_id, candidate_id, finding_id, kind,
+                    disposition, severity, provenance, text
+                 ) VALUES ('case-1', 'review-1', 'unit-1', NULL, NULL, 'unit',
+                           NULL, NULL, NULL, 'parse_result handles input')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE VIRTUAL TABLE learning_search_fts USING fts5(case_id UNINDEXED, body);
+                 INSERT INTO learning_search_fts (case_id, body)
+                 VALUES ('case-1', 'parse_result handles input');",
+            )
+            .unwrap();
+        assert!(!fts_index_uses_trigram(&connection).unwrap());
+
+        assert!(ensure_fts_index(&connection).unwrap());
+        assert!(fts_index_uses_trigram(&connection).unwrap());
+        let matched: String = connection
+            .query_row(
+                "SELECT case_id FROM learning_search_fts
+                 WHERE learning_search_fts MATCH 'ars'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched, "case-1");
     }
 }

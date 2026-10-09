@@ -10,6 +10,8 @@
 //! структурному сходству, а высокий исторический уровень `acceptable` не
 //! трактуется как доказанная безопасность нового кода.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::error::DomainError;
 
 use super::import::LoadedReview;
@@ -17,9 +19,7 @@ use super::model::{
     CaseRef, HistoryGeneration, Recommendation, Recommendations, SupportLevel, SupportSummary,
     TrustLevel,
 };
-use super::patterns::{
-    cases_for_signature, feature_signature, support_for_signature, unit_features,
-};
+use super::patterns::{evidence_for_signatures, feature_signature, unit_features};
 use super::store::LearningStore;
 use super::{LEARNING_POLICY_VERSION, ROOT_WORKSPACE_VARIANT};
 
@@ -30,6 +30,7 @@ pub const RECOMMENDATIONS_SCHEMA_VERSION: u32 = 1;
 #[must_use]
 pub fn granularity_for(
     is_group: bool,
+    guardrailed: bool,
     support: Option<&SupportSummary>,
     related_repeats: usize,
 ) -> &'static str {
@@ -37,7 +38,12 @@ pub fn granularity_for(
         return "look_for_related_finding";
     }
     match support {
-        Some(summary) if summary.level == SupportLevel::Supported && is_group => "inspect_group",
+        Some(summary) if summary.level == SupportLevel::Supported && is_group && guardrailed => {
+            "inspect_individually"
+        }
+        Some(summary) if summary.level == SupportLevel::Supported && is_group => {
+            "inspect_each_candidate"
+        }
         Some(summary)
             if summary.level == SupportLevel::Supported
                 && summary.confirmed_units > 0
@@ -132,6 +138,19 @@ pub fn recommend(
         ),
     };
     let case_limit = request.case_limit.max(1);
+    let signatures: BTreeSet<String> = loaded
+        .queue
+        .units
+        .iter()
+        .map(|unit| feature_signature(&unit_features(&unit.signature)))
+        .collect();
+    let evidence_by_signature = if learning_disabled {
+        BTreeMap::new()
+    } else if let Some(store) = store {
+        evidence_for_signatures(store, &signatures, case_limit, now)?
+    } else {
+        BTreeMap::new()
+    };
     let mut recommendations = Vec::new();
     let mut order: Vec<(u8, u8, String)> = Vec::new();
     for unit in &loaded.queue.units {
@@ -140,18 +159,18 @@ pub fn recommend(
         let is_group = unit.is_group();
         let (support, cases, repeats) = if learning_disabled {
             (None, Vec::new(), 0usize)
-        } else if let Some(store) = store {
-            let support = support_for_signature(store, &signature, now)?;
-            let cases = cases_for_signature(store, &signature, case_limit, now)?;
+        } else {
+            let evidence = evidence_by_signature.get(&signature);
+            let support = evidence.map(|item| item.support.clone());
+            let cases = evidence.map_or_else(Vec::new, |item| item.cases.clone());
             let repeats = cases
                 .iter()
                 .filter(|case| case.link == super::model::CaseLinkKind::StructuralRepeat)
                 .count();
             (support, cases, repeats)
-        } else {
-            (None, Vec::new(), 0usize)
         };
-        let granularity = granularity_for(is_group, support.as_ref(), repeats);
+        let guardrailed = is_guardrailed(unit);
+        let granularity = granularity_for(is_group, guardrailed, support.as_ref(), repeats);
         let mut unit_limitations = Vec::new();
         if let Some(summary) = support.as_ref() {
             match summary.level {
@@ -180,7 +199,6 @@ pub fn recommend(
                     .to_owned(),
             );
         }
-        let guardrailed = is_guardrailed(unit);
         let reason = reason_for(unit, support.as_ref(), granularity, guardrailed);
         let historical_cases: Vec<CaseRef> = cases.into_iter().map(|case| case.case).collect();
         order.push((
@@ -209,12 +227,18 @@ pub fn recommend(
     }
     order.sort();
     let limit = request.limit.max(1);
-    let suggested_order: Vec<String> = order
+    debug_assert_eq!(order.len(), recommendations.len());
+    let positions: BTreeMap<String, usize> = order
         .into_iter()
-        .take(limit)
-        .map(|(_, _, unit_id)| unit_id)
+        .enumerate()
+        .map(|(position, (_, _, unit_id))| (unit_id, position))
         .collect();
+    recommendations.sort_by_key(|item| positions.get(&item.unit_id).copied().unwrap_or(usize::MAX));
     recommendations.truncate(limit);
+    let suggested_order: Vec<String> = recommendations
+        .iter()
+        .map(|item| item.unit_id.clone())
+        .collect();
     let mut document_limitations = limitations;
     document_limitations.push(
         "Подсказка — дополнительное ранжирование: baseline priority и порядок review-queue.json не изменяются."
@@ -290,8 +314,11 @@ fn reason_for(
         "look_for_related_finding" => {
             "В истории есть связанный повтор того же структурного дефекта: сначала проверьте, не повторяется ли он в этом снимке."
         }
-        "inspect_group" => {
-            "Единица структурно однородна и имеет достаточную поддержку в истории: проверьте представителей и распространите вывод на группу."
+        "inspect_each_candidate" => {
+            "По этим структурным признакам есть достаточная поддержка истории: представителей можно использовать для навигации, но проверьте каждого кандидата; сходство не доказывает семантическую однородность."
+        }
+        "inspect_individually" => {
+            "Защищённую единицу нужно проверить целиком и по каждому кандидату отдельно; представители помогают найти контекст, но не доказывают однородность группы."
         }
         "inspect_first" => {
             "В истории по этим признакам есть подтверждённые случаи: имеет смысл посмотреть единицу раньше обычного порядка."
@@ -349,5 +376,49 @@ pub fn empty_document(loaded: &LoadedReview) -> Recommendations {
         suggested_order: Vec::new(),
         recommendations: Vec::new(),
         limitations: vec!["Документ не заполнен.".to_owned()],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn supported_summary() -> SupportSummary {
+        SupportSummary {
+            support_units: 3,
+            support_reviews: 3,
+            confirmed_units: 3,
+            acceptable_units: 0,
+            false_positive_units: 0,
+            not_applicable_units: 0,
+            uncertain_units: 0,
+            unresolved_units: 0,
+            confirmed_findings: 0,
+            findings_by_provenance: BTreeMap::new(),
+            freshest_age_days: 0,
+            oldest_age_days: 0,
+            revised_units: 0,
+            level: SupportLevel::Supported,
+            confirmed_share_lower_bound: Some(0.4),
+            explanation: String::new(),
+            contradicting_unit_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn grouped_recommendations_never_transfer_a_decision_to_guardrailed_units() {
+        let support = supported_summary();
+        assert_eq!(
+            granularity_for(true, true, Some(&support), 0),
+            "inspect_individually"
+        );
+        assert_eq!(
+            granularity_for(true, false, Some(&support), 0),
+            "inspect_each_candidate"
+        );
+        assert_eq!(
+            granularity_for(true, true, Some(&support), 1),
+            "look_for_related_finding"
+        );
     }
 }

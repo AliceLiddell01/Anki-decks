@@ -378,11 +378,9 @@ impl Artifacts {
             serde_json::to_vec(pack).unwrap(),
         )
         .unwrap();
-        fs::write(
-            directory.join("review-queue.json"),
-            serde_json::to_vec(queue).unwrap(),
-        )
-        .unwrap();
+        let mut queue_bytes = serde_json::to_vec_pretty(queue).unwrap();
+        queue_bytes.push(b'\n');
+        fs::write(directory.join("review-queue.json"), queue_bytes).unwrap();
         fs::write(
             directory.join("semantic-triage.json"),
             serde_json::to_vec(triage).unwrap(),
@@ -498,6 +496,11 @@ fn idempotent_double_import_does_not_double_counts_or_findings() {
         .expect("доверенный импорт должен находить точные Git-образы");
     assert_eq!(loaded.trust, TrustLevel::AstAuthenticated);
     assert_eq!(loaded.review_pack_sha256, digest);
+    assert_eq!(
+        loaded.queue_sha256,
+        learning::import::sha256_hex(&fs::read(artifacts.queue()).unwrap()),
+        "digest очереди считается по точным байтам файла"
+    );
 
     let first = import(&loaded, &store);
     assert_eq!(first.observations.findings, 1);
@@ -1174,12 +1177,10 @@ fn concurrent_readers_and_writer_keep_history_consistent() {
         handles.push(std::thread::spawn(move || {
             for _ in 0..20 {
                 let records = learning::import::list_imports(&reader, true, 50).unwrap();
-                // Читатель всегда видит согласованный снимок: либо ноль, либо целую запись.
+                // Читатель всегда видит согласованный снимок: одну целую запись.
+                assert_eq!(records.len(), 1);
                 for record in records {
-                    assert_eq!(
-                        record.observations.raw_candidates,
-                        record.observations.raw_candidates
-                    );
+                    assert_eq!(record.observations.raw_candidates, 3);
                     assert!(!record.review_id.is_empty());
                 }
                 let _ = learning::import::generation(&reader).unwrap();
@@ -1773,6 +1774,49 @@ fn feedback_correction_and_retraction_remove_wrong_label_after_recompute() {
     learning::feedback::record_feedback(&store, &usefulness).unwrap();
     let outcome = learning::feedback::outcome(&store, &record.review_id, &unit_id).unwrap();
     assert_eq!(outcome.effective_disposition, None);
+
+    // После отзыва прежняя позиция освобождена для нового утверждения.
+    let mut appended_after_retraction = correction.clone();
+    appended_after_retraction.event_id = "event-5".into();
+    appended_after_retraction.effective_disposition = Some("acceptable".into());
+    appended_after_retraction.recorded_at = 4;
+    let appended = learning::feedback::record_feedback(&store, &appended_after_retraction).unwrap();
+    assert_eq!(
+        appended.outcome.effective_disposition.as_deref(),
+        Some("acceptable")
+    );
+    assert_eq!(appended.outcome.effective_event_ids, ["event-5"]);
+    assert!(!appended.outcome.has_conflict);
+
+    // supersede выводит целевое событие из эффективной истории.
+    let superseding = FeedbackEvent {
+        schema_version: learning::feedback::FEEDBACK_SCHEMA_VERSION,
+        event_id: "event-6".into(),
+        review_id: record.review_id.clone(),
+        unit_id: unit_id.clone(),
+        candidate_id: Some("production-0".into()),
+        kind: FeedbackKind::SemanticOutcomeRevision,
+        action: FeedbackAction::Supersede,
+        supersedes_event_id: Some("event-5".into()),
+        effective_disposition: Some("false_positive".into()),
+        usefulness: None,
+        explanation: "Уточнённый исход заменяет прежнюю оценку.".into(),
+        provenance: "reviewer".into(),
+        recorded_at: 5,
+    };
+    let superseded = learning::feedback::record_feedback(&store, &superseding).unwrap();
+    assert_eq!(
+        superseded.outcome.effective_disposition.as_deref(),
+        Some("false_positive")
+    );
+    assert_eq!(superseded.outcome.effective_event_ids, ["event-6"]);
+    assert!(!superseded.outcome.has_conflict);
+    assert_eq!(
+        learning::feedback::outcome_distribution(&store)
+            .unwrap()
+            .get("false_positive"),
+        Some(&1)
+    );
 }
 
 #[test]
@@ -2050,7 +2094,7 @@ fn policy_proposal_is_never_auto_applied() {
     let store_dir = TempDir::new("learning-policy-store");
     let store = open_store(store_dir.path());
     let loaded = load_in_repo(&repo, &artifacts, false).unwrap();
-    import(&loaded, &store);
+    let record = import(&loaded, &store);
 
     let report =
         learning::pattern_report(&store, &learning::patterns::PatternQuery::default()).unwrap();
@@ -2101,6 +2145,57 @@ fn policy_proposal_is_never_auto_applied() {
             .len(),
         1
     );
+
+    // Ключ политики находится и у паттерна за пределами стандартной страницы отчёта.
+    let synthetic_patterns: Vec<(String, String)> = (0..24)
+        .map(|index| {
+            let features =
+                BTreeMap::from([("fixture_pattern".to_owned(), format!("pattern-{index:02}"))]);
+            let signature = learning::patterns::feature_signature(&features);
+            let feature_json = serde_json::to_string(&features).unwrap();
+            (signature, feature_json)
+        })
+        .collect();
+    store
+        .write(|write| {
+            for (index, (signature, feature_json)) in synthetic_patterns.iter().enumerate() {
+                write.execute(
+                    "INSERT INTO learning_unit (
+                        review_id, unit_id, kind, candidate_count, priority,
+                        representatives_json, disposition, reason_code, detector, source,
+                        role, code_role, surfaces_json, signature, feature_json
+                     ) VALUES (?1, ?2, 'individual', 0, 'normal', '[]', 'acceptable', NULL,
+                               'fixture-detector', 'fixture-source', 'unknown', 'unknown',
+                               '[]', ?3, ?4)",
+                    rusqlite::params![
+                        record.review_id,
+                        format!("fixture-unit-{index:02}"),
+                        signature,
+                        feature_json,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let visible: BTreeSet<String> =
+        learning::pattern_report(&store, &learning::patterns::PatternQuery::default())
+            .unwrap()
+            .rules
+            .into_iter()
+            .map(|rule| rule.signature)
+            .collect();
+    let (hidden_signature, hidden_feature_json) = synthetic_patterns
+        .iter()
+        .find(|(signature, _)| !visible.contains(signature))
+        .expect("синтетический паттерн должен оказаться за пределами первых 20");
+    let hidden_proposal =
+        learning::feedback::propose_policy(&store, hidden_signature, "learning.observe.hidden", 0)
+            .unwrap();
+    assert_eq!(
+        hidden_proposal.key,
+        serde_json::from_str::<BTreeMap<String, String>>(hidden_feature_json).unwrap()
+    );
 }
 
 #[test]
@@ -2144,6 +2239,15 @@ fn recommendations_are_deterministic_and_guardrailed() {
     }
     assert_eq!(ordered.len(), queue.units.len());
     assert_eq!(first.suggested_order.len(), queue.units.len());
+    assert_eq!(
+        first.suggested_order,
+        first
+            .recommendations
+            .iter()
+            .map(|item| item.unit_id.clone())
+            .collect::<Vec<_>>(),
+        "подсказки и рекомендации должны иметь один и тот же порядок"
+    );
 
     // Guardrails: high/unknown/security остаются обязательными к просмотру.
     for unit in &queue.units {
@@ -2192,7 +2296,7 @@ fn search_distinguishes_match_kinds_and_paginates() {
         id: "finding-search".into(),
         severity: Severity::Minor,
         title: "Незначительное замечание".into(),
-        description: "src/lib.rs:2: описание для локального текстового поиска.".into(),
+        description: "src/lib.rs:2: parse и описание для локального текстового поиска.".into(),
         provenance: FindingProvenance::CandidateAssisted,
         candidate_ids: vec!["production-0".into()],
     };
@@ -2232,6 +2336,42 @@ fn search_distinguishes_match_kinds_and_paginates() {
     );
     assert!(textual.cases[0].source_reference.contains("review.json"));
     assert!(textual.fts5_used);
+
+    let partial_word = learning::search_history(
+        &store,
+        &learning::search::SearchQuery {
+            text: Some("pars".into()),
+            limit: 5,
+            ..learning::search::SearchQuery::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(partial_word.cases.len(), 1);
+    assert!(partial_word.fts5_used);
+
+    let middle_of_token = learning::search_history(
+        &store,
+        &learning::search::SearchQuery {
+            text: Some("екстов".into()),
+            limit: 5,
+            ..learning::search::SearchQuery::default()
+        },
+    )
+    .unwrap();
+    assert!(!middle_of_token.cases.is_empty());
+    assert!(middle_of_token.fts5_used);
+
+    let two_character_substring = learning::search_history(
+        &store,
+        &learning::search::SearchQuery {
+            text: Some("ar".into()),
+            limit: 5,
+            ..learning::search::SearchQuery::default()
+        },
+    )
+    .unwrap();
+    assert!(!two_character_substring.cases.is_empty());
+    assert!(!two_character_substring.fts5_used);
 
     let thematic = learning::search_history(
         &store,

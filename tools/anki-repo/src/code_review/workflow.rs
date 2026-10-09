@@ -583,17 +583,18 @@ fn load_validated_review_queue(
     Ok((pack, queue, summary, syntax_authenticity))
 }
 
-/// Проверенная очередь вместе с точными байтами пакета, сводкой и контекстами.
+/// Проверенная очередь вместе с точными байтами обоих документов, сводкой и контекстами.
 pub(crate) type LoadedReviewQueue = (
     ReviewPack,
     Vec<u8>,
     ReviewQueue,
+    Vec<u8>,
     QueueSummary,
     SyntaxAuthenticityStatus,
     BTreeMap<String, review_queue::SyntaxContext>,
 );
 
-/// Проверенное чтение очереди вместе с точными байтами пакета и контекстами.
+/// Проверенное чтение очереди вместе с точными байтами пакета и очереди, сводкой и контекстами.
 ///
 /// Отдельная точка входа нужна вызывающим, которым кроме сводки требуются точные
 /// байты `review.json` и авторитетные контексты разбора. Доверенный путь с
@@ -606,7 +607,7 @@ pub(crate) fn load_validated_review_queue_with_contexts(
     structure_only: bool,
 ) -> Result<LoadedReviewQueue, DomainError> {
     let (pack, pack_bytes) = read_review_pack(pack_path)?;
-    let queue = read_json(
+    let (queue, queue_bytes) = read_json_with_bytes(
         queue_path,
         MAX_REVIEW_ARTIFACT_BYTES,
         "структурная очередь code-review",
@@ -618,6 +619,7 @@ pub(crate) fn load_validated_review_queue_with_contexts(
             pack,
             pack_bytes,
             queue,
+            queue_bytes,
             summary,
             SyntaxAuthenticityStatus::StructureOnly,
             BTreeMap::new(),
@@ -630,6 +632,7 @@ pub(crate) fn load_validated_review_queue_with_contexts(
         pack,
         pack_bytes,
         queue,
+        queue_bytes,
         summary,
         SyntaxAuthenticityStatus::Verified,
         contexts,

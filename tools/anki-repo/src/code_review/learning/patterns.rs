@@ -175,6 +175,13 @@ struct StoredUnit {
     trust: TrustLevel,
 }
 
+/// Поддержка и исторические случаи, загруженные одним проходом для сигнатуры.
+#[derive(Debug, Clone)]
+pub(super) struct SignatureEvidence {
+    pub support: SupportSummary,
+    pub cases: Vec<PatternCaseRef>,
+}
+
 /// Строит отчёт по паттернам на текущем снимке истории.
 pub fn pattern_report(
     store: &LearningStore,
@@ -874,6 +881,100 @@ pub fn cases_for_signature(
             });
         }
         Ok(cases)
+    })
+}
+
+/// Загружает историю для набора сигнатур за один проход по каждому источнику.
+/// Рекомендации строятся для всей очереди разом, поэтому отдельный полный запрос
+/// на каждую единицу делал стоимость пропорциональной `очередь × история`.
+pub(super) fn evidence_for_signatures(
+    store: &LearningStore,
+    signatures: &BTreeSet<String>,
+    case_limit: usize,
+    now: u64,
+) -> Result<BTreeMap<String, SignatureEvidence>, DomainError> {
+    if signatures.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    store.read(|read| {
+        let units = load_units(read, &PatternQuery::default())?;
+        let findings = load_findings(read)?;
+        let confirmed_findings = load_confirmed_findings(read)?;
+        let links = load_case_links(read)?;
+        let mut members_by_signature: BTreeMap<String, Vec<StoredUnit>> = BTreeMap::new();
+        let mut signatures_by_unit: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for unit in units {
+            let signature = feature_signature(&unit.feature);
+            if signatures.contains(&signature) {
+                signatures_by_unit
+                    .entry((unit.review_id.clone(), unit.unit_id.clone()))
+                    .or_default()
+                    .insert(signature.clone());
+                members_by_signature
+                    .entry(signature)
+                    .or_default()
+                    .push(unit);
+            }
+        }
+
+        let mut findings_by_signature: BTreeMap<String, Vec<StoredFinding>> = BTreeMap::new();
+        for finding in findings {
+            let linked_signatures: BTreeSet<&str> = finding
+                .units
+                .iter()
+                .filter_map(|unit_id| {
+                    signatures_by_unit.get(&(finding.review_id.clone(), unit_id.clone()))
+                })
+                .flat_map(|values| values.iter().map(String::as_str))
+                .collect();
+            for signature in linked_signatures {
+                findings_by_signature
+                    .entry(signature.to_owned())
+                    .or_default()
+                    .push(finding.clone());
+            }
+        }
+
+        let mut evidence = BTreeMap::new();
+        for (signature, members) in members_by_signature {
+            let support = support_summary(
+                &members,
+                findings_by_signature
+                    .get(&signature)
+                    .map_or(&[], Vec::as_slice),
+                &confirmed_findings,
+                now,
+            );
+            let cases = members
+                .into_iter()
+                .take(case_limit)
+                .map(|unit| {
+                    let link = links
+                        .get(&(unit.review_id.clone(), unit.unit_id.clone()))
+                        .copied()
+                        .unwrap_or(CaseLinkKind::Unknown);
+                    PatternCaseRef {
+                        case: CaseRef {
+                            review_id: unit.review_id,
+                            unit_id: unit.unit_id,
+                            candidate_ids: if unit.sample_candidate.is_some() {
+                                unit.sample_candidate.into_iter().collect()
+                            } else {
+                                unit.representatives
+                            },
+                            path: unit.sample_path,
+                            snippet: unit.snippet,
+                            disposition: unit.disposition,
+                            trust: unit.trust,
+                            age_days: now.saturating_sub(unit.imported_at) / 86_400,
+                        },
+                        link,
+                    }
+                })
+                .collect();
+            evidence.insert(signature, SignatureEvidence { support, cases });
+        }
+        Ok(evidence)
     })
 }
 

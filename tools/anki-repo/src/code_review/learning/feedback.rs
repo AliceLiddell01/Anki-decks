@@ -33,8 +33,10 @@ pub const FEEDBACK_SCHEMA_VERSION: u32 = 1;
 /// Версия схемы предложений политики.
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
 
+type EffectiveRevision = (u64, String, String);
+
 /// Путь материализации утверждённой политики, которую коммитит человек.
-pub const POLICY_ARTIFACT_PATH: &str = ".anki-repo/learning/policy.json";
+pub const POLICY_ARTIFACT_PATH: &str = ".anki-repo/policies/learning-policy.json";
 
 /// Содержательные решения, допустимые в правке семантического исхода.
 const DISPOSITIONS: &[&str] = &[
@@ -233,10 +235,23 @@ fn conflicting_events(
     let mut statement = write
         .transaction()
         .prepare(
-            "SELECT event_id FROM learning_feedback
-             WHERE review_id = ?1 AND unit_id = ?2 AND kind = ?3
-               AND retracted_event_id IS NULL
-             ORDER BY event_id ASC",
+            "SELECT event.event_id FROM learning_feedback AS event
+             WHERE event.review_id = ?1 AND event.unit_id = ?2 AND event.kind = ?3
+               AND event.action <> 'retract'
+               AND NOT EXISTS (
+                   SELECT 1 FROM learning_feedback AS correction
+                   WHERE correction.review_id = event.review_id
+                     AND correction.unit_id = event.unit_id
+                     AND correction.kind = event.kind
+                     AND (
+                         (correction.action = 'retract'
+                          AND correction.retracted_event_id = event.event_id)
+                         OR
+                         (correction.action = 'supersede'
+                          AND correction.supersedes_event_id = event.event_id)
+                     )
+               )
+             ORDER BY event.recorded_at ASC, event.event_id ASC",
         )
         .map_err(|error| map_error(&error, "не удалось прочитать прежние утверждения"))?;
     let rows = statement
@@ -263,7 +278,21 @@ fn ensure_supersedable(
         .transaction()
         .query_row(
             "SELECT event_id FROM learning_feedback
-             WHERE event_id = ?1 AND review_id = ?2 AND unit_id = ?3 AND kind = ?4",
+             WHERE event_id = ?1 AND review_id = ?2 AND unit_id = ?3 AND kind = ?4
+               AND action <> 'retract'
+               AND NOT EXISTS (
+                   SELECT 1 FROM learning_feedback AS correction
+                   WHERE correction.review_id = learning_feedback.review_id
+                     AND correction.unit_id = learning_feedback.unit_id
+                     AND correction.kind = learning_feedback.kind
+                     AND (
+                         (correction.action = 'retract'
+                          AND correction.retracted_event_id = learning_feedback.event_id)
+                         OR
+                         (correction.action = 'supersede'
+                          AND correction.supersedes_event_id = learning_feedback.event_id)
+                     )
+               )",
             params![target, event.review_id, event.unit_id, event.kind.as_str()],
             |row| row.get(0),
         )
@@ -272,7 +301,7 @@ fn ensure_supersedable(
     if exists.is_none() {
         return Err(DomainError::new(
             ErrorCode::NotFound,
-            format!("Заменяемое утверждение learning не найдено: {target}"),
+            format!("Заменяемое утверждение learning не найдено или уже не действует: {target}"),
         ));
     }
     Ok(())
@@ -456,7 +485,7 @@ fn outcome_for(
             "SELECT event_id, kind, action, supersedes_event_id, retracted_event_id,
                     effective_disposition
              FROM learning_feedback WHERE review_id = ?1 AND unit_id = ?2
-             ORDER BY event_id ASC",
+             ORDER BY recorded_at ASC, event_id ASC",
         )
         .map_err(|error| map_error(&error, "не удалось прочитать исход случая"))?;
     let rows = statement
@@ -478,15 +507,30 @@ fn outcome_for(
     drop(statement);
     let retracted: BTreeSet<&str> = data
         .iter()
-        .filter_map(|(_, _, _, _, retracted, _)| retracted.as_deref())
+        .filter_map(|(_, _, action, _, retracted, _)| {
+            (action == "retract")
+                .then_some(retracted.as_deref())
+                .flatten()
+        })
+        .collect();
+    let superseded: BTreeSet<&str> = data
+        .iter()
+        .filter_map(|(_, _, action, supersedes, _, _)| {
+            (action == "supersede")
+                .then_some(supersedes.as_deref())
+                .flatten()
+        })
         .collect();
     let original = original_disposition(transaction, review_id, unit_id)?;
     let mut effective: Vec<(String, String)> = Vec::new();
-    for (event_id, kind, _action, _supersedes, _retracted_event, disposition) in &data {
+    for (event_id, kind, action, _supersedes, _retracted_event, disposition) in &data {
         if kind != FeedbackKind::SemanticOutcomeRevision.as_str() {
             continue;
         }
-        if retracted.contains(event_id.as_str()) {
+        if action == "retract"
+            || retracted.contains(event_id.as_str())
+            || superseded.contains(event_id.as_str())
+        {
             continue;
         }
         if let Some(value) = disposition {
@@ -552,14 +596,14 @@ pub(super) fn effective_dispositions(
             original.insert((review_id, unit_id), disposition);
         }
     }
-    let mut retracted: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    let mut revisions: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+    let mut inactive: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let mut revisions: BTreeMap<(String, String), Vec<EffectiveRevision>> = BTreeMap::new();
     {
         let mut statement = transaction
             .prepare(
-                "SELECT review_id, unit_id, event_id, kind, retracted_event_id,
-                        effective_disposition
-                 FROM learning_feedback ORDER BY event_id ASC",
+                "SELECT review_id, unit_id, event_id, kind, action, supersedes_event_id,
+                        retracted_event_id, effective_disposition, recorded_at
+                 FROM learning_feedback ORDER BY recorded_at ASC, event_id ASC",
             )
             .map_err(|error| map_error(&error, "не удалось прочитать правки исходов"))?;
         let rows = statement
@@ -569,41 +613,63 @@ pub(super) fn effective_dispositions(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })
             .map_err(|error| map_error(&error, "не удалось прочитать правки исходов"))?;
         for row in rows {
-            let (review_id, unit_id, event_id, kind, retracted_event, disposition) =
-                row.map_err(|error| map_error(&error, "не удалось прочитать правки исходов"))?;
+            let (
+                review_id,
+                unit_id,
+                event_id,
+                kind,
+                action,
+                superseded_event,
+                retracted_event,
+                disposition,
+                recorded_at,
+            ) = row.map_err(|error| map_error(&error, "не удалось прочитать правки исходов"))?;
             let key = (review_id, unit_id);
-            if let Some(retracted_event) = retracted_event {
-                retracted
+            if action == "retract" {
+                if let Some(retracted_event) = retracted_event {
+                    inactive
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(retracted_event);
+                }
+            } else if action == "supersede"
+                && let Some(superseded_event) = superseded_event
+            {
+                inactive
                     .entry(key.clone())
                     .or_default()
-                    .insert(retracted_event);
+                    .insert(superseded_event);
             }
-            if kind != FeedbackKind::SemanticOutcomeRevision.as_str() {
+            if kind != FeedbackKind::SemanticOutcomeRevision.as_str() || action == "retract" {
                 continue;
             }
             if let Some(disposition) = disposition {
-                revisions
-                    .entry(key)
-                    .or_default()
-                    .push((event_id, disposition));
+                revisions.entry(key.clone()).or_default().push((
+                    u64::try_from(recorded_at.max(0)).unwrap_or(0),
+                    event_id,
+                    disposition,
+                ));
             }
         }
     }
     let mut effective = BTreeMap::new();
     for (key, original_disposition) in original {
-        let retracted_for_case = retracted.remove(&key).unwrap_or_default();
+        let inactive_for_case = inactive.remove(&key).unwrap_or_default();
         let active = revisions
             .remove(&key)
             .unwrap_or_default()
             .into_iter()
-            .filter(|(event_id, _)| !retracted_for_case.contains(event_id))
-            .map(|(_, disposition)| disposition)
+            .filter(|(_, event_id, _)| !inactive_for_case.contains(event_id))
+            .map(|(_, _, disposition)| disposition)
             .next_back();
         effective.insert(key, active.or(original_disposition));
     }
@@ -714,14 +780,31 @@ fn key_for_signature(
     store: &LearningStore,
     signature: &str,
 ) -> Result<BTreeMap<String, String>, DomainError> {
-    let query = super::patterns::PatternQuery::default();
-    let report = super::patterns::pattern_report(store, &query)?;
-    for rule in report.rules {
-        if rule.signature == signature {
-            return Ok(rule.key);
+    store.read(|read| {
+        let mut statement = read
+            .transaction()
+            .prepare(
+                "SELECT u.feature_json FROM learning_unit AS u
+                 JOIN learning_import AS i ON i.review_id = u.review_id
+                 WHERE i.trust = 'ast_authenticated'
+                 ORDER BY u.review_id ASC, u.unit_id ASC",
+            )
+            .map_err(|error| map_error(&error, "не удалось прочитать ключ признаков политики"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| map_error(&error, "не удалось прочитать ключ признаков политики"))?;
+        for row in rows {
+            let feature_json = row.map_err(|error| {
+                map_error(&error, "не удалось прочитать ключ признаков политики")
+            })?;
+            let key: BTreeMap<String, String> =
+                super::import::parse_domain_json(&feature_json, "признаки единицы")?;
+            if super::patterns::feature_signature(&key) == signature {
+                return Ok(key);
+            }
         }
-    }
-    Ok(BTreeMap::new())
+        Ok(BTreeMap::new())
+    })
 }
 
 /// Возвращает точный ключ признаков сохранённого предложения.
