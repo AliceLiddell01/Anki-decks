@@ -35,12 +35,8 @@ def sections(body: str) -> list[tuple[str, str]]:
                 fence_char, fence_len = token[0], len(token)
             elif token[0] == fence_char and len(token) >= fence_len:
                 fence_char = ""
-            if found and not fence_char:
-                active.append(line)
             continue
         if fence_char:
-            if found:
-                active.append(line)
             continue
         match = HEADING.match(line)
         if match:

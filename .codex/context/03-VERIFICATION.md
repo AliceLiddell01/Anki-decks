@@ -295,7 +295,9 @@ cargo run --quiet --bin anki-repo -- visual-report \
 
 Три job'а (точные команды и актуальные флаги определяет сам workflow):
 
-- «Форматирование и Clippy» — `cargo fmt --all --check` и
+- «Форматирование и Clippy» — сначала проверяет метаданные и ссылки
+  Agent Skills штатным Python stdlib-скриптом и его регрессионными тестами,
+  затем запускает `cargo fmt --all --check` и
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
 - «Код и тесты» — `cargo test --workspace --locked --profile ci`,
   проверки verified-only корпусов кандзи и pitch-accent, а также

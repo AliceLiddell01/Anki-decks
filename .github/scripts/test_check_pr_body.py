@@ -34,6 +34,14 @@ class PrBodyContractTests(unittest.TestCase):
     def test_headings_in_code_fence_are_not_real(self):
         self.assertEqual(len(validate("```md\n" + valid_body() + "\n```")), len(HEADINGS))
 
+    def test_fenced_content_does_not_make_section_nonempty(self):
+        body = valid_body().replace("Фактическая информация для раздела CI.", "```md\nThis is a sample, not CI evidence.\n```")
+        self.assertTrue(any("Пустой" in e for e in validate(body)))
+
+    def test_coderabbit_table_in_fence_is_not_accepted(self):
+        body = valid_body() + "\n\n## CodeRabbit review и disposition\n```markdown\n| Итерация / reviewed HEAD | Уровень | Путь | Влияние | Решение | Исправление |\n| 1 · x | — | — | 0 | clean | x |\n```"
+        self.assertTrue(any("таблицы" in e for e in validate(body)))
+
     def test_duplicate_and_reordered_headings(self):
         body = valid_body() + "\n\n## Цель\nПовторный раздел."
         self.assertTrue(any("повторяется" in e for e in validate(body)))
