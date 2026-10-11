@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-
 use crate::cli::{Cli, Command, MatchArg};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
@@ -480,10 +479,6 @@ fn build_retire_request(
     Ok(request)
 }
 
-/// Записывает JSON-документ в канонической форме.
-///
-/// Канонические байты дают побайтовую воспроизводимость: повторный прогон
-/// создаёт тот же файл, а не «почти тот же».
 /// Собирает запрос на правку из аргументов CLI.
 ///
 /// `--request` читается целиком и разбирается; `-` означает stdin.

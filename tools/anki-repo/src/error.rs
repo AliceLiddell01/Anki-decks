@@ -143,7 +143,7 @@ impl ErrorCode {
             | Self::UnknownQaCode
             | Self::SourceNotCanonical
             | Self::InvalidRequest
-            | Self::DuplicateEditTarget
+            | Self::DuplicateEditTarget => 3,
             Self::NotFound | Self::NoteNotFound => 4,
             Self::Ambiguous | Self::AmbiguousDeck | Self::AmbiguousModel => 5,
             Self::ExportInvalid

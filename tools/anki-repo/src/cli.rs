@@ -469,3 +469,20 @@ pub enum Command {
 
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn help_keeps_card_review_and_excludes_removed_code_review_commands() {
+        let command = Cli::command();
+        let names: Vec<_> = command.get_subcommands().map(|sub| sub.get_name()).collect();
+        assert!(names.contains(&"review"));
+        assert!(names.contains(&"review-check"));
+        assert!(!names.contains(&"code-review"));
+        assert!(!names.contains(&"language"));
+        assert!(Cli::try_parse_from(["anki-repo", "code-review"]).is_err());
+        assert!(Cli::try_parse_from(["anki-repo", "language"]).is_err());
+    }
+}
