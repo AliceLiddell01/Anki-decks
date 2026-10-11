@@ -31,7 +31,9 @@ export function useFilters() {
       next.delete("group_page");
       next.delete("finding_page");
     }
-    setParams(next);
+    setParams(next, {
+      replace: ["q", "detector", "role", "surface"].includes(key),
+    });
   };
   const query = new URLSearchParams();
   for (const key of [
@@ -91,8 +93,26 @@ export function Filters({
   );
 }
 export function ReviewSelector({ revision }: { revision: number }) {
-  const { value } = useApi<Page<ReviewSummary>>("/reviews?limit=100", revision);
+  const first = useApi<Page<ReviewSummary>>(
+    "/reviews?limit=100&page=1",
+    revision,
+  );
+  const total = first.value?.data?.total ?? 0;
+  const second = useApi<Page<ReviewSummary>>(
+    total > 100 ? "/reviews?limit=100&page=2" : null,
+    revision,
+  );
+  const third = useApi<Page<ReviewSummary>>(
+    total > 200 ? "/reviews?limit=100&page=3" : null,
+    revision,
+  );
   const { review, set } = useFilters();
+  const items = [
+    ...(first.value?.data?.items ?? []),
+    ...(second.value?.data?.items ?? []),
+    ...(third.value?.data?.items ?? []),
+  ];
+  const selectedMissing = review && !items.some((item) => item.id === review);
   return (
     <label className="flex flex-col sm:flex-row sm:items-center gap-2 text-sm">
       <span className="text-muted-foreground shrink-0">Снимок ревью</span>
@@ -103,7 +123,10 @@ export function ReviewSelector({ revision }: { revision: number }) {
         onChange={(e) => set("review_id", e.target.value)}
       >
         <option value="">Выберите сохранённый снимок</option>
-        {value?.data?.items.map((x) => (
+        {selectedMissing && (
+          <option value={review}>Текущий снимок · {review}</option>
+        )}
+        {items.map((x) => (
           <option key={x.id} value={x.id}>
             {x.namespace} · {x.head_sha?.slice(0, 10) ?? "неизвестный HEAD"} ·{" "}
             {x.workspace_variant}

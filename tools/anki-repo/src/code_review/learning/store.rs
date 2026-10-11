@@ -1270,10 +1270,22 @@ mod tests {
             .iter()
             .map(|path| std::fs::read(path).unwrap())
             .collect::<Vec<_>>();
-        let status=std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact").arg("code_review::learning::store::tests::observer_reads_active_wal_in_another_process_without_changing_files")
-            .env(DATABASE_ENV,&database).status().unwrap();
-        assert!(status.success());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("code_review::learning::store::tests::observer_reads_active_wal_in_another_process_without_changing_files")
+            .env(DATABASE_ENV, &database)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "Дочерний процесс завершился с ошибкой: stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "Дочерний процесс не выполнил ровно один тест: {stdout}"
+        );
         for (path, expected) in paths.iter().zip(before) {
             assert_eq!(
                 std::fs::read(path).unwrap(),

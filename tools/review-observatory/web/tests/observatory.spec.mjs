@@ -44,6 +44,32 @@ test("navigation preserves review and clears unrelated selection/filter state", 
   await expect(page).toHaveURL("/execution?review_id=" + review);
   await expect(page.getByLabel("Снимок ревью")).toHaveValue(review);
 });
+test("review selector loads later pages and preserves a selected snapshot", async ({
+  page,
+}) => {
+  const laterReview = {
+    ...reviews[1],
+    id: "f".repeat(24),
+    namespace: "ТЕСТОВЫЙ СНИМОК · третья страница",
+  };
+  await page.route("**/api/v1/reviews?*", (route) => {
+    const url = new URL(route.request().url());
+    const pageNumber = Number(url.searchParams.get("page"));
+    const items = pageNumber === 3 ? [reviews[0], laterReview] : [];
+    return route.fulfill({
+      json: envelope({ items, total: 256, page: pageNumber, limit: 100 }),
+    });
+  });
+  await page.goto("/evidence?review_id=" + review);
+  const selector = page.getByLabel("Снимок ревью");
+  await expect(selector).toHaveValue(review);
+  await expect(selector.locator(`option[value="${review}"]`)).toHaveCount(1);
+  await expect(
+    selector.getByRole("option", { name: /третья страница/ }),
+  ).toHaveCount(1);
+  await selector.selectOption(laterReview.id);
+  await expect(page).toHaveURL(new RegExp("review_id=" + laterReview.id));
+});
 test("review detail displays nullable pack and coverage without crashing", async ({
   page,
 }) => {
@@ -73,8 +99,13 @@ test("evidence pagination, search, filters and details are URL backed", async ({
   await page.goto("/evidence?review_id=" + review);
   await page.getByRole("button", { name: "Следующая страница" }).click();
   await expect(page).toHaveURL(/page=2/);
-  await page.getByLabel("Поиск", { exact: true }).fill("literal");
+  await page
+    .getByLabel("Поиск", { exact: true })
+    .pressSequentially("literal", { delay: 100 });
   await expect(page).toHaveURL(/q=literal/);
+  expect(new URL(page.url()).searchParams.has("page")).toBe(false);
+  await page.goBack();
+  await expect(page).not.toHaveURL(/q=/);
   expect(new URL(page.url()).searchParams.has("page")).toBe(false);
   await page.getByLabel("Приоритет", { exact: true }).selectOption("high");
   await page.getByLabel("Поверхность", { exact: true }).fill("runtime");
