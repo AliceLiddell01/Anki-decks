@@ -8,30 +8,12 @@ mod common;
 
 #[path = "cli_contract.rs"]
 mod cli_contract;
-#[path = "code_review_contract.rs"]
-mod code_review_contract;
 #[path = "edit_contract.rs"]
 mod edit_contract;
 #[path = "edit_source_preservation.rs"]
 mod edit_source_preservation;
 #[path = "export_contract.rs"]
 mod export_contract;
-#[path = "learning_cli_contract.rs"]
-mod learning_cli_contract;
-#[path = "learning_cli_regressions.rs"]
-mod learning_cli_regressions;
-#[path = "learning_contract.rs"]
-mod learning_contract;
-#[path = "learning_feedback_search_regressions.rs"]
-mod learning_feedback_search_regressions;
-#[path = "learning_import_regressions.rs"]
-mod learning_import_regressions;
-#[path = "learning_patterns_regressions.rs"]
-mod learning_patterns_regressions;
-#[path = "learning_store_regressions.rs"]
-mod learning_store_regressions;
-#[path = "learning_transfer_regressions.rs"]
-mod learning_transfer_regressions;
 #[path = "note_lifecycle_contract.rs"]
 mod note_lifecycle_contract;
 #[path = "qa_contract.rs"]
@@ -40,13 +22,7 @@ mod qa_contract;
 mod review_check_contract;
 #[path = "review_contract.rs"]
 mod review_contract;
-#[path = "semantic_triage_contract.rs"]
-mod semantic_triage_contract;
 #[path = "synthetic.rs"]
 mod synthetic;
 #[path = "visual_report_contract.rs"]
 mod visual_report_contract;
-
-#[cfg(target_os = "linux")]
-#[path = "execution_lifecycle_contract.rs"]
-mod execution_lifecycle_contract;

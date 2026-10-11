@@ -38,7 +38,6 @@
 //! `deck_config_uuid`).
 
 pub mod cli;
-pub mod code_review;
 pub mod error;
 pub mod guid;
 pub mod htmlscan;
