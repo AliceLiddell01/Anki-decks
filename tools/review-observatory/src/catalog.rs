@@ -13,6 +13,7 @@ use anki_repo::code_review::{
     review_queue::{self, ReviewQueue, ReviewUnit},
     semantic_triage::{self, SemanticTriage},
 };
+use anki_repo::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -748,7 +749,7 @@ fn learning_snapshot(root: &SafeRoot) -> (Envelope<Value>, BTreeMap<String, Vec<
         Err(e) => {
             return (
                 Envelope::absent(
-                    if e.to_string().contains("миграции") {
+                    if e.code == ErrorCode::LearningSchemaUnsupported {
                         Availability::Incomplete
                     } else {
                         Availability::Unavailable

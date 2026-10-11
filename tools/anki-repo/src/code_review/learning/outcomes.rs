@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rusqlite::Transaction;
+use rusqlite::{Transaction, params_from_iter};
 
 use crate::error::DomainError;
 
@@ -65,11 +65,44 @@ pub(super) fn is_homogeneous(disposition: Option<&str>) -> bool {
 pub(super) fn original_outcomes(
     transaction: &Transaction<'_>,
 ) -> Result<BTreeMap<UnitKey, UnitOutcome>, DomainError> {
+    original_outcomes_filtered(transaction, None)
+}
+
+/// Пересчитывает исходы только для указанных ревью. Пакеты ограничены, чтобы
+/// не зависеть от максимального числа параметров SQLite при экспорте истории.
+pub(super) fn original_outcomes_for_reviews(
+    transaction: &Transaction<'_>,
+    reviews: &BTreeSet<&str>,
+) -> Result<BTreeMap<UnitKey, UnitOutcome>, DomainError> {
+    const REVIEW_BATCH_SIZE: usize = 500;
+    let reviews: Vec<&str> = reviews.iter().copied().collect();
+    let mut outcomes = BTreeMap::new();
+    for batch in reviews.chunks(REVIEW_BATCH_SIZE) {
+        outcomes.extend(original_outcomes_filtered(transaction, Some(batch))?);
+    }
+    Ok(outcomes)
+}
+
+fn original_outcomes_filtered(
+    transaction: &Transaction<'_>,
+    reviews: Option<&[&str]>,
+) -> Result<BTreeMap<UnitKey, UnitOutcome>, DomainError> {
+    let query = |select: &str| match reviews {
+        Some(reviews) => format!(
+            "{select} WHERE review_id IN ({})",
+            vec!["?"; reviews.len()].join(",")
+        ),
+        None => select.to_owned(),
+    };
+    let parameters = || params_from_iter(reviews.unwrap_or_default().iter().copied());
+
     let mut statement = transaction
-        .prepare("SELECT review_id, unit_id, disposition, reason_code FROM learning_unit")
+        .prepare(&query(
+            "SELECT review_id, unit_id, disposition, reason_code FROM learning_unit",
+        ))
         .map_err(|error| map_error(&error, "не удалось прочитать исходы единиц"))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(parameters(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -93,10 +126,12 @@ pub(super) fn original_outcomes(
     drop(statement);
 
     let mut statement = transaction
-        .prepare("SELECT review_id, covered_json, disposition, reason_code FROM learning_decision")
+        .prepare(&query(
+            "SELECT review_id, covered_json, disposition, reason_code FROM learning_decision",
+        ))
         .map_err(|error| map_error(&error, "не удалось прочитать аудит решений"))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(parameters(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -120,10 +155,12 @@ pub(super) fn original_outcomes(
     drop(statement);
 
     let mut statement = transaction
-        .prepare("SELECT review_id, candidate_id, unit_id FROM learning_candidate")
+        .prepare(&query(
+            "SELECT review_id, candidate_id, unit_id FROM learning_candidate",
+        ))
         .map_err(|error| map_error(&error, "не удалось прочитать принадлежность кандидатов"))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(parameters(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -152,7 +189,11 @@ pub(super) fn normalize_records(
     transaction: &Transaction<'_>,
     records: &mut [ImportRecord],
 ) -> Result<(), DomainError> {
-    let outcomes = original_outcomes(transaction)?;
+    let reviews: BTreeSet<&str> = records
+        .iter()
+        .map(|record| record.review_id.as_str())
+        .collect();
+    let outcomes = original_outcomes_for_reviews(transaction, &reviews)?;
     let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for ((review, _), outcome) in &outcomes {
         let count = counts.entry(review.as_str()).or_default();
@@ -169,4 +210,80 @@ pub(super) fn normalize_records(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{Connection, params};
+
+    #[test]
+    fn original_outcomes_can_be_limited_to_requested_reviews() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE learning_unit (
+                    review_id TEXT, unit_id TEXT, disposition TEXT, reason_code TEXT
+                );
+                 CREATE TABLE learning_decision (
+                    review_id TEXT, covered_json TEXT, disposition TEXT, reason_code TEXT
+                );
+                 CREATE TABLE learning_candidate (
+                    review_id TEXT, candidate_id TEXT, unit_id TEXT
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO learning_unit VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "review-one",
+                    "unit-one",
+                    "unresolved",
+                    Option::<String>::None
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO learning_unit VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "review-two",
+                    "unit-two",
+                    "unresolved",
+                    Option::<String>::None
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO learning_decision VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "review-one",
+                    "[\"candidate-one\"]",
+                    "confirmed",
+                    "supported"
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO learning_candidate VALUES (?1, ?2, ?3)",
+                params!["review-one", "candidate-one", "unit-one"],
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+
+        let filtered =
+            original_outcomes_for_reviews(&transaction, &BTreeSet::from(["review-one"])).unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered.get(&("review-one".to_owned(), "unit-one".to_owned())),
+            Some(&UnitOutcome {
+                disposition: "confirmed".to_owned(),
+                reason_code: Some("supported".to_owned()),
+            })
+        );
+    }
 }

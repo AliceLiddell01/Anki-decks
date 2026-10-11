@@ -6,6 +6,8 @@ import {
   candidates,
   unit,
   coverage,
+  finding,
+  snapshot,
 } from "./fixture.mjs";
 const review = reviews[0].id;
 const pages = [
@@ -151,6 +153,44 @@ test("independent finding has no invented candidate links", async ({
   await page.getByLabel("Поиск", { exact: true }).fill("независимое");
   await expect(page).toHaveURL(/q=/);
 });
+test("finding links encode reserved ID characters", async ({ page }) => {
+  const specialId = "finding&selected=other";
+  await page.route(
+    "**/api/v1/reviews/" + review + "/candidates/candidate-0",
+    (route) =>
+      route.fulfill({
+        json: envelope({
+          candidate: {
+            ...candidates[0],
+            column: 1,
+            snippet: "let outcome = aggregate_all_candidates(&decisions);",
+            signals: ["ТЕСТ: обнаружен литерал"],
+            source: "literal detector",
+            metadata: { semantic_basis: "individual decision" },
+          },
+          classification: unit.classification,
+          unit,
+          decision: {
+            candidate_id: "candidate-0",
+            disposition: "acceptable",
+            reason_code: "supported",
+            explanation: "ТЕСТ: решение на точном evidence",
+            finding_ids: [specialId],
+          },
+          findings: [{ ...finding, id: specialId }],
+        }),
+      }),
+  );
+  await page.goto("/evidence?review_id=" + review + "&selected=candidate-0");
+
+  await page
+    .getByRole("link", { name: `Finding ${specialId} →` })
+    .click();
+
+  const url = new URL(page.url());
+  expect(url.searchParams.get("review_id")).toBe(review);
+  expect(url.searchParams.get("selected")).toBe(specialId);
+});
 test("group coverage paginates covered IDs separately from representatives", async ({
   page,
 }) => {
@@ -214,6 +254,73 @@ test("loading, empty and HTTP error states are explicit", async ({ page }) => {
   );
   await page.reload();
   await expect(page.getByRole("alert")).toContainText("HTTP 503");
+});
+test("live refresh keeps the shown snapshot until its replacement arrives", async ({
+  page,
+}) => {
+  let snapshotRequests = 0;
+  let holdNextSnapshot = false;
+  let releaseRefresh;
+  let finishRefresh;
+  const refreshFinished = new Promise((resolve) => {
+    finishRefresh = resolve;
+  });
+  await page.addInitScript(() => {
+    const sources = [];
+    class TestEventSource {
+      constructor(url) {
+        this.url = url;
+        this.listeners = new Map();
+        sources.push(this);
+      }
+      addEventListener(type, listener) {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+      close() {}
+    }
+    Object.defineProperty(window, "EventSource", {
+      value: TestEventSource,
+      configurable: true,
+    });
+    window.__dispatchTestEvent = (type) => {
+      for (const listener of sources[0]?.listeners.get(type) ?? [])
+        listener(new Event(type));
+    };
+  });
+  await page.route("**/api/v1/snapshot", async (route) => {
+    snapshotRequests += 1;
+    if (holdNextSnapshot) {
+      holdNextSnapshot = false;
+      await new Promise((resolve) => {
+        releaseRefresh = resolve;
+      });
+      await route.fulfill({ json: snapshot });
+      finishRefresh();
+      return;
+    }
+    await route.fulfill({ json: snapshot });
+  });
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Последние ревью" }),
+  ).toBeVisible();
+  const baselineRequests = snapshotRequests;
+  holdNextSnapshot = true;
+
+  await page.evaluate(() => window.__dispatchTestEvent("snapshot_changed"));
+  await expect.poll(() => snapshotRequests).toBe(baselineRequests + 1);
+  await expect(page.getByText("Загрузка источника…")).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "Последние ревью" }),
+  ).toBeVisible();
+
+  releaseRefresh();
+  await refreshFinished;
+  await expect(
+    page.getByRole("heading", { name: "Последние ревью" }),
+  ).toBeVisible();
 });
 test("light/dark theme survives reload; mobile menu closes and contains overflow", async ({
   page,

@@ -6,12 +6,31 @@ use anki_repo::code_review::{
 };
 use axum::{body::Body, http::Request};
 use http_body_util::BodyExt;
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 use tower::ServiceExt;
 
 struct Fixture {
     root: PathBuf,
+}
+struct RestorePermissions(Vec<(PathBuf, fs::Permissions)>);
+impl RestorePermissions {
+    fn capture(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self(
+            paths
+                .into_iter()
+                .map(|path| (path.clone(), fs::metadata(path).unwrap().permissions()))
+                .collect(),
+        )
+    }
+}
+impl Drop for RestorePermissions {
+    fn drop(&mut self) {
+        for (path, permissions) in &self.0 {
+            let _ = fs::set_permissions(path, permissions.clone());
+        }
+    }
 }
 impl Fixture {
     fn new() -> Self {
@@ -237,17 +256,18 @@ async fn inaccessible_parent_is_unavailable_instead_of_missing() {
     let learning = fixture.root.join(".anki-repo/learning");
     fs::create_dir_all(&learning).unwrap();
     fs::write(learning.join("state.sqlite"), b"inaccessible").unwrap();
+    let restore_permissions = RestorePermissions::capture([directory.clone(), learning.clone()]);
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o0)).unwrap();
     fs::set_permissions(&learning, fs::Permissions::from_mode(0o0)).unwrap();
-    assert_eq!(
-        fs::symlink_metadata(directory.join("review.json"))
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::PermissionDenied
-    );
+    match fs::symlink_metadata(directory.join("review.json")) {
+        Ok(_) => {
+            drop(restore_permissions);
+            return;
+        }
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+    }
     let state = fixture.state();
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::set_permissions(&learning, fs::Permissions::from_mode(0o700)).unwrap();
+    drop(restore_permissions);
     let snapshot = state.snapshot();
     assert_eq!(snapshot.reviews.len(), 1);
     for name in ["review", "queue", "triage", "report"] {
@@ -265,6 +285,21 @@ async fn inaccessible_parent_is_unavailable_instead_of_missing() {
     .await;
     assert_eq!(report["state"], "unavailable");
     assert!(!report["diagnostics"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unsupported_learning_schema_is_incomplete() {
+    let fixture = Fixture::new();
+    let directory = fixture.root.join(".anki-repo/learning");
+    fs::create_dir_all(&directory).unwrap();
+    let database = directory.join("state.sqlite");
+    let connection = Connection::open(database).unwrap();
+    connection.pragma_update(None, "user_version", 99).unwrap();
+    drop(connection);
+
+    let snapshot = fixture.state().snapshot();
+
+    assert_eq!(snapshot.learning.state, Availability::Incomplete);
 }
 
 #[tokio::test]

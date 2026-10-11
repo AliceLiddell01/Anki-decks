@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 export type Availability =
   | "available"
   | "missing"
@@ -250,16 +250,20 @@ export function useApi<T>(path: string | null, revision: number = 0) {
   const [value, setValue] = useState<Envelope<T> | null>(null);
   const [loading, setLoading] = useState(Boolean(path));
   const [error, setError] = useState<string | null>(null);
+  const shownPath = useRef(path);
   useEffect(() => {
+    if (path !== shownPath.current) {
+      shownPath.current = path;
+      setValue(null);
+      setLoading(Boolean(path));
+    }
     if (!path) {
       setValue(null);
       setLoading(false);
       return;
     }
     const controller = new AbortController();
-    setLoading(true);
     setError(null);
-    setValue(null);
     fetch("/api/v1" + path, {
       signal: controller.signal,
       headers: { Accept: "application/json" },

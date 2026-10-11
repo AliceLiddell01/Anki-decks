@@ -738,9 +738,12 @@ fn original_disposition(
     review_id: &str,
     unit_id: &str,
 ) -> Result<Option<String>, DomainError> {
-    Ok(super::outcomes::original_outcomes(transaction)?
-        .remove(&(review_id.to_owned(), unit_id.to_owned()))
-        .map(|outcome| outcome.disposition))
+    let reviews = BTreeSet::from([review_id]);
+    Ok(
+        super::outcomes::original_outcomes_for_reviews(transaction, &reviews)?
+            .remove(&(review_id.to_owned(), unit_id.to_owned()))
+            .map(|outcome| outcome.disposition),
+    )
 }
 
 /// Действующие исходы всех случаев с учётом аудируемых правок.

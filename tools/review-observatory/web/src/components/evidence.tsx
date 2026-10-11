@@ -464,7 +464,12 @@ function CandidateView({
           </p>
           <Link
             className="text-sm text-primary"
-            to={"/triage?review_id=" + review + "&selected=" + finding.id}
+            to={
+              "/triage?review_id=" +
+              encodeURIComponent(review) +
+              "&selected=" +
+              encodeURIComponent(finding.id)
+            }
           >
             Finding {finding.id} →
           </Link>
