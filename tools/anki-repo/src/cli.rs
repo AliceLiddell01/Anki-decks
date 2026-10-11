@@ -466,7 +466,6 @@ pub enum Command {
         #[arg(long)]
         pitch_asset_store: Option<PathBuf>,
     },
-
 }
 
 #[cfg(test)]
@@ -477,7 +476,10 @@ mod cli_tests {
     #[test]
     fn help_keeps_card_review_and_excludes_removed_code_review_commands() {
         let command = Cli::command();
-        let names: Vec<_> = command.get_subcommands().map(|sub| sub.get_name()).collect();
+        let names: Vec<_> = command
+            .get_subcommands()
+            .map(|sub| sub.get_name())
+            .collect();
         assert!(names.contains(&"review"));
         assert!(names.contains(&"review-check"));
         assert!(!names.contains(&"code-review"));
