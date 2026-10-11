@@ -57,7 +57,7 @@ pub struct LiveEvent {
 #[derive(Clone)]
 pub struct AppState {
     pub root: Arc<SafeRoot>,
-    pub catalog: Arc<RwLock<Catalog>>,
+    pub catalog: Arc<RwLock<Arc<Catalog>>>,
     pub address: SocketAddr,
     events: broadcast::Sender<LiveEvent>,
     replay: Arc<Mutex<VecDeque<LiveEvent>>>,
@@ -74,14 +74,14 @@ impl AppState {
         let (event_stop, _) = watch::channel(false);
         Ok(Self {
             root,
-            catalog: Arc::new(RwLock::new(initial)),
+            catalog: Arc::new(RwLock::new(Arc::new(initial))),
             address,
             events,
             replay: Arc::new(Mutex::new(VecDeque::new())),
             event_stop,
         })
     }
-    pub fn snapshot(&self) -> Catalog {
+    pub fn snapshot(&self) -> Arc<Catalog> {
         self.catalog
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -91,12 +91,16 @@ impl AppState {
         let _ = self.event_stop.send(true);
     }
     fn publish(&self, updated: Catalog) {
-        let changed = updated.revision != self.snapshot().revision;
         let event = LiveEvent {
             revision: updated.revision,
             observed_unix_ms: updated.observed_unix_ms,
         };
-        *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = updated;
+        let changed = {
+            let mut catalog = self.catalog.write().unwrap_or_else(|e| e.into_inner());
+            let changed = updated.revision != catalog.revision;
+            *catalog = Arc::new(updated);
+            changed
+        };
         if changed {
             let mut replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
             if replay.len() == 64 {
@@ -262,8 +266,9 @@ fn find_review(
     state
         .snapshot()
         .reviews
-        .into_iter()
+        .iter()
         .find(|r| r.summary.id == id)
+        .cloned()
         .ok_or_else(|| failure(StatusCode::NOT_FOUND, "Review snapshot не найден"))
 }
 fn resource_id(id: &str) -> bool {
@@ -272,11 +277,13 @@ fn resource_id(id: &str) -> bool {
 async fn snapshot(State(state): State<AppState>) -> ApiResult {
     let c = state.snapshot();
     Ok(json_response(Envelope::available(
-        json!({"revision":c.revision,"observed_unix_ms":c.observed_unix_ms,"reviews":c.reviews.iter().map(|r|&r.summary).collect::<Vec<_>>(),"learning":c.learning,"health":c.health}),
+        json!({"revision":c.revision,"observed_unix_ms":c.observed_unix_ms,"reviews":c.reviews.iter().map(|r|&r.summary).collect::<Vec<_>>(),"learning":&c.learning,"health":&c.health}),
     )))
 }
 async fn health(State(state): State<AppState>) -> ApiResult {
-    Ok(json_response(Envelope::available(state.snapshot().health)))
+    Ok(json_response(Envelope::available(
+        state.snapshot().health.clone(),
+    )))
 }
 async fn reviews(State(state): State<AppState>, HttpQuery(q): HttpQuery<Query>) -> ApiResult {
     checked(&q)?;
@@ -546,12 +553,17 @@ async fn report(State(state): State<AppState>, HttpPath(id): HttpPath<String>) -
 }
 async fn jobs(State(state): State<AppState>, HttpQuery(q): HttpQuery<Query>) -> ApiResult {
     checked(&q)?;
-    let rows = state.snapshot().jobs.into_iter().filter(|j| {
-        q.review_id
-            .as_ref()
-            .is_none_or(|id| j["review_id"].as_str() == Some(id))
-            && q.matches(&format!("{} {} {}", j["id"], j["scope"], j["lifecycle"]))
-    });
+    let catalog = state.snapshot();
+    let rows = catalog
+        .jobs
+        .iter()
+        .filter(|j| {
+            q.review_id
+                .as_ref()
+                .is_none_or(|id| j["review_id"].as_str() == Some(id))
+                && q.matches(&format!("{} {} {}", j["id"], j["scope"], j["lifecycle"]))
+        })
+        .cloned();
     // Список не дублирует request/enforcement; подробности доступны отдельно.
     let rows = rows.map(|mut j| {
         if let Some(map) = j.as_object_mut() {
@@ -571,11 +583,12 @@ async fn job_detail(State(state): State<AppState>, HttpPath(id): HttpPath<String
     if !files::hex(&id, 32) {
         return Err(failure(StatusCode::BAD_REQUEST, "Некорректный job ID"));
     }
-    let mut job = state
-        .snapshot()
+    let catalog = state.snapshot();
+    let mut job = catalog
         .jobs
-        .into_iter()
+        .iter()
         .find(|j| j["id"] == id)
+        .cloned()
         .ok_or_else(|| failure(StatusCode::NOT_FOUND, "Execution job не найден"))?;
     if let Some(fields) = job.as_object_mut() {
         fields.remove("artifact_stamp");
@@ -587,7 +600,7 @@ async fn job_detail(State(state): State<AppState>, HttpPath(id): HttpPath<String
     Ok(json_response(envelope))
 }
 async fn learning_summary(State(state): State<AppState>) -> ApiResult {
-    Ok(json_response(state.snapshot().learning))
+    Ok(json_response(state.snapshot().learning.clone()))
 }
 async fn learning_collection(
     State(state): State<AppState>,
@@ -693,11 +706,11 @@ async fn learning_collection(
             q.paginate(items.iter().filter(|v| q.matches(&v.to_string())).cloned())
                 .map_err(|e| failure(StatusCode::BAD_REQUEST, e))?,
         );
-        envelope.provenance = c.learning.provenance;
+        envelope.provenance = c.learning.provenance.clone();
         return Ok(json_response(envelope));
     }
     if c.learning.data.is_none() {
-        return Ok(json_response(c.learning));
+        return Ok(json_response(c.learning.clone()));
     }
     let root = state.root.clone();
     match tokio::task::spawn_blocking(move || catalog::learning_page(&root, &collection, &q)).await

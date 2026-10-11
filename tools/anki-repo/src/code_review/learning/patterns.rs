@@ -217,9 +217,10 @@ pub fn pattern_report(
                 super::store::map_error(&error, "не удалось прочитать опорное время истории")
             })?;
         let history_reference_time = u64::try_from(imported_at.max(0)).unwrap_or(u64::MAX);
-        let units = load_units(read, query)?;
+        let (effective, revisions) = super::feedback::effective_disposition_maps(read)?;
+        let units = load_units(read, query, &effective)?;
         let findings = load_findings(read)?;
-        let confirmed_findings = load_confirmed_findings(read)?;
+        let confirmed_findings = load_confirmed_findings(read, &revisions)?;
         let mut groups: BTreeMap<String, Vec<StoredUnit>> = BTreeMap::new();
         for unit in units {
             groups.entry(feature_signature(&unit.feature)).or_default().push(unit);
@@ -288,9 +289,10 @@ pub fn pattern_catalog(
     let signature = feature_signature(key);
     store.read(|read| {
         let query = PatternQuery::default();
-        let units = load_units(read, &query)?;
+        let (effective, revisions) = super::feedback::effective_disposition_maps(read)?;
+        let units = load_units(read, &query, &effective)?;
         let findings = load_findings(read)?;
-        let confirmed_findings = load_confirmed_findings(read)?;
+        let confirmed_findings = load_confirmed_findings(read, &revisions)?;
         let members: Vec<StoredUnit> = units
             .into_iter()
             .filter(|unit| feature_signature(&unit.feature) == signature)
@@ -310,6 +312,7 @@ pub fn pattern_catalog(
 fn load_units(
     read: &LearningRead<'_>,
     query: &PatternQuery,
+    effective: &super::feedback::EffectiveDispositionMap,
 ) -> Result<Vec<StoredUnit>, DomainError> {
     let lineages = observation_lineages(read, query.include_quarantine)?;
     let mut statement = read
@@ -349,7 +352,6 @@ fn load_units(
     drop(statement);
     // Пересчёт видит действующие исходы: аудируемая правка заменяет решение,
     // а отозванная — перестаёт на него влиять.
-    let effective = super::feedback::effective_dispositions(read)?;
     let mut units = Vec::new();
     for (
         review_id,
@@ -807,8 +809,8 @@ fn classify_support(
 /// множеств в пределах одной записи, а серьёзность находки в неё не входит.
 fn load_confirmed_findings(
     read: &LearningRead<'_>,
+    revisions: &super::feedback::EffectiveDispositionMap,
 ) -> Result<BTreeSet<(String, String)>, DomainError> {
-    let revisions = super::feedback::effective_revision_dispositions(read)?;
     let mut decisions_statement = read
         .transaction()
         .prepare(
@@ -999,9 +1001,10 @@ pub fn support_for_signature(
 ) -> Result<Option<SupportSummary>, DomainError> {
     store.read(|read| {
         let query = PatternQuery::default();
-        let units = load_units(read, &query)?;
+        let (effective, revisions) = super::feedback::effective_disposition_maps(read)?;
+        let units = load_units(read, &query, &effective)?;
         let findings = load_findings(read)?;
-        let confirmed_findings = load_confirmed_findings(read)?;
+        let confirmed_findings = load_confirmed_findings(read, &revisions)?;
         let members: Vec<StoredUnit> = units
             .into_iter()
             .filter(|unit| feature_signature(&unit.feature) == signature)
@@ -1027,7 +1030,8 @@ pub fn cases_for_signature(
 ) -> Result<Vec<PatternCaseRef>, DomainError> {
     store.read(|read| {
         let query = PatternQuery::default();
-        let units = load_units(read, &query)?;
+        let effective = super::feedback::effective_dispositions(read)?;
+        let units = load_units(read, &query, &effective)?;
         let links = load_case_links(read)?;
         let mut cases = Vec::new();
         for unit in units
@@ -1081,9 +1085,10 @@ pub(super) fn evidence_for_signatures(
     if signatures.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let units = load_units(read, &PatternQuery::default())?;
+    let (effective, revisions) = super::feedback::effective_disposition_maps(read)?;
+    let units = load_units(read, &PatternQuery::default(), &effective)?;
     let findings = load_findings(read)?;
-    let confirmed_findings = load_confirmed_findings(read)?;
+    let confirmed_findings = load_confirmed_findings(read, &revisions)?;
     let links = load_case_links(read)?;
     let mut members_by_signature: BTreeMap<String, Vec<StoredUnit>> = BTreeMap::new();
     let mut signatures_by_unit: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();

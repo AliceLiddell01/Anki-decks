@@ -307,7 +307,7 @@ async fn baseline_priority_order_is_high_normal_low() {
     let fixture = Fixture::new();
     fixture.source(3);
     let state = fixture.state();
-    let mut catalog = state.snapshot();
+    let mut catalog = (*state.snapshot()).clone();
     let mut review = (*catalog.reviews[0]).clone();
     let units = &mut review.queue.as_mut().unwrap().units;
     units[0].priority = review_queue::ReviewPriority::Low;
@@ -372,7 +372,7 @@ async fn sse_replay_is_bounded_and_resets_after_a_gap() {
     let state = fixture.state();
     let initial = state.snapshot().revision;
     for _ in 0..70 {
-        let mut c = state.snapshot();
+        let mut c = (*state.snapshot()).clone();
         c.revision += 1;
         state.publish(c);
     }

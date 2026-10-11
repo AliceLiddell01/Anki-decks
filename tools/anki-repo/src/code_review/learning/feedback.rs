@@ -751,24 +751,35 @@ fn original_disposition(
 /// Пересчёт аналитики обязан видеть актуальные утверждения: содержательная
 /// правка заменяет исход, а отозванная правка перестаёт на него влиять.
 /// Отсутствие действующей правки означает, что сохраняется исход разбора.
+pub(super) type EffectiveDispositionMap = BTreeMap<(String, String), Option<String>>;
+
+/// Читает исходы и правки один раз и возвращает обе проекции: полный исход
+/// единицы и только исходы, на которые повлияли аудируемые правки.
+pub(super) fn effective_disposition_maps(
+    read: &super::store::LearningTx<'_>,
+) -> Result<(EffectiveDispositionMap, EffectiveDispositionMap), DomainError> {
+    disposition_maps(read, true, true)
+}
+
 pub(super) fn effective_dispositions(
     read: &super::store::LearningTx<'_>,
-) -> Result<BTreeMap<(String, String), Option<String>>, DomainError> {
-    disposition_map(read, true)
+) -> Result<EffectiveDispositionMap, DomainError> {
+    disposition_maps(read, true, false).map(|(effective, _)| effective)
 }
 
 /// Только действующие правки: поисковый случай без правки сохраняет собственный
 /// исход решения/замечания, который может отличаться от агрегата всей единицы.
 pub(super) fn effective_revision_dispositions(
     read: &super::store::LearningTx<'_>,
-) -> Result<BTreeMap<(String, String), Option<String>>, DomainError> {
-    disposition_map(read, false)
+) -> Result<EffectiveDispositionMap, DomainError> {
+    disposition_maps(read, false, true).map(|(_, revisions)| revisions)
 }
 
-fn disposition_map(
+fn disposition_maps(
     read: &super::store::LearningTx<'_>,
-    include_original: bool,
-) -> Result<BTreeMap<(String, String), Option<String>>, DomainError> {
+    include_effective: bool,
+    include_revisions: bool,
+) -> Result<(EffectiveDispositionMap, EffectiveDispositionMap), DomainError> {
     let transaction = read.transaction();
     let original = super::outcomes::original_outcomes(transaction)?;
     let mut inactive: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -840,6 +851,7 @@ fn disposition_map(
         }
     }
     let mut effective = BTreeMap::new();
+    let mut revision_effective = BTreeMap::new();
     for (key, original_outcome) in original {
         let inactive_for_case = inactive.remove(&key).unwrap_or_default();
         let active = revisions
@@ -850,20 +862,22 @@ fn disposition_map(
             .map(|(_, _, disposition)| disposition)
             .next_back();
         let homogeneous = super::outcomes::is_homogeneous(Some(&original_outcome.disposition));
-        if include_original {
-            effective.insert(
-                key,
-                if homogeneous {
-                    active.or(Some(original_outcome.disposition))
-                } else {
-                    Some(original_outcome.disposition)
-                },
-            );
-        } else if active.is_some() && homogeneous {
-            effective.insert(key, active);
+        if include_revisions
+            && homogeneous
+            && let Some(disposition) = active.as_ref()
+        {
+            revision_effective.insert(key.clone(), Some(disposition.clone()));
+        }
+        let disposition = if homogeneous {
+            active.unwrap_or(original_outcome.disposition)
+        } else {
+            original_outcome.disposition
+        };
+        if include_effective {
+            effective.insert(key, Some(disposition));
         }
     }
-    Ok(effective)
+    Ok((effective, revision_effective))
 }
 
 /// Строит объяснимое предложение постоянного правила.

@@ -608,7 +608,7 @@ fn load_jobs(
     diagnostics: &mut Vec<String>,
 ) -> Vec<Value> {
     let mut jobs = Vec::new();
-    for review in reviews {
+    'reviews: for review in reviews {
         let runs = review.directory.join("runs");
         for id in children(root, &runs, diagnostics)
             .into_iter()
@@ -617,7 +617,7 @@ fn load_jobs(
             if jobs.len() >= 1000 {
                 diagnostics
                     .push("Достигнут глобальный предел 1000 execution jobs; список неполон".into());
-                return jobs;
+                break 'reviews;
             }
             let dir = runs.join(&id);
             let stamps = [

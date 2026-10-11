@@ -45,7 +45,7 @@ npm run dev --prefix tools/review-observatory/web
 ```bash
 npm run typecheck --prefix tools/review-observatory/web
 npm run build --prefix tools/review-observatory/web
-npx playwright install chromium
+npm exec --prefix tools/review-observatory/web -- playwright install chromium
 npm run test:browser --prefix tools/review-observatory/web
 ```
 
