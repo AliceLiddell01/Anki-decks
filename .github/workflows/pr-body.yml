@@ -11,9 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Получить валидатор и тесты
+      - name: Получить валидаторы и тесты
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Проверить тесты контракта
-        run: python3 -m unittest discover -s .github/scripts -p 'test_check_pr_body.py' -v
+      - name: Проверить тесты контрактов
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Проверить формат Agent Skills
+        run: python3 .github/scripts/check_skill_contracts.py
       - name: Проверить реальное описание PR
         run: python3 .github/scripts/check_pr_body.py --event-path "$GITHUB_EVENT_PATH"
