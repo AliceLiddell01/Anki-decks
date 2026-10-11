@@ -427,7 +427,10 @@ function CandidateView({
           <p className="text-muted-foreground">
             {data.source_location.limitation}
           </p>
-          <SourceLink location={data.source_location} />
+          <SourceLink
+            location={data.source_location}
+            sourceUrl={data.source_url}
+          />
         </div>
       )}
       <section>
@@ -503,8 +506,10 @@ export function JsonFields({
 
 function SourceLink({
   location,
+  sourceUrl,
 }: {
   location: NonNullable<CandidateDetail["source_location"]>;
+  sourceUrl: CandidateDetail["source_url"];
 }) {
   const sha = location.snapshot_sha;
   const parts = location.path.split("/");
@@ -524,18 +529,19 @@ function SourceLink({
     location.path.includes("\\")
   )
     return null;
-  const url =
-    "https://github.com/AliceLiddell01/Anki-decks/blob/" +
-    sha +
-    "/" +
-    parts.map(encodeURIComponent).join("/") +
-    (location.line && Number.isSafeInteger(location.line) && location.line > 0
-      ? "#L" + location.line
-      : "");
+  if (!sourceUrl) return null;
+  let url: URL;
+  try {
+    url = new URL(sourceUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || !url.hostname || url.username || url.password)
+    return null;
   return (
     <>
       <a
-        href={url}
+        href={url.toString()}
         target="_blank"
         rel="noreferrer"
         className="text-primary underline"

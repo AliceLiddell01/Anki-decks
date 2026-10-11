@@ -685,7 +685,7 @@ fn database_rows(store: &LearningStore, sql: &str) -> Result<Vec<Value>, String>
             let mut statement = read
                 .transaction()
                 .prepare(sql)
-                .map_err(|e| store.corrupt(&e))?;
+                .map_err(|e| learning::store::map_error(&e, "Читаю строки learning"))?;
             let names: Vec<String> = statement
                 .column_names()
                 .iter()
@@ -713,9 +713,9 @@ fn database_rows(store: &LearningStore, sql: &str) -> Result<Vec<Value>, String>
                     }
                     Ok(Value::Object(output))
                 })
-                .map_err(|e| store.corrupt(&e))?;
+                .map_err(|e| learning::store::map_error(&e, "Запрашиваю строки learning"))?;
             rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| store.corrupt(&e))
+                .map_err(|e| learning::store::map_error(&e, "Собираю строки learning"))
         })
         .map_err(|e| e.to_string())
 }
@@ -983,7 +983,7 @@ pub fn learning_page(
                     [needle],
                     |row| row.get(0),
                 )
-                .map_err(|e| store.corrupt(&e))?;
+                .map_err(|e| learning::store::map_error(&e, "Считаю строки learning"))?;
             let order = match collection {
                 "observations" => "revision DESC, review_id",
                 "feedback" => "recorded_at DESC,event_id",
@@ -1000,7 +1000,7 @@ pub fn learning_page(
                 .prepare(&format!(
                 "SELECT {columns} FROM {table} WHERE {predicate} ORDER BY {order} LIMIT ?2 OFFSET ?3"
                 ))
-                .map_err(|e| store.corrupt(&e))?;
+                .map_err(|e| learning::store::map_error(&e, "Читаю страницу learning"))?;
             let names: Vec<String> = statement
                 .column_names()
                 .iter()
@@ -1031,10 +1031,10 @@ pub fn learning_page(
                         Ok(Value::Object(item))
                     },
                 )
-                .map_err(|e| store.corrupt(&e))?;
+                .map_err(|e| learning::store::map_error(&e, "Запрашиваю страницу learning"))?;
             let items = rows
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| store.corrupt(&e))?;
+                .map_err(|e| learning::store::map_error(&e, "Собираю страницу learning"))?;
             Ok(crate::dto::Page {
                 items,
                 total: total as usize,

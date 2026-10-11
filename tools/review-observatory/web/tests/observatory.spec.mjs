@@ -351,7 +351,7 @@ test("disconnected live stream is shown independently of artifact health", async
   await expect(page.getByText("Отключено · ожидаем reconnect")).toBeVisible();
   await expect(page.getByText("Источники и целостность")).toBeVisible();
 });
-test("source permalink requires SHA, known file status and safe repository path", async ({
+test("source permalink requires API URL, SHA, known file status and safe repository path", async ({
   page,
 }) => {
   const location = {
@@ -375,7 +375,12 @@ test("source permalink requires SHA, known file status and safe repository path"
     decision: null,
     findings: [],
     triage_state: "available",
-    source_url: null,
+    source_url:
+      "https://example.test/project/blob/" +
+      location.snapshot_sha +
+      "/src/" +
+      encodeURIComponent("日本 語.rs") +
+      "#L17",
     source_location: location,
   };
   await page.route(
@@ -387,12 +392,19 @@ test("source permalink requires SHA, known file status and safe repository path"
     page.getByRole("link", { name: "Открыть опубликованный commit" }),
   ).toHaveAttribute(
     "href",
-    "https://github.com/AliceLiddell01/Anki-decks/blob/" +
-      location.snapshot_sha +
-      "/src/" +
-      encodeURIComponent("日本 語.rs") +
-      "#L17",
+    detail.source_url,
   );
+  detail.source_url = null;
+  await page.reload();
+  await expect(
+    page.getByRole("link", { name: "Открыть опубликованный commit" }),
+  ).toHaveCount(0);
+  detail.source_url =
+    "https://example.test/project/blob/" +
+    location.snapshot_sha +
+    "/src/" +
+    encodeURIComponent("日本 語.rs") +
+    "#L17";
   location.path = "../private";
   await page.reload();
   await expect(
