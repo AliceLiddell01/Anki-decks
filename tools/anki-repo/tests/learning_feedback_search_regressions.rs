@@ -42,6 +42,16 @@ fn fixture() -> (TempDir, LearningStore) {
                            'introduced_or_changed', 'production', '{}')",
                 [unit],
             )?;
+            // Статистика выводится из исходных решений и полного membership,
+            // а прежняя метка learning_unit сама по себе их не заменяет.
+            write.execute(
+                "INSERT INTO learning_decision (
+                    review_id, decision_id, kind, disposition, reason_code,
+                    explanation, candidate_count, covered_json
+                 ) VALUES ('review', ?1, 'individual', 'confirmed', 'other',
+                           'Подтверждённое исходное решение', 1, ?2)",
+                rusqlite::params![unit, serde_json::to_string(&[unit]).unwrap()],
+            )?;
         }
         for (case, unit, original) in [
             ("case-first", "first", "confirmed"),

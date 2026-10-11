@@ -3337,8 +3337,9 @@ fn unreviewed_units_are_absence_of_evidence_not_a_position() {
         summary.explanation
     );
     assert!(
-        summary.explanation.contains("не рассмотрено")
-            || summary.explanation.contains("Без решения"),
+        summary
+            .explanation
+            .contains("Без полного однородного исхода: 2"),
         "объяснение обязано называть нерассмотренные единицы: {}",
         summary.explanation
     );
@@ -3375,7 +3376,9 @@ fn unreviewed_units_are_absence_of_evidence_not_a_position() {
     );
     assert!(conflicting.explanation.contains("противоречат"));
     assert!(
-        conflicting.explanation.contains("не рассмотрено: 1"),
+        conflicting
+            .explanation
+            .contains("без полного однородного исхода: 1"),
         "объяснение обязано называть числа: {}",
         conflicting.explanation
     );

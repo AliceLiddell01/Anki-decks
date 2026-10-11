@@ -713,11 +713,21 @@ fn outcome_for(
     // либо отмечается здесь, если утверждение было отозвано после создания
     // второго действующего утверждения.
     let has_conflict = effective.len() > 1;
-    let effective_disposition = effective.last().map(|(_, value)| value.clone());
+    let effective_disposition = if super::outcomes::is_homogeneous(original.as_deref()) {
+        effective.last().map(|(_, value)| value.clone())
+    } else {
+        // Правка агрегата не содержит покрытия candidates и потому не может
+        // превратить частичные исходные решения в полное рассмотрение группы.
+        None
+    };
     Ok(FeedbackOutcome {
         original_disposition: original,
+        effective_event_ids: if effective_disposition.is_some() {
+            effective.iter().map(|(id, _)| id.clone()).collect()
+        } else {
+            Vec::new()
+        },
         effective_disposition,
-        effective_event_ids: effective.iter().map(|(id, _)| id.clone()).collect(),
         retracted_event_ids: retracted.iter().map(|id| (*id).to_owned()).collect(),
         has_conflict,
     })
@@ -728,15 +738,9 @@ fn original_disposition(
     review_id: &str,
     unit_id: &str,
 ) -> Result<Option<String>, DomainError> {
-    transaction
-        .query_row(
-            "SELECT disposition FROM learning_unit WHERE review_id = ?1 AND unit_id = ?2",
-            params![review_id, unit_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(|error| map_error(&error, "не удалось прочитать исходное решение случая"))
-        .map(|value: Option<Option<String>>| value.flatten())
+    Ok(super::outcomes::original_outcomes(transaction)?
+        .remove(&(review_id.to_owned(), unit_id.to_owned()))
+        .map(|outcome| outcome.disposition))
 }
 
 /// Действующие исходы всех случаев с учётом аудируемых правок.
@@ -763,26 +767,7 @@ fn disposition_map(
     include_original: bool,
 ) -> Result<BTreeMap<(String, String), Option<String>>, DomainError> {
     let transaction = read.transaction();
-    let mut original = BTreeMap::new();
-    {
-        let mut statement = transaction
-            .prepare("SELECT review_id, unit_id, disposition FROM learning_unit")
-            .map_err(|error| map_error(&error, "не удалось прочитать исходы единиц"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|error| map_error(&error, "не удалось прочитать исходы единиц"))?;
-        for row in rows {
-            let (review_id, unit_id, disposition) =
-                row.map_err(|error| map_error(&error, "не удалось прочитать исходы единиц"))?;
-            original.insert((review_id, unit_id), disposition);
-        }
-    }
+    let original = super::outcomes::original_outcomes(transaction)?;
     let mut inactive: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut revisions: BTreeMap<(String, String), Vec<EffectiveRevision>> = BTreeMap::new();
     {
@@ -852,7 +837,7 @@ fn disposition_map(
         }
     }
     let mut effective = BTreeMap::new();
-    for (key, original_disposition) in original {
+    for (key, original_outcome) in original {
         let inactive_for_case = inactive.remove(&key).unwrap_or_default();
         let active = revisions
             .remove(&key)
@@ -861,9 +846,17 @@ fn disposition_map(
             .filter(|(_, event_id, _)| !inactive_for_case.contains(event_id))
             .map(|(_, _, disposition)| disposition)
             .next_back();
+        let homogeneous = super::outcomes::is_homogeneous(Some(&original_outcome.disposition));
         if include_original {
-            effective.insert(key, active.or(original_disposition));
-        } else if active.is_some() {
+            effective.insert(
+                key,
+                if homogeneous {
+                    active.or(Some(original_outcome.disposition))
+                } else {
+                    Some(original_outcome.disposition)
+                },
+            );
+        } else if active.is_some() && homogeneous {
             effective.insert(key, active);
         }
     }

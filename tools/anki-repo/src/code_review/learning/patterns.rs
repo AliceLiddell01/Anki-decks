@@ -42,7 +42,8 @@ const Z_95: f64 = 1.959_963_984_540_054;
 pub const PATTERN_POLICY: &str = "Точное сопоставление по ключу признаков StructuralClassification, \
 CandidateOrigin, detector/source и совместимости правил классификации; независимая единица — \
 единица очереди внутри точного Git-среза или доказанной линии его ревизий, а не кандидат; минимум поддержки — 3 независимые единицы; доля единиц с решением confirmed \
-сопровождается нижней границей Wilson для 95 % уровня только как мера согласованности наблюдений.";
+сопровождается нижней границей Wilson для 95 % уровня только как мера согласованности наблюдений; \
+в распределение решений входят только полные однородные исходы, смешанные и частичные единицы учитываются отдельно как unresolved.";
 
 /// Точный ключ признаков единицы наблюдения.
 ///
@@ -654,16 +655,16 @@ fn support_summary(
         .collect();
     for unit in &independent {
         match unit.disposition.as_deref() {
-            Some(disposition) => {
+            Some(disposition) if super::outcomes::is_homogeneous(Some(disposition)) => {
                 *by_disposition.entry(disposition).or_default() += 1;
                 reviewed_units += 1;
                 if disposition == "confirmed" {
                     confirmed_units += 1;
                 }
             }
-            // Отсутствие решения — не позиция, а нехватка информации: в
-            // распределение решений оно не попадает и противоречия не создаёт.
-            None => unresolved_units += 1,
+            // Смешанные/частичные исходы и отсутствие решения не представляют
+            // однородную позицию единицы и в распределение решений не входят.
+            Some(_) | None => unresolved_units += 1,
         }
     }
     // Свежесть наблюдений считается по всем единицам среза: это свойство
@@ -708,8 +709,10 @@ fn support_summary(
         independent
             .iter()
             .filter(|unit| match unit.disposition.as_deref() {
-                Some(disposition) => disposition != majority,
-                None => false,
+                Some(disposition) if super::outcomes::is_homogeneous(Some(disposition)) => {
+                    disposition != majority
+                }
+                Some(_) | None => false,
             })
             .map(|unit| unit.unit_id.clone())
             .collect()
@@ -763,7 +766,7 @@ fn classify_support(
             SupportLevel::InsufficientEvidence,
             None,
             format!(
-                "Недостаточно независимых единиц: {support_units} < {MIN_SUPPORT_UNITS}; вывод воздерживается. Повторных наблюдений того же случая исключено: {revised_units}, без решения: {unresolved_units}."
+                "Недостаточно независимых единиц: {support_units} < {MIN_SUPPORT_UNITS}; вывод воздерживается. Повторных наблюдений того же случая исключено: {revised_units}, без полного однородного исхода: {unresolved_units}."
             ),
         );
     }
@@ -772,7 +775,7 @@ fn classify_support(
             SupportLevel::Contradictory,
             Some(wilson_lower_bound(confirmed_units, reviewed_units)),
             format!(
-                "Поддерживающие единицы противоречат друг другу: из {reviewed_units} рассмотренных независимых единиц {} имеют отличающееся решение; не рассмотрено: {unresolved_units}.",
+                "Поддерживающие единицы противоречат друг другу: из {reviewed_units} рассмотренных независимых единиц {} имеют отличающееся решение; без полного однородного исхода: {unresolved_units}.",
                 minority.len()
             ),
         );
@@ -782,7 +785,7 @@ fn classify_support(
             SupportLevel::InsufficientEvidence,
             None,
             format!(
-                "Независимых единиц: {support_units}, но решений ревьюера только {reviewed_units} < {MIN_SUPPORT_UNITS}; вывод воздерживается. Без решения: {unresolved_units}, повторных наблюдений исключено: {revised_units}."
+                "Независимых единиц: {support_units}, но полных однородных исходов только {reviewed_units} < {MIN_SUPPORT_UNITS}; вывод воздерживается. Без полного однородного исхода: {unresolved_units}, повторных наблюдений исключено: {revised_units}."
             ),
         );
     }
@@ -791,7 +794,7 @@ fn classify_support(
         SupportLevel::Supported,
         Some(lower),
         format!(
-            "Независимых единиц: {support_units}, покрытых кандидатов: {covered_candidates}, из них с решением: {reviewed_units} (без решения: {unresolved_units}); повторных наблюдений того же случая исключено: {revised_units}; нижняя граница доли confirmed для 95 % уровня: {lower:.6}. Это мера согласованности наблюдений, а не вероятность безопасности нового кода."
+            "Независимых единиц: {support_units}, кандидатов в них: {covered_candidates}, единиц с полным однородным исходом: {reviewed_units} (без полного однородного исхода: {unresolved_units}); повторных наблюдений того же случая исключено: {revised_units}; нижняя граница доли confirmed для 95 % уровня: {lower:.6}. Это мера согласованности наблюдений, а не вероятность безопасности нового кода."
         ),
     )
 }
@@ -805,17 +808,21 @@ fn classify_support(
 fn load_confirmed_findings(
     read: &LearningRead<'_>,
 ) -> Result<BTreeSet<(String, String)>, DomainError> {
-    let effective_dispositions = super::feedback::effective_dispositions(read)?;
+    let revisions = super::feedback::effective_revision_dispositions(read)?;
     let mut decisions_statement = read
         .transaction()
         .prepare(
-            "SELECT review_id, covered_json FROM learning_decision
+            "SELECT review_id, covered_json, disposition FROM learning_decision
              ORDER BY review_id ASC, decision_id ASC",
         )
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать решения"))?;
     let decisions = decisions_statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .map_err(|error| super::store::map_error(&error, "не удалось прочитать решения"))?;
     let mut confirmed_decisions = Vec::new();
@@ -881,17 +888,18 @@ fn load_confirmed_findings(
     }
     drop(links_statement);
     let mut confirmed = BTreeSet::new();
-    for (review_id, covered) in confirmed_decisions {
+    for (review_id, covered, original_disposition) in confirmed_decisions {
         let covered: Vec<String> = parse_domain_json(&covered, "покрытые кандидаты решения")?;
         for candidate_id in covered {
             let Some(unit_id) = units_of_candidate.get(&(review_id.clone(), candidate_id.clone()))
             else {
                 continue;
             };
-            if effective_dispositions
+            if revisions
                 .get(&(review_id.clone(), unit_id.clone()))
                 .and_then(Option::as_deref)
-                != Some("confirmed")
+                .unwrap_or(&original_disposition)
+                != "confirmed"
             {
                 continue;
             }

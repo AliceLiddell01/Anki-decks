@@ -98,6 +98,393 @@ fn loaded_fixture_with_candidates(candidate_count: usize) -> LoadedReview {
     }
 }
 
+fn fixture_with_outcomes(outcomes: &[Option<&str>]) -> LoadedReview {
+    use anki_repo::code_review::semantic_triage::{
+        self, CandidateDecision, Disposition, FindingProvenance, ReasonCode, SemanticFinding,
+        Severity,
+    };
+    let mut loaded = loaded_fixture_with_candidates(outcomes.len());
+    let mut triage = semantic_triage::initialize(&loaded.pack, &loaded.review_pack_sha256);
+    for (index, outcome) in outcomes.iter().enumerate() {
+        let Some(outcome) = outcome else { continue };
+        let candidate_id = format!("case-{index}");
+        triage
+            .unreviewed_candidate_ids
+            .retain(|id| id != &candidate_id);
+        let confirmed = *outcome == "confirmed";
+        let finding_id = format!("finding-{index}");
+        triage.individual_decisions.push(CandidateDecision {
+            candidate_id: candidate_id.clone(),
+            disposition: if confirmed {
+                Disposition::Confirmed
+            } else {
+                Disposition::Acceptable
+            },
+            reason_code: ReasonCode::Other,
+            explanation: "Исход проверен индивидуально внутри structural group".into(),
+            finding_ids: if confirmed {
+                vec![finding_id.clone()]
+            } else {
+                Vec::new()
+            },
+        });
+        if confirmed {
+            triage.findings.push(SemanticFinding {
+                id: finding_id,
+                severity: Severity::Major,
+                title: "Подтверждённый дефект".into(),
+                description: "src/tests.rs:2: воспроизводимый сбой отдельного кандидата".into(),
+                provenance: FindingProvenance::DirectCandidate,
+                candidate_ids: vec![candidate_id],
+            });
+        }
+    }
+    semantic_triage::canonicalize(&mut triage);
+    semantic_triage::validate(&triage, &loaded.pack, &loaded.review_pack_sha256).unwrap();
+    let digest = learning::import::sha256_hex(&serde_json::to_vec(&triage).unwrap());
+    loaded.triage = Some((triage, digest));
+    loaded
+}
+
+#[test]
+fn mixed_partial_group_preserves_decisions_across_read_patterns_recommendation_and_restore() {
+    let permutations = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for permutation in permutations {
+        let mut loaded = fixture_with_outcomes(&[Some("acceptable"), Some("confirmed"), None]);
+        if let review_queue::UnitMembers::Group { candidate_ids, .. } =
+            &mut loaded.queue.units[0].members
+        {
+            *candidate_ids = permutation
+                .iter()
+                .map(|index| format!("case-{index}"))
+                .collect();
+        }
+        loaded.queue_sha256 =
+            learning::import::sha256_hex(&serde_json::to_vec(&loaded.queue).unwrap());
+        let temporary = TempDir::new("learning-mixed-partial");
+        let source =
+            LearningStore::open(StoreOptions::at(temporary.path().join("source.sqlite"))).unwrap();
+        let record =
+            learning::import_history(&source, &loaded, &learning::ImportRequest::default())
+                .unwrap();
+        assert_eq!(
+            (
+                record.observations.reviewed_units,
+                record.observations.unresolved_units
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            (
+                record.observations.covered_candidates,
+                record.observations.unreviewed_candidates
+            ),
+            (2, 1)
+        );
+        assert_eq!(
+            (
+                record.observations.acceptable_candidates,
+                record.observations.confirmed_candidates
+            ),
+            (1, 1)
+        );
+
+        // Имитируем старую ошибочную материализацию: read API обязаны брать
+        // полное покрытие аудита, а не доверять первому агрегированному исходу.
+        let mut old_counts = record.observations.clone();
+        old_counts.reviewed_units = 1;
+        old_counts.unresolved_units = 0;
+        source
+            .write(|write| {
+                write.execute(
+                    "UPDATE learning_unit SET disposition = 'acceptable', reason_code = 'other'",
+                    [],
+                )?;
+                write.execute(
+                    "UPDATE learning_import SET observations_json = ?1",
+                    [serde_json::to_string(&old_counts).unwrap()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            learning::show_import(&source, &record.review_id)
+                .unwrap()
+                .observations,
+            record.observations
+        );
+        assert_eq!(
+            learning::list_imports(&source, false, 10).unwrap()[0].observations,
+            record.observations
+        );
+        let (total, page) = learning::import::list_imports_page(&source, false, 0, 1, "").unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(page[0].observations, record.observations);
+        assert_eq!(
+            learning::import_history(&source, &loaded, &learning::ImportRequest::default())
+                .unwrap()
+                .observations,
+            record.observations
+        );
+
+        let support = only_support(&source);
+        assert_eq!(
+            (
+                support.support_units,
+                support.confirmed_units,
+                support.acceptable_units,
+                support.unresolved_units
+            ),
+            (1, 0, 0, 1)
+        );
+        assert_eq!(
+            support.confirmed_findings, 1,
+            "Индивидуально confirmed finding сохраняет собственный исход"
+        );
+        assert_eq!(support.level, SupportLevel::InsufficientEvidence);
+        assert!(support.confirmed_share_lower_bound.is_none());
+        assert!(support.contradicting_unit_ids.is_empty());
+        let recommendations = learning::recommend(
+            Some(&source),
+            &loaded,
+            &learning::RecommendRequest::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            recommendations.recommendations[0]
+                .support
+                .as_ref()
+                .unwrap()
+                .level,
+            SupportLevel::InsufficientEvidence
+        );
+        assert_eq!(
+            recommendations.recommendations[0].historical_cases[0]
+                .disposition
+                .as_deref(),
+            Some("mixed_partial")
+        );
+
+        let archive = learning::export_history(&source).unwrap().archive;
+        assert_eq!(
+            archive.units[0].disposition.as_deref(),
+            Some("mixed_partial")
+        );
+        assert!(archive.units[0].reason_code.is_none());
+        assert_eq!(archive.decisions.len(), 2);
+        assert_eq!(archive.candidates.len(), 3);
+        assert_eq!(archive.reviews[0].observations, record.observations);
+        let destination =
+            LearningStore::open(StoreOptions::at(temporary.path().join("restored.sqlite")))
+                .unwrap();
+        learning::restore_history(&destination, &archive).unwrap();
+        assert_eq!(only_support(&destination), support);
+        let restored = learning::export_history(&destination).unwrap().archive;
+        assert_eq!(restored.units, archive.units);
+        assert_eq!(restored.decisions, archive.decisions);
+        assert_eq!(restored.candidates, archive.candidates);
+        assert_eq!(
+            learning::recommend(
+                Some(&destination),
+                &loaded,
+                &learning::RecommendRequest::default()
+            )
+            .unwrap()
+            .recommendations,
+            recommendations.recommendations
+        );
+    }
+}
+
+#[test]
+fn mixed_partial_and_unresolved_states_do_not_count_as_homogeneous_observations() {
+    for (outcomes, expected) in [
+        (
+            vec![Some("acceptable"), Some("confirmed"), None],
+            "mixed_partial",
+        ),
+        (
+            vec![Some("acceptable"), Some("confirmed"), Some("acceptable")],
+            "mixed",
+        ),
+        (vec![Some("acceptable"), None, None], "partial"),
+        (vec![None, None, None], "unresolved"),
+    ] {
+        let loaded = fixture_with_outcomes(&outcomes);
+        let temporary = TempDir::new("learning-outcome-states");
+        let store =
+            LearningStore::open(StoreOptions::at(temporary.path().join("state.sqlite"))).unwrap();
+        let record =
+            learning::import_history(&store, &loaded, &learning::ImportRequest::default()).unwrap();
+        assert_eq!(
+            (
+                record.observations.reviewed_units,
+                record.observations.unresolved_units
+            ),
+            (0, 1)
+        );
+        let archive = learning::export_history(&store).unwrap().archive;
+        assert_eq!(archive.units[0].disposition.as_deref(), Some(expected));
+        let support = only_support(&store);
+        assert_eq!(
+            (
+                support.confirmed_units,
+                support.acceptable_units,
+                support.unresolved_units
+            ),
+            (0, 0, 1)
+        );
+
+        let event = learning::FeedbackEvent {
+            schema_version: learning::feedback::FEEDBACK_SCHEMA_VERSION,
+            event_id: "outcome-revision".into(),
+            review_id: record.review_id.clone(),
+            unit_id: loaded.queue.units[0].id.clone(),
+            candidate_id: None,
+            kind: learning::FeedbackKind::SemanticOutcomeRevision,
+            action: learning::FeedbackAction::Append,
+            supersedes_event_id: None,
+            effective_disposition: Some("confirmed".into()),
+            usefulness: None,
+            explanation: "Правка агрегата не доказывает покрытие исходных кандидатов".into(),
+            provenance: "reviewer".into(),
+            recorded_at: 1,
+        };
+        learning::feedback::record_feedback(&store, &event).unwrap();
+        assert_eq!(only_support(&store), support);
+        assert_eq!(
+            learning::feedback::outcome_distribution(&store)
+                .unwrap()
+                .get(expected),
+            Some(&1)
+        );
+        let archive = learning::export_history(&store).unwrap().archive;
+        assert_eq!(archive.feedback_events, vec![event]);
+        let restored =
+            LearningStore::open(StoreOptions::at(temporary.path().join("restored.sqlite")))
+                .unwrap();
+        learning::restore_history(&restored, &archive).unwrap();
+        assert_eq!(only_support(&restored), support);
+        assert_eq!(
+            learning::export_history(&restored)
+                .unwrap()
+                .archive
+                .feedback_events,
+            archive.feedback_events
+        );
+    }
+}
+
+#[test]
+fn full_homogeneous_group_decision_remains_one_reviewed_unit() {
+    use anki_repo::code_review::semantic_triage::{self, Disposition, GroupDecision, ReasonCode};
+    let mut loaded = loaded_fixture_with_candidates(3);
+    let unit = &loaded.queue.units[0];
+    let mut triage = semantic_triage::initialize(&loaded.pack, &loaded.review_pack_sha256);
+    triage.unreviewed_candidate_ids.clear();
+    triage.group_decisions.push(GroupDecision {
+        id: unit.id.clone(),
+        candidate_ids: unit.candidate_ids().to_vec(),
+        representative_candidate_ids: unit.representative_candidate_ids().to_vec(),
+        disposition: Disposition::Acceptable,
+        reason_code: ReasonCode::Other,
+        explanation: "Все кандидаты группы рассмотрены с единым исходом".into(),
+        finding_ids: Vec::new(),
+    });
+    semantic_triage::canonicalize(&mut triage);
+    loaded.triage = Some((
+        triage.clone(),
+        learning::import::sha256_hex(&serde_json::to_vec(&triage).unwrap()),
+    ));
+    let temporary = TempDir::new("learning-homogeneous-group");
+    let store =
+        LearningStore::open(StoreOptions::at(temporary.path().join("state.sqlite"))).unwrap();
+    let record =
+        learning::import_history(&store, &loaded, &learning::ImportRequest::default()).unwrap();
+    assert_eq!(
+        (
+            record.observations.group_decisions,
+            record.observations.covered_candidates,
+            record.observations.reviewed_units,
+            record.observations.unresolved_units
+        ),
+        (1, 3, 1, 0)
+    );
+    let support = only_support(&store);
+    assert_eq!(
+        (
+            support.support_units,
+            support.acceptable_units,
+            support.unresolved_units
+        ),
+        (1, 1, 0)
+    );
+    let archive = learning::export_history(&store).unwrap().archive;
+    assert_eq!(archive.units[0].disposition.as_deref(), Some("acceptable"));
+    assert_eq!(archive.units[0].reason_code.as_deref(), Some("other"));
+    assert_eq!(archive.decisions[0].covered_candidate_ids.len(), 3);
+}
+
+#[test]
+fn history_pages_filter_before_limit_and_keep_deterministic_revision_order() {
+    let temporary = TempDir::new("learning-history-pages");
+    let store =
+        LearningStore::open(StoreOptions::at(temporary.path().join("state.sqlite"))).unwrap();
+    let loaded = loaded_fixture();
+    for (id, head) in [
+        ("first", "head-a"),
+        ("second", "head-b"),
+        ("third", "head-c"),
+    ] {
+        seed_case(&store, &loaded, id, head, None, "acceptable", None);
+    }
+    store.write(|write| {
+        write.execute("UPDATE learning_import SET revision = 3, workspace_label = 'PR%-SPECIAL' WHERE review_id = 'third'", [])?;
+        write.execute("UPDATE learning_import SET trust = 'structure_only_quarantine' WHERE review_id = 'second'", [])?;
+        Ok(())
+    }).unwrap();
+    let (total, first) = learning::import::list_imports_page(&store, true, 0, 2, "").unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(
+        first
+            .iter()
+            .map(|record| record.review_id.as_str())
+            .collect::<Vec<_>>(),
+        ["third", "first"]
+    );
+    let (total, second) = learning::import::list_imports_page(&store, true, 2, 2, "").unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(second[0].review_id, "second");
+    let (total, trusted) = learning::import::list_imports_page(&store, false, 0, 10, "").unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(trusted.len(), 2);
+    for (search, id) in [
+        ("THIRD", "third"),
+        ("HEAD-B", "second"),
+        ("quarantine", "second"),
+        ("pr%-special", "third"),
+    ] {
+        let (total, records) =
+            learning::import::list_imports_page(&store, true, 0, 1, search).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(records[0].review_id, id);
+    }
+    let (total, absent) =
+        learning::import::list_imports_page(&store, true, usize::MAX, 1, "").unwrap();
+    assert_eq!(total, 3);
+    assert!(absent.is_empty());
+    let (total, zero) = learning::import::list_imports_page(&store, true, 0, 0, "").unwrap();
+    assert_eq!(total, 3);
+    assert!(zero.is_empty());
+}
+
 #[test]
 fn recommendation_artifact_bounds_group_candidate_ids_and_reports_the_full_count() {
     let loaded = loaded_fixture_with_candidates(5);

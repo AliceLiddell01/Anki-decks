@@ -60,3 +60,13 @@
 # репозитория, поэтому каталог игнорируется целиком. Утверждённые policy
 # artifacts версионируются отдельно и попадают в Git только вручную.
 /.anki-repo/learning/
+
+# Локальные данные Review Observatory и визуальные evidence. Данные ревью
+# остаются в существующих игнорируемых каталогах; скриншоты и серверные артефакты
+# — результаты запуска, а не содержимое репозитория.
+/.anki-repo/observatory/
+/tools/review-observatory/web/node_modules/
+/tools/review-observatory/web/dist/
+/tools/review-observatory/web/tsconfig.tsbuildinfo
+/tools/review-observatory/web/playwright-report/
+/tools/review-observatory/web/test-results/

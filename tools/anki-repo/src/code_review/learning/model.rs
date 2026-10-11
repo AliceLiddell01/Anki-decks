@@ -268,9 +268,9 @@ pub struct ObservationCounts {
     pub individual_decisions: usize,
     /// Число групповых решений.
     pub group_decisions: usize,
-    /// Число независимых единиц очереди, реально рассмотренных ревьюером.
+    /// Число независимых единиц с полным однородным семантическим исходом.
     pub reviewed_units: usize,
-    /// Число независимых единиц очереди, оставшихся без решения.
+    /// Число единиц без полного однородного исхода: mixed/partial/unresolved.
     pub unresolved_units: usize,
     /// Число замечаний.
     pub findings: usize,
@@ -331,7 +331,8 @@ pub struct ReviewUnitRecord {
     pub priority: String,
     /// Подтверждённые представители единицы.
     pub representative_candidate_ids: Vec<String>,
-    /// Решение ревьюера по единице, если оно было заявлено.
+    /// Полный однородный исход либо `mixed`, `partial`, `mixed_partial`,
+    /// `unresolved`. Исходные решения и их покрытие сохраняются отдельно.
     pub disposition: Option<String>,
     /// Код причины решения, если он был заявлен.
     pub reason_code: Option<String>,

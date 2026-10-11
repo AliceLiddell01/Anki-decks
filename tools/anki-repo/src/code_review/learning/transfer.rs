@@ -1251,6 +1251,7 @@ fn read_tables(
             observations: parse_domain_json::<ObservationCounts>(&row.25, "единицы наблюдения")?,
         });
     }
+    super::outcomes::normalize_records(transaction, &mut reviews)?;
     let units = read_units(transaction)?;
     let candidates = read_candidates(transaction)?;
     let decisions = read_decisions(transaction)?;
@@ -1400,8 +1401,10 @@ fn read_units(
         raw.push(row.map_err(|error| map_error(&error, "не удалось прочитать единицы истории"))?);
     }
     let mut units = Vec::new();
+    let mut outcomes = super::outcomes::original_outcomes(transaction)?;
     for row in raw {
         let feature: BTreeMap<String, String> = parse_domain_json(&row.13, "признаки единицы")?;
+        let outcome = outcomes.remove(&(row.0.clone(), row.1.clone()));
         units.push(ReviewUnitRecord {
             review_id: row.0,
             unit_id: row.1,
@@ -1413,8 +1416,11 @@ fn read_units(
             candidate_count: usize::try_from(row.3.max(0)).unwrap_or(0),
             priority: row.4,
             representative_candidate_ids: parse_domain_json(&row.5, "представители единицы")?,
-            disposition: row.6,
-            reason_code: row.7,
+            disposition: outcome
+                .as_ref()
+                .map(|value| value.disposition.clone())
+                .or(row.6),
+            reason_code: outcome.map_or(row.7, |value| value.reason_code),
             detector: row.8,
             source: row.9,
             role: row.10,

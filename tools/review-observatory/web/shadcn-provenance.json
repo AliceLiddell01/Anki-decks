@@ -1,0 +1,25 @@
+{
+  "source": "https://ui.shadcn.com/r/styles/new-york-v4/dashboard-01.json",
+  "license": "MIT",
+  "adapted_components": [
+    "app-sidebar.tsx",
+    "site-header.tsx",
+    "section-cards.tsx",
+    "chart-area-interactive.tsx",
+    "data-table.tsx"
+  ],
+  "registry_components": [
+    "badge",
+    "button",
+    "card",
+    "chart",
+    "input",
+    "separator",
+    "sheet",
+    "sidebar",
+    "skeleton",
+    "table",
+    "tooltip",
+    "use-mobile"
+  ]
+}

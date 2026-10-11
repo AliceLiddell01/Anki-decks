@@ -346,14 +346,73 @@ pub fn list_imports(
                 super::store::map_error(&error, "не удалось прочитать историю")
             })?);
         }
+        super::outcomes::normalize_records(read.transaction(), &mut records)?;
         Ok(records)
+    })
+}
+
+/// Страница истории и число совпадений из одного согласованного снимка.
+/// Поиск выполняется как буквальная подстрока SQLite `lower` по identity,
+/// HEAD, trust и workspace label; `%` и `_` не являются шаблонами.
+/// Новые ревизии выводятся первыми, исходные unit counts нормализуются по аудиту.
+pub fn list_imports_page(
+    store: &LearningStore,
+    include_quarantine: bool,
+    offset: usize,
+    limit: usize,
+    search: &str,
+) -> Result<(usize, Vec<ImportRecord>), DomainError> {
+    const FILTER: &str = "WHERE (?1 = 1 OR trust = 'ast_authenticated')
+        AND instr(lower(review_id || ' ' || head_sha || ' ' || trust || ' ' ||
+                        COALESCE(workspace_label, '')), lower(?2)) > 0";
+    store.read(|read| {
+        let transaction = read.transaction();
+        let total: i64 = transaction
+            .query_row(
+                &format!("SELECT COUNT(*) FROM learning_import {FILTER}"),
+                params![i64::from(include_quarantine), search],
+                |row| row.get(0),
+            )
+            .map_err(|error| super::store::map_error(&error, "не удалось посчитать записи истории"))?;
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT review_id, repository_id, base_sha, head_sha, merge_base_sha,
+                        workspace_variant, workspace_label, review_pack_sha256, queue_sha256,
+                        triage_sha256, execution_result_sha256,
+                        review_schema_version, queue_schema_version, triage_schema_version,
+                        execution_schema_version, execution_evidence_json, analyzer_digest, classifier_digest,
+                        trust, outcome, limitations_json, revision_of, superseded_by,
+                        revision, imported_at, observations_json
+                 FROM learning_import {FILTER}
+                 ORDER BY revision DESC, review_id ASC LIMIT ?3 OFFSET ?4"
+            ))
+            .map_err(|error| super::store::map_error(&error, "не удалось прочитать страницу истории"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    i64::from(include_quarantine),
+                    search,
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ],
+                record_from_row,
+            )
+            .map_err(|error| super::store::map_error(&error, "не удалось прочитать страницу истории"))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|error| {
+                super::store::map_error(&error, "не удалось прочитать запись страницы истории")
+            })?);
+        }
+        super::outcomes::normalize_records(transaction, &mut records)?;
+        Ok((usize::try_from(total).unwrap_or(usize::MAX), records))
     })
 }
 
 /// Возвращает одну запись истории по идентификатору.
 pub fn show_import(store: &LearningStore, review_id: &str) -> Result<ImportRecord, DomainError> {
     store.read(|read| {
-        read.transaction()
+        let mut record = read.transaction()
             .query_row(
                 "SELECT review_id, repository_id, base_sha, head_sha, merge_base_sha,
                         workspace_variant, workspace_label, review_pack_sha256, queue_sha256,
@@ -372,7 +431,9 @@ pub fn show_import(store: &LearningStore, review_id: &str) -> Result<ImportRecor
                     format!("Запись истории learning не найдена: {review_id}"),
                 ),
                 other => super::store::map_error(&other, "не удалось прочитать запись истории"),
-            })
+            })?;
+        super::outcomes::normalize_records(read.transaction(), std::slice::from_mut(&mut record))?;
+        Ok(record)
     })
 }
 
@@ -761,7 +822,8 @@ fn show_import_in_write(
     read: &super::store::LearningTx<'_>,
     review_id: &str,
 ) -> Result<ImportRecord, DomainError> {
-    read.transaction()
+    let mut record = read
+        .transaction()
         .query_row(
             "SELECT review_id, repository_id, base_sha, head_sha, merge_base_sha,
                     workspace_variant, workspace_label, review_pack_sha256, queue_sha256,
@@ -775,7 +837,9 @@ fn show_import_in_write(
             params![review_id],
             record_from_row,
         )
-        .map_err(|error| super::store::map_error(&error, "не удалось прочитать запись истории"))
+        .map_err(|error| super::store::map_error(&error, "не удалось прочитать запись истории"))?;
+    super::outcomes::normalize_records(read.transaction(), std::slice::from_mut(&mut record))?;
+    Ok(record)
 }
 
 /// Предыдущая не вытесненная запись той же доказанной линии наблюдения.
@@ -985,14 +1049,12 @@ fn observation_counts(loaded: &LoadedReview) -> ObservationCounts {
             }
         }
     }
-    // Независимая единица — единица очереди, в которой есть решение. 1200
+    // Рассмотренная единица требует полного однородного исхода. 1200
     // кандидатов одного GroupDecision дают ровно одну рассмотренную единицу.
+    let decisions = decision_index(loaded);
     for unit in &loaded.queue.units {
-        let resolved = unit
-            .candidate_ids()
-            .iter()
-            .any(|id| matches!(outcomes.get(id.as_str()), Some(Some(_))));
-        if resolved {
+        let outcome = unit_outcome(unit, &decisions);
+        if super::outcomes::is_homogeneous(Some(&outcome.disposition)) {
             counts.reviewed_units += 1;
         } else {
             counts.unresolved_units += 1;
@@ -1035,11 +1097,7 @@ fn write_units(
         } else {
             ReviewUnitKind::Individual
         };
-        let (disposition, reason_code) = unit
-            .candidate_ids()
-            .iter()
-            .find_map(|id| dispositions.get(id.as_str()).cloned())
-            .unwrap_or((None, None));
+        let outcome = unit_outcome(unit, &dispositions);
         let features = super::patterns::unit_features_with_classifier(&unit.signature, &classifier);
         let representatives = serialize_json(
             unit.representative_candidate_ids(),
@@ -1069,8 +1127,8 @@ fn write_units(
                 unit.candidate_ids().len() as i64,
                 unit.priority.as_str(),
                 representatives,
-                disposition,
-                reason_code,
+                outcome.disposition,
+                outcome.reason_code,
                 unit.signature.detector,
                 unit.signature.source,
                 unit.signature.classification.role.as_str(),
@@ -1082,6 +1140,17 @@ fn write_units(
         )?;
     }
     Ok(())
+}
+
+fn unit_outcome(
+    unit: &crate::code_review::review_queue::ReviewUnit,
+    decisions: &BTreeMap<&str, (Option<String>, Option<String>)>,
+) -> super::outcomes::UnitOutcome {
+    super::outcomes::aggregate(unit.candidate_ids().iter().map(|id| {
+        decisions
+            .get(id.as_str())
+            .and_then(|(disposition, reason)| disposition.as_deref().zip(reason.as_deref()))
+    }))
 }
 
 fn decision_index(loaded: &LoadedReview) -> BTreeMap<&str, (Option<String>, Option<String>)> {

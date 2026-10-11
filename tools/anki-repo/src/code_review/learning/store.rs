@@ -178,6 +178,139 @@ impl std::fmt::Debug for LearningStore {
 }
 
 impl LearningStore {
+    /// Открывает существующую актуальную базу исключительно для наблюдения.
+    ///
+    /// Не вызывает `open`, миграции, инициализацию, настройку journal mode или
+    /// создание индекса. `immutable` не используется: он теряет WAL и не даёт
+    /// согласованного снимка при параллельном импорте. WAL читается только с уже
+    /// существующими обычными sidecar-файлами; отсутствующий SHM не создаётся.
+    pub fn open_read_only(mut options: StoreOptions) -> Result<Self, DomainError> {
+        options.create = false;
+        for path in [
+            options.database.clone(),
+            PathBuf::from(format!("{}-wal", options.database.display())),
+            PathBuf::from(format!("{}-shm", options.database.display())),
+            PathBuf::from(format!("{}-journal", options.database.display())),
+        ] {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Err(unavailable(
+                        &options,
+                        "SQLite или sidecar не является обычным файлом",
+                    ));
+                }
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(_) => return Err(unavailable(&options, "файл SQLite недоступен")),
+            }
+        }
+        if !options.database.is_file() {
+            return Err(unavailable(&options, "файл базы learning отсутствует"));
+        }
+        // SQLite может создать отсутствующий SHM даже при READ_ONLY main DB,
+        // если каталог доступен для записи. Проверяем WAL-заголовок до открытия
+        // SQLite, чтобы наблюдение само не создало эти persistent sidecars.
+        let mut header = [0_u8; 100];
+        let descriptor = rustix::fs::open(
+            &options.database,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|_| unavailable(&options, "база learning не открыта безопасно"))?;
+        use std::io::Read;
+        let mut file = std::fs::File::from(descriptor);
+        file.read_exact(&mut header)
+            .map_err(|_| unavailable(&options, "заголовок SQLite неполон"))?;
+        if header[18] == 2 || header[19] == 2 {
+            for suffix in ["-wal", "-shm"] {
+                if !std::fs::symlink_metadata(format!("{}{suffix}", options.database.display()))
+                    .is_ok_and(|m| m.is_file())
+                {
+                    return Err(unavailable(
+                        &options,
+                        "read-only WAL требует существующие WAL и SHM; наблюдатель не создаёт sidecar-файлы",
+                    ));
+                }
+            }
+        }
+        // Параметр bundled SQLite unix VFS `readonly_shm=1` запрещает создание
+        // и writable mmap SHM: обычный READ_ONLY main DB сам по себе этого не
+        // гарантирует. URI кодирует каждый байт пути, поэтому ?, #, % и пробелы
+        // имени файла не становятся параметрами соединения.
+        let database = if options.database.is_absolute() {
+            options.database.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|_| unavailable(&options, "текущий каталог недоступен"))?
+                .join(&options.database)
+        };
+        let mut uri = String::from("file:");
+        for byte in database.as_os_str().as_encoded_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+                uri.push(char::from(*byte));
+            } else {
+                use std::fmt::Write;
+                let _ = write!(uri, "%{byte:02X}");
+            }
+        }
+        uri.push_str("?mode=ro&readonly_shm=1");
+        let connection = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| {
+            map_open_error(
+                &options,
+                &error,
+                "не удалось открыть learning только для чтения",
+            )
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_millis(options.busy_timeout_ms))
+            .map_err(|error| map_error(&error, "не удалось настроить ожидание чтения"))?;
+        let mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|error| map_error(&error, "не удалось прочитать режим журнала"))?;
+        if mode.eq_ignore_ascii_case("wal") {
+            for suffix in ["-wal", "-shm"] {
+                if !PathBuf::from(format!("{}{suffix}", options.database.display())).is_file() {
+                    return Err(unavailable(
+                        &options,
+                        "read-only WAL требует существующие WAL и SHM; наблюдатель не создаёт sidecar-файлы",
+                    ));
+                }
+            }
+        }
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            map_error(&error, "не удалось начать согласованное чтение learning")
+        })?;
+        let version = schema::validate_existing_database(&transaction)?;
+        if version != LEARNING_SCHEMA_VERSION {
+            return Err(DomainError::new(
+                ErrorCode::LearningSchemaUnsupported,
+                format!(
+                    "Схема learning {version} требует явной миграции CLI; наблюдатель поддерживает {LEARNING_SCHEMA_VERSION} и не изменяет базу"
+                ),
+            ));
+        }
+        let fts5_available = schema::fts5_available(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| map_error(&error, "не удалось завершить чтение learning"))?;
+        Ok(Self {
+            connection,
+            options,
+            journal_mode: JournalModeDecision {
+                mode,
+                reason: "Существующий режим прочитан без изменения".into(),
+            },
+            fts5_available,
+        })
+    }
+
     /// Открывает (и при необходимости создаёт) базу learning.
     ///
     /// Более новая версия схемы отвергается до любых изменений; повреждённый
@@ -274,6 +407,12 @@ impl LearningStore {
         &self,
         action: impl FnOnce(&LearningWrite<'_>) -> Result<T, DomainError>,
     ) -> Result<T, DomainError> {
+        if self.connection.is_readonly("main").unwrap_or(true) {
+            return Err(unavailable(
+                &self.options,
+                "read-only наблюдение запрещает транзакции записи",
+            ));
+        }
         let connection = &self.connection;
         let transaction = rusqlite::Transaction::new_unchecked(
             connection,
@@ -992,6 +1131,159 @@ mod tests {
             "читающее открытие не фиксирует запись в БД"
         );
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn observer_does_not_create_migrate_or_allow_writes() {
+        let directory = temp_directory("observer-readonly");
+        let missing = directory.join("absent.sqlite");
+        assert!(LearningStore::open_read_only(StoreOptions::at(&missing)).is_err());
+        assert!(!missing.exists());
+        let database = directory.join("state.sqlite");
+        let writer = LearningStore::open(StoreOptions::at(&database)).unwrap();
+        writer
+            .connection()
+            .pragma_update(None, "journal_mode", "delete")
+            .unwrap();
+        drop(writer);
+        let before = std::fs::read(&database).unwrap();
+        let store = LearningStore::open_read_only(StoreOptions::at(&database)).unwrap();
+        assert!(store.connection().is_readonly("main").unwrap());
+        assert!(
+            store
+                .write(|write| write.execute("DELETE FROM learning_meta", []))
+                .is_err()
+        );
+        assert!(
+            store
+                .connection()
+                .execute("DELETE FROM learning_meta", [])
+                .is_err()
+        );
+        assert_eq!(
+            super::super::import::generation(&store).unwrap().revision,
+            0
+        );
+        drop(store);
+        assert_eq!(before, std::fs::read(&database).unwrap());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn observer_refuses_checkpointed_wal_without_creating_sidecars() {
+        let directory = temp_directory("observer-wal");
+        let database = directory.join("state.sqlite");
+        drop(LearningStore::open(StoreOptions::at(&database)).unwrap());
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "wal")
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&database).unwrap();
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert!(LearningStore::open_read_only(StoreOptions::at(&database)).is_err());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(before, std::fs::read(&database).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn observer_rejects_database_parent_and_sidecar_symlinks() {
+        let directory = temp_directory("observer-symlinks");
+        let database = directory.join("state.sqlite");
+        let writer = LearningStore::open(StoreOptions::at(&database)).unwrap();
+        writer
+            .connection()
+            .pragma_update(None, "journal_mode", "delete")
+            .unwrap();
+        drop(writer);
+        let alias = directory.join("alias.sqlite");
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+        assert!(LearningStore::open_read_only(StoreOptions::at(alias)).is_err());
+        let parent = directory.join("alias-directory");
+        std::os::unix::fs::symlink(&directory, &parent).unwrap();
+        assert!(
+            LearningStore::open_read_only(StoreOptions::at(parent.join("state.sqlite"))).is_err()
+        );
+        let sidecar = directory.join("state.sqlite-wal");
+        std::os::unix::fs::symlink(&database, &sidecar).unwrap();
+        let before = std::fs::read(&database).unwrap();
+        assert!(LearningStore::open_read_only(StoreOptions::at(&database)).is_err());
+        assert_eq!(before, std::fs::read(&database).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn observer_uri_encodes_reserved_filename_bytes() {
+        let directory = temp_directory("observer-uri");
+        let database = directory.join("space ?#% name.sqlite");
+        let writer = LearningStore::open(StoreOptions::at(&database)).unwrap();
+        writer
+            .connection()
+            .pragma_update(None, "journal_mode", "delete")
+            .unwrap();
+        drop(writer);
+        let before = std::fs::read(&database).unwrap();
+        let reader = LearningStore::open_read_only(StoreOptions::at(&database)).unwrap();
+        assert_eq!(
+            super::super::import::generation(&reader).unwrap().revision,
+            0
+        );
+        drop(reader);
+        assert_eq!(before, std::fs::read(database).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn observer_reads_active_wal_in_another_process_without_changing_files() {
+        const DATABASE_ENV: &str = "ANKI_REPO_TEST_OBSERVER_DATABASE";
+        if let Some(database) = std::env::var_os(DATABASE_ENV) {
+            let store =
+                LearningStore::open_read_only(StoreOptions::at(PathBuf::from(database))).unwrap();
+            assert_eq!(
+                super::super::import::generation(&store).unwrap().revision,
+                1
+            );
+            return;
+        }
+        let directory = temp_directory("observer-active-wal");
+        let database = directory.join("state.sqlite");
+        let writer = LearningStore::open(StoreOptions::at(&database)).unwrap();
+        writer
+            .connection()
+            .pragma_update(None, "journal_mode", "wal")
+            .unwrap();
+        writer
+            .write(|write| write.execute("UPDATE learning_meta SET value=value", []))
+            .unwrap();
+        assert_eq!(
+            super::super::import::generation(&writer).unwrap().revision,
+            1
+        );
+        let paths = [
+            database.clone(),
+            directory.join("state.sqlite-wal"),
+            directory.join("state.sqlite-shm"),
+        ];
+        let before = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("code_review::learning::store::tests::observer_reads_active_wal_in_another_process_without_changing_files")
+            .env(DATABASE_ENV,&database).status().unwrap();
+        assert!(status.success());
+        for (path, expected) in paths.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                expected,
+                "Изменился {}",
+                path.display()
+            );
+        }
+        drop(writer);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod feedback;
 pub mod import;
 pub mod lifecycle;
 pub mod model;
+mod outcomes;
 pub mod patterns;
 pub mod recommend;
 pub mod schema;
@@ -80,7 +81,7 @@ pub fn workspace_variant(raw: &str) -> Result<String, crate::error::DomainError>
 /// Изменение любой калиброванной константы или правила агрегации обязано
 /// увеличивать эту версию: recommendations artifact и срез паттерна фиксируют
 /// её, чтобы смысл накопленных примеров не менялся молча.
-pub const LEARNING_POLICY_VERSION: u32 = 2;
+pub const LEARNING_POLICY_VERSION: u32 = 3;
 
 /// Относительный путь базы learning по умолчанию от корня репозитория.
 pub const DEFAULT_LEARNING_DIRECTORY: &str = ".anki-repo/learning";
