@@ -53,10 +53,3 @@
 # репозитория и не tracked: процедуру владеет `.agents/skills/anki-git-workflow/`.
 /.codex/local/
 
-/.anki-repo/review/
-
-# Локальная база адаптивной памяти code review: SQLite-история, backup и
-# экспорты learning. Это рабочие данные конкретного клона, а не контракт
-# репозитория, поэтому каталог игнорируется целиком. Утверждённые policy
-# artifacts версионируются отдельно и попадают в Git только вручную.
-/.anki-repo/learning/
