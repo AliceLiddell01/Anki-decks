@@ -27,7 +27,7 @@ decks/
     └── words/
 tools/
 ├── anki-repo/               # набор инструментов анализа и точечной правки CrowdAnki-экспорта
-└── asset-store/             # общая библиотека ресурсов и CLI kanji-assets
+└── asset-store/             # библиотека ресурсов, CLI kanji-assets и pitch-assets
 ```
 
 ## Владельцы
@@ -47,7 +47,7 @@ tools/
   рабочее пространство: `cargo` запускается из корня репозитория.
 - `tools/asset-store/` — пакет Rust общей библиотеки жизненного цикла ресурсов,
   которыми управляет программа, и
-  бинарника `kanji-assets`; его единственный публичный контракт —
+  бинарников `kanji-assets` и `pitch-assets`; его единственный публичный контракт —
   `tools/asset-store/README.md`. Пакет входит в корневое рабочее пространство и наследует
   его `edition` и MSRV. Он не зависит от Anki/Yarxi и не читает `decks/**/media/`.
 - `Cargo.toml` в корне — единственный владелец `[workspace.package]`: заявленной

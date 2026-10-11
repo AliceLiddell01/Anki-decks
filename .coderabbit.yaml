@@ -109,7 +109,8 @@ reviews:
     - path: "tools/anki-repo/Cargo.toml"
       instructions: >-
         Проверяй необходимость новых зависимостей и features, совместимость с
-        Rust edition 2024 и заявленным toolchain около rustc/cargo 1.98.1,
+        Rust edition 2024, заявленной MSRV из `[workspace.package]`
+        корневого `Cargo.toml` и актуальным stable toolchain,
         сохранение publish=false и unsafe_code=forbid. Новая зависимость должна
         решать конкретную задачу и не дублировать уже имеющуюся возможность.
 
