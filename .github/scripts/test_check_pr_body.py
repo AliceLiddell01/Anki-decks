@@ -55,8 +55,12 @@ class PrBodyContractTests(unittest.TestCase):
     def test_conditional_coderabbit_table(self):
         body = valid_body() + "\n\n## CodeRabbit review и disposition\nПроверено."
         self.assertTrue(any("таблицы" in e for e in validate(body)))
-        body += "\n| Итерация / reviewed HEAD | Уровень | Путь | Влияние | Решение | Исправление |\n| --- | --- | --- | --- | --- | --- |\n| 1 · `abc` | — | — | 0 findings | clean | `def` |"
+        body += "\n| Итерация / reviewed HEAD | Уровень | Путь | Влияние | Решение | Исправление |\n| --- | --- | --- | --- | --- | --- |\n| 1 · `abcdef0` | — | — | 0 findings | clean | `def` |"
         self.assertEqual(validate(body), [])
+
+    def test_coderabbit_row_requires_reviewed_sha(self):
+        body = valid_body() + "\n\n## CodeRabbit review и disposition\n| Итерация / reviewed HEAD | Уровень | Путь | Влияние | Решение | Исправление |\n| --- | --- | --- | --- | --- | --- |\n| 1 | — | — | 0 findings | clean | unknown |"
+        self.assertTrue(any("строка" in e for e in validate(body)))
 
     def test_bot_exception_is_limited_to_account_and_branch(self):
         def payload(login, branch):

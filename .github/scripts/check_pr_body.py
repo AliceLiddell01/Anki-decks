@@ -78,7 +78,7 @@ def validate(body: str) -> list[str]:
             if name == "CodeRabbit review и disposition":
                 if "| Итерация / reviewed HEAD | Уровень | Путь | Влияние | Решение | Исправление |" not in content:
                     errors.append("В разделе CodeRabbit отсутствует заголовок накопительной таблицы")
-                if not re.search(r"(?m)^\|\s*\d+\s*[·|]", content):
+                if not re.search(r"(?m)^\|\s*[1-9]\d*\s*·\s*`[0-9a-f]{7,40}`\s*\|(?:[^|\n]*\|){5}\s*$", content):
                     errors.append("В разделе CodeRabbit отсутствует строка завершённой итерации")
     return errors
 
