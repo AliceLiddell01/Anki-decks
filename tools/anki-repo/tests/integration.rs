@@ -26,4 +26,3 @@ mod review_contract;
 mod synthetic;
 #[path = "visual_report_contract.rs"]
 mod visual_report_contract;
-
