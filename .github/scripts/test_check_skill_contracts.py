@@ -48,13 +48,27 @@ class SkillContractTests(unittest.TestCase):
         self.assertTrue(any("SKILL.md" in x for x in validate_tree(self.root)))
 
     def test_broken_yaml_values_are_rejected(self):
-        for value in ("[broken", '"unterminated', "'unterminated", "{a: 1", "trailing,"):
+        for value in ("[broken", '"unterminated', "'unterminated", "{a: 1", "trailing,", '"первая" "вторая"'):
             with self.subTest(value=value):
                 self.write_skill(f"---\nname: sample-skill\ndescription: {value}\n---\n")
                 self.assertTrue(any("неразбираемое" in x for x in validate_skill(self.file)))
 
+    def test_empty_block_scalars_are_rejected(self):
+        for marker in ("|", "|-", "|+", ">", ">-", ">+"):
+            with self.subTest(marker=marker):
+                self.write_skill(f"---\nname: sample-skill\ndescription: {marker}\n---\n")
+                self.assertTrue(any("1024" in x for x in validate_skill(self.file)), marker)
+
+    def test_filled_block_scalar_is_accepted(self):
+        for marker in ("|", "|+", ">-"):
+            with self.subTest(marker=marker):
+                self.write_skill(f"---\nname: sample-skill\ndescription: {marker}\n  Достаточное описание.\n---\n", body="Без ссылок.")
+                self.assertEqual(validate_skill(self.file), [])
+
     def test_valid_quoted_and_block_scalars(self):
         self.write_skill('---\nname: sample-skill\ndescription: "Краткое описание."\n---\n', body="Без ссылок.")
+        self.assertEqual(validate_skill(self.file), [])
+        self.write_skill("---\nname: sample-skill\ndescription: 'It''s fine.'\n---\n", body="Без ссылок.")
         self.assertEqual(validate_skill(self.file), [])
         self.write_skill(body="Без ссылок.")
         self.assertEqual(validate_skill(self.file), [])

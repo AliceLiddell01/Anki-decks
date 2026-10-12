@@ -10,15 +10,37 @@ NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 KEY = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):(?:\s*(.*))?$")
 LINK = re.compile(r"\]\(([^)]+)\)")
 ALLOWED = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+# Все формы блочных скаляров YAML: значение продолжается отступленными строками.
+BLOCK_SCALARS = (">", ">-", ">+", "|", "|-", "|+")
 # Значения вне блочных скаляров должны быть корректными скалярами YAML: незакрытые
-# кавычки и непарные flow-скобки делают frontmatter неразбираемым для потребителя.
+# кавычки, текст после закрывающей кавычки и непарные flow-скобки делают frontmatter
+# неразбираемым для потребителя.
 PLAIN_UNSAFE = re.compile(r"^\s*[\[{]")
+
+
+def quoted_error(value: str) -> str | None:
+    """Check a value that starts with a quote; return a reason if it is not one scalar."""
+    quote = value[0]
+    index = 1
+    while index < len(value):
+        char = value[index]
+        if quote == '"' and char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            # В одинарных кавычках удвоенная кавычка — это escape, а не конец значения.
+            if quote == "'" and index + 1 < len(value) and value[index + 1] == "'":
+                index += 2
+                continue
+            return None if not value[index + 1:].strip() else "текст после закрывающей кавычки"
+        index += 1
+    return "незакрытая кавычка"
 
 
 def syntax_error(value: str) -> str | None:
     """Return a reason when a frontmatter value is not a parsable YAML scalar."""
     if value.startswith(("'", '"')):
-        return None if len(value) > 1 and value.endswith(value[0]) else "незакрытая кавычка"
+        return quoted_error(value)
     if PLAIN_UNSAFE.match(value) or value.endswith(("[", "{", ",")):
         return "непарная flow-скобка"
     if ": " in value or value.endswith(":"):
@@ -59,7 +81,7 @@ def validate_skill(path: Path) -> list[str]:
             errors.append(f"{path}: нестандартное поле {key}; условия активации помещай в description")
         # Блочный скаляр (`|`, `>`) продолжается отступленными строками и
         # проверяется отдельно при разборе description.
-        if value not in (">-", ">", "|-", "|", "|+", ">+"):
+        if value not in BLOCK_SCALARS:
             reason = syntax_error(value)
             if reason:
                 errors.append(f"{path}: неразбираемое значение {key}: {reason}")
@@ -70,11 +92,13 @@ def validate_skill(path: Path) -> list[str]:
         errors.append(f"{path}: отсутствует description")
     else:
         start, value = entries["description"]
-        if value in (">-", ">", "|-", "|"):
+        if value in BLOCK_SCALARS:
             next_key = next((i for i in range(start + 1, len(header)) if KEY.fullmatch(header[i])), len(header))
             text = " ".join(line.strip() for line in header[start + 1:next_key] if line.startswith((" ", "\t"))).strip()
+        elif value.startswith(("'", '"')):
+            text = value[1:-1]
         else:
-            text = value.strip("'\"")
+            text = value
         if not text or len(text) > 1024:
             errors.append(f"{path}: description должен содержать 1–1024 символа")
     body = "\n".join(lines[end + 1:])
