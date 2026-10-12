@@ -313,10 +313,17 @@ cargo run --quiet --bin anki-repo -- visual-report \
 Локально тот же набор воспроизводится из корня репозитория:
 
 ```bash
+python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+python3 .github/scripts/check_skill_contracts.py
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
+
+Проверки корпусов (`kanji-corpus-gate`, `pitch-corpus-gate`) и структурная
+`validate` найденных экспортов выполняются только при наличии соответствующих
+данных в рабочей копии: их шаги пропускаются, если корпуса или `decks/**`
+отсутствуют.
 
 Здесь важно не смешивать два разных инварианта:
 

@@ -19,6 +19,9 @@ REQUIRED = (
 BOT_BRANCHES = {"renovate[bot]": "renovate/", "dependabot[bot]": "dependabot/"}
 HEADING = re.compile(r"^ {0,3}##\s+(.+?)\s*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# Закрывающая граница не допускает info string: ```` ```python ```` — это строка
+# содержимого блока, а не его конец.
+FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 
 
 def sections(body: str) -> list[tuple[str, str]]:
@@ -28,15 +31,15 @@ def sections(body: str) -> list[tuple[str, str]]:
     fence_char = ""
     fence_len = 0
     for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        marker = FENCE.match(line)
-        if marker:
-            token = marker.group(1)
-            if not fence_char:
-                fence_char, fence_len = token[0], len(token)
-            elif token[0] == fence_char and len(token) >= fence_len:
+        if fence_char:
+            closing = FENCE_CLOSE.match(line)
+            if closing and closing.group(1)[0] == fence_char and len(closing.group(1)) >= fence_len:
                 fence_char = ""
             continue
-        if fence_char:
+        opening = FENCE.match(line)
+        if opening:
+            token = opening.group(1)
+            fence_char, fence_len = token[0], len(token)
             continue
         match = HEADING.match(line)
         if match:

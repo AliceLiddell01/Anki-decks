@@ -34,6 +34,25 @@ class PrBodyContractTests(unittest.TestCase):
     def test_headings_in_code_fence_are_not_real(self):
         self.assertEqual(len(validate("```md\n" + valid_body() + "\n```")), len(HEADINGS))
 
+    def test_inner_info_string_does_not_close_fence(self):
+        # Строка с info string внутри открытого блока — содержимое, а не его конец,
+        # поэтому заголовки примера не становятся разделами реального body.
+        nested = "```text\n```md\n" + valid_body() + "\n```\n"
+        self.assertEqual(len(validate(nested)), len(HEADINGS))
+
+    def test_closing_fence_requires_bare_marker(self):
+        body = "```\n" + valid_body() + "\n```python\n```\n"
+        self.assertEqual(len(validate(body)), len(HEADINGS))
+
+    def test_tilde_and_longer_backtick_fences(self):
+        self.assertEqual(len(validate("~~~md\n" + valid_body() + "\n~~~")), len(HEADINGS))
+        # Более длинный маркер открывает блок, который не закрывается более коротким,
+        # поэтому заголовки внутри остаются примером, а не разделами.
+        self.assertEqual(len(validate("````md\n```\n" + valid_body() + "\n````")), len(HEADINGS))
+        # Более длинный маркер способен закрыть блок, открытый коротким, но всё,
+        # что уже лежало внутри, остаётся примером, а не разделом body.
+        self.assertEqual(len(validate("```md\n" + valid_body() + "\n````")), len(HEADINGS))
+
     def test_fenced_content_does_not_make_section_nonempty(self):
         body = valid_body().replace("Фактическая информация для раздела CI.", "```md\nThis is a sample, not CI evidence.\n```")
         self.assertTrue(any("Пустой" in e for e in validate(body)))
