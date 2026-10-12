@@ -2184,13 +2184,14 @@ fn rewrite_element(
                     continue;
                 };
                 resolved_media.insert(path.to_string());
-                let mut segment = value[candidate.segment].to_string();
-                let offset = candidate.range.start - candidate.segment.start;
+                let source_segment = &value[candidate.segment];
+                let url = &value[candidate.range];
+                let range = source_segment
+                    .substr_range(url)
+                    .expect("URL — срез кандидата srcset");
+                let mut segment = source_segment.to_string();
                 let resolved = preview_address(path);
-                segment.replace_range(
-                    offset..offset + (candidate.range.end - candidate.range.start),
-                    &resolved,
-                );
+                segment.replace_range(range, &resolved);
                 segments.push(segment.trim().to_string());
             }
             if segments.is_empty() {
