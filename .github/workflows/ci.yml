@@ -1,23 +1,23 @@
 name: Проверки репозитория
 
-# Семантические triggers, без привязки к литералу имени ветки:
+# Семантические события запуска без привязки к имени ветки:
 # - `pull_request` — проверка любого PR;
 # - `push` — событие покрывает интеграцию в поддерживаемую ветку, а какой именно
-#   branch является default, job определяет сам через `github.event.repository`
-#   (см. `if` у job'ов), поэтому имя ветки в workflow не зашито;
+#   ветка является основной, задание определяет через `github.event.repository`
+#   (см. `if` у заданий), поэтому имя ветки в процессе не зашито;
 # - `workflow_dispatch` — ручной запуск.
 on:
   pull_request:
   push:
   workflow_dispatch:
 
-# CI только читает репозиторий: ни один job не пишет в него, не публикует
-# артефакты и не выполняет mutating repository операции.
+# CI только читает репозиторий: ни одно задание не пишет в него, не публикует
+# артефакты и не выполняет изменяющих операций с репозиторием.
 permissions:
   contents: read
 
 concurrency:
-  # Новый прогон отменяет предыдущий только для PR: проверку default branch
+  # Новый прогон отменяет предыдущий только для PR: проверку основной ветки
   # нельзя отменять на середине.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -28,8 +28,8 @@ env:
 jobs:
   lint:
     name: Форматирование и Clippy
-    # Push в feature-ветку не дублирует прогон PR: на push job выполняется
-    # только для default branch текущего репозитория.
+    # Отправка изменений в рабочую ветку не дублирует прогон PR: на `push` задание выполняется
+    # только для основной ветки текущего репозитория.
     if: >-
       github.event_name != 'push'
       || github.ref_name == github.event.repository.default_branch
@@ -41,7 +41,7 @@ jobs:
 
       - name: Проверить контракты скриптов и метаданные Agent Skills
         # Единственный владелец этих проверок: они не зависят от данных репозитория
-        # и нужны также на push в default branch, где события PR нет.
+        # и нужны также при отправке изменений в основную ветку, где события PR нет.
         run: |
           python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
           python3 .github/scripts/check_skill_contracts.py
@@ -68,8 +68,8 @@ jobs:
   code:
     name: Код и тесты
     env:
-      # sccache сохраняет результаты rustc для workspace library crates между
-      # hosted runners; rust-cache ниже остаётся слоем Cargo registry/target.
+      # sccache сохраняет результаты rustc библиотечных пакетов рабочей области между
+      # исполнителями GitHub Actions; rust-cache ниже кэширует реестр и сборку Cargo.
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
     # Push в feature-ветку не дублирует прогон PR: на push job выполняется
@@ -101,15 +101,15 @@ jobs:
       - name: Восстановить Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Весь code job использует один custom profile (test + cargo run),
-          # поэтому держим отдельное поколение dependency cache.
+          # Всё задание использует один специализированный профиль (тесты и `cargo run`),
+          # поэтому используем отдельное поколение кэша зависимостей.
           key: unified-ci-v1
 
       - name: Собрать и выполнить тесты
-        # В workspace нет feature-gated test-кода. Единственная feature
-        # reference-generator включает resvg только для двух служебных
-        # generator binaries; их all-features/all-targets сборку уже проверяют
-        # Clippy и MSRV jobs параллельно.
+        # В рабочей области нет тестов, ограниченных возможностями Cargo. Единственная возможность
+        # `reference-generator` включает resvg только для двух служебных
+        # исполняемых файлов генератора; сборку всех целей и возможностей уже проверяют
+        # задания Clippy и MSRV параллельно.
         run: cargo test --workspace --locked --profile ci
 
       - name: Проверить verified-only kanji corpus
@@ -138,7 +138,7 @@ jobs:
         # колодах, уровнях, моделях заметок и именах полей. Отсутствие экспортов —
         # не ошибка, поэтому состав данных может меняться без правки CI. Но каждый
         # фактически найденный экспорт обязан проходить `validate`: структурно
-        # невалидный закоммиченный payload делает шаг красным.
+        # невалидное содержимое коммита делает шаг красным.
         run: |
           set -euo pipefail
           status=0
