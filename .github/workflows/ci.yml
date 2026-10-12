@@ -46,10 +46,14 @@ jobs:
           python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
           python3 .github/scripts/check_skill_contracts.py
 
-      - name: Установить стабильный Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          components: rustfmt, clippy
+      - name: Активировать Rust из rust-toolchain.toml
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+
+      - name: Проверить контракт MSRV, rustup и компилятора
+        run: python3 .github/scripts/check_rust_toolchain.py
 
       - name: Восстановить Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -78,8 +82,14 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Установить стабильный Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Активировать Rust из rust-toolchain.toml
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+
+      - name: Проверить контракт MSRV, rustup и компилятора
+        run: python3 .github/scripts/check_rust_toolchain.py
 
       - name: Настроить sccache
         uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -165,33 +175,19 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Прочитать заявленную MSRV
-        id: msrv
-        # Единственный владелец значения — `[workspace.package] rust-version`
-        # в корневом Cargo.toml. Workflow не хранит собственную копию версии:
-        # он спрашивает Cargo и заодно проверяет, что участники workspace не
-        # расходятся в `rust-version`.
+      - name: Активировать Rust из rust-toolchain.toml
         run: |
-          set -euo pipefail
-          versions=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '[.packages[].rust_version] | unique | .[]')
-          declared=$(printf '%s\n' "$versions" | grep -c . || true)
-          if [ "$declared" -ne 1 ]; then
-            echo "::error::участники workspace расходятся в rust-version: $(printf '%s' "$versions" | tr '\n' ' ')"
-            exit 1
-          fi
-          echo "toolchain=$versions" >> "$GITHUB_OUTPUT"
-          echo "Заявленная MSRV: $versions"
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
 
-      - name: Установить Rust заявленной MSRV
-        run: rustup toolchain install "${{ steps.msrv.outputs.toolchain }}" --profile minimal
+      - name: Проверить контракт MSRV, rustup и компилятора
+        run: python3 .github/scripts/check_rust_toolchain.py
 
       - name: Восстановить Rust cache для MSRV
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        env:
-          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.toolchain }}
         with:
           shared-key: msrv
 
       - name: Проверить сборку на заявленной MSRV
-        run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --all-features --locked
+        run: cargo check --workspace --all-targets --all-features --locked

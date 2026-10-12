@@ -11,9 +11,9 @@ resolver = "3"
 
 [workspace.package]
 # Минимальная поддерживаемая версия Rust (MSRV) для всех участников рабочей области.
-# Единственный владелец этого значения: CI читает его отсюда через
-# `cargo metadata`, а не хранит собственную копию.
-rust-version = "1.88"
+# Канонический владелец MSRV: rust-toolchain.toml повторяет её для rustup,
+# а CI проверяет совпадение двух TOML и всех участников workspace.
+rust-version = "1.88.0"
 edition = "2024"
 license = "MIT"
 
