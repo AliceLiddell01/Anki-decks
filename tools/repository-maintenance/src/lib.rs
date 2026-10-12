@@ -952,7 +952,7 @@ pub fn render_text(report: &Report) -> String {
         for entry in &inventory.largest {
             let age = entry
                 .age_seconds
-                .map_or_else(|| "?".into(), |age| format!("{}с", age));
+                .map_or_else(|| "?".into(), |age| format!("{age}с"));
             let _ = writeln!(
                 text,
                 "  {} — {}, {}, {}, возраст {}, {}",
