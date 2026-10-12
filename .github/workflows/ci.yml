@@ -1,23 +1,23 @@
 name: Проверки репозитория
 
-# Семантические triggers, без привязки к литералу имени ветки:
+# Семантические события запуска без привязки к имени ветки:
 # - `pull_request` — проверка любого PR;
 # - `push` — событие покрывает интеграцию в поддерживаемую ветку, а какой именно
-#   branch является default, job определяет сам через `github.event.repository`
-#   (см. `if` у job'ов), поэтому имя ветки в workflow не зашито;
+#   ветка является основной, задание определяет через `github.event.repository`
+#   (см. `if` у заданий), поэтому имя ветки в процессе не зашито;
 # - `workflow_dispatch` — ручной запуск.
 on:
   pull_request:
   push:
   workflow_dispatch:
 
-# CI только читает репозиторий: ни один job не пишет в него, не публикует
-# артефакты и не выполняет mutating repository операции.
+# CI только читает репозиторий: ни одно задание не пишет в него, не публикует
+# артефакты и не выполняет изменяющих операций с репозиторием.
 permissions:
   contents: read
 
 concurrency:
-  # Новый прогон отменяет предыдущий только для PR: проверку default branch
+  # Новый прогон отменяет предыдущий только для PR: проверку основной ветки
   # нельзя отменять на середине.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -28,8 +28,8 @@ env:
 jobs:
   lint:
     name: Форматирование и Clippy
-    # Push в feature-ветку не дублирует прогон PR: на push job выполняется
-    # только для default branch текущего репозитория.
+    # Отправка изменений в рабочую ветку не дублирует прогон PR: на `push` задание выполняется
+    # только для основной ветки текущего репозитория.
     if: >-
       github.event_name != 'push'
       || github.ref_name == github.event.repository.default_branch
@@ -41,17 +41,22 @@ jobs:
 
       - name: Проверить контракты скриптов и метаданные Agent Skills
         # Единственный владелец этих проверок: они не зависят от данных репозитория
-        # и нужны также на push в default branch, где события PR нет.
+        # и нужны также при отправке изменений в основную ветку, где события PR нет.
         run: |
           python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
           python3 .github/scripts/check_skill_contracts.py
 
-      - name: Установить стабильный Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          components: rustfmt, clippy
+      - name: Установить Rust из rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
 
-      - name: Восстановить Rust cache
+      - name: Проверить контракт MSRV, rustup и компилятора
+        run: python3 .github/scripts/check_rust_toolchain.py
+
+      - name: Восстановить кэш Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Проверить форматирование
@@ -63,12 +68,12 @@ jobs:
   code:
     name: Код и тесты
     env:
-      # sccache сохраняет результаты rustc для workspace library crates между
-      # hosted runners; rust-cache ниже остаётся слоем Cargo registry/target.
+      # sccache сохраняет результаты rustc библиотечных пакетов рабочей области между
+      # исполнителями GitHub Actions; rust-cache ниже кэширует реестр и сборку Cargo.
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
-    # Push в feature-ветку не дублирует прогон PR: на push job выполняется
-    # только для default branch текущего репозитория.
+    # Отправка изменений в рабочую ветку не дублирует прогон PR: при `push` задание выполняется
+    # только для основной ветки текущего репозитория.
     if: >-
       github.event_name != 'push'
       || github.ref_name == github.event.repository.default_branch
@@ -78,36 +83,44 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Установить стабильный Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Установить Rust из rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+
+      - name: Проверить контракт MSRV, rustup и компилятора
+        run: python3 .github/scripts/check_rust_toolchain.py
 
       - name: Настроить sccache
         uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
 
-      - name: Восстановить Rust cache
+      - name: Восстановить кэш Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Весь code job использует один custom profile (test + cargo run),
-          # поэтому держим отдельное поколение dependency cache.
+          # Всё задание использует один специализированный профиль (тесты и `cargo run`),
+          # поэтому используем отдельное поколение кэша зависимостей.
           key: unified-ci-v1
 
       - name: Собрать и выполнить тесты
-        # В workspace нет feature-gated test-кода. Единственная feature
-        # reference-generator включает resvg только для двух служебных
-        # generator binaries; их all-features/all-targets сборку уже проверяют
-        # Clippy и MSRV jobs параллельно.
+        # В рабочей области нет тестов, ограниченных возможностями Cargo. Единственная возможность
+        # `reference-generator` включает resvg только для двух служебных
+        # исполняемых файлов генератора; сборку всех целей и возможностей уже проверяют
+        # задания Clippy и MSRV параллельно.
         run: cargo test --workspace --locked --profile ci
 
-      - name: Проверить verified-only kanji corpus
-        # Ветка без tracked corpus допустима. Если store присутствует (в том числе
-        # как symlink), read-only gate обязан подтвердить verified-only содержимое.
+      - name: Проверить подтверждённые записи корпуса кандзи
+        # Ветка без отслеживаемого корпуса допустима. Если хранилище присутствует
+        # (в том числе как символическая ссылка), проверка только для чтения
+        # обязана подтвердить, что все записи корпуса проверены.
         run: |
           if [ -e .asset-store/kanji ] || [ -L .asset-store/kanji ]; then
             cargo run --quiet --locked --profile ci --bin kanji-corpus-gate
           else
-            echo "Канонический kanji corpus отсутствует; проверка пропущена"
+            echo "Канонический корпус кандзи отсутствует; проверка пропущена"
           fi
 
       - name: Проверить корпус pitch-accent на записи только со статусом VERIFIED
@@ -126,7 +139,7 @@ jobs:
         # колодах, уровнях, моделях заметок и именах полей. Отсутствие экспортов —
         # не ошибка, поэтому состав данных может меняться без правки CI. Но каждый
         # фактически найденный экспорт обязан проходить `validate`: структурно
-        # невалидный закоммиченный payload делает шаг красным.
+        # невалидное содержимое коммита делает шаг красным.
         run: |
           set -euo pipefail
           status=0
@@ -165,33 +178,20 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Прочитать заявленную MSRV
-        id: msrv
-        # Единственный владелец значения — `[workspace.package] rust-version`
-        # в корневом Cargo.toml. Workflow не хранит собственную копию версии:
-        # он спрашивает Cargo и заодно проверяет, что участники workspace не
-        # расходятся в `rust-version`.
+      - name: Установить Rust из rust-toolchain.toml
         run: |
-          set -euo pipefail
-          versions=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '[.packages[].rust_version] | unique | .[]')
-          declared=$(printf '%s\n' "$versions" | grep -c . || true)
-          if [ "$declared" -ne 1 ]; then
-            echo "::error::участники workspace расходятся в rust-version: $(printf '%s' "$versions" | tr '\n' ' ')"
-            exit 1
-          fi
-          echo "toolchain=$versions" >> "$GITHUB_OUTPUT"
-          echo "Заявленная MSRV: $versions"
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
 
-      - name: Установить Rust заявленной MSRV
-        run: rustup toolchain install "${{ steps.msrv.outputs.toolchain }}" --profile minimal
+      - name: Проверить контракт MSRV, rustup и компилятора
+        run: python3 .github/scripts/check_rust_toolchain.py
 
-      - name: Восстановить Rust cache для MSRV
+      - name: Восстановить кэш Rust для MSRV
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        env:
-          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.toolchain }}
         with:
           shared-key: msrv
 
       - name: Проверить сборку на заявленной MSRV
-        run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --all-features --locked
+        run: cargo check --workspace --all-targets --all-features --locked
