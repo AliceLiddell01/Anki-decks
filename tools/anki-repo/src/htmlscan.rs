@@ -453,7 +453,7 @@ fn parse_start_tag<'a>(html: &'a str, start: usize) -> ParsedTag<'a> {
                         end += 1;
                     }
                     value = &html[content_start..end];
-                    value_range = Some(html.substr_range(value).expect("значение — срез HTML"));
+                    value_range = Some(Span::from(content_start..end));
                     if end >= bytes.len() {
                         unterminated_value = true;
                         position = end;
@@ -472,7 +472,7 @@ fn parse_start_tag<'a>(html: &'a str, start: usize) -> ParsedTag<'a> {
                         end += 1;
                     }
                     value = &html[value_start..end];
-                    value_range = Some(html.substr_range(value).expect("значение — срез HTML"));
+                    value_range = Some(Span::from(value_start..end));
                     position = end;
                 }
             }
@@ -710,6 +710,19 @@ mod tests {
         let range = found[0].attribute("src").expect("src").value_range;
         let range = range.expect("диапазон");
         assert_eq!(&html[range], "a.png");
+    }
+
+    #[test]
+    fn empty_quoted_values_keep_their_source_ranges() {
+        for html in [r#"<img src="">"#, "<img src=''>"] {
+            let found = elements(html);
+            let range = found[0]
+                .attribute("src")
+                .expect("src")
+                .value_range
+                .expect("диапазон пустого значения");
+            assert_eq!(&html[range], "");
+        }
     }
 
     #[test]

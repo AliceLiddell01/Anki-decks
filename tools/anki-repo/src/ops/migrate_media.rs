@@ -558,15 +558,17 @@ fn claimable_ranges(text: &str, legacy: &str) -> Vec<Span> {
             if !attribute.name.eq_ignore_ascii_case("src") {
                 continue;
             }
-            let Some(_) = attribute.value_range else {
+            let Some(value_range) = attribute.value_range else {
                 continue;
             };
             for candidate in media::split_attribute_values(attribute.name, attribute.value) {
                 if candidate.text != legacy {
                     continue;
                 }
-                let url = &attribute.value[candidate.range];
-                found.push(text.substr_range(url).expect("URL — срез исходного поля"));
+                found.push(Span::from(
+                    value_range.start + candidate.range.start
+                        ..value_range.start + candidate.range.end,
+                ));
             }
         }
     }

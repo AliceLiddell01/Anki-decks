@@ -777,9 +777,12 @@ mod tests {
             "[build]\ntarget-dir=\"target\"\nbuild-dir=\"build\"\n",
         )
         .unwrap();
+        let cargo_home = owner.path().join("cargo-home");
+        fs::create_dir_all(&cargo_home).unwrap();
         for build_only in [false, true] {
             let output = Command::new("cargo")
                 .args(["build", "--offline"])
+                .env("CARGO_HOME", &cargo_home)
                 .env_remove("CARGO_TARGET_DIR")
                 .env_remove("CARGO_BUILD_TARGET_DIR")
                 .env_remove("CARGO_BUILD_BUILD_DIR")

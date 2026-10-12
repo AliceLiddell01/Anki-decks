@@ -95,6 +95,7 @@ fn independent_writers_wait_then_publish_exactly_one_complete_candidate() {
             if reader_done.load(Ordering::Acquire) {
                 return reads;
             }
+            std::thread::yield_now();
         }
     });
     drop(holder);
