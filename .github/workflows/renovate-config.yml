@@ -1,0 +1,32 @@
+name: Проверка конфигурации Renovate
+
+on:
+  pull_request:
+    paths:
+      - renovate.json
+      - Cargo.toml
+      - rust-toolchain.toml
+      - .github/scripts/check_renovate_rust.py
+      - .github/workflows/renovate-config.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  renovate-rust:
+    name: Валидация и извлечение Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Установить официальный Renovate
+        run: npm install --no-save --no-package-lock --no-audit --no-fund renovate@44.149.3
+
+      - name: Проверить конфигурацию штатным валидатором
+        run: ./node_modules/.bin/renovate-config-validator --strict
+
+      - name: Проверить настоящее извлечение и группировку Rust
+        run: python3 .github/scripts/check_renovate_rust.py
