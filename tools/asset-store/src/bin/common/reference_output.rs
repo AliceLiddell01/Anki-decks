@@ -10,13 +10,13 @@ pub fn publish(output: &Path, bytes: &[u8]) -> io::Result<()> {
     let outcome = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
     let outcome = outcome.and_then(|()| fs::rename(&temp, output));
-    if outcome.is_err() {
-        if let Err(cleanup_error) = fs::remove_file(&temp) {
-            eprintln!(
-                "не удалось удалить временный файл {} после сбоя публикации: {cleanup_error}",
-                temp.display()
-            );
-        }
+    if outcome.is_err()
+        && let Err(cleanup_error) = fs::remove_file(&temp)
+    {
+        eprintln!(
+            "не удалось удалить временный файл {} после сбоя публикации: {cleanup_error}",
+            temp.display()
+        );
     }
     outcome
 }
