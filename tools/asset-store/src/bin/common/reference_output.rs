@@ -11,7 +11,12 @@ pub fn publish(output: &Path, bytes: &[u8]) -> io::Result<()> {
     drop(file);
     let outcome = outcome.and_then(|()| fs::rename(&temp, output));
     if outcome.is_err() {
-        fs::remove_file(&temp)?;
+        if let Err(cleanup_error) = fs::remove_file(&temp) {
+            eprintln!(
+                "не удалось удалить временный файл {} после сбоя публикации: {cleanup_error}",
+                temp.display()
+            );
+        }
     }
     outcome
 }
