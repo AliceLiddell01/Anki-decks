@@ -37,7 +37,7 @@ tools/
 - `.codex/context/` — долговременные карты формата и рабочего процесса.
 - `.agents/skills/` — skills репозитория, по каталогу на skill; процедурой владеет
   сам skill, а не этот файл. Обычной процедурой Git/GitHub владеет
-  `.agents/skills/anki-git-workflow/`, независимое ревью кода без изменения файлов —
+  `.agents/skills/anki-git-workflow/`, независимое ревью кода без изменения файлов репозитория (временные скрипты — только в системном temp) —
   `.agents/skills/anki-code-review/`, явно запрошенный цикл ревью CodeRabbit —
   `.agents/skills/anki-coderabbit-review/`.
 - `tools/anki-repo/` — пакет Rust `anki-repo` для анализа экспорта и строго
