@@ -478,6 +478,18 @@ pub fn cargo_clean(workspace: &CargoWorkspace) -> Result<(String, String), Strin
             bounded(&stderr)
         ));
     }
+    // Cargo до 1.91 игнорирует build.build-dir. Если основной cargo clean
+    // не удалил отдельный каталог промежуточной сборки, очищаем именно его
+    // штатным cargo clean, совместимым с закреплённой MSRV.
+    if let Some(build_dir) = &workspace.build_dir
+        && build_dir != &workspace.target_dir
+        && build_dir.exists()
+    {
+        let mut separate_build = workspace.clone();
+        separate_build.target_dir = build_dir.clone();
+        cargo_clean_external(&separate_build)
+            .map_err(|error| format!("не удалось очистить отдельный build-dir: {error}"))?;
+    }
     Ok((stdout, stderr))
 }
 
@@ -628,6 +640,8 @@ mod tests {
         )
         .unwrap();
         fs::write(target.join("synthetic-artifact"), [7_u8; 4096]).unwrap();
+        let untouched = root.join("unrelated-file");
+        fs::write(&untouched, "должен остаться").unwrap();
         let workspace = CargoWorkspace {
             root: root.clone(),
             manifest: root.join("Cargo.toml"),
@@ -643,6 +657,7 @@ mod tests {
                 .join("debug/incremental/synthetic/artifact")
                 .exists()
         );
+        assert_eq!(fs::read_to_string(&untouched).unwrap(), "должен остаться");
         assert!(before > 0);
     }
 }
