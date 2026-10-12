@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail CI when Cargo MSRV, rustup pin, workspace members or runtime Rust disagree."""
+"""Останавливает CI при рассинхронизации MSRV, rustup и фактической версии Rust."""
 
 import argparse
 import json
@@ -13,7 +13,7 @@ RELEASE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
 class ContractError(Exception):
-    """A repository toolchain contract violation."""
+    """Нарушение контракта версии Rust в репозитории."""
 
 
 def release(value, where):
@@ -114,8 +114,8 @@ def check(root):
     if not found or release(found.group(1), "cargo --version") != msrv:
         raise ContractError(f"Фактический cargo не соответствует {expected}: {cargo.strip()}")
 
-    print(f"Rust contract: MSRV = rustup pin = rustc = cargo = {expected}")
-    print(f"Все участники Cargo workspace проверены: {len(members)}")
+    print(f"Контракт Rust: MSRV = версия rustup = rustc = cargo = {expected}")
+    print(f"Проверены все участники рабочей области Cargo: {len(members)}")
     print(rustc.strip())
     print(cargo.strip())
 
