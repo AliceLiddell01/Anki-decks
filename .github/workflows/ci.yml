@@ -39,7 +39,9 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Проверить формат Agent Skills
+      - name: Проверить контракты скриптов и метаданные Agent Skills
+        # Единственный владелец этих проверок: они не зависят от данных репозитория
+        # и нужны также на push в default branch, где события PR нет.
         run: |
           python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
           python3 .github/scripts/check_skill_contracts.py

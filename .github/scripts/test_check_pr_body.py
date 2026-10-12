@@ -100,6 +100,12 @@ class PrBodyContractTests(unittest.TestCase):
         body = valid_body() + "\n\n## CodeRabbit review и disposition\n| Итерация / reviewed HEAD | Уровень | Путь | Влияние | Решение | Исправление |\n| --- | --- | --- | --- | --- | --- |\n| 1 | — | — | 0 findings | clean | unknown |"
         self.assertTrue(any("строка" in e for e in validate(body)))
 
+    def test_coderabbit_row_requires_filled_cells(self):
+        # Строка из одних разделителей не является записью disposition.
+        table = "\n\n## CodeRabbit review и disposition\n| Итерация / reviewed HEAD | Уровень | Путь | Влияние | Решение | Исправление |\n| --- | --- | --- | --- | --- | --- |\n"
+        self.assertTrue(any("строка" in e for e in validate(valid_body() + table + "| 1 · `abcdef0` | | | | | |")))
+        self.assertEqual(validate(valid_body() + table + "| 1 · `abcdef0` | — | — | 0 findings | clean | `abcdef0` |"), [])
+
     def test_bot_exception_is_limited_to_account_and_branch(self):
         def payload(login, branch):
             return {"pull_request": {"user": {"login": login}, "head": {"ref": branch}}}

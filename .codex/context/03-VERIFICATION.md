@@ -295,9 +295,9 @@ cargo run --quiet --bin anki-repo -- visual-report \
 
 Три job'а (точные команды и актуальные флаги определяет сам workflow):
 
-- «Форматирование и Clippy» — сначала проверяет метаданные и ссылки
-  Agent Skills штатным Python stdlib-скриптом и его регрессионными тестами,
-  затем запускает `cargo fmt --all --check` и
+- «Форматирование и Clippy» — единственный владелец проверок, не зависящих от
+  данных репозитория: регрессионные тесты `.github/scripts/test_*.py` и проверка
+  метаданных и ссылок Agent Skills; затем `cargo fmt --all --check` и
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
 - «Код и тесты» — `cargo test --workspace --locked --profile ci`,
   проверки verified-only корпусов кандзи и pitch-accent, а также
@@ -306,9 +306,11 @@ cargo run --quiet --bin anki-repo -- visual-report \
   единого значения у участников workspace и выполняет
   `cargo +<msrv> check --workspace --all-targets --all-features --locked`.
 
-Формат описаний PR независимо проверяет `.github/workflows/pr-body.yml`;
-он не подменяет перечисленные проверки кода и данных. Единственный владелец
-версии MSRV — `[workspace.package]` корневого `Cargo.toml`.
+Отдельный `.github/workflows/pr-body.yml` владеет только той проверкой, которой
+нужно событие PR: валидацией описания самого PR. Тесты скриптов и метаданные
+Agent Skills здесь намеренно не дублируются — их выполняет `ci.yml`, который
+покрывает и push в default branch. Единственный владелец версии MSRV —
+`[workspace.package]` корневого `Cargo.toml`.
 
 Локально тот же набор воспроизводится из корня репозитория — сначала
 Python-проверки контрактов, затем канонические Cargo-команды из `AGENTS.md`:
@@ -321,10 +323,11 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-CI добавляет к тем же проверкам только конфигурацию выделенных исполнителей:
-Clippy собирается с `--all-features`, а тесты — с `--profile ci`. Эти флаги
-не меняют проверяемые контракты и не отменяют локальный набор; более строгая
-локальная репетиция обязательного CI — те же команды с этими флагами.
+Блок выше — канонический локальный набор, а не дословная копия CI: вместо
+`cargo test --workspace --locked` обязательный CI собирает тесты в профиле
+исполнителя (`cargo test --workspace --locked --profile ci`), а Clippy
+дополнительно включает `--all-features`. Строгая локальная репетиция
+обязательного CI — те же команды с этими флагами.
 
 Проверки корпусов (`kanji-corpus-gate`, `pitch-corpus-gate`) и структурная
 `validate` найденных экспортов выполняются только при наличии соответствующих
