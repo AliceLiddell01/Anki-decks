@@ -1,4 +1,4 @@
-"""Integration tests: exercise the real checker against mutated TOML, metadata and tool output."""
+"""Интеграционные тесты проверяющего скрипта с изменёнными TOML, метаданными и выводом команд."""
 
 import json
 import os
@@ -86,7 +86,7 @@ class ToolchainContractTests(unittest.TestCase):
         )
         if expected is None:
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Все участники Cargo workspace проверены: 3", result.stdout)
+            self.assertIn("Проверены все участники рабочей области Cargo: 3", result.stdout)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn(expected, result.stderr)
