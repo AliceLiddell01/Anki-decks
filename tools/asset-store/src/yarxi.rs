@@ -35,7 +35,7 @@ const PROVIDER_ID: &str = "yarxi-suu-browser";
 const PROVIDER_VERSION: &str = "7";
 const SITE_URL: &str = "https://www.yarxi.su/";
 const SITE_HOST: &str = "www.yarxi.su";
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const OPERATION_TIMEOUT: Duration = Duration::from_mins(20);
 const SESSION_SETUP_READINESS_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_SETUP_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SESSION_SETUP_RECREATIONS: u8 = 2;
@@ -4134,7 +4134,7 @@ mod tests {
         assert_eq!(ordinary.acceptance_rotate_after_items, None);
         let forced = AcquisitionRun::new_for_acceptance_rotation(2).unwrap();
         assert_eq!(forced.acceptance_rotate_after_items, Some(2));
-        assert_eq!(OPERATION_TIMEOUT, Duration::from_secs(20 * 60));
+        assert_eq!(OPERATION_TIMEOUT, Duration::from_mins(20));
         assert_eq!(ITEM_TIMEOUT, Duration::from_secs(90));
         assert_eq!(BATCH_PACING, Duration::from_millis(900));
         assert_eq!(MAX_ACQUISITION_ATTEMPTS, 2);

@@ -1839,7 +1839,7 @@ fn reconcile_loaded_batch(
 // 20 минут — возраст сессии. Меняем сессию после надёжного сохранения результата.
 // Уже запущенный запрос сохраняет собственный тайм-аут провайдера в 90 секунд.
 const PITCH_SESSION_MAX_ITEMS: usize = 64;
-const PITCH_SESSION_MAX_AGE: Duration = Duration::from_secs(20 * 60);
+const PITCH_SESSION_MAX_AGE: Duration = Duration::from_mins(20);
 const PITCH_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
 const PITCH_DEFAULT_WORKERS: u8 = 4;
 const PITCH_MAX_WORKERS: usize = 4;

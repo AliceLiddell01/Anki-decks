@@ -25,7 +25,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
 use crate::details;
@@ -45,6 +44,7 @@ use crate::report::html::{
 use crate::report::manifest::{self, Ownership};
 use crate::report::media::{self, MediaPlan};
 use crate::report::sanitize;
+use crate::span::Span;
 use crate::template::{
     ConstructKind, ModelKind, RenderedSide, TemplateContext, render_card, scan_constructs,
 };
@@ -2151,14 +2151,14 @@ fn rewrite_element(
     plan: &MediaPlan,
     resolved_media: &mut BTreeSet<String>,
 ) -> String {
-    let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
+    let mut replacements: Vec<(Span, String)> = Vec::new();
     let mut missing_all = false;
 
     for attribute in &element.attributes {
         if !media_index::attribute_carries_media(element.name, attribute.name) {
             continue;
         }
-        let Some(value_range) = attribute.value_range.clone() else {
+        let Some(value_range) = attribute.value_range else {
             // Атрибут без `=`: адреса у него нет, но браузер прочтёт его как
             // пустой адрес и запросит сам документ. Пустой адрес не остаётся.
             if element.name_is("img") {
@@ -2168,7 +2168,7 @@ fn rewrite_element(
             }
             continue;
         };
-        let value = &html[value_range.clone()];
+        let value = &html[value_range];
         let candidates = media_index::split_attribute_values(attribute.name, value);
 
         // Список кандидатов (`srcset`) пересобирается только из показанных
@@ -2184,10 +2184,13 @@ fn rewrite_element(
                     continue;
                 };
                 resolved_media.insert(path.to_string());
-                let mut segment = value[candidate.segment.clone()].to_string();
+                let mut segment = value[candidate.segment].to_string();
                 let offset = candidate.range.start - candidate.segment.start;
                 let resolved = preview_address(path);
-                segment.replace_range(offset..offset + candidate.range.len(), &resolved);
+                segment.replace_range(
+                    offset..offset + (candidate.range.end - candidate.range.start),
+                    &resolved,
+                );
                 segments.push(segment.trim().to_string());
             }
             if segments.is_empty() {
@@ -2240,7 +2243,7 @@ fn rewrite_element(
         }) else {
             return html[element.start..element.end + 1].to_string();
         };
-        let value = &html[attribute.value_range.clone().expect("проверено выше")];
+        let value = &html[attribute.value_range.expect("проверено выше")];
         return missing_image_placeholder(value, state);
     }
 
@@ -2267,12 +2270,12 @@ fn attribute_removal(
     html: &str,
     element: &htmlscan::Element<'_>,
     attribute: &htmlscan::Attribute<'_>,
-) -> Range<usize> {
+) -> Span {
     let mut start = attribute.span.start;
     while start > element.start && htmlscan::is_whitespace(html.as_bytes()[start - 1]) {
         start -= 1;
     }
-    start..attribute.span.end
+    Span::from(start..attribute.span.end)
 }
 
 /// Плейсхолдер отсутствующей картинки: говорит basename и то, что файла нет.

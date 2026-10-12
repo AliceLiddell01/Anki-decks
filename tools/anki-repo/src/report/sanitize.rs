@@ -47,12 +47,12 @@
 //! именно не показано, и это уходит в превью и в диагностику отчёта.
 
 use std::collections::BTreeSet;
-use std::ops::Range;
 
 use crate::htmlscan::{self, Tag};
 use crate::media;
 use crate::report::css;
 use crate::report::runtime;
+use crate::span::Span;
 
 /// Чем заменяется нелокальный адрес в CSS.
 ///
@@ -374,7 +374,7 @@ pub fn css(style: &str, page: Page, resources: &Resources) -> SanitizedCss {
             }
             css::Event::Address(address) => {
                 if address.target.is_empty() || page.allows(resources, &address.target) {
-                    out.push_str(&style[span.clone()]);
+                    out.push_str(&style[span]);
                 } else {
                     out.push_str(INERT_CSS_VALUE);
                     blocked.push(Blocked::new(
@@ -472,7 +472,7 @@ pub fn inspect(document: &str, page: Page, resources: &Resources) -> Vec<Violati
             } => {
                 let lower = name.to_ascii_lowercase();
                 if lower == "script" {
-                    let body_text = &document[body.clone()];
+                    let body_text = &document[body];
                     if !is_report_runtime(body_text) {
                         violations.push(Violation {
                             what: "тело <script> не совпадает с runtime отчёта".to_string(),
@@ -480,12 +480,7 @@ pub fn inspect(document: &str, page: Page, resources: &Resources) -> Vec<Violati
                     }
                 }
                 if lower == "style" {
-                    violations.extend(css_violations(
-                        &document[body.clone()],
-                        page,
-                        resources,
-                        "style",
-                    ));
+                    violations.extend(css_violations(&document[body], page, resources, "style"));
                 }
                 if close_end.is_none() {
                     violations.push(Violation {
@@ -686,7 +681,7 @@ impl Sanitizer<'_> {
     }
 
     /// Элемент с содержимым, которое не является разметкой.
-    fn raw_text(&mut self, name: &str, start: usize, body: Range<usize>, close_end: Option<usize>) {
+    fn raw_text(&mut self, name: &str, start: usize, body: Span, close_end: Option<usize>) {
         let lower = name.to_ascii_lowercase();
         if close_end.is_none() {
             // Незакрытое содержимое поглотило бы остаток документа, включая
@@ -711,7 +706,7 @@ impl Sanitizer<'_> {
         // `<style>`: оформление сохраняется, потому что именно оно и делает
         // превью похожим на карточку, но CSS проходит ту же проверку адресов.
         self.flush(start);
-        let sanitized = css(&self.source[body.clone()], self.page, self.resources);
+        let sanitized = css(&self.source[body], self.page, self.resources);
         self.blocked.extend(sanitized.blocked);
         self.out.push_str("<style>");
         self.out.push_str(&sanitized.css);

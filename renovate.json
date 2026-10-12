@@ -33,15 +33,6 @@
       "allowedVersions": "<0.48.0"
     },
     {
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchPackageNames": [
-        "fs2"
-      ],
-      "abandonmentThreshold": null
-    },
-    {
       "description": "Обе версии Rust должны обновляться совместно, без beta/nightly и без захвата crates",
       "matchManagers": [
         "rust-toolchain",

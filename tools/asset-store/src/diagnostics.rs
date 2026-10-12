@@ -571,10 +571,7 @@ fn bound_text(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         return value.to_owned();
     }
-    let mut end = maximum.saturating_sub('…'.len_utf8());
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
+    let end = value.floor_char_boundary(maximum.saturating_sub('…'.len_utf8()));
     format!("{}…", &value[..end])
 }
 

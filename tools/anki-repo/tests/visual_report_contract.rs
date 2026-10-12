@@ -2711,3 +2711,38 @@ fn a_field_value_is_parsed_the_way_the_browser_parses_it() {
         "диагностика называет отвергнутые конструкции: {result}"
     );
 }
+
+#[test]
+fn unicode_repeated_addresses_reach_preview_without_shifting_surrounding_text() {
+    let before = canonical_base("report-unicode-spans-before");
+    let after = canonical_base("report-unicode-spans-after");
+    let fragment = "開始<div title='日本語'><img srcset=\"　飴.png 1x,　飴.png 200w　\">漢字[sound: 声.mp3 ]<style>.例 { color: red; background: url('https://evil.example/飴.png') } /* 日本語 */</style></div>終了<img src='未完";
+    set_field(&after, "guid-2", 0, fragment);
+    after.write_media(&["飴.png", "声.mp3"]);
+    let before_bytes = before.deck_json_bytes();
+    let after_bytes = after.deck_json_bytes();
+    let out = TempDir::new("report-unicode-spans-out");
+    let (exit, document) = report(before.path(), after.path(), out.path(), &[]);
+    result_of(exit, &document);
+    assert_every_page_is_offline(&out);
+    let card = card_text(&out, "cards/card-0002.html");
+    assert!(card.contains("開始<div title=\"日本語\">"), "{card}");
+    assert!(
+        card.contains("srcset=\"../media/after/飴.png 1x, ../media/after/飴.png 200w\""),
+        "{card}"
+    );
+    assert!(
+        card.contains("漢字<span class=\"replay-button\">"),
+        "{card}"
+    );
+    assert!(card.contains("src=\"../media/after/声.mp3\""), "{card}");
+    assert!(
+        card.contains(".例 { color: red; background: none } /* 日本語 */"),
+        "{card}"
+    );
+    assert!(card.contains("</div>終了"), "{card}");
+    assert!(!style_texts(&card).join("\n").contains("evil.example"));
+    assert!(!card.contains("<img src='未完"));
+    assert_eq!(before.deck_json_bytes(), before_bytes);
+    assert_eq!(after.deck_json_bytes(), after_bytes);
+}

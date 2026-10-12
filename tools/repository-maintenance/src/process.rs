@@ -489,41 +489,35 @@ mod tests {
         let mut own = FakeProcess::new("anki-repository-maintenance", "/workspace");
         own.exe = "/workspace/target/release/anki-repository-maintenance".into();
         own.fd_error = Some(io::ErrorKind::PermissionDenied);
-        assert!(matches!(check([(SELF_PID, own)]), ProcessCheck::Clear));
+        std::assert_matches!(check([(SELF_PID, own)]), ProcessCheck::Clear);
     }
 
     #[test]
     fn another_process_with_the_same_name_and_executable_still_blocks() {
         let mut other = FakeProcess::new("anki-repository-maintenance", "/other");
         other.exe = "/workspace/target/release/anki-repository-maintenance".into();
-        assert!(matches!(
-            check([(43, other)]),
-            ProcessCheck::Busy { pid: 43, .. }
-        ));
+        std::assert_matches!(check([(43, other)]), ProcessCheck::Busy { pid: 43, .. });
     }
 
     #[test]
     fn own_pid_with_different_start_ticks_is_not_exempt() {
         let mut reused = FakeProcess::new("anki-repository-maintenance", "/workspace/target");
         reused.identity.start_ticks += 1;
-        assert!(matches!(
-            check([(SELF_PID, reused)]),
-            ProcessCheck::Busy { .. }
-        ));
+        std::assert_matches!(check([(SELF_PID, reused)]), ProcessCheck::Busy { .. });
     }
 
     #[test]
     fn related_live_cargo_blocks_even_with_unreadable_fd() {
         let mut cargo = FakeProcess::new("cargo", "/workspace");
         cargo.fd_error = Some(io::ErrorKind::PermissionDenied);
-        assert!(matches!(check([(43, cargo)]), ProcessCheck::Busy { .. }));
+        std::assert_matches!(check([(43, cargo)]), ProcessCheck::Busy { .. });
     }
 
     #[test]
     fn unrelated_live_cargo_with_unreadable_fd_does_not_block() {
         let mut cargo = FakeProcess::new("cargo", "/other-workspace");
         cargo.fd_error = Some(io::ErrorKind::PermissionDenied);
-        assert!(matches!(check([(43, cargo)]), ProcessCheck::Clear));
+        std::assert_matches!(check([(43, cargo)]), ProcessCheck::Clear);
     }
 
     #[test]
@@ -532,7 +526,7 @@ mod tests {
             let mut cargo = FakeProcess::new("cargo", "/workspace");
             cargo.identity.state = state;
             cargo.fd_error = Some(io::ErrorKind::PermissionDenied);
-            assert!(matches!(check([(43, cargo)]), ProcessCheck::Clear));
+            std::assert_matches!(check([(43, cargo)]), ProcessCheck::Clear);
         }
     }
 
@@ -542,7 +536,7 @@ mod tests {
             let mut process = FakeProcess::new("worker", cwd);
             process.fd_error = Some(io::ErrorKind::PermissionDenied);
             process.next_identity = Some(None);
-            assert!(matches!(check([(43, process)]), ProcessCheck::Clear));
+            std::assert_matches!(check([(43, process)]), ProcessCheck::Clear);
         }
     }
 
@@ -562,7 +556,7 @@ mod tests {
         ] {
             let mut process = FakeProcess::new("worker", "/workspace/target");
             process.next_identity = Some(Some(identity));
-            assert!(matches!(check([(43, process)]), ProcessCheck::Clear));
+            std::assert_matches!(check([(43, process)]), ProcessCheck::Clear);
         }
     }
 
@@ -570,17 +564,14 @@ mod tests {
     fn related_live_worker_with_unreadable_fd_remains_unknown() {
         let mut worker = FakeProcess::new("worker", "/workspace");
         worker.fd_error = Some(io::ErrorKind::PermissionDenied);
-        assert!(matches!(
-            check([(43, worker)]),
-            ProcessCheck::Unknown { .. }
-        ));
+        std::assert_matches!(check([(43, worker)]), ProcessCheck::Unknown { .. });
     }
 
     #[test]
     fn unrelated_process_with_target_fd_still_blocks() {
         let mut worker = FakeProcess::new("worker", "/other");
         worker.fd = Some("/workspace/target/artifact".into());
-        assert!(matches!(check([(43, worker)]), ProcessCheck::Busy { .. }));
+        std::assert_matches!(check([(43, worker)]), ProcessCheck::Busy { .. });
     }
 
     #[test]
@@ -591,10 +582,10 @@ mod tests {
         // Родитель записан позже рабочего процесса: результат зависит от проверки
         // цепочки родителей рабочего процесса.
         let cargo = FakeProcess::new("cargo", "/workspace");
-        assert!(matches!(
+        std::assert_matches!(
             check([(43, worker), (44, cargo)]),
             ProcessCheck::Unknown { .. }
-        ));
+        );
     }
 
     #[test]
@@ -632,8 +623,7 @@ mod tests {
         let result = target_process_check(&target, &root);
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(
-            matches!(result, ProcessCheck::Busy { pid, .. } if pid == child.id()),
+        std::assert_matches!(result, ProcessCheck::Busy { pid, .. } if pid == child.id(),
             "живой процесс, использующий каталог `target`, должен блокировать очистку: {result:?}"
         );
     }

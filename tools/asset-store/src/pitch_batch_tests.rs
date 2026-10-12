@@ -630,13 +630,13 @@ fn vocabulary_not_found_is_preserved_as_a_typed_non_acquired_outcome() {
     assert!(item.request.selection.is_none());
     assert!(item.current_candidate_sha256.is_none());
     assert!(item.canonical_sha256.is_none());
-    assert!(matches!(
+    std::assert_matches!(
         item.current_outcome(),
         Some(crate::pitch_batch::PitchBatchOutcome::VocabularyNotFound {
             surface,
             reading: Some(reading),
         }) if surface == "幽霊" && reading == "ゆうれい"
-    ));
+    );
 
     drop(runtime);
 }
@@ -1666,12 +1666,12 @@ fn batch_wide_retry_matches_targeted_retry_after_owner_reconciliation() {
         .unwrap();
     let reconciled = batch.item("二").unwrap();
     assert_eq!(reconciled.status(), PitchBatchItemStatus::ExistingVerified);
-    assert!(matches!(
+    std::assert_matches!(
         reconciled.current_outcome(),
         Some(crate::pitch_batch::PitchBatchOutcome::Failed {
             error: JpdbPitchFailure::Timeout { .. }
         })
-    ));
+    );
     assert!(reconciled.owner_conflict.is_none());
     assert_eq!(
         batch.item("三").unwrap().status(),

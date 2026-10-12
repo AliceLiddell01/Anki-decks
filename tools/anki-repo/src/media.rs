@@ -36,12 +36,12 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::ops::Range;
 use std::path::Path;
 
 use crate::htmlscan::{self, Tag};
 use crate::index::ExportIndex;
 use crate::report::css;
+use crate::span::Span;
 
 /// Имя каталога media внутри экспорта.
 pub const MEDIA_DIR: &str = "media";
@@ -176,7 +176,7 @@ pub struct SoundReference<'a> {
     /// Имя файла без пробелов по краям.
     pub name: &'a str,
     /// Диапазон всей конструкции `[sound:NAME]` в источнике.
-    pub span: Range<usize>,
+    pub span: Span,
 }
 
 /// Находит конструкции `[sound:NAME]`.
@@ -199,7 +199,7 @@ pub fn sound_references(text: &str) -> Vec<SoundReference<'_>> {
         if !name.is_empty() {
             found.push(SoundReference {
                 name,
-                span: start..content_start + end + 1,
+                span: Span::from(start..content_start + end + 1),
             });
         }
         position = content_start + end + 1;
@@ -416,7 +416,7 @@ fn css_references_with(text: &str, addresses: fn(&str) -> Vec<String>) -> Vec<St
             }
             Tag::RawText { name, body, .. } => {
                 if name.eq_ignore_ascii_case("style") {
-                    found.extend(addresses(&text[body.clone()]));
+                    found.extend(addresses(&text[body]));
                 }
             }
             // CSS в незакрытом теге тоже читает браузер: значение поля склеится с
@@ -474,14 +474,14 @@ pub struct AttributeValue {
     ///
     /// Нужен тому, кто подменяет ссылку: замена на месте сохраняет остальную
     /// запись значения, включая дескрипторы `srcset`.
-    pub range: Range<usize>,
+    pub range: Span,
     /// Байтовый диапазон всего кандидата внутри значения атрибута — вместе с
     /// дескрипторами `srcset` (`200w`, `2x`) и без запятой-разделителя.
     ///
     /// Нужен тому, кто убирает кандидата целиком: список пересобирается из
     /// кандидатов, и «выкинуть ссылку, оставив её дескриптор» — не то же самое,
     /// что выкинуть кандидата.
-    pub segment: Range<usize>,
+    pub segment: Span,
 }
 
 /// Разбирает значение атрибута на отдельные ссылки вместе с их местом.
@@ -493,34 +493,35 @@ pub struct AttributeValue {
 #[must_use]
 pub fn split_attribute_values(attribute: &str, value: &str) -> Vec<AttributeValue> {
     if !attribute.eq_ignore_ascii_case("srcset") {
-        let trimmed_start = value.len() - value.trim_start().len();
-        let trimmed_end = value.trim_end().len();
         let text = value.trim();
         return if text.is_empty() {
             Vec::new()
         } else {
+            let range = value
+                .substr_range(text)
+                .expect("trim возвращает срез значения");
             vec![AttributeValue {
                 text: text.to_string(),
-                range: trimmed_start..trimmed_end,
-                segment: trimmed_start..trimmed_end,
+                range,
+                segment: range,
             }]
         };
     }
 
     let mut found: Vec<AttributeValue> = Vec::new();
-    let mut offset = 0usize;
     for candidate in value.split(',') {
-        let start = offset;
-        offset += candidate.len() + 1;
         let piece = candidate.trim();
         let Some(url) = piece.split_whitespace().next() else {
             continue;
         };
-        let segment_start = start + (candidate.len() - candidate.trim_start().len());
         found.push(AttributeValue {
             text: url.to_string(),
-            range: segment_start..segment_start + url.len(),
-            segment: segment_start..segment_start + piece.len(),
+            range: value
+                .substr_range(url)
+                .expect("URL — срез значения атрибута"),
+            segment: value
+                .substr_range(piece)
+                .expect("кандидат — срез значения атрибута"),
         });
     }
     found
@@ -721,7 +722,35 @@ mod tests {
         let found = sound_references(text);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "a.mp3");
-        assert_eq!(&text[found[0].span.clone()], "[sound: a.mp3 ]");
+        assert_eq!(&text[found[0].span], "[sound: a.mp3 ]");
+    }
+
+    #[test]
+    fn repeated_unicode_srcset_ranges_keep_their_own_occurrence_and_descriptors() {
+        let value = "　飴.png 1x ,　飴.png 200w, , 新.png 2x　";
+        let found = split_attribute_values("SRCSET", value);
+        assert_eq!(found.len(), 3);
+        assert_eq!(
+            found
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["飴.png", "飴.png", "新.png"]
+        );
+        assert!(found[0].range.end < found[1].range.start);
+        let mut rewritten = value.to_string();
+        for item in found.iter().rev() {
+            assert_eq!(&value[item.range], item.text);
+            assert!(value[item.segment].starts_with(&item.text));
+            rewritten.replace_range(item.range, "長い置換.pitch.png");
+        }
+        assert_eq!(
+            rewritten,
+            "　長い置換.pitch.png 1x ,　長い置換.pitch.png 200w, , 長い置換.pitch.png 2x　"
+        );
+        assert!(split_attribute_values("src", "　 ").is_empty());
+        let single = split_attribute_values("src", "　飴.png　");
+        assert_eq!(&"　飴.png　"[single[0].range], "飴.png");
     }
 
     #[test]

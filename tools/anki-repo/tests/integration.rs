@@ -26,3 +26,5 @@ mod review_contract;
 mod synthetic;
 #[path = "visual_report_contract.rs"]
 mod visual_report_contract;
+#[path = "write_lock_contract.rs"]
+mod write_lock_contract;

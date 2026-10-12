@@ -101,9 +101,7 @@ impl ExportLock {
 /// Возвращает [`ErrorCode::WriteFailed`] при отказе файловой системы.
 #[cfg(unix)]
 fn lock_exclusive(path: &Path, file: &File) -> Result<(), DomainError> {
-    use fs2::FileExt;
-
-    file.lock_exclusive()
+    file.lock()
         .map_err(|error| write_error(path, "lock_source", &error))
 }
 
@@ -659,7 +657,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn publication_waits_for_the_lock_holder() {
-        use fs2::FileExt;
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -669,7 +666,7 @@ mod tests {
 
         // Владелец блокировки: критическая секция занята.
         let holder_file = File::open(dir.path()).expect("каталог экспорта");
-        holder_file.lock_exclusive().expect("блокировка");
+        holder_file.lock().expect("блокировка");
 
         // Публикация в отдельном потоке: она обязана ждать блокировку.
         let (sender, receiver) = mpsc::channel();

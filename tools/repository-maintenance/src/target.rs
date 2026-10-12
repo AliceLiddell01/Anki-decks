@@ -200,13 +200,13 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-/// Отдельный `build-dir`, который удаляется собственным вызовом `cargo clean`.
+/// Отдельный `build-dir`, требующий собственного доказательства права очистки.
 fn separate_build_dir(workspace: &CargoWorkspace) -> Option<&Path> {
     let build_dir = workspace.build_dir.as_deref()?;
     (build_dir != workspace.target_dir.as_path()).then_some(build_dir)
 }
 
-/// Каталоги, которые инструмент удаляет отдельными вызовами `cargo clean`.
+/// Каталоги, которые инструмент передаёт `cargo clean`.
 /// Существующий отдельный `build-dir` попадает в список наравне с `target`:
 /// право удалить его содержимое подтверждается тем же маркером Cargo.
 fn cleanup_dirs(workspace: &CargoWorkspace) -> Vec<&Path> {
@@ -562,51 +562,37 @@ pub fn cargo_clean(workspace: &CargoWorkspace) -> Result<(String, String), Strin
         })?;
     }
 
-    // Отсутствующий target не удаляем: отдельный build-dir можно очистить
-    // самостоятельно, без создания или затрагивания основного каталога.
-    let (stdout, stderr) = if candidates.contains(&workspace.target_dir.as_path()) {
-        let output = Command::new("cargo")
-            .arg("clean")
-            .arg("--manifest-path")
-            .arg(&workspace.manifest)
-            .arg("--target-dir")
-            .arg(&workspace.target_dir)
-            .arg("--locked")
-            .arg("--offline")
-            .env("CARGO_NET_OFFLINE", "true")
-            .env(
-                "CARGO_BUILD_BUILD_DIR",
-                workspace
-                    .build_dir
-                    .as_deref()
-                    .unwrap_or(&workspace.target_dir),
-            )
-            .env("RUSTUP_AUTO_INSTALL", "0")
-            .current_dir(&workspace.root)
-            .output()
-            .map_err(|error| format!("не удалось запустить cargo clean: {error}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        if !output.status.success() {
-            return Err(format!(
-                "cargo clean завершился с кодом {:?}: {}",
-                output.status.code(),
-                bounded(&stderr)
-            ));
-        }
-        (stdout, stderr)
-    } else {
-        (String::new(), String::new())
+    // Cargo очищает оба каталога одним вызовом. Если основной target отсутствует,
+    // передаём существующий проверенный build-dir как оба пути: внезапно
+    // появившийся основной target не должен попасть под удаление без проверки.
+    let Some(target_dir) = candidates.first() else {
+        return Ok((String::new(), String::new()));
     };
-    // На закреплённой Cargo 1.88 отдельный build-dir требует своего вызова.
-    if let Some(build_dir) = separate_build_dir(workspace)
-        && candidates.contains(&build_dir)
-        && build_dir.exists()
-    {
-        let mut separate_build = workspace.clone();
-        separate_build.target_dir = build_dir.to_path_buf();
-        cargo_clean_external(&separate_build)
-            .map_err(|error| format!("не удалось очистить отдельный build-dir: {error}"))?;
+    let build_dir = separate_build_dir(workspace)
+        .filter(|path| candidates.contains(path))
+        .unwrap_or(target_dir);
+    let output = Command::new("cargo")
+        .arg("clean")
+        .arg("--manifest-path")
+        .arg(&workspace.manifest)
+        .arg("--target-dir")
+        .arg(target_dir)
+        .arg("--locked")
+        .arg("--offline")
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_BUILD_BUILD_DIR", build_dir)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .current_dir(&workspace.root)
+        .output()
+        .map_err(|error| format!("не удалось запустить cargo clean: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !output.status.success() {
+        return Err(format!(
+            "cargo clean завершился с кодом {:?}: {}",
+            output.status.code(),
+            bounded(&stderr)
+        ));
     }
     Ok((stdout, stderr))
 }
@@ -648,12 +634,7 @@ fn bounded(text: &str) -> String {
     if text.len() <= LIMIT {
         return text.to_owned();
     }
-    let boundary = text
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= LIMIT)
-        .last()
-        .unwrap_or(0);
+    let boundary = text.floor_char_boundary(LIMIT);
     format!("{}…", &text[..boundary])
 }
 
@@ -717,10 +698,7 @@ mod tests {
 
         assert_eq!(measurement.decision, ThresholdDecision::Keep);
         assert!(!measurement.safe_to_clean);
-        assert!(matches!(
-            measurement.blocker,
-            Some(TargetBlocker::Unsafe(_))
-        ));
+        std::assert_matches!(measurement.blocker, Some(TargetBlocker::Unsafe(_)));
         assert!(measurement.reason.contains("нельзя безопасно измерить"));
     }
 
@@ -785,6 +763,86 @@ mod tests {
     }
 
     #[test]
+    fn real_cargo_build_marks_both_directories_and_clean_preserves_sources() {
+        let owner = TempWorkspace::create("repository-maintenance-real-build").unwrap();
+        let root = owner.path().join("fixture");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".cargo")).unwrap();
+        fs::write(root.join("Cargo.toml"),
+            "[package]\nname=\"gc_real_fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n").unwrap();
+        let source = root.join("src/lib.rs");
+        fs::write(&source, "pub fn fixture() {}\n").unwrap();
+        fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\ntarget-dir=\"target\"\nbuild-dir=\"build\"\n",
+        )
+        .unwrap();
+        for build_only in [false, true] {
+            let output = Command::new("cargo")
+                .args(["build", "--offline"])
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let target = root.join("target");
+            let build = root.join("build");
+            validate_cargo_target(&target).unwrap();
+            validate_cargo_target(&build).unwrap();
+            if build_only {
+                fs::remove_dir_all(&target).unwrap();
+            }
+            let workspace = CargoWorkspace {
+                root: root.clone(),
+                manifest: root.join("Cargo.toml"),
+                target_dir: target.clone(),
+                build_dir: Some(build.clone()),
+                measured_dirs: vec![target.clone(), build.clone()],
+            };
+            cargo_clean(&workspace).unwrap();
+            assert!(!target.exists());
+            assert!(!build.exists());
+            assert_eq!(
+                fs::read_to_string(&source).unwrap(),
+                "pub fn fixture() {}\n"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_does_not_create_an_absent_configured_build_directory() {
+        let owner = TempWorkspace::create("repository-maintenance-missing-build").unwrap();
+        let root = owner.path().join("fixture");
+        let target = root.join("target");
+        let build = root.join("build");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"),
+            "[package]\nname=\"gc_missing_build\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n").unwrap();
+        fs::write(root.join("Cargo.lock"), "version = 3\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE).unwrap();
+        fs::write(target.join("artifact"), b"owned").unwrap();
+        let workspace = CargoWorkspace {
+            root: root.clone(),
+            manifest: root.join("Cargo.toml"),
+            target_dir: target.clone(),
+            build_dir: Some(build.clone()),
+            measured_dirs: vec![target.clone(), build.clone()],
+        };
+        cargo_clean(&workspace).unwrap();
+        assert!(!target.exists());
+        assert!(!build.exists());
+        assert!(root.join("src/lib.rs").exists());
+    }
+
+    #[test]
     fn cargo_clean_refuses_unmarked_separate_build_dir() {
         let owner = TempWorkspace::create("repository-maintenance-unmarked-build-dir-test")
             .expect("временная рабочая область проекта создаётся");
@@ -839,6 +897,67 @@ mod tests {
         assert!(error.contains("не подтверждён маркером"), "{error}");
         assert!(artifact.exists(), "неподтверждённый каталог не очищается");
     }
+    #[test]
+    fn cleanup_rechecks_symlinks_and_replaced_directories_before_running_cargo() {
+        use std::os::unix::fs::symlink;
+        for change in ["target-link", "parent-link", "marker-link", "replacement"] {
+            let owner = TempWorkspace::create("repository-maintenance-clean-recheck").unwrap();
+            let root = owner.path().join("fixture");
+            let parent = root.join("build-parent");
+            let target = parent.join("target");
+            fs::create_dir_all(&target).unwrap();
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("Cargo.toml"),
+                "[package]\nname=\"gc_recheck\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n").unwrap();
+            fs::write(root.join("Cargo.lock"), "version = 3\n").unwrap();
+            fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+            fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE).unwrap();
+            fs::write(target.join("artifact"), b"must survive").unwrap();
+            let workspace = CargoWorkspace {
+                root: root.clone(),
+                manifest: root.join("Cargo.toml"),
+                target_dir: target.clone(),
+                build_dir: None,
+                measured_dirs: vec![target.clone()],
+            };
+            assert!(inspect_target(&workspace, 1, 2).safe_to_clean, "{change}");
+            let preserved = match change {
+                "target-link" => {
+                    let saved = parent.join("saved");
+                    fs::rename(&target, &saved).unwrap();
+                    symlink(&saved, &target).unwrap();
+                    saved.join("artifact")
+                }
+                "parent-link" => {
+                    let saved = root.join("saved-parent");
+                    fs::rename(&parent, &saved).unwrap();
+                    symlink(&saved, &parent).unwrap();
+                    saved.join("target/artifact")
+                }
+                "marker-link" => {
+                    let saved = root.join("saved-tag");
+                    fs::rename(target.join("CACHEDIR.TAG"), &saved).unwrap();
+                    symlink(&saved, target.join("CACHEDIR.TAG")).unwrap();
+                    target.join("artifact")
+                }
+                "replacement" => {
+                    let saved = parent.join("saved");
+                    fs::rename(&target, &saved).unwrap();
+                    fs::create_dir(&target).unwrap();
+                    fs::write(target.join("foreign"), b"new owner").unwrap();
+                    saved.join("artifact")
+                }
+                _ => unreachable!(),
+            };
+            assert!(cargo_clean(&workspace).is_err(), "{change}");
+            assert_eq!(fs::read(preserved).unwrap(), b"must survive", "{change}");
+            if change == "replacement" {
+                assert_eq!(fs::read(target.join("foreign")).unwrap(), b"new owner");
+            }
+            assert!(root.join("src/lib.rs").exists());
+        }
+    }
+
     #[test]
     fn cargo_clean_refuses_workspace_root_even_with_marker() {
         let owner = TempWorkspace::create("repository-maintenance-root-guard-test").unwrap();
