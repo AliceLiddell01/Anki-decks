@@ -3,7 +3,8 @@
   "description": [
     "Постоянная политика dependency maintenance: поддерживать зависимости и GitHub Actions актуальными без автоматического merge.",
     "Использовать рекомендации Renovate для pin digest, config migrations, abandoned dependency detection и регулярного обслуживания lock-файлов.",
-    "Обычные обновления, включая major, проходят через ограниченный PR/CI budget; security updates получают отдельный быстрый канал."
+    "Обычные обновления, включая major, проходят через ограниченный PR/CI budget; security updates получают отдельный быстрый канал.",
+    "Версии Rust workspace MSRV и rustup обновляются вместе через официальный Rust datasource, только по завершённым stable-релизам."
   ],
   "extends": [
     "config:best-practices"
@@ -39,6 +40,40 @@
         "fs2"
       ],
       "abandonmentThreshold": null
+    },
+    {
+      "description": "Обе версии Rust должны обновляться совместно, без beta/nightly и без захвата crates",
+      "matchManagers": [
+        "rust-toolchain",
+        "custom.regex"
+      ],
+      "matchDatasources": [
+        "rust-version"
+      ],
+      "matchPackageNames": [
+        "rust"
+      ],
+      "groupName": "Rust stable toolchain",
+      "rangeStrategy": "replace",
+      "allowedVersions": "/^\\d+\\.\\d+\\.\\d+$/",
+      "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "MSRV только из [workspace.package] корневого Cargo.toml",
+      "managerFilePatterns": [
+        "/^Cargo\\.toml$/"
+      ],
+      "matchStringsStrategy": "recursive",
+      "matchStrings": [
+        "(?:^|\\r?\\n)\\[workspace\\.package\\][ \\t]*(?:#[^\\r\\n]*)?(?:\\r?\\n[ \\t]*(?:#[^\\r\\n]*|[A-Za-z][A-Za-z0-9_-]*[ \\t]*=[^\\r\\n]*|[^ \\t\\[\\r\\n][^\\r\\n]*)?)*",
+        "(?:^|\\r?\\n)[ \\t]*rust-version[ \\t]*=[ \\t]*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "rust-version",
+      "versioningTemplate": "rust-release-channel"
     }
   ]
 }

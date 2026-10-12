@@ -1,0 +1,63 @@
+name: Проверка конфигурации Renovate
+
+on:
+  pull_request:
+    paths:
+      - renovate.json
+      - Cargo.toml
+      - rust-toolchain.toml
+      - .github/scripts/check_renovate_rust.py
+      - .github/workflows/renovate-config.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  renovate-rust:
+    name: Валидация и извлечение Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # GitHub проверяет paths для всего PR, поэтому пустые коммиты ревью
+      # повторно запускают job. Успех прежнего запуска переиспользуется
+      # ТОЛЬКО при неизменном наборе входных файлов и версии проверяющего workflow.
+      # Кэш создаётся лишь после полного успеха job; restore-keys нет.
+      - name: Найти проверку для неизменных входных файлов
+        id: proof
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/renovate-proof/verified
+          key: renovate-rust-proof-v1-${{ runner.os }}-${{ hashFiles('renovate.json', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'tools/**/Cargo.toml', '.github/scripts/check_renovate_rust.py', '.github/workflows/renovate-config.yml') }}
+          lookup-only: true
+
+      - name: Использовать ранее проверенное состояние
+        if: steps.proof.outputs.cache-hit == 'true' && github.event_name != 'workflow_dispatch'
+        run: echo "Полный Renovate test уже прошёл на идентичных файлах; повторный запуск не нужен"
+
+      - name: Установить Node.js для Renovate
+        if: steps.proof.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Установить официальный Renovate
+        if: steps.proof.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        run: npm install --no-save --no-package-lock --no-audit --no-fund renovate@44.149.3
+
+      - name: Проверить конфигурацию штатным валидатором
+        if: steps.proof.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        run: ./node_modules/.bin/renovate-config-validator --strict
+
+      - name: Проверить настоящее извлечение и группировку Rust
+        if: steps.proof.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        run: python3 .github/scripts/check_renovate_rust.py
+
+      - name: Сохранить доказательство успешной проверки
+        if: steps.proof.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p "${{ runner.temp }}/renovate-proof"
+          printf 'Renovate 44.149.3: strict validation, extraction, lookup and fixtures PASS\n' > "${{ runner.temp }}/renovate-proof/verified"
