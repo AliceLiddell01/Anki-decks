@@ -63,7 +63,7 @@ def select(package_files: dict, manager: str) -> list[tuple[str, dict]]:
     return found
 
 
-def check_expected(package_files: dict, *, expect_regex: bool = True, require_updates: bool = False) -> None:
+def check_expected(package_files: dict, *, expected_current: str, expect_regex: bool = True, require_updates: bool = False) -> None:
     native = select(package_files, "rust-toolchain")
     custom = select(package_files, "regex")
     assert len(native) == 1, f"Ожидали один rust-toolchain, получено {native!r}"
@@ -72,7 +72,7 @@ def check_expected(package_files: dict, *, expect_regex: bool = True, require_up
     entries = native + custom
     for path, dep in entries:
         assert dep["depName"] == "rust", (path, dep)
-        assert dep["currentValue"] == "1.88.0", (path, dep)
+        assert dep["currentValue"] == expected_current, (path, dep)
         assert dep.get("skipReason") is None, (path, dep)
     if not require_updates:
         return
@@ -101,29 +101,45 @@ def check_expected(package_files: dict, *, expect_regex: bool = True, require_up
 def main():
     cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
     toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
-    assert tomllib.loads(cargo)["workspace"]["package"]["rust-version"] == "1.88.0"
-    assert tomllib.loads(toolchain)["toolchain"]["channel"] == "1.88.0"
+    current = tomllib.loads(cargo)["workspace"]["package"]["rust-version"]
+    assert isinstance(current, str) and PIN.fullmatch(current), "MSRV не является точным pin X.Y.Z"
+    assert tomllib.loads(toolchain)["toolchain"]["channel"] == current, "Rust toolchain и MSRV различаются"
     config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
     assert config["automerge"] is False
     assert config["prConcurrentLimit"] == 4 and config["prHourlyLimit"] == 2
     assert config["commitHourlyLimit"] == 2
     full = run_renovate(ROOT, mode="lookup", managers=["cargo", "rust-toolchain", "custom.regex"])
-    check_expected(full, require_updates=True)
+    check_expected(full, expected_current=current)
     assert "cargo" in full and any(p.get("deps") for p in full["cargo"]), "Cargo-зависимости не извлечены"
 
     with tempfile.TemporaryDirectory(prefix="renovate-rust-test-") as tmp:
         directory = Path(tmp)
         shutil.copy(ROOT / "renovate.json", directory)
         shutil.copy(ROOT / "rust-toolchain.toml", directory)
+        # Историческая версия — только в изолированном сценарии, не в production CI.
+        historical = "1.88.0"
+        fixture_cargo = cargo.replace(f'rust-version = "{current}"', f'rust-version = "{historical}"', 1)
+        fixture_toolchain = toolchain.replace(f'channel = "{current}"', f'channel = "{historical}"', 1)
+        assert fixture_cargo != cargo or current == historical
+        assert fixture_toolchain != toolchain or current == historical
+        (directory / "Cargo.toml").write_text(fixture_cargo, encoding="utf-8")
+        (directory / "rust-toolchain.toml").write_text(fixture_toolchain, encoding="utf-8")
+        check_expected(
+            run_renovate(directory, mode="lookup", managers=["rust-toolchain", "custom.regex"]),
+            expected_current=historical, require_updates=True,
+        )
         (directory / "Cargo.toml").write_text(
-            cargo + '\n[workspace.metadata]\nrust-version = "9.9.9"\n',
+            fixture_cargo + '\n[workspace.metadata]\nrust-version = "9.9.9"\n',
             encoding="utf-8",
         )
         assert tomllib.loads((directory / "Cargo.toml").read_text())["workspace"]["metadata"]["rust-version"] == "9.9.9"
-        check_expected(run_renovate(directory, mode="extract", managers=["rust-toolchain", "custom.regex"]))
-        (directory / "Cargo.toml").write_text(cargo.replace("rust-version = \"1.88.0\"", "minimum-rust-version = \"1.88.0\""), encoding="utf-8")
-        check_expected(run_renovate(directory, mode="extract", managers=["rust-toolchain", "custom.regex"]), expect_regex=False)
-        doubled = cargo.replace('rust-version = "1.88.0"', 'rust-version = "1.88.0"\nrust-version = "1.89.0"')
+        check_expected(run_renovate(directory, mode="extract", managers=["rust-toolchain", "custom.regex"]), expected_current=historical)
+        (directory / "Cargo.toml").write_text(
+            fixture_cargo.replace(f'rust-version = "{historical}"', f'minimum-rust-version = "{historical}"', 1),
+            encoding="utf-8",
+        )
+        check_expected(run_renovate(directory, mode="extract", managers=["rust-toolchain", "custom.regex"]), expected_current=historical, expect_regex=False)
+        doubled = fixture_cargo.replace(f'rust-version = "{historical}"', f'rust-version = "{historical}"\nrust-version = "1.89.0"', 1)
         try:
             tomllib.loads(doubled)
         except tomllib.TOMLDecodeError:
