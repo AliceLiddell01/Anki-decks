@@ -1,9 +1,8 @@
 [package]
 name = "anki-repo"
 version = "0.1.0"
-# `edition` и `rust-version` принадлежат корневому workspace (`/Cargo.toml`,
-# `[workspace.package]`): toolchain/MSRV объявлены там один раз для всех
-# Rust-участников репозитория, а CI читает их оттуда же.
+# `edition` и MSRV наследуются из корневого `[workspace.package]`.
+# `rust-toolchain.toml` отражает MSRV для rustup; CI проверяет их совпадение.
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
