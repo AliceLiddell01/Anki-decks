@@ -46,8 +46,9 @@ jobs:
           python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
           python3 .github/scripts/check_skill_contracts.py
 
-      - name: Активировать Rust из rust-toolchain.toml
+      - name: Установить Rust из rust-toolchain.toml
         run: |
+          rustup toolchain install
           rustup show active-toolchain
           rustc --version --verbose
           cargo --version
@@ -82,8 +83,9 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Активировать Rust из rust-toolchain.toml
+      - name: Установить Rust из rust-toolchain.toml
         run: |
+          rustup toolchain install
           rustup show active-toolchain
           rustc --version --verbose
           cargo --version
@@ -175,8 +177,9 @@ jobs:
       - name: Получить исходники
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Активировать Rust из rust-toolchain.toml
+      - name: Установить Rust из rust-toolchain.toml
         run: |
+          rustup toolchain install
           rustup show active-toolchain
           rustc --version --verbose
           cargo --version
