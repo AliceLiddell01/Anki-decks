@@ -722,7 +722,7 @@ fn verify(bytes: &[u8]) -> Result<(), Error> {
     let mut names = std::collections::BTreeSet::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         if entry.enclosed_name().is_none() || !names.insert(name) {
             return Err("недопустимое или повторное имя ZIP entry".into());
         }
