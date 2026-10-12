@@ -64,9 +64,11 @@ def check(root):
     if pin.get("profile") != "minimal":
         raise ContractError("rust-toolchain.toml: ожидается profile = 'minimal'")
     components = pin.get("components")
-    if not isinstance(components, list) or len(components) != 2 or set(
-        component for component in components if isinstance(component, str)
-    ) != {"rustfmt", "clippy"}:
+    if (
+        not isinstance(components, list)
+        or not all(isinstance(component, str) for component in components)
+        or sorted(components) != ["clippy", "rustfmt"]
+    ):
         raise ContractError("rust-toolchain.toml: components должны содержать rustfmt и clippy")
     if "path" in pin:
         raise ContractError("rust-toolchain.toml: path не допускается вместе с закреплённым channel")
