@@ -124,10 +124,45 @@ def main():
         assert fixture_toolchain != toolchain or current == historical
         (directory / "Cargo.toml").write_text(fixture_cargo, encoding="utf-8")
         (directory / "rust-toolchain.toml").write_text(fixture_toolchain, encoding="utf-8")
-        check_expected(
-            run_renovate(directory, mode="lookup", managers=["rust-toolchain", "custom.regex"]),
-            expected_current=historical, require_updates=True,
+        historical_result = run_renovate(
+            directory, mode="lookup", managers=["rust-toolchain", "custom.regex"]
         )
+        check_expected(historical_result, expected_current=historical, require_updates=True)
+        historical_custom = select(historical_result, "regex")
+        update_value = historical_custom[0][1]["updates"][0]["newValue"]
+
+        commented = fixture_cargo.replace(
+            f'rust-version = "{historical}"',
+            f'# MSRV {historical}\nrust-version = "{historical}"',
+            1,
+        )
+        (directory / "Cargo.toml").write_text(commented, encoding="utf-8")
+        comment_result = run_renovate(
+            directory, mode="extract", managers=["rust-toolchain", "custom.regex"]
+        )
+        check_expected(comment_result, expected_current=historical)
+        comment_dep = select(comment_result, "regex")[0][1]
+        replace_string = comment_dep["replaceString"]
+        assert f"# MSRV {historical}" not in replace_string, replace_string
+        assert f'rust-version = "{historical}"' in replace_string, replace_string
+        replacement = replace_string.replace(historical, update_value, 1)
+        updated_comment_fixture = commented.replace(replace_string, replacement, 1)
+        assert f"# MSRV {historical}" in updated_comment_fixture
+        assert f'rust-version = "{update_value}"' in updated_comment_fixture
+        assert f"# MSRV {update_value}" not in updated_comment_fixture
+
+        multiline = fixture_cargo.replace(
+            f'rust-version = "{historical}"',
+            f'keywords = [\n  "cli",\n]\nrust-version = "{historical}"',
+            1,
+        )
+        assert tomllib.loads(multiline)["workspace"]["package"]["keywords"] == ["cli"]
+        (directory / "Cargo.toml").write_text(multiline, encoding="utf-8")
+        multiline_result = run_renovate(
+            directory, mode="extract", managers=["rust-toolchain", "custom.regex"]
+        )
+        check_expected(multiline_result, expected_current=historical)
+
         (directory / "Cargo.toml").write_text(
             fixture_cargo + '\n[workspace.metadata]\nrust-version = "9.9.9"\n',
             encoding="utf-8",
