@@ -68,7 +68,7 @@
       ],
       "matchStringsStrategy": "recursive",
       "matchStrings": [
-        "(?:^|\\r?\\n)\\[workspace\\.package\\][ \\t]*(?:#[^\\r\\n]*)?(?:\\r?\\n[ \\t]*(?:#[^\\r\\n]*|[A-Za-z][A-Za-z0-9_-]*[ \\t]*=[^\\r\\n]*|[^\\[\\r\\n][^\\r\\n]*)?)*",
+        "(?:^|\\r?\\n)\\[workspace\\.package\\][ \\t]*(?:#[^\\r\\n]*)?(?:\\r?\\n[ \\t]*(?:#[^\\r\\n]*|[A-Za-z][A-Za-z0-9_-]*[ \\t]*=[^\\r\\n]*|[^ \\t\\[\\r\\n][^\\r\\n]*)?)*",
         "(?:^|\\r?\\n)[ \\t]*rust-version[ \\t]*=[ \\t]*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
       ],
       "depNameTemplate": "rust",

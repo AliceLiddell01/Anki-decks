@@ -163,12 +163,35 @@ def main():
         )
         check_expected(multiline_result, expected_current=historical)
 
-        (directory / "Cargo.toml").write_text(
-            fixture_cargo + '\n[workspace.metadata]\nrust-version = "9.9.9"\n',
-            encoding="utf-8",
+        def metadata_fixture(*, indentation: str, include_workspace_msrv: bool) -> str:
+            rust_version = f'rust-version = "{historical}"\n' if include_workspace_msrv else ""
+            return (
+                '[workspace]\nresolver = "3"\n\n'
+                '[workspace.package]\n'
+                f'{rust_version}edition = "2024"\n\n'
+                f'{indentation}[workspace.metadata]\n'
+                'rust-version = "9.9.9"\n'
+            )
+
+        for indentation in ("", "  "):
+            metadata_cargo = metadata_fixture(indentation=indentation, include_workspace_msrv=True)
+            assert tomllib.loads(metadata_cargo)["workspace"]["metadata"]["rust-version"] == "9.9.9"
+            (directory / "Cargo.toml").write_text(metadata_cargo, encoding="utf-8")
+            check_expected(
+                run_renovate(directory, mode="extract", managers=["rust-toolchain", "custom.regex"]),
+                expected_current=historical,
+            )
+
+        metadata_only = metadata_fixture(indentation="  ", include_workspace_msrv=False)
+        parsed_metadata_only = tomllib.loads(metadata_only)["workspace"]
+        assert "rust-version" not in parsed_metadata_only["package"]
+        assert parsed_metadata_only["metadata"]["rust-version"] == "9.9.9"
+        (directory / "Cargo.toml").write_text(metadata_only, encoding="utf-8")
+        check_expected(
+            run_renovate(directory, mode="extract", managers=["rust-toolchain", "custom.regex"]),
+            expected_current=historical,
+            expect_regex=False,
         )
-        assert tomllib.loads((directory / "Cargo.toml").read_text())["workspace"]["metadata"]["rust-version"] == "9.9.9"
-        check_expected(run_renovate(directory, mode="extract", managers=["rust-toolchain", "custom.regex"]), expected_current=historical)
         (directory / "Cargo.toml").write_text(
             fixture_cargo.replace(f'rust-version = "{historical}"', f'minimum-rust-version = "{historical}"', 1),
             encoding="utf-8",
