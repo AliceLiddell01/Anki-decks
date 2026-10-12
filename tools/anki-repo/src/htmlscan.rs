@@ -26,7 +26,8 @@
 //!   (fail-closed), а санитайз отчёта делает её безвредным текстом.
 
 use std::borrow::Cow;
-use std::ops::Range;
+
+use crate::span::Span;
 
 /// Пробельные символы, которые HTML считает разделителями атрибутов.
 #[must_use]
@@ -45,9 +46,9 @@ pub struct Attribute<'a> {
     ///
     /// `None`, если у атрибута вовсе нет `=`: значение такого атрибута пустое по
     /// семантике, но заменять в источнике нечего.
-    pub value_range: Option<Range<usize>>,
+    pub value_range: Option<Span>,
     /// Байтовый диапазон всего атрибута: имя, `=` и значение.
-    pub span: Range<usize>,
+    pub span: Span,
 }
 
 impl Attribute<'_> {
@@ -82,8 +83,8 @@ impl<'a> Element<'a> {
 
     /// Диапазон всего тега вместе со скобками.
     #[must_use]
-    pub fn span(&self) -> Range<usize> {
-        self.start..self.end + 1
+    pub fn span(&self) -> Span {
+        Span::from(self.start..self.end + 1)
     }
 
     /// Первый атрибут с этим именем (без учёта ASCII-регистра).
@@ -112,7 +113,7 @@ pub enum Tag<'a> {
         /// Индекс `<` открывающего тега.
         start: usize,
         /// Диапазон тела между `>` открывающего тега и закрывающим тегом.
-        body: Range<usize>,
+        body: Span,
         /// Позиция `>` закрывающего тега, если он в источнике есть.
         close_end: Option<usize>,
     },
@@ -319,7 +320,7 @@ pub fn scan_tags(html: &str) -> Vec<Tag<'_>> {
                         tags.push(Tag::RawText {
                             name: element.name,
                             start: element.start,
-                            body: body_start..body_end,
+                            body: Span::from(body_start..body_end),
                             close_end,
                         });
                         position = close_end.map_or(bytes.len(), |end| end + 1);
@@ -421,7 +422,7 @@ fn parse_start_tag<'a>(html: &'a str, start: usize) -> ParsedTag<'a> {
         let attribute_name = &html[attribute_name_start..position];
 
         let mut value: &str = "";
-        let mut value_range: Option<Range<usize>> = None;
+        let mut value_range: Option<Span> = None;
         // Незакрытая кавычка значения: тег не порождает элемента, но уже
         // собранное значение важно потребителю с fail-closed.
         let mut unterminated_value = false;
@@ -452,7 +453,7 @@ fn parse_start_tag<'a>(html: &'a str, start: usize) -> ParsedTag<'a> {
                         end += 1;
                     }
                     value = &html[content_start..end];
-                    value_range = Some(content_start..end);
+                    value_range = Some(Span::from(content_start..end));
                     if end >= bytes.len() {
                         unterminated_value = true;
                         position = end;
@@ -462,7 +463,7 @@ fn parse_start_tag<'a>(html: &'a str, start: usize) -> ParsedTag<'a> {
                 }
                 b'>' => {
                     // `attr=>`: значение пустое, а тег на этом заканчивается.
-                    value_range = Some(value_start..value_start);
+                    value_range = Some(Span::from(value_start..value_start));
                     position = value_start;
                 }
                 _ => {
@@ -471,7 +472,7 @@ fn parse_start_tag<'a>(html: &'a str, start: usize) -> ParsedTag<'a> {
                         end += 1;
                     }
                     value = &html[value_start..end];
-                    value_range = Some(value_start..end);
+                    value_range = Some(Span::from(value_start..end));
                     position = end;
                 }
             }
@@ -482,7 +483,7 @@ fn parse_start_tag<'a>(html: &'a str, start: usize) -> ParsedTag<'a> {
                 name: attribute_name,
                 value,
                 value_range,
-                span: attribute_start..position,
+                span: Span::from(attribute_start..position),
             });
         }
 
@@ -644,12 +645,9 @@ mod tests {
     #[test]
     fn unterminated_tag_is_named_not_guessed() {
         let tags = scan_tags("<img src=\"a.png\"");
-        assert!(
-            matches!(tags.as_slice(), [Tag::Unterminated { .. }]),
-            "{tags:?}"
-        );
+        std::assert_matches!(tags.as_slice(), [Tag::Unterminated { .. }], "{tags:?}");
         let tags = scan_tags("<img src=\"незакрытый>");
-        assert!(matches!(tags.as_slice(), [Tag::Unterminated { .. }]));
+        std::assert_matches!(tags.as_slice(), [Tag::Unterminated { .. }]);
     }
 
     /// У незакрытого тега частично собранное значение обязано сохраниться:
@@ -673,27 +671,25 @@ mod tests {
     #[test]
     fn raw_text_body_is_not_scanned_as_markup() {
         let tags = scan_tags("<style>.a{}</style><img src=\"a.png\">");
-        assert!(
-            matches!(&tags[0], Tag::RawText { name, .. } if name.eq_ignore_ascii_case("style"))
-        );
-        assert!(matches!(tags[1], Tag::Element(ref element) if element.name_is("img")));
+        std::assert_matches!(&tags[0], Tag::RawText { name, .. } if name.eq_ignore_ascii_case("style"));
+        std::assert_matches!(tags[1], Tag::Element(ref element) if element.name_is("img"));
 
         let tags = scan_tags("<script>var x = \"<img src='a.png'>\";</script>");
         assert_eq!(tags.len(), 1, "внутри script разметки нет: {tags:?}");
-        assert!(matches!(tags[0], Tag::RawText { .. }));
+        std::assert_matches!(tags[0], Tag::RawText { .. });
     }
 
     #[test]
     fn raw_text_element_without_close_swallows_the_rest() {
         let tags = scan_tags("<style>body{color:red}");
         assert_eq!(tags.len(), 1);
-        assert!(matches!(
+        std::assert_matches!(
             tags[0],
             Tag::RawText {
                 close_end: None,
                 ..
             }
-        ));
+        );
     }
 
     #[test]
@@ -711,9 +707,22 @@ mod tests {
     fn value_ranges_point_into_the_source() {
         let html = "<img src=\"a.png\">";
         let found = elements(html);
-        let range = found[0].attribute("src").expect("src").value_range.clone();
+        let range = found[0].attribute("src").expect("src").value_range;
         let range = range.expect("диапазон");
         assert_eq!(&html[range], "a.png");
+    }
+
+    #[test]
+    fn empty_quoted_values_keep_their_source_ranges() {
+        for html in [r#"<img src="">"#, "<img src=''>"] {
+            let found = elements(html);
+            let range = found[0]
+                .attribute("src")
+                .expect("src")
+                .value_range
+                .expect("диапазон пустого значения");
+            assert_eq!(&html[range], "");
+        }
     }
 
     #[test]
@@ -758,8 +767,8 @@ mod tests {
             panic!("первый тег — raw-text script, а не {tags:?}");
         };
         assert!(name.eq_ignore_ascii_case("script"));
-        assert_eq!(&html[body.clone()], "alert(1)");
-        assert!(matches!(&tags[1], Tag::Element(element) if element.name_is("p")));
+        assert_eq!(&html[*body], "alert(1)");
+        std::assert_matches!(&tags[1], Tag::Element(element) if element.name_is("p"));
     }
 
     /// Комментарий кончается там, где его закрывает браузер, а не там, где рядом `-->`.

@@ -54,6 +54,7 @@ pub mod render;
 pub mod report;
 pub mod run;
 pub mod selection;
+pub mod span;
 pub mod template;
 pub mod text;
 pub mod write;

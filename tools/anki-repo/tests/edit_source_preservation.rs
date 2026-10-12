@@ -316,12 +316,22 @@ fn repeated_apply_never_rewrites_the_file() {
         assert_eq!(dir.deck_json_bytes(), settled, "файл не переписывался");
     }
 
-    // Даже mtime не должен меняться: записи не было.
+    // Метка заведомо в прошлом: переписывание различимо даже на файловой
+    // системе с секундным разрешением времени. Сравниваем прочитанную метку,
+    // учитывая округление самой файловой системой, и inode атомарной замены.
+    use std::os::unix::fs::MetadataExt;
+    let path = dir.path().join("deck.json");
+    std::fs::set_times(
+        &path,
+        std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800)),
+    )
+    .expect("установить контрольную метку");
+    let inode = std::fs::metadata(&path).expect("metadata").ino();
     let modified = std::fs::metadata(dir.path().join("deck.json"))
         .expect("metadata")
         .modified()
         .expect("mtime");
-    std::thread::sleep(std::time::Duration::from_millis(20));
     let attempt = args("--apply");
     let (exit, _, _) = run_cli_in(
         None,
@@ -336,6 +346,8 @@ fn repeated_apply_never_rewrites_the_file() {
         modified,
         "идемпотентный повтор не должен перезаписывать файл"
     );
+    assert_eq!(std::fs::metadata(&path).expect("metadata").ino(), inode);
+    assert_eq!(dir.deck_json_bytes(), settled, "байты сохранены");
 }
 
 #[test]

@@ -4661,7 +4661,7 @@ async fn pitch_session_age_rotates_between_items_and_production_limits_are_expli
     assert_eq!(super::PitchRunPolicy::default().max_items, 64);
     assert_eq!(
         super::PitchRunPolicy::default().max_age,
-        std::time::Duration::from_secs(20 * 60)
+        std::time::Duration::from_mins(20)
     );
 }
 

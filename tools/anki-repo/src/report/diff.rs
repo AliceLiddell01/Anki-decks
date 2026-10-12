@@ -194,24 +194,15 @@ pub fn has_changes(before: &str, after: &str) -> bool {
 fn next_token_len(rest: &str) -> usize {
     let first = rest.chars().next().expect("rest проверен на непустоту");
 
-    if first == '<'
-        && let Some(length) = tag_len(rest)
-    {
-        return length;
+    match first {
+        '<' if let Some(length) = tag_len(rest) => length,
+        '&' if let Some(length) = entity_len(rest) => length,
+        symbol if symbol.is_whitespace() => run_len(rest, char::is_whitespace),
+        symbol if symbol.is_ascii_alphanumeric() => {
+            run_len(rest, |symbol| symbol.is_ascii_alphanumeric())
+        }
+        symbol => symbol.len_utf8(),
     }
-    if first == '&'
-        && let Some(length) = entity_len(rest)
-    {
-        return length;
-    }
-    if first.is_whitespace() {
-        return run_len(rest, char::is_whitespace);
-    }
-    if first.is_ascii_alphanumeric() {
-        return run_len(rest, |symbol| symbol.is_ascii_alphanumeric());
-    }
-
-    first.len_utf8()
 }
 
 /// Длина HTML-тега вместе с угловыми скобками, если он есть.

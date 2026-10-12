@@ -692,7 +692,7 @@ fn repeated_unicode_and_ascii_links_are_rebuilt_from_the_original_text() {
         let legacy = format!("{surface}.png");
         let canonical = format!("{surface}.pitch.png");
         let original = format!(
-            "начало <img src=\"{legacy}\"> промежуток 漢字 <img SRC='{legacy}'> / <IMG src={legacy}> конец"
+            "開始 <div title='日本語'><img src=\"　{legacy}　\"> промежуток 漢字 <span><img SRC=' {legacy} '></span> / <IMG src={legacy}></div> 終了"
         );
         let mut value = fixture.document();
         value["notes"][0]["fields"][1] = json!(original);

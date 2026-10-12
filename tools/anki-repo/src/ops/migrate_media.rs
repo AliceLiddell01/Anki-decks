@@ -25,7 +25,6 @@
 //! дают `copy`, а занятое чужими байтами каноническое имя — отказ.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use asset_store::{AssetIdentity, VerifiedAssetBytes};
@@ -41,6 +40,7 @@ use crate::ops::publish::{self, Candidate};
 use crate::ops::source::{
     self, EditableSource, ValidationDelta, internal, load_editable_source, validation_delta,
 };
+use crate::span::Span;
 use crate::{details, htmlscan, media, write};
 
 /// Стабильная причина отказа, когда ссылку на legacy-имя нельзя доказать.
@@ -416,7 +416,7 @@ struct Rewrite {
     /// Позиция поля в заметке.
     field_ord: usize,
     /// Диапазон значения атрибута внутри текста поля.
-    range: Range<usize>,
+    range: Span,
     /// Свидетельство для отчёта.
     reference: MigratedReference,
 }
@@ -545,7 +545,7 @@ fn field_at(model: &NoteModel, position: usize) -> Option<(&str, i64)> {
 /// Это ровно `<img src="<legacy>">` — та же форма, которой владеет обработчик
 /// домена. Всё остальное (`srcset`, CSS, `[sound:]`, незакрытый тег, чужое имя
 /// элемента, имя с каталогом) остаётся вне набора и приводит к отказу.
-fn claimable_ranges(text: &str, legacy: &str) -> Vec<Range<usize>> {
+fn claimable_ranges(text: &str, legacy: &str) -> Vec<Span> {
     let mut found = Vec::new();
     for tag in htmlscan::scan_tags(text) {
         let htmlscan::Tag::Element(element) = tag else {
@@ -558,17 +558,17 @@ fn claimable_ranges(text: &str, legacy: &str) -> Vec<Range<usize>> {
             if !attribute.name.eq_ignore_ascii_case("src") {
                 continue;
             }
-            let Some(value_range) = attribute.value_range.clone() else {
+            let Some(value_range) = attribute.value_range else {
                 continue;
             };
             for candidate in media::split_attribute_values(attribute.name, attribute.value) {
                 if candidate.text != legacy {
                     continue;
                 }
-                found.push(
+                found.push(Span::from(
                     value_range.start + candidate.range.start
                         ..value_range.start + candidate.range.end,
-                );
+                ));
             }
         }
     }

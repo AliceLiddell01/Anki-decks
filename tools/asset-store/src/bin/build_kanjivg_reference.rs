@@ -1,3 +1,6 @@
+#[path = "common/reference_output.rs"]
+mod reference_output;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
@@ -55,9 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(&raw)?;
     let compressed = encoder.finish()?;
-    let temp = output.with_extension("zlib.tmp");
-    fs::write(&temp, &compressed)?;
-    fs::rename(&temp, &output)?;
+    reference_output::publish(&output, &compressed)?;
     println!(
         "templates={} raw_bytes={} compressed_bytes={} sha256={}",
         raw.len().saturating_sub(8) / (4 + MASK_BYTES),

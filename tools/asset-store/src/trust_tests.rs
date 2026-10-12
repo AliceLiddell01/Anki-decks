@@ -355,10 +355,10 @@ fn hash_and_path_integrity_cannot_be_overridden() {
         let error = fixture
             .attest(&record.sha256, HumanDecision::Approve)
             .unwrap_err();
-        assert!(matches!(
+        std::assert_matches!(
             error.code,
             ErrorCode::IntegrityMismatch | ErrorCode::BoundaryViolation
-        ));
+        );
     }
 }
 

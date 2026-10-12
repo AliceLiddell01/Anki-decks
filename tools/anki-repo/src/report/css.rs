@@ -31,7 +31,7 @@
 //! CSS-парсером и не пытается им быть: он лексический, и всё, что он не смог
 //! разобрать однозначно, он называет адресом, а не пропускает.
 
-use std::ops::Range;
+use crate::span::Span;
 
 /// Как записан адрес в CSS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +47,7 @@ pub enum AddressForm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {
     /// Диапазон конструкции, которую нужно нейтрализовать.
-    pub span: Range<usize>,
+    pub span: Span,
     /// Декодированный адрес: escape-последовательности уже развёрнуты.
     pub target: String,
     /// Как адрес записан в источнике.
@@ -58,7 +58,7 @@ pub struct Address {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// `@import` в любой записи: правило целиком, включая точку с запятой.
-    Import(Range<usize>),
+    Import(Span),
     /// Адрес, за которым браузер пошёл бы.
     Address(Address),
 }
@@ -66,10 +66,10 @@ pub enum Event {
 impl Event {
     /// Диапазон, который событие занимает в источнике.
     #[must_use]
-    pub fn span(&self) -> Range<usize> {
+    pub fn span(&self) -> Span {
         match self {
-            Self::Import(span) => span.clone(),
-            Self::Address(address) => address.span.clone(),
+            Self::Import(span) => *span,
+            Self::Address(address) => address.span,
         }
     }
 }
@@ -202,7 +202,7 @@ impl Scanner<'_> {
         let name = name.to_ascii_lowercase();
         if name == "import" && !self.imports_are_addresses {
             let end = self.end_of_at_rule();
-            self.events.push(Event::Import(start..end));
+            self.events.push(Event::Import(Span::from(start..end)));
             self.pos = end;
             self.pending_at_rule = Some(name.clone());
             self.note("at-rule");
@@ -243,7 +243,7 @@ impl Scanner<'_> {
         let lower = name.to_ascii_lowercase();
         if escaped_at && lower == "import" && !self.imports_are_addresses {
             let end = self.end_of_at_rule();
-            self.events.push(Event::Import(start..end));
+            self.events.push(Event::Import(Span::from(start..end)));
             self.pos = end;
             self.pending_at_rule = Some(lower.clone());
             self.note("at-rule");
@@ -300,7 +300,7 @@ impl Scanner<'_> {
         };
         self.pos = if close.is_some() { end + 1 } else { end };
         self.events.push(Event::Address(Address {
-            span,
+            span: Span::from(span),
             target,
             form: AddressForm::Url,
         }));
@@ -314,7 +314,7 @@ impl Scanner<'_> {
         let is_address = self.string_is_address();
         if is_address {
             self.events.push(Event::Address(Address {
-                span: start..self.pos,
+                span: Span::from(start..self.pos),
                 target: value,
                 form: AddressForm::String,
             }));
@@ -611,10 +611,10 @@ mod tests {
             .into_iter()
             .filter_map(|event| match event {
                 Event::Address(address) => {
-                    assert_eq!(
-                        &style[address.span.clone()],
-                        &style[address.span.clone()],
-                        "диапазон обязан лежать в источнике"
+                    assert!(
+                        style.get(address.span).is_some(),
+                        "диапазон обязан лежать в источнике и на границах UTF-8: {:?}",
+                        address.span,
                     );
                     Some(address.target)
                 }
@@ -704,7 +704,7 @@ mod tests {
     fn an_import_rule_is_one_event_and_carries_no_nested_address() {
         let events = scan("@import url(https://evil.example/a.css); a { color: red }");
         assert_eq!(events.len(), 1, "{events:?}");
-        assert!(matches!(events[0], Event::Import(_)));
+        std::assert_matches!(events[0], Event::Import(_));
     }
 
     #[test]
@@ -745,11 +745,11 @@ mod tests {
         let events = scan(style);
         assert_eq!(events.len(), 1);
         let span = events[0].span();
-        assert_eq!(span, 13..style.len());
+        assert_eq!(span, Span::from(13..style.len()));
         assert_eq!(
             events[0],
             Event::Address(Address {
-                span: 13..style.len(),
+                span: Span::from(13..style.len()),
                 target: "https://evil.example/a.png".to_string(),
                 form: AddressForm::Url,
             })
