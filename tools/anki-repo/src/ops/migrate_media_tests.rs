@@ -9,6 +9,7 @@
 use super::*;
 use crate::ops::create::{CreateResult, create_with_options, parse_request_bytes};
 use crate::test_support::TempDir;
+use asset_store::hashing::sha256_hex;
 use asset_store::kanji_validator::KanjiImageValidator;
 use asset_store::pitch_accent::PitchAccentImageValidator;
 use asset_store::{
@@ -17,7 +18,6 @@ use asset_store::{
     ValidationEvidence, ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::fs;
 
 /// Экспорт с двумя полями одной модели: kanji-обработчик на `Заголовок` и
@@ -321,7 +321,7 @@ fn legacy_pitch_reference_migrates_and_frees_the_kanji_fallback_name() {
     assert_eq!(dry.canonical_action, "copy");
     assert_eq!(
         dry.canonical_sha256,
-        format!("{:x}", Sha256::digest(PITCH_PNG))
+        sha256_hex(PITCH_PNG)
     );
     assert_eq!(dry.references_total, 1);
     assert_eq!(dry.references[0].guid.as_deref(), Some("guid-1"));
@@ -333,7 +333,7 @@ fn legacy_pitch_reference_migrates_and_frees_the_kanji_fallback_name() {
     assert!(dry.legacy_declared);
     let digest = dry.legacy_media.as_ref().expect("legacy-файл на месте");
     assert_eq!(digest.byte_length, LEGACY_PNG.len());
-    assert_eq!(digest.sha256, format!("{:x}", Sha256::digest(LEGACY_PNG)));
+    assert_eq!(digest.sha256, sha256_hex(LEGACY_PNG));
     // Dry-run ничего не записал.
     assert_eq!(fixture.read_media("飴.png").as_deref(), Some(LEGACY_PNG));
     assert_eq!(fixture.read_media("飴.pitch.png"), None);
@@ -562,7 +562,7 @@ fn kanji_domain_policy_is_the_owner_of_the_consumer_name() {
     let pitch = PitchAccentDomainPolicy
         .canonical_location(
             &AssetIdentity::new("pitch_accent", "飴").unwrap(),
-            &format!("{:x}", Sha256::digest(PITCH_PNG)),
+            &sha256_hex(PITCH_PNG),
             DetectedFormat::Png,
         )
         .unwrap();
@@ -570,7 +570,7 @@ fn kanji_domain_policy_is_the_owner_of_the_consumer_name() {
     let kanji = KanjiDomainPolicy
         .canonical_location(
             &AssetIdentity::new("kanji", "飴").unwrap(),
-            &format!("{:x}", Sha256::digest(KANJI_PNG)),
+            &sha256_hex(KANJI_PNG),
             DetectedFormat::Png,
         )
         .unwrap();
@@ -857,7 +857,7 @@ fn migration_render_preserves_pre_state_and_reports_actual_post_state() {
         if result.changed {
             assert_eq!(
                 data["legacy_media"]["sha256"],
-                format!("{:x}", Sha256::digest(LEGACY_PNG))
+                sha256_hex(LEGACY_PNG)
             );
         } else {
             assert!(data["legacy_media"].is_null());

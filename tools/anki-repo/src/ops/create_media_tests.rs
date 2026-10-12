@@ -4,6 +4,7 @@
 use super::*;
 use crate::ops::create::{MAX_REPORTED_NOTES, create_with_options, parse_request_bytes};
 use crate::test_support::{MINIMAL_EXPORT, TempDir};
+use asset_store::hashing::sha256_hex;
 use asset_store::{
     AssetRecord, DetectedFormat, HumanAttestationRequest, HumanDecision, IngestRequest,
     LifecycleState, Provenance, SelectionMode, SemanticDecision, SemanticStatus, SemanticValidator,
@@ -11,7 +12,6 @@ use asset_store::{
     VerifiedIngestRequest,
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::fs;
 
 struct Fixture {
@@ -241,7 +241,7 @@ fn verified_asset_fixture(
             identity,
             storage_path: storage_path.into(),
             consumer_filename: consumer_filename.into(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
             byte_length: bytes.len() as u64,
             format,
             provenance: Provenance {

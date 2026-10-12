@@ -27,7 +27,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "yaml_serde",
 ]

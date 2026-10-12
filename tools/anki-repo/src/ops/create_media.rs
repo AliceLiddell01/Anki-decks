@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use asset_store::hashing::sha256_hex;
 use asset_store::kanji_validator::KanjiImageValidator;
 use asset_store::pitch_accent::PitchAccentImageValidator;
 use asset_store::store::VerifiedAssetBytes;
@@ -16,7 +17,6 @@ use asset_store::{
 use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, openat, unlinkat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::error::{DomainError, ErrorCode};
 use crate::ops::create::MAX_REPORTED_NOTES;
@@ -876,7 +876,7 @@ fn media_file_digest_from_export(
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(io_failure)?;
-    Ok(Some((bytes.len(), format!("{:x}", Sha256::digest(&bytes)))))
+    Ok(Some((bytes.len(), sha256_hex(&bytes))))
 }
 
 /// Сверяет физический файл с отпечатком, снятым при построении плана миграции.
@@ -1007,7 +1007,7 @@ fn exact_state(directory: &File, name: &str, expected: &[u8]) -> Result<&'static
         return Err(blocker(
             ErrorCode::ExpectedMismatch,
             "destination_media_conflict",
-            json!({"filename": name, "expected_sha256": format!("{:x}", Sha256::digest(expected)), "actual_sha256": format!("{:x}", Sha256::digest(&bytes)), "action": "conflict"}),
+            json!({"filename": name, "expected_sha256": sha256_hex(expected), "actual_sha256": sha256_hex(&bytes), "action": "conflict"}),
         ));
     }
     Ok("reuse")
