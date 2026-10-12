@@ -22,15 +22,58 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # Закрывающая граница не допускает info string: ```` ```python ```` — это строка
 # содержимого блока, а не его конец.
 FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+# GitHub скрывает HTML-комментарии, поэтому заголовки внутри них не являются
+# видимыми разделами body. Внутри код-блока `<!--` — литерал, а не комментарий.
+
+
+def strip_comments(lines: list[str]) -> list[str]:
+    """Remove HTML comments line by line, leaving fenced code blocks intact."""
+    result: list[str] = []
+    inside = False
+    fence_char = ""
+    fence_len = 0
+    for line in lines:
+        if fence_char:
+            closing = FENCE_CLOSE.match(line)
+            if closing and closing.group(1)[0] == fence_char and len(closing.group(1)) >= fence_len:
+                fence_char = ""
+            result.append(line)
+            continue
+        if opening := FENCE.match(line):
+            fence_char, fence_len = opening.group(1)[0], len(opening.group(1))
+            result.append(line)
+            continue
+        visible = ""
+        rest = line
+        while rest:
+            if inside:
+                end = rest.find("-->")
+                if end < 0:
+                    rest = ""
+                    continue
+                inside = False
+                rest = rest[end + 3:]
+                continue
+            start = rest.find("<!--")
+            if start < 0:
+                visible += rest
+                rest = ""
+                continue
+            visible += rest[:start]
+            inside = True
+            rest = rest[start + 4:]
+        result.append(visible)
+    return result
 
 
 def sections(body: str) -> list[tuple[str, str]]:
-    """Extract level-two headings and their text, ignoring fenced code examples."""
+    """Extract visible level-two headings and their text."""
+    lines = strip_comments(body.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
     found: list[tuple[str, str]] = []
     active: list[str] = []
     fence_char = ""
     fence_len = 0
-    for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    for line in lines:
         if fence_char:
             closing = FENCE_CLOSE.match(line)
             if closing and closing.group(1)[0] == fence_char and len(closing.group(1)) >= fence_len:

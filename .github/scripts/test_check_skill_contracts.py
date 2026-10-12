@@ -42,6 +42,23 @@ class SkillContractTests(unittest.TestCase):
         self.write_skill("# Just text")
         self.assertTrue(any("frontmatter" in x for x in validate_skill(self.file)))
 
+    def test_directory_without_manifest_fails(self):
+        self.write_skill()
+        (self.folder / "SKILL.md").unlink()
+        self.assertTrue(any("SKILL.md" in x for x in validate_tree(self.root)))
+
+    def test_broken_yaml_values_are_rejected(self):
+        for value in ("[broken", '"unterminated', "'unterminated", "{a: 1", "trailing,"):
+            with self.subTest(value=value):
+                self.write_skill(f"---\nname: sample-skill\ndescription: {value}\n---\n")
+                self.assertTrue(any("неразбираемое" in x for x in validate_skill(self.file)))
+
+    def test_valid_quoted_and_block_scalars(self):
+        self.write_skill('---\nname: sample-skill\ndescription: "Краткое описание."\n---\n', body="Без ссылок.")
+        self.assertEqual(validate_skill(self.file), [])
+        self.write_skill(body="Без ссылок.")
+        self.assertEqual(validate_skill(self.file), [])
+
 
 if __name__ == "__main__":
     unittest.main()

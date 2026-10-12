@@ -10,6 +10,22 @@ NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 KEY = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):(?:\s*(.*))?$")
 LINK = re.compile(r"\]\(([^)]+)\)")
 ALLOWED = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+# Значения вне блочных скаляров должны быть корректными скалярами YAML: незакрытые
+# кавычки и непарные flow-скобки делают frontmatter неразбираемым для потребителя.
+PLAIN_UNSAFE = re.compile(r"^\s*[\[{]")
+
+
+def syntax_error(value: str) -> str | None:
+    """Return a reason when a frontmatter value is not a parsable YAML scalar."""
+    if value.startswith(("'", '"')):
+        return None if len(value) > 1 and value.endswith(value[0]) else "незакрытая кавычка"
+    if PLAIN_UNSAFE.match(value) or value.endswith(("[", "{", ",")):
+        return "непарная flow-скобка"
+    if ": " in value or value.endswith(":"):
+        return "неожиданное ':' внутри скаляра"
+    if value.endswith("\\"):
+        return "висячий escape"
+    return None
 
 
 def validate_skill(path: Path) -> list[str]:
@@ -41,6 +57,12 @@ def validate_skill(path: Path) -> list[str]:
             entries[key] = (i, value)
         if key not in ALLOWED:
             errors.append(f"{path}: нестандартное поле {key}; условия активации помещай в description")
+        # Блочный скаляр (`|`, `>`) продолжается отступленными строками и
+        # проверяется отдельно при разборе description.
+        if value not in (">-", ">", "|-", "|", "|+", ">+"):
+            reason = syntax_error(value)
+            if reason:
+                errors.append(f"{path}: неразбираемое значение {key}: {reason}")
     name = entries.get("name", (-1, ""))[1]
     if not NAME.fullmatch(name) or len(name) > 64 or name != path.parent.name:
         errors.append(f"{path}: name должен совпадать с каталогом и отвечать Agent Skills spec")
@@ -67,10 +89,14 @@ def validate_skill(path: Path) -> list[str]:
 
 
 def validate_tree(root: Path) -> list[str]:
-    skills = sorted((root / ".agents" / "skills").glob("*/SKILL.md"))
-    if not skills:
-        return ["Нет skills в .agents/skills/"]
-    return [error for skill in skills for error in validate_skill(skill)]
+    base = root / ".agents" / "skills"
+    directories = sorted((path for path in base.glob("*") if path.is_dir()), key=lambda path: path.name)
+    if not directories:
+        return ["Нет каталогов skills в .agents/skills/"]
+    # Каталог skill без манифеста — тоже нарушение контракта: обход по
+    # `*/SKILL.md` такую поломку не заметил бы.
+    missing = [f"{directory}: отсутствует SKILL.md" for directory in directories if not (directory / "SKILL.md").is_file()]
+    return missing + [error for skill in sorted(base.glob("*/SKILL.md")) for error in validate_skill(skill)]
 
 
 def main() -> int:

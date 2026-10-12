@@ -53,6 +53,25 @@ class PrBodyContractTests(unittest.TestCase):
         # что уже лежало внутри, остаётся примером, а не разделом body.
         self.assertEqual(len(validate("```md\n" + valid_body() + "\n````")), len(HEADINGS))
 
+    def test_headings_in_html_comment_are_not_real(self):
+        # GitHub скрывает HTML-комментарии, поэтому шаблон внутри них не является телом PR.
+        self.assertEqual(len(validate(f"<!--\n{valid_body()}\n-->")), len(HEADINGS))
+
+    def test_unterminated_comment_hides_rest(self):
+        body = f"## Цель\nИнформация.\n<!-- {chr(10)}" + "\n\n".join(f"## {n}\nИнформация." for n in HEADINGS[1:])
+        self.assertTrue(any("Область изменений" in e for e in validate(body)))
+
+    def test_inline_comment_keeps_section_text(self):
+        body = valid_body().replace("Фактическая информация для раздела CI.", "<!-- пояснение -->\nФакт CI.")
+        self.assertEqual(validate(body), [])
+
+    def test_comment_marker_inside_fence_is_literal(self):
+        # Внутри код-блока `<!--` — пример, а не комментарий, поэтому описанный
+        # в примере заголовок не становится разделом реального body.
+        self.assertEqual(len(validate("```md\n<!--\n" + valid_body() + "\n-->\n```")), len(HEADINGS))
+        documented = valid_body() + "\n\n```md\n<!-- скрытый пример -->\n```"
+        self.assertEqual(validate(documented), [])
+
     def test_fenced_content_does_not_make_section_nonempty(self):
         body = valid_body().replace("Фактическая информация для раздела CI.", "```md\nThis is a sample, not CI evidence.\n```")
         self.assertTrue(any("Пустой" in e for e in validate(body)))
