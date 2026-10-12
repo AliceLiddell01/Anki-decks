@@ -66,7 +66,7 @@ recovery baseline, а не поводом затереть доказанные 
 Перед публикацией проверь по локальному файлу: title, body, base/head, реально
 выполненные проверки и фактические ограничения. Содержательную структуру body
 сверь с [`pr-body.md`](pr-body.md) и запусти
-`.github/scripts/check_pr_body.py --body-file <путь>`.
+`python3 .github/scripts/check_pr_body.py --body-file <путь>`.
 
 Если задача явно выполняется **только через GitHub MCP/API**, без доступного
 локального checkout и `gh`, сохрани Markdown-source во временном рабочем файле

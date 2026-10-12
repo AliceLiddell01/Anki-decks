@@ -65,6 +65,19 @@ class SkillContractTests(unittest.TestCase):
                 self.write_skill(f"---\nname: sample-skill\ndescription: {marker}\n  Достаточное описание.\n---\n", body="Без ссылок.")
                 self.assertEqual(validate_skill(self.file), [])
 
+    def test_flow_collections_are_accepted(self):
+        # `metadata` — YAML-отображение, поэтому корректные flow-структуры допустимы.
+        for value in ("{author: x}", "{author: [a, b]}", "{author: '}'}"):
+            with self.subTest(value=value):
+                self.write_skill(f"---\nname: sample-skill\ndescription: Demo.\nmetadata: {value}\n---\n", body="Без ссылок.")
+                self.assertEqual(validate_skill(self.file), [])
+
+    def test_unbalanced_flow_collections_are_rejected(self):
+        for value in ("{author: x", "[broken", "{author: x} extra", "}"):
+            with self.subTest(value=value):
+                self.write_skill(f"---\nname: sample-skill\ndescription: Demo.\nmetadata: {value}\n---\n", body="Без ссылок.")
+                self.assertTrue(any("flow" in x for x in validate_skill(self.file)), value)
+
     def test_valid_quoted_and_block_scalars(self):
         self.write_skill('---\nname: sample-skill\ndescription: "Краткое описание."\n---\n', body="Без ссылок.")
         self.assertEqual(validate_skill(self.file), [])

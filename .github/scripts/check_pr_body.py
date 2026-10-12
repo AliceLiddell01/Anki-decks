@@ -17,7 +17,8 @@ REQUIRED = (
     "Ограничения",
 )
 BOT_BRANCHES = {"renovate[bot]": "renovate/", "dependabot[bot]": "dependabot/"}
-HEADING = re.compile(r"^ {0,3}##\s+(.+?)\s*$")
+# ATX-заголовок: закрывающие `#` — часть оформления, а не имени раздела.
+HEADING = re.compile(r"^ {0,3}##\s+(.+?)(?:\s+#+)?\s*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # Закрывающая граница не допускает info string: ```` ```python ```` — это строка
 # содержимого блока, а не его конец.

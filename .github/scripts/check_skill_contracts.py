@@ -12,10 +12,46 @@ LINK = re.compile(r"\]\(([^)]+)\)")
 ALLOWED = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
 # Все формы блочных скаляров YAML: значение продолжается отступленными строками.
 BLOCK_SCALARS = (">", ">-", ">+", "|", "|-", "|+")
-# Значения вне блочных скаляров должны быть корректными скалярами YAML: незакрытые
-# кавычки, текст после закрывающей кавычки и непарные flow-скобки делают frontmatter
-# неразбираемым для потребителя.
-PLAIN_UNSAFE = re.compile(r"^\s*[\[{]")
+# Flow-структуры YAML допустимы (`metadata: {author: x}`), недопустимы только
+# незакрытые или несбалансированные: они делают frontmatter неразбираемым.
+FLOW_MAP = {"[": "]", "{": "}"}
+CLOSING = set(FLOW_MAP.values())
+
+
+def flow_error(value: str) -> str | None:
+    """Check a value that starts with a flow bracket: balance and trailing text."""
+    stack: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                # Удвоенная одинарная кавычка — escape внутри одинарного скаляра.
+                if quote == "'" and value[index + 1:index + 2] == "'":
+                    index += 2
+                    continue
+                quote = ""
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char in FLOW_MAP:
+            stack.append(FLOW_MAP[char])
+        elif char in CLOSING:
+            if not stack or stack.pop() != char:
+                return "несбалансированная flow-скобка"
+            if not stack and value[index + 1:].strip():
+                return "текст после flow-структуры"
+        index += 1
+    if quote:
+        return "незакрытая кавычка"
+    if stack:
+        return "незакрытая flow-скобка"
+    return None
 
 
 def quoted_error(value: str) -> str | None:
@@ -41,7 +77,11 @@ def syntax_error(value: str) -> str | None:
     """Return a reason when a frontmatter value is not a parsable YAML scalar."""
     if value.startswith(("'", '"')):
         return quoted_error(value)
-    if PLAIN_UNSAFE.match(value) or value.endswith(("[", "{", ",")):
+    if value.startswith(("[", "{")):
+        return flow_error(value)
+    if value.endswith(("[", "{", "]", "}")):
+        return "незакрытая flow-скобка"
+    if value.endswith(","):
         return "непарная flow-скобка"
     if ": " in value or value.endswith(":"):
         return "неожиданное ':' внутри скаляра"

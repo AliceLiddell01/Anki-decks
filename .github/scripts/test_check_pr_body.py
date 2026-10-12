@@ -72,6 +72,11 @@ class PrBodyContractTests(unittest.TestCase):
         documented = valid_body() + "\n\n```md\n<!-- скрытый пример -->\n```"
         self.assertEqual(validate(documented), [])
 
+    def test_atx_closing_hashes_are_not_part_of_heading_name(self):
+        # `## Цель ##` — корректный ATX-заголовок, и GitHub показывает имя «Цель».
+        self.assertEqual(validate("\n\n".join(f"## {n} ##\nИнформация." for n in HEADINGS)), [])
+        self.assertEqual(validate("\n\n".join(f"## {n} ###\nИнформация." for n in HEADINGS)), [])
+
     def test_fenced_content_does_not_make_section_nonempty(self):
         body = valid_body().replace("Фактическая информация для раздела CI.", "```md\nThis is a sample, not CI evidence.\n```")
         self.assertTrue(any("Пустой" in e for e in validate(body)))
