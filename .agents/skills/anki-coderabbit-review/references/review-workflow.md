@@ -238,8 +238,9 @@ focus-текст, по описанию самого CLI, требует early a
 review-возможность, которая меняет характер review, поэтому правила такие:
 
 - обычный CodeRabbit cycle **не** становится deep по умолчанию; `--deep`
-  добавляется только тогда, когда пользователь явно запросил deep/deep review,
-  назвал focus, либо иной явно определённый контракт этого требует;
+  добавляется только тогда, когда пользователь явно запросил deep review — как
+  без focus, так и с ним (то есть явно запросил deep или deep с focus);
+  одиночный запрос тематического focus обычного review не разрешает `--deep`;
 - focus передаётся **дословно**, без переформулирования, сокращения и потери
   значения: если пользователь задал смысл, его нельзя заменить своим;
 - нельзя молча отбросить `--deep` и прогнать обычный review вместо запрошенного;
@@ -677,22 +678,15 @@ CLI умеет заметно больше, чем этот cycle, и расши
 потому, что новая версия получила новую команду, не нужно. Осознанно вне
 назначения этого skill остаются:
 
-- **`coderabbit review --remote <owner/repo> --source-branch <ref> --base
-  <branch>`** — review без локального checkout. Назначение этого skill — review
-  текущего checkout, поэтому remote mode не включается сюда: он ломает
-  current-checkout invariant и требует собственного явного trigger'а. Не
-  переводи запрос «локального» CodeRabbit cycle в remote review. - **`coderabbit
-  pullrequest <number-or-url>`** — чтение уже существующего вывода CodeRabbit по
-  GitHub PR (prompts, inline threads). Это не запуск локального review и не
-  замена ему; не подменяй им cycle и не выдавай его вывод за authority
-  завершённого локального review. - **Cloud Coding Agent: `coderabbit code
-  handoff`, `coderabbit code skills import`** — передача локальной сессии в
-  облачную задачу и управление облачными skills. - **`coderabbit skills`** —
-  установка собственных user-level skills CodeRabbit для поддерживаемых агентов;
-  к установке repository skills этого репозитория отношения не имеет. -
-  **Генерация и применение repository config** (`coderabbit config`, `coderabbit
-  config apply`) — отдельная задача про конфигурацию; в cycle допустим только
-  `coderabbit config validate`.
+- **`coderabbit review --remote <owner/repo> --source-branch <ref> --base <branch>`** —
+  серверный review без локального checkout. Не подменяй им локальный цикл.
+- **`coderabbit pullrequest <number-or-url>`** — чтение существующего вывода по PR,
+  не новый локальный review и не доказательство его завершённости.
+- **Cloud Coding Agent** (`coderabbit code handoff`, `coderabbit code skills import`)
+  — облачные задачи и управление их навыками.
+- **`coderabbit skills`** — user-level skills CodeRabbit, не skills репозитория.
+- **`coderabbit config` / `config apply`** — отдельная задача настройки;
+  в этом цикле допустим только `coderabbit config validate`.
 
 Если для одной из этих возможностей появится настоящий пользовательский запрос,
 это отдельная задача и, возможно, отдельный skill, а не тихое расширение этого.

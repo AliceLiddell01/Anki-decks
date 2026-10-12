@@ -1,0 +1,20 @@
+name: Контракт описания PR
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+
+jobs:
+  pr-body:
+    name: Структура PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Получить валидатор
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Тесты скриптов и метаданные Agent Skills проверяет job «Форматирование и
+      # Clippy» в ci.yml: он покрывает и push в default branch. Здесь остаётся
+      # только проверка, которой нужно событие PR, — описание самого PR.
+      - name: Проверить реальное описание PR
+        run: python3 .github/scripts/check_pr_body.py --event-path "$GITHUB_EVENT_PATH"

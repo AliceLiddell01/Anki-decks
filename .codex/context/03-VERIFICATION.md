@@ -293,33 +293,46 @@ cargo run --quiet --bin anki-repo -- visual-report \
 `permissions: contents: read`: он не публикует артефакты, не использует секреты и
 ничего не пишет в репозиторий.
 
-Два job'а:
+Три job'а (точные команды и актуальные флаги определяет сам workflow):
 
-- «Код и тесты» — на стабильном тулчейне, из корня репозитория:
-  - `cargo fmt --all --check`;
-  - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
-  - `cargo test --workspace --locked`;
-  - проверка найденных CrowdAnki-экспортов: шаг сам ищет `deck.json` внутри
-    `decks/` и вызывает для каждого `validate`. Конкретные колоды, уровни, модели
-    заметок и имена полей в workflow не зашиты; если экспортов нет, шаг
-    завершается успешно. Структурно невалидный найденный экспорт, наоборот, даёт
-    non-zero итог шага: валидность live payload под `decks/**` — обязательный
-    repository gate.
-- «Заявленная MSRV» — отдельный job: читает версию из корневого `Cargo.toml`
-  через `cargo metadata --no-deps --format-version 1` (поле `rust_version`
-  участников workspace), проверяет, что участники не расходятся в этой версии,
-  ставит её и выполняет
-  `cargo +<msrv> check --workspace --all-targets --locked`. Версия MSRV не
-  дублируется в workflow: единственный владелец — `[workspace.package]` корневого
-  манифеста.
+- «Форматирование и Clippy» — единственный владелец проверок, не зависящих от
+  данных репозитория: регрессионные тесты `.github/scripts/test_*.py` и проверка
+  метаданных и ссылок Agent Skills; затем `cargo fmt --all --check` и
+  `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
+- «Код и тесты» — `cargo test --workspace --locked --profile ci`,
+  проверки verified-only корпусов кандзи и pitch-accent, а также
+  структурная `validate` каждого найденного `decks/**/deck.json`.
+- «Заявленная MSRV» — читает `rust_version` через Cargo metadata, требует
+  единого значения у участников workspace и выполняет
+  `cargo +<msrv> check --workspace --all-targets --all-features --locked`.
 
-Локально тот же набор воспроизводится из корня репозитория:
+Отдельный `.github/workflows/pr-body.yml` владеет только той проверкой, которой
+нужно событие PR: валидацией описания самого PR. Тесты скриптов и метаданные
+Agent Skills здесь намеренно не дублируются — их выполняет `ci.yml`, который
+покрывает и push в default branch. Единственный владелец версии MSRV —
+`[workspace.package]` корневого `Cargo.toml`.
+
+Локально тот же набор воспроизводится из корня репозитория — сначала
+Python-проверки контрактов, затем канонические Cargo-команды из `AGENTS.md`:
 
 ```bash
+python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+python3 .github/scripts/check_skill_contracts.py
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
+
+Блок выше — канонический локальный набор, а не дословная копия CI: вместо
+`cargo test --workspace --locked` обязательный CI собирает тесты в профиле
+исполнителя (`cargo test --workspace --locked --profile ci`), а Clippy
+дополнительно включает `--all-features`. Строгая локальная репетиция
+обязательного CI — те же команды с этими флагами.
+
+Проверки корпусов (`kanji-corpus-gate`, `pitch-corpus-gate`) и структурная
+`validate` найденных экспортов выполняются только при наличии соответствующих
+данных в рабочей копии: их шаги пропускаются, если корпуса или `decks/**`
+отсутствуют.
 
 Здесь важно не смешивать два разных инварианта:
 
