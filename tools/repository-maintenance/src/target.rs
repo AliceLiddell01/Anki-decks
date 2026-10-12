@@ -239,7 +239,7 @@ fn validate_cleanup_layout(workspace: &CargoWorkspace) -> Result<(), String> {
         })?;
         if canonical == root || !canonical.starts_with(&root) {
             return Err(format!(
-                "каталог {} пересекается с корнем рабочей области или находится вне него; очистка запрещена",
+                "каталог {} пересекается с корнем рабочей области или находится вне корня рабочей области; очистка запрещена",
                 path.display()
             ));
         }
