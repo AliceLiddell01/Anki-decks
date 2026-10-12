@@ -56,7 +56,7 @@ jobs:
       - name: Проверить контракт MSRV, rustup и компилятора
         run: python3 .github/scripts/check_rust_toolchain.py
 
-      - name: Восстановить Rust cache
+      - name: Восстановить кэш Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Проверить форматирование
@@ -72,8 +72,8 @@ jobs:
       # исполнителями GitHub Actions; rust-cache ниже кэширует реестр и сборку Cargo.
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
-    # Push в feature-ветку не дублирует прогон PR: на push job выполняется
-    # только для default branch текущего репозитория.
+    # Отправка изменений в рабочую ветку не дублирует прогон PR: при `push` задание выполняется
+    # только для основной ветки текущего репозитория.
     if: >-
       github.event_name != 'push'
       || github.ref_name == github.event.repository.default_branch
@@ -98,7 +98,7 @@ jobs:
         with:
           version: v0.18.0
 
-      - name: Восстановить Rust cache
+      - name: Восстановить кэш Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Всё задание использует один специализированный профиль (тесты и `cargo run`),
@@ -112,14 +112,15 @@ jobs:
         # задания Clippy и MSRV параллельно.
         run: cargo test --workspace --locked --profile ci
 
-      - name: Проверить verified-only kanji corpus
-        # Ветка без tracked corpus допустима. Если store присутствует (в том числе
-        # как symlink), read-only gate обязан подтвердить verified-only содержимое.
+      - name: Проверить подтверждённые записи корпуса кандзи
+        # Ветка без отслеживаемого корпуса допустима. Если хранилище присутствует
+        # (в том числе как символическая ссылка), проверка только для чтения
+        # обязана подтвердить, что все записи корпуса проверены.
         run: |
           if [ -e .asset-store/kanji ] || [ -L .asset-store/kanji ]; then
             cargo run --quiet --locked --profile ci --bin kanji-corpus-gate
           else
-            echo "Канонический kanji corpus отсутствует; проверка пропущена"
+            echo "Канонический корпус кандзи отсутствует; проверка пропущена"
           fi
 
       - name: Проверить корпус pitch-accent на записи только со статусом VERIFIED
@@ -187,7 +188,7 @@ jobs:
       - name: Проверить контракт MSRV, rustup и компилятора
         run: python3 .github/scripts/check_rust_toolchain.py
 
-      - name: Восстановить Rust cache для MSRV
+      - name: Восстановить кэш Rust для MSRV
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: msrv
