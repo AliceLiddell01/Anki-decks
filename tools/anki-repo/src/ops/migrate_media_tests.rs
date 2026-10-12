@@ -319,10 +319,7 @@ fn legacy_pitch_reference_migrates_and_frees_the_kanji_fallback_name() {
     assert_eq!(dry.legacy_filename, "飴.png");
     assert_eq!(dry.canonical_filename, "飴.pitch.png");
     assert_eq!(dry.canonical_action, "copy");
-    assert_eq!(
-        dry.canonical_sha256,
-        sha256_hex(PITCH_PNG)
-    );
+    assert_eq!(dry.canonical_sha256, sha256_hex(PITCH_PNG));
     assert_eq!(dry.references_total, 1);
     assert_eq!(dry.references[0].guid.as_deref(), Some("guid-1"));
     assert_eq!(dry.references[0].field, "Толкование");
@@ -855,10 +852,7 @@ fn migration_render_preserves_pre_state_and_reports_actual_post_state() {
         assert_eq!(data["legacy_media_exists_after"], exists_after);
         assert_eq!(data["legacy_declared_after"], exists_after);
         if result.changed {
-            assert_eq!(
-                data["legacy_media"]["sha256"],
-                sha256_hex(LEGACY_PNG)
-            );
+            assert_eq!(data["legacy_media"]["sha256"], sha256_hex(LEGACY_PNG));
         } else {
             assert!(data["legacy_media"].is_null());
         }
