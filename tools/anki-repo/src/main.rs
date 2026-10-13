@@ -86,12 +86,13 @@ fn maybe_offer_maintenance(cli: &Cli) {
         return;
     }
     if choice == "no" {
-        if care::should_warn().unwrap_or(false) {
+        if care::warning_due().unwrap_or(false) {
             let status = care::inspect(&root);
             if status
                 .diagnostics
                 .iter()
                 .any(|d| d.code == "target_warning" || d.code == "external_cache_limit")
+                && care::should_warn().unwrap_or(false)
             {
                 eprintln!(
                     "Предупреждение GC: объём управляемых артефактов превысил порог; подробности: anki-repo maintenance status."
