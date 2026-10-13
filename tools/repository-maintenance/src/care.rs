@@ -408,18 +408,90 @@ pub fn record_failure(root: &Path, message: &str) -> Result<(), String> {
     })
 }
 
-/// Необязательный графический канал. Наличие графической переменной не гарантирует D-Bus.
+/// Уведомление — необязательное побочное действие: ошибка не меняет результат GC.
 pub fn desktop_alert(message: &str) {
+    let _ = try_desktop_alert(message);
+}
+
+/// Диагностика выбранного канала, пригодная также для безопасной проверки из systemd.
+/// Успешный статус означает, что вызываемый обработчик принял запрос, но не
+/// гарантирует, что пользователь увидел окно.
+pub fn try_desktop_alert(message: &str) -> Result<&'static str, String> {
+    if is_wsl() {
+        return windows_toast(message).map(|()| "windows-toast");
+    }
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
         || (std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none())
     {
-        return;
+        return Err("графическая Linux-сессия с D-Bus недоступна".into());
     }
-    let _ = Command::new("notify-send")
+    let result = Command::new("notify-send")
         .args(["--urgency=normal", "Anki-decks: обслуживание", message])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .map_err(|e| format!("notify-send недоступен: {e}"))?;
+    if result.success() {
+        Ok("linux-notify-send")
+    } else {
+        Err(format!("notify-send завершился с кодом {:?}", result.code()))
+    }
+}
+
+/// Обнаружение WSL не опирается исключительно на WSL_INTEROP: у user systemd
+/// переменной может не быть, хотя binfmt WSLInterop зарегистрирован в /proc.
+fn is_wsl() -> bool {
+    if std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some()
+    {
+        return true;
+    }
+    if std::fs::read_to_string("/proc/sys/fs/binfmt_misc/WSLInterop")
+        .is_ok_and(|value| value.starts_with("enabled"))
+    {
+        return true;
+    }
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .is_ok_and(|value| value.to_ascii_lowercase().contains("microsoft"))
+}
+
+/// Только постоянный PowerShell-код. Текст уведомления передаётся строковым
+/// литералом с экранированными апострофами — без shell и PowerShell-инъекций.
+fn power_shell_script(message: &str) -> String {
+    let escaped = message.replace('\'', "''");
+    format!(
+        "$ErrorActionPreference = 'Stop';          Import-Module BurntToast -ErrorAction Stop;          New-BurntToastNotification -Text @('Anki-decks: обслуживание', '{escaped}') -ErrorAction Stop"
+    )
+}
+
+fn windows_toast(message: &str) -> Result<(), String> {
+    // В systemd user-unit обычно нет каталогов Windows в PATH. В таком случае
+    // используется стандартный путь при включённом automount диска C:.
+    let from_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("powershell.exe"))
+            .find(|candidate| candidate.is_file())
+    });
+    let fallback = Path::new("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+    let executable = from_path.or_else(|| fallback.is_file().then(|| fallback.to_path_buf()))
+        .ok_or("powershell.exe не найден в PATH или стандартном /mnt/c/Windows; проверьте WSL interop")?;
+    let result = Command::new(executable)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &power_shell_script(message),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("не удалось запустить Windows PowerShell через WSL: {e}"))?;
+    if result.success() {
+        Ok(())
+    } else {
+        Err(format!("Windows PowerShell/BurntToast завершился с кодом {:?}", result.code()))
+    }
 }
 
 fn diag(
@@ -955,6 +1027,85 @@ mod tests {
         std::fs::remove_file(&log).unwrap();
         invoke(true, true, &mock_bin, "0");
         assert!(std::fs::read_to_string(&log).unwrap().contains("ошибка GC"));
+    }
+
+    /// Запускаем независимым процессом, чтобы окружение теста не влияло на
+    /// остальные тесты Cargo, и проверяем маршрут WSL без Windows/GUI.
+    #[test]
+    fn windows_notification_subprocess_helper() {
+        if std::env::var_os("ANKI_GC_WINDOWS_NOTIFICATION_TEST").is_none() {
+            return;
+        }
+        let message = "ошибка GC: O'Brien; $(rm -rf /)";
+        assert_eq!(try_desktop_alert(message).unwrap(), "windows-toast");
+    }
+
+    #[test]
+    fn windows_notification_is_escaped_and_works_without_gui_or_wsl_interop_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("care-wsl-notification").unwrap();
+        let bin = workspace.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = workspace.path().join("powershell-args.txt");
+        let fake = bin.join("powershell.exe");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ANKI_GC_WINDOWS_NOTIFICATION_LOG\"\nexit \"$ANKI_GC_WINDOWS_NOTIFICATION_EXIT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invoke = |exit_code: &str| {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "care::tests::windows_notification_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env("ANKI_GC_WINDOWS_NOTIFICATION_TEST", "1")
+                .env("ANKI_GC_WINDOWS_NOTIFICATION_LOG", &log)
+                .env("ANKI_GC_WINDOWS_NOTIFICATION_EXIT", exit_code)
+                .env("WSL_DISTRO_NAME", "synthetic-wsl")
+                .env_remove("WSL_INTEROP")
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
+                .env("PATH", &bin)
+                .output()
+                .unwrap();
+            output
+        };
+        let success = invoke("0");
+        assert!(
+            success.status.success(),
+            "{}",
+            String::from_utf8_lossy(&success.stderr)
+        );
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.contains("-NoProfile -NonInteractive -Command"), "{args}");
+        assert!(args.contains("O''Brien; $(rm -rf /)"), "{args}");
+        assert!(args.contains("New-BurntToastNotification"), "{args}");
+        assert!(!args.contains("O'Brien;"), "{args}");
+        assert!(!args.contains("notify-send"), "{args}");
+
+        let failed = invoke("17");
+        assert!(
+            !failed.status.success(),
+            "проверочный try_desktop_alert должен сообщать сбой доставки"
+        );
+        assert!(
+            String::from_utf8_lossy(&failed.stderr)
+                .contains("Windows PowerShell/BurntToast завершился с кодом"),
+            "{}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+    }
+
+    #[test]
+    fn powershell_escaping_handles_quotes_and_multiline_without_command_breakout() {
+        let text = power_shell_script("пример: 'строка'\\n; Remove-Item /");
+        assert!(text.contains("пример: ''строка''\\n; Remove-Item /"));
+        assert!(text.contains("New-BurntToastNotification"));
     }
 
     #[test]
