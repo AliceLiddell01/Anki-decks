@@ -31,8 +31,103 @@ struct InstalledConfig<'a> {
     repository_root: &'a Path,
 }
 
+
+#[derive(Debug, Clone)]
+pub struct TimerInspection {
+    pub state: String,
+    pub active: Option<bool>,
+    pub installed_root: Option<PathBuf>,
+    pub service_result: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledConfigOwned {
+    managed_by: String,
+    schema: u32,
+    repository_root: PathBuf,
+}
+
+fn installed_root() -> Result<Option<PathBuf>, String> {
+    let home = config_home().ok_or("не задан HOME / XDG_CONFIG_HOME")?;
+    let path = home.join(format!("anki-decks/{INSTALLED_CONFIG_NAME}"));
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.uid() != uid
+        || meta.mode() & 0o077 != 0 || meta.nlink() != 1 {
+        return Err(format!("небезопасная конфигурация установки {}", path.display()));
+    }
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let config: InstalledConfigOwned = toml::from_str(&text).map_err(|e| e.to_string())?;
+    if config.managed_by != "repository-maintenance" || config.schema != 1 {
+        return Err("неподдерживаемая конфигурация установки таймера".into());
+    }
+    Ok(Some(config.repository_root))
+}
+
+/// Не приравнивает сохранённую настройку или is-enabled к работающему таймеру.
+pub fn inspect() -> TimerInspection {
+    let root = installed_root();
+    let installed_root = root.as_ref().ok().and_then(Clone::clone);
+    let mut result = TimerInspection {
+        state: "unavailable".into(), active: None, installed_root,
+        service_result: None, error: root.err(),
+    };
+    if let Err(e) = require_user_systemd() {
+        result.error = Some(e);
+        return result;
+    }
+    let enabled = Command::new("systemctl").args(["--user", "is-enabled", TIMER_NAME]).output();
+    let active = Command::new("systemctl").args(["--user", "is-active", TIMER_NAME]).output();
+    match (enabled, active) {
+        (Ok(enabled), Ok(active)) => {
+            result.active = Some(active.status.success());
+            result.state = if enabled.status.success() && active.status.success() {
+                "enabled"
+            } else {
+                "disabled"
+            }.into();
+            if enabled.status.success() && !active.status.success() {
+                result.error = Some("таймер включён, но фактически не активен".into());
+            }
+            if enabled.status.success() && result.installed_root.is_none() {
+                result.state = "unknown".into();
+                result.error = Some("таймер включён, но принадлежность рабочей области не подтверждена".into());
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            result.error = Some(format!("не удалось запросить состояние таймера: {e}"));
+            return result;
+        }
+    }
+    if let Ok(output) = Command::new("systemctl")
+        .args(["--user", "show", SERVICE_NAME, "--property=Result", "--value"]).output()
+        && output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !value.is_empty() { result.service_result = Some(value); }
+    }
+    result
+}
+
 pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
     require_user_systemd()?;
+    // Один пользовательский таймер не должен незаметно переключаться между клонами.
+    if let Some(existing) = installed_root()? {
+        if existing != root {
+            return Err(format!(
+                "таймер уже принадлежит {}; сначала явно отключите его, затем установите для {}",
+                existing.display(), root.display()
+            ));
+        }
+    } else if config_home().is_some_and(|home|
+        home.join(format!("systemd/user/{SERVICE_NAME}")).exists()) {
+        return Err("найден существующий service без подтверждённой привязки к checkout; автоматическая переустановка запрещена".into());
+    }
     let cargo_bin_dir = resolve_cargo_bin_dir()?;
     let service_unit = render_service_unit(&cargo_bin_dir)?;
     let config_home = config_home().ok_or("не задан HOME или XDG_CONFIG_HOME")?;
