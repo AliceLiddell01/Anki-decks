@@ -666,7 +666,7 @@ pub fn disable(root: &Path) -> Result<(), String> {
         );
     }
     if health.installed_root.is_some() {
-        timer::uninstall()?;
+        timer::uninstall_for(root)?;
     }
     set_choice("no")
 }
