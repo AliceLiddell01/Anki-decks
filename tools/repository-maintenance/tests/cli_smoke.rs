@@ -57,7 +57,10 @@ fn notify_test_uses_windows_toast_without_cleaning_or_real_windows() {
     );
     let stdout = String::from_utf8(success.stdout).unwrap();
     assert!(stdout.contains("windows-toast"), "{stdout}");
-    assert!(stdout.contains("Видимость окна проверяется отдельно"), "{stdout}");
+    assert!(
+        stdout.contains("Видимость окна проверяется отдельно"),
+        "{stdout}"
+    );
     let command = fs::read_to_string(&log).unwrap();
     assert!(command.contains("New-BurntToastNotification"), "{command}");
     assert!(command.contains("очистка не запускалась"), "{command}");
