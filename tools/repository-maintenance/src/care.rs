@@ -71,6 +71,33 @@ pub struct SystemTmpHealth {
     pub mount_boundaries: usize,
 }
 
+impl SystemTmpHealth {
+    fn from_inventories(inventories: &[crate::inventory::TmpInventory]) -> Self {
+        Self {
+            complete: inventories.iter().all(|item| item.complete),
+            errors: inventories.iter().map(|item| item.errors).sum(),
+            mount_boundaries: inventories.iter().map(|item| item.mount_boundaries).sum(),
+        }
+    }
+}
+
+fn system_tmp_diagnostic(health: &SystemTmpHealth) -> Option<Diagnostic> {
+    if health.complete {
+        return None;
+    }
+    let mut entry = diag(
+        "system_tmp_inventory_incomplete",
+        "info",
+        "Общий обзор /tmp неполон; показатели подтверждённых артефактов Anki-decks учитываются отдельно. Чужие каталоги и mount не обходятся.",
+        Some("anki-repository-maintenance scan --detail --json"),
+    );
+    entry.context = serde_json::json!({
+        "errors": health.errors,
+        "mount_boundaries": health.mount_boundaries,
+    });
+    Some(entry)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Measurement {
     pub project_bytes: Option<u64>,
@@ -509,11 +536,8 @@ pub fn inspect(root: &Path) -> CareStatus {
                     measurement.complete =
                         report.tmp.iter().all(|t| t.complete) && report.errors == 0;
                     measurement.errors = report.errors;
-                    measurement.system_tmp = Some(SystemTmpHealth {
-                        complete: report.tmp.iter().all(|t| t.complete),
-                        errors: report.tmp.iter().map(|t| t.errors).sum(),
-                        mount_boundaries: report.tmp.iter().map(|t| t.mount_boundaries).sum(),
-                    });
+                    measurement.system_tmp =
+                        Some(SystemTmpHealth::from_inventories(&report.tmp));
                     if report.cargo_target.ownership == "project-owned" {
                         measurement.cargo_target_bytes = Some(report.cargo_target.bytes_before);
                     }
@@ -561,18 +585,8 @@ pub fn inspect(root: &Path) -> CareStatus {
                         ));
                     }
                     if let Some(tmp) = &measurement.system_tmp
-                        && !tmp.complete
+                        && let Some(entry) = system_tmp_diagnostic(tmp)
                     {
-                        let mut entry = diag(
-                            "system_tmp_inventory_incomplete",
-                            "info",
-                            "Общий обзор /tmp неполон; показатели подтверждённых артефактов Anki-decks учитываются отдельно. Чужие каталоги и mount не обходятся.",
-                            Some("anki-repository-maintenance scan --detail --json"),
-                        );
-                        entry.context = serde_json::json!({
-                            "errors": tmp.errors,
-                            "mount_boundaries": tmp.mount_boundaries,
-                        });
                         diagnostics.push(entry);
                     }
                     if report.fatal_errors > 0 {
@@ -711,7 +725,7 @@ pub fn render_text(status: &CareStatus) -> String {
     }
     let m = &status.measurement;
     s.push_str(&format!(
-        "Управляемые артефакты: {} байт (полнота: {})\n",
+        "Учтённые управляемые артефакты: {} байт (полнота общего обзора, включая /tmp: {})\n",
         m.project_bytes
             .map_or_else(|| "неизвестно".into(), |v| v.to_string()),
         m.complete
@@ -827,6 +841,40 @@ mod tests {
         assert_eq!(recovered.choice, "no");
     }
 
+
+    #[test]
+    fn foreign_tmp_inaccessibility_is_informational_not_gc_failure() {
+        let tmp = crate::inventory::TmpInventory {
+            root: PathBuf::from("/tmp"),
+            allocated_bytes: 0,
+            top_level_entries: 2,
+            mount_boundaries: 1,
+            errors: 2,
+            complete: false,
+            largest: Vec::new(),
+        };
+        let health = SystemTmpHealth::from_inventories(&[tmp]);
+        assert!(!health.complete);
+        assert_eq!(health.errors, 2);
+        assert_eq!(health.mount_boundaries, 1);
+        let diagnostic = system_tmp_diagnostic(&health).expect("partial /tmp must be described");
+        assert_eq!(diagnostic.code, "system_tmp_inventory_incomplete");
+        assert_eq!(diagnostic.severity, "info");
+        assert_eq!(diagnostic.context["errors"], 2);
+        assert_eq!(diagnostic.context["mount_boundaries"], 1);
+
+        let complete = crate::inventory::TmpInventory {
+            root: PathBuf::from("/tmp"),
+            allocated_bytes: 0,
+            top_level_entries: 0,
+            mount_boundaries: 0,
+            errors: 0,
+            complete: true,
+            largest: Vec::new(),
+        };
+        let health = SystemTmpHealth::from_inventories(&[complete]);
+        assert!(system_tmp_diagnostic(&health).is_none());
+    }
     #[test]
     fn snapshot_round_trip_and_no_false_success() {
         let item = LastAttempt {
