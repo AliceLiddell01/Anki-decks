@@ -1140,3 +1140,118 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
     assert_eq!(status["result"]["preference"], "no");
     assert!(config.join("anki-decks/gc-preference.json").is_file());
 }
+
+
+/// Linux live-acceptance: настоящая псевдотерминальная сессия, но полностью
+/// отдельные пользовательские настройки и подменённый systemctl. Вызовы
+/// настоящего пользовательского таймера при этом не выполняются.
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = TempDir::new("gc-onboarding-pty");
+    fixture.write_export(&base_export());
+    let isolated_config = fixture.path().join("config");
+    let isolated_state = fixture.path().join("state");
+    let isolated_cache = fixture.path().join("cache");
+    let mock_bin = fixture.path().join("mock-bin");
+    for path in [&isolated_config, &isolated_state, &isolated_cache, &mock_bin] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let systemctl = mock_bin.join("systemctl");
+    let mock_log = fixture.path().join("systemctl-calls.log");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"$ANKI_GC_PTY_MOCK_LOG\"\n\
+         case \"$*\" in\n\
+         '  --user show-environment') exit 0 ;;\n\
+         '  --user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
+         '  --user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
+         '  --user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+         esac\n",
+    ).unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let sandbox_path = std::env::join_paths(
+        std::iter::once(mock_bin.clone())
+            .chain(std::env::split_paths(&original_path))
+    ).unwrap();
+
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+
+    let launch = |input: &[u8]| -> String {
+        // util-linux script предоставляет все три TTY самому anki-repo.
+        let mut child = Command::new("script")
+            .args([
+                "-q",
+                "-e",
+                "-c",
+                "exec \"$ANKI_GC_PTY_CLI\" models \"$ANKI_GC_PTY_EXPORT\"",
+                "/dev/null",
+            ])
+            .env("ANKI_GC_PTY_CLI", cli_binary())
+            .env("ANKI_GC_PTY_EXPORT", fixture.path())
+            .env("ANKI_GC_PTY_MOCK_LOG", &mock_log)
+            .env("ANKI_REPOSITORY_ROOT", &repository)
+            .env("XDG_CONFIG_HOME", &isolated_config)
+            .env("XDG_STATE_HOME", &isolated_state)
+            .env("XDG_CACHE_HOME", &isolated_cache)
+            .env("PATH", &sandbox_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("для живого Linux PTY-теста нужен util-linux script");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input).unwrap();
+        drop(stdin);
+        let result = child.wait_with_output().unwrap();
+        let output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            result.status.success(),
+            "CLI в PTY завершился с ошибкой: {output}"
+        );
+        output
+    };
+
+    let first = launch(b"n\n");
+    assert!(first.contains("Включить автоматическую очистку? [y/N]"), "{first}");
+    let preference = isolated_config.join("anki-decks/gc-preference.json");
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(&preference).unwrap()).unwrap();
+    assert_eq!(saved["choice"], "no");
+
+    let second = launch(b"\n");
+    assert!(
+        !second.contains("Включить автоматическую очистку? [y/N]"),
+        "после сохранённого отказа нельзя задавать вопрос повторно: {second}"
+    );
+    let saved_again: Value =
+        serde_json::from_slice(&std::fs::read(&preference).unwrap()).unwrap();
+    assert_eq!(saved_again["choice"], "no");
+
+    let calls = std::fs::read_to_string(&mock_log).unwrap();
+    assert!(calls.contains("--user show-environment"), "{calls}");
+    assert!(!calls.contains("enable"), "{calls}");
+    assert!(!calls.contains("disable"), "{calls}");
+    assert!(!calls.contains("--now"), "{calls}");
+    println!(
+        "PTY acceptance PASS: первый [y/N], сохранённый N и отсутствие повтора; \
+         настоящий systemctl не вызывался"
+    );
+}
