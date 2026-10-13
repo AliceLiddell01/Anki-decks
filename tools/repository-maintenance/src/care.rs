@@ -15,6 +15,7 @@ use crate::{Report, RunOptions, run, timer};
 
 const WARNING_INTERVAL: u64 = 24 * 60 * 60;
 const MAX_STATE_BYTES: u64 = 32 * 1024;
+const MAX_REPORTED_ITEMS: usize = 24;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +23,18 @@ struct PreferenceFile {
     schema_version: u32,
     choice: String,
     last_warning_at: Option<u64>,
+}
+
+/// Краткая запись о проверенном объекте; оригинальная политика GC не дублируется.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GcItem {
+    pub category: String,
+    #[serde(serialize_with = "crate::serialize_report_path")]
+    pub path: PathBuf,
+    pub action: String,
+    pub result: String,
+    pub bytes_freed: u64,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,6 +48,10 @@ pub struct LastAttempt {
     pub errors: usize,
     pub inventory_complete: bool,
     pub message: String,
+    #[serde(default)]
+    pub items: Vec<GcItem>,
+    #[serde(default)]
+    pub omitted_items: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -43,6 +60,7 @@ pub struct Diagnostic {
     pub severity: &'static str,
     pub message: String,
     pub action: Option<&'static str>,
+    pub context: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -67,6 +85,8 @@ pub struct CareStatus {
     pub installed_workspace: Option<PathBuf>,
     pub timer_active: Option<bool>,
     pub measurement: Measurement,
+    pub items: Vec<GcItem>,
+    pub omitted_items: usize,
     pub last_attempt: Option<LastAttempt>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -254,7 +274,47 @@ fn record(entry: &LastAttempt) -> Result<(), String> {
     )
 }
 
+
+/// Только кандидаты текущего Report; общий /tmp инвентаризируется, но не
+/// считается проектным объектом и не попадает в список управляемых.
+fn report_items(report: &Report) -> (Vec<GcItem>, usize) {
+    let mut items = Vec::new();
+    let target = &report.cargo_target;
+    items.push(GcItem {
+        category: target.category.into(),
+        path: target.path.clone(),
+        action: target.action.into(),
+        result: target.result.into(),
+        bytes_freed: target.bytes_freed,
+        reason: target.reason.chars().take(200).collect(),
+    });
+    for c in &report.external_build_caches {
+        items.push(GcItem {
+            category: "external-build-cache".into(),
+            path: c.path.clone(),
+            action: c.action.into(),
+            result: if c.bytes_freed > 0 { "removed" } else { "not_removed" }.into(),
+            bytes_freed: c.bytes_freed,
+            reason: c.reason.chars().take(200).collect(),
+        });
+    }
+    for c in &report.project_temp {
+        items.push(GcItem {
+            category: c.category.into(),
+            path: c.path.clone(),
+            action: c.action.into(),
+            result: c.result.into(),
+            bytes_freed: c.bytes_freed,
+            reason: c.reason.chars().take(200).collect(),
+        });
+    }
+    let omitted = items.len().saturating_sub(MAX_REPORTED_ITEMS);
+    items.truncate(MAX_REPORTED_ITEMS);
+    (items, omitted)
+}
+
 pub fn record_report(report: &Report) -> Result<(), String> {
+    let (items, omitted_items) = report_items(report);
     let complete = report.tmp.iter().all(|t| t.complete) && report.errors == report.fatal_errors;
     let freed = report
         .cargo_target
@@ -286,6 +346,8 @@ pub fn record_report(report: &Report) -> Result<(), String> {
             "{}; освобождено {freed} байт; ошибок {}",
             report.mode, report.errors
         ),
+        items,
+        omitted_items,
     })
 }
 
@@ -299,6 +361,8 @@ pub fn record_failure(root: &Path, message: &str) -> Result<(), String> {
         errors: 1,
         inventory_complete: false,
         message: message.into(),
+        items: Vec::new(),
+        omitted_items: 0,
     })
 }
 
@@ -333,6 +397,8 @@ fn diag(
 /// Диагностика пользуется тем же планировщиком и политикой, что и настоящий GC.
 pub fn inspect(root: &Path) -> CareStatus {
     let mut diagnostics = Vec::new();
+    let mut items = Vec::new();
+    let mut omitted_items = 0;
     let preference = match read_pref() {
         Ok(p) => p.choice,
         Err(e) => {
@@ -422,6 +488,7 @@ pub fn inspect(root: &Path) -> CareStatus {
             measurement.external_cache_hard_limit_bytes = policy.external_hard_limit_bytes();
             match run(root, &policy, &RunOptions::default()) {
                 Ok(report) => {
+                    (items, omitted_items) = report_items(&report);
                     measurement.complete =
                         report.tmp.iter().all(|t| t.complete) && report.errors == 0;
                     measurement.errors = report.errors;
@@ -535,6 +602,8 @@ pub fn inspect(root: &Path) -> CareStatus {
         installed_workspace: timer.installed_root,
         timer_active: timer.active,
         measurement,
+        items,
+        omitted_items,
         last_attempt,
         diagnostics,
     }
