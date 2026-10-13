@@ -31,6 +31,8 @@ enum Command {
     Timer(TimerArgs),
     /// Учёт и использование принадлежащего проекту внешнего кэша Cargo.
     Cache(CacheArgs),
+    /// Отправить тестовое уведомление, не запуская очистку или таймер.
+    NotifyTest,
 }
 
 #[derive(Debug, Args)]
@@ -138,6 +140,18 @@ fn main() {
         }
         Command::Timer(args) => timer(args),
         Command::Cache(args) => cache(args),
+        Command::NotifyTest => match care::try_desktop_alert(
+            "Проверка уведомления; очистка не запускалась.",
+        ) {
+            Ok(channel) => {
+                println!("Запрос уведомления принят обработчиком: {channel}. Видимость окна проверяется отдельно.");
+                0
+            }
+            Err(error) => {
+                eprintln!("Не удалось отправить тестовое уведомление: {error}");
+                1
+            }
+        },
     };
     if exit_code != 0 {
         std::process::exit(exit_code);
