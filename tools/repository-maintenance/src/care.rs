@@ -274,7 +274,6 @@ fn record(entry: &LastAttempt) -> Result<(), String> {
     )
 }
 
-
 /// Только кандидаты текущего Report; общий /tmp инвентаризируется, но не
 /// считается проектным объектом и не попадает в список управляемых.
 fn report_items(report: &Report) -> (Vec<GcItem>, usize) {
@@ -293,7 +292,12 @@ fn report_items(report: &Report) -> (Vec<GcItem>, usize) {
             category: "external-build-cache".into(),
             path: c.path.clone(),
             action: c.action.into(),
-            result: if c.bytes_freed > 0 { "removed" } else { "not_removed" }.into(),
+            result: if c.bytes_freed > 0 {
+                "removed"
+            } else {
+                "not_removed"
+            }
+            .into(),
             bytes_freed: c.bytes_freed,
             reason: c.reason.chars().take(200).collect(),
         });
@@ -714,7 +718,10 @@ pub fn render_text(status: &CareStatus) -> String {
             }
         }
         if last.omitted_items > 0 {
-            s.push_str(&format!("  Пропущено {} объектов; полный отчёт смотрите в журнале GC\n", last.omitted_items));
+            s.push_str(&format!(
+                "  Пропущено {} объектов; полный отчёт смотрите в журнале GC\n",
+                last.omitted_items
+            ));
         }
     } else {
         s.push_str("Последняя попытка для этого checkout: неизвестна\n");
@@ -731,7 +738,10 @@ pub fn render_text(status: &CareStatus) -> String {
         ));
     }
     if status.omitted_items > 0 {
-        s.push_str(&format!("Ещё {} объектов не выведено; используйте scan --json для полной инвентаризации\n", status.omitted_items));
+        s.push_str(&format!(
+            "Ещё {} объектов не выведено; используйте scan --json для полной инвентаризации\n",
+            status.omitted_items
+        ));
     }
     for d in &status.diagnostics {
         s.push_str(&format!("[{}] {}: {}\n", d.severity, d.code, d.message));
