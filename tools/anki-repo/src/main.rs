@@ -10,10 +10,10 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use anki_repo::cli::{Cli, Command};
-use repository_maintenance::care;
 use anki_repo::error::ErrorCode;
 use anki_repo::output::write_text;
 use anki_repo::run::{execute_cli, render_error};
+use repository_maintenance::care;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -62,11 +62,19 @@ fn internal_failure() -> ExitCode {
 /// Вступительное предложение — только в обычных командах с настоящим TTY.
 /// Никакого чтения stdin у piped запросов и никаких баннеров в JSON.
 fn maybe_offer_maintenance(cli: &Cli) {
-    if cli.json || !io::stdin().is_terminal() || !io::stdout().is_terminal()
+    if cli.json
+        || !io::stdin().is_terminal()
+        || !io::stdout().is_terminal()
         || !io::stderr().is_terminal()
-        || !matches!(&cli.command,
-            Command::Inspect { .. } | Command::Find { .. } | Command::Stats { .. }
-            | Command::Validate { .. } | Command::Qa { .. } | Command::Models { .. })
+        || !matches!(
+            &cli.command,
+            Command::Inspect { .. }
+                | Command::Find { .. }
+                | Command::Stats { .. }
+                | Command::Validate { .. }
+                | Command::Qa { .. }
+                | Command::Models { .. }
+        )
     {
         return;
     }
@@ -74,14 +82,20 @@ fn maybe_offer_maintenance(cli: &Cli) {
         return;
     };
     let Ok(choice) = care::choice() else { return };
-    if choice == "yes" { return; }
+    if choice == "yes" {
+        return;
+    }
     if choice == "no" {
         if care::should_warn().unwrap_or(false) {
             let status = care::inspect(&root);
-            if status.diagnostics.iter().any(|d|
-                d.code == "target_warning" || d.code == "external_cache_limit")
+            if status
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "target_warning" || d.code == "external_cache_limit")
             {
-                eprintln!("Предупреждение GC: объём управляемых артефактов превысил порог; подробности: anki-repo maintenance status.");
+                eprintln!(
+                    "Предупреждение GC: объём управляемых артефактов превысил порог; подробности: anki-repo maintenance status."
+                );
             }
         }
         return;
@@ -93,19 +107,32 @@ fn maybe_offer_maintenance(cli: &Cli) {
         return;
     }
     let status = care::inspect(&root);
-    eprintln!("Рекомендуем включить автоматическую очистку временных файлов и артефактов сборки Anki-decks.");
+    eprintln!(
+        "Рекомендуем включить автоматическую очистку временных файлов и артефактов сборки Anki-decks."
+    );
     if let Some(bytes) = status.measurement.project_bytes {
-        eprintln!("Измерено управляемых данных: {bytes} байт{}.", if status.measurement.complete { "" } else { " (измерение неполное)" });
+        eprintln!(
+            "Измерено управляемых данных: {bytes} байт{}.",
+            if status.measurement.complete {
+                ""
+            } else {
+                " (измерение неполное)"
+            }
+        );
     }
     eprintln!("Очистка ограничена проверками владения и безопасности действующего GC.");
     eprint!("Включить автоматическую очистку? [y/N] ");
     let _ = io::stderr().flush();
     let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err() { return; }
+    if io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
     if answer.trim().eq_ignore_ascii_case("y") {
         match care::enable(&root) {
             Ok(()) => eprintln!("Автоочистка подтверждена: таймер установлен и активен."),
-            Err(e) => eprintln!("Не удалось включить GC: {e}. Согласие сохранено; проверьте anki-repo maintenance status."),
+            Err(e) => eprintln!(
+                "Не удалось включить GC: {e}. Согласие сохранено; проверьте anki-repo maintenance status."
+            ),
         }
     } else if let Err(e) = care::set_choice("no") {
         eprintln!("Не удалось сохранить отказ: {e}");
