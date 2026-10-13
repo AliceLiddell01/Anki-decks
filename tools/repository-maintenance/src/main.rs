@@ -174,12 +174,12 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
                 if let Err(error) = care::record_report(&report) {
                     eprintln!("Не удалось сохранить последний результат GC: {error}");
                 }
-                if report.fatal_errors > 0 || report.errors > report.fatal_errors {
-                    care::desktop_alert(if report.fatal_errors > 0 {
-                        "Ошибка автоматической очистки; проверьте anki-repo maintenance status"
-                    } else {
-                        "Измерение GC неполное; проверьте anki-repo maintenance status"
-                    });
+                // Частичный обзор чужих каталогов /tmp — не сбой очистки
+                // и не основание тревожить пользователя при каждом запуске таймера.
+                if report.fatal_errors > 0 {
+                    care::desktop_alert(
+                        "Ошибка автоматической очистки; проверьте anki-repo maintenance status",
+                    );
                 }
             }
             if args.json {
