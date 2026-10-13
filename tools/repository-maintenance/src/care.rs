@@ -505,18 +505,18 @@ pub fn inspect(root: &Path) -> CareStatus {
             None
         }
     };
-    if let Some(last) = &last_attempt {
-        if last.outcome != "success" {
-            diagnostics.push(diag(
-                "last_gc_problem",
-                "warning",
-                format!(
-                    "Последнее обслуживание: {} ({})",
-                    last.outcome, last.message
-                ),
-                Some("anki-repository-maintenance scan --json"),
-            ));
-        }
+    if let Some(last) = &last_attempt
+        && last.outcome != "success"
+    {
+        diagnostics.push(diag(
+            "last_gc_problem",
+            "warning",
+            format!(
+                "Последнее обслуживание: {} ({})",
+                last.outcome, last.message
+            ),
+            Some("anki-repository-maintenance scan --json"),
+        ));
     }
     CareStatus {
         schema_version: 1,
