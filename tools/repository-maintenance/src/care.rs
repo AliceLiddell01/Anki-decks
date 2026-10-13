@@ -208,6 +208,15 @@ pub fn set_choice(choice: &str) -> Result<(), String> {
     )
 }
 
+/// Проверяет суточный интервал без расходования его на незапущенную диагностику.
+pub fn warning_due() -> Result<bool, String> {
+    let p = read_pref()?;
+    Ok(p.choice == "no"
+        && !p
+            .last_warning_at
+            .is_some_and(|prev| now().saturating_sub(prev) < WARNING_INTERVAL))
+}
+
 /// Текстовое предупреждение ограничено по частоте; машинная диагностика — нет.
 pub fn should_warn() -> Result<bool, String> {
     let _lock = MaintenanceLock::acquire().map_err(|e| e.to_string())?;
