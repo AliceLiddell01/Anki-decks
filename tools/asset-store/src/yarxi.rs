@@ -1,8 +1,6 @@
 //! Провайдер браузера для динамических статей Yarxi и изображений слева от них.
 
-use std::collections::HashSet;
-#[cfg(test)]
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,8 +9,8 @@ use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer, runtime_s
 #[cfg(test)]
 use crate::browser_runtime::TrackedRequest;
 use crate::browser_runtime::{
-    self, BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor, DeviceMetrics, NetworkOutcome,
-    RetryTrigger, RuntimeSnapshot,
+    self, BrowserLaunchError, BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor,
+    DeviceMetrics, NetworkOutcome, RetryTrigger, RuntimeSnapshot,
 };
 pub use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
 use crate::error::AssetError;
@@ -25,9 +23,12 @@ use chromiumoxide::{
         CaptureScreenshotFormat, GetResourceContentParams, GetResourceTreeParams,
     },
 };
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use image::{GenericImageView, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::panic::AssertUnwindSafe;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep, timeout_at};
 use url::Url;
 
@@ -712,6 +713,889 @@ pub enum AcquisitionEvent {
     },
 }
 
+/// Контекст единственного назначения; provider attempt отличается от owner attempt.
+#[derive(Debug)]
+pub struct AcquisitionWorkerEvent {
+    pub worker_id: usize,
+    pub index: Option<usize>,
+    pub generation: Option<u32>,
+    pub owner_attempt: Option<usize>,
+    pub session: u32,
+    pub browser_session: Option<u64>,
+    pub attempt: u8,
+    pub event: AcquisitionWorkerEventKind,
+}
+
+#[derive(Debug)]
+pub enum AcquisitionWorkerEventKind {
+    Assigned,
+    SessionBootstrapStarted,
+    Provider(AcquisitionEvent),
+    Deferred {
+        reason: String,
+    },
+    Requeued {
+        reason: String,
+    },
+    WorkerRetired {
+        consecutive_failures: u8,
+        reason: String,
+    },
+    WorkerStopped {
+        reason: String,
+    },
+}
+
+fn yarxi_workspace(purpose: &str) -> std::io::Result<TempWorkspace> {
+    TempWorkspace::create(purpose)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParallelJob {
+    index: usize,
+    character: String,
+    generation: u32,
+    owner_attempt: usize,
+}
+
+#[derive(Clone, Default)]
+struct ParallelWorkerContext {
+    worker_id: usize,
+    session: u32,
+    browser_session: Option<u64>,
+    attempt: u8,
+    job: Option<ParallelJob>,
+}
+
+impl ParallelWorkerContext {
+    fn event(&self, event: AcquisitionWorkerEventKind) -> AcquisitionWorkerEvent {
+        AcquisitionWorkerEvent {
+            worker_id: self.worker_id,
+            index: self.job.as_ref().map(|job| job.index),
+            generation: self.job.as_ref().map(|job| job.generation),
+            owner_attempt: self.job.as_ref().map(|job| job.owner_attempt),
+            session: self.session,
+            browser_session: self.browser_session,
+            attempt: self.attempt,
+            event,
+        }
+    }
+}
+
+enum ParallelMessage {
+    Event(AcquisitionWorkerEvent, Option<oneshot::Sender<()>>),
+    Ready(usize),
+}
+
+fn parallel_protocol_error(message: &str) -> AcquisitionStreamError {
+    AcquisitionStreamError::Provider(format!("browser_worker_protocol_violation: {message}"))
+}
+
+fn send_parallel_event(
+    sender: &mpsc::UnboundedSender<ParallelMessage>,
+    context: &ParallelWorkerContext,
+    event: AcquisitionWorkerEventKind,
+) -> Result<(), AcquisitionStreamError> {
+    sender
+        .send(ParallelMessage::Event(context.event(event), None))
+        .map_err(|_| parallel_protocol_error("канал координатора закрыт"))
+}
+
+async fn acknowledge_parallel_event(
+    sender: &mpsc::UnboundedSender<ParallelMessage>,
+    context: &ParallelWorkerContext,
+    event: AcquisitionWorkerEventKind,
+) -> Result<(), AcquisitionStreamError> {
+    let (ack, received) = oneshot::channel();
+    sender
+        .send(ParallelMessage::Event(context.event(event), Some(ack)))
+        .map_err(|_| parallel_protocol_error("канал координатора закрыт"))?;
+    received
+        .await
+        .map_err(|_| parallel_protocol_error("результат не подтверждён координатором"))
+}
+
+struct ParallelAcquired {
+    outcome: Option<Result<AcquiredMedia, String>>,
+    diagnostics: Option<AcquisitionItemDiagnostics>,
+    stop: Option<SessionStopReason>,
+}
+
+/// Узкая подмена только браузера; координатор и ack остаются настоящими в тестах.
+trait ParallelDriver {
+    async fn acquire(
+        &mut self,
+        job: &ParallelJob,
+        context: &mut ParallelWorkerContext,
+        sender: &mpsc::UnboundedSender<ParallelMessage>,
+    ) -> Result<ParallelAcquired, AcquisitionStreamError>;
+    async fn rotate(&mut self) -> Result<(), AcquisitionStreamError>;
+    fn finish(&mut self) -> Result<(), AcquisitionStreamError>;
+}
+
+struct ParallelBrowserDriver {
+    workspace: Option<TempWorkspace>,
+    session: Option<BrowserSession>,
+    monitor: Option<BrowserEvidenceMonitor>,
+    tls_exception: Option<TlsExceptionProvenance>,
+    deadline: Instant,
+    session_items: usize,
+    interrupt: CtrlCListener,
+    allow_insecure_tls: bool,
+    acceptance_rotate_after_items: Option<usize>,
+}
+
+impl ParallelBrowserDriver {
+    async fn start(
+        &mut self,
+        context: &mut ParallelWorkerContext,
+        sender: &mpsc::UnboundedSender<ParallelMessage>,
+    ) -> Result<(), AcquisitionStreamError> {
+        if self.workspace.is_none() {
+            self.workspace = Some(yarxi_workspace("yarxi-browser-worker").map_err(|error| {
+                AcquisitionStreamError::Provider(format!("worker_workspace_create_failed: {error}"))
+            })?);
+        }
+        context.session += 1;
+        context.browser_session = None;
+        self.deadline = Instant::now() + OPERATION_TIMEOUT;
+        let config = BrowserRuntimeConfig {
+            device_metrics: Some(
+                DeviceMetrics::new(
+                    CAPTURE_VIEWPORT_WIDTH,
+                    CAPTURE_VIEWPORT_HEIGHT,
+                    CAPTURE_DEVICE_SCALE_FACTOR,
+                )
+                .map_err(AcquisitionStreamError::Provider)?,
+            ),
+            prefers_color_scheme: Some("dark".into()),
+            ..BrowserRuntimeConfig::default()
+        };
+        // Не отменяем launch: после получения владельца отмена проходит через явный close.
+        let session = BrowserSession::launch_in_workspace(
+            config,
+            self.workspace.as_ref().expect("worker workspace").path(),
+        )
+        .await
+        .map_err(|error| match error {
+            BrowserLaunchError::Setup(message) => {
+                AcquisitionStreamError::Provider(format!("browser_worker_session_fault: {message}"))
+            }
+            error => {
+                AcquisitionStreamError::Provider(format!("browser_worker_launch_fatal: {error}"))
+            }
+        })?;
+        context.browser_session = Some(session.diagnostic_session_id());
+        self.monitor = Some(BrowserEvidenceMonitor::new(session.telemetry().clone()));
+        self.session = Some(session);
+        send_parallel_event(
+            sender,
+            context,
+            AcquisitionWorkerEventKind::SessionBootstrapStarted,
+        )?;
+        let setup = run_setup_before_deadline(
+            self.deadline,
+            prepare_yarxi_session(
+                self.session.as_ref().expect("session owned"),
+                self.monitor.as_ref().expect("monitor owned"),
+                self.allow_insecure_tls,
+                AcquisitionTarget::PreferredSource,
+            ),
+        );
+        let setup = tokio::select! {
+            biased;
+            setup = setup => setup.map_err(|error| AcquisitionStreamError::Provider(format!("browser_worker_session_fault: {error}"))),
+            signal = &mut self.interrupt => return Err(signal_error(signal)),
+        }?;
+        self.tls_exception = setup.map(|approved| approved.provenance);
+        self.session_items = 0;
+        send_parallel_event(
+            sender,
+            context,
+            AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionStarted {
+                session: context.session,
+            }),
+        )
+    }
+}
+
+impl ParallelDriver for ParallelBrowserDriver {
+    async fn acquire(
+        &mut self,
+        job: &ParallelJob,
+        context: &mut ParallelWorkerContext,
+        sender: &mpsc::UnboundedSender<ParallelMessage>,
+    ) -> Result<ParallelAcquired, AcquisitionStreamError> {
+        if self.session.is_none() {
+            self.start(context, sender).await?;
+        }
+        let generations = [job.generation];
+        let session = self.session.as_ref().expect("session owned");
+        let monitor = self.monitor.as_ref().expect("monitor owned");
+        let mut driver = BrowserSessionItemDriver {
+            context: RetryAcquisitionContext {
+                page: session.page(),
+                target: AcquisitionTarget::PreferredSource,
+                evidence_monitor: monitor,
+                browser_runtime: session.provenance(),
+                tls_exception: self.tls_exception.clone(),
+                session_deadline: self.deadline,
+                session: context.session,
+                browser_session: session.diagnostic_session_id(),
+                interrupt: &mut self.interrupt,
+            },
+            session: context.session,
+            generations: Some(&generations),
+            worker: Some((context.worker_id as u64, context.session as u64)),
+            diagnostics: None,
+        };
+        if let Some(stop) = driver
+            .before_item(usize::from(self.session_items > 0))
+            .await?
+        {
+            return Ok(ParallelAcquired {
+                outcome: None,
+                diagnostics: None,
+                stop: Some(stop),
+            });
+        }
+        context.attempt = 1;
+        send_parallel_event(
+            sender,
+            context,
+            AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemStarted {
+                index: job.index,
+            }),
+        )?;
+        // Индекс 0 соответствует локальному массиву generation, внешний индекс — исходному frontier.
+        let mut events = |event| {
+            let event = match event {
+                AcquisitionEvent::RetryStarted { attempt, .. } => {
+                    context.attempt = attempt;
+                    AcquisitionEvent::RetryStarted {
+                        index: job.index,
+                        attempt,
+                    }
+                }
+                AcquisitionEvent::RetryRecoveryStarted { attempt, .. } => {
+                    context.attempt = attempt;
+                    AcquisitionEvent::RetryRecoveryStarted {
+                        index: job.index,
+                        attempt,
+                    }
+                }
+                AcquisitionEvent::Heartbeat { attempt, .. } => {
+                    context.attempt = attempt;
+                    AcquisitionEvent::Heartbeat {
+                        index: job.index,
+                        attempt,
+                    }
+                }
+                event => event,
+            };
+            send_parallel_event(sender, context, AcquisitionWorkerEventKind::Provider(event))
+                .map_err(|error| {
+                    AssetError::new(
+                        crate::error::ErrorCode::InvalidTransition,
+                        error.into_message(),
+                    )
+                })
+        };
+        let (outcome, stop) = driver.acquire(0, &job.character, &mut events).await?;
+        let diagnostics = driver.take_diagnostics();
+        // Неисправный CDP/возраст сессии до доказанного результата не является attempt владельца.
+        let deferred = outcome.is_err()
+            && matches!(
+                stop,
+                Some(SessionStopReason::Deadline | SessionStopReason::RuntimeFailure(_))
+            );
+        if !deferred {
+            self.session_items += 1;
+        }
+        #[cfg(feature = "session-rotation-acceptance")]
+        let stop = stop.or_else(|| {
+            self.acceptance_rotate_after_items
+                .is_some_and(|limit| self.session_items >= limit)
+                .then_some(SessionStopReason::ItemLimitReached)
+        });
+        #[cfg(not(feature = "session-rotation-acceptance"))]
+        let _ = self.acceptance_rotate_after_items;
+        Ok(ParallelAcquired {
+            outcome: (!deferred).then_some(outcome),
+            diagnostics,
+            stop,
+        })
+    }
+
+    async fn rotate(&mut self) -> Result<(), AcquisitionStreamError> {
+        if let Some(monitor) = self.monitor.take() {
+            monitor.abort();
+        }
+        if let Some(session) = self.session.take() {
+            session.close().await.map_err(|error| {
+                AcquisitionStreamError::Provider(format!("browser_worker_cleanup_failed: {error}"))
+            })?;
+        }
+        self.tls_exception = None;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), AcquisitionStreamError> {
+        self.interrupt.abort();
+        self.workspace.take().map_or(Ok(()), |workspace| {
+            workspace.close().map_err(|error| {
+                AcquisitionStreamError::Provider(format!(
+                    "worker_workspace_cleanup_failed: {error}"
+                ))
+            })
+        })
+    }
+}
+
+const PARALLEL_RECOVERY_BUDGET: u8 = MAX_SESSION_SETUP_RECREATIONS + 1;
+
+fn parallel_recoverable(error: &AcquisitionStreamError) -> bool {
+    matches!(error, AcquisitionStreamError::Provider(message) if message.starts_with("browser_worker_session_fault:"))
+}
+
+fn parallel_session_fault(stop: &SessionStopReason) -> bool {
+    matches!(
+        stop,
+        SessionStopReason::RuntimeFailure(_)
+            | SessionStopReason::RetryRecoveryFailed(_)
+            | SessionStopReason::ItemTimeout
+    )
+}
+
+async fn run_parallel_worker(
+    mut driver: impl ParallelDriver,
+    worker_id: usize,
+    mut commands: mpsc::UnboundedReceiver<ParallelJob>,
+    sender: mpsc::UnboundedSender<ParallelMessage>,
+    mut cancellation: watch::Receiver<bool>,
+) -> (usize, Result<(), AcquisitionStreamError>) {
+    let mut context = ParallelWorkerContext {
+        worker_id,
+        ..ParallelWorkerContext::default()
+    };
+    let mut consecutive_failures = 0u8;
+    let mut session_processed = 0usize;
+    let result = AssertUnwindSafe(async {
+        loop {
+            sender
+                .send(ParallelMessage::Ready(worker_id))
+                .map_err(|_| parallel_protocol_error("канал координатора закрыт"))?;
+            let job = tokio::select! {
+                biased;
+                _ = cancellation.changed() => break,
+                job = commands.recv() => match job { Some(job) => job, None => break },
+            };
+            if *cancellation.borrow() {
+                break;
+            }
+            context.job = Some(job.clone());
+            context.attempt = 1;
+            send_parallel_event(&sender, &context, AcquisitionWorkerEventKind::Assigned)?;
+            let acquired = driver.acquire(&job, &mut context, &sender).await;
+            let stop;
+            match acquired {
+                Ok(mut acquired) => {
+                    stop = acquired.stop.take();
+                    if let Some(outcome) = acquired.outcome.take() {
+                        // Доказанный item outcome без отказа session либо успешные байты
+                        // подтверждают здоровую работу. Серия terminal timeout/recovery
+                        // failures продолжает расходовать бюджет даже после checkpoint.
+                        if outcome.is_ok() || !stop.as_ref().is_some_and(parallel_session_fault) {
+                            consecutive_failures = 0;
+                        }
+                        session_processed += 1;
+                        acknowledge_parallel_event(
+                            &sender,
+                            &context,
+                            AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                                index: job.index,
+                                outcome: Box::new(outcome),
+                                diagnostics: acquired.diagnostics.take(),
+                            }),
+                        )
+                        .await?;
+                    } else {
+                        if let Some(diagnostics) = acquired.diagnostics.take() {
+                            diagnostics.timing.interrupt("session_fault_deferred", None);
+                        }
+                        let reason = stop
+                            .as_ref()
+                            .map_or_else(|| "session_fault".into(), SessionStopReason::summary);
+                        acknowledge_parallel_event(
+                            &sender,
+                            &context,
+                            AcquisitionWorkerEventKind::Deferred { reason },
+                        )
+                        .await?;
+                    }
+                    if stop.as_ref().is_some_and(parallel_session_fault) {
+                        consecutive_failures += 1;
+                    }
+                }
+                Err(AcquisitionStreamError::Interrupted) => {
+                    acknowledge_parallel_event(
+                        &sender,
+                        &context,
+                        AcquisitionWorkerEventKind::Deferred {
+                            reason: "interrupted".into(),
+                        },
+                    )
+                    .await?;
+                    break;
+                }
+                Err(error) if parallel_recoverable(&error) => {
+                    consecutive_failures += 1;
+                    acknowledge_parallel_event(
+                        &sender,
+                        &context,
+                        AcquisitionWorkerEventKind::Deferred {
+                            reason: error.into_message(),
+                        },
+                    )
+                    .await?;
+                    stop = Some(SessionStopReason::RuntimeFailure(
+                        "session_setup_failed".into(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+            if let Some(reason) = stop {
+                driver.rotate().await?;
+                send_parallel_event(
+                    &sender,
+                    &context,
+                    AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionEnded {
+                        session: context.session,
+                        processed: session_processed,
+                        stop_reason: Some(reason.clone()),
+                    }),
+                )?;
+                session_processed = 0;
+                context.browser_session = None;
+                if consecutive_failures >= PARALLEL_RECOVERY_BUDGET {
+                    send_parallel_event(
+                        &sender,
+                        &context,
+                        AcquisitionWorkerEventKind::WorkerRetired {
+                            consecutive_failures,
+                            reason: reason.summary(),
+                        },
+                    )?;
+                    break;
+                }
+                send_parallel_event(
+                    &sender,
+                    &context,
+                    AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionRotated {
+                        next_session: context.session + 1,
+                        reason,
+                    }),
+                )?;
+                context.browser_session = None;
+            }
+            context.job = None;
+        }
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    let mut result = result.unwrap_or_else(|_| {
+        Err(AcquisitionStreamError::Provider(
+            "browser_worker_panicked".into(),
+        ))
+    });
+    let cleanup = AssertUnwindSafe(driver.rotate())
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            Err(AcquisitionStreamError::Provider(
+                "browser_worker_cleanup_panicked".into(),
+            ))
+        });
+    if cleanup.is_ok() && context.browser_session.is_some() {
+        let stop_reason = (*cancellation.borrow()).then_some(SessionStopReason::Interrupted);
+        if let Err(error) = send_parallel_event(
+            &sender,
+            &context,
+            AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionEnded {
+                session: context.session,
+                processed: session_processed,
+                stop_reason,
+            }),
+        ) {
+            result = Err(error);
+        }
+    }
+    if let Err(cleanup) = cleanup {
+        result = Err(AcquisitionStreamError::Provider(format!(
+            "{}; {}",
+            result.err().map_or_else(
+                || "worker stopped".into(),
+                AcquisitionStreamError::into_message
+            ),
+            cleanup.into_message()
+        )));
+    }
+    let finish =
+        std::panic::catch_unwind(AssertUnwindSafe(|| driver.finish())).unwrap_or_else(|_| {
+            Err(AcquisitionStreamError::Provider(
+                "worker_workspace_cleanup_panicked".into(),
+            ))
+        });
+    if let Err(cleanup) = finish {
+        result = Err(AcquisitionStreamError::Provider(format!(
+            "{}; {}",
+            result.err().map_or_else(
+                || "worker stopped".into(),
+                AcquisitionStreamError::into_message
+            ),
+            cleanup.into_message()
+        )));
+    }
+    let reason = result
+        .as_ref()
+        .err()
+        .map_or_else(|| "finished".into(), |error| format!("{error:?}"));
+    let _ = send_parallel_event(
+        &sender,
+        &context,
+        AcquisitionWorkerEventKind::WorkerStopped { reason },
+    );
+    (worker_id, result)
+}
+
+struct ParallelAssignments {
+    pending: VecDeque<ParallelJob>,
+    active: Vec<Option<ParallelJob>>,
+    ready: Vec<bool>,
+    retired: Vec<bool>,
+}
+
+impl ParallelAssignments {
+    fn accept(
+        &mut self,
+        event: &AcquisitionWorkerEvent,
+    ) -> Result<ParallelJob, AcquisitionStreamError> {
+        let slot = event
+            .worker_id
+            .checked_sub(1)
+            .filter(|slot| *slot < self.active.len())
+            .ok_or_else(|| parallel_protocol_error("неизвестный worker"))?;
+        let expected = self.active[slot]
+            .as_ref()
+            .ok_or_else(|| parallel_protocol_error("результат без назначения"))?;
+        if event.index != Some(expected.index)
+            || event.generation != Some(expected.generation)
+            || event.owner_attempt != Some(expected.owner_attempt)
+        {
+            return Err(parallel_protocol_error(
+                "identity/generation/attempt результата не совпали с назначением",
+            ));
+        }
+        Ok(self.active[slot].take().expect("assignment checked"))
+    }
+
+    fn dispatch(
+        &mut self,
+        commands: &[mpsc::UnboundedSender<ParallelJob>],
+    ) -> Result<(), AcquisitionStreamError> {
+        for (slot, command) in commands.iter().enumerate() {
+            if self.retired[slot] || !self.ready[slot] || self.active[slot].is_some() {
+                continue;
+            }
+            let Some(job) = self.pending.pop_front() else {
+                break;
+            };
+            command
+                .send(job.clone())
+                .map_err(|_| parallel_protocol_error("worker не принимает назначение"))?;
+            self.active[slot] = Some(job);
+            self.ready[slot] = false;
+        }
+        Ok(())
+    }
+}
+
+fn stopped_parallel_failure(event: &AcquisitionWorkerEvent) -> Option<AcquisitionStreamError> {
+    match &event.event {
+        AcquisitionWorkerEventKind::WorkerStopped { reason } if reason != "finished" => Some(
+            AcquisitionStreamError::Provider(format!("browser_worker_stopped_fatal: {reason}")),
+        ),
+        _ => None,
+    }
+}
+
+fn deliver_parallel_event(
+    on_event: &mut impl FnMut(AcquisitionWorkerEvent) -> Result<(), AssetError>,
+    event: AcquisitionWorkerEvent,
+) -> Result<(), AcquisitionStreamError> {
+    std::panic::catch_unwind(AssertUnwindSafe(|| on_event(event)))
+        .map_err(|_| AcquisitionStreamError::Provider("browser_worker_consumer_panicked".into()))?
+        .map_err(AcquisitionStreamError::Consumer)
+}
+
+async fn coordinate_parallel<D: ParallelDriver>(
+    drivers: Vec<D>,
+    jobs: VecDeque<ParallelJob>,
+    interrupt: impl Future<Output = AcquisitionStreamError>,
+    cancellation: watch::Sender<bool>,
+    on_event: &mut impl FnMut(AcquisitionWorkerEvent) -> Result<(), AssetError>,
+) -> Result<AcquisitionSummary, AcquisitionStreamError> {
+    let count = drivers.len();
+    let mut state = ParallelAssignments {
+        pending: jobs,
+        active: vec![None; count],
+        ready: vec![false; count],
+        retired: vec![false; count],
+    };
+    let (sender, mut messages) = mpsc::unbounded_channel();
+    let mut futures = FuturesUnordered::new();
+    let mut commands = Vec::new();
+    for (slot, driver) in drivers.into_iter().enumerate() {
+        let (command, received) = mpsc::unbounded_channel();
+        commands.push(command);
+        futures.push(run_parallel_worker(
+            driver,
+            slot + 1,
+            received,
+            sender.clone(),
+            cancellation.subscribe(),
+        ));
+    }
+    drop(sender);
+    tokio::pin!(interrupt);
+    let mut error = None;
+    let mut interrupted = false;
+    let mut processed = 0;
+    let mut sessions = 0;
+    let mut closed = false;
+    let mut contexts = (1..=count)
+        .map(|worker_id| ParallelWorkerContext {
+            worker_id,
+            ..ParallelWorkerContext::default()
+        })
+        .collect::<Vec<_>>();
+    let mut heartbeat = tokio::time::interval(PROGRESS_HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    while !futures.is_empty() || !closed {
+        tokio::select! {
+            biased;
+            message = messages.recv(), if !closed => {
+                let Some(message) = message else { closed = true; continue; };
+                let handled = (|| -> Result<(), AcquisitionStreamError> {
+                    match message {
+                        ParallelMessage::Ready(worker) => {
+                            state.ready[worker - 1] = true;
+                        },
+                        ParallelMessage::Event(event, ack) => {
+                            let worker = event.worker_id;
+                            let slot = worker.checked_sub(1).filter(|slot| *slot < count)
+                                .ok_or_else(|| parallel_protocol_error("неизвестный worker события"))?;
+                            contexts[slot] = ParallelWorkerContext {
+                                worker_id: worker, session: event.session,
+                                browser_session: event.browser_session, attempt: event.attempt,
+                                job: state.active[slot].clone(),
+                            };
+                            let terminal = matches!(event.event, AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted { .. }));
+                            let deferred = matches!(event.event, AcquisitionWorkerEventKind::Deferred { .. });
+                            if terminal || deferred {
+                                let job = state.accept(&event)?;
+                                if deferred { state.pending.push_back(job); }
+                                else { processed += 1; }
+                            }
+                            if matches!(event.event, AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionStarted { .. })) { sessions += 1; }
+                            if matches!(event.event, AcquisitionWorkerEventKind::WorkerRetired { .. } | AcquisitionWorkerEventKind::WorkerStopped { .. }) { state.retired[worker - 1] = true; }
+                            // После отказа callback принятые результаты соседей продолжают checkpoint.
+                            // Не ждём join-error: сосед уже может прислать Ready.
+                            // Fatal stop закрывает dispatch в обработке этого же сообщения.
+                            let stopped_failure = stopped_parallel_failure(&event);
+                            let requeue_reason = match &event.event {
+                                AcquisitionWorkerEventKind::Deferred { reason } => reason.clone(),
+                                _ => String::new(),
+                            };
+                            let requeued = deferred.then(|| AcquisitionWorkerEvent {
+                                worker_id: event.worker_id, index: event.index,
+                                generation: event.generation, owner_attempt: event.owner_attempt,
+                                session: event.session, browser_session: event.browser_session,
+                                attempt: event.attempt,
+                                event: AcquisitionWorkerEventKind::Requeued { reason: requeue_reason },
+                            });
+                            deliver_parallel_event(on_event, event)?;
+                            if let Some(requeued) = requeued { deliver_parallel_event(on_event, requeued)?; }
+                            if let Some(ack) = ack { let _ = ack.send(()); }
+                            if let Some(stopped_failure) = stopped_failure { return Err(stopped_failure); }
+                        },
+                    }
+                    Ok(())
+                })();
+                if let Err(next) = handled { if error.is_none() { error = Some(next); } let _ = cancellation.send(true); }
+                // Сигнал, полученный в callback checkpoint, проверяется до refill.
+                if !interrupted && let Some(signal) = interrupt.as_mut().now_or_never() {
+                    interrupted = true;
+                    if error.is_none() { error = Some(signal); }
+                    let _ = cancellation.send(true);
+                    commands.clear();
+                }
+                if error.is_none()
+                    && !interrupted
+                    && let Err(next) = state.dispatch(&commands)
+                {
+                    error = Some(next);
+                    let _ = cancellation.send(true);
+                }
+                if state.pending.is_empty() && state.active.iter().all(Option::is_none) { commands.clear(); }
+            },
+            signal = &mut interrupt, if !interrupted => {
+                interrupted = true;
+                if error.is_none() { error = Some(signal); }
+                let _ = cancellation.send(true);
+                commands.clear();
+            },
+            _ = heartbeat.tick() => {
+                for (slot, active) in state.active.iter().enumerate() {
+                    if let Some(job) = active && contexts[slot].job.as_ref() == Some(job) {
+                        let context = &contexts[slot];
+                        let event = context.event(AcquisitionWorkerEventKind::Provider(AcquisitionEvent::Heartbeat {
+                            index: job.index, attempt: context.attempt,
+                        }));
+                        if let Err(next) = deliver_parallel_event(on_event, event) {
+                            if error.is_none() { error = Some(next); }
+                            let _ = cancellation.send(true);
+                            commands.clear();
+                            break;
+                        }
+                    }
+                }
+            },
+            worker = futures.next(), if !futures.is_empty() => {
+                if let Some((worker, result)) = worker {
+                    state.retired[worker - 1] = true;
+                    if let Err(next) = result {
+                        error = Some(match error.take() {
+                            Some(original) => AcquisitionStreamError::Provider(format!("{}; {}", original.into_message(), next.into_message())),
+                            None => next,
+                        });
+                        let _ = cancellation.send(true);
+                        commands.clear();
+                    }
+                }
+            },
+        }
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let mut pending_indices = state
+        .pending
+        .iter()
+        .map(|job| job.index)
+        .collect::<Vec<_>>();
+    pending_indices.extend(state.active.iter().flatten().map(|job| job.index));
+    pending_indices.sort_unstable();
+    if !pending_indices.is_empty() {
+        return Err(AcquisitionStreamError::WorkersExhausted { pending_indices });
+    }
+    Ok(AcquisitionSummary {
+        processed,
+        sessions,
+    })
+}
+
+impl AcquisitionRun {
+    /// Получает один frontier: раунды и CAS остаются у единственного потребителя.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn acquire_with_generations_parallel<F>(
+        &mut self,
+        characters: &[String],
+        allow_insecure_tls: bool,
+        generations: &[u32],
+        owner_attempts: &[usize],
+        workers: usize,
+        mut on_event: F,
+    ) -> Result<AcquisitionSummary, AcquisitionStreamError>
+    where
+        F: FnMut(AcquisitionWorkerEvent) -> Result<(), AssetError>,
+    {
+        if !(2..=4).contains(&workers)
+            || characters.len() != generations.len()
+            || characters.len() != owner_attempts.len()
+            || owner_attempts.contains(&0)
+        {
+            return Err(parallel_protocol_error(
+                "некорректное число workers или owner tokens",
+            ));
+        }
+        let mut unique = HashSet::new();
+        let mut jobs = VecDeque::new();
+        for (index, character) in characters.iter().enumerate() {
+            crate::kanji_domain::parse_kanji_character(character)
+                .map_err(AcquisitionStreamError::Provider)?;
+            if !unique.insert(character) {
+                return Err(parallel_protocol_error("повторная identity frontier"));
+            }
+            jobs.push_back(ParallelJob {
+                index,
+                character: character.clone(),
+                generation: generations[index],
+                owner_attempt: owner_attempts[index],
+            });
+        }
+        if self.stopped {
+            return Err(AcquisitionStreamError::Interrupted);
+        }
+        let result = self.runtime.block_on(async {
+            if self.interrupt.is_finished() {
+                return Err(signal_error((&mut self.interrupt).await));
+            }
+            let (cancel, receiver) = watch::channel(false);
+            let drivers = (0..workers)
+                .map(|_| {
+                    let mut receiver = receiver.clone();
+                    let interrupt = tokio::spawn(async move {
+                        while !*receiver.borrow() {
+                            if receiver.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    });
+                    ParallelBrowserDriver {
+                        workspace: None,
+                        session: None,
+                        monitor: None,
+                        tls_exception: None,
+                        deadline: Instant::now(),
+                        session_items: 0,
+                        interrupt,
+                        allow_insecure_tls,
+                        acceptance_rotate_after_items: self.acceptance_rotate_after_items,
+                    }
+                })
+                .collect();
+            coordinate_parallel(
+                drivers,
+                jobs,
+                async { signal_error((&mut self.interrupt).await) },
+                cancel,
+                &mut on_event,
+            )
+            .await
+        });
+        if matches!(result, Err(AcquisitionStreamError::Interrupted))
+            || self.interrupt.is_finished()
+        {
+            self.stopped = true;
+        }
+        result
+    }
+}
+
 /// Передаёт единственный таймер элемента от браузера к потребителю результата.
 /// Пакет завершает его после проверки и надёжного checkpoint; самостоятельный
 /// потребитель — после приёма результата получения.
@@ -739,6 +1623,10 @@ impl AcquisitionItemDiagnostics {
             Ok(_) => self.timing.finish_success(),
             Err(error) => self.finish_recorded_failure(acquisition_failure_code(error)),
         }
+    }
+
+    pub fn stage_timings(&self) -> Vec<crate::browser_diagnostics::BrowserStageTiming> {
+        self.timing.stage_timings()
     }
 
     pub(crate) fn finish_recorded_failure(self, code: &str) {
@@ -811,6 +1699,7 @@ pub enum AcquisitionStreamError {
     Provider(String),
     Consumer(AssetError),
     Interrupted,
+    WorkersExhausted { pending_indices: Vec<usize> },
 }
 
 impl AcquisitionStreamError {
@@ -819,6 +1708,9 @@ impl AcquisitionStreamError {
             Self::Provider(message) => message,
             Self::Consumer(error) => format!("progress_consumer_failed: {error}"),
             Self::Interrupted => "acquisition_interrupted: получен Ctrl+C".into(),
+            Self::WorkersExhausted { pending_indices } => {
+                format!("browser_workers_exhausted: незавершённые индексы {pending_indices:?}")
+            }
         }
     }
 }
@@ -931,7 +1823,7 @@ pub struct AcquisitionRun {
 
 impl AcquisitionRun {
     pub fn new() -> Result<Self, AcquisitionStreamError> {
-        let workspace = TempWorkspace::create("yarxi-acquisition").map_err(|error| {
+        let workspace = yarxi_workspace("yarxi-acquisition").map_err(|error| {
             AcquisitionStreamError::Provider(format!("temp_workspace_create_failed: {error}"))
         })?;
         Self::with_workspace(workspace.path().to_path_buf(), Some(workspace))
@@ -945,7 +1837,7 @@ impl AcquisitionRun {
     pub(crate) fn new_for_acceptance_rotation(
         max_items: usize,
     ) -> Result<Self, AcquisitionStreamError> {
-        let workspace = TempWorkspace::create("yarxi-acquisition").map_err(|error| {
+        let workspace = yarxi_workspace("yarxi-acquisition").map_err(|error| {
             AcquisitionStreamError::Provider(format!("temp_workspace_create_failed: {error}"))
         })?;
         Self::with_workspace_and_rotation_limit(
@@ -1308,6 +2200,67 @@ fn session_action(
     }
 }
 
+/// Обе границы запуска используют один TLS/readiness barrier.
+async fn prepare_yarxi_session(
+    session: &BrowserSession,
+    evidence_monitor: &BrowserEvidenceMonitor,
+    allow_insecure_tls: bool,
+    target: AcquisitionTarget,
+) -> Result<Option<ApprovedTlsException>, String> {
+    let page = session.page();
+    let tls_exception = match page.goto(SITE_URL).await {
+        Err(error) => Some(
+            async_error_or_tls_interstitial(page, evidence_monitor, allow_insecure_tls, error)
+                .await?,
+        ),
+        Ok(_) => {
+            let tls_probe: Value = page
+            .evaluate("() => ({ code: document.querySelector('#error-code')?.textContent?.trim() || '', proceed: Boolean(document.querySelector('#proceed-link')) })")
+            .await
+            .map_err(|error| format!("проверка TLS-страницы: {error}"))?
+            .into_value()
+            .map_err(|error| format!("ответ проверки TLS-страницы: {error}"))?;
+            if !tls_probe["code"].as_str().unwrap_or_default().is_empty() {
+                Some(
+                    async_error_or_tls_interstitial(
+                        page,
+                        evidence_monitor,
+                        allow_insecure_tls,
+                        tls_probe["code"].as_str().unwrap_or_default(),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        }
+    };
+    let site_host: bool = page
+        .evaluate(format!("location.hostname === {SITE_HOST:?}"))
+        .await
+        .map_err(|error| format!("проверка узла Yarxi: {error}"))?
+        .into_value()
+        .map_err(|error| format!("ответ проверки узла Yarxi: {error}"))?;
+    if !site_host {
+        return Err("provider_host_mismatch: загрузка ушла с www.yarxi.su".into());
+    }
+    wait_until(page, Duration::from_secs(20), || {
+        "Boolean([...document.querySelectorAll('.kanji-search-form input[placeholder=\"Чтение\"]')].find(node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden'))"
+    })
+    .await?;
+    if let Some(approved) = &tls_exception {
+        evidence_monitor.clear_explicitly_approved_tls_interstitial_failure(
+            &approved.request_id,
+            &approved.blocked_url,
+        );
+    }
+    if target == AcquisitionTarget::RenderedFontSamplePng {
+        apply_dark_theme(page).await?;
+    }
+    wait_for_session_setup_readiness(evidence_monitor).await?;
+    Ok::<_, String>(tls_exception)
+}
+
 async fn acquire_one_session(
     config: SessionAcquisitionConfig<'_>,
     on_event: &mut impl FnMut(AcquisitionEvent) -> Result<(), AssetError>,
@@ -1363,58 +2316,7 @@ async fn acquire_one_session(
 
     let setup_started_at = Instant::now();
     let setup = run_setup_before_deadline(session_deadline, async {
-        let page = session.page();
-        let tls_exception = match page.goto(SITE_URL).await {
-            Err(error) => Some(
-                async_error_or_tls_interstitial(page, &evidence_monitor, allow_insecure_tls, error)
-                    .await?,
-            ),
-            Ok(_) => {
-                let tls_probe: Value = page
-                    .evaluate("() => ({ code: document.querySelector('#error-code')?.textContent?.trim() || '', proceed: Boolean(document.querySelector('#proceed-link')) })")
-                    .await
-                    .map_err(|error| format!("проверка TLS-страницы: {error}"))?
-                    .into_value()
-                    .map_err(|error| format!("ответ проверки TLS-страницы: {error}"))?;
-                if !tls_probe["code"].as_str().unwrap_or_default().is_empty() {
-                    Some(
-                        async_error_or_tls_interstitial(
-                            page,
-                            &evidence_monitor,
-                            allow_insecure_tls,
-                            tls_probe["code"].as_str().unwrap_or_default(),
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                }
-            }
-        };
-        let site_host: bool = page
-            .evaluate(format!("location.hostname === {SITE_HOST:?}"))
-            .await
-            .map_err(|error| format!("проверка узла Yarxi: {error}"))?
-            .into_value()
-            .map_err(|error| format!("ответ проверки узла Yarxi: {error}"))?;
-        if !site_host {
-            return Err("provider_host_mismatch: загрузка ушла с www.yarxi.su".into());
-        }
-        wait_until(page, Duration::from_secs(20), || {
-            "Boolean([...document.querySelectorAll('.kanji-search-form input[placeholder=\"Чтение\"]')].find(node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden'))"
-        })
-        .await?;
-        if let Some(approved) = &tls_exception {
-            evidence_monitor.clear_explicitly_approved_tls_interstitial_failure(
-                &approved.request_id,
-                &approved.blocked_url,
-            );
-        }
-        if target == AcquisitionTarget::RenderedFontSamplePng {
-            apply_dark_theme(page).await?;
-        }
-        wait_for_session_setup_readiness(&evidence_monitor).await?;
-        Ok::<_, String>(tls_exception)
+        prepare_yarxi_session(&session, &evidence_monitor, allow_insecure_tls, target).await
     });
     let setup_result = tokio::select! {
         result = setup => Ok(result),
@@ -1515,6 +2417,7 @@ async fn acquire_one_session(
         },
         session: session_number,
         generations,
+        worker: None,
         diagnostics: None,
     };
     let result = process_session_items(
@@ -1647,6 +2550,7 @@ struct BrowserSessionItemDriver<'a> {
     context: RetryAcquisitionContext<'a>,
     session: u32,
     generations: Option<&'a [u32]>,
+    worker: Option<(u64, u64)>,
     diagnostics: Option<AcquisitionItemDiagnostics>,
 }
 
@@ -1748,6 +2652,10 @@ impl SessionItemDriver for BrowserSessionItemDriver<'_> {
             None => BrowserItemContext::without_generation(PROVIDER_ID, character, 1),
         }
         .with_browser_session(self.context.browser_session);
+        let item_context = match self.worker {
+            Some((worker, session)) => item_context.with_worker(worker, session),
+            None => item_context,
+        };
         let timing = BrowserItemTimer::new(item_context);
         tracing::info!(
             session = self.session,
@@ -1804,6 +2712,9 @@ impl SessionItemDriver for BrowserSessionItemDriver<'_> {
             }
             Err(AcquisitionStreamError::Provider(error)) => {
                 timing.finish_failure(acquisition_failure_code(error), false, None)
+            }
+            Err(AcquisitionStreamError::WorkersExhausted { .. }) => {
+                timing.finish_failure("browser_workers_exhausted", false, None)
             }
         }
         result
@@ -1889,6 +2800,7 @@ async fn acquire_one_with_retries(
             heartbeat.tick().await;
             let acquisition = loop {
                 tokio::select! {
+                    biased;
                     result = &mut item_timeout => break result,
                     _ = heartbeat.tick() => {
                         if let Err(error) = on_event(AcquisitionEvent::Heartbeat { index, attempt }) {
@@ -5018,6 +5930,600 @@ mod tests {
                 false,
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod parallel_pool_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Copy)]
+    enum SyntheticMode {
+        Terminal,
+        Fault,
+        CleanupFailure,
+        TerminalSessionFault,
+        AlternatingHealthy,
+        FaultCleanupFailure,
+        Panic,
+    }
+
+    struct SyntheticDriver {
+        mode: SyntheticMode,
+        cancellation: watch::Receiver<bool>,
+        gate: Option<Arc<Notify>>,
+        wait_index: Option<usize>,
+        cleanup: Arc<Mutex<Vec<&'static str>>>,
+        acquisitions: usize,
+    }
+
+    impl ParallelDriver for SyntheticDriver {
+        async fn acquire(
+            &mut self,
+            job: &ParallelJob,
+            context: &mut ParallelWorkerContext,
+            sender: &mpsc::UnboundedSender<ParallelMessage>,
+        ) -> Result<ParallelAcquired, AcquisitionStreamError> {
+            self.acquisitions += 1;
+            context.session += 1;
+            context.browser_session =
+                Some(context.worker_id as u64 * 100 + u64::from(context.session));
+            send_parallel_event(
+                sender,
+                context,
+                AcquisitionWorkerEventKind::SessionBootstrapStarted,
+            )?;
+            send_parallel_event(
+                sender,
+                context,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionStarted {
+                    session: context.session,
+                }),
+            )?;
+            if self.wait_index == Some(job.index) {
+                let gate = self.gate.as_ref().expect("test gate");
+                tokio::select! {
+                    biased;
+                    _ = gate.notified() => {},
+                    _ = self.cancellation.changed() => return Err(AcquisitionStreamError::Interrupted),
+                }
+            }
+            match self.mode {
+                SyntheticMode::Fault => Err(AcquisitionStreamError::Provider(
+                    "browser_worker_session_fault: injected".into(),
+                )),
+                SyntheticMode::Panic => panic!("injected worker panic"),
+                mode => Ok(ParallelAcquired {
+                    outcome: Some(Err("gif_unknown: synthetic terminal failure".into())),
+                    diagnostics: None,
+                    stop: (matches!(
+                        mode,
+                        SyntheticMode::TerminalSessionFault | SyntheticMode::FaultCleanupFailure
+                    ) || (matches!(mode, SyntheticMode::AlternatingHealthy)
+                        && !self.acquisitions.is_multiple_of(3)))
+                    .then_some(SessionStopReason::ItemTimeout),
+                }),
+            }
+        }
+        async fn rotate(&mut self) -> Result<(), AcquisitionStreamError> {
+            self.cleanup.lock().unwrap().push("session_closed");
+            if matches!(
+                self.mode,
+                SyntheticMode::CleanupFailure | SyntheticMode::FaultCleanupFailure
+            ) {
+                Err(AcquisitionStreamError::Provider(
+                    "browser_worker_cleanup_failed: injected".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn finish(&mut self) -> Result<(), AcquisitionStreamError> {
+            self.cleanup.lock().unwrap().push("workspace_closed");
+            Ok(())
+        }
+    }
+
+    fn jobs(count: usize) -> VecDeque<ParallelJob> {
+        (0..count)
+            .map(|index| ParallelJob {
+                index,
+                character: "漢".into(),
+                generation: 7,
+                owner_attempt: 2,
+            })
+            .collect()
+    }
+    fn driver(
+        mode: SyntheticMode,
+        cancellation: &watch::Sender<bool>,
+        cleanup: &Arc<Mutex<Vec<&'static str>>>,
+    ) -> SyntheticDriver {
+        SyntheticDriver {
+            mode,
+            cancellation: cancellation.subscribe(),
+            gate: None,
+            wait_index: None,
+            cleanup: cleanup.clone(),
+            acquisitions: 0,
+        }
+    }
+    fn completion(event: &AcquisitionWorkerEvent) -> bool {
+        matches!(
+            event.event,
+            AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted { .. })
+        )
+    }
+
+    #[test]
+    fn assignment_rejects_wrong_token_and_duplicate_completion() {
+        let job = jobs(1).pop_front().unwrap();
+        let mut assignments = ParallelAssignments {
+            pending: VecDeque::new(),
+            active: vec![Some(job.clone())],
+            ready: vec![false],
+            retired: vec![false],
+        };
+        let context = ParallelWorkerContext {
+            worker_id: 1,
+            job: Some(job),
+            ..ParallelWorkerContext::default()
+        };
+        let mut stale = context.event(AcquisitionWorkerEventKind::Assigned);
+        stale.generation = Some(8);
+        assert!(assignments.accept(&stale).is_err());
+        assert!(assignments.active[0].is_some());
+        let current = context.event(AcquisitionWorkerEventKind::Assigned);
+        assert!(assignments.accept(&current).is_ok());
+        assert!(assignments.accept(&current).is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_checkpoints_out_of_order_before_slow_assignment_finishes() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Notify::new());
+        let drivers = (0..2)
+            .map(|_| {
+                let mut driver = driver(SyntheticMode::Terminal, &cancel, &cleanup);
+                driver.gate = Some(gate.clone());
+                driver.wait_index = Some(0);
+                driver
+            })
+            .collect();
+        let mut completed = Vec::new();
+        let summary = coordinate_parallel(
+            drivers,
+            jobs(4),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if completion(&event) {
+                    completed.push(event.index.unwrap());
+                    if event.index == Some(1) {
+                        gate.notify_one();
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.processed, 4);
+        assert_eq!(completed[0], 1);
+        completed.sort_unstable();
+        assert_eq!(completed, vec![0, 1, 2, 3]);
+        assert_eq!(
+            cleanup
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|value| **value == "workspace_closed")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_sessions_keep_worker_local_browser_context() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let drivers = vec![
+            driver(SyntheticMode::TerminalSessionFault, &cancel, &cleanup),
+            driver(SyntheticMode::TerminalSessionFault, &cancel, &cleanup),
+        ];
+        let mut bootstraps = std::collections::BTreeMap::<usize, Vec<(u32, u64)>>::new();
+        let mut rotations = 0;
+        let mut retired = 0;
+        let summary = coordinate_parallel(
+            drivers,
+            jobs(6),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if matches!(
+                    event.event,
+                    AcquisitionWorkerEventKind::SessionBootstrapStarted
+                ) {
+                    bootstraps.entry(event.worker_id).or_default().push((
+                        event.session,
+                        event
+                            .browser_session
+                            .expect("bootstrap уже владеет session ID"),
+                    ));
+                }
+                if matches!(
+                    event.event,
+                    AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionRotated { .. })
+                ) {
+                    rotations += 1;
+                }
+                if matches!(
+                    event.event,
+                    AcquisitionWorkerEventKind::WorkerRetired { .. }
+                ) {
+                    retired += 1;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.processed, 6);
+        assert_eq!(
+            rotations, 4,
+            "each worker rotates twice before its fault budget retires it"
+        );
+        assert_eq!(retired, 2);
+        assert_eq!(bootstraps[&1], [(1, 101), (2, 102), (3, 103)]);
+        assert_eq!(bootstraps[&2], [(1, 201), (2, 202), (3, 203)]);
+        assert!(
+            bootstraps[&1]
+                .iter()
+                .all(|(_, browser)| !bootstraps[&2].iter().any(|(_, other)| browser == other)),
+            "browser session identifiers remain worker-local across rotations"
+        );
+    }
+
+    #[tokio::test]
+    async fn sick_worker_requeues_without_terminal_attempt_and_healthy_neighbor_finishes() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let drivers = vec![
+            driver(SyntheticMode::Fault, &cancel, &cleanup),
+            driver(SyntheticMode::Terminal, &cancel, &cleanup),
+        ];
+        let mut completed = Vec::new();
+        let mut deferred = 0;
+        let summary = coordinate_parallel(
+            drivers,
+            jobs(12),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if completion(&event) {
+                    completed.push(event.index.unwrap());
+                }
+                if matches!(event.event, AcquisitionWorkerEventKind::Deferred { .. }) {
+                    deferred += 1;
+                }
+                assert!(event.owner_attempt.is_none_or(|attempt| attempt == 2));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.processed, 12);
+        assert!(deferred > 0);
+        completed.sort_unstable();
+        assert_eq!(completed, (0..12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn exhaustion_returns_exact_frontier_without_synthetic_outcomes() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let drivers = vec![
+            driver(SyntheticMode::Fault, &cancel, &cleanup),
+            driver(SyntheticMode::Fault, &cancel, &cleanup),
+        ];
+        let mut terminal = 0;
+        let mut retired = 0;
+        let error = coordinate_parallel(
+            drivers,
+            jobs(7),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if completion(&event) {
+                    terminal += 1;
+                }
+                if matches!(
+                    event.event,
+                    AcquisitionWorkerEventKind::WorkerRetired { .. }
+                ) {
+                    retired += 1;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, AcquisitionStreamError::WorkersExhausted { pending_indices } if pending_indices == (0..7).collect::<Vec<_>>())
+        );
+        assert_eq!(terminal, 0);
+        assert_eq!(retired, 2);
+        assert_eq!(
+            cleanup
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|value| **value == "workspace_closed")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_terminal_progress_resets_recovery_budget() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let drivers = vec![
+            driver(SyntheticMode::AlternatingHealthy, &cancel, &cleanup),
+            driver(SyntheticMode::AlternatingHealthy, &cancel, &cleanup),
+        ];
+        let mut retired = 0;
+        let summary = coordinate_parallel(
+            drivers,
+            jobs(12),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if matches!(
+                    event.event,
+                    AcquisitionWorkerEventKind::WorkerRetired { .. }
+                ) {
+                    retired += 1;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.processed, 12);
+        assert_eq!(retired, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_checkpoint_preserves_completed_and_defers_running_job() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Notify::new());
+        let drivers = (0..2)
+            .map(|_| {
+                let mut driver = driver(SyntheticMode::Terminal, &cancel, &cleanup);
+                driver.gate = Some(gate.clone());
+                driver.wait_index = Some(0);
+                driver
+            })
+            .collect();
+        let (interrupt, received) = oneshot::channel();
+        let mut interrupt = Some(interrupt);
+        let mut completed = Vec::new();
+        let mut deferred = Vec::new();
+        let result = coordinate_parallel(
+            drivers,
+            jobs(5),
+            async {
+                let _ = received.await;
+                AcquisitionStreamError::Interrupted
+            },
+            cancel,
+            &mut |event| {
+                if completion(&event) {
+                    completed.push(event.index.unwrap());
+                    if let Some(interrupt) = interrupt.take() {
+                        let _ = interrupt.send(());
+                    }
+                }
+                if matches!(event.event, AcquisitionWorkerEventKind::Deferred { .. }) {
+                    deferred.push(event.index.unwrap());
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(AcquisitionStreamError::Interrupted)));
+        assert!(completed.contains(&1));
+        assert!(!completed.contains(&0));
+        assert!(deferred.contains(&0));
+        assert_eq!(
+            cleanup
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|value| **value == "workspace_closed")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_error_and_worker_panic_both_wait_for_all_cleanup() {
+        for mode in [SyntheticMode::Terminal, SyntheticMode::Panic] {
+            let (cancel, _) = watch::channel(false);
+            let cleanup = Arc::new(Mutex::new(Vec::new()));
+            let drivers = vec![
+                driver(mode, &cancel, &cleanup),
+                driver(SyntheticMode::Terminal, &cancel, &cleanup),
+            ];
+            let mut callback_failed = false;
+            let result = coordinate_parallel(
+                drivers,
+                jobs(5),
+                futures::future::pending(),
+                cancel,
+                &mut |event| {
+                    if completion(&event) && !callback_failed {
+                        callback_failed = true;
+                        return Err(AssetError::new(
+                            crate::error::ErrorCode::InvalidTransition,
+                            "injected checkpoint error",
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                cleanup
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|value| **value == "workspace_closed")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_is_fatal_after_accepted_terminal_outcome() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let drivers = vec![
+            driver(SyntheticMode::CleanupFailure, &cancel, &cleanup),
+            driver(SyntheticMode::Terminal, &cancel, &cleanup),
+        ];
+        let mut terminal = 0;
+        let error = coordinate_parallel(
+            drivers,
+            jobs(2),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if completion(&event) {
+                    terminal += 1;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, AcquisitionStreamError::Provider(message) if message.contains("cleanup_failed"))
+        );
+        assert_eq!(terminal, 2);
+    }
+    #[tokio::test]
+    async fn repeated_terminal_timeouts_retire_workers_after_durable_results() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let drivers = vec![
+            driver(SyntheticMode::TerminalSessionFault, &cancel, &cleanup),
+            driver(SyntheticMode::TerminalSessionFault, &cancel, &cleanup),
+        ];
+        let mut completed = Vec::new();
+        let mut retired = Vec::new();
+        let error = coordinate_parallel(
+            drivers,
+            jobs(12),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if completion(&event) {
+                    completed.push(event.index.unwrap());
+                }
+                if let AcquisitionWorkerEventKind::WorkerRetired {
+                    consecutive_failures,
+                    ..
+                } = event.event
+                {
+                    retired.push(consecutive_failures);
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(completed.len(), usize::from(PARALLEL_RECOVERY_BUDGET) * 2);
+        assert_eq!(retired, vec![PARALLEL_RECOVERY_BUDGET; 2]);
+        let AcquisitionStreamError::WorkersExhausted { pending_indices } = error else {
+            panic!("expected pool exhaustion")
+        };
+        completed.extend(pending_indices);
+        completed.sort_unstable();
+        assert_eq!(completed, (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn failed_stop_is_fatal_before_join_and_normal_retirement_is_not() {
+        let context = ParallelWorkerContext {
+            worker_id: 1,
+            ..ParallelWorkerContext::default()
+        };
+        let failed = context.event(AcquisitionWorkerEventKind::WorkerStopped {
+            reason: "browser_worker_cleanup_failed".into(),
+        });
+        assert!(stopped_parallel_failure(&failed).is_some());
+        let finished = context.event(AcquisitionWorkerEventKind::WorkerStopped {
+            reason: "finished".into(),
+        });
+        assert!(stopped_parallel_failure(&finished).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_stop_prevents_refill_while_healthy_ready_and_join_can_race() {
+        let (cancel, _) = watch::channel(false);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let drivers = vec![
+            driver(SyntheticMode::FaultCleanupFailure, &cancel, &cleanup),
+            driver(SyntheticMode::Terminal, &cancel, &cleanup),
+        ];
+        let mut fatal_seen = false;
+        let mut completed = Vec::new();
+        let error = coordinate_parallel(
+            drivers,
+            jobs(20),
+            futures::future::pending(),
+            cancel,
+            &mut |event| {
+                if matches!(event.event, AcquisitionWorkerEventKind::Assigned) {
+                    assert!(!fatal_seen, "assignment after known fatal stop");
+                }
+                if completion(&event) {
+                    completed.push(event.index.unwrap());
+                }
+                if stopped_parallel_failure(&event).is_some() {
+                    fatal_seen = true;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(fatal_seen);
+        assert!(
+            matches!(error, AcquisitionStreamError::Provider(message) if message.contains("cleanup_failed"))
+        );
+        assert!(!completed.is_empty());
+        completed.sort_unstable();
+        completed.dedup();
+        assert!(completed.len() < 20);
+        assert_eq!(
+            cleanup
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|value| **value == "workspace_closed")
+                .count(),
+            2
         );
     }
 }

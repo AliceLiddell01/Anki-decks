@@ -387,9 +387,17 @@ fn build_browser_config(
     config: &BrowserRuntimeConfig,
     executable: Option<BrowserExecutableSelection>,
 ) -> Result<BrowserConfig, String> {
+    let configured_temp_root =
+        std::env::var_os(crate::temp_workspace::CONFIGURED_TEMP_ROOT_ENV).map(PathBuf::from);
+    let current_directory = std::env::current_dir().ok();
+    let temp_directory = browser_tmpdir_value(
+        &profile.temp_path,
+        configured_temp_root.as_deref(),
+        current_directory.as_deref(),
+    );
     let mut builder = BrowserConfig::builder()
         .user_data_dir(&profile.path)
-        .env("TMPDIR", profile.temp_path.to_string_lossy().into_owned())
+        .env("TMPDIR", temp_directory.to_string_lossy().into_owned())
         .incognito()
         .respect_https_errors()
         .launch_timeout(config.launch_timeout)
@@ -400,6 +408,26 @@ fn build_browser_config(
     builder
         .build()
         .map_err(|error| format!("настройка браузера: {error}"))
+}
+
+fn browser_tmpdir_value(
+    temp_path: &Path,
+    configured_root: Option<&Path>,
+    current_directory: Option<&Path>,
+) -> PathBuf {
+    if let (Some(configured_root), Some(current_directory)) = (configured_root, current_directory)
+        && let (Ok(root), Ok(current)) = (
+            fs::canonicalize(configured_root),
+            fs::canonicalize(current_directory),
+        )
+        && root == current
+        && let Ok(temp_path) = fs::canonicalize(temp_path)
+        && let Ok(relative) = temp_path.strip_prefix(&root)
+        && !relative.as_os_str().is_empty()
+    {
+        return relative.to_path_buf();
+    }
+    temp_path.to_path_buf()
 }
 
 fn profile_setup_failure(profile: BrowserProfile, message: String) -> BrowserLaunchError {
@@ -1969,6 +1997,29 @@ mod tests {
         assert_eq!(std::env::var_os("TMPDIR"), before);
         assert!(profile.temp_path.as_os_str().as_bytes().len() < 108);
         profile.close().unwrap();
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn browser_tmpdir_is_relative_when_the_configured_root_is_the_process_directory() {
+        let parent = TempWorkspace::create("browser-relative-tmpdir-parent-test").unwrap();
+        let worker = TempWorkspace::create_under(parent.path(), "worker").unwrap();
+        let temp_path = worker.path().join("t00");
+        fs::create_dir(&temp_path).unwrap();
+
+        let relative = browser_tmpdir_value(&temp_path, Some(parent.path()), Some(parent.path()));
+        assert!(relative.is_relative());
+        let socket_path = relative
+            .join("org.chromium.Chromium.XXXXXX")
+            .join("SingletonSocket");
+        assert!(
+            socket_path.as_os_str().as_bytes().len() < 108,
+            "Unix socket path is {} bytes: {}",
+            socket_path.as_os_str().as_bytes().len(),
+            socket_path.display()
+        );
+
+        worker.close().unwrap();
         parent.close().unwrap();
     }
 

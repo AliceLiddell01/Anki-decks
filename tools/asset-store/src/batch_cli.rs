@@ -1,7 +1,7 @@
 //! Тонкий CLI-слой для управления пакетами кандзи и общим владельцем ресурсов.
 
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor, Read, Write};
 #[cfg(feature = "session-rotation-acceptance")]
 use std::num::NonZeroUsize;
@@ -18,7 +18,10 @@ use crate::domain::{AssetDomainPolicy, KanjiDomainPolicy};
 use crate::model::{HumanDecision, Provenance, SemanticDecision, ValidationRecord};
 use crate::store::{HumanAttestationRequest, validate_image_decode};
 use crate::validation::ValidatorFailure;
-use crate::yarxi::{AcquisitionEvent, AcquisitionRun, AcquisitionStreamError};
+use crate::yarxi::{
+    AcquisitionEvent, AcquisitionRun, AcquisitionStreamError, AcquisitionWorkerEvent,
+    AcquisitionWorkerEventKind,
+};
 
 #[derive(Debug, Subcommand)]
 pub enum BatchCommand {
@@ -35,6 +38,9 @@ pub enum BatchCommand {
         batch_id: String,
         #[arg(long, default_value_t = MAX_ACQUISITION_ROUNDS)]
         rounds: u32,
+        /// Число изолированных браузерных обработчиков; значение по умолчанию выбрано по live benchmark.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=4))]
+        workers: u8,
         /// Только в приёмочной сборке: менять сессию браузера после N сохранённых элементов.
         #[cfg(feature = "session-rotation-acceptance")]
         #[arg(long, value_name = "N")]
@@ -157,6 +163,9 @@ pub(super) fn prevalidate(command: &BatchCommand) -> Result<(), AssetError> {
                 "число раундов должно быть от 1 до {MAX_ACQUISITION_ROUNDS}"
             )));
         }
+        BatchCommand::Run { workers, .. } if !(1..=4).contains(workers) => {
+            return Err(invalid("число workers должно быть от 1 до 4"));
+        }
         _ => {}
     }
     Ok(())
@@ -228,12 +237,26 @@ struct BatchProgressEvent {
     round_total: usize,
     run_completed: usize,
     batch_total: usize,
+    workers: u8,
+    in_flight: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<AssetIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    worker_id: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser_session_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     attempt: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_attempt: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_elapsed_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_timings: Option<Vec<crate::browser_diagnostics::BrowserStageTiming>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +298,9 @@ struct BatchProgressReporter<'a> {
     round_total: usize,
     run_completed: usize,
     batch_total: usize,
+    workers: u8,
+    in_flight: BTreeSet<String>,
+    item_contexts: BTreeMap<String, BatchProgressItemContext>,
     last_identity: Option<AssetIdentity>,
     // Контекст подробного журнала: публичные события прогресса сохраняют прежние поля.
     browser_session: Option<u32>,
@@ -287,6 +313,16 @@ struct BatchProgressReporter<'a> {
     run_stop_reason: Option<&'static str>,
 }
 
+struct BatchProgressItemContext {
+    worker_id: Option<usize>,
+    browser_session_id: Option<u64>,
+    session: Option<u32>,
+    generation: u32,
+    owner_attempt: usize,
+    acquisition_attempt: Option<u8>,
+    started: Instant,
+}
+
 impl BatchProgressReporter<'_> {
     fn begin_round(&mut self, round: u32, total: usize) {
         self.round = Some(round);
@@ -294,11 +330,52 @@ impl BatchProgressReporter<'_> {
         self.round_total = total;
     }
 
-    fn begin_item(&mut self, generation: u32, prior_attempts: usize) {
+    fn begin_item(
+        &mut self,
+        identity: &AssetIdentity,
+        generation: u32,
+        prior_attempts: usize,
+        worker_id: Option<usize>,
+        session: Option<u32>,
+        browser_session_id: Option<u64>,
+    ) {
         self.acquisition_attempt = Some(1);
         self.generation = Some(generation);
         self.owner_attempt = Some(prior_attempts + 1);
+        let key = identity.key.clone();
+        self.item_contexts
+            .entry(key.clone())
+            .and_modify(|context| {
+                context.worker_id = worker_id.or(context.worker_id);
+                context.browser_session_id = browser_session_id.or(context.browser_session_id);
+                context.session = session.or(context.session);
+                context.acquisition_attempt = Some(1);
+            })
+            .or_insert_with(|| BatchProgressItemContext {
+                worker_id,
+                browser_session_id,
+                session,
+                generation,
+                owner_attempt: prior_attempts + 1,
+                acquisition_attempt: Some(1),
+                started: Instant::now(),
+            });
+        self.in_flight.insert(key);
         self.item_pending_checkpoint = true;
+    }
+
+    fn update_worker_context(
+        &mut self,
+        identity: &AssetIdentity,
+        session: Option<u32>,
+        worker_id: usize,
+        browser_session_id: Option<u64>,
+    ) {
+        if let Some(context) = self.item_contexts.get_mut(&identity.key) {
+            context.worker_id = Some(worker_id);
+            context.browser_session_id = browser_session_id.or(context.browser_session_id);
+            context.session = session.or(context.session);
+        }
     }
 
     fn checkpointed(&mut self, identity: &AssetIdentity, revision: u64) {
@@ -306,7 +383,14 @@ impl BatchProgressReporter<'_> {
         self.run_completed += 1;
         self.last_checkpointed_identity = Some(identity.clone());
         self.last_checkpoint_revision = Some(revision);
-        self.item_pending_checkpoint = false;
+        self.in_flight.remove(&identity.key);
+        self.item_pending_checkpoint = !self.in_flight.is_empty();
+    }
+
+    fn finish_item(&mut self, identity: &AssetIdentity) {
+        self.in_flight.remove(&identity.key);
+        self.item_contexts.remove(&identity.key);
+        self.item_pending_checkpoint = !self.in_flight.is_empty();
     }
 
     fn emit(
@@ -318,6 +402,27 @@ impl BatchProgressReporter<'_> {
         outcome: Option<String>,
         reason: Option<String>,
     ) -> Result<(), AssetError> {
+        self.emit_with_context(
+            event, identity, session, attempt, outcome, reason, None, None, None, None, None, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_with_context(
+        &mut self,
+        event: &'static str,
+        identity: Option<&AssetIdentity>,
+        session: Option<u32>,
+        attempt: Option<u8>,
+        outcome: Option<String>,
+        reason: Option<String>,
+        worker_id: Option<usize>,
+        browser_session_id: Option<u64>,
+        generation: Option<u32>,
+        owner_attempt: Option<usize>,
+        item_elapsed_ms: Option<u128>,
+        stage_timings: Option<Vec<crate::browser_diagnostics::BrowserStageTiming>>,
+    ) -> Result<(), AssetError> {
         if identity.is_some() {
             self.last_identity = identity.cloned();
         }
@@ -327,6 +432,29 @@ impl BatchProgressReporter<'_> {
         if let Some(attempt) = attempt {
             self.acquisition_attempt = Some(attempt);
         }
+        if let Some(identity) = identity
+            && let Some(context) = self.item_contexts.get_mut(&identity.key)
+        {
+            context.worker_id = worker_id.or(context.worker_id);
+            context.browser_session_id = browser_session_id.or(context.browser_session_id);
+            context.session = session.or(context.session);
+            context.generation = generation.unwrap_or(context.generation);
+            context.owner_attempt = owner_attempt.unwrap_or(context.owner_attempt);
+            context.acquisition_attempt = attempt.or(context.acquisition_attempt);
+        }
+        let context = identity.and_then(|identity| self.item_contexts.get(&identity.key));
+        let worker_id = worker_id.or_else(|| context.and_then(|context| context.worker_id));
+        let browser_session_id =
+            browser_session_id.or_else(|| context.and_then(|context| context.browser_session_id));
+        let generation = generation
+            .or_else(|| context.map(|context| context.generation))
+            .or_else(|| worker_id.is_none().then_some(self.generation).flatten());
+        let owner_attempt = owner_attempt
+            .or_else(|| context.map(|context| context.owner_attempt))
+            .or_else(|| worker_id.is_none().then_some(self.owner_attempt).flatten());
+        let item_elapsed_ms = item_elapsed_ms
+            .or_else(|| context.map(|context| context.started.elapsed().as_millis()));
+        let session = context.and_then(|context| context.session).or(session);
         let reason = reason.map(|reason| safe_message(&reason));
         tracing::info!(
             diagnostic_schema = "kanji_batch_progress_v1",
@@ -335,7 +463,8 @@ impl BatchProgressReporter<'_> {
             identity = identity.map(|identity| identity.key.as_str()), session, attempt,
             browser_session = self.browser_session,
             acquisition_attempt = self.acquisition_attempt,
-            generation = self.generation, owner_attempt = self.owner_attempt,
+            worker_id, browser_session_id,
+            generation, owner_attempt,
             run_stop_reason = self.run_stop_reason,
             last_checkpointed_identity = self.last_checkpointed_identity.as_ref().map(|identity| identity.key.as_str()),
             last_checkpoint_revision = self.last_checkpoint_revision,
@@ -345,7 +474,10 @@ impl BatchProgressReporter<'_> {
             elapsed_ms = self.started.elapsed().as_millis() as u64,
             round = ?self.round, round_completed = self.round_completed,
             round_total = self.round_total, run_completed = self.run_completed,
-            batch_total = self.batch_total, "Прогресс обработки пакета"
+            batch_total = self.batch_total, workers = self.workers,
+            in_flight = self.in_flight.len(), item_elapsed_ms,
+            stage_timings = ?stage_timings,
+            "Прогресс обработки пакета"
         );
         self.sink.emit(BatchProgressEvent {
             schema_version: 1,
@@ -359,9 +491,17 @@ impl BatchProgressReporter<'_> {
             round_total: self.round_total,
             run_completed: self.run_completed,
             batch_total: self.batch_total,
+            workers: self.workers,
+            in_flight: self.in_flight.len(),
             identity: identity.cloned(),
             session,
+            worker_id,
+            browser_session_id,
             attempt,
+            generation,
+            owner_attempt,
+            item_elapsed_ms,
+            stage_timings,
             outcome,
             reason,
         })
@@ -999,18 +1139,20 @@ fn execute_command_with_snapshots_and_progress(
         BatchCommand::Run {
             batch_id,
             rounds,
+            workers,
             #[cfg(feature = "session-rotation-acceptance")]
             acceptance_rotate_after_items,
-            ..
         } => {
+            let selected_workers = usize::from(*workers);
             #[cfg(feature = "session-rotation-acceptance")]
             let acceptance_rotate_after_items = *acceptance_rotate_after_items;
             let mut acquisition_run = None;
-            let result = run_batch_with_stream_and_progress(
+            let result = run_batch_with_worker_stream_and_progress(
                 store,
                 batch_id,
                 *rounds,
-                |characters, generations, on_event| {
+                selected_workers,
+                |characters, generations, owner_attempts, worker_count, on_event| {
                     if acquisition_run.is_none() {
                         #[cfg(feature = "session-rotation-acceptance")]
                         let new_run = match acceptance_rotate_after_items {
@@ -1023,16 +1165,27 @@ fn execute_command_with_snapshots_and_progress(
                         let new_run = AcquisitionRun::new()?;
                         acquisition_run = Some(new_run);
                     }
-                    acquisition_run
-                        .as_mut()
-                        .expect("среда получения создана")
-                        .acquire_with_generations(
+                    let run = acquisition_run.as_mut().expect("среда получения создана");
+                    if worker_count == 1 {
+                        let mut adapt = |event| on_event(BatchAcquisitionEvent::Sequential(event));
+                        run.acquire_with_generations(
                             characters,
                             allow_insecure_tls,
                             generations,
-                            on_event,
+                            &mut adapt,
                         )
                         .map(|_| ())
+                    } else {
+                        run.acquire_with_generations_parallel(
+                            characters,
+                            allow_insecure_tls,
+                            generations,
+                            owner_attempts,
+                            worker_count,
+                            |event| on_event(BatchAcquisitionEvent::Worker(event)),
+                        )
+                        .map(|_| ())
+                    }
                 },
                 reader,
                 progress,
@@ -1046,6 +1199,11 @@ fn execute_command_with_snapshots_and_progress(
                     AcquisitionStreamError::Consumer(error) => error.to_string(),
                     AcquisitionStreamError::Interrupted => {
                         "acquisition_interrupted: получен Ctrl+C".into()
+                    }
+                    AcquisitionStreamError::WorkersExhausted { pending_indices } => {
+                        format!(
+                            "browser_workers_exhausted: незавершённые индексы {pending_indices:?}"
+                        )
                     }
                 };
                 tracing::error!(stage = "temp_cleanup", code = "temp_workspace_cleanup_failed", message = %safe_message(&message), "Не удалось закрыть временное дерево получения кандзи");
@@ -1237,6 +1395,115 @@ where
     )
 }
 
+enum BatchAcquisitionEvent {
+    Sequential(AcquisitionEvent),
+    Worker(AcquisitionWorkerEvent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrontierItemState {
+    Pending,
+    Active { worker_id: usize },
+    Terminal,
+}
+
+fn validate_worker_token(
+    event_index: Option<usize>,
+    event_generation: Option<u32>,
+    event_owner_attempt: Option<usize>,
+    frontier: &[AssetIdentity],
+    generations: &[(u32, usize)],
+) -> Result<usize, AssetError> {
+    let index = event_index.ok_or_else(|| invalid("worker event не содержит индекс назначения"))?;
+    let Some((generation, previous_attempts)) = generations.get(index) else {
+        return Err(invalid("worker сообщил индекс вне текущего frontier"));
+    };
+    if event_generation != Some(*generation) || event_owner_attempt != Some(previous_attempts + 1) {
+        return Err(invalid(format!(
+            "worker сообщил устаревший generation/attempt для {}",
+            frontier[index].key
+        )));
+    }
+    Ok(index)
+}
+
+fn is_acquisition_session_fault(reason: &crate::yarxi::SessionStopReason) -> bool {
+    matches!(
+        reason,
+        crate::yarxi::SessionStopReason::RuntimeFailure(_)
+            | crate::yarxi::SessionStopReason::RetryRecoveryFailed(_)
+            | crate::yarxi::SessionStopReason::ItemTimeout
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_batch_acquisition_item(
+    runtime: &mut BatchRuntime,
+    state: &mut KanjiBatch,
+    identity: &AssetIdentity,
+    generation_attempts: (u32, usize),
+    outcome: Result<AcquiredMedia, String>,
+    diagnostics: Option<crate::yarxi::AcquisitionItemDiagnostics>,
+    issues: &mut Vec<BatchIssue>,
+    progress: &mut BatchProgressReporter<'_>,
+    worker_id: Option<usize>,
+    session: Option<u32>,
+    browser_session_id: Option<u64>,
+    attempt: Option<u8>,
+) -> Result<(), AssetError> {
+    if let Some(worker_id) = worker_id {
+        progress.update_worker_context(identity, session, worker_id, browser_session_id);
+    }
+    let stage_timings = diagnostics
+        .as_ref()
+        .map(crate::yarxi::AcquisitionItemDiagnostics::stage_timings);
+    let owner_attempt = generation_attempts.1 + 1;
+    let (latest, saved, outcome_code) = checkpoint_acquisition_outcome(
+        runtime,
+        identity,
+        generation_attempts,
+        outcome,
+        diagnostics,
+        issues,
+    )?;
+    *state = latest;
+    let event_result = if saved {
+        progress.checkpointed(identity, state.revision);
+        progress.emit_with_context(
+            "item_checkpointed",
+            Some(identity),
+            session,
+            attempt,
+            outcome_code,
+            None,
+            worker_id,
+            browser_session_id,
+            Some(generation_attempts.0),
+            Some(owner_attempt),
+            None,
+            stage_timings,
+        )
+    } else {
+        progress.emit_with_context(
+            "item_discarded_stale",
+            Some(identity),
+            session,
+            attempt,
+            None,
+            Some("состояние символа изменилось во время получения".into()),
+            worker_id,
+            browser_session_id,
+            Some(generation_attempts.0),
+            Some(owner_attempt),
+            None,
+            stage_timings,
+        )
+    };
+    progress.finish_item(identity);
+    event_result
+}
+
+#[cfg(test)]
 fn run_batch_with_stream_and_progress<F>(
     store: &AssetStore,
     batch_id: &str,
@@ -1252,6 +1519,38 @@ where
         &mut dyn FnMut(AcquisitionEvent) -> Result<(), AssetError>,
     ) -> Result<(), AcquisitionStreamError>,
 {
+    run_batch_with_worker_stream_and_progress(
+        store,
+        batch_id,
+        rounds,
+        1,
+        |characters, generations, _owner_attempts, _workers, on_event| {
+            let mut adapt = |event| on_event(BatchAcquisitionEvent::Sequential(event));
+            acquire(characters, generations, &mut adapt)
+        },
+        reader,
+        progress_sink,
+    )
+}
+
+fn run_batch_with_worker_stream_and_progress<F>(
+    store: &AssetStore,
+    batch_id: &str,
+    rounds: u32,
+    workers: usize,
+    mut acquire: F,
+    reader: &mut impl OwnerSnapshotReader,
+    progress_sink: &mut dyn BatchProgressSink,
+) -> Result<(KanjiBatch, bool, Vec<BatchIssue>), AssetError>
+where
+    F: FnMut(
+        &[String],
+        &[u32],
+        &[usize],
+        usize,
+        &mut dyn FnMut(BatchAcquisitionEvent) -> Result<(), AssetError>,
+    ) -> Result<(), AcquisitionStreamError>,
+{
     let _run_span = tracing::info_span!(
         "kanji_batch_run",
         domain = "kanji",
@@ -1265,6 +1564,9 @@ where
         return Err(invalid(format!(
             "число раундов должно быть от 1 до {MAX_ACQUISITION_ROUNDS}"
         )));
+    }
+    if !(1..=4).contains(&workers) {
+        return Err(invalid("число workers должно быть от 1 до 4"));
     }
     let mut issues = Vec::new();
     let (initial_revision, batch_total) = {
@@ -1295,6 +1597,9 @@ where
         round_total: 0,
         run_completed: 0,
         batch_total,
+        workers: workers as u8,
+        in_flight: BTreeSet::new(),
+        item_contexts: BTreeMap::new(),
         last_identity: None,
         browser_session: None,
         acquisition_attempt: None,
@@ -1330,10 +1635,16 @@ where
             .iter()
             .map(|(generation, _)| *generation)
             .collect();
+        let owner_attempts: Vec<_> = generations
+            .iter()
+            .map(|(_, previous_attempts)| previous_attempts + 1)
+            .collect();
         let characters: Vec<_> = frontier
             .iter()
             .map(|identity| identity.key.clone())
             .collect();
+        let mut frontier_state = vec![FrontierItemState::Pending; frontier.len()];
+        let mut active_workers = BTreeMap::<usize, usize>::new();
         progress.begin_round(round, frontier.len());
         progress.emit("round_started", None, None, None, None, None)?;
         // Кандидаты уже проверены загрузкой. Объект сохраняет кэш проверок,
@@ -1344,130 +1655,637 @@ where
             "Блокировка пакета отпущена перед получением"
         );
         let acquisition = {
-            let mut on_acquisition_event = |event| match event {
-                AcquisitionEvent::SessionStarted { session } => progress.emit(
-                    "browser_session_started",
-                    None,
-                    Some(session),
-                    None,
-                    None,
-                    None,
-                ),
-                AcquisitionEvent::SessionEnded {
-                    session,
-                    processed,
-                    stop_reason,
-                } => progress.emit(
-                    "browser_session_ended",
-                    None,
-                    Some(session),
-                    None,
-                    Some(format!("{processed} обработано")),
-                    stop_reason.map(|reason| reason.summary()),
-                ),
-                AcquisitionEvent::SessionRotated {
-                    next_session,
-                    reason,
-                } => progress.emit(
-                    "browser_session_rotated",
-                    None,
-                    Some(next_session),
-                    None,
-                    None,
-                    Some(reason.summary()),
-                ),
-                AcquisitionEvent::ItemStarted { index } => {
-                    let identity = frontier.get(index).ok_or_else(|| {
-                        invalid("поставщик сообщил индекс символа вне очереди раунда")
-                    })?;
-                    progress.begin_item(generations[index].0, generations[index].1);
-                    progress.emit("item_started", Some(identity), None, None, None, None)
-                }
-                AcquisitionEvent::RetryStarted { index, attempt } => {
-                    let identity = frontier
-                        .get(index)
-                        .ok_or_else(|| invalid("поставщик сообщил повтор вне очереди раунда"))?;
-                    progress.emit(
-                        "retry_started",
-                        Some(identity),
+            let mut on_acquisition_event = |event: BatchAcquisitionEvent| match event {
+                BatchAcquisitionEvent::Sequential(event) => match event {
+                    AcquisitionEvent::SessionStarted { session } => progress.emit(
+                        "browser_session_started",
                         None,
-                        Some(attempt),
+                        Some(session),
                         None,
                         None,
-                    )
-                }
-                AcquisitionEvent::RetryRecoveryStarted { index, attempt } => {
-                    let identity = frontier.get(index).ok_or_else(|| {
-                        invalid("поставщик сообщил восстановление вне очереди раунда")
-                    })?;
-                    progress.emit(
-                        "retry_recovery_started",
-                        Some(identity),
                         None,
-                        Some(attempt),
+                    ),
+                    AcquisitionEvent::SessionEnded {
+                        session,
+                        processed,
+                        stop_reason,
+                    } => progress.emit(
+                        "browser_session_ended",
                         None,
+                        Some(session),
                         None,
-                    )
-                }
-                AcquisitionEvent::Heartbeat { index, attempt } => {
-                    let identity = frontier
-                        .get(index)
-                        .ok_or_else(|| invalid("поставщик сообщил ожидание вне очереди раунда"))?;
-                    progress.emit("heartbeat", Some(identity), None, Some(attempt), None, None)
-                }
-                AcquisitionEvent::ItemCompleted {
-                    index,
-                    outcome,
-                    diagnostics,
-                } => {
-                    let identity = frontier
-                        .get(index)
-                        .ok_or_else(|| invalid("поставщик сообщил результат вне очереди раунда"))?;
-                    let (latest, saved, outcome_code) = checkpoint_acquisition_outcome(
-                        &mut runtime,
-                        identity,
-                        generations[index],
-                        *outcome,
+                        Some(format!("{processed} обработано")),
+                        stop_reason.map(|reason| reason.summary()),
+                    ),
+                    AcquisitionEvent::SessionRotated {
+                        next_session,
+                        reason,
+                    } => {
+                        let summary = reason.summary();
+                        if is_acquisition_session_fault(&reason) {
+                            progress.emit(
+                                "browser_session_recovery_started",
+                                None,
+                                Some(next_session),
+                                None,
+                                None,
+                                Some(summary.clone()),
+                            )?;
+                        }
+                        progress.emit(
+                            "browser_session_rotated",
+                            None,
+                            Some(next_session),
+                            None,
+                            None,
+                            Some(summary),
+                        )
+                    }
+                    AcquisitionEvent::ItemStarted { index } => {
+                        let identity = frontier.get(index).ok_or_else(|| {
+                            invalid("поставщик сообщил индекс символа вне очереди раунда")
+                        })?;
+                        if frontier_state[index] != FrontierItemState::Pending
+                            || active_workers.contains_key(&0)
+                        {
+                            return Err(invalid(
+                                "поставщик повторно назначил или повторно запустил элемент frontier",
+                            ));
+                        }
+                        frontier_state[index] = FrontierItemState::Active { worker_id: 0 };
+                        active_workers.insert(0, index);
+                        progress.begin_item(
+                            identity,
+                            generations[index].0,
+                            generations[index].1,
+                            None,
+                            None,
+                            None,
+                        );
+                        progress.emit("item_started", Some(identity), None, None, None, None)
+                    }
+                    AcquisitionEvent::RetryStarted { index, attempt } => {
+                        let identity = frontier.get(index).ok_or_else(|| {
+                            invalid("поставщик сообщил повтор вне очереди раунда")
+                        })?;
+                        if frontier_state[index] != (FrontierItemState::Active { worker_id: 0 }) {
+                            return Err(invalid("повтор получен без активного назначения"));
+                        }
+                        progress.emit(
+                            "retry_started",
+                            Some(identity),
+                            None,
+                            Some(attempt),
+                            None,
+                            None,
+                        )
+                    }
+                    AcquisitionEvent::RetryRecoveryStarted { index, attempt } => {
+                        let identity = frontier.get(index).ok_or_else(|| {
+                            invalid("поставщик сообщил восстановление вне очереди раунда")
+                        })?;
+                        if frontier_state[index] != (FrontierItemState::Active { worker_id: 0 }) {
+                            return Err(invalid(
+                                "восстановление получено без активного назначения",
+                            ));
+                        }
+                        progress.emit(
+                            "retry_recovery_started",
+                            Some(identity),
+                            None,
+                            Some(attempt),
+                            None,
+                            None,
+                        )
+                    }
+                    AcquisitionEvent::Heartbeat { index, attempt } => {
+                        let identity = frontier.get(index).ok_or_else(|| {
+                            invalid("поставщик сообщил ожидание вне очереди раунда")
+                        })?;
+                        if frontier_state[index] != (FrontierItemState::Active { worker_id: 0 }) {
+                            return Err(invalid("heartbeat получен без активного назначения"));
+                        }
+                        progress.emit("heartbeat", Some(identity), None, Some(attempt), None, None)
+                    }
+                    AcquisitionEvent::ItemCompleted {
+                        index,
+                        outcome,
                         diagnostics,
-                        &mut issues,
-                    )?;
-                    state = latest;
-                    if saved {
-                        progress.checkpointed(identity, state.revision);
-                        progress.emit(
-                            "item_checkpointed",
-                            Some(identity),
+                    } => {
+                        let identity = frontier.get(index).ok_or_else(|| {
+                            invalid("поставщик сообщил результат вне очереди раунда")
+                        })?;
+                        if frontier_state[index] != (FrontierItemState::Active { worker_id: 0 }) {
+                            return Err(invalid(
+                                "результат получен без единственного активного назначения",
+                            ));
+                        }
+                        checkpoint_batch_acquisition_item(
+                            &mut runtime,
+                            &mut state,
+                            identity,
+                            generations[index],
+                            *outcome,
+                            diagnostics,
+                            &mut issues,
+                            &mut progress,
                             None,
                             None,
-                            outcome_code,
-                            None,
-                        )
-                    } else {
-                        progress.item_pending_checkpoint = false;
-                        progress.emit(
-                            "item_discarded_stale",
-                            Some(identity),
                             None,
                             None,
-                            None,
-                            Some("состояние символа изменилось во время получения".into()),
-                        )
+                        )?;
+                        frontier_state[index] = FrontierItemState::Terminal;
+                        active_workers.remove(&0);
+                        Ok(())
+                    }
+                },
+                BatchAcquisitionEvent::Worker(event) => {
+                    if event.worker_id == 0 || event.worker_id > workers {
+                        return Err(invalid("worker сообщил неизвестный worker_id"));
+                    }
+                    match event.event {
+                        AcquisitionWorkerEventKind::Assigned => {
+                            let index = validate_worker_token(
+                                event.index,
+                                event.generation,
+                                event.owner_attempt,
+                                &frontier,
+                                &generations,
+                            )?;
+                            let identity = &frontier[index];
+                            if frontier_state[index] != FrontierItemState::Pending
+                                || active_workers.contains_key(&event.worker_id)
+                            {
+                                return Err(invalid(
+                                    "worker получил повторное или параллельное назначение",
+                                ));
+                            }
+                            frontier_state[index] = FrontierItemState::Active {
+                                worker_id: event.worker_id,
+                            };
+                            active_workers.insert(event.worker_id, index);
+                            progress.begin_item(
+                                identity,
+                                generations[index].0,
+                                generations[index].1,
+                                Some(event.worker_id),
+                                Some(event.session),
+                                event.browser_session,
+                            );
+                            progress.emit_with_context(
+                                "worker_assigned",
+                                Some(identity),
+                                Some(event.session),
+                                Some(event.attempt),
+                                None,
+                                None,
+                                Some(event.worker_id),
+                                event.browser_session,
+                                event.generation,
+                                event.owner_attempt,
+                                None,
+                                None,
+                            )
+                        }
+                        AcquisitionWorkerEventKind::SessionBootstrapStarted => {
+                            let index = validate_worker_token(
+                                event.index,
+                                event.generation,
+                                event.owner_attempt,
+                                &frontier,
+                                &generations,
+                            )?;
+                            if frontier_state[index]
+                                != (FrontierItemState::Active {
+                                    worker_id: event.worker_id,
+                                })
+                            {
+                                return Err(invalid(
+                                    "bootstrap не соответствует активному assignment token",
+                                ));
+                            }
+                            let identity = &frontier[index];
+                            progress.update_worker_context(
+                                identity,
+                                Some(event.session),
+                                event.worker_id,
+                                event.browser_session,
+                            );
+                            progress.emit_with_context(
+                                "browser_session_bootstrap_started",
+                                Some(identity),
+                                Some(event.session),
+                                Some(event.attempt),
+                                None,
+                                None,
+                                Some(event.worker_id),
+                                event.browser_session,
+                                event.generation,
+                                event.owner_attempt,
+                                None,
+                                None,
+                            )
+                        }
+                        AcquisitionWorkerEventKind::Provider(provider_event) => {
+                            let item_index = match &provider_event {
+                                AcquisitionEvent::ItemStarted { index }
+                                | AcquisitionEvent::RetryStarted { index, .. }
+                                | AcquisitionEvent::RetryRecoveryStarted { index, .. }
+                                | AcquisitionEvent::Heartbeat { index, .. }
+                                | AcquisitionEvent::ItemCompleted { index, .. } => Some(*index),
+                                _ => None,
+                            };
+                            if let Some(index) = item_index {
+                                let token_index = validate_worker_token(
+                                    event.index,
+                                    event.generation,
+                                    event.owner_attempt,
+                                    &frontier,
+                                    &generations,
+                                )?;
+                                if index != token_index
+                                    || frontier_state[index]
+                                        != (FrontierItemState::Active {
+                                            worker_id: event.worker_id,
+                                        })
+                                {
+                                    return Err(invalid(
+                                        "provider report не соответствует активному assignment token",
+                                    ));
+                                }
+                            }
+                            match provider_event {
+                                AcquisitionEvent::SessionStarted { session } => {
+                                    let active_index =
+                                        active_workers.get(&event.worker_id).copied();
+                                    let identity = active_index.map(|index| &frontier[index]);
+                                    if let Some(identity) = identity {
+                                        progress.update_worker_context(
+                                            identity,
+                                            Some(session),
+                                            event.worker_id,
+                                            event.browser_session,
+                                        );
+                                    }
+                                    progress.emit_with_context(
+                                        "browser_session_started",
+                                        identity,
+                                        Some(session),
+                                        Some(event.attempt),
+                                        None,
+                                        None,
+                                        Some(event.worker_id),
+                                        event.browser_session,
+                                        active_index.map(|index| generations[index].0),
+                                        active_index.map(|index| generations[index].1 + 1),
+                                        None,
+                                        None,
+                                    )
+                                }
+                                AcquisitionEvent::SessionEnded {
+                                    session,
+                                    processed,
+                                    stop_reason,
+                                } => progress.emit_with_context(
+                                    "browser_session_ended",
+                                    None,
+                                    Some(session),
+                                    Some(event.attempt),
+                                    Some(format!("{processed} обработано")),
+                                    stop_reason.map(|reason| reason.summary()),
+                                    Some(event.worker_id),
+                                    event.browser_session,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                ),
+                                AcquisitionEvent::SessionRotated {
+                                    next_session,
+                                    reason,
+                                } => {
+                                    let summary = reason.summary();
+                                    if is_acquisition_session_fault(&reason) {
+                                        progress.emit_with_context(
+                                            "browser_session_recovery_started",
+                                            None,
+                                            Some(next_session),
+                                            Some(event.attempt),
+                                            None,
+                                            Some(summary.clone()),
+                                            Some(event.worker_id),
+                                            event.browser_session,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        )?;
+                                    }
+                                    progress.emit_with_context(
+                                        "browser_session_rotated",
+                                        None,
+                                        Some(next_session),
+                                        Some(event.attempt),
+                                        None,
+                                        Some(summary),
+                                        Some(event.worker_id),
+                                        event.browser_session,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                }
+                                AcquisitionEvent::ItemStarted { index } => {
+                                    let identity = &frontier[index];
+                                    progress.update_worker_context(
+                                        identity,
+                                        Some(event.session),
+                                        event.worker_id,
+                                        event.browser_session,
+                                    );
+                                    progress.emit_with_context(
+                                        "item_started",
+                                        Some(identity),
+                                        Some(event.session),
+                                        Some(event.attempt),
+                                        None,
+                                        None,
+                                        Some(event.worker_id),
+                                        event.browser_session,
+                                        event.generation,
+                                        event.owner_attempt,
+                                        None,
+                                        None,
+                                    )
+                                }
+                                AcquisitionEvent::RetryStarted { index, attempt } => {
+                                    let identity = &frontier[index];
+                                    progress.emit_with_context(
+                                        "retry_started",
+                                        Some(identity),
+                                        Some(event.session),
+                                        Some(attempt),
+                                        None,
+                                        None,
+                                        Some(event.worker_id),
+                                        event.browser_session,
+                                        event.generation,
+                                        event.owner_attempt,
+                                        None,
+                                        None,
+                                    )
+                                }
+                                AcquisitionEvent::RetryRecoveryStarted { index, attempt } => {
+                                    let identity = &frontier[index];
+                                    progress.emit_with_context(
+                                        "retry_recovery_started",
+                                        Some(identity),
+                                        Some(event.session),
+                                        Some(attempt),
+                                        None,
+                                        None,
+                                        Some(event.worker_id),
+                                        event.browser_session,
+                                        event.generation,
+                                        event.owner_attempt,
+                                        None,
+                                        None,
+                                    )
+                                }
+                                AcquisitionEvent::Heartbeat { index, attempt } => {
+                                    let identity = &frontier[index];
+                                    progress.emit_with_context(
+                                        "heartbeat",
+                                        Some(identity),
+                                        Some(event.session),
+                                        Some(attempt),
+                                        None,
+                                        None,
+                                        Some(event.worker_id),
+                                        event.browser_session,
+                                        event.generation,
+                                        event.owner_attempt,
+                                        None,
+                                        None,
+                                    )
+                                }
+                                AcquisitionEvent::ItemCompleted {
+                                    index,
+                                    outcome,
+                                    diagnostics,
+                                } => {
+                                    let identity = &frontier[index];
+                                    checkpoint_batch_acquisition_item(
+                                        &mut runtime,
+                                        &mut state,
+                                        identity,
+                                        generations[index],
+                                        *outcome,
+                                        diagnostics,
+                                        &mut issues,
+                                        &mut progress,
+                                        Some(event.worker_id),
+                                        Some(event.session),
+                                        event.browser_session,
+                                        Some(event.attempt),
+                                    )?;
+                                    frontier_state[index] = FrontierItemState::Terminal;
+                                    active_workers.remove(&event.worker_id);
+                                    Ok(())
+                                }
+                            }
+                        }
+                        AcquisitionWorkerEventKind::Deferred { reason } => {
+                            let index = validate_worker_token(
+                                event.index,
+                                event.generation,
+                                event.owner_attempt,
+                                &frontier,
+                                &generations,
+                            )?;
+                            let identity = &frontier[index];
+                            if frontier_state[index]
+                                != (FrontierItemState::Active {
+                                    worker_id: event.worker_id,
+                                })
+                                || active_workers.get(&event.worker_id) != Some(&index)
+                            {
+                                return Err(invalid(
+                                    "worker попытался отложить неактивное назначение",
+                                ));
+                            }
+                            frontier_state[index] = FrontierItemState::Pending;
+                            active_workers.remove(&event.worker_id);
+                            let result = progress.emit_with_context(
+                                "item_deferred",
+                                Some(identity),
+                                Some(event.session),
+                                Some(event.attempt),
+                                None,
+                                Some(reason),
+                                Some(event.worker_id),
+                                event.browser_session,
+                                event.generation,
+                                event.owner_attempt,
+                                None,
+                                None,
+                            );
+                            progress.finish_item(identity);
+                            result
+                        }
+                        AcquisitionWorkerEventKind::Requeued { reason } => {
+                            let index = validate_worker_token(
+                                event.index,
+                                event.generation,
+                                event.owner_attempt,
+                                &frontier,
+                                &generations,
+                            )?;
+                            if frontier_state[index] != FrontierItemState::Pending {
+                                return Err(invalid(
+                                    "worker сообщил requeue без незавершённого pending элемента",
+                                ));
+                            }
+                            progress.emit_with_context(
+                                "item_requeued",
+                                Some(&frontier[index]),
+                                Some(event.session),
+                                Some(event.attempt),
+                                None,
+                                Some(reason),
+                                Some(event.worker_id),
+                                event.browser_session,
+                                event.generation,
+                                event.owner_attempt,
+                                None,
+                                None,
+                            )
+                        }
+                        AcquisitionWorkerEventKind::WorkerRetired {
+                            consecutive_failures,
+                            reason,
+                        } => {
+                            if let Some(index) = active_workers.remove(&event.worker_id)
+                                && frontier_state[index]
+                                    == (FrontierItemState::Active {
+                                        worker_id: event.worker_id,
+                                    })
+                            {
+                                frontier_state[index] = FrontierItemState::Pending;
+                                let identity = &frontier[index];
+                                let _ = progress.emit_with_context(
+                                    "item_deferred",
+                                    Some(identity),
+                                    Some(event.session),
+                                    Some(event.attempt),
+                                    None,
+                                    Some(reason.clone()),
+                                    Some(event.worker_id),
+                                    event.browser_session,
+                                    Some(generations[index].0),
+                                    Some(generations[index].1 + 1),
+                                    None,
+                                    None,
+                                );
+                                progress.finish_item(identity);
+                            }
+                            progress.emit_with_context(
+                                "worker_retired",
+                                None,
+                                Some(event.session),
+                                Some(event.attempt),
+                                Some(format!("consecutive_failures={consecutive_failures}")),
+                                Some(reason),
+                                Some(event.worker_id),
+                                event.browser_session,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                        }
+                        AcquisitionWorkerEventKind::WorkerStopped { reason } => {
+                            if let Some(index) = active_workers.remove(&event.worker_id)
+                                && frontier_state[index]
+                                    == (FrontierItemState::Active {
+                                        worker_id: event.worker_id,
+                                    })
+                            {
+                                frontier_state[index] = FrontierItemState::Pending;
+                                let identity = &frontier[index];
+                                let _ = progress.emit_with_context(
+                                    "item_deferred",
+                                    Some(identity),
+                                    Some(event.session),
+                                    Some(event.attempt),
+                                    None,
+                                    Some(reason.clone()),
+                                    Some(event.worker_id),
+                                    event.browser_session,
+                                    Some(generations[index].0),
+                                    Some(generations[index].1 + 1),
+                                    None,
+                                    None,
+                                );
+                                progress.finish_item(identity);
+                            }
+                            progress.emit_with_context(
+                                "worker_stopped",
+                                None,
+                                Some(event.session),
+                                Some(event.attempt),
+                                None,
+                                Some(reason),
+                                Some(event.worker_id),
+                                event.browser_session,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                        }
                     }
                 }
             };
-            acquire(&characters, &owner_generations, &mut on_acquisition_event)
+            acquire(
+                &characters,
+                &owner_generations,
+                &owner_attempts,
+                workers,
+                &mut on_acquisition_event,
+            )
         };
         if let Err(error) = acquisition {
             progress.run_stop_reason = Some(match &error {
                 AcquisitionStreamError::Provider(_) => "provider_failure",
                 AcquisitionStreamError::Consumer(_) => "consumer_failure",
                 AcquisitionStreamError::Interrupted => "interrupted",
+                AcquisitionStreamError::WorkersExhausted { .. } => "workers_exhausted",
             });
             let reason = match &error {
                 AcquisitionStreamError::Provider(message) => message.clone(),
                 AcquisitionStreamError::Consumer(error) => error.to_string(),
                 AcquisitionStreamError::Interrupted => "получен Ctrl+C".into(),
+                AcquisitionStreamError::WorkersExhausted { pending_indices } => {
+                    let pending = pending_indices
+                        .iter()
+                        .filter_map(|index| frontier.get(*index))
+                        .map(|identity| identity.key.as_str())
+                        .collect::<Vec<_>>();
+                    format!("browser_workers_exhausted: pending={pending:?}")
+                }
             };
+            if matches!(&error, AcquisitionStreamError::WorkersExhausted { .. }) {
+                progress.emit(
+                    "worker_exhausted",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(reason.clone()),
+                )?;
+            }
             let last_identity = progress.last_identity.clone();
             let _ = progress.emit(
                 "run_stopped",
@@ -1489,7 +2307,57 @@ where
                     crate::error::ErrorCode::InvalidTransition,
                     "batch_interrupted: получен Ctrl+C; сохранённый прогресс доступен для возобновления",
                 ),
+                AcquisitionStreamError::WorkersExhausted { pending_indices } => {
+                    let pending = pending_indices
+                        .iter()
+                        .filter_map(|index| frontier.get(*index))
+                        .map(|identity| identity.key.as_str())
+                        .collect::<Vec<_>>();
+                    AssetError::new(
+                        crate::error::ErrorCode::InvalidTransition,
+                        format!(
+                            "browser_workers_exhausted: сохранённый прогресс доступен для возобновления; pending={pending:?}"
+                        ),
+                    )
+                }
             });
+        }
+        let unfinished = frontier_state
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (*item != FrontierItemState::Terminal).then_some(index))
+            .collect::<Vec<_>>();
+        if !unfinished.is_empty() {
+            progress.run_stop_reason = Some("frontier_protocol_incomplete");
+            for index in &unfinished {
+                if let FrontierItemState::Active { worker_id } = frontier_state[*index] {
+                    let identity = &frontier[*index];
+                    let _ = progress.emit_with_context(
+                        "item_deferred",
+                        Some(identity),
+                        None,
+                        None,
+                        None,
+                        Some("поставщик завершился без terminal результата".into()),
+                        (worker_id != 0).then_some(worker_id),
+                        None,
+                        Some(generations[*index].0),
+                        Some(generations[*index].1 + 1),
+                        None,
+                        None,
+                    );
+                    progress.finish_item(identity);
+                }
+            }
+            let identities = unfinished
+                .iter()
+                .map(|index| frontier[*index].key.as_str())
+                .collect::<Vec<_>>();
+            let reason = format!(
+                "batch_frontier_incomplete: поставщик вернул успех до terminal checkpoint: {identities:?}"
+            );
+            let _ = progress.emit("run_stopped", None, None, None, None, Some(reason.clone()));
+            return Err(invalid(reason));
         }
         let mut snapshot = reader.capture(store);
         runtime.reacquire_lock()?;

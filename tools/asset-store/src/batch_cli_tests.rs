@@ -84,6 +84,23 @@ fn emit_stream_item(
     .map_err(AcquisitionStreamError::Consumer)
 }
 
+fn worker_event(
+    worker_id: usize,
+    index: usize,
+    event: AcquisitionWorkerEventKind,
+) -> BatchAcquisitionEvent {
+    BatchAcquisitionEvent::Worker(AcquisitionWorkerEvent {
+        worker_id,
+        index: Some(index),
+        generation: Some(0),
+        owner_attempt: Some(1),
+        session: 1,
+        browser_session: Some(worker_id as u64 + 100),
+        attempt: 1,
+        event,
+    })
+}
+
 fn identity(value: char) -> AssetIdentity {
     AssetIdentity::new("kanji", value.to_string()).unwrap()
 }
@@ -225,10 +242,35 @@ fn cli_parser_supports_structured_batch_actions_and_rejects_free_text() {
         command,
         BatchCommand::Run {
             rounds: MAX_ACQUISITION_ROUNDS,
+            workers: 4,
             ..
         }
     ));
     assert!(prevalidate(command).is_ok());
+    assert!(
+        Cli::try_parse_from([
+            "kanji-assets",
+            "batch",
+            "run",
+            "--batch-id",
+            "fixture",
+            "--workers",
+            "0",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "kanji-assets",
+            "batch",
+            "run",
+            "--batch-id",
+            "fixture",
+            "--workers",
+            "5",
+        ])
+        .is_err()
+    );
 
     let explicit_default = Cli::try_parse_from([
         "kanji-assets",
@@ -628,6 +670,213 @@ fn owner_generation_is_passed_to_the_acquisition_stream() {
 }
 
 #[test]
+fn parallel_frontier_checkpoints_out_of_order_before_worker_reassignment() {
+    let fixture = Fixture::new();
+    fixture.start("parallel-order", &['元', '漢', '字']);
+    let mut progress = CapturedProgress::default();
+    let (state, _, _) = run_batch_with_worker_stream_and_progress(
+        &fixture.store,
+        "parallel-order",
+        1,
+        2,
+        |characters, generations, owner_attempts, workers, on_event| {
+            assert_eq!(characters, ["元", "漢", "字"]);
+            assert_eq!(generations, [0, 0, 0]);
+            assert_eq!(owner_attempts, [1, 1, 1]);
+            assert_eq!(workers, 2);
+            for (worker, index) in [(1, 0), (2, 1)] {
+                on_event(worker_event(
+                    worker,
+                    index,
+                    AcquisitionWorkerEventKind::Assigned,
+                ))
+                .map_err(AcquisitionStreamError::Consumer)?;
+                on_event(worker_event(
+                    worker,
+                    index,
+                    AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemStarted { index }),
+                ))
+                .map_err(AcquisitionStreamError::Consumer)?;
+            }
+            on_event(worker_event(
+                2,
+                1,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                    index: 1,
+                    outcome: Box::new(Err("синтетическая ошибка 漢".into())),
+                    diagnostics: None,
+                }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)?;
+            let checkpoint = fixture.load("parallel-order");
+            assert!(checkpoint.items[0].attempts.is_empty());
+            assert_eq!(checkpoint.items[1].attempts.len(), 1);
+            assert!(checkpoint.items[2].attempts.is_empty());
+
+            // Worker 2 получает новый элемент только после возврата callback
+            // выше, то есть после синхронного durable checkpoint элемента 漢.
+            on_event(worker_event(2, 2, AcquisitionWorkerEventKind::Assigned))
+                .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(worker_event(
+                2,
+                2,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemStarted { index: 2 }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(worker_event(
+                2,
+                2,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                    index: 2,
+                    outcome: Box::new(Err("синтетическая ошибка 字".into())),
+                    diagnostics: None,
+                }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(worker_event(
+                1,
+                0,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                    index: 0,
+                    outcome: Box::new(Err("синтетическая ошибка 元".into())),
+                    diagnostics: None,
+                }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)?;
+            Ok(())
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    )
+    .unwrap();
+
+    assert!(state.items.iter().all(|item| item.attempts.len() == 1));
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.event == "item_checkpointed")
+            .map(|event| event.identity.as_ref().unwrap().key.as_str())
+            .collect::<Vec<_>>(),
+        ["漢", "字", "元"]
+    );
+    let first = progress
+        .events
+        .iter()
+        .find(|event| event.event == "item_checkpointed")
+        .unwrap();
+    assert_eq!(first.worker_id, Some(2));
+    assert_eq!(first.generation, Some(0));
+    assert_eq!(first.owner_attempt, Some(1));
+    assert_eq!(first.in_flight, 1);
+}
+
+#[test]
+fn parallel_frontier_rejects_duplicate_terminal_and_incomplete_success() {
+    let fixture = Fixture::new();
+    fixture.start("parallel-protocol", &['元', '漢']);
+    let mut progress = CapturedProgress::default();
+    let duplicate = run_batch_with_worker_stream_and_progress(
+        &fixture.store,
+        "parallel-protocol",
+        3,
+        2,
+        |_characters, _generations, _owner_attempts, _workers, on_event| {
+            on_event(worker_event(1, 0, AcquisitionWorkerEventKind::Assigned))
+                .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(worker_event(
+                1,
+                0,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemStarted { index: 0 }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)?;
+            let completed = worker_event(
+                1,
+                0,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                    index: 0,
+                    outcome: Box::new(Err("синтетическая ошибка 元".into())),
+                    diagnostics: None,
+                }),
+            );
+            on_event(completed).map_err(AcquisitionStreamError::Consumer)?;
+            on_event(worker_event(
+                1,
+                0,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                    index: 0,
+                    outcome: Box::new(Err("дубликат".into())),
+                    diagnostics: None,
+                }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    );
+    assert!(duplicate.is_err());
+    assert_eq!(fixture.load("parallel-protocol").items[0].attempts.len(), 1);
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.event == "round_started")
+            .count(),
+        1
+    );
+
+    let fixture = Fixture::new();
+    fixture.start("parallel-incomplete", &['元', '漢']);
+    let mut progress = CapturedProgress::default();
+    let incomplete = run_batch_with_worker_stream_and_progress(
+        &fixture.store,
+        "parallel-incomplete",
+        3,
+        2,
+        |_characters, _generations, _owner_attempts, _workers, on_event| {
+            on_event(worker_event(1, 0, AcquisitionWorkerEventKind::Assigned))
+                .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(worker_event(
+                1,
+                0,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemStarted { index: 0 }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)?;
+            on_event(worker_event(
+                1,
+                0,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                    index: 0,
+                    outcome: Box::new(Err("синтетическая ошибка 元".into())),
+                    diagnostics: None,
+                }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    );
+    assert!(
+        incomplete
+            .unwrap_err()
+            .message
+            .starts_with("batch_frontier_incomplete:")
+    );
+    let state = fixture.load("parallel-incomplete");
+    assert_eq!(state.items[0].attempts.len(), 1);
+    assert!(state.items[1].attempts.is_empty());
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.event == "round_started")
+            .count(),
+        1,
+        "следующий round нельзя начать до terminal checkpoint всего frontier"
+    );
+}
+
+#[test]
 fn interrupted_frontier_tail_stays_pending_and_retry_fairness_is_preserved() {
     let fixture = Fixture::new();
     fixture.start("frontier-tail", &['元', '漢', '字']);
@@ -998,9 +1247,17 @@ fn human_progress_localizes_event_and_outcome_without_changing_machine_values() 
         round_total: 1,
         run_completed: 0,
         batch_total: 1,
+        workers: 1,
+        in_flight: 0,
         identity: None,
         session: Some(1),
+        worker_id: None,
+        browser_session_id: None,
         attempt: None,
+        generation: None,
+        owner_attempt: None,
+        item_elapsed_ms: None,
+        stage_timings: None,
         outcome: Some("candidate_recorded".into()),
         reason: None,
     };
@@ -1035,9 +1292,17 @@ fn progress_jsonl_is_separate_from_the_single_final_json_response() {
         round_total: 1,
         run_completed: 1,
         batch_total: 1,
+        workers: 1,
+        in_flight: 0,
         identity: Some(identity('漢')),
         session: Some(1),
+        worker_id: None,
+        browser_session_id: None,
         attempt: None,
+        generation: None,
+        owner_attempt: None,
+        item_elapsed_ms: None,
+        stage_timings: None,
         outcome: Some("acquisition_failed".into()),
         reason: None,
     };
@@ -2146,6 +2411,7 @@ fn run_error_response_exposes_a_flushed_per_run_diagnostic_log() {
     let command = BatchCommand::Run {
         batch_id: "diagnostic-missing-batch".into(),
         rounds: 1,
+        workers: 1,
         #[cfg(feature = "session-rotation-acceptance")]
         acceptance_rotate_after_items: None,
     };
@@ -2194,6 +2460,7 @@ fn successful_run_response_exposes_a_flushed_per_run_diagnostic_log() {
     let command = BatchCommand::Run {
         batch_id: "diagnostic-success".into(),
         rounds: 1,
+        workers: 1,
         #[cfg(feature = "session-rotation-acceptance")]
         acceptance_rotate_after_items: None,
     };

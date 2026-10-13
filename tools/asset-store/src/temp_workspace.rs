@@ -21,6 +21,7 @@ use rustix::fs::{
 use serde::{Deserialize, Serialize};
 
 const TEMP_ROOT: &str = "/tmp";
+pub(crate) const CONFIGURED_TEMP_ROOT_ENV: &str = "ASSET_STORE_TEMP_ROOT";
 const NAMESPACE_PREFIX: &str = "anki-decks";
 const MARKER: &str = ".anki-decks-owner.json";
 const REPOSITORY: &str = "anki-decks";
@@ -96,6 +97,17 @@ pub(crate) fn cleanup_orphans_on_startup() -> io::Result<()> {
 impl TempWorkspace {
     /// Создаёт закрытое дерево после начальной очистки; TTL действует только для схемы 1.
     pub fn create(purpose: &str) -> io::Result<Self> {
+        if let Some(root) = std::env::var_os(CONFIGURED_TEMP_ROOT_ENV) {
+            let root = PathBuf::from(root);
+            if !root.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{CONFIGURED_TEMP_ROOT_ENV} должен быть абсолютным путём"),
+                ));
+            }
+            cleanup_orphans_under(&root, DEFAULT_ORPHAN_MIN_AGE)?;
+            return Self::create_under(&root, purpose);
+        }
         cleanup_orphans_on_startup()?;
         Self::create_under(Path::new(TEMP_ROOT), purpose)
     }
