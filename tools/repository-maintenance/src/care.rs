@@ -941,7 +941,10 @@ mod tests {
         invoke(false, true, &mock_bin, "0");
         invoke(true, false, &mock_bin, "0");
         invoke(true, true, &empty_bin, "0");
-        assert!(!log.exists(), "без GUI/D-Bus/notify-send нельзя посылать уведомление");
+        assert!(
+            !log.exists(),
+            "без GUI/D-Bus/notify-send нельзя посылать уведомление"
+        );
 
         invoke(true, true, &mock_bin, "17");
         let delivered = std::fs::read_to_string(&log).unwrap();
