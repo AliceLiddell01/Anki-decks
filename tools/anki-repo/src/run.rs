@@ -10,8 +10,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::cli::{Cli, Command, MatchArg};
+use crate::cli::{Cli, Command, MatchArg, MaintenanceAction};
 use crate::error::{DomainError, ErrorCode};
+use repository_maintenance::care;
 use crate::index::ExportIndex;
 use crate::loader::load_export;
 use crate::ops::create as create_op;
@@ -62,6 +63,27 @@ pub fn execute_cli(cli: &Cli) -> Result<Rendered, DomainError> {
 /// Выполняет команду и готовит результат без обращения к стандартным потокам.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
     match &cli.command {
+        Command::Maintenance { action, workspace_root } => {
+            let root = repository_maintenance::policy::workspace_root(workspace_root.as_deref(), false)
+                .map_err(|e| DomainError::new(ErrorCode::InputUnreadable, e))?;
+            match action {
+                MaintenanceAction::Status => (),
+                MaintenanceAction::Enable => care::enable(&root)
+                    .map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?,
+                MaintenanceAction::Disable => care::disable(&root)
+                    .map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?,
+            }
+            let status = care::inspect(&root);
+            Ok(Rendered {
+                command: "maintenance",
+                stdout: if cli.json {
+                    json::generic_json("maintenance", &status)
+                } else {
+                    care::render_text(&status)
+                },
+                exit: 0,
+            })
+        }
         Command::Inspect {
             export_dir,
             verbose,
