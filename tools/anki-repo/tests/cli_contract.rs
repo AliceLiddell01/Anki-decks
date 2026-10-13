@@ -1181,6 +1181,134 @@ fn maintenance_disable_reports_failure_when_binding_cannot_be_proven() {
     );
 }
 
+/// Без подтверждённой привязки `disable` снимает только установку с отметкой
+/// владельца: управляемые unit-файлы удаляются, но `no` сохраняется лишь тогда,
+/// когда таймер после этого действительно не активен.
+#[cfg(target_os = "linux")]
+#[test]
+fn maintenance_disable_removes_owner_marked_units_without_binding() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const MANAGED: &str = "# Managed by repository-maintenance; do not edit by hand.";
+
+    let scenario =
+        |timer_stays_enabled: bool| -> (TempDir, std::process::Output, std::path::PathBuf, bool) {
+            let fixture = TempDir::new("maintenance-disable-managed");
+            let home = fixture.path().join("home");
+            let config = fixture.path().join("config");
+            let state = fixture.path().join("state");
+            let cache = fixture.path().join("cache");
+            let bin = fixture.path().join("mock-bin");
+            for dir in [&home, &config, &state, &cache, &bin] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            // Конфигурации установки нет, поэтому привязка не подтверждена, но
+            // unit-файлы с отметкой владельца на месте.
+            let unit_dir = config.join("systemd/user");
+            std::fs::create_dir_all(&unit_dir).unwrap();
+            for name in [
+                "anki-repository-maintenance.service",
+                "anki-repository-maintenance.timer",
+            ] {
+                std::fs::write(unit_dir.join(name), format!("{MANAGED}\n[Unit]\n")).unwrap();
+            }
+            let disabled_flag = fixture.path().join("timer-disabled");
+            let stays = fixture.path().join("timer-stays-enabled");
+            if timer_stays_enabled {
+                std::fs::write(&stays, "").unwrap();
+            }
+            let systemctl = bin.join("systemctl");
+            std::fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                 '--user show-environment') exit 0 ;;\n\
+                 '--user disable --now anki-repository-maintenance.timer')\n\
+                 if [ ! -f '{stays}' ]; then : > '{disabled_flag}'; fi\n\
+                 exit 0 ;;\n\
+                 '--user daemon-reload') exit 0 ;;\n\
+                 '--user is-enabled anki-repository-maintenance.timer'|'--user is-active anki-repository-maintenance.timer')\n\
+                 if [ -f '{stays}' ]; then exit 0; fi\n\
+                 if [ -f '{disabled_flag}' ]; then exit 1; fi\n\
+                 exit 1 ;;\n\
+                 '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+                 'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
+                 *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+                 esac\n",
+                stays = stays.display(),
+                disabled_flag = disabled_flag.display(),
+            ),
+        )
+        .unwrap();
+            std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let sandbox_path = std::env::join_paths(std::iter::once(bin.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap();
+            let repository = isolated_maintenance_workspace(&fixture, &bin);
+            let output = Command::new(cli_binary())
+                .args([
+                    "--json",
+                    "maintenance",
+                    "--workspace-root",
+                    repository.to_str().unwrap(),
+                    "disable",
+                ])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_STATE_HOME", &state)
+                .env("XDG_CACHE_HOME", &cache)
+                .env("ANKI_MAINTENANCE_ROOT", &repository)
+                .env("PATH", &sandbox_path)
+                .output()
+                .unwrap();
+            let units_removed = !unit_dir
+                .join("anki-repository-maintenance.service")
+                .exists()
+                && !unit_dir.join("anki-repository-maintenance.timer").exists();
+            // Временный каталог возвращается наружу: иначе он удалялся бы до проверок.
+            (
+                fixture,
+                output,
+                config.join("anki-decks/gc-preference.json"),
+                units_removed,
+            )
+        };
+
+    let (_fixture, disabled, preference, units_removed) = scenario(false);
+    assert_eq!(
+        disabled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    assert!(
+        units_removed,
+        "управляемые unit-файлы обязаны быть сняты без подтверждённой привязки"
+    );
+    assert!(
+        preference.is_file(),
+        "отказ сохраняется, когда таймер после снятия не активен"
+    );
+
+    let (_fixture, still_enabled, preference, units_removed) = scenario(true);
+    assert_eq!(
+        still_enabled.status.code(),
+        Some(8),
+        "ожидалась ошибка записи: {}",
+        String::from_utf8_lossy(&still_enabled.stderr)
+    );
+    assert!(
+        units_removed,
+        "установка владельца снимается и при сохранившемся таймере"
+    );
+    assert!(
+        !preference.exists(),
+        "при работающем таймере отказ не сохраняется"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
@@ -1374,6 +1502,21 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
     assert!(
         !preference.exists(),
         "пустой ввод на EOF не должен сохранять отказ: {eof}"
+    );
+
+    // Нераспознанный ответ — не отказ: выбор не сохраняется, вопрос задаётся снова.
+    let unrecognized = launch(b"maybe\n");
+    assert!(
+        unrecognized.contains("Включить автоматическую очистку? [y/N]"),
+        "{unrecognized}"
+    );
+    assert!(
+        unrecognized.contains("Ответ не распознан"),
+        "{unrecognized}"
+    );
+    assert!(
+        !preference.exists(),
+        "нераспознанный ответ не должен сохраняться как отказ: {unrecognized}"
     );
 
     let first = launch(b"n\n");

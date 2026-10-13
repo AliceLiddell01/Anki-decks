@@ -850,13 +850,28 @@ pub fn disable(root: &Path) -> Result<(), String> {
     set_choice("no")
 }
 
+/// Значение необязательного счётчика в пользовательском тексте: `None` — это
+/// «неизвестно», а не внутреннее представление Rust `None`.
+fn bytes_or_unknown(value: Option<u64>) -> String {
+    value.map_or_else(|| "неизвестно".into(), |value| value.to_string())
+}
+
+/// Состояние необязательного признака в пользовательском тексте.
+fn active_or_unknown(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "да",
+        Some(false) => "нет",
+        None => "неизвестно",
+    }
+}
+
 pub fn render_text(status: &CareStatus) -> String {
     let mut s = format!(
-        "Рабочая область: {}\nВыбор пользователя: {}\nАвтоочистка: {} (таймер активен: {:?})\n",
+        "Рабочая область: {}\nВыбор пользователя: {}\nАвтоочистка: {} (таймер активен: {})\n",
         status.workspace_root.display(),
         status.preference,
         status.automatic,
-        status.timer_active
+        active_or_unknown(status.timer_active)
     );
     if let Some(installed) = &status.installed_workspace {
         s.push_str(&format!(
@@ -867,8 +882,7 @@ pub fn render_text(status: &CareStatus) -> String {
     let m = &status.measurement;
     s.push_str(&format!(
         "Учтённые управляемые артефакты: {} байт (полнота общего обзора, включая /tmp: {})\n",
-        m.project_bytes
-            .map_or_else(|| "неизвестно".into(), |v| v.to_string()),
+        bytes_or_unknown(m.project_bytes),
         m.complete
     ));
     if let Some(tmp) = &m.system_tmp {
@@ -878,17 +892,23 @@ pub fn render_text(status: &CareStatus) -> String {
         ));
     }
     s.push_str(&format!(
-        "Cargo target: {:?} байт (предупреждение {}, предел {})\n",
-        m.cargo_target_bytes, m.target_warning_bytes, m.target_hard_limit_bytes
+        "Cargo target: {} байт (предупреждение {}, предел {})\n",
+        bytes_or_unknown(m.cargo_target_bytes),
+        m.target_warning_bytes,
+        m.target_hard_limit_bytes
     ));
     s.push_str(&format!(
-        "Внешние кэши: {:?} байт (предел {})\n",
-        m.external_cache_bytes, m.external_cache_hard_limit_bytes
+        "Внешние кэши: {} байт (предел {})\n",
+        bytes_or_unknown(m.external_cache_bytes),
+        m.external_cache_hard_limit_bytes
     ));
     if let Some(last) = &status.last_attempt {
         s.push_str(&format!(
-            "Последняя попытка: {} в {} (освобождено {:?} байт; {})\n",
-            last.outcome, last.timestamp, last.bytes_freed, last.message
+            "Последняя попытка: {} в {} (освобождено {} байт; {})\n",
+            last.outcome,
+            last.timestamp,
+            bytes_or_unknown(last.bytes_freed),
+            last.message
         ));
         for item in &last.items {
             if item.bytes_freed > 0 || item.action == "deferred" || item.action == "error" {

@@ -257,6 +257,7 @@ fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
     let fixture = CacheFixture::new();
     let target_file = fixture.owner.path().join("target-is-a-file");
     fs::write(&target_file, b"target contents must be preserved").unwrap();
+    let (state_home, config_home) = isolated_state_dirs(&fixture.cache_home);
     let output = Command::new(BINARY)
         .args([
             "clean",
@@ -272,6 +273,8 @@ fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
         .env("CARGO_TARGET_DIR", &target_file)
         .env_remove("CARGO_BUILD_BUILD_DIR")
         .env("XDG_CACHE_HOME", &fixture.cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("XDG_RUNTIME_DIR")
         .env("PATH", notification_path(&fixture.root))
         .env("TMPDIR", &fixture.temp_root)
@@ -462,6 +465,7 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
     )
     .unwrap();
 
+    let (state_home, config_home) = isolated_state_dirs(&cache_home);
     let initialized = Command::new(BINARY)
         .args([
             "cache",
@@ -473,6 +477,8 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
             "--json",
         ])
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .output()
         .unwrap();
     assert!(
@@ -501,6 +507,8 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
             "build",
         ])
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", &temp_root)
         .output()
@@ -599,11 +607,14 @@ impl CacheFixture {
 
     fn command(&self, action: &str) -> Command {
         let mut command = Command::new(BINARY);
+        let (state_home, config_home) = isolated_state_dirs(&self.cache_home);
         command
             .args(["cache", action, "--id", "fixture", "--workspace-root"])
             .arg(&self.root)
             .arg("--json")
             .env("XDG_CACHE_HOME", &self.cache_home)
+            .env("XDG_STATE_HOME", state_home)
+            .env("XDG_CONFIG_HOME", config_home)
             .env_remove("XDG_RUNTIME_DIR")
             .env("TMPDIR", &self.temp_root);
         command
@@ -1052,6 +1063,7 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         search_path.extend(std::env::split_paths(&existing));
     }
     let search_path = std::env::join_paths(search_path).unwrap();
+    let (state_home, config_home) = isolated_state_dirs(&cache_home);
     let output = Command::new(BINARY)
         .args([
             "clean",
@@ -1066,6 +1078,8 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         ])
         .env("PATH", search_path)
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", &temp_root)
         .env("CARGO_HOME", cargo_home)
@@ -1086,6 +1100,12 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         "{report}"
     );
     assert!(target.join("synthetic-artifact").exists());
+    // Сбойный прогон обязан оставить снимок в изолированном состоянии, а не
+    // перезаписать настоящий результат GC в домашнем каталоге запускающего.
+    assert!(
+        isolated_snapshot(&cache_home).is_file(),
+        "снимок последней попытки обязан лежать в изолированном состоянии"
+    );
 }
 
 fn write_cargo(directory: &Path, body: &str) -> PathBuf {
@@ -1125,6 +1145,24 @@ fn notification_path(root: &Path) -> OsString {
     std::env::join_paths(entries).unwrap()
 }
 
+/// Изолированные `XDG_STATE_HOME` и `XDG_CONFIG_HOME` рядом с кэшем проверки:
+/// `clean --apply` записывает снимок последней попытки, и без этих переменных он
+/// попадает в домашний каталог запускающего, заменяя настоящий результат GC.
+fn isolated_state_dirs(cache_home: &Path) -> (PathBuf, PathBuf) {
+    let state = cache_home.with_file_name("state-home");
+    let config = cache_home.with_file_name("config-home");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&config).unwrap();
+    (state, config)
+}
+
+/// Путь снимка последней попытки внутри изолированного состояния.
+fn isolated_snapshot(cache_home: &Path) -> PathBuf {
+    cache_home
+        .with_file_name("state-home")
+        .join("anki-decks/gc-last-attempt.json")
+}
+
 fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply: bool) -> Output {
     invoke_with_legacy(root, policy, temp_root, cache_home, apply, false)
 }
@@ -1138,6 +1176,7 @@ fn invoke_with_legacy(
     cleanup_legacy: bool,
 ) -> Output {
     let mut command = Command::new(BINARY);
+    let (state_home, config_home) = isolated_state_dirs(cache_home);
     command
         .args([
             "clean",
@@ -1150,6 +1189,8 @@ fn invoke_with_legacy(
             "--json",
         ])
         .env("XDG_CACHE_HOME", cache_home)
+        .env("XDG_STATE_HOME", state_home)
+        .env("XDG_CONFIG_HOME", config_home)
         .env_remove("XDG_RUNTIME_DIR")
         .env("PATH", notification_path(root))
         .env("TMPDIR", temp_root);

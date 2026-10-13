@@ -148,14 +148,22 @@ fn maybe_offer_maintenance(cli: &Cli) {
         Ok(0) | Err(_) => return,
         Ok(_) => {}
     }
-    if answer.trim().eq_ignore_ascii_case("y") {
+    // Отказом считается явный `n`/`no`/`нет` и пустой ответ (умолчание `[y/N]`).
+    // Нераспознанный ввод — опечатка или форма, которую инструмент не понимает, —
+    // не сохраняется: иначе случайная строка навсегда закрывала бы вопрос.
+    let answer = answer.trim().to_lowercase();
+    if matches!(answer.as_str(), "y" | "yes" | "д" | "да") {
         match care::enable(&root) {
             Ok(()) => eprintln!("Автоочистка подтверждена: таймер установлен и активен."),
             Err(e) => eprintln!(
                 "Не удалось включить GC: {e}. Согласие сохранено; проверьте anki-repo maintenance status."
             ),
         }
-    } else if let Err(e) = care::set_choice("no") {
-        eprintln!("Не удалось сохранить отказ: {e}");
+    } else if matches!(answer.as_str(), "" | "n" | "no" | "н" | "нет") {
+        if let Err(e) = care::set_choice("no") {
+            eprintln!("Не удалось сохранить отказ: {e}");
+        }
+    } else {
+        eprintln!("Ответ не распознан; выбор не сохранён, вопрос будет задан снова.");
     }
 }
