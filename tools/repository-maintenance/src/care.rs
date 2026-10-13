@@ -1063,7 +1063,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let invoke = |exit_code: &str| {
-            let output = Command::new(std::env::current_exe().unwrap())
+            Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "care::tests::windows_notification_subprocess_helper",
@@ -1079,8 +1079,7 @@ mod tests {
                 .env_remove("WAYLAND_DISPLAY")
                 .env("PATH", &bin)
                 .output()
-                .unwrap();
-            output
+                .unwrap()
         };
         let success = invoke("0");
         assert!(
