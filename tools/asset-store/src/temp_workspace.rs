@@ -923,7 +923,7 @@ fn workspace_process_references(
                     ));
                 }
             };
-            if environment_uses_workspace(&environment, &cwd, &run_path) {
+            if environment_uses_workspace(&environment, &cwd, &run_path)? {
                 return Ok(true);
             }
         }
@@ -931,7 +931,7 @@ fn workspace_process_references(
             if is_current_process {
                 let cwd = fs::read_link(process.join("cwd"))?;
                 let environment = fs::read(process.join("environ"))?;
-                if environment_uses_workspace(&environment, &cwd, &run_path) {
+                if environment_uses_workspace(&environment, &cwd, &run_path)? {
                     return Ok(true);
                 }
             }
@@ -1023,10 +1023,10 @@ fn command_uses_workspace(cmdline: &[u8], run_path: &Path) -> bool {
     false
 }
 
-fn environment_uses_workspace(environment: &[u8], cwd: &Path, run_path: &Path) -> bool {
-    environment.split(|byte| *byte == 0).any(|entry| {
+fn environment_uses_workspace(environment: &[u8], cwd: &Path, run_path: &Path) -> io::Result<bool> {
+    for entry in environment.split(|byte| *byte == 0) {
         let Some(value) = entry.strip_prefix(b"TMPDIR=") else {
-            return false;
+            continue;
         };
         let path = PathBuf::from(OsString::from_vec(value.to_vec()));
         let path = if path.is_absolute() {
@@ -1034,8 +1034,11 @@ fn environment_uses_workspace(environment: &[u8], cwd: &Path, run_path: &Path) -
         } else {
             cwd.join(path)
         };
-        path_is_within(&path, run_path)
-    })
+        if path_is_within(&fs::canonicalize(path)?, run_path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn is_chromium_process(comm: &[u8], cmdline: &[u8]) -> bool {
@@ -2319,6 +2322,58 @@ mod tests {
             workspace_process_references(&proc_root, &path, current_uid().unwrap(), true, &[7],)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn browser_tmpdir_resolves_parent_components_before_workspace_check() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (path, _) = exact_orphan(root.path());
+        let temp = path.join("browser-temp");
+        fs::create_dir(&temp).unwrap();
+        let cwd = root.path().join("sibling-cwd");
+        fs::create_dir(&cwd).unwrap();
+        let tmpdir = Path::new("..")
+            .join(path.strip_prefix(root.path()).unwrap())
+            .join("browser-temp");
+        let environment = format!("TMPDIR={}\0", tmpdir.display());
+        let process = fake_chromium_process(
+            &proc_root,
+            300_001,
+            b"chrome\0",
+            environment.as_bytes(),
+            None,
+        );
+        fs::remove_file(process.join("cwd")).unwrap();
+        symlink(&cwd, process.join("cwd")).unwrap();
+
+        assert!(
+            workspace_process_references(&proc_root, &path, current_uid().unwrap(), false, &[],)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn browser_tmpdir_resolution_errors_preserve_the_owned_workspace() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (path, _) = exact_orphan(root.path());
+        let process = fake_chromium_process(
+            &proc_root,
+            300_002,
+            b"chrome\0",
+            b"TMPDIR=/missing-anki-decks-browser-tmpdir\0",
+            None,
+        );
+        let cwd = root.path().join("sibling-cwd");
+        fs::create_dir(&cwd).unwrap();
+        fs::remove_file(process.join("cwd")).unwrap();
+        symlink(&cwd, process.join("cwd")).unwrap();
+
+        let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(path.exists());
     }
 
     #[test]

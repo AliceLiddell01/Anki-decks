@@ -550,10 +550,18 @@ def summarize(progress, execution, run_root, store, command_directory):
             if isinstance(timing, dict) and isinstance(timing.get("stage"), str) and isinstance(timing.get("duration_ms"), (int, float)):
                 public_stages[timing["stage"]].append(timing["duration_ms"])
                 public_stages_by_identity[row["identity"]][timing["stage"]].append(timing["duration_ms"])
+    has_diagnostic_stages = bool(stages)
+    used_public_fallback = False
+    for key, identity_stages in public_stages_by_identity.items():
+        if stages_by_identity[key]:
+            continue
+        used_public_fallback = True
+        for stage, durations in identity_stages.items():
+            stages[stage].extend(durations)
+            stages_by_identity[key][stage].extend(durations)
     stage_source = "diagnostic_log"
-    if public_stages:
-        stages, stages_by_identity = public_stages, public_stages_by_identity
-        stage_source = "progress.stage_timings"
+    if used_public_fallback:
+        stage_source = "diagnostic_log+progress.stage_timings" if has_diagnostic_stages else "progress.stage_timings"
     resource_samples = []
     for line in (command_directory / "resources.jsonl").read_text(encoding="utf-8").splitlines():
         resource_samples.append(json.loads(line))
