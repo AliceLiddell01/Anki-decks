@@ -1101,7 +1101,7 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
 
     let invoke = |action: &str| {
         Command::new(cli_binary())
-            .args(["--json", "maintenance", action, "--workspace-root", root])
+            .args(["--json", "maintenance", "--workspace-root", root, action])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_STATE_HOME", &state)
