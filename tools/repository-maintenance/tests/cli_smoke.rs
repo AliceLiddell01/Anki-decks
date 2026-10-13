@@ -256,6 +256,7 @@ fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
         .env_remove("CARGO_BUILD_BUILD_DIR")
         .env("XDG_CACHE_HOME", &fixture.cache_home)
         .env_remove("XDG_RUNTIME_DIR")
+        .env("PATH", notification_path(&fixture.root))
         .env("TMPDIR", &fixture.temp_root)
         .output()
         .unwrap();
@@ -1029,7 +1030,7 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=1\n",
     )
     .unwrap();
-    let mut search_path = vec![cargo_bin];
+    let mut search_path = vec![notification_stubs(&root), cargo_bin];
     if let Some(existing) = std::env::var_os("PATH") {
         search_path.extend(std::env::split_paths(&existing));
     }
@@ -1081,6 +1082,32 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+/// Заглушки каналов уведомления внутри рабочей области проверки: сбой очистки не
+/// должен будить рабочий стол пользователя. На WSL `windows_toast` ищет
+/// `powershell.exe` в `PATH`, а при его отсутствии берёт стандартный
+/// `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`, поэтому
+/// заглушка обязана стоять в `PATH` раньше системных каталогов, а не просто
+/// отсутствовать в нём. `notify-send` закрывает тот же маршрут на Linux-хосте.
+fn notification_stubs(root: &Path) -> PathBuf {
+    let bin = root.join("notification-stubs");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["powershell.exe", "notify-send"] {
+        let stub = bin.join(name);
+        fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    bin
+}
+
+/// `PATH` с заглушками уведомления перед унаследованным `PATH`.
+fn notification_path(root: &Path) -> OsString {
+    let mut entries = vec![notification_stubs(root)];
+    if let Some(existing) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(entries).unwrap()
+}
+
 fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply: bool) -> Output {
     invoke_with_legacy(root, policy, temp_root, cache_home, apply, false)
 }
@@ -1107,6 +1134,7 @@ fn invoke_with_legacy(
         ])
         .env("XDG_CACHE_HOME", cache_home)
         .env_remove("XDG_RUNTIME_DIR")
+        .env("PATH", notification_path(root))
         .env("TMPDIR", temp_root);
     if apply {
         command.arg("--apply");
