@@ -410,14 +410,27 @@ pub fn record_failure(root: &Path, message: &str) -> Result<(), String> {
 
 /// Уведомление — необязательное побочное действие: ошибка не меняет результат GC.
 pub fn desktop_alert(message: &str) {
-    let _ = try_desktop_alert(message);
+    desktop_alert_on(is_wsl(), message);
+}
+
+/// Маршрут уведомления с явным признаком платформы: тот же код, что и в
+/// `desktop_alert`, но необязательное действие остаётся необязательным.
+fn desktop_alert_on(wsl: bool, message: &str) {
+    let _ = try_desktop_alert_on(wsl, message);
 }
 
 /// Диагностика выбранного канала, пригодная также для безопасной проверки из systemd.
 /// Успешный статус означает, что вызываемый обработчик принял запрос, но не
 /// гарантирует, что пользователь увидел окно.
 pub fn try_desktop_alert(message: &str) -> Result<&'static str, String> {
-    if is_wsl() {
+    try_desktop_alert_on(is_wsl(), message)
+}
+
+/// Выбор канала по уже установленной платформе. Признак передаётся параметром,
+/// чтобы тест канала Linux не зависел от того, распознан ли хост как WSL по
+/// `/proc` и `/mnt/c`, и не мог запустить настоящий Windows PowerShell.
+fn try_desktop_alert_on(wsl: bool, message: &str) -> Result<&'static str, String> {
+    if wsl {
         return windows_toast(message).map(|()| "windows-toast");
     }
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
@@ -773,7 +786,27 @@ pub fn enable(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Не отключает unit, принадлежащий другому checkout.
+/// Следы установки на диске: unit-файлы таймера в пользовательском каталоге
+/// systemd либо конфигурация установки. Их отсутствие — единственное
+/// доказательство того, что сохранённый отказ ничего не скрывает.
+fn installed_artifacts_present() -> bool {
+    let Some(config_home) = config_home() else {
+        return true;
+    };
+    let unit_dir = config_home.join("systemd/user");
+    [
+        unit_dir.join("anki-repository-maintenance.service"),
+        unit_dir.join("anki-repository-maintenance.timer"),
+        config_home.join("anki-decks/repository-maintenance-install.toml"),
+    ]
+    .iter()
+    .any(|path| fs::symlink_metadata(path).is_ok())
+}
+
+/// Не отключает unit, принадлежащий другому checkout, и не выдаёт отказ за
+/// выполненное отключение. Если принадлежность не подтверждена, а следы
+/// установки есть, `disable` сначала пытается снять установку и только по
+/// фактическому результату сохраняет выбор.
 pub fn disable(root: &Path) -> Result<(), String> {
     let health = timer::inspect();
     if health
@@ -787,6 +820,30 @@ pub fn disable(root: &Path) -> Result<(), String> {
     }
     if health.installed_root.is_some() {
         timer::uninstall_for(root)?;
+    } else if installed_artifacts_present() {
+        // Привязка не подтверждена (нет конфигурации установки или её нельзя
+        // прочитать), но unit-файлы на месте и таймер может продолжать работать.
+        // `uninstall` удаляет только файлы с отметкой владельца.
+        timer::uninstall()?;
+        let after = timer::inspect();
+        if after.installed_root.is_some() || installed_artifacts_present() {
+            return Err(format!(
+                "автоматическая очистка не отключена: состояние таймера {}; {}",
+                after.state,
+                after
+                    .error
+                    .unwrap_or_else(|| "проверьте anki-repo maintenance status".into())
+            ));
+        }
+    }
+    // Проверяем результат до записи отказа: сохранённый `no` при работающем
+    // таймере даёт вечный preference_mismatch и не останавливает очистку.
+    let after = timer::inspect();
+    if matches!(after.state.as_str(), "enabled" | "unknown") {
+        return Err(format!(
+            "автоматическая очистка всё ещё включена: состояние таймера {}; проверьте anki-repo maintenance status",
+            after.state
+        ));
     }
     set_choice("no")
 }
@@ -958,13 +1015,15 @@ mod tests {
     }
 
     /// Запускается как отдельный test process, чтобы не менять глобальное
-    /// окружение остальных параллельно выполняемых тестов.
+    /// окружение остальных параллельно выполняемых тестов. Канал выбирается
+    /// параметром, а не распознаванием хоста: на WSL-хосте `is_wsl()` вернул бы
+    /// true и проверка Linux-маршрута обратилась бы к настоящему Windows PowerShell.
     #[test]
     fn desktop_notification_subprocess_helper() {
         if std::env::var_os("ANKI_GC_NOTIFICATION_SUBPROCESS").is_none() {
             return;
         }
-        desktop_alert("ошибка GC");
+        desktop_alert_on(false, "ошибка GC");
     }
 
     #[test]

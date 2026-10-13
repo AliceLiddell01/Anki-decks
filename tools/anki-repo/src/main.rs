@@ -61,8 +61,13 @@ fn internal_failure() -> ExitCode {
 
 /// Вступительное предложение — только в обычных командах с настоящим TTY.
 /// Никакого чтения stdin у piped запросов и никаких баннеров в JSON.
+/// Признак `CI` проверяется отдельно от TTY: некоторые CI-среды выделяют
+/// псевдотерминал (`docker run -t`, util-linux `script`), и тогда вопрос
+/// ожидал бы ответа без ограничения времени. README обещает отсутствие
+/// вопросов в CI, поэтому проверка нужна здесь, а не только по потокам.
 fn maybe_offer_maintenance(cli: &Cli) {
     if cli.json
+        || std::env::var_os("CI").is_some()
         || !io::stdin().is_terminal()
         || !io::stdout().is_terminal()
         || !io::stderr().is_terminal()
@@ -102,9 +107,13 @@ fn maybe_offer_maintenance(cli: &Cli) {
         return;
     }
     // Не предлагаем переустановку автоматически при существующем user timer,
-    // даже если он связан с другой рабочей копией.
+    // даже если он связан с другой рабочей копией. Состояния `unknown`
+    // (таймер включён, принадлежность не подтверждена) и `unavailable`
+    // (нет пользовательского менеджера systemd) означают, что предложение
+    // нельзя выполнить: ответ `y` сохранил бы согласие и всё равно не смог
+    // установить таймер.
     let timer = repository_maintenance::timer::inspect();
-    if timer.installed_root.is_some() || timer.state == "unknown" {
+    if timer.installed_root.is_some() || matches!(timer.state.as_str(), "unknown" | "unavailable") {
         return;
     }
     let status = care::inspect(&root);

@@ -1081,15 +1081,116 @@ fn migration_cli_rejects_unproven_identity_before_reading_missing_store() {
     }
 }
 
+/// Отказ не должен выглядеть выполненным, если установленный таймер невозможно
+/// снять: без подтверждённой привязки `disable` обязан сообщить ошибку, а не
+/// сохранить `no` при работающей автоочистке.
+#[cfg(target_os = "linux")]
+#[test]
+fn maintenance_disable_reports_failure_when_binding_cannot_be_proven() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = TempDir::new("maintenance-disable-unproven");
+    let home = fixture.path().join("home");
+    let config = fixture.path().join("config");
+    let state = fixture.path().join("state");
+    let bin = fixture.path().join("mock-bin");
+    for dir in [&home, &config, &state, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    // Подтверждённой привязки нет: конфигурации установки не существует.
+    // Таймер при этом включён и активен, то есть автоочистка работает.
+    std::fs::create_dir_all(config.join("systemd/user")).unwrap();
+    let systemctl = bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         '--user show-environment') exit 0 ;;\n\
+         '--user is-enabled anki-repository-maintenance.timer') exit 0 ;;\n\
+         '--user is-active anki-repository-maintenance.timer') exit 0 ;;\n\
+         '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
+         *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sandbox_path = std::env::join_paths(std::iter::once(bin.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+
+    let output = Command::new(cli_binary())
+        .args([
+            "--json",
+            "maintenance",
+            "--workspace-root",
+            repository.to_str().unwrap(),
+            "disable",
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", &state)
+        .env("PATH", &sandbox_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(8), "ожидалась ошибка записи");
+    let parsed = parse_json(&String::from_utf8(output.stdout).unwrap());
+    assert_eq!(parsed["error"]["code"], "write_failed");
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("таймер"),
+        "{parsed}"
+    );
+    assert!(
+        !config.join("anki-decks/gc-preference.json").exists(),
+        "отказ не сохранён, пока автоочистка не отключена"
+    );
+}
+
 #[test]
 fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
+    use std::os::unix::fs::PermissionsExt;
+
     let fixture = TempDir::new("maintenance-contract");
     let home = fixture.path().join("home");
     let config = fixture.path().join("config");
     let state = fixture.path().join("state");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&config).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
+    let bin = fixture.path().join("mock-bin");
+    for dir in [&home, &config, &state, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    // Таймер не установлен: проверяется чистый отказ, а не состояние таймера
+    // машины, на которой выполняется тест.
+    let systemctl = bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         '--user show-environment') exit 0 ;;\n\
+         '--user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
+         '--user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
+         '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
+         *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sandbox_path = std::env::join_paths(std::iter::once(bin.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -1105,6 +1206,7 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_STATE_HOME", &state)
+            .env("PATH", &sandbox_path)
             .output()
             .expect("CLI должен запускаться с перенаправленными потоками")
     };
@@ -1213,6 +1315,9 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
             .env("XDG_STATE_HOME", &isolated_state)
             .env("XDG_CACHE_HOME", &isolated_cache)
             .env("PATH", &sandbox_path)
+            // Тест проверяет интерактивный сценарий: признак CI снимается
+            // явно, чтобы результат не зависел от окружения запуска.
+            .env_remove("CI")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1365,7 +1470,10 @@ esac
             .env("ANKI_REPOSITORY_ROOT", &root)
             .env("ANKI_GC_CONSENT_SYSTEMCTL_LOG", &systemctl_log)
             .env("ANKI_GC_CONSENT_ACTIVE_MARKER", &active_marker)
-            .env("PATH", &isolated_path);
+            .env("PATH", &isolated_path)
+            // Тест проверяет интерактивный сценарий: признак CI снимается
+            // явно, чтобы результат не зависел от окружения запуска.
+            .env_remove("CI");
     };
     let launch_pty = |input: &[u8]| -> String {
         let mut command = Command::new("script");

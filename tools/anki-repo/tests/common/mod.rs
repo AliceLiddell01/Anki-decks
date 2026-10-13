@@ -294,6 +294,10 @@ pub fn run_cli(args: &[&str]) -> (i32, String, String) {
 pub fn run_cli_in(cwd: Option<&Path>, args: &[&str]) -> (i32, String, String) {
     let mut command = std::process::Command::new(cli_binary());
     command.args(args);
+    // Потоки перенаправлены, поэтому вопрос `[y/N]` здесь не задаётся ни в CI,
+    // ни на машине разработчика; признак CI снимается, чтобы результат не
+    // зависел от окружения запуска теста.
+    command.env_remove("CI");
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -325,6 +329,7 @@ pub fn run_cli_with_stdin_in(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.env_remove("CI");
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
