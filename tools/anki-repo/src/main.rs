@@ -59,6 +59,31 @@ fn internal_failure() -> ExitCode {
     ExitCode::from(ErrorCode::Internal.exit_code())
 }
 
+/// Корень рабочей области, к которой относится экспорт выбранной команды.
+///
+/// Явное указание окружением `ANKI_REPOSITORY_ROOT` старше расположения
+/// экспорта: это осознанное решение оператора. Иначе репозиторий берётся из
+/// самого экспорта, а не из текущего каталога процесса: иначе предложение
+/// измерило бы `target` постороннего проекта, а согласие установило бы таймер,
+/// который ежедневно очищает чужой `target`.
+fn maintenance_workspace_root(command: &Command) -> Option<std::path::PathBuf> {
+    use repository_maintenance::policy::workspace_root;
+    if std::env::var_os("ANKI_REPOSITORY_ROOT").is_some() {
+        return workspace_root(None, false).ok();
+    }
+    let export_dir = match command {
+        Command::Inspect { export_dir, .. }
+        | Command::Find { export_dir, .. }
+        | Command::Stats { export_dir, .. }
+        | Command::Validate { export_dir, .. }
+        | Command::Qa { export_dir, .. }
+        | Command::Models { export_dir, .. } => export_dir,
+        _ => return None,
+    };
+    let repository = anki_repo::run::export_repository_root(export_dir)?;
+    workspace_root(Some(repository.as_path()), false).ok()
+}
+
 /// Вступительное предложение — только в обычных командах с настоящим TTY.
 /// Никакого чтения stdin у piped запросов и никаких баннеров в JSON.
 /// Признак `CI` проверяется отдельно от TTY: некоторые CI-среды выделяют
@@ -83,7 +108,7 @@ fn maybe_offer_maintenance(cli: &Cli) {
     {
         return;
     }
-    let Ok(root) = repository_maintenance::policy::workspace_root(None, false) else {
+    let Some(root) = maintenance_workspace_root(&cli.command) else {
         return;
     };
     let Ok(choice) = care::choice() else { return };
@@ -91,7 +116,11 @@ fn maybe_offer_maintenance(cli: &Cli) {
         return;
     }
     if choice == "no" {
-        if care::warning_due().unwrap_or(false) {
+        // Суточный интервал расходуется на саму проверку, а не только на
+        // показанное предупреждение: иначе у пользователя, отказавшегося от
+        // автоочистки и не превышающего пороги, полный обход повторялся бы при
+        // каждом вызове.
+        if care::claim_daily_check().unwrap_or(false) {
             let status = care::inspect(&root);
             if status
                 .diagnostics

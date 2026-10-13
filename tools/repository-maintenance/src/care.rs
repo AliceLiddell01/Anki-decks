@@ -23,6 +23,11 @@ struct PreferenceFile {
     schema_version: u32,
     choice: String,
     last_warning_at: Option<u64>,
+    /// Метка последней фоновой проверки объёма. Отдельно от метки показанного
+    /// предупреждения: интервал расходуется на саму проверку, иначе полный обход
+    /// повторялся бы при каждом вызове, пока пороги не превышены.
+    #[serde(default)]
+    last_check_at: Option<u64>,
 }
 
 /// Краткая запись о проверенном объекте; оригинальная политика GC не дублируется.
@@ -237,6 +242,7 @@ fn read_pref() -> Result<PreferenceFile, String> {
             schema_version: 1,
             choice: "unset".into(),
             last_warning_at: None,
+            last_check_at: None,
         });
     };
     let p: PreferenceFile =
@@ -266,13 +272,37 @@ pub fn set_choice(choice: &str) -> Result<(), String> {
     )
 }
 
-/// Проверяет суточный интервал без расходования его на незапущенную диагностику.
-pub fn warning_due() -> Result<bool, String> {
-    let p = read_pref()?;
-    Ok(p.choice == "no"
-        && !p
-            .last_warning_at
-            .is_some_and(|prev| now().saturating_sub(prev) < WARNING_INTERVAL))
+/// Занимает суточный интервал фоновой проверки объёма и сообщает, нужно ли её
+/// выполнять.
+///
+/// Метка проверки отделена от метки показанного предупреждения: интервал должен
+/// расходоваться на саму проверку. Иначе у пользователя, отказавшегося от
+/// автоочистки и не превышающего пороги, метка предупреждения не обновляется
+/// никогда, и полный обход `/tmp`, `cargo metadata` и `systemctl` повторяется при
+/// каждом интерактивном вызове.
+pub fn claim_daily_check() -> Result<bool, String> {
+    let _lock = MaintenanceLock::acquire().map_err(|e| e.to_string())?;
+    let mut p = read_pref()?;
+    if !claim_check_interval(&mut p, now()) {
+        return Ok(false);
+    }
+    write_private(
+        &pref_path()?,
+        &serde_json::to_vec_pretty(&p).map_err(|e| e.to_string())?,
+    )?;
+    Ok(true)
+}
+
+/// Отмечает проверку в `at`, если суточный интервал истёк.
+fn claim_check_interval(p: &mut PreferenceFile, at: u64) -> bool {
+    if p.choice != "no"
+        || p.last_check_at
+            .is_some_and(|prev| at.saturating_sub(prev) < WARNING_INTERVAL)
+    {
+        return false;
+    }
+    p.last_check_at = Some(at);
+    true
 }
 
 /// Текстовое предупреждение ограничено по частоте; машинная диагностика — нет.
@@ -996,10 +1026,48 @@ mod tests {
             schema_version: 1,
             choice: "no".into(),
             last_warning_at: None,
+            last_check_at: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let recovered: PreferenceFile = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.choice, "no");
+    }
+
+    #[test]
+    fn preference_file_without_check_marker_is_still_readable() {
+        let older = br#"{"schema_version":1,"choice":"no","last_warning_at":null}"#;
+        let p: PreferenceFile = serde_json::from_slice(older).unwrap();
+        assert_eq!(p.choice, "no");
+        assert_eq!(p.last_check_at, None);
+    }
+
+    #[test]
+    fn daily_check_interval_is_claimed_once_per_day() {
+        let mut p = PreferenceFile {
+            schema_version: 1,
+            choice: "no".into(),
+            last_warning_at: None,
+            last_check_at: None,
+        };
+        assert!(claim_check_interval(&mut p, 1_000));
+        assert!(!claim_check_interval(&mut p, 1_000 + WARNING_INTERVAL - 1));
+        assert!(claim_check_interval(&mut p, 1_000 + WARNING_INTERVAL));
+        assert_eq!(
+            p.last_warning_at, None,
+            "проверка не должна расходовать метку показанного предупреждения"
+        );
+    }
+
+    #[test]
+    fn daily_check_is_not_claimed_without_a_saved_refusal() {
+        let mut p = PreferenceFile {
+            schema_version: 1,
+            choice: "unset".into(),
+            last_warning_at: None,
+            last_check_at: None,
+        };
+        assert!(!claim_check_interval(&mut p, 1_000));
+        assert_eq!(p.last_check_at, None);
     }
 
     #[test]

@@ -706,6 +706,19 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
     }
 }
 
+/// Ближайший родительский каталог экспорта, который является репозиторием.
+///
+/// Владение экспортом определяется его расположением, а не текущим каталогом
+/// процесса: иначе команда над экспортом одного репозитория работала бы с
+/// границами другого.
+pub fn export_repository_root(export_dir: &Path) -> Option<std::path::PathBuf> {
+    let export = std::fs::canonicalize(export_dir).ok()?;
+    export
+        .ancestors()
+        .find(|directory| directory.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
