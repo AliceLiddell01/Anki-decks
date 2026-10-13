@@ -391,6 +391,7 @@ fn diag(
         severity,
         message: message.into(),
         action,
+        context: serde_json::json!({}),
     }
 }
 
@@ -700,8 +701,37 @@ pub fn render_text(status: &CareStatus) -> String {
             "Последняя попытка: {} в {} (освобождено {:?} байт; {})\n",
             last.outcome, last.timestamp, last.bytes_freed, last.message
         ));
+        for item in &last.items {
+            if item.bytes_freed > 0 || item.action == "deferred" || item.action == "error" {
+                s.push_str(&format!(
+                    "  Результат {}: {} — {} (освобождено {} байт; {})\n",
+                    item.category,
+                    crate::redact_temp_namespace_uid(&item.path).display(),
+                    item.result,
+                    item.bytes_freed,
+                    item.reason
+                ));
+            }
+        }
+        if last.omitted_items > 0 {
+            s.push_str(&format!("  Пропущено {} объектов; полный отчёт смотрите в журнале GC\n", last.omitted_items));
+        }
     } else {
         s.push_str("Последняя попытка для этого checkout: неизвестна\n");
+    }
+    for item in &status.items {
+        s.push_str(&format!(
+            "Текущее состояние {}: {} — {} / {} ({}); освобождено {} байт\n",
+            item.category,
+            crate::redact_temp_namespace_uid(&item.path).display(),
+            item.action,
+            item.result,
+            item.reason,
+            item.bytes_freed
+        ));
+    }
+    if status.omitted_items > 0 {
+        s.push_str(&format!("Ещё {} объектов не выведено; используйте scan --json для полной инвентаризации\n", status.omitted_items));
     }
     for d in &status.diagnostics {
         s.push_str(&format!("[{}] {}: {}\n", d.severity, d.code, d.message));
@@ -768,6 +798,8 @@ mod tests {
             errors: 1,
             inventory_complete: false,
             message: "неполное измерение".into(),
+            items: Vec::new(),
+            omitted_items: 0,
         };
         let rebuilt: LastAttempt =
             serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
