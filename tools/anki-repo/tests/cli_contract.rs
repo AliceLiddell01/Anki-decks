@@ -1080,3 +1080,60 @@ fn migration_cli_rejects_unproven_identity_before_reading_missing_store() {
         );
     }
 }
+
+
+#[test]
+fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
+    let fixture = TempDir::new("maintenance-contract");
+    let home = fixture.path().join("home");
+    let config = fixture.path().join("config");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let root = repository.to_str().unwrap();
+
+    let invoke = |action: &str| {
+        Command::new(cli_binary())
+            .args(["--json", "maintenance", action, "--workspace-root", root])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .expect("CLI должен запускаться с перенаправленными потоками")
+    };
+
+    let before = invoke("status");
+    assert!(before.status.success(), "{:?}", String::from_utf8_lossy(&before.stderr));
+    assert!(!String::from_utf8_lossy(&before.stderr).contains("[y/N]"));
+    let initial = parse_json(&String::from_utf8(before.stdout).unwrap());
+    assert_eq!(initial["schema_version"], json!(1));
+    assert_eq!(initial["command"], "maintenance");
+    assert_eq!(initial["result"]["schema_version"], json!(1));
+    assert_eq!(initial["result"]["preference"], "unset");
+    assert!(initial["result"]["diagnostics"].is_array());
+
+    let declined = invoke("disable");
+    assert!(
+        declined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&declined.stderr)
+    );
+    let saved = parse_json(&String::from_utf8(declined.stdout).unwrap());
+    assert_eq!(saved["command"], "maintenance");
+    assert_eq!(saved["result"]["preference"], "no");
+    assert!(!String::from_utf8_lossy(&declined.stderr).contains("[y/N]"));
+
+    let repeated = invoke("status");
+    assert!(repeated.status.success());
+    let status = parse_json(&String::from_utf8(repeated.stdout).unwrap());
+    assert_eq!(status["result"]["preference"], "no");
+    assert!(config.join("anki-decks/gc-preference.json").is_file());
+}
