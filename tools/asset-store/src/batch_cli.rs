@@ -565,6 +565,14 @@ fn progress_event_label(event: &str) -> &'static str {
         "round_finished" => "раунд завершён",
         "run_stopped" => "пакет остановлен",
         "run_finished" => "пакет завершён",
+        "worker_assigned" => "элемент назначен обработчику",
+        "browser_session_bootstrap_started" => "подготовка сессии браузера",
+        "browser_session_recovery_started" => "восстановление сессии браузера",
+        "item_deferred" => "элемент отложен",
+        "item_requeued" => "элемент возвращён в очередь",
+        "worker_retired" => "обработчик выведен из пула",
+        "worker_stopped" => "обработчик остановлен",
+        "worker_exhausted" => "пул обработчиков исчерпан",
         _ => "событие прогресса",
     }
 }

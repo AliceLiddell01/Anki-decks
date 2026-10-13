@@ -2735,3 +2735,19 @@ fn browser_item_cancelled_before_checkpoint_remains_interrupted_and_resumable() 
     assert!(fixture.load(batch_id).items[0].attempts.is_empty());
     assert_eq!(fixture.load(batch_id).next_round(), [identity('元')]);
 }
+
+#[test]
+fn parallel_progress_events_have_human_labels() {
+    for event in [
+        "worker_assigned",
+        "browser_session_bootstrap_started",
+        "browser_session_recovery_started",
+        "item_deferred",
+        "item_requeued",
+        "worker_retired",
+        "worker_stopped",
+        "worker_exhausted",
+    ] {
+        assert_ne!(progress_event_label(event), "событие прогресса", "{event}");
+    }
+}

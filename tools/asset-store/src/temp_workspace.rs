@@ -908,7 +908,14 @@ fn workspace_process_references(
             };
             let cwd = match fs::read_link(process.join("cwd")) {
                 Ok(value) => value,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if !fs::symlink_metadata(&process)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    {
+                        return Err(error);
+                    }
+                    continue;
+                }
                 Err(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -2384,7 +2391,7 @@ mod tests {
 
     #[test]
     fn missing_process_sources_do_not_prove_absence_of_references() {
-        for source in ["comm", "cmdline", "environ", "fd"] {
+        for source in ["comm", "cmdline", "environ", "fd", "cwd"] {
             let root = sandbox();
             let (proc_root, _) = proc_fixture(root.path());
             let (path, _) = exact_orphan(root.path());

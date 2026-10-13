@@ -718,7 +718,17 @@ def run_scenario(arguments, root, values, workers, baseline):
                     raise AcceptanceError(f"CLI завершился ошибкой {execution['returncode']}; см. {directory / phase}")
                 if not durable.get("available") or durable.get("pending") or len(checkpoint_keys) != len(values):
                     raise AcceptanceError(f"Прогон неполон; точное состояние сохранено в {directory}")
-    finally:
+    except BaseException:
+        try:
+            write_json(directory / "scenario-results.json", reports)
+        except Exception as save_error:
+            print(f"Дополнительно: не удалось сохранить результаты сценария: {save_error}", file=sys.stderr)
+        try:
+            verify_protection(arguments.repository_root, baseline, directory / "repository-protection.json")
+        except Exception as protection_error:
+            print(f"Дополнительно: {protection_error}", file=sys.stderr)
+        raise
+    else:
         write_json(directory / "scenario-results.json", reports)
         verify_protection(arguments.repository_root, baseline, directory / "repository-protection.json")
     cleanup_audit = post_run_cleanup_audit(directory, last_resources)
