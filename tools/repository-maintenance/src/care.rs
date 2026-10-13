@@ -878,6 +878,82 @@ mod tests {
         assert!(system_tmp_diagnostic(&health).is_none());
     }
 
+    /// Запускается как отдельный test process, чтобы не менять глобальное
+    /// окружение остальных параллельно выполняемых тестов.
+    #[test]
+    fn desktop_notification_subprocess_helper() {
+        if std::env::var_os("ANKI_GC_NOTIFICATION_SUBPROCESS").is_none() {
+            return;
+        }
+        desktop_alert("ошибка GC");
+    }
+
+    #[test]
+    fn desktop_notification_is_optional_and_delivery_failure_is_nonfatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace =
+            asset_store::temp_workspace::TempWorkspace::create("care-notification-test").unwrap();
+        let mock_bin = workspace.path().join("mock-notify-bin");
+        let empty_bin = workspace.path().join("empty-notify-bin");
+        std::fs::create_dir_all(&mock_bin).unwrap();
+        std::fs::create_dir_all(&empty_bin).unwrap();
+        let mock_notify = mock_bin.join("notify-send");
+        std::fs::write(
+            &mock_notify,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ANKI_GC_NOTIFICATION_LOG\"\nexit \"$ANKI_GC_NOTIFICATION_EXIT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mock_notify, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = workspace.path().join("notification.log");
+
+        let invoke = |dbus: bool, gui: bool, notify_path: &Path, exit: &str| {
+            let mut process = Command::new(std::env::current_exe().unwrap());
+            process
+                .args([
+                    "--exact",
+                    "care::tests::desktop_notification_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env("ANKI_GC_NOTIFICATION_SUBPROCESS", "1")
+                .env("ANKI_GC_NOTIFICATION_LOG", &log)
+                .env("ANKI_GC_NOTIFICATION_EXIT", exit)
+                .env("PATH", notify_path)
+                .env_remove("WAYLAND_DISPLAY");
+            if dbus {
+                process.env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/absent/isolated-bus");
+            } else {
+                process.env_remove("DBUS_SESSION_BUS_ADDRESS");
+            }
+            if gui {
+                process.env("DISPLAY", ":199");
+            } else {
+                process.env_remove("DISPLAY");
+            }
+            let output = process.output().unwrap();
+            assert!(
+                output.status.success(),
+                "сбой необязательного уведомления изменил результат: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        invoke(false, false, &mock_bin, "0");
+        invoke(false, true, &mock_bin, "0");
+        invoke(true, false, &mock_bin, "0");
+        invoke(true, true, &empty_bin, "0");
+        assert!(!log.exists(), "без GUI/D-Bus/notify-send нельзя посылать уведомление");
+
+        invoke(true, true, &mock_bin, "17");
+        let delivered = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            delivered.contains("--urgency=normal Anki-decks: обслуживание ошибка GC"),
+            "{delivered}"
+        );
+        std::fs::remove_file(&log).unwrap();
+        invoke(true, true, &mock_bin, "0");
+        assert!(std::fs::read_to_string(&log).unwrap().contains("ошибка GC"));
+    }
+
     #[test]
     fn snapshot_round_trip_and_no_false_success() {
         let item = LastAttempt {
