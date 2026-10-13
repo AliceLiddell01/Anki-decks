@@ -357,7 +357,9 @@ fn report_items(report: &Report) -> (Vec<GcItem>, usize) {
 
 pub fn record_report(report: &Report) -> Result<(), String> {
     let (items, omitted_items) = report_items(report);
-    let complete = report.tmp.iter().all(|t| t.complete) && report.errors == report.fatal_errors;
+    // То же условие, что и у `measurement.complete` в `inspect`: фатальная ошибка
+    // измерения `target` делает инвентаризацию неполной, а не «полной с ошибкой».
+    let complete = report.tmp.iter().all(|t| t.complete) && report.errors == 0;
     let freed = report
         .cargo_target
         .bytes_freed

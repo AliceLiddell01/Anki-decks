@@ -1280,11 +1280,13 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
 
     let fixture = TempDir::new("gc-onboarding-pty");
     fixture.write_export(&base_export());
+    let isolated_home = fixture.path().join("home");
     let isolated_config = fixture.path().join("config");
     let isolated_state = fixture.path().join("state");
     let isolated_cache = fixture.path().join("cache");
     let mock_bin = fixture.path().join("mock-bin");
     for path in [
+        &isolated_home,
         &isolated_config,
         &isolated_state,
         &isolated_cache,
@@ -1315,13 +1317,7 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
     )
     .unwrap();
 
-    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .canonicalize()
-        .unwrap();
+    let repository = isolated_maintenance_workspace(&fixture, &mock_bin);
 
     let launch = |input: &[u8]| -> String {
         // util-linux script предоставляет все три TTY самому anki-repo.
@@ -1337,6 +1333,8 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
             .env("ANKI_GC_PTY_EXPORT", fixture.path())
             .env("ANKI_GC_PTY_MOCK_LOG", &mock_log)
             .env("ANKI_REPOSITORY_ROOT", &repository)
+            .env("ANKI_MAINTENANCE_ROOT", &repository)
+            .env("HOME", &isolated_home)
             .env("XDG_CONFIG_HOME", &isolated_config)
             .env("XDG_STATE_HOME", &isolated_state)
             .env("XDG_CACHE_HOME", &isolated_cache)
@@ -1365,12 +1363,24 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
         output
     };
 
+    let preference = isolated_config.join("anki-decks/gc-preference.json");
+    // Ctrl-D в начале строки — это EOF, то есть отсутствие ответа, а не отказ:
+    // выбор сохраняться не должен, поэтому вопрос обязан появиться снова.
+    let eof = launch(b"\x04");
+    assert!(
+        eof.contains("Включить автоматическую очистку? [y/N]"),
+        "{eof}"
+    );
+    assert!(
+        !preference.exists(),
+        "пустой ввод на EOF не должен сохранять отказ: {eof}"
+    );
+
     let first = launch(b"n\n");
     assert!(
         first.contains("Включить автоматическую очистку? [y/N]"),
         "{first}"
     );
-    let preference = isolated_config.join("anki-decks/gc-preference.json");
     let saved: Value = serde_json::from_slice(&std::fs::read(&preference).unwrap()).unwrap();
     assert_eq!(saved["choice"], "no");
 

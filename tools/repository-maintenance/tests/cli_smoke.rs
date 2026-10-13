@@ -24,7 +24,11 @@ fn orphan_helper() {
 fn notify_test_uses_windows_toast_without_cleaning_or_real_windows() {
     let workspace = TempWorkspace::create("maintenance-notify-cli").unwrap();
     let bin = workspace.path().join("mock-bin");
+    let config = workspace.path().join("config");
+    let state = workspace.path().join("state");
     fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir_all(&state).unwrap();
     let log = workspace.path().join("powershell.log");
     let fake = bin.join("powershell.exe");
     fs::write(
@@ -43,6 +47,8 @@ fn notify_test_uses_windows_toast_without_cleaning_or_real_windows() {
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env("PATH", &bin)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
             .env("NOTIFY_TEST_LOG", &log)
             .env("NOTIFY_TEST_EXIT", exit_code)
             .output()
@@ -64,6 +70,17 @@ fn notify_test_uses_windows_toast_without_cleaning_or_real_windows() {
     let command = fs::read_to_string(&log).unwrap();
     assert!(command.contains("New-BurntToastNotification"), "{command}");
     assert!(command.contains("очистка не запускалась"), "{command}");
+    // Наблюдаемое следствие очистки — записанный результат последней попытки и
+    // сохранённый выбор пользователя. Их отсутствие и доказывает, что `notify-test`
+    // очистку не запускал, независимо от текста уведомления.
+    assert!(
+        !state.join("anki-decks/gc-last-attempt.json").exists(),
+        "`notify-test` не должен записывать результат очистки"
+    );
+    assert!(
+        !config.join("anki-decks/gc-preference.json").exists(),
+        "`notify-test` не должен менять сохранённый выбор пользователя"
+    );
 
     let failure = launch("23");
     assert!(!failure.status.success());

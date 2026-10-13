@@ -141,8 +141,12 @@ fn maybe_offer_maintenance(cli: &Cli) {
     eprint!("Включить автоматическую очистку? [y/N] ");
     let _ = io::stderr().flush();
     let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err() {
-        return;
+    // Пустой ввод на EOF (Ctrl-D, закрытие терминала) — это отсутствие ответа, а не
+    // отказ: сохранять `no` в этом случае нельзя, иначе вопрос исчезнет навсегда,
+    // хотя пользователь на него не отвечал.
+    match io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => return,
+        Ok(_) => {}
     }
     if answer.trim().eq_ignore_ascii_case("y") {
         match care::enable(&root) {
