@@ -434,16 +434,17 @@ pub fn try_desktop_alert(message: &str) -> Result<&'static str, String> {
     if result.success() {
         Ok("linux-notify-send")
     } else {
-        Err(format!("notify-send завершился с кодом {:?}", result.code()))
+        Err(format!(
+            "notify-send завершился с кодом {:?}",
+            result.code()
+        ))
     }
 }
 
 /// Обнаружение WSL не опирается исключительно на WSL_INTEROP: у user systemd
 /// переменной может не быть, хотя binfmt WSLInterop зарегистрирован в /proc.
 fn is_wsl() -> bool {
-    if std::env::var_os("WSL_DISTRO_NAME").is_some()
-        || std::env::var_os("WSL_INTEROP").is_some()
-    {
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some() {
         return true;
     }
     if std::fs::read_to_string("/proc/sys/fs/binfmt_misc/WSLInterop")
@@ -473,8 +474,11 @@ fn windows_toast(message: &str) -> Result<(), String> {
             .find(|candidate| candidate.is_file())
     });
     let fallback = Path::new("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
-    let executable = from_path.or_else(|| fallback.is_file().then(|| fallback.to_path_buf()))
-        .ok_or("powershell.exe не найден в PATH или стандартном /mnt/c/Windows; проверьте WSL interop")?;
+    let executable = from_path
+        .or_else(|| fallback.is_file().then(|| fallback.to_path_buf()))
+        .ok_or(
+            "powershell.exe не найден в PATH или стандартном /mnt/c/Windows; проверьте WSL interop",
+        )?;
     let result = Command::new(executable)
         .args([
             "-NoLogo",
@@ -490,7 +494,10 @@ fn windows_toast(message: &str) -> Result<(), String> {
     if result.success() {
         Ok(())
     } else {
-        Err(format!("Windows PowerShell/BurntToast завершился с кодом {:?}", result.code()))
+        Err(format!(
+            "Windows PowerShell/BurntToast завершился с кодом {:?}",
+            result.code()
+        ))
     }
 }
 
@@ -1082,7 +1089,10 @@ mod tests {
             String::from_utf8_lossy(&success.stderr)
         );
         let args = std::fs::read_to_string(&log).unwrap();
-        assert!(args.contains("-NoProfile -NonInteractive -Command"), "{args}");
+        assert!(
+            args.contains("-NoProfile -NonInteractive -Command"),
+            "{args}"
+        );
         assert!(args.contains("O''Brien; $(rm -rf /)"), "{args}");
         assert!(args.contains("New-BurntToastNotification"), "{args}");
         assert!(!args.contains("O'Brien;"), "{args}");
