@@ -10,9 +10,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::cli::{Cli, Command, MatchArg, MaintenanceAction};
+use crate::cli::{Cli, Command, MaintenanceAction, MatchArg};
 use crate::error::{DomainError, ErrorCode};
-use repository_maintenance::care;
 use crate::index::ExportIndex;
 use crate::loader::load_export;
 use crate::ops::create as create_op;
@@ -39,6 +38,7 @@ use crate::ops::visual_report as visual_report_op;
 use crate::ops::visual_report::ReportRequest;
 use crate::proposal;
 use crate::render::{human, json};
+use repository_maintenance::care;
 
 /// Полностью подготовленный к печати результат команды.
 #[derive(Debug)]
@@ -63,15 +63,21 @@ pub fn execute_cli(cli: &Cli) -> Result<Rendered, DomainError> {
 /// Выполняет команду и готовит результат без обращения к стандартным потокам.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
     match &cli.command {
-        Command::Maintenance { action, workspace_root } => {
-            let root = repository_maintenance::policy::workspace_root(workspace_root.as_deref(), false)
-                .map_err(|e| DomainError::new(ErrorCode::InputUnreadable, e))?;
+        Command::Maintenance {
+            action,
+            workspace_root,
+        } => {
+            let root =
+                repository_maintenance::policy::workspace_root(workspace_root.as_deref(), false)
+                    .map_err(|e| DomainError::new(ErrorCode::InputUnreadable, e))?;
             match action {
                 MaintenanceAction::Status => (),
-                MaintenanceAction::Enable => care::enable(&root)
-                    .map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?,
-                MaintenanceAction::Disable => care::disable(&root)
-                    .map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?,
+                MaintenanceAction::Enable => {
+                    care::enable(&root).map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?
+                }
+                MaintenanceAction::Disable => {
+                    care::disable(&root).map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?
+                }
             }
             let status = care::inspect(&root);
             Ok(Rendered {
