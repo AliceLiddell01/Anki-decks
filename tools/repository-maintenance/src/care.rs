@@ -345,6 +345,52 @@ pub fn inspect(root: &Path) -> CareStatus {
         last_attempt, diagnostics }
 }
 
+
+/// Поиск именно бинарника GC: передавать исполняемый anki-repo в установщик нельзя.
+fn maintenance_binary() -> Result<PathBuf, String> {
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    if current.file_name().is_some_and(|name| name == "anki-repository-maintenance") {
+        return Ok(current);
+    }
+    let sibling = current.with_file_name("anki-repository-maintenance");
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join("anki-repository-maintenance");
+            if candidate.is_file() {
+                return candidate.canonicalize().map_err(|e| e.to_string());
+            }
+        }
+    }
+    Err("не найден бинарник anki-repository-maintenance; соберите оба инструмента командой cargo build --release --workspace".into())
+}
+
+/// Согласие само по себе не означает успешную установку.
+pub fn enable(root: &Path) -> Result<(), String> {
+    set_choice("yes")?;
+    let binary = maintenance_binary()?;
+    timer::install(root, &binary)?;
+    let health = timer::inspect();
+    if health.state != "enabled" || health.installed_root.as_deref() != Some(root) {
+        return Err(format!("после установки таймер не подтверждён: {}", health.state));
+    }
+    Ok(())
+}
+
+/// Не отключает unit, принадлежащий другому checkout.
+pub fn disable(root: &Path) -> Result<(), String> {
+    let health = timer::inspect();
+    if health.installed_root.as_deref().is_some_and(|installed| installed != root) {
+        return Err("таймер связан с другим checkout; отказ здесь не должен отключить чужой таймер".into());
+    }
+    if health.installed_root.is_some() {
+        timer::uninstall()?;
+    }
+    set_choice("no")
+}
+
 pub fn render_text(status: &CareStatus) -> String {
     let mut s = format!("Рабочая область: {}\nВыбор пользователя: {}\nАвтоочистка: {} (таймер активен: {:?})\n",
         status.workspace_root.display(), status.preference, status.automatic, status.timer_active);
