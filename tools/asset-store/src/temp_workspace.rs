@@ -3,6 +3,7 @@
 //! Все операции обхода и удаления привязаны к дескрипторам каталогов. Маркер
 //! подтверждает назначение, а UID, пространство имён, NOFOLLOW и идентичность процесса ограничивают очистку.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -11,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
@@ -29,7 +30,9 @@ const TOOL: &str = "asset-store";
 const SCHEMA: u32 = 2;
 const LEGACY_SCHEMA: u32 = 1;
 const MARKER_LIMIT: u64 = 16 * 1024;
+type CachedGcResult = Result<(), (io::ErrorKind, String)>;
 static STARTUP_GC: OnceLock<Result<(), (io::ErrorKind, String)>> = OnceLock::new();
+static CONFIGURED_ROOT_GC: OnceLock<Mutex<HashMap<PathBuf, CachedGcResult>>> = OnceLock::new();
 pub const DEFAULT_ORPHAN_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,7 +108,7 @@ impl TempWorkspace {
                     format!("{CONFIGURED_TEMP_ROOT_ENV} должен быть абсолютным путём"),
                 ));
             }
-            cleanup_orphans_under(&root, DEFAULT_ORPHAN_MIN_AGE)?;
+            cleanup_configured_root_once(&root)?;
             return Self::create_under(&root, purpose);
         }
         cleanup_orphans_on_startup()?;
@@ -240,6 +243,43 @@ impl TempWorkspace {
         verify_identity(&self.parent, OsStr::new(&self.run_id), &self.directory)?;
         unlinkat(&self.parent, self.run_id.as_str(), AtFlags::REMOVEDIR).map_err(Into::into)
     }
+}
+
+fn cleanup_configured_root_once(root: &Path) -> io::Result<()> {
+    cleanup_configured_root_once_with(root, || {
+        let report = cleanup_orphans_under(root, DEFAULT_ORPHAN_MIN_AGE)?;
+        tracing::debug!(
+            removed = report.removed,
+            skipped = report.skipped,
+            errors = report.errors,
+            "начальная очистка временных деревьев"
+        );
+        Ok(())
+    })
+}
+
+fn cleanup_configured_root_once_with(
+    root: &Path,
+    cleanup: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut results = CONFIGURED_ROOT_GC
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| io::Error::other("кэш начальной очистки временных корней повреждён"))?;
+    if let Some(result) = results.get(root) {
+        return result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|(kind, message)| io::Error::new(*kind, message.clone()));
+    }
+
+    let result = cleanup();
+    let cached = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| (error.kind(), error.to_string()));
+    results.insert(root.to_path_buf(), cached);
+    result
 }
 
 impl Drop for TempWorkspace {
@@ -1843,9 +1883,61 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sandbox() -> TempWorkspace {
         TempWorkspace::create_under(Path::new(TEMP_ROOT), "temp-workspace-unit").unwrap()
+    }
+
+    #[test]
+    fn configured_root_initial_gc_runs_once_under_concurrent_creation() {
+        let root = std::env::temp_dir().join(format!("configured-root-gc-{}", random_hex()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let workers = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let calls = Arc::clone(&calls);
+                std::thread::spawn(move || {
+                    cleanup_configured_root_once_with(&root, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let other_root = std::env::temp_dir().join(format!("configured-root-gc-{}", random_hex()));
+        cleanup_configured_root_once_with(&other_root, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn configured_root_initial_gc_caches_and_propagates_first_error() {
+        let root = std::env::temp_dir().join(format!("configured-root-gc-error-{}", random_hex()));
+        let calls = AtomicUsize::new(0);
+        for _ in 0..2 {
+            let error = cleanup_configured_root_once_with(&root, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected configured-root GC failure",
+                ))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "injected configured-root GC failure");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     fn make_orphan(root: &Path, age: Duration) -> PathBuf {

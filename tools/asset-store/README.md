@@ -764,7 +764,9 @@ cargo run --locked --features session-rotation-acceptance -p asset-store --bin k
 `/tmp/anki-decks-<uid>/run-<32 lowercase hex>` с правами `0700`. Переменная
 `ASSET_STORE_TEMP_ROOT` задаёт альтернативный абсолютный существующий корень без
 symlink; тогда каталоги создаются под `<ASSET_STORE_TEMP_ROOT>/anki-decks-<uid>` и
-начальная GC проверяет только этот корень, а не `/tmp`. Относительное значение
+начальная GC проверяет только этот корень, а не `/tmp`. Результат GC (включая
+ошибку) кэшируется по значению абсолютного пути на время процесса, чтобы пул
+workers не повторял обход при каждом создании workspace. Относительное значение
 `ASSET_STORE_TEMP_ROOT` приводит к `InvalidInput`. Пространство имён разделено по
 текущему UID. Каталог содержит маркер
 `.anki-decks-owner.json` (поля `schema`, `repository`, `tool`, PID, время создания, `run_id`
