@@ -1437,11 +1437,9 @@ esac
         assert!(file.is_file(), "не установлен файл {}", file.display());
     }
     assert!(active_marker.is_file());
-    assert!(
-        std::fs::read_to_string(&service)
-            .unwrap()
-            .contains("ExecStart=%h/.local/bin/anki-repository-maintenance clean --apply --installed-root")
-    );
+    assert!(std::fs::read_to_string(&service).unwrap().contains(
+        "ExecStart=%h/.local/bin/anki-repository-maintenance clean --apply --installed-root"
+    ));
     assert!(
         std::fs::read_to_string(&install_config)
             .unwrap()
@@ -1450,7 +1448,10 @@ esac
     let enabled = invoke("status");
     assert_eq!(enabled["result"]["preference"], "yes");
     assert_eq!(enabled["result"]["automatic"], "enabled");
-    assert_eq!(enabled["result"]["installed_workspace"], root.to_str().unwrap());
+    assert_eq!(
+        enabled["result"]["installed_workspace"],
+        root.to_str().unwrap()
+    );
     assert_eq!(enabled["result"]["timer_active"], true);
 
     let second = launch_pty(b"\n");
@@ -1464,7 +1465,11 @@ esac
     assert_eq!(disabled["result"]["automatic"], "disabled");
     assert!(!active_marker.exists());
     for file in [&service, &timer, &install_config, &installed_binary] {
-        assert!(!file.exists(), "после отключения остался {}", file.display());
+        assert!(
+            !file.exists(),
+            "после отключения остался {}",
+            file.display()
+        );
     }
     let declined = launch_pty(b"\n");
     assert!(
