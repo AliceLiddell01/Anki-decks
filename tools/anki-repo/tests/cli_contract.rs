@@ -1081,6 +1081,31 @@ fn migration_cli_rejects_unproven_identity_before_reading_missing_store() {
     }
 }
 
+/// Изолированный Cargo workspace с подменённым `cargo` для проверок `maintenance`:
+/// они не должны обходить реальный `target` рабочей копии, запускать настоящий
+/// Cargo или зависеть от каталогов конкретной машины.
+#[cfg(target_os = "linux")]
+fn isolated_maintenance_workspace(fixture: &TempDir, bin: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = fixture.path().join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         --version) printf 'cargo 1.99.0\\n' ;;\n\
+         metadata) printf '{\"workspace_root\":\"%s\",\"target_directory\":\"%s/target\"}\\n' \"$ANKI_MAINTENANCE_ROOT\" \"$ANKI_MAINTENANCE_ROOT\" ;;\n\
+         *) printf 'Unexpected cargo call: %s\\n' \"$*\" >&2; exit 98 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    root.canonicalize().unwrap()
+}
+
 /// Отказ не должен выглядеть выполненным, если установленный таймер невозможно
 /// снять: без подтверждённой привязки `disable` обязан сообщить ошибку, а не
 /// сохранить `no` при работающей автоочистке.
@@ -1120,13 +1145,9 @@ fn maintenance_disable_reports_failure_when_binding_cannot_be_proven() {
     ))
     .unwrap();
 
-    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .canonicalize()
-        .unwrap();
+    let repository = isolated_maintenance_workspace(&fixture, &bin);
+    let cache = fixture.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
 
     let output = Command::new(cli_binary())
         .args([
@@ -1139,6 +1160,8 @@ fn maintenance_disable_reports_failure_when_binding_cannot_be_proven() {
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config)
         .env("XDG_STATE_HOME", &state)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("ANKI_MAINTENANCE_ROOT", &repository)
         .env("PATH", &sandbox_path)
         .output()
         .unwrap();
@@ -1158,6 +1181,7 @@ fn maintenance_disable_reports_failure_when_binding_cannot_be_proven() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
     use std::os::unix::fs::PermissionsExt;
@@ -1191,13 +1215,9 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))
     .unwrap();
-    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .canonicalize()
-        .unwrap();
+    let repository = isolated_maintenance_workspace(&fixture, &bin);
+    let cache = fixture.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
     let root = repository.to_str().unwrap();
 
     let invoke = |action: &str| {
@@ -1206,6 +1226,8 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_STATE_HOME", &state)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("ANKI_MAINTENANCE_ROOT", &repository)
             .env("PATH", &sandbox_path)
             .output()
             .expect("CLI должен запускаться с перенаправленными потоками")
@@ -1224,6 +1246,10 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
     assert_eq!(initial["result"]["schema_version"], json!(1));
     assert_eq!(initial["result"]["preference"], "unset");
     assert!(initial["result"]["diagnostics"].is_array());
+    assert_eq!(
+        initial["result"]["workspace_root"], root,
+        "измеряться обязана изолированная рабочая область, а не рабочая копия репозитория"
+    );
 
     let declined = invoke("disable");
     assert!(
