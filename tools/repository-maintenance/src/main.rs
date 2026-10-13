@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 
 use clap::{Args, Parser, Subcommand};
-use repository_maintenance::policy::{Policy, workspace_root};
 use repository_maintenance::care;
+use repository_maintenance::policy::{Policy, workspace_root};
 use repository_maintenance::{RunOptions, render_json, render_text, run};
 use serde::Serialize;
 
@@ -197,7 +197,9 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
                 if let Err(snapshot_error) = care::record_failure(&root, &error) {
                     eprintln!("Не удалось сохранить сбой GC: {snapshot_error}");
                 }
-                care::desktop_alert("Не удалось выполнить GC; проверьте anki-repo maintenance status");
+                care::desktop_alert(
+                    "Не удалось выполнить GC; проверьте anki-repo maintenance status",
+                );
             }
             fail(&error, args.json)
         }
