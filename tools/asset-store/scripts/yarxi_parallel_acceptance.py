@@ -798,11 +798,13 @@ def main():
     except FileExistsError as error:
         raise AcceptanceError(f"Приёмка уже заблокирована файлом {lock}; проверьте его владельца перед новым запуском") from error
     with lock_file:
-        lock_file.write(json.dumps({"pid": os.getpid(), "created_utc": datetime.now(timezone.utc).isoformat()}) + "\n")
-        lock_file.flush()
         session = root / ("session-" + uuid.uuid4().hex)
-        session.mkdir()
+        session_created = False
         try:
+            lock_file.write(json.dumps({"pid": os.getpid(), "created_utc": datetime.now(timezone.utc).isoformat()}) + "\n")
+            lock_file.flush()
+            session.mkdir()
+            session_created = True
             (session / "corpus.txt").write_bytes(raw)
             write_json(session / "inputs.json", {
                 "mode": arguments.mode, "corpus_sha256": sha, "corpus_count": len(corpus),
@@ -821,7 +823,11 @@ def main():
             write_json(session / "results.json", results)
             print(f"Приёмка завершена; сводный индекс: {session / 'results.json'}")
         except Exception as error:
-            write_json(session / "failure.json", {"error": str(error), "type": type(error).__name__, "artifacts_retained": True})
+            if session_created:
+                try:
+                    write_json(session / "failure.json", {"error": str(error), "type": type(error).__name__, "artifacts_retained": True})
+                except Exception as report_error:
+                    print(f"Не удалось сохранить failure.json: {report_error}", file=sys.stderr)
             raise
         finally:
             # Удаляется только блокировка этого runner, свидетельства сохраняются.
