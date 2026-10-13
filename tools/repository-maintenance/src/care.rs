@@ -156,6 +156,11 @@ fn read_pref() -> Result<PreferenceFile, String> {
     Ok(p)
 }
 
+/// Быстрая проверка решения без полной инвентаризации файловой системы.
+pub fn choice() -> Result<String, String> {
+    Ok(read_pref()?.choice)
+}
+
 /// Сохраняет явное решение пользователя под общей межпроцессной блокировкой.
 pub fn set_choice(choice: &str) -> Result<(), String> {
     if !matches!(choice, "yes" | "no") {
@@ -171,7 +176,7 @@ pub fn set_choice(choice: &str) -> Result<(), String> {
 pub fn should_warn() -> Result<bool, String> {
     let _lock = MaintenanceLock::acquire().map_err(|e| e.to_string())?;
     let mut p = read_pref()?;
-    if p.last_warning_at.is_some_and(|prev| now().saturating_sub(prev) < WARNING_INTERVAL) {
+    if p.choice != "no" || p.last_warning_at.is_some_and(|prev| now().saturating_sub(prev) < WARNING_INTERVAL) {
         return Ok(false);
     }
     p.last_warning_at = Some(now());
