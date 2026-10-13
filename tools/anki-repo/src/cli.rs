@@ -87,6 +87,7 @@ impl Cli {
     pub const fn command_name(&self) -> &'static str {
         match &self.command {
             Command::Inspect { .. } => "inspect",
+            Command::Maintenance { .. } => "maintenance",
             Command::Find { .. } => "find",
             Command::Stats { .. } => "stats",
             Command::Validate { .. } => "validate",
@@ -106,6 +107,14 @@ impl Cli {
 /// Поддерживаемые команды.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Настройка и диагностика автоматической очистки (не меняет карточки).
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceAction,
+        /// Корень Cargo workspace; по умолчанию определяется автоматически.
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+    },
     /// Компактное описание структуры экспорта.
     #[command(visible_alias = "describe")]
     Inspect {
@@ -466,6 +475,16 @@ pub enum Command {
         #[arg(long)]
         pitch_asset_store: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MaintenanceAction {
+    /// Текущий факт работы, объёмы, последняя попытка и диагностика.
+    Status,
+    /// Явное согласие и попытка установки таймера.
+    Enable,
+    /// Явный отказ и удаление только принадлежащего этому checkout таймера.
+    Disable,
 }
 
 #[cfg(test)]
