@@ -21,6 +21,58 @@ fn orphan_helper() {
 }
 
 #[test]
+fn notify_test_uses_windows_toast_without_cleaning_or_real_windows() {
+    let workspace = TempWorkspace::create("maintenance-notify-cli").unwrap();
+    let bin = workspace.path().join("mock-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = workspace.path().join("powershell.log");
+    let fake = bin.join("powershell.exe");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NOTIFY_TEST_LOG\"\nexit \"$NOTIFY_TEST_EXIT\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let launch = |exit_code: &str| {
+        Command::new(BINARY)
+            .arg("notify-test")
+            .env("WSL_DISTRO_NAME", "test-wsl")
+            .env_remove("WSL_INTEROP")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("PATH", &bin)
+            .env("NOTIFY_TEST_LOG", &log)
+            .env("NOTIFY_TEST_EXIT", exit_code)
+            .output()
+            .unwrap()
+    };
+
+    let success = launch("0");
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let stdout = String::from_utf8(success.stdout).unwrap();
+    assert!(stdout.contains("windows-toast"), "{stdout}");
+    assert!(stdout.contains("Видимость окна проверяется отдельно"), "{stdout}");
+    let command = fs::read_to_string(&log).unwrap();
+    assert!(command.contains("New-BurntToastNotification"), "{command}");
+    assert!(command.contains("очистка не запускалась"), "{command}");
+
+    let failure = launch("23");
+    assert!(!failure.status.success());
+    assert!(
+        String::from_utf8_lossy(&failure.stderr)
+            .contains("Windows PowerShell/BurntToast завершился с кодом"),
+        "{}",
+        String::from_utf8_lossy(&failure.stderr)
+    );
+}
+
+#[test]
 fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
     let owner = TempWorkspace::create("repository-maintenance-cli-target-smoke").unwrap();
     let root = owner.path().join("checkout");
