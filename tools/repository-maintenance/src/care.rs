@@ -536,8 +536,7 @@ pub fn inspect(root: &Path) -> CareStatus {
                     measurement.complete =
                         report.tmp.iter().all(|t| t.complete) && report.errors == 0;
                     measurement.errors = report.errors;
-                    measurement.system_tmp =
-                        Some(SystemTmpHealth::from_inventories(&report.tmp));
+                    measurement.system_tmp = Some(SystemTmpHealth::from_inventories(&report.tmp));
                     if report.cargo_target.ownership == "project-owned" {
                         measurement.cargo_target_bytes = Some(report.cargo_target.bytes_before);
                     }
@@ -629,7 +628,11 @@ pub fn inspect(root: &Path) -> CareStatus {
     {
         diagnostics.push(diag(
             "last_gc_problem",
-            if last.outcome == "partial" { "info" } else { "warning" },
+            if last.outcome == "partial" {
+                "info"
+            } else {
+                "warning"
+            },
             format!(
                 "Последнее обслуживание: {} ({})",
                 last.outcome, last.message
