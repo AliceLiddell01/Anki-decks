@@ -1175,6 +1175,7 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
          '--user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
          '--user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
          '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
          *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
          esac\n",
     ).unwrap();
@@ -1267,6 +1268,7 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
                 | "--user is-enabled anki-repository-maintenance.timer"
                 | "--user is-active anki-repository-maintenance.timer"
                 | "--user show anki-repository-maintenance.service --property=Result --value"
+                | "is-active systemd-tmpfiles-clean.timer"
         )),
         "неожиданный systemctl-вызов: {calls}"
     );
