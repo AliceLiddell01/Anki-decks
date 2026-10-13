@@ -4,18 +4,20 @@
 //! аргументов, печать подготовленного вывода и отображение результата на
 //! process exit code.
 
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use anki_repo::cli::Cli;
+use anki_repo::cli::{Cli, Command};
+use repository_maintenance::care;
 use anki_repo::error::ErrorCode;
 use anki_repo::output::write_text;
 use anki_repo::run::{execute_cli, render_error};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    maybe_offer_maintenance(&cli);
 
     match execute_cli(&cli) {
         Ok(rendered) => {
@@ -55,4 +57,43 @@ fn stdout_write_failed(text: &str) -> bool {
 /// Exit code внутренней ошибки: вывод не удалось записать.
 fn internal_failure() -> ExitCode {
     ExitCode::from(ErrorCode::Internal.exit_code())
+}
+
+/// Вступительное предложение — только в обычных командах с настоящим TTY.
+/// Никакого чтения stdin у piped запросов и никаких баннеров в JSON.
+fn maybe_offer_maintenance(cli: &Cli) {
+    if cli.json || !io::stdin().is_terminal() || !io::stdout().is_terminal()
+        || !io::stderr().is_terminal()
+        || !matches!(&cli.command,
+            Command::Inspect { .. } | Command::Find { .. } | Command::Stats { .. }
+            | Command::Validate { .. } | Command::Qa { .. } | Command::Models { .. })
+    {
+        return;
+    }
+    let Ok(root) = repository_maintenance::policy::workspace_root(None, false) else { return };
+    let status = care::inspect(&root);
+    if status.preference == "unset" && status.installed_workspace.is_none() {
+        eprintln!("Рекомендуем включить автоматическую очистку временных файлов и артефактов сборки Anki-decks.");
+        if let Some(bytes) = status.measurement.project_bytes {
+            eprintln!("Измерено управляемых данных: {bytes} байт{}.", if status.measurement.complete { "" } else { " (измерение неполное)" });
+        }
+        eprintln!("Очистка ограничена проверками владения и безопасности действующего GC.");
+        eprint!("Включить автоматическую очистку? [y/N] ");
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer).is_err() { return; }
+        if answer.trim().eq_ignore_ascii_case("y") {
+            match care::enable(&root) {
+                Ok(()) => eprintln!("Автоочистка подтверждена: таймер установлен и активен."),
+                Err(e) => eprintln!("Не удалось включить GC: {e}. Согласие сохранено; проверьте anki-repo maintenance status."),
+            }
+        } else if let Err(e) = care::set_choice("no") {
+            eprintln!("Не удалось сохранить отказ: {e}");
+        }
+    } else if status.preference == "no"
+        && status.diagnostics.iter().any(|d| d.code == "target_warning" || d.code == "external_cache_limit")
+        && care::should_warn().unwrap_or(false)
+    {
+        eprintln!("Предупреждение GC: объём управляемых артефактов превысил порог; подробности: anki-repo maintenance status.");
+    }
 }
