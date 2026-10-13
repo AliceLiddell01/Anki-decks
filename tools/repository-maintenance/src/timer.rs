@@ -681,6 +681,19 @@ mod tests {
             "status" => {
                 status().unwrap();
             }
+            "inspect" => {
+                let observed = inspect();
+                assert_eq!(observed.state, "enabled");
+                assert_eq!(observed.installed_root.as_deref(), Some(root.as_path()));
+                assert_eq!(observed.active, Some(true));
+            }
+            "other-checkout" => {
+                let another = root.with_file_name("another-checkout");
+                fs::create_dir_all(&another).unwrap();
+                let err = install(&another, &executable).unwrap_err();
+                assert!(err.contains("таймер уже принадлежит"), "{err}");
+                assert_eq!(installed_root().unwrap(), Some(root));
+            }
             "uninstall" => {
                 uninstall().unwrap();
             }
@@ -808,7 +821,7 @@ mod tests {
             cargo_log: &cargo_log,
         };
 
-        for action in ["install", "install", "service", "status"] {
+        for action in ["install", "install", "service", "status", "inspect", "other-checkout"] {
             let output = helper.invoke(action);
             assert!(
                 output.status.success(),
