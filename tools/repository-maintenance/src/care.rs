@@ -841,7 +841,6 @@ mod tests {
         assert_eq!(recovered.choice, "no");
     }
 
-
     #[test]
     fn foreign_tmp_inaccessibility_is_informational_not_gc_failure() {
         let tmp = crate::inventory::TmpInventory {
@@ -875,6 +874,7 @@ mod tests {
         let health = SystemTmpHealth::from_inventories(&[complete]);
         assert!(system_tmp_diagnostic(&health).is_none());
     }
+
     #[test]
     fn snapshot_round_trip_and_no_false_success() {
         let item = LastAttempt {
