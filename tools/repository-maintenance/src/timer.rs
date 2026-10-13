@@ -141,6 +141,8 @@ pub fn inspect() -> TimerInspection {
 }
 
 pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
+    let _lock = crate::guard::MaintenanceLock::acquire()
+        .map_err(|e| format!("параллельная операция установки или GC: {e}"))?;
     require_user_systemd()?;
     // Один пользовательский таймер не должен незаметно переключаться между клонами.
     if let Some(existing) = installed_root()? {
@@ -207,7 +209,23 @@ pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
 }
 
 pub fn uninstall() -> Result<TimerResult, String> {
+    uninstall_inner(None)
+}
+
+/// Удаление с повторной проверкой checkout под той же блокировкой, что и установка.
+pub fn uninstall_for(root: &Path) -> Result<TimerResult, String> {
+    uninstall_inner(Some(root))
+}
+
+fn uninstall_inner(expected_root: Option<&Path>) -> Result<TimerResult, String> {
+    let _lock = crate::guard::MaintenanceLock::acquire()
+        .map_err(|e| format!("параллельная операция удаления или GC: {e}"))?;
     require_user_systemd()?;
+    if let Some(expected) = expected_root
+        && installed_root()?.as_deref() != Some(expected)
+    {
+        return Err("таймер больше не принадлежит выбранному checkout; удаление запрещено".into());
+    }
     let config_home = config_home().ok_or("не задан HOME или XDG_CONFIG_HOME")?;
     let unit_dir = config_home.join("systemd/user");
     let service_path = unit_dir.join(SERVICE_NAME);
