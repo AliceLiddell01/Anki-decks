@@ -63,6 +63,14 @@ pub struct Diagnostic {
     pub context: serde_json::Value,
 }
 
+/// Состояние полного обзора системных временных каталогов (включая чужие).
+#[derive(Clone, Debug, Serialize)]
+pub struct SystemTmpHealth {
+    pub complete: bool,
+    pub errors: usize,
+    pub mount_boundaries: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Measurement {
     pub project_bytes: Option<u64>,
@@ -73,7 +81,10 @@ pub struct Measurement {
     pub external_cache_bytes: Option<u64>,
     pub external_cache_hard_limit_bytes: u64,
     pub deferred: usize,
+    /// Всего ошибок в полном отчёте, включая чужой /tmp.
     pub errors: usize,
+    /// Статус общесистемного /tmp, который не равен полноте проекта.
+    pub system_tmp: Option<SystemTmpHealth>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -485,6 +496,7 @@ pub fn inspect(root: &Path) -> CareStatus {
         external_cache_hard_limit_bytes: 0,
         deferred: 0,
         errors: 0,
+        system_tmp: None,
     };
     match Policy::defaults() {
         Ok(policy) => {
@@ -497,6 +509,11 @@ pub fn inspect(root: &Path) -> CareStatus {
                     measurement.complete =
                         report.tmp.iter().all(|t| t.complete) && report.errors == 0;
                     measurement.errors = report.errors;
+                    measurement.system_tmp = Some(SystemTmpHealth {
+                        complete: report.tmp.iter().all(|t| t.complete),
+                        errors: report.tmp.iter().map(|t| t.errors).sum(),
+                        mount_boundaries: report.tmp.iter().map(|t| t.mount_boundaries).sum(),
+                    });
                     if report.cargo_target.ownership == "project-owned" {
                         measurement.cargo_target_bytes = Some(report.cargo_target.bytes_before);
                     }
@@ -543,13 +560,20 @@ pub fn inspect(root: &Path) -> CareStatus {
                             Some("anki-repository-maintenance clean (сначала dry-run)"),
                         ));
                     }
-                    if !measurement.complete {
-                        diagnostics.push(diag(
-                            "inventory_incomplete",
-                            "warning",
-                            "Измерение частично; указанные объёмы не являются полным итогом",
-                            Some("anki-repository-maintenance scan --json"),
-                        ));
+                    if let Some(tmp) = &measurement.system_tmp
+                        && !tmp.complete
+                    {
+                        let mut entry = diag(
+                            "system_tmp_inventory_incomplete",
+                            "info",
+                            "Общий обзор /tmp неполон; показатели подтверждённых артефактов Anki-decks учитываются отдельно. Чужие каталоги и mount не обходятся.",
+                            Some("anki-repository-maintenance scan --detail --json"),
+                        );
+                        entry.context = serde_json::json!({
+                            "errors": tmp.errors,
+                            "mount_boundaries": tmp.mount_boundaries,
+                        });
+                        diagnostics.push(entry);
                     }
                     if report.fatal_errors > 0 {
                         diagnostics.push(diag(
@@ -591,7 +615,7 @@ pub fn inspect(root: &Path) -> CareStatus {
     {
         diagnostics.push(diag(
             "last_gc_problem",
-            "warning",
+            if last.outcome == "partial" { "info" } else { "warning" },
             format!(
                 "Последнее обслуживание: {} ({})",
                 last.outcome, last.message
@@ -692,6 +716,12 @@ pub fn render_text(status: &CareStatus) -> String {
             .map_or_else(|| "неизвестно".into(), |v| v.to_string()),
         m.complete
     ));
+    if let Some(tmp) = &m.system_tmp {
+        s.push_str(&format!(
+            "Общий обзор системного /tmp: полный {}, ошибок {}, границ mount {} (чужие объекты не удаляются)\n",
+            tmp.complete, tmp.errors, tmp.mount_boundaries
+        ));
+    }
     s.push_str(&format!(
         "Cargo target: {:?} байт (предупреждение {}, предел {})\n",
         m.cargo_target_bytes, m.target_warning_bytes, m.target_hard_limit_bytes
