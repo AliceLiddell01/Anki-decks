@@ -500,9 +500,15 @@ mod cli_tests {
             .map(|sub| sub.get_name())
             .collect();
         assert!(names.contains(&"review"));
+        assert!(names.contains(&"maintenance"));
         assert!(names.contains(&"review-check"));
         assert!(!names.contains(&"code-review"));
         assert!(!names.contains(&"language"));
+        let status = Cli::try_parse_from(["anki-repo", "--json", "maintenance", "status"]).unwrap();
+        assert!(status.json);
+        assert_eq!(status.command_name(), "maintenance");
+        assert!(Cli::try_parse_from(["anki-repo", "maintenance", "enable"]).is_ok());
+        assert!(Cli::try_parse_from(["anki-repo", "maintenance", "disable"]).is_ok());
         assert!(Cli::try_parse_from(["anki-repo", "code-review"]).is_err());
         assert!(Cli::try_parse_from(["anki-repo", "language"]).is_err());
     }
