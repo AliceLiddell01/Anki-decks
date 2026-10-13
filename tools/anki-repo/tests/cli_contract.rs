@@ -1081,7 +1081,6 @@ fn migration_cli_rejects_unproven_identity_before_reading_missing_store() {
     }
 }
 
-
 #[test]
 fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
     let fixture = TempDir::new("maintenance-contract");
@@ -1111,7 +1110,11 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
     };
 
     let before = invoke("status");
-    assert!(before.status.success(), "{:?}", String::from_utf8_lossy(&before.stderr));
+    assert!(
+        before.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&before.stderr)
+    );
     assert!(!String::from_utf8_lossy(&before.stderr).contains("[y/N]"));
     let initial = parse_json(&String::from_utf8(before.stdout).unwrap());
     assert_eq!(initial["schema_version"], json!(1));
