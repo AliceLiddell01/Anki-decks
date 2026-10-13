@@ -6,6 +6,7 @@ use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 
 use clap::{Args, Parser, Subcommand};
 use repository_maintenance::policy::{Policy, workspace_root};
+use repository_maintenance::care;
 use repository_maintenance::{RunOptions, render_json, render_text, run};
 use serde::Serialize;
 
@@ -169,6 +170,18 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
     };
     match run(&root, &policy, &options) {
         Ok(report) => {
+            if apply {
+                if let Err(error) = care::record_report(&report) {
+                    eprintln!("Не удалось сохранить последний результат GC: {error}");
+                }
+                if report.fatal_errors > 0 || report.errors > report.fatal_errors {
+                    care::desktop_alert(if report.fatal_errors > 0 {
+                        "Ошибка автоматической очистки; проверьте anki-repo maintenance status"
+                    } else {
+                        "Измерение GC неполное; проверьте anki-repo maintenance status"
+                    });
+                }
+            }
             if args.json {
                 match render_json(&report) {
                     Ok(json) => println!("{json}"),
@@ -179,7 +192,15 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
             }
             i32::from(report.fatal_errors > 0)
         }
-        Err(error) => fail(&error, args.json),
+        Err(error) => {
+            if apply {
+                if let Err(snapshot_error) = care::record_failure(&root, &error) {
+                    eprintln!("Не удалось сохранить сбой GC: {snapshot_error}");
+                }
+                care::desktop_alert("Не удалось выполнить GC; проверьте anki-repo maintenance status");
+            }
+            fail(&error, args.json)
+        }
     }
 }
 
