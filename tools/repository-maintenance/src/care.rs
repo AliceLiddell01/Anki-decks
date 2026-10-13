@@ -639,9 +639,18 @@ mod tests {
     use super::*;
     #[test]
     fn diagnostic_codes_are_stable_and_rendered() {
-        let d = diag("setup_required", "info", "Настройка требуется", Some("anki-repo maintenance enable"));
+        let d = diag(
+            "setup_required",
+            "info",
+            "Настройка требуется",
+            Some("anki-repo maintenance enable"),
+        );
         assert_eq!(d.code, "setup_required");
-        assert!(serde_json::to_string(&d).unwrap().contains("setup_required"));
+        assert!(
+            serde_json::to_string(&d)
+                .unwrap()
+                .contains("setup_required")
+        );
     }
     #[test]
     fn private_snapshot_rejects_symlink_and_permissive_files() {
@@ -660,7 +669,11 @@ mod tests {
 
     #[test]
     fn preference_only_accepts_explicit_choices() {
-        let p = PreferenceFile { schema_version: 1, choice: "no".into(), last_warning_at: None };
+        let p = PreferenceFile {
+            schema_version: 1,
+            choice: "no".into(),
+            last_warning_at: None,
+        };
         let json = serde_json::to_string(&p).unwrap();
         let recovered: PreferenceFile = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.choice, "no");
