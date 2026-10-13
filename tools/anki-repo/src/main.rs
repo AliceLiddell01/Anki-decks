@@ -116,8 +116,15 @@ fn maybe_offer_maintenance(cli: &Cli) {
             "Измерено управляемых данных: {bytes} байт{}.",
             if status.measurement.complete {
                 ""
+            } else if status
+                .measurement
+                .system_tmp
+                .as_ref()
+                .is_some_and(|tmp| !tmp.complete)
+            {
+                " (общий обзор системного /tmp неполон; размер системных данных не включён)"
             } else {
-                " (измерение неполное)"
+                " (полнота проверки не подтверждена)"
             }
         );
     }
