@@ -1277,3 +1277,234 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
          настоящий systemctl не вызывался"
     );
 }
+
+/// Linux PTY-приёмка согласия: настоящая интерактивная команда, но фиктивный
+/// systemd и отдельный HOME. Установка не затрагивает настоящий пользовательский timer.
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_onboarding_pty_consent_installs_and_disables_isolated_timer() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = TempDir::new("gc-onboarding-consent");
+    fixture.write_export(&base_export());
+    let root = fixture.path().join("workspace");
+    let home = fixture.path().join("home");
+    let config = fixture.path().join("config");
+    let state = fixture.path().join("state");
+    let cache = fixture.path().join("cache");
+    let bin = fixture.path().join("mock-bin");
+    for dir in [&root, &home, &config, &state, &cache, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let systemctl_log = fixture.path().join("systemctl-consent.log");
+    let active_marker = fixture.path().join("fake-timer-active");
+    let systemctl = bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$ANKI_GC_CONSENT_SYSTEMCTL_LOG"
+case "$*" in
+  '--user show-environment') exit 0 ;;
+  '--user is-enabled anki-repository-maintenance.timer'|'--user is-active anki-repository-maintenance.timer')
+    test -f "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
+  '--user show anki-repository-maintenance.service --property=Result --value')
+    printf '%s\n' success ;;
+  'is-active systemd-tmpfiles-clean.timer') exit 1 ;;
+  '--user daemon-reload') exit 0 ;;
+  '--user enable --now anki-repository-maintenance.timer')
+    : > "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
+  '--user status anki-repository-maintenance.timer --no-pager')
+    test -f "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
+  '--user disable --now anki-repository-maintenance.timer')
+    rm -f "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
+  *) printf 'Unexpected systemctl call: %s\n' "$*" >&2; exit 97 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        r#"#!/bin/sh
+case "$1" in
+  --version) printf 'cargo 1.99.0\n' ;;
+  metadata)
+    printf '{"workspace_root":"%s","target_directory":"%s/target"}\n' \
+      "$ANKI_REPOSITORY_ROOT" "$ANKI_REPOSITORY_ROOT" ;;
+  *) printf 'Unexpected cargo call: %s\n' "$*" >&2; exit 98 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Если отдельный GC-бинарник не собран рядом с anki-repo, поиск в PATH
+    // получит именно этот безвредный файл. Установщик лишь копирует его.
+    let dummy_gc = bin.join("anki-repository-maintenance");
+    std::fs::write(&dummy_gc, b"#!/bin/sh\nexit 99\n").unwrap();
+    std::fs::set_permissions(&dummy_gc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let isolated_path = std::env::join_paths(
+        std::iter::once(bin.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+
+    let configure = |command: &mut Command| {
+        command
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("ANKI_REPOSITORY_ROOT", &root)
+            .env("ANKI_GC_CONSENT_SYSTEMCTL_LOG", &systemctl_log)
+            .env("ANKI_GC_CONSENT_ACTIVE_MARKER", &active_marker)
+            .env("PATH", &isolated_path);
+    };
+    let launch_pty = |input: &[u8]| -> String {
+        let mut command = Command::new("script");
+        command
+            .args([
+                "-q",
+                "-e",
+                "-c",
+                "exec \"$ANKI_GC_CONSENT_CLI\" models \"$ANKI_GC_CONSENT_EXPORT\"",
+                "/dev/null",
+            ])
+            .env("ANKI_GC_CONSENT_CLI", cli_binary())
+            .env("ANKI_GC_CONSENT_EXPORT", fixture.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure(&mut command);
+        let mut child = command.spawn().expect("нужен util-linux script");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input).unwrap();
+        drop(stdin);
+        let result = child.wait_with_output().unwrap();
+        let output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.status.success(), "PTY CLI: {output}");
+        output
+    };
+    let invoke = |action: &str| -> Value {
+        let mut command = Command::new(cli_binary());
+        command.args([
+            "--json",
+            "maintenance",
+            "--workspace-root",
+            root.to_str().unwrap(),
+            action,
+        ]);
+        configure(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            action,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_json(&String::from_utf8(output.stdout).unwrap())
+    };
+
+    let first = launch_pty(b"y\n");
+    assert!(
+        first.contains("Включить автоматическую очистку? [y/N]"),
+        "{first}"
+    );
+    assert!(
+        first.contains("Автоочистка подтверждена: таймер установлен и активен."),
+        "{first}"
+    );
+    let choice_file = config.join("anki-decks/gc-preference.json");
+    let choice: Value = serde_json::from_slice(&std::fs::read(&choice_file).unwrap()).unwrap();
+    assert_eq!(choice["choice"], "yes");
+    let unit_dir = config.join("systemd/user");
+    let service = unit_dir.join("anki-repository-maintenance.service");
+    let timer = unit_dir.join("anki-repository-maintenance.timer");
+    let install_config = config.join("anki-decks/repository-maintenance-install.toml");
+    let installed_binary = home.join(".local/bin/anki-repository-maintenance");
+    for file in [&service, &timer, &install_config, &installed_binary] {
+        assert!(file.is_file(), "не установлен файл {}", file.display());
+    }
+    assert!(active_marker.is_file());
+    assert!(
+        std::fs::read_to_string(&service)
+            .unwrap()
+            .contains("ExecStart=%h/.local/bin/anki-repository-maintenance clean --apply --installed-root")
+    );
+    assert!(
+        std::fs::read_to_string(&install_config)
+            .unwrap()
+            .contains(&format!("repository_root = \"{}\"", root.display()))
+    );
+    let enabled = invoke("status");
+    assert_eq!(enabled["result"]["preference"], "yes");
+    assert_eq!(enabled["result"]["automatic"], "enabled");
+    assert_eq!(enabled["result"]["installed_workspace"], root.to_str().unwrap());
+    assert_eq!(enabled["result"]["timer_active"], true);
+
+    let second = launch_pty(b"\n");
+    assert!(
+        !second.contains("Включить автоматическую очистку? [y/N]"),
+        "повторное предложение при согласии: {second}"
+    );
+
+    let disabled = invoke("disable");
+    assert_eq!(disabled["result"]["preference"], "no");
+    assert_eq!(disabled["result"]["automatic"], "disabled");
+    assert!(!active_marker.exists());
+    for file in [&service, &timer, &install_config, &installed_binary] {
+        assert!(!file.exists(), "после отключения остался {}", file.display());
+    }
+    let declined = launch_pty(b"\n");
+    assert!(
+        !declined.contains("Включить автоматическую очистку? [y/N]"),
+        "после отключения нельзя повторять приглашение: {declined}"
+    );
+
+    let calls = std::fs::read_to_string(&systemctl_log).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|call| *call == "--user enable --now anki-repository-maintenance.timer")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|call| *call == "--user disable --now anki-repository-maintenance.timer")
+            .count(),
+        1
+    );
+    assert!(
+        calls.lines().all(|line| matches!(
+            line,
+            "--user show-environment"
+                | "--user is-enabled anki-repository-maintenance.timer"
+                | "--user is-active anki-repository-maintenance.timer"
+                | "--user show anki-repository-maintenance.service --property=Result --value"
+                | "is-active systemd-tmpfiles-clean.timer"
+                | "--user daemon-reload"
+                | "--user enable --now anki-repository-maintenance.timer"
+                | "--user status anki-repository-maintenance.timer --no-pager"
+                | "--user disable --now anki-repository-maintenance.timer"
+        )),
+        "непредусмотренный вызов systemctl: {calls}"
+    );
+    println!(
+        "PTY consent PASS: согласие Y, файлы и работающий фиктивный timer, \
+         отсутствие повтора, disable и удаление фиктивной установки; \
+         настоящий systemctl не вызывался"
+    );
+}
