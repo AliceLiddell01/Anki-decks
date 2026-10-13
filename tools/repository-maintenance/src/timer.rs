@@ -821,7 +821,14 @@ mod tests {
             cargo_log: &cargo_log,
         };
 
-        for action in ["install", "install", "service", "status", "inspect", "other-checkout"] {
+        for action in [
+            "install",
+            "install",
+            "service",
+            "status",
+            "inspect",
+            "other-checkout",
+        ] {
             let output = helper.invoke(action);
             assert!(
                 output.status.success(),
