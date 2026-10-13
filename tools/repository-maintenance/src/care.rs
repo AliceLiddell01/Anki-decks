@@ -432,6 +432,29 @@ mod tests {
         assert!(serde_json::to_string(&d).unwrap().contains("setup_required"));
     }
     #[test]
+    fn private_snapshot_rejects_symlink_and_permissive_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let work = asset_store::temp_workspace::TempWorkspace::create("care-file-test").unwrap();
+        let path = work.path().join("private").join("state.json");
+        write_private(&path, b"{\"schema_version\":1}").unwrap();
+        assert!(read_private(&path).unwrap().is_some());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = work.path().join("state-link");
+        symlink(&path, &link).unwrap();
+        assert!(read_private(&link).is_err());
+    }
+
+    #[test]
+    fn preference_only_accepts_explicit_choices() {
+        let p = PreferenceFile { schema_version: 1, choice: "no".into(), last_warning_at: None };
+        let json = serde_json::to_string(&p).unwrap();
+        let recovered: PreferenceFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.choice, "no");
+    }
+
+    #[test]
     fn snapshot_round_trip_and_no_false_success() {
         let item = LastAttempt { schema_version: 1, workspace_root: PathBuf::from("/repo"),
             timestamp: 1, outcome: "partial".into(), bytes_freed: Some(0),
