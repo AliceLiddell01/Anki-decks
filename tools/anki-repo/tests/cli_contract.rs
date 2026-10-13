@@ -1141,7 +1141,6 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
     assert!(config.join("anki-decks/gc-preference.json").is_file());
 }
 
-
 /// Linux live-acceptance: настоящая псевдотерминальная сессия, но полностью
 /// отдельные пользовательские настройки и подменённый systemctl. Вызовы
 /// настоящего пользовательского таймера при этом не выполняются.
@@ -1167,10 +1166,10 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> \"$ANKI_GC_PTY_MOCK_LOG\"\n\
          case \"$*\" in\n\
-         '  --user show-environment') exit 0 ;;\n\
-         '  --user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
-         '  --user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
-         '  --user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         '--user show-environment') exit 0 ;;\n\
+         '--user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
+         '--user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
+         '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
          *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
          esac\n",
     ).unwrap();
@@ -1178,9 +1177,9 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
 
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     let sandbox_path = std::env::join_paths(
-        std::iter::once(mock_bin.clone())
-            .chain(std::env::split_paths(&original_path))
-    ).unwrap();
+        std::iter::once(mock_bin.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
 
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1247,9 +1246,18 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
 
     let calls = std::fs::read_to_string(&mock_log).unwrap();
     assert!(calls.contains("--user show-environment"), "{calls}");
-    assert!(!calls.contains("enable"), "{calls}");
-    assert!(!calls.contains("disable"), "{calls}");
-    assert!(!calls.contains("--now"), "{calls}");
+    assert!(calls.contains("--user is-enabled anki-repository-maintenance.timer"), "{calls}");
+    assert!(calls.contains("--user is-active anki-repository-maintenance.timer"), "{calls}");
+    assert!(
+        calls.lines().all(|line| matches!(
+            line,
+            "--user show-environment"
+                | "--user is-enabled anki-repository-maintenance.timer"
+                | "--user is-active anki-repository-maintenance.timer"
+                | "--user show anki-repository-maintenance.service --property=Result --value"
+        )),
+        "неожиданный systemctl-вызов: {calls}"
+    );
     println!(
         "PTY acceptance PASS: первый [y/N], сохранённый N и отсутствие повтора; \
          настоящий systemctl не вызывался"
