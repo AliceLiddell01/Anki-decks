@@ -906,14 +906,25 @@ fn workspace_process_references(
                     ));
                 }
             };
-            if environment_uses_workspace(&environment, &run_path) {
+            let cwd = match fs::read_link(process.join("cwd")) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "не удалось проверить рабочий каталог процесса браузера",
+                    ));
+                }
+            };
+            if environment_uses_workspace(&environment, &cwd, &run_path) {
                 return Ok(true);
             }
         }
         if include_generic {
             if is_current_process {
+                let cwd = fs::read_link(process.join("cwd"))?;
                 let environment = fs::read(process.join("environ"))?;
-                if environment_uses_workspace(&environment, &run_path) {
+                if environment_uses_workspace(&environment, &cwd, &run_path) {
                     return Ok(true);
                 }
             }
@@ -1005,12 +1016,18 @@ fn command_uses_workspace(cmdline: &[u8], run_path: &Path) -> bool {
     false
 }
 
-fn environment_uses_workspace(environment: &[u8], run_path: &Path) -> bool {
+fn environment_uses_workspace(environment: &[u8], cwd: &Path, run_path: &Path) -> bool {
     environment.split(|byte| *byte == 0).any(|entry| {
         let Some(value) = entry.strip_prefix(b"TMPDIR=") else {
             return false;
         };
-        path_is_within(&PathBuf::from(OsString::from_vec(value.to_vec())), run_path)
+        let path = PathBuf::from(OsString::from_vec(value.to_vec()));
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        path_is_within(&path, run_path)
     })
 }
 
@@ -2250,6 +2267,7 @@ mod tests {
                 fs::write(process.join("cmdline"), b"generic\0").unwrap();
             }
             if reference == "generic-cwd" {
+                fs::remove_file(process.join("cwd")).unwrap();
                 symlink(&profile, process.join("cwd")).unwrap();
             }
             let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
@@ -2282,6 +2300,7 @@ mod tests {
                 .unwrap()
         );
         fs::remove_file(process.join("cwd")).unwrap();
+        symlink(Path::new("/"), process.join("cwd")).unwrap();
 
         symlink(&path, process.join("fd/7")).unwrap();
         assert!(
@@ -2511,6 +2530,7 @@ mod tests {
         fs::write(process.join("comm"), b"chrome\n").unwrap();
         fs::write(process.join("cmdline"), cmdline).unwrap();
         fs::write(process.join("environ"), environment).unwrap();
+        symlink(Path::new("/"), process.join("cwd")).unwrap();
         if let Some(target) = fd_target {
             symlink(target, process.join("fd/7")).unwrap();
         }
@@ -2751,6 +2771,33 @@ mod tests {
                 .unwrap()
         );
         fs::remove_dir_all(fd_process).unwrap();
+        proc_root.close().unwrap();
+        run.close().unwrap();
+    }
+
+    #[test]
+    fn browser_process_relative_tmpdir_is_resolved_from_process_cwd() {
+        let run = sandbox();
+        let proc_root = sandbox();
+        let temp = run.path().join(format!("t{}", &random_hex()[..3]));
+        fs::create_dir(&temp).unwrap();
+        let relative_temp = temp.strip_prefix(run.path()).unwrap();
+        let process = fake_chromium_process(
+            proc_root.path(),
+            100_005,
+            b"/usr/bin/chrome\0--type=renderer\0",
+            format!("TMPDIR={}\0", relative_temp.display()).as_bytes(),
+            None,
+        );
+        fs::remove_file(process.join("cwd")).unwrap();
+        symlink(run.path(), process.join("cwd")).unwrap();
+
+        assert!(
+            workspace_has_process_references(proc_root.path(), run.path(), current_uid().unwrap())
+                .unwrap()
+        );
+
+        fs::remove_dir_all(process).unwrap();
         proc_root.close().unwrap();
         run.close().unwrap();
     }

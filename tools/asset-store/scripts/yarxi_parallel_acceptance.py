@@ -54,6 +54,19 @@ def unavailable(reason):
     return {"available": False, "reason": reason}
 
 
+def temporary_path_references_root(value, cwd, root):
+    if not value:
+        return False
+    path = Path(value)
+    if not path.is_absolute():
+        if not cwd:
+            return True
+        path = Path(cwd) / path
+    path = Path(os.path.abspath(path))
+    root = Path(os.path.abspath(root))
+    return path == root or root in path.parents
+
+
 def digest(path):
     hasher = hashlib.sha256()
     with path.open("rb") as source:
@@ -180,7 +193,7 @@ def process_table():
     """Снимок /proc; cmdline/environ используются только для доказательства владения."""
     if not Path("/proc/self/stat").exists():
         return {}, unavailable("Linux /proc недоступен")
-    rows, denied, environment_denied, zombies = {}, 0, 0, 0
+    rows, denied, environment_denied, cwd_denied, zombies = {}, 0, 0, 0, 0
     for path in Path("/proc").iterdir():
         if not path.name.isdigit():
             continue
@@ -195,6 +208,12 @@ def process_table():
                 continue
             command = (path / "cmdline").read_bytes().split(b"\0")
             executable = os.path.basename(command[0].decode(errors="replace")) if command else ""
+            process_cwd = None
+            if "chrom" in executable.lower():
+                try:
+                    process_cwd = os.readlink(path / "cwd")
+                except PermissionError:
+                    cwd_denied += 1
             try:
                 environment = (path / "environ").read_bytes().split(b"\0")
             except PermissionError:
@@ -206,7 +225,7 @@ def process_table():
             rows[int(path.name)] = {
                 "pid": int(path.name), "ppid": int(fields[1]), "start_ticks": int(fields[19]),
                 "rss_bytes": int(fields[21]) * os.sysconf("SC_PAGE_SIZE"),
-                "chromium": "chrom" in executable.lower(),
+                "chromium": "chrom" in executable.lower(), "cwd": process_cwd,
                 "references": [entry.decode(errors="replace") for entry in command], "tmpdir": temporary,
             }
         except (FileNotFoundError, ProcessLookupError):
@@ -219,6 +238,7 @@ def process_table():
         "available": True,
         "unreadable_same_uid_processes": denied,
         "unreadable_environments": environment_denied,
+        "unreadable_process_cwds": cwd_denied,
         "ignored_zombie_processes": zombies,
     }
 
@@ -247,7 +267,7 @@ class ResourceObserver:
         browser = []
         for pid, row in rows.items():
             root_reference = any(str(self.root) in reference for reference in row["references"])
-            root_reference |= bool(row["tmpdir"] and str(self.root) in row["tmpdir"])
+            root_reference |= temporary_path_references_root(row["tmpdir"], row["cwd"], self.root)
             if row["chromium"] and (pid in owned or root_reference):
                 self.known.add((pid, row["start_ticks"]))
                 browser.append({key: row[key] for key in ("pid", "start_ticks", "rss_bytes", "tmpdir")})
@@ -387,7 +407,7 @@ def post_run_cleanup_audit(directory, previous_resources=None):
         if not row["chromium"]:
             continue
         references_root = any(str(root) in reference for reference in row["references"])
-        references_root |= bool(row["tmpdir"] and str(root) in row["tmpdir"])
+        references_root |= temporary_path_references_root(row["tmpdir"], row["cwd"], root)
         if references_root:
             chromium.append({key: row[key] for key in ("pid", "ppid", "start_ticks", "references", "tmpdir")})
     workspaces = []

@@ -1478,6 +1478,14 @@ async fn coordinate_parallel<D: ParallelDriver>(
                     state.retired[worker - 1] = true;
                     if let Err(next) = result {
                         error = Some(match error.take() {
+                            Some(original @ (AcquisitionStreamError::Consumer(_) | AcquisitionStreamError::Interrupted)) => {
+                                tracing::warn!(
+                                    stage = "worker_stop",
+                                    message = %crate::diagnostics::safe_message(&next.into_message()),
+                                    "Вторичная ошибка worker после первичной"
+                                );
+                                original
+                            }
                             Some(original) => AcquisitionStreamError::Provider(format!("{}; {}", original.into_message(), next.into_message())),
                             None => next,
                         });
@@ -6380,7 +6388,16 @@ mod parallel_pool_tests {
                 },
             )
             .await;
-            assert!(result.is_err());
+            let error = result.unwrap_err();
+            if matches!(mode, SyntheticMode::Terminal) {
+                assert!(matches!(
+                    error,
+                    AcquisitionStreamError::Consumer(ref error)
+                        if error.code == crate::error::ErrorCode::InvalidTransition
+                ));
+            } else {
+                assert!(!matches!(error, AcquisitionStreamError::Interrupted));
+            }
             assert_eq!(
                 cleanup
                     .lock()
