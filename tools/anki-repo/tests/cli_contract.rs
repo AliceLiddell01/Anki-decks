@@ -1156,7 +1156,12 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
     let isolated_state = fixture.path().join("state");
     let isolated_cache = fixture.path().join("cache");
     let mock_bin = fixture.path().join("mock-bin");
-    for path in [&isolated_config, &isolated_state, &isolated_cache, &mock_bin] {
+    for path in [
+        &isolated_config,
+        &isolated_state,
+        &isolated_cache,
+        &mock_bin,
+    ] {
         std::fs::create_dir_all(path).unwrap();
     }
     let systemctl = mock_bin.join("systemctl");
@@ -1229,10 +1234,12 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
     };
 
     let first = launch(b"n\n");
-    assert!(first.contains("Включить автоматическую очистку? [y/N]"), "{first}");
+    assert!(
+        first.contains("Включить автоматическую очистку? [y/N]"),
+        "{first}"
+    );
     let preference = isolated_config.join("anki-decks/gc-preference.json");
-    let saved: Value =
-        serde_json::from_slice(&std::fs::read(&preference).unwrap()).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&preference).unwrap()).unwrap();
     assert_eq!(saved["choice"], "no");
 
     let second = launch(b"\n");
@@ -1240,14 +1247,19 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
         !second.contains("Включить автоматическую очистку? [y/N]"),
         "после сохранённого отказа нельзя задавать вопрос повторно: {second}"
     );
-    let saved_again: Value =
-        serde_json::from_slice(&std::fs::read(&preference).unwrap()).unwrap();
+    let saved_again: Value = serde_json::from_slice(&std::fs::read(&preference).unwrap()).unwrap();
     assert_eq!(saved_again["choice"], "no");
 
     let calls = std::fs::read_to_string(&mock_log).unwrap();
     assert!(calls.contains("--user show-environment"), "{calls}");
-    assert!(calls.contains("--user is-enabled anki-repository-maintenance.timer"), "{calls}");
-    assert!(calls.contains("--user is-active anki-repository-maintenance.timer"), "{calls}");
+    assert!(
+        calls.contains("--user is-enabled anki-repository-maintenance.timer"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--user is-active anki-repository-maintenance.timer"),
+        "{calls}"
+    );
     assert!(
         calls.lines().all(|line| matches!(
             line,
