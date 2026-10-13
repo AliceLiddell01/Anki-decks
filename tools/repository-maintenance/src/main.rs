@@ -140,18 +140,21 @@ fn main() {
         }
         Command::Timer(args) => timer(args),
         Command::Cache(args) => cache(args),
-        Command::NotifyTest => match care::try_desktop_alert(
-            "Проверка уведомления; очистка не запускалась.",
-        ) {
-            Ok(channel) => {
-                println!("Запрос уведомления принят обработчиком: {channel}. Видимость окна проверяется отдельно.");
-                0
+        Command::NotifyTest => {
+            match care::try_desktop_alert("Проверка уведомления; очистка не запускалась.")
+            {
+                Ok(channel) => {
+                    println!(
+                        "Запрос уведомления принят обработчиком: {channel}. Видимость окна проверяется отдельно."
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("Не удалось отправить тестовое уведомление: {error}");
+                    1
+                }
             }
-            Err(error) => {
-                eprintln!("Не удалось отправить тестовое уведомление: {error}");
-                1
-            }
-        },
+        }
     };
     if exit_code != 0 {
         std::process::exit(exit_code);
