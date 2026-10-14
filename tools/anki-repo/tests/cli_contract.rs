@@ -1098,7 +1098,7 @@ fn isolated_maintenance_workspace(fixture: &TempDir, bin: &std::path::Path) -> s
          case \"$1\" in\n\
          --version) printf 'cargo 1.99.0\\n' ;;\n\
          metadata) printf '{\"workspace_root\":\"%s\",\"target_directory\":\"%s/target\"}\\n' \"$ANKI_MAINTENANCE_ROOT\" \"$ANKI_MAINTENANCE_ROOT\" ;;\n\
-         *) printf 'Unexpected cargo call: %s\\n' \"$*\" >&2; exit 98 ;;\n\
+         *) printf 'Непредусмотренный вызов Cargo: %s\\n' \"$*\" >&2; exit 98 ;;\n\
          esac\n",
     )
     .unwrap();
@@ -1133,9 +1133,9 @@ fn maintenance_disable_reports_failure_when_binding_cannot_be_proven() {
          '--user show-environment') exit 0 ;;\n\
          '--user is-enabled anki-repository-maintenance.timer') exit 0 ;;\n\
          '--user is-active anki-repository-maintenance.timer') exit 0 ;;\n\
-         '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         '--user show '* ) printf '%s\\n' LoadState=not-found ActiveState=inactive FragmentPath= DropInPaths= NeedDaemonReload=no Result=success; exit 0 ;;\n\
          'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
-         *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+         *) echo \"Непредусмотренный вызов systemctl: $*\" >&2; exit 97 ;;\n\
          esac\n",
     )
     .unwrap();
@@ -1181,12 +1181,11 @@ fn maintenance_disable_reports_failure_when_binding_cannot_be_proven() {
     );
 }
 
-/// Без подтверждённой привязки `disable` снимает только установку с отметкой
-/// владельца: управляемые unit-файлы удаляются, но `no` сохраняется лишь тогда,
-/// когда таймер после этого действительно не активен.
+/// Одна отметка владельца без привязки к checkout не разрешает отключение.
+/// Unit-файлы сохраняются, отказ не записывается.
 #[cfg(target_os = "linux")]
 #[test]
-fn maintenance_disable_removes_owner_marked_units_without_binding() {
+fn maintenance_disable_rejects_owner_marked_units_without_binding() {
     use std::os::unix::fs::PermissionsExt;
 
     const MANAGED: &str = "# Managed by repository-maintenance; do not edit by hand.";
@@ -1239,9 +1238,9 @@ fn maintenance_disable_removes_owner_marked_units_without_binding() {
                  if [ -f '{stays}' ]; then exit 0; fi\n\
                  if [ -f '{disabled_flag}' ]; then exit 1; fi\n\
                  exit 0 ;;\n\
-                 '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+                 '--user show '* ) printf '%s\\n' LoadState=not-found ActiveState=inactive FragmentPath= DropInPaths= NeedDaemonReload=no Result=success; exit 0 ;;\n\
                  'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
-                 *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+                 *) echo \"Непредусмотренный вызов systemctl: $*\" >&2; exit 97 ;;\n\
                  esac\n",
                 call_log = call_log.display(),
                 stays = stays.display(),
@@ -1285,53 +1284,24 @@ fn maintenance_disable_removes_owner_marked_units_without_binding() {
         )
     };
 
-    let (_fixture, disabled, preference, units_removed, calls) = scenario(false);
-    assert_eq!(
-        disabled.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&disabled.stderr)
-    );
-    assert!(
-        units_removed,
-        "управляемые unit-файлы обязаны быть сняты без подтверждённой привязки"
-    );
-    assert!(
-        preference.is_file(),
-        "отказ сохраняется, когда таймер после снятия не активен"
-    );
-    // Таймер до снятия установки действительно работал, и снятие его выключило:
-    // без этого проверка не отличала бы снятие от «таймер и так был выключен».
-    let calls = std::fs::read_to_string(&calls).unwrap();
-    let lines: Vec<&str> = calls.lines().collect();
-    let observed = lines
-        .iter()
-        .position(|line| *line == "--user is-enabled anki-repository-maintenance.timer")
-        .expect("состояние таймера обязано быть проверено");
-    let disabled_at = lines
-        .iter()
-        .position(|line| *line == "--user disable --now anki-repository-maintenance.timer")
-        .expect("снятие установки обязано выключить таймер");
-    assert!(
-        observed < disabled_at,
-        "таймер должен быть замечен включённым до снятия установки: {calls}"
-    );
-
-    let (_fixture, still_enabled, preference, units_removed, _calls) = scenario(true);
-    assert_eq!(
-        still_enabled.status.code(),
-        Some(8),
-        "ожидалась ошибка записи: {}",
-        String::from_utf8_lossy(&still_enabled.stderr)
-    );
-    assert!(
-        units_removed,
-        "установка владельца снимается и при сохранившемся таймере"
-    );
-    assert!(
-        !preference.exists(),
-        "при работающем таймере отказ не сохраняется"
-    );
+    for stays_active in [false, true] {
+        let (_fixture, result, preference, units_removed, calls) = scenario(stays_active);
+        assert_eq!(
+            result.status.code(),
+            Some(8),
+            "неподтверждённая установка не снимается"
+        );
+        assert!(
+            !units_removed,
+            "unit-файлы сохраняются для ручной диагностики"
+        );
+        assert!(!preference.exists(), "ложный отказ не сохраняется");
+        assert!(
+            !std::fs::read_to_string(calls)
+                .unwrap()
+                .contains("--user disable")
+        );
+    }
 }
 
 /// Владение экспортом определяется его расположением: корень рабочей области не
@@ -1382,11 +1352,11 @@ fn gc_onboarding_offer_uses_the_export_repository_not_the_process_directory() {
         "#!/bin/sh\n\
          case \"$*\" in\n\
          '--user show-environment') exit 0 ;;\n\
-         '--user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
-         '--user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
-         '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         '--user is-enabled anki-repository-maintenance.timer') echo disabled; exit 1 ;;\n\
+         '--user is-active anki-repository-maintenance.timer') echo inactive; exit 3 ;;\n\
+         '--user show '* ) printf '%s\\n' LoadState=not-found ActiveState=inactive FragmentPath= DropInPaths= NeedDaemonReload=no Result=success; exit 0 ;;\n\
          'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
-         *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+         *) echo \"Непредусмотренный вызов systemctl: $*\" >&2; exit 97 ;;\n\
          esac\n",
     )
     .unwrap();
@@ -1469,11 +1439,11 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
         "#!/bin/sh\n\
          case \"$*\" in\n\
          '--user show-environment') exit 0 ;;\n\
-         '--user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
-         '--user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
-         '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         '--user is-enabled anki-repository-maintenance.timer') echo disabled; exit 1 ;;\n\
+         '--user is-active anki-repository-maintenance.timer') echo inactive; exit 3 ;;\n\
+         '--user show '* ) printf '%s\\n' LoadState=not-found ActiveState=inactive FragmentPath= DropInPaths= NeedDaemonReload=no Result=success; exit 0 ;;\n\
          'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
-         *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+         *) echo \"Непредусмотренный вызов systemctl: $*\" >&2; exit 97 ;;\n\
          esac\n",
     )
     .unwrap();
@@ -1514,7 +1484,8 @@ fn maintenance_status_and_decline_keep_json_pure_with_piped_streams() {
     assert_eq!(initial["result"]["preference"], "unset");
     assert!(initial["result"]["diagnostics"].is_array());
     assert_eq!(
-        initial["result"]["workspace_root"], root,
+        initial["result"]["workspace_root"],
+        redacted_maintenance_path(&repository),
         "измеряться обязана изолированная рабочая область, а не рабочая копия репозитория"
     );
 
@@ -1569,11 +1540,11 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
          printf '%s\\n' \"$*\" >> \"$ANKI_GC_PTY_MOCK_LOG\"\n\
          case \"$*\" in\n\
          '--user show-environment') exit 0 ;;\n\
-         '--user is-enabled anki-repository-maintenance.timer') exit 1 ;;\n\
-         '--user is-active anki-repository-maintenance.timer') exit 1 ;;\n\
-         '--user show anki-repository-maintenance.service --property=Result --value') printf '%s\\n' success; exit 0 ;;\n\
+         '--user is-enabled anki-repository-maintenance.timer') echo disabled; exit 1 ;;\n\
+         '--user is-active anki-repository-maintenance.timer') echo inactive; exit 3 ;;\n\
+         '--user show '* ) printf '%s\\n' LoadState=not-found ActiveState=inactive FragmentPath= DropInPaths= NeedDaemonReload=no Result=success; exit 0 ;;\n\
          'is-active systemd-tmpfiles-clean.timer') exit 1 ;;\n\
-         *) echo \"Unexpected systemctl call: $*\" >&2; exit 97 ;;\n\
+         *) echo \"Непредусмотренный вызов systemctl: $*\" >&2; exit 97 ;;\n\
          esac\n",
     ).unwrap();
     std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1690,13 +1661,14 @@ fn gc_onboarding_pty_decline_is_saved_and_prompt_does_not_repeat() {
             "--user show-environment"
                 | "--user is-enabled anki-repository-maintenance.timer"
                 | "--user is-active anki-repository-maintenance.timer"
-                | "--user show anki-repository-maintenance.service --property=Result --value"
+                | "--user show anki-repository-maintenance.service --property=LoadState,FragmentPath,ExecStart,ActiveState,Result,DropInPaths,NeedDaemonReload"
+                | "--user show anki-repository-maintenance.timer --property=LoadState,FragmentPath,ExecStart,ActiveState,Result,DropInPaths,NeedDaemonReload"
                 | "is-active systemd-tmpfiles-clean.timer"
         )),
         "неожиданный systemctl-вызов: {calls}"
     );
     println!(
-        "PTY acceptance PASS: первый [y/N], сохранённый N и отсутствие повтора; \
+        "PTY-приёмка пройдена: первый [y/N], сохранённый N и отсутствие повтора; \
          настоящий systemctl не вызывался"
     );
 }
@@ -1733,18 +1705,30 @@ printf '%s\n' "$*" >> "$ANKI_GC_CONSENT_SYSTEMCTL_LOG"
 case "$*" in
   '--user show-environment') exit 0 ;;
   '--user is-enabled anki-repository-maintenance.timer'|'--user is-active anki-repository-maintenance.timer')
-    test -f "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
-  '--user show anki-repository-maintenance.service --property=Result --value')
-    printf '%s\n' success ;;
+    if test -f "$ANKI_GC_CONSENT_ACTIVE_MARKER"; then case "$2" in is-enabled) echo enabled;; *) echo active;; esac; else case "$2" in is-enabled) echo disabled; exit 1;; *) echo inactive; exit 3;; esac; fi ;;
+  '--user show '*)
+name="$3"
+fragment="$XDG_CONFIG_HOME/systemd/user/$name"
+if [ -f "$fragment" ]; then echo LoadState=loaded; echo "FragmentPath=$fragment";
+else echo LoadState=not-found; echo FragmentPath=; fi
+echo ActiveState=inactive
+echo Result=success
+echo DropInPaths=
+echo NeedDaemonReload=no
+execpath="$HOME/.local/bin/anki-repository-maintenance"
+echo "ExecStart={ path=$execpath ; argv[]=$execpath clean --apply --installed-root ; }"
+    ;;
+  '--user stop anki-repository-maintenance.service') exit 0 ;;
   'is-active systemd-tmpfiles-clean.timer') exit 1 ;;
   '--user daemon-reload') exit 0 ;;
   '--user enable --now anki-repository-maintenance.timer')
+    if [ -f "$ANKI_GC_CONSENT_ACTIVE_MARKER.fail" ]; then exit 9; fi
     : > "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
   '--user status anki-repository-maintenance.timer --no-pager')
-    test -f "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
+    if test -f "$ANKI_GC_CONSENT_ACTIVE_MARKER"; then case "$2" in is-enabled) echo enabled;; *) echo active;; esac; else case "$2" in is-enabled) echo disabled; exit 1;; *) echo inactive; exit 3;; esac; fi ;;
   '--user disable --now anki-repository-maintenance.timer')
     rm -f "$ANKI_GC_CONSENT_ACTIVE_MARKER" ;;
-  *) printf 'Unexpected systemctl call: %s\n' "$*" >&2; exit 97 ;;
+  *) printf 'Непредусмотренный вызов systemctl: %s\n' "$*" >&2; exit 97 ;;
 esac
 "#,
     )
@@ -1760,7 +1744,7 @@ case "$1" in
   metadata)
     printf '{"workspace_root":"%s","target_directory":"%s/target"}\n' \
       "$ANKI_REPOSITORY_ROOT" "$ANKI_REPOSITORY_ROOT" ;;
-  *) printf 'Unexpected cargo call: %s\n' "$*" >&2; exit 98 ;;
+  *) printf 'Непредусмотренный вызов Cargo: %s\n' "$*" >&2; exit 98 ;;
 esac
 "#,
     )
@@ -1842,15 +1826,21 @@ esac
         parse_json(&String::from_utf8(output.stdout).unwrap())
     };
 
-    let first = launch_pty(b"y\n");
+    let failed_marker = active_marker.with_file_name("fake-timer-active.fail");
+    std::fs::write(&failed_marker, "").unwrap();
+    let failed = launch_pty(b"y\n");
+    assert!(failed.contains("Не удалось включить GC"), "{failed}");
+    assert!(!active_marker.exists());
+    assert_eq!(invoke("status")["result"]["preference"], "yes");
+    std::fs::remove_file(failed_marker).unwrap();
+    let recovered = invoke("enable");
+    assert_eq!(recovered["result"]["automatic"], "enabled");
+    let first = failed;
     assert!(
         first.contains("Включить автоматическую очистку? [y/N]"),
         "{first}"
     );
-    assert!(
-        first.contains("Автоочистка подтверждена: таймер установлен и активен."),
-        "{first}"
-    );
+    assert!(recovered["result"]["timer_active"] == true, "{first}");
     let choice_file = config.join("anki-decks/gc-preference.json");
     let choice: Value = serde_json::from_slice(&std::fs::read(&choice_file).unwrap()).unwrap();
     assert_eq!(choice["choice"], "yes");
@@ -1876,7 +1866,7 @@ esac
     assert_eq!(enabled["result"]["automatic"], "enabled");
     assert_eq!(
         enabled["result"]["installed_workspace"],
-        root.to_str().unwrap()
+        redacted_maintenance_path(&root)
     );
     assert_eq!(enabled["result"]["timer_active"], true);
 
@@ -1903,20 +1893,30 @@ esac
         "после отключения нельзя повторять приглашение: {declined}"
     );
 
+    // Отдельно сохраняем приёмку успешного Y без предыдущей ошибки установки.
+    std::fs::remove_file(&choice_file).unwrap();
+    let accepted = launch_pty(b"y\n");
+    assert!(
+        accepted.contains("Автоочистка подтверждена: таймер установлен и активен."),
+        "{accepted}"
+    );
+    assert_eq!(invoke("status")["result"]["preference"], "yes");
+    assert_eq!(invoke("disable")["result"]["preference"], "no");
+
     let calls = std::fs::read_to_string(&systemctl_log).unwrap();
     assert_eq!(
         calls
             .lines()
             .filter(|call| *call == "--user enable --now anki-repository-maintenance.timer")
             .count(),
-        1
+        3
     );
     assert_eq!(
         calls
             .lines()
             .filter(|call| *call == "--user disable --now anki-repository-maintenance.timer")
             .count(),
-        1
+        2
     );
     assert!(
         calls.lines().all(|line| matches!(
@@ -1924,18 +1924,28 @@ esac
             "--user show-environment"
                 | "--user is-enabled anki-repository-maintenance.timer"
                 | "--user is-active anki-repository-maintenance.timer"
-                | "--user show anki-repository-maintenance.service --property=Result --value"
+                | "--user show anki-repository-maintenance.service --property=LoadState,FragmentPath,ExecStart,ActiveState,Result,DropInPaths,NeedDaemonReload"
+                | "--user show anki-repository-maintenance.timer --property=LoadState,FragmentPath,ExecStart,ActiveState,Result,DropInPaths,NeedDaemonReload"
                 | "is-active systemd-tmpfiles-clean.timer"
                 | "--user daemon-reload"
                 | "--user enable --now anki-repository-maintenance.timer"
                 | "--user status anki-repository-maintenance.timer --no-pager"
                 | "--user disable --now anki-repository-maintenance.timer"
+                | "--user stop anki-repository-maintenance.service"
         )),
         "непредусмотренный вызов systemctl: {calls}"
     );
     println!(
-        "PTY consent PASS: согласие Y, файлы и работающий фиктивный timer, \
+        "PTY-приёмка согласия пройдена: согласие Y, файлы и работающий фиктивный timer, \
          отсутствие повтора, disable и удаление фиктивной установки; \
          настоящий systemctl не вызывался"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn redacted_maintenance_path(path: &std::path::Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").unwrap().uid();
+    path.to_string_lossy()
+        .replace(&format!("anki-decks-{uid}"), "anki-decks-<uid>")
 }

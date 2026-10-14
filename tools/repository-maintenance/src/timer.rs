@@ -10,7 +10,7 @@ use crate::policy::config_home;
 
 const SERVICE_NAME: &str = "anki-repository-maintenance.service";
 const TIMER_NAME: &str = "anki-repository-maintenance.timer";
-const INSTALLED_CONFIG_NAME: &str = "repository-maintenance-install.toml";
+pub(crate) const INSTALLED_CONFIG_NAME: &str = "repository-maintenance-install.toml";
 const SERVICE_TEMPLATE: &str = include_str!("../systemd/anki-repository-maintenance.service");
 const TIMER_TEMPLATE: &str = include_str!("../systemd/anki-repository-maintenance.timer");
 // Точная подпись владения служебным файлом systemd, которую установщик проверяет при обновлении и удалении.
@@ -35,6 +35,8 @@ struct InstalledConfig<'a> {
 pub struct TimerInspection {
     pub state: String,
     pub active: Option<bool>,
+    pub enabled: Option<bool>,
+    pub service_active: Option<bool>,
     pub installed_root: Option<PathBuf>,
     pub service_result: Option<String>,
     pub error: Option<String>,
@@ -48,7 +50,7 @@ struct InstalledConfigOwned {
     repository_root: PathBuf,
 }
 
-fn installed_root() -> Result<Option<PathBuf>, String> {
+pub(crate) fn installed_root() -> Result<Option<PathBuf>, String> {
     let home = config_home().ok_or("не задан HOME / XDG_CONFIG_HOME")?;
     let path = home.join(format!("anki-decks/{INSTALLED_CONFIG_NAME}"));
     let meta = match fs::symlink_metadata(&path) {
@@ -76,66 +78,229 @@ fn installed_root() -> Result<Option<PathBuf>, String> {
     Ok(Some(config.repository_root))
 }
 
-/// Не приравнивает сохранённую настройку или is-enabled к работающему таймеру.
+/// Пути установки принадлежат таймеру, а не потребителям диагностики.
+pub(crate) fn artifact_paths() -> Result<[PathBuf; 3], String> {
+    let home = config_home().ok_or("не задан HOME / XDG_CONFIG_HOME")?;
+    Ok([
+        home.join("systemd/user").join(SERVICE_NAME),
+        home.join("systemd/user").join(TIMER_NAME),
+        home.join("anki-decks").join(INSTALLED_CONFIG_NAME),
+    ])
+}
+
+pub(crate) fn artifacts_present() -> Result<bool, String> {
+    for path in artifact_paths()? {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(false)
+}
+
+fn installed_binary() -> Result<PathBuf, String> {
+    Ok(
+        PathBuf::from(std::env::var_os("HOME").ok_or("не задан HOME")?)
+            .join(".local/bin/anki-repository-maintenance"),
+    )
+}
+
+// Ненулевой exit code сам по себе не доказывает выключенный таймер.
+fn query_flag(verb: &str, absent: bool) -> Result<bool, String> {
+    let out = Command::new("systemctl")
+        .args(["--user", verb, TIMER_NAME])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let value = String::from_utf8_lossy(&out.stdout);
+    match (verb, value.trim(), out.status.code()) {
+        ("is-enabled", "enabled" | "enabled-runtime", Some(0)) => Ok(true),
+        ("is-enabled", "disabled" | "masked" | "masked-runtime", Some(1)) => Ok(false),
+        ("is-enabled", "static" | "indirect", Some(0)) => Ok(false),
+        ("is-enabled", "", Some(1 | 4)) if absent => Ok(false),
+        ("is-enabled", "not-found", Some(4)) => Ok(false),
+        ("is-active", "active" | "activating" | "reloading", Some(0)) => Ok(true),
+        ("is-active", "inactive" | "failed", Some(3)) => Ok(false),
+        ("is-active", "unknown", Some(4)) => Ok(false),
+        _ => Err(format!(
+            "неизвестный ответ systemctl {verb}: {} (код {:?})",
+            value.trim(),
+            out.status.code()
+        )),
+    }
+}
+
+fn loaded_unit(name: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let text = systemctl(&[
+        "show",
+        name,
+        "--property=LoadState,FragmentPath,ExecStart,ActiveState,Result,DropInPaths,NeedDaemonReload",
+    ])?;
+    let properties: std::collections::BTreeMap<_, _> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    if !properties.contains_key("LoadState") || !properties.contains_key("ActiveState") {
+        return Err(format!("неполный ответ systemctl show для {name}"));
+    }
+    Ok(properties)
+}
+
+fn verify_unit(
+    name: &str,
+    path: &Path,
+    loaded: &std::collections::BTreeMap<String, String>,
+    allow_missing_binary: bool,
+) -> Result<(), String> {
+    let get = |key: &str| loaded.get(key).map(String::as_str).unwrap_or("");
+    let unloaded = get("LoadState") == "not-found"
+        && get("FragmentPath").is_empty()
+        && matches!(get("ActiveState"), "inactive" | "failed")
+        && get("DropInPaths").is_empty();
+    if get("LoadState") == "not-found" && !unloaded {
+        return Err(format!("противоречивое состояние незагруженного {name}"));
+    }
+    if unloaded {
+        // Файлы на диске всё равно проверяются перед переустановкой/удалением.
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+            Ok(_) => (),
+        }
+    }
+    if !unloaded
+        && (get("LoadState") != "loaded"
+            || Path::new(get("FragmentPath")) != path
+            || !get("DropInPaths").is_empty()
+            || get("NeedDaemonReload") != "no")
+    {
+        return Err(format!(
+            "загруженный {name} не соответствует управляемому unit (FragmentPath={}, LoadState={})",
+            get("FragmentPath"),
+            get("LoadState")
+        ));
+    }
+    let directory = fs::symlink_metadata(path.parent().ok_or("нет каталога unit")?)
+        .map_err(|e| e.to_string())?;
+    let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
+    if directory.file_type().is_symlink()
+        || !directory.is_dir()
+        || directory.uid() != uid
+        || directory.mode() & 0o022 != 0
+    {
+        return Err("каталог управляемых unit небезопасен".into());
+    }
+    ensure_managed(path)?;
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if name == TIMER_NAME {
+        if text != format!("{MANAGED_MARKER}\n{TIMER_TEMPLATE}") {
+            return Err("содержимое управляемого таймера изменено".into());
+        }
+    } else {
+        // Проверяем весь шаблон, разрешая только подстановку PATH установщиком.
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|l| !l.starts_with("Environment=\"PATH="))
+            .collect();
+        let expected: Vec<_> = SERVICE_TEMPLATE
+            .lines()
+            .filter(|l| *l != CARGO_PATH_MARKER)
+            .collect();
+        if lines.first() != Some(&MANAGED_MARKER) || lines[1..] != expected {
+            return Err("содержимое управляемой службы изменено".into());
+        }
+        let binary = installed_binary()?;
+        ensure_binary_managed_or_absent(&binary, path, &artifact_paths()?[2])?;
+        if !allow_missing_binary && !binary.is_file() {
+            return Err("установленный бинарник отсутствует".into());
+        }
+        if unloaded {
+            return Ok(());
+        }
+        let exec = get("ExecStart");
+        // show использует структурированную запись с path и argv[]. Дополнительные
+        // команды, аргументы и исполняемые файлы нельзя считать нашей службой.
+        let expected_path = format!("path={} ;", binary.display());
+        let expected_args = format!(
+            "argv[]={} clean --apply --installed-root ;",
+            binary.display()
+        );
+        if exec.matches("path=").count() != 1
+            || !exec.contains(&expected_path)
+            || !exec.contains(&expected_args)
+        {
+            return Err(
+                "ExecStart загруженной службы не соответствует установленному бинарнику".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Общий источник фактов для обоих публичных интерфейсов состояния.
 pub fn inspect() -> TimerInspection {
-    let root = installed_root();
-    let installed_root = root.as_ref().ok().and_then(Clone::clone);
     let mut result = TimerInspection {
         state: "unavailable".into(),
+        enabled: None,
         active: None,
-        installed_root,
+        service_active: None,
+        installed_root: None,
         service_result: None,
-        error: root.err(),
+        error: None,
     };
     if let Err(e) = require_user_systemd() {
         result.error = Some(e);
         return result;
     }
-    let enabled = Command::new("systemctl")
-        .args(["--user", "is-enabled", TIMER_NAME])
-        .output();
-    let active = Command::new("systemctl")
-        .args(["--user", "is-active", TIMER_NAME])
-        .output();
-    match (enabled, active) {
-        (Ok(enabled), Ok(active)) => {
-            result.active = Some(active.status.success());
-            result.state = if enabled.status.success() && active.status.success() {
-                "enabled"
-            } else {
-                "disabled"
-            }
-            .into();
-            if enabled.status.success() && !active.status.success() {
-                result.error = Some("таймер включён, но фактически не активен".into());
-            }
-            if enabled.status.success() && result.installed_root.is_none() {
-                result.state = "unknown".into();
-                result.error = Some(
-                    "таймер включён, но принадлежность рабочей области не подтверждена".into(),
-                );
-            }
+    result.state = "unknown".into();
+    let facts = (|| {
+        let timer = loaded_unit(TIMER_NAME)?;
+        let absent = timer.get("LoadState").is_some_and(|v| v == "not-found")
+            && timer.get("FragmentPath").is_none_or(String::is_empty);
+        result.enabled = Some(query_flag("is-enabled", absent)?);
+        result.active = Some(query_flag("is-active", absent)?);
+        let service = loaded_unit(SERVICE_NAME)?;
+        result.service_active = match service.get("ActiveState").map(String::as_str) {
+            Some("inactive" | "failed") => Some(false),
+            Some("active" | "activating" | "deactivating" | "reloading") => Some(true),
+            _ => return Err("неизвестная активность службы".into()),
+        };
+        let paths = artifact_paths()?;
+        verify_unit(TIMER_NAME, &paths[1], &timer, false)?;
+        verify_unit(SERVICE_NAME, &paths[0], &service, false)?;
+        if (result.enabled == Some(true) || result.active == Some(true))
+            && (absent || service.get("LoadState").is_some_and(|v| v != "loaded"))
+        {
+            return Err("действующий таймер не имеет загруженной управляемой службы".into());
         }
-        (Err(e), _) | (_, Err(e)) => {
-            result.error = Some(format!("не удалось запросить состояние таймера: {e}"));
-            return result;
+        result.installed_root = installed_root()?;
+        if result.installed_root.is_none()
+            && (result.enabled == Some(true)
+                || result.active == Some(true)
+                || result.service_active == Some(true)
+                || artifacts_present()?)
+        {
+            return Err("принадлежность таймера рабочей области не подтверждена".into());
         }
+        result.service_result = service.get("Result").filter(|v| !v.is_empty()).cloned();
+        Ok::<_, String>(())
+    })();
+    if let Err(e) = facts {
+        result.error = Some(e);
+        return result;
     }
-    if let Ok(output) = Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            SERVICE_NAME,
-            "--property=Result",
-            "--value",
-        ])
-        .output()
-        && output.status.success()
+    result.state = if result.enabled == Some(true)
+        || result.active == Some(true)
+        || result.service_active == Some(true)
     {
-        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !value.is_empty() {
-            result.service_result = Some(value);
-        }
+        "enabled"
+    } else {
+        "disabled"
+    }
+    .into();
+    if result.enabled == Some(true) && result.active != Some(true) {
+        result.error = Some("автозапуск разрешён, но таймер сейчас не активен".into());
     }
     result
 }
@@ -143,7 +308,16 @@ pub fn inspect() -> TimerInspection {
 pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
     let _lock = crate::guard::MaintenanceLock::acquire()
         .map_err(|e| format!("параллельная операция установки или GC: {e}"))?;
+    install_with_lock(root, current_exe, &_lock)
+}
+
+pub(crate) fn install_with_lock(
+    root: &Path,
+    current_exe: &Path,
+    _lock: &crate::guard::MaintenanceLock,
+) -> Result<TimerResult, String> {
     require_user_systemd()?;
+    verify_installation_binding()?;
     // Один пользовательский таймер не должен незаметно переключаться между клонами.
     if let Some(existing) = installed_root()? {
         if existing != root {
@@ -201,11 +375,29 @@ pub fn install(root: &Path, current_exe: &Path) -> Result<TimerResult, String> {
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", TIMER_NAME])?;
     let status = systemctl(&["status", TIMER_NAME, "--no-pager"])?;
+    let facts = inspect();
+    if facts.state != "enabled"
+        || facts.enabled != Some(true)
+        || facts.active != Some(true)
+        || facts.installed_root.as_deref() != Some(root)
+    {
+        return Err(format!(
+            "после установки таймер не подтверждён: {}; {:?}",
+            facts.state, facts.error
+        ));
+    }
     Ok(TimerResult {
         state: "enabled",
         message: "ежедневный пользовательский таймер systemd установлен и включён".into(),
         command_output: Some(status),
     })
+}
+
+fn verify_installation_binding() -> Result<(), String> {
+    let paths = artifact_paths()?;
+    verify_unit(TIMER_NAME, &paths[1], &loaded_unit(TIMER_NAME)?, true)?;
+    verify_unit(SERVICE_NAME, &paths[0], &loaded_unit(SERVICE_NAME)?, true)?;
+    Ok(())
 }
 
 pub fn uninstall() -> Result<TimerResult, String> {
@@ -220,7 +412,16 @@ pub fn uninstall_for(root: &Path) -> Result<TimerResult, String> {
 fn uninstall_inner(expected_root: Option<&Path>) -> Result<TimerResult, String> {
     let _lock = crate::guard::MaintenanceLock::acquire()
         .map_err(|e| format!("параллельная операция удаления или GC: {e}"))?;
+    uninstall_with_lock(expected_root, &_lock)
+}
+
+pub(crate) fn uninstall_with_lock(
+    expected_root: Option<&Path>,
+    _lock: &crate::guard::MaintenanceLock,
+) -> Result<TimerResult, String> {
     require_user_systemd()?;
+    verify_installation_binding()?;
+    installed_root()?;
     if let Some(expected) = expected_root
         && installed_root()?.as_deref() != Some(expected)
     {
@@ -245,7 +446,19 @@ fn uninstall_inner(expected_root: Option<&Path>) -> Result<TimerResult, String> 
         }
     }
     if has_managed_unit {
-        let _ = systemctl(&["disable", "--now", TIMER_NAME]);
+        systemctl(&["disable", "--now", TIMER_NAME])?;
+        systemctl(&["stop", SERVICE_NAME])?;
+        if query_flag("is-enabled", false)?
+            || query_flag("is-active", false)?
+            || !matches!(
+                loaded_unit(SERVICE_NAME)?
+                    .get("ActiveState")
+                    .map(String::as_str),
+                Some("inactive" | "failed")
+            )
+        {
+            return Err("таймер или служба остались активны; файлы сохранены".into());
+        }
     }
     let mut managed_config = false;
     if let Ok(metadata) = fs::symlink_metadata(&app_config) {
@@ -302,24 +515,34 @@ fn uninstall_inner(expected_root: Option<&Path>) -> Result<TimerResult, String> 
 }
 
 pub fn status() -> Result<TimerResult, String> {
-    require_user_systemd()?;
-    let enabled = Command::new("systemctl")
-        .args(["--user", "is-enabled", TIMER_NAME])
-        .output()
-        .map_err(|error| format!("не удалось проверить таймер: {error}"))?;
-    if !enabled.status.success() {
-        return Ok(TimerResult {
-            state: "disabled",
-            message: "таймер не включён".into(),
-            command_output: Some(String::from_utf8_lossy(&enabled.stdout).trim().to_owned()),
-        });
+    let facts = inspect();
+    if matches!(facts.state.as_str(), "unknown" | "unavailable") {
+        return Err(facts
+            .error
+            .unwrap_or_else(|| "состояние таймера неизвестно".into()));
     }
-    let output = systemctl(&["status", TIMER_NAME, "--no-pager"])?;
     Ok(TimerResult {
-        state: "enabled",
-        message: "состояние пользовательского таймера systemd".into(),
-        command_output: Some(output),
+        state: if facts.state == "enabled" {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        message: format!(
+            "автозапуск: {}; таймер активен: {}; служба активна: {}",
+            flag_text(facts.enabled),
+            flag_text(facts.active),
+            flag_text(facts.service_active)
+        ),
+        command_output: facts.error,
     })
+}
+
+fn flag_text(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "да",
+        Some(false) => "нет",
+        None => "неизвестно",
+    }
 }
 
 fn require_user_systemd() -> Result<(), String> {
@@ -495,9 +718,15 @@ fn ensure_managed_or_absent(path: &Path) -> Result<(), String> {
 fn ensure_managed(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("не удалось проверить {}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+    {
         return Err(format!(
-            "{} не является обычным служебным файлом systemd",
+            "{} не является безопасным обычным служебным файлом systemd",
             path.display()
         ));
     }
@@ -582,8 +811,11 @@ fn ensure_binary_managed_or_absent(
             let uid = fs::metadata("/proc/self")
                 .map_err(|error| error.to_string())?
                 .uid();
-            if metadata.uid() != uid {
-                return Err(format!("{} принадлежит другому UID", binary.display()));
+            if metadata.uid() != uid || metadata.nlink() != 1 || metadata.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "{} имеет небезопасного владельца, ссылки или права",
+                    binary.display()
+                ));
             }
             let service_owned = match fs::symlink_metadata(service) {
                 Ok(_) => {
@@ -815,7 +1047,28 @@ mod tests {
         let systemctl = fake_bin.join("systemctl");
         fs::write(
             &systemctl,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\ncase \" $* \" in *' is-enabled '*) echo enabled;; *' status '*) echo active;; esac\nexit 0\n",
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$2" in
+is-enabled) if [ -f "$HOME/active" ]; then echo enabled; else echo disabled; exit 1; fi;;
+is-active) if [ -f "$HOME/active" ]; then echo active; else echo inactive; exit 3; fi;;
+enable) : > "$HOME/active";;
+disable) /bin/rm -f "$HOME/active";;
+show)
+name="$3"
+fragment="$XDG_CONFIG_HOME/systemd/user/$name"
+if [ -f "$fragment" ]; then echo LoadState=loaded; echo "FragmentPath=$fragment";
+else echo LoadState=not-found; echo FragmentPath=; fi
+echo ActiveState=inactive
+echo Result=success
+echo DropInPaths=
+echo NeedDaemonReload=no
+execpath="$HOME/.local/bin/anki-repository-maintenance"
+echo "ExecStart={ path=$execpath ; argv[]=$execpath clean --apply --installed-root ; }"
+ ;;
+esac
+exit 0
+"#,
         )
         .unwrap();
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();

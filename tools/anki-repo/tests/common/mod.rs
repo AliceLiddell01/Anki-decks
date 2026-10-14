@@ -1,11 +1,11 @@
-//! Общие helpers интеграционных тестов.
+//! Общие вспомогательные функции интеграционных тестов.
 //!
-//! Каждый fixture живёт в собственном временном каталоге и удаляется через
+//! Каждый тестовый набор данных живёт в собственном временном каталоге и удаляется через
 //! `Drop`, поэтому тесты можно запускать параллельно.
 //!
-//! Ни один helper не знает layout репозитория и содержимого `decks/`: default
-//! test suite обязан оставаться корректным, когда состав колод, уровни JLPT,
-//! note models и media изменятся или временно отсутствуют. Всё, что тесту
+//! Вспомогательные функции не знают структуру репозитория и содержимое `decks/`:
+//! набор тестов по умолчанию обязан оставаться корректным, когда состав колод,
+//! уровни JLPT, модели заметок и медиафайлы изменятся или временно отсутствуют. Всё, что тесту
 //! нужно, тест строит сам — в своём временном каталоге и с собственными именами
 //! полей и моделей.
 
@@ -45,7 +45,8 @@ impl TempDir {
 
     /// Записывает `deck.json` из готового значения.
     pub fn write_export(&self, export: &Value) {
-        let text = serde_json::to_string_pretty(export).expect("fixture должен сериализоваться");
+        let text =
+            serde_json::to_string_pretty(export).expect("тестовые данные должны сериализоваться");
         self.write_raw_deck_json(&text);
     }
 
@@ -57,7 +58,7 @@ impl TempDir {
     /// Записывает `deck.json` в канонической форме, которую требует `edit`.
     pub fn write_canonical_deck_json(&self, export: &Value) {
         let bytes = anki_repo::loader::render_canonical_bytes(export)
-            .expect("fixture должен сериализоваться в каноническую форму");
+            .expect("тестовые данные должны сериализоваться в каноническую форму");
         self.write_deck_json_bytes(&bytes);
     }
 
@@ -724,7 +725,7 @@ fn white_color_value(raw: &str) -> bool {
 
 /// Разбивает байты на строки без завершающего перевода строки.
 pub fn lines(bytes: &[u8]) -> Vec<Vec<u8>> {
-    let text = std::str::from_utf8(bytes).expect("fixture — utf-8");
+    let text = std::str::from_utf8(bytes).expect("тестовые данные — utf-8");
     text.split('\n')
         .map(|line| line.as_bytes().to_vec())
         .collect()

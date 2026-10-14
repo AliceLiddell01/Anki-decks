@@ -86,7 +86,7 @@ fn notify_test_uses_windows_toast_without_cleaning_or_real_windows() {
     assert!(!failure.status.success());
     assert!(
         String::from_utf8_lossy(&failure.stderr)
-            .contains("Windows PowerShell/BurntToast завершился с кодом"),
+            .contains("Windows PowerShell/BurntToast: обработчик уведомления завершился с кодом"),
         "{}",
         String::from_utf8_lossy(&failure.stderr)
     );

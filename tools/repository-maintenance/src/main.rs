@@ -7,7 +7,7 @@ use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use clap::{Args, Parser, Subcommand};
 use repository_maintenance::care;
 use repository_maintenance::policy::{Policy, workspace_root};
-use repository_maintenance::{RunOptions, render_json, render_text, run};
+use repository_maintenance::{RunOptions, render_json, render_text};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -185,12 +185,13 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
         temp_root: args.temp_root,
         top_entries: args.top.unwrap_or(policy.tmp_top_entries),
     };
-    match run(&root, &policy, &options) {
+    let (result, snapshot_error) = repository_maintenance::run_and_record(&root, &policy, &options);
+    if let Some(error) = snapshot_error {
+        eprintln!("Не удалось сохранить последний результат GC: {error}");
+    }
+    match result {
         Ok(report) => {
             if apply {
-                if let Err(error) = care::record_report(&report) {
-                    eprintln!("Не удалось сохранить последний результат GC: {error}");
-                }
                 // Частичный обзор чужих каталогов /tmp — не сбой очистки
                 // и не основание тревожить пользователя при каждом запуске таймера.
                 if report.fatal_errors > 0 {
@@ -211,9 +212,6 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
         }
         Err(error) => {
             if apply {
-                if let Err(snapshot_error) = care::record_failure(&root, &error) {
-                    eprintln!("Не удалось сохранить сбой GC: {snapshot_error}");
-                }
                 care::desktop_alert(
                     "Не удалось выполнить GC; проверьте anki-repo maintenance status",
                 );

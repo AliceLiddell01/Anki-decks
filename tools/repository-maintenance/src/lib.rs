@@ -142,8 +142,6 @@ impl Default for RunOptions {
 }
 
 pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report, String> {
-    let started = Instant::now();
-    let scan_started = Instant::now();
     let lock = if options.apply {
         match guard::MaintenanceLock::acquire() {
             Ok(lock) => Some(lock),
@@ -156,6 +154,46 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
     } else {
         None
     };
+    run_with_lock(root, policy, options, lock.as_ref())
+}
+
+/// Применение, повторные замеры и snapshot фиксируются под одной блокировкой.
+/// Внешнее уведомление вызывающий код выполняет после возврата и снятия lock.
+pub fn run_and_record(
+    root: &Path,
+    policy: &Policy,
+    options: &RunOptions,
+) -> (Result<Report, String>, Option<String>) {
+    if !options.apply {
+        return (run(root, policy, options), None);
+    }
+    let lock = match guard::MaintenanceLock::acquire() {
+        Ok(lock) => lock,
+        Err(e) => {
+            return (
+                Err(format!(
+                    "очистка отложена: не удалось получить общую блокировку обслуживания: {e}"
+                )),
+                None,
+            );
+        }
+    };
+    let result = run_with_lock(root, policy, options, Some(&lock));
+    let snapshot = match &result {
+        Ok(report) => care::record_report_with_lock(report, &lock),
+        Err(e) => care::record_failure_with_lock(root, e, &lock),
+    };
+    (result, snapshot.err())
+}
+
+fn run_with_lock(
+    root: &Path,
+    policy: &Policy,
+    options: &RunOptions,
+    _lock: Option<&guard::MaintenanceLock>,
+) -> Result<Report, String> {
+    let started = Instant::now();
+    let scan_started = Instant::now();
     let workspace = target::discover_workspace(root)?;
     let target_report = target::inspect_target(
         &workspace,
@@ -412,7 +450,6 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
         }
         cleanup_ms = cleanup_ms.saturating_add(clean_start.elapsed().as_millis());
     }
-    drop(lock);
 
     let project_temp = if options.apply {
         project_temp_candidates(

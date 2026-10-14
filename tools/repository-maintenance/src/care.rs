@@ -46,12 +46,19 @@ pub struct GcItem {
 #[serde(deny_unknown_fields)]
 pub struct LastAttempt {
     pub schema_version: u32,
+    #[serde(serialize_with = "crate::serialize_report_path")]
     pub workspace_root: PathBuf,
     pub timestamp: u64,
     pub outcome: String,
     pub bytes_freed: Option<u64>,
     pub errors: usize,
     pub inventory_complete: bool,
+    #[serde(default)]
+    pub managed_inventory_complete: Option<bool>,
+    #[serde(default)]
+    pub fatal_errors: Option<usize>,
+    #[serde(default)]
+    pub mode: Option<String>,
     pub message: String,
     #[serde(default)]
     pub items: Vec<GcItem>,
@@ -64,7 +71,7 @@ pub struct Diagnostic {
     pub code: &'static str,
     pub severity: &'static str,
     pub message: String,
-    pub action: Option<&'static str>,
+    pub action: Option<String>,
     pub context: serde_json::Value,
 }
 
@@ -93,7 +100,7 @@ fn system_tmp_diagnostic(health: &SystemTmpHealth) -> Option<Diagnostic> {
     let mut entry = diag(
         "system_tmp_inventory_incomplete",
         "info",
-        "Общий обзор /tmp неполон; показатели подтверждённых артефактов Anki-decks учитываются отдельно. Чужие каталоги и mount не обходятся.",
+        "Общий обзор /tmp неполон; показатели подтверждённых артефактов Anki-decks учитываются отдельно. Доступные чужие каталоги могут просматриваться, но не удаляются; границы mount не пересекаются.",
         Some("anki-repository-maintenance scan --detail --json"),
     );
     entry.context = serde_json::json!({
@@ -107,6 +114,8 @@ fn system_tmp_diagnostic(health: &SystemTmpHealth) -> Option<Diagnostic> {
 pub struct Measurement {
     pub project_bytes: Option<u64>,
     pub complete: bool,
+    pub managed_complete: bool,
+    pub fatal_errors: usize,
     pub cargo_target_bytes: Option<u64>,
     pub target_warning_bytes: u64,
     pub target_hard_limit_bytes: u64,
@@ -122,11 +131,15 @@ pub struct Measurement {
 #[derive(Clone, Debug, Serialize)]
 pub struct CareStatus {
     pub schema_version: u32,
+    #[serde(serialize_with = "crate::serialize_report_path")]
     pub workspace_root: PathBuf,
     pub preference: String,
     pub automatic: String,
+    #[serde(serialize_with = "crate::serialize_optional_report_path")]
     pub installed_workspace: Option<PathBuf>,
     pub timer_active: Option<bool>,
+    pub timer_enabled: Option<bool>,
+    pub service_active: Option<bool>,
     pub measurement: Measurement,
     pub items: Vec<GcItem>,
     pub omitted_items: usize,
@@ -264,6 +277,10 @@ pub fn set_choice(choice: &str) -> Result<(), String> {
         return Err("допускаются только yes или no".into());
     }
     let _lock = MaintenanceLock::acquire().map_err(|e| format!("блокировка настройки GC: {e}"))?;
+    set_choice_with_lock(choice, &_lock)
+}
+
+fn set_choice_with_lock(choice: &str, _lock: &MaintenanceLock) -> Result<(), String> {
     let mut p = read_pref()?;
     p.choice = choice.into();
     write_private(
@@ -334,11 +351,22 @@ pub fn last_attempt() -> Result<Option<LastAttempt>, String> {
     Ok(Some(entry))
 }
 
-fn record(entry: &LastAttempt) -> Result<(), String> {
-    let _lock = MaintenanceLock::acquire().map_err(|e| e.to_string())?;
+fn record(entry: &LastAttempt, _lock: &MaintenanceLock) -> Result<(), String> {
+    // Snapshot хранит точные рабочие пути; маскировка применяется только к
+    // внешнему JSON. Это сохраняет сопоставление checkout после чтения.
+    let mut stored = serde_json::to_value(entry).map_err(|e| e.to_string())?;
+    stored["workspace_root"] = serde_json::json!(entry.workspace_root);
+    for (value, item) in stored["items"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(&entry.items)
+    {
+        value["path"] = serde_json::json!(item.path);
+    }
     write_private(
         &state_path()?,
-        &serde_json::to_vec_pretty(entry).map_err(|e| e.to_string())?,
+        &serde_json::to_vec_pretty(&stored).map_err(|e| e.to_string())?,
     )
 }
 
@@ -386,6 +414,14 @@ fn report_items(report: &Report) -> (Vec<GcItem>, usize) {
 }
 
 pub fn record_report(report: &Report) -> Result<(), String> {
+    let lock = MaintenanceLock::acquire().map_err(|e| e.to_string())?;
+    record_report_with_lock(report, &lock)
+}
+
+pub(crate) fn record_report_with_lock(
+    report: &Report,
+    lock: &MaintenanceLock,
+) -> Result<(), String> {
     let (items, omitted_items) = report_items(report);
     // То же условие, что и у `measurement.complete` в `inspect`: фатальная ошибка
     // измерения `target` делает инвентаризацию неполной, а не «полной с ошибкой».
@@ -408,36 +444,99 @@ pub fn record_report(report: &Report) -> Result<(), String> {
     } else {
         "success"
     };
-    record(&LastAttempt {
-        schema_version: 1,
-        workspace_root: report.workspace_root.clone(),
-        timestamp: report.generated_unix_seconds,
-        outcome: outcome.into(),
-        bytes_freed: Some(freed),
-        errors: report.errors,
-        inventory_complete: complete,
-        message: format!(
-            "{}; освобождено {freed} байт; ошибок {}",
-            report.mode, report.errors
-        ),
-        items,
-        omitted_items,
-    })
+    record(
+        &LastAttempt {
+            schema_version: 1,
+            workspace_root: report.workspace_root.clone(),
+            timestamp: report.generated_unix_seconds,
+            outcome: outcome.into(),
+            bytes_freed: Some(freed),
+            errors: report.errors,
+            inventory_complete: complete,
+            managed_inventory_complete: Some(managed_complete(report)),
+            fatal_errors: Some(report.fatal_errors),
+            mode: Some(report.mode.into()),
+            message: format!("Ошибок {}", report.errors),
+            items,
+            omitted_items,
+        },
+        lock,
+    )
 }
 
 pub fn record_failure(root: &Path, message: &str) -> Result<(), String> {
-    record(&LastAttempt {
-        schema_version: 1,
-        workspace_root: root.to_path_buf(),
-        timestamp: now(),
-        outcome: "failed".into(),
-        bytes_freed: None,
-        errors: 1,
-        inventory_complete: false,
-        message: message.into(),
-        items: Vec::new(),
-        omitted_items: 0,
-    })
+    let lock = MaintenanceLock::acquire().map_err(|e| e.to_string())?;
+    record_failure_with_lock(root, message, &lock)
+}
+
+pub(crate) fn record_failure_with_lock(
+    root: &Path,
+    message: &str,
+    lock: &MaintenanceLock,
+) -> Result<(), String> {
+    record(
+        &LastAttempt {
+            schema_version: 1,
+            workspace_root: root.to_path_buf(),
+            timestamp: now(),
+            outcome: "failed".into(),
+            bytes_freed: None,
+            errors: 1,
+            inventory_complete: false,
+            managed_inventory_complete: Some(false),
+            fatal_errors: Some(1),
+            mode: None,
+            message: message.into(),
+            items: Vec::new(),
+            omitted_items: 0,
+        },
+        lock,
+    )
+}
+
+fn managed_complete(report: &Report) -> bool {
+    report.fatal_errors == 0
+        && report.cargo_target.ownership == "project-owned"
+        && report.external_cache_unknown_entries == 0
+        && report
+            .project_temp
+            .iter()
+            .all(|c| c.ownership == "project-owned" && c.action != "error")
+}
+
+/// Ограничивает необязательное внешнее действие; после kill обязательно wait.
+fn bounded_notification(command: &mut Command, timeout: Duration) -> Result<(), String> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("не удалось запустить уведомление: {e}"))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "обработчик уведомления завершился с кодом {:?}",
+                        status.code()
+                    ))
+                };
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            result => {
+                let kill = child.kill();
+                let wait = child.wait();
+                return Err(format!(
+                    "уведомление не завершилось за отведённое время или ожидание прервано: {result:?}; завершение: {kill:?}; ожидание: {wait:?}"
+                ));
+            }
+        }
+    }
 }
 
 /// Уведомление — необязательное побочное действие: ошибка не меняет результат GC.
@@ -470,20 +569,12 @@ fn try_desktop_alert_on(wsl: bool, message: &str) -> Result<&'static str, String
     {
         return Err("графическая Linux-сессия с D-Bus недоступна".into());
     }
-    let result = Command::new("notify-send")
-        .args(["--urgency=normal", "Anki-decks: обслуживание", message])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("notify-send недоступен: {e}"))?;
-    if result.success() {
-        Ok("linux-notify-send")
-    } else {
-        Err(format!(
-            "notify-send завершился с кодом {:?}",
-            result.code()
-        ))
-    }
+    bounded_notification(
+        Command::new("notify-send").args(["--urgency=normal", "Anki-decks: обслуживание", message]),
+        Duration::from_secs(5),
+    )
+    .map(|()| "linux-notify-send")
+    .map_err(|e| format!("notify-send: {e}"))
 }
 
 /// Обнаружение WSL не опирается исключительно на WSL_INTEROP: у user systemd
@@ -510,40 +601,57 @@ fn power_shell_script(message: &str) -> String {
     )
 }
 
-fn windows_toast(message: &str) -> Result<(), String> {
-    // В systemd user-unit обычно нет каталогов Windows в PATH. В таком случае
-    // используется стандартный путь при включённом automount диска C:.
-    let from_path = std::env::var_os("PATH").and_then(|path| {
+// Путь PATH имеет приоритет над резервом, в том числе в изолированных тестах.
+fn powershell_executable(
+    path: Option<std::ffi::OsString>,
+    automount: &Path,
+) -> Result<PathBuf, String> {
+    let from_path = path.and_then(|path| {
         std::env::split_paths(&path)
             .map(|dir| dir.join("powershell.exe"))
-            .find(|candidate| candidate.is_file())
+            .find(|p| p.is_file())
     });
-    let fallback = Path::new("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
-    let executable = from_path
-        .or_else(|| fallback.is_file().then(|| fallback.to_path_buf()))
-        .ok_or(
-            "powershell.exe не найден в PATH или стандартном /mnt/c/Windows; проверьте WSL interop",
-        )?;
-    let result = Command::new(executable)
-        .args([
+    from_path.or_else(|| {
+        let candidate = automount.join("c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+        candidate.is_file().then_some(candidate)
+    }).ok_or("powershell.exe не найден в PATH или Windows automount; проверьте WSL interop и добавьте Windows PowerShell в PATH службы".into())
+}
+
+fn windows_toast(message: &str) -> Result<(), String> {
+    // Сохраняем стандартный /mnt/c; нестандартный automount читаем из wsl.conf.
+    let config = fs::read_to_string("/etc/wsl.conf").unwrap_or_default();
+    let automount = wsl_automount(&config);
+    let executable = powershell_executable(std::env::var_os("PATH"), &automount)?;
+    bounded_notification(
+        Command::new(executable).args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             &power_shell_script(message),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("не удалось запустить Windows PowerShell через WSL: {e}"))?;
-    if result.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Windows PowerShell/BurntToast завершился с кодом {:?}",
-            result.code()
-        ))
+        ]),
+        Duration::from_secs(5),
+    )
+    .map_err(|e| format!("Windows PowerShell/BurntToast: {e}"))
+}
+
+fn wsl_automount(config: &str) -> PathBuf {
+    let mut in_section = false;
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_section = line.eq_ignore_ascii_case("[automount]");
+        }
+        if in_section
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("root")
+        {
+            let value = value.trim().trim_matches('"');
+            if Path::new(value).is_absolute() {
+                return PathBuf::from(value);
+            }
+        }
     }
+    PathBuf::from("/mnt")
 }
 
 fn diag(
@@ -556,13 +664,21 @@ fn diag(
         code,
         severity,
         message: message.into(),
-        action,
+        action: action.map(str::to_owned),
         context: serde_json::json!({}),
     }
 }
 
 /// Диагностика пользуется тем же планировщиком и политикой, что и настоящий GC.
 pub fn inspect(root: &Path) -> CareStatus {
+    inspect_with_policy(root, Policy::defaults(), &RunOptions::default())
+}
+
+fn inspect_with_policy(
+    root: &Path,
+    policy: Result<Policy, String>,
+    options: &RunOptions,
+) -> CareStatus {
     let mut diagnostics = Vec::new();
     let mut items = Vec::new();
     let mut omitted_items = 0;
@@ -609,7 +725,9 @@ pub fn inspect(root: &Path) -> CareStatus {
             Some("anki-repo maintenance enable"),
         ));
     }
-    if preference == "yes" && automatic != "enabled" {
+    if preference == "yes"
+        && (automatic != "enabled" || timer.enabled != Some(true) || timer.active != Some(true))
+    {
         diagnostics.push(diag(
             "preference_mismatch",
             "warning",
@@ -617,7 +735,11 @@ pub fn inspect(root: &Path) -> CareStatus {
             Some("anki-repo maintenance enable"),
         ));
     }
-    if preference == "no" && automatic == "enabled" {
+    if preference == "no"
+        && (timer.enabled == Some(true)
+            || timer.active == Some(true)
+            || timer.service_active == Some(true))
+    {
         diagnostics.push(diag(
             "preference_mismatch",
             "warning",
@@ -640,6 +762,8 @@ pub fn inspect(root: &Path) -> CareStatus {
     let mut measurement = Measurement {
         project_bytes: None,
         complete: false,
+        managed_complete: false,
+        fatal_errors: 0,
         cargo_target_bytes: None,
         target_warning_bytes: 0,
         target_hard_limit_bytes: 0,
@@ -649,17 +773,19 @@ pub fn inspect(root: &Path) -> CareStatus {
         errors: 0,
         system_tmp: None,
     };
-    match Policy::defaults() {
+    match policy {
         Ok(policy) => {
             measurement.target_warning_bytes = policy.warning_bytes();
             measurement.target_hard_limit_bytes = policy.hard_limit_bytes();
             measurement.external_cache_hard_limit_bytes = policy.external_hard_limit_bytes();
-            match run(root, &policy, &RunOptions::default()) {
+            match run(root, &policy, options) {
                 Ok(report) => {
                     (items, omitted_items) = report_items(&report);
                     measurement.complete =
                         report.tmp.iter().all(|t| t.complete) && report.errors == 0;
                     measurement.errors = report.errors;
+                    measurement.managed_complete = managed_complete(&report);
+                    measurement.fatal_errors = report.fatal_errors;
                     measurement.system_tmp = Some(SystemTmpHealth::from_inventories(&report.tmp));
                     if report.cargo_target.ownership == "project-owned" {
                         measurement.cargo_target_bytes = Some(report.cargo_target.bytes_before);
@@ -696,7 +822,7 @@ pub fn inspect(root: &Path) -> CareStatus {
                                 report.cargo_target.bytes_before,
                                 policy.warning_bytes()
                             ),
-                            Some("anki-repository-maintenance clean (сначала dry-run)"),
+                            Some("anki-repository-maintenance clean"),
                         ));
                     }
                     if report.external_cache_bytes_before >= policy.external_hard_limit_bytes() {
@@ -704,7 +830,7 @@ pub fn inspect(root: &Path) -> CareStatus {
                             "external_cache_limit",
                             "warning",
                             "Достигнут предел зарегистрированных внешних кэшей",
-                            Some("anki-repository-maintenance clean (сначала dry-run)"),
+                            Some("anki-repository-maintenance clean"),
                         ));
                     }
                     if let Some(tmp) = &measurement.system_tmp
@@ -758,11 +884,53 @@ pub fn inspect(root: &Path) -> CareStatus {
                 "warning"
             },
             format!(
-                "Последнее обслуживание: {} ({})",
-                last.outcome, last.message
+                "Последнее обслуживание: {}; ошибок {}",
+                outcome_text(&last.outcome),
+                last.errors
             ),
             Some("anki-repository-maintenance scan --json"),
         ));
+    }
+    // Все исполняемые рекомендации привязаны к диагностируемому checkout.
+    let quoted = format!("'{}'", root.to_string_lossy().replace('\'', "'\\''"));
+    for diagnostic in &mut diagnostics {
+        if let Some(action) = &mut diagnostic.action {
+            if let Some(tail) = action.strip_prefix("anki-repository-maintenance ") {
+                let (verb, args) = tail.split_once(' ').unwrap_or((tail, ""));
+                *action =
+                    format!("anki-repository-maintenance {verb} --workspace-root {quoted} {args}")
+                        .trim_end()
+                        .into();
+            } else if let Some(tail) = action.strip_prefix("anki-repo maintenance ") {
+                *action = format!("anki-repo maintenance --workspace-root {quoted} {tail}");
+            }
+        }
+        if matches!(
+            diagnostic.code,
+            "timer_unavailable"
+                | "timer_other_workspace"
+                | "preference_mismatch"
+                | "systemd_service_failure"
+        ) {
+            diagnostic.context["timer_enabled"] = serde_json::json!(timer.enabled);
+            diagnostic.context["timer_active"] = serde_json::json!(timer.active);
+            diagnostic.context["service_active"] = serde_json::json!(timer.service_active);
+            diagnostic.context["installed_workspace"] = serde_json::json!(
+                timer
+                    .installed_root
+                    .as_deref()
+                    .map(crate::redact_temp_namespace_uid)
+            );
+        }
+        if diagnostic.code == "last_gc_problem"
+            && let Some(last) = &last_attempt
+        {
+            diagnostic.context["outcome"] = serde_json::json!(last.outcome);
+            diagnostic.context["mode"] = serde_json::json!(last.mode);
+            diagnostic.context["message"] = serde_json::json!(last.message);
+        }
+        diagnostic.context["workspace_root"] =
+            serde_json::json!(crate::redact_temp_namespace_uid(root));
     }
     CareStatus {
         schema_version: 1,
@@ -771,6 +939,8 @@ pub fn inspect(root: &Path) -> CareStatus {
         automatic,
         installed_workspace: timer.installed_root,
         timer_active: timer.active,
+        timer_enabled: timer.enabled,
+        service_active: timer.service_active,
         measurement,
         items,
         omitted_items,
@@ -805,79 +975,61 @@ fn maintenance_binary() -> Result<PathBuf, String> {
 
 /// Согласие само по себе не означает успешную установку.
 pub fn enable(root: &Path) -> Result<(), String> {
-    set_choice("yes")?;
+    let lock = MaintenanceLock::acquire().map_err(|e| format!("блокировка настройки GC: {e}"))?;
+    // Согласие намеренно сохраняется при неудачной установке: повторный enable
+    // восстанавливает её. Ошибка возвращается вызывающему коду явно.
+    set_choice_with_lock("yes", &lock)?;
     let binary = maintenance_binary()?;
-    timer::install(root, &binary)?;
+    timer::install_with_lock(root, &binary, &lock)?;
     let health = timer::inspect();
-    if health.state != "enabled" || health.installed_root.as_deref() != Some(root) {
+    if health.state != "enabled"
+        || health.enabled != Some(true)
+        || health.active != Some(true)
+        || health.installed_root.as_deref() != Some(root)
+    {
         return Err(format!(
-            "после установки таймер не подтверждён: {}",
-            health.state
+            "после установки таймер не подтверждён: {}; {:?}",
+            health.state, health.error
         ));
     }
     Ok(())
 }
 
-/// Следы установки на диске: unit-файлы таймера в пользовательском каталоге
-/// systemd либо конфигурация установки. Их отсутствие — единственное
-/// доказательство того, что сохранённый отказ ничего не скрывает.
-fn installed_artifacts_present() -> bool {
-    let Some(config_home) = config_home() else {
-        return true;
-    };
-    let unit_dir = config_home.join("systemd/user");
-    [
-        unit_dir.join("anki-repository-maintenance.service"),
-        unit_dir.join("anki-repository-maintenance.timer"),
-        config_home.join("anki-decks/repository-maintenance-install.toml"),
-    ]
-    .iter()
-    .any(|path| fs::symlink_metadata(path).is_ok())
-}
-
-/// Не отключает unit, принадлежащий другому checkout, и не выдаёт отказ за
-/// выполненное отключение. Если принадлежность не подтверждена, а следы
-/// установки есть, `disable` сначала пытается снять установку и только по
-/// фактическому результату сохраняет выбор.
+/// Проверка фактов, отключение и сохранение отказа составляют одну операцию.
 pub fn disable(root: &Path) -> Result<(), String> {
+    let lock = MaintenanceLock::acquire().map_err(|e| format!("блокировка настройки GC: {e}"))?;
     let health = timer::inspect();
+    if matches!(health.state.as_str(), "unknown" | "unavailable") {
+        return Err(format!(
+            "таймер не подтверждён; отключение запрещено: {:?}",
+            health.error
+        ));
+    }
     if health
         .installed_root
         .as_deref()
         .is_some_and(|installed| installed != root)
     {
-        return Err(
-            "таймер связан с другим checkout; отказ здесь не должен отключить чужой таймер".into(),
-        );
+        return Err("таймер связан с другим checkout; отключение запрещено".into());
     }
     if health.installed_root.is_some() {
-        timer::uninstall_for(root)?;
-    } else if installed_artifacts_present() {
-        // Привязка не подтверждена (нет конфигурации установки или её нельзя
-        // прочитать), но unit-файлы на месте и таймер может продолжать работать.
-        // `uninstall` удаляет только файлы с отметкой владельца.
-        timer::uninstall()?;
-        let after = timer::inspect();
-        if after.installed_root.is_some() || installed_artifacts_present() {
-            return Err(format!(
-                "автоматическая очистка не отключена: состояние таймера {}; {}",
-                after.state,
-                after
-                    .error
-                    .unwrap_or_else(|| "проверьте anki-repo maintenance status".into())
-            ));
-        }
+        timer::uninstall_with_lock(Some(root), &lock)?;
+    } else if timer::artifacts_present()? {
+        return Err("принадлежность артефактов таймера не подтверждена".into());
     }
-    // Проверяем результат до записи отказа: сохранённый `no` при работающем
-    // таймере даёт вечный preference_mismatch и не останавливает очистку.
     let after = timer::inspect();
-    if matches!(after.state.as_str(), "enabled" | "unknown") {
+    if after.state != "disabled"
+        || after.enabled != Some(false)
+        || after.active != Some(false)
+        || after.service_active != Some(false)
+        || timer::artifacts_present()?
+    {
         return Err(format!(
-            "автоматическая очистка всё ещё включена: состояние таймера {}; проверьте anki-repo maintenance status",
-            after.state
+            "автоматическая очистка не отключена: {}; {:?}",
+            after.state, after.error
         ));
     }
-    set_choice("no")
+    set_choice_with_lock("no", &lock)
 }
 
 /// Значение необязательного счётчика в пользовательском тексте: `None` — это
@@ -895,12 +1047,55 @@ fn active_or_unknown(value: Option<bool>) -> &'static str {
     }
 }
 
+fn outcome_text(value: &str) -> &str {
+    match value {
+        "success" => "успешно",
+        "partial" => "неполный обзор",
+        "failed" => "сбой",
+        _ => "неизвестно",
+    }
+}
+fn mode_text(value: Option<&str>) -> &str {
+    match value {
+        Some("apply") => "очистка с записью",
+        Some("scan") => "обзор",
+        Some("dry-run") => "предварительный просмотр",
+        _ => "неизвестно",
+    }
+}
+fn age_text(timestamp: u64, at: u64) -> String {
+    if timestamp > at {
+        return "время из будущего (проверьте часы)".into();
+    }
+    let age = at - timestamp;
+    if age < 60 {
+        "менее минуты назад".into()
+    } else if age < 3600 {
+        format!("{} мин. назад", age / 60)
+    } else if age < 86400 {
+        format!("{} ч. назад", age / 3600)
+    } else {
+        format!("{} дн. назад", age / 86400)
+    }
+}
+
 pub fn render_text(status: &CareStatus) -> String {
     let mut s = format!(
         "Рабочая область: {}\nВыбор пользователя: {}\nАвтоочистка: {} (таймер активен: {})\n",
         status.workspace_root.display(),
-        status.preference,
-        status.automatic,
+        match status.preference.as_str() {
+            "yes" => "согласие",
+            "no" => "отказ",
+            "unset" => "ещё не выбран",
+            _ => "неизвестно",
+        },
+        match status.automatic.as_str() {
+            "enabled" => "включена",
+            "disabled" => "отключена",
+            "other_workspace" => "принадлежит другому checkout",
+            "unavailable" => "systemd недоступен",
+            _ => "неизвестно",
+        },
         active_or_unknown(status.timer_active)
     );
     if let Some(installed) = &status.installed_workspace {
@@ -913,12 +1108,12 @@ pub fn render_text(status: &CareStatus) -> String {
     s.push_str(&format!(
         "Учтённые управляемые артефакты: {} байт (полнота общего обзора, включая /tmp: {})\n",
         bytes_or_unknown(m.project_bytes),
-        m.complete
+        active_or_unknown(Some(m.complete))
     ));
     if let Some(tmp) = &m.system_tmp {
         s.push_str(&format!(
             "Общий обзор системного /tmp: полный {}, ошибок {}, границ mount {} (чужие объекты не удаляются)\n",
-            tmp.complete, tmp.errors, tmp.mount_boundaries
+            active_or_unknown(Some(tmp.complete)), tmp.errors, tmp.mount_boundaries
         ));
     }
     s.push_str(&format!(
@@ -934,12 +1129,16 @@ pub fn render_text(status: &CareStatus) -> String {
     ));
     if let Some(last) = &status.last_attempt {
         s.push_str(&format!(
-            "Последняя попытка: {} в {} (освобождено {} байт; {})\n",
-            last.outcome,
-            last.timestamp,
+            "Последняя попытка: {}, {} (режим: {}; освобождено {} байт; ошибок {})\n",
+            outcome_text(&last.outcome),
+            age_text(last.timestamp, now()),
+            mode_text(last.mode.as_deref()),
             bytes_or_unknown(last.bytes_freed),
-            last.message
+            last.errors
         ));
+        if last.outcome == "failed" && last.bytes_freed.is_none() {
+            s.push_str(&format!("Причина сбоя: {}\n", last.message));
+        }
         for item in &last.items {
             if item.bytes_freed > 0 || item.action == "deferred" || item.action == "error" {
                 s.push_str(&format!(
@@ -980,7 +1179,7 @@ pub fn render_text(status: &CareStatus) -> String {
     }
     for d in &status.diagnostics {
         s.push_str(&format!("[{}] {}: {}\n", d.severity, d.code, d.message));
-        if let Some(action) = d.action {
+        if let Some(action) = &d.action {
             s.push_str(&format!("  Действие: {action}\n"));
         }
     }
@@ -1085,7 +1284,8 @@ mod tests {
         assert!(!health.complete);
         assert_eq!(health.errors, 2);
         assert_eq!(health.mount_boundaries, 1);
-        let diagnostic = system_tmp_diagnostic(&health).expect("partial /tmp must be described");
+        let diagnostic =
+            system_tmp_diagnostic(&health).expect("неполный обзор /tmp должен быть описан");
         assert_eq!(diagnostic.code, "system_tmp_inventory_incomplete");
         assert_eq!(diagnostic.severity, "info");
         assert_eq!(diagnostic.context["errors"], 2);
@@ -1104,7 +1304,7 @@ mod tests {
         assert!(system_tmp_diagnostic(&health).is_none());
     }
 
-    /// Запускается как отдельный test process, чтобы не менять глобальное
+    /// Запускается как отдельный тестового процесса, чтобы не менять глобальное
     /// окружение остальных параллельно выполняемых тестов. Канал выбирается
     /// параметром, а не распознаванием хоста: на WSL-хосте `is_wsl()` вернул бы
     /// true и проверка Linux-маршрута обратилась бы к настоящему Windows PowerShell.
@@ -1252,8 +1452,9 @@ mod tests {
             "проверочный try_desktop_alert должен сообщать сбой доставки"
         );
         assert!(
-            String::from_utf8_lossy(&failed.stderr)
-                .contains("Windows PowerShell/BurntToast завершился с кодом"),
+            String::from_utf8_lossy(&failed.stderr).contains(
+                "Windows PowerShell/BurntToast: обработчик уведомления завершился с кодом"
+            ),
             "{}",
             String::from_utf8_lossy(&failed.stderr)
         );
@@ -1276,6 +1477,9 @@ mod tests {
             bytes_freed: Some(0),
             errors: 1,
             inventory_complete: false,
+            managed_inventory_complete: None,
+            fatal_errors: None,
+            mode: None,
             message: "неполное измерение".into(),
             items: Vec::new(),
             omitted_items: 0,
@@ -1284,5 +1488,323 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
         assert_eq!(rebuilt.outcome, "partial");
         assert!(!rebuilt.inventory_complete);
+    }
+    #[test]
+    fn notification_timeout_helper() {
+        let Ok(channel) = std::env::var("CARE_TIMEOUT_CHANNEL") else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let error = try_desktop_alert_on(channel == "windows", "проверка таймаута").unwrap_err();
+        assert!(error.contains("отведённое время"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(8));
+    }
+
+    #[test]
+    fn both_notification_channels_timeout_and_reap_child() {
+        let owner =
+            asset_store::temp_workspace::TempWorkspace::create("notification-timeout").unwrap();
+        let bin = owner.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["notify-send", "powershell.exe"] {
+            let path = bin.join(name);
+            fs::write(
+                &path,
+                "#!/bin/sh\nprintf '%s' \"$$\" > \"$CARE_NOTIFICATION_PID\"\nexec /bin/sleep 60\n",
+            )
+            .unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut children = Vec::new();
+        for channel in ["linux", "windows"] {
+            let pid = owner.path().join(channel);
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "care::tests::notification_timeout_helper",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", owner.path())
+                .env("PATH", &bin)
+                .env("CARE_TIMEOUT_CHANNEL", channel)
+                .env("CARE_NOTIFICATION_PID", &pid)
+                .env("DISPLAY", ":199")
+                .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/isolated")
+                .spawn()
+                .unwrap();
+            children.push((child, pid));
+        }
+        for (mut child, pidfile) in children {
+            assert!(child.wait().unwrap().success());
+            let pid = fs::read_to_string(pidfile).unwrap();
+            assert!(
+                !Path::new("/proc").join(pid).exists(),
+                "дочерний процесс должен быть завершён и собран"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_discovery_keeps_path_priority_and_handles_custom_mount() {
+        let owner =
+            asset_store::temp_workspace::TempWorkspace::create("powershell-discovery").unwrap();
+        let bin = owner.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let custom = owner.path().join("custom-mount");
+        let fallback = custom.join("c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+        fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        fs::write(&fallback, "").unwrap();
+        let stub = bin.join("powershell.exe");
+        fs::write(&stub, "").unwrap();
+        assert_eq!(
+            powershell_executable(Some(bin.clone().into_os_string()), &custom).unwrap(),
+            stub
+        );
+        fs::remove_file(stub).unwrap();
+        assert_eq!(
+            powershell_executable(Some(bin.into_os_string()), &custom).unwrap(),
+            fallback
+        );
+        fs::remove_file(fallback).unwrap();
+        assert!(
+            powershell_executable(None, &custom)
+                .unwrap_err()
+                .contains("PATH службы")
+        );
+        let config = format!(
+            "[boot]\nsystemd=true\n[automount]\nroot = {}\n",
+            custom.display()
+        );
+        assert_eq!(wsl_automount(&config), custom);
+        assert_eq!(wsl_automount(""), Path::new("/mnt"));
+    }
+
+    #[test]
+    fn diagnostic_policy_conditions_helper() {
+        let Ok(scenario) = std::env::var("CARE_POLICY_SCENARIO") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("CARE_ROOT").unwrap());
+        let mut policy = Policy::defaults().unwrap();
+        policy.target_warning_bytes = Some(1);
+        policy.target_hard_limit_bytes = Some(1024 * 1024);
+        policy.external_cache_hard_limit_bytes = Some(1);
+        policy.external_cache_goal_bytes = Some(0);
+        let tmp = std::env::temp_dir();
+        let live = asset_store::temp_workspace::TempWorkspace::create_under(&tmp, "care-live-temp")
+            .unwrap();
+        fs::write(live.path().join("data"), [1; 4096]).unwrap();
+        let cache = crate::policy::cache_home()
+            .unwrap()
+            .join("anki-decks/repository-maintenance");
+        let cache_dir = crate::cache::initialize_build_cache(&root, &cache, "diagnostic").unwrap();
+        fs::create_dir_all(cache_dir.join("target")).unwrap();
+        fs::write(
+            cache_dir.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        fs::write(cache_dir.join("target/data"), [2; 4096]).unwrap();
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("data"), [3; 4096]).unwrap();
+        let closed = tmp.join("foreign-private");
+        fs::create_dir_all(&closed).unwrap();
+        fs::write(closed.join("data"), [4; 4096]).unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        if scenario == "unsafe" {
+            fs::remove_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&cache_dir, &target).unwrap();
+        }
+        let options = RunOptions {
+            temp_root: tmp,
+            ..Default::default()
+        };
+        let status = inspect_with_policy(
+            &root,
+            if scenario == "policy-error" {
+                Err("проверяемая ошибка политики".into())
+            } else {
+                Ok(policy)
+            },
+            &options,
+        );
+        fs::set_permissions(closed, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            std::env::var_os("CARE_OUTPUT").unwrap(),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn diagnostic_thresholds_deferred_partial_inventory_and_policy_error_use_real_inspect() {
+        let owner =
+            asset_store::temp_workspace::TempWorkspace::create("care-policy-diagnostics").unwrap();
+        for scenario in ["thresholds", "unsafe", "policy-error"] {
+            let base = owner.path().join(scenario);
+            let root = base.join("checkout with spaces");
+            for name in ["bin", "home", "config", "state", "cache", "tmp"] {
+                fs::create_dir_all(base.join(name)).unwrap();
+            }
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+            let cargo = base.join("bin/cargo");
+            fs::write(&cargo,"#!/bin/sh\nprintf '{\"workspace_root\":\"%s\",\"target_directory\":\"%s/target\"}\\n' \"$CARE_ROOT\" \"$CARE_ROOT\"\n").unwrap();
+            fs::set_permissions(cargo, fs::Permissions::from_mode(0o755)).unwrap();
+            // Недоступный user-systemd также является реальным условием диагностики.
+            let systemctl = base.join("bin/systemctl");
+            fs::write(&systemctl, "#!/bin/sh\nexit 5\n").unwrap();
+            fs::set_permissions(systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+            let output = base.join("out.json");
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "care::tests::diagnostic_policy_conditions_helper",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", base.join("home"))
+                .env("XDG_CONFIG_HOME", base.join("config"))
+                .env("XDG_STATE_HOME", base.join("state"))
+                .env("XDG_CACHE_HOME", base.join("cache"))
+                .env("TMPDIR", base.join("tmp"))
+                .env("PATH", base.join("bin"))
+                .env("CARE_ROOT", &root)
+                .env("CARE_OUTPUT", &output)
+                .env("CARE_POLICY_SCENARIO", scenario)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+            let diagnostics = value["diagnostics"].as_array().unwrap();
+            let expected = match scenario {
+                "thresholds" => vec![
+                    ("target_warning", "warning"),
+                    ("external_cache_limit", "warning"),
+                    ("gc_deferred", "info"),
+                    ("system_tmp_inventory_incomplete", "info"),
+                ],
+                "unsafe" => vec![("gc_operation_error", "error")],
+                _ => vec![("policy_unavailable", "error")],
+            };
+            for (code, severity) in expected {
+                if code == "system_tmp_inventory_incomplete"
+                    && fs::metadata("/proc/self").unwrap().uid() == 0
+                {
+                    continue;
+                }
+                let d = diagnostics
+                    .iter()
+                    .find(|d| d["code"] == code)
+                    .unwrap_or_else(|| panic!("нет {code}: {value}"));
+                assert_eq!(d["severity"], severity);
+                assert!(d["context"]["workspace_root"].is_string());
+                if matches!(code, "policy_unavailable" | "gc_deferred") {
+                    assert!(d["action"].is_null());
+                }
+                if matches!(
+                    code,
+                    "system_tmp_inventory_incomplete" | "gc_operation_error"
+                ) {
+                    assert!(
+                        d["action"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("anki-repository-maintenance scan --workspace-root")
+                    );
+                }
+                if code == "target_warning" || code == "external_cache_limit" {
+                    let action = d["action"].as_str().unwrap();
+                    assert!(action.contains("--workspace-root"));
+                    assert!(action.contains("checkout with spaces"));
+                    assert!(!action.contains("--apply"));
+                    assert!(!action.contains("(сначала"));
+                }
+            }
+            if scenario == "thresholds" {
+                assert!(
+                    !diagnostics
+                        .iter()
+                        .any(|d| d["code"] == "gc_operation_error")
+                );
+                assert_eq!(value["measurement"]["fatal_errors"], 0);
+                assert_eq!(value["measurement"]["managed_complete"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn readable_status_localizes_values_without_changing_json() {
+        let status = CareStatus {
+            schema_version: 1,
+            workspace_root: PathBuf::from("/repo"),
+            preference: "yes".into(),
+            automatic: "enabled".into(),
+            installed_workspace: None,
+            timer_active: Some(true),
+            timer_enabled: Some(true),
+            service_active: Some(false),
+            measurement: Measurement {
+                project_bytes: None,
+                complete: false,
+                managed_complete: false,
+                fatal_errors: 0,
+                cargo_target_bytes: None,
+                target_warning_bytes: 1,
+                target_hard_limit_bytes: 2,
+                external_cache_bytes: None,
+                external_cache_hard_limit_bytes: 1,
+                deferred: 0,
+                errors: 0,
+                system_tmp: Some(SystemTmpHealth {
+                    complete: false,
+                    errors: 1,
+                    mount_boundaries: 0,
+                }),
+            },
+            items: vec![],
+            omitted_items: 0,
+            last_attempt: None,
+            diagnostics: vec![],
+        };
+        let text = render_text(&status);
+        assert!(text.contains("неизвестна"));
+        assert!(!text.contains("true"));
+        assert!(!text.contains("false"));
+        for outcome in ["success", "partial", "failed"] {
+            let mut s = status.clone();
+            s.last_attempt = Some(LastAttempt {
+                schema_version: 1,
+                workspace_root: PathBuf::from("/repo"),
+                timestamp: now() - 120,
+                outcome: outcome.into(),
+                bytes_freed: Some(123),
+                errors: 0,
+                inventory_complete: false,
+                managed_inventory_complete: None,
+                fatal_errors: None,
+                mode: Some("apply".into()),
+                message: "apply; освобождено 123 байт; ошибок 0".into(),
+                items: vec![],
+                omitted_items: 0,
+            });
+            let json = serde_json::to_value(&s).unwrap();
+            let text = render_text(&s);
+            assert_eq!(text.matches("освобождено 123 байт").count(), 1);
+            assert!(!text.contains("apply"));
+            assert!(!text.contains("partial"));
+            assert!(text.contains("мин. назад"));
+            assert_eq!(json["last_attempt"]["mode"], "apply");
+            assert_eq!(json["last_attempt"]["outcome"], outcome);
+            assert_eq!(json, serde_json::to_value(&s).unwrap());
+        }
+        assert!(age_text(now() + 10, now()).contains("будущего"));
     }
 }
