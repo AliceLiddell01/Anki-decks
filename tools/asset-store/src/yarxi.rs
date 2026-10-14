@@ -1341,7 +1341,7 @@ async fn run_parallel_worker(
     let reason = result
         .as_ref()
         .err()
-        .map_or_else(|| "finished".into(), |error| format!("{error:?}"));
+        .map_or_else(|| "finished".into(), AcquisitionStreamError::message);
     let _ = send_parallel_event(
         &sender,
         &context,
@@ -1832,14 +1832,21 @@ pub enum AcquisitionStreamError {
 }
 
 impl AcquisitionStreamError {
-    fn into_message(self) -> String {
+    fn message(&self) -> String {
         match self {
-            Self::Provider(message) => message,
+            Self::Provider(message) => message.clone(),
             Self::Consumer(error) => format!("progress_consumer_failed: {error}"),
             Self::Interrupted => "acquisition_interrupted: получен Ctrl+C".into(),
             Self::WorkersExhausted { pending_indices } => {
                 format!("browser_workers_exhausted: незавершённые индексы {pending_indices:?}")
             }
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Provider(message) => message,
+            error => error.message(),
         }
     }
 }
@@ -6293,6 +6300,7 @@ mod parallel_pool_tests {
             let cleanup = Arc::new(Mutex::new(Vec::new()));
             let mut completed = Vec::new();
             let mut ended = Vec::new();
+            let mut stopped_reason = None;
             let mut deferred = 0;
             let result = coordinate_parallel(
                 vec![driver(mode, &cancel, &cleanup)],
@@ -6300,6 +6308,9 @@ mod parallel_pool_tests {
                 futures::future::pending(),
                 cancel,
                 &mut |event| {
+                    if let AcquisitionWorkerEventKind::WorkerStopped { reason } = &event.event {
+                        stopped_reason = Some(reason.clone());
+                    }
                     if completion(&event) {
                         completed.push((
                             event.index.unwrap(),
@@ -6333,6 +6344,10 @@ mod parallel_pool_tests {
             );
             if matches!(mode, SyntheticMode::PostCheckpointInterrupt) {
                 assert!(matches!(result, Err(AcquisitionStreamError::Interrupted)));
+                assert_eq!(
+                    stopped_reason.as_deref(),
+                    Some("acquisition_interrupted: получен Ctrl+C")
+                );
             } else if matches!(mode, SyntheticMode::PostCheckpointFault) {
                 assert!(
                     matches!(result, Err(AcquisitionStreamError::Provider(ref message))
@@ -6531,6 +6546,7 @@ mod parallel_pool_tests {
             let mut rotated = 0;
             let mut retired = 0;
             let mut terminal = 0;
+            let mut stopped_reason = None;
             let error = coordinate_parallel(
                 vec![driver(
                     SyntheticMode::SetupFailure(message),
@@ -6546,6 +6562,9 @@ mod parallel_pool_tests {
                         AcquisitionWorkerEventKind::Deferred { .. }
                         | AcquisitionWorkerEventKind::Requeued { .. } => deferred += 1,
                         AcquisitionWorkerEventKind::WorkerRetired { .. } => retired += 1,
+                        AcquisitionWorkerEventKind::WorkerStopped { reason } => {
+                            stopped_reason = Some(reason)
+                        }
                         AcquisitionWorkerEventKind::Provider(
                             AcquisitionEvent::SessionRotated { .. },
                         ) => rotated += 1,
@@ -6564,6 +6583,7 @@ mod parallel_pool_tests {
                 "{error:?}"
             );
             assert_eq!(assigned, 1);
+            assert_eq!(stopped_reason.as_deref(), Some(message));
             assert_eq!((deferred, rotated, retired, terminal), (0, 0, 0, 0));
             assert_eq!(
                 *cleanup.lock().unwrap(),

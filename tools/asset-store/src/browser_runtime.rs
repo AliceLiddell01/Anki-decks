@@ -395,9 +395,12 @@ fn build_browser_config(
         configured_temp_root.as_deref(),
         current_directory.as_deref(),
     );
+    let temp_directory = temp_directory
+        .to_str()
+        .ok_or("browser_tmpdir_invalid: путь TMPDIR должен быть UTF-8")?;
     let mut builder = BrowserConfig::builder()
         .user_data_dir(&profile.path)
-        .env("TMPDIR", temp_directory.to_string_lossy().into_owned())
+        .env("TMPDIR", temp_directory)
         .incognito()
         .respect_https_errors()
         .launch_timeout(config.launch_timeout)
@@ -1997,6 +2000,47 @@ mod tests {
         assert_eq!(std::env::var_os("TMPDIR"), before);
         assert!(profile.temp_path.as_os_str().as_bytes().len() < 108);
         profile.close().unwrap();
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn browser_config_preserves_unicode_tmpdir_and_rejects_non_utf8_before_launch() {
+        let parent = TempWorkspace::create("browser-tmpdir-encoding-test").unwrap();
+        for name in ["рабочее".as_bytes(), b"invalid-\xff".as_slice()] {
+            let borrowed = parent.path().join(std::ffi::OsStr::from_bytes(name));
+            fs::create_dir(&borrowed).unwrap();
+            fs::write(borrowed.join("keep"), b"borrowed").unwrap();
+            let profile = BrowserProfile::in_workspace(&borrowed).unwrap();
+            let profile_path = profile.path.clone();
+            let temp_path = profile.temp_path.clone();
+            let executable = BrowserExecutableSelection {
+                path: PathBuf::from("/bin/true"),
+                source: BrowserExecutableSource::PathLookup,
+            };
+            let result =
+                build_browser_config(&profile, &BrowserRuntimeConfig::default(), Some(executable));
+            if let Some(expected) = temp_path.to_str() {
+                let config = result.unwrap();
+                assert_eq!(
+                    config.process_envs.unwrap().get("TMPDIR").unwrap(),
+                    expected
+                );
+                profile.close().unwrap();
+            } else {
+                let message = result.unwrap_err();
+                assert_eq!(
+                    message,
+                    "browser_tmpdir_invalid: путь TMPDIR должен быть UTF-8"
+                );
+                assert!(matches!(
+                    profile_setup_failure(profile, message),
+                    BrowserLaunchError::Setup(_)
+                ));
+            }
+            assert!(!profile_path.exists());
+            assert!(!temp_path.exists());
+            assert_eq!(fs::read(borrowed.join("keep")).unwrap(), b"borrowed");
+        }
         parent.close().unwrap();
     }
 
