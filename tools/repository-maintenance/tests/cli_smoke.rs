@@ -21,6 +21,78 @@ fn orphan_helper() {
 }
 
 #[test]
+fn notify_test_uses_windows_toast_without_cleaning_or_real_windows() {
+    let workspace = TempWorkspace::create("maintenance-notify-cli").unwrap();
+    let bin = workspace.path().join("mock-bin");
+    let config = workspace.path().join("config");
+    let state = workspace.path().join("state");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let log = workspace.path().join("powershell.log");
+    let fake = bin.join("powershell.exe");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NOTIFY_TEST_LOG\"\nexit \"$NOTIFY_TEST_EXIT\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let launch = |exit_code: &str| {
+        Command::new(BINARY)
+            .arg("notify-test")
+            .env("WSL_DISTRO_NAME", "test-wsl")
+            .env_remove("WSL_INTEROP")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("PATH", &bin)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("NOTIFY_TEST_LOG", &log)
+            .env("NOTIFY_TEST_EXIT", exit_code)
+            .output()
+            .unwrap()
+    };
+
+    let success = launch("0");
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let stdout = String::from_utf8(success.stdout).unwrap();
+    assert!(stdout.contains("windows-toast"), "{stdout}");
+    assert!(
+        stdout.contains("Видимость окна проверяется отдельно"),
+        "{stdout}"
+    );
+    let command = fs::read_to_string(&log).unwrap();
+    assert!(command.contains("New-BurntToastNotification"), "{command}");
+    assert!(command.contains("очистка не запускалась"), "{command}");
+    // Наблюдаемое следствие очистки — записанный результат последней попытки и
+    // сохранённый выбор пользователя. Их отсутствие и доказывает, что `notify-test`
+    // очистку не запускал, независимо от текста уведомления.
+    assert!(
+        !state.join("anki-decks/gc-last-attempt.json").exists(),
+        "`notify-test` не должен записывать результат очистки"
+    );
+    assert!(
+        !config.join("anki-decks/gc-preference.json").exists(),
+        "`notify-test` не должен менять сохранённый выбор пользователя"
+    );
+
+    let failure = launch("23");
+    assert!(!failure.status.success());
+    assert!(
+        String::from_utf8_lossy(&failure.stderr)
+            .contains("Windows PowerShell/BurntToast: обработчик уведомления завершился с кодом"),
+        "{}",
+        String::from_utf8_lossy(&failure.stderr)
+    );
+}
+
+#[test]
 fn cli_clean_dry_run_apply_and_repeat_report_real_sizes() {
     let owner = TempWorkspace::create("repository-maintenance-cli-target-smoke").unwrap();
     let root = owner.path().join("checkout");
@@ -185,6 +257,7 @@ fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
     let fixture = CacheFixture::new();
     let target_file = fixture.owner.path().join("target-is-a-file");
     fs::write(&target_file, b"target contents must be preserved").unwrap();
+    let (state_home, config_home) = isolated_state_dirs(&fixture.cache_home);
     let output = Command::new(BINARY)
         .args([
             "clean",
@@ -200,7 +273,10 @@ fn cli_clean_treats_incomplete_target_measurement_as_fatal_below_threshold() {
         .env("CARGO_TARGET_DIR", &target_file)
         .env_remove("CARGO_BUILD_BUILD_DIR")
         .env("XDG_CACHE_HOME", &fixture.cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("XDG_RUNTIME_DIR")
+        .env("PATH", notification_path(&fixture.root))
         .env("TMPDIR", &fixture.temp_root)
         .output()
         .unwrap();
@@ -389,6 +465,7 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
     )
     .unwrap();
 
+    let (state_home, config_home) = isolated_state_dirs(&cache_home);
     let initialized = Command::new(BINARY)
         .args([
             "cache",
@@ -400,6 +477,8 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
             "--json",
         ])
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .output()
         .unwrap();
     assert!(
@@ -428,6 +507,8 @@ fn cli_managed_external_cache_is_touched_by_run_and_pruned_after_minimum_age() {
             "build",
         ])
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", &temp_root)
         .output()
@@ -526,11 +607,14 @@ impl CacheFixture {
 
     fn command(&self, action: &str) -> Command {
         let mut command = Command::new(BINARY);
+        let (state_home, config_home) = isolated_state_dirs(&self.cache_home);
         command
             .args(["cache", action, "--id", "fixture", "--workspace-root"])
             .arg(&self.root)
             .arg("--json")
             .env("XDG_CACHE_HOME", &self.cache_home)
+            .env("XDG_STATE_HOME", state_home)
+            .env("XDG_CONFIG_HOME", config_home)
             .env_remove("XDG_RUNTIME_DIR")
             .env("TMPDIR", &self.temp_root);
         command
@@ -974,11 +1058,12 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         "target_warning_gib=1\ntarget_hard_limit_gib=2\ntarget_warning_bytes=1\ntarget_hard_limit_bytes=2\nexternal_cache_hard_limit_gib=3\nexternal_cache_goal_gib=1\nexternal_cache_hard_limit_bytes=3\nexternal_cache_goal_bytes=1\nexternal_cache_min_age_days=7\nexternal_cache_min_age_seconds=1\norphan_min_age_hours=24\norphan_min_age_seconds=86400\ntmp_top_entries=1\n",
     )
     .unwrap();
-    let mut search_path = vec![cargo_bin];
+    let mut search_path = vec![notification_stubs(&root), cargo_bin];
     if let Some(existing) = std::env::var_os("PATH") {
         search_path.extend(std::env::split_paths(&existing));
     }
     let search_path = std::env::join_paths(search_path).unwrap();
+    let (state_home, config_home) = isolated_state_dirs(&cache_home);
     let output = Command::new(BINARY)
         .args([
             "clean",
@@ -993,6 +1078,8 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         ])
         .env("PATH", search_path)
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("XDG_RUNTIME_DIR")
         .env("TMPDIR", &temp_root)
         .env("CARGO_HOME", cargo_home)
@@ -1013,6 +1100,12 @@ fn cli_destructive_cleanup_failure_returns_non_success() {
         "{report}"
     );
     assert!(target.join("synthetic-artifact").exists());
+    // Сбойный прогон обязан оставить снимок в изолированном состоянии, а не
+    // перезаписать настоящий результат GC в домашнем каталоге запускающего.
+    assert!(
+        isolated_snapshot(&cache_home).is_file(),
+        "снимок последней попытки обязан лежать в изолированном состоянии"
+    );
 }
 
 fn write_cargo(directory: &Path, body: &str) -> PathBuf {
@@ -1024,6 +1117,50 @@ fn write_cargo(directory: &Path, body: &str) -> PathBuf {
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Заглушки каналов уведомления внутри рабочей области проверки: сбой очистки не
+/// должен будить рабочий стол пользователя. На WSL `windows_toast` ищет
+/// `powershell.exe` в `PATH`, а при его отсутствии берёт стандартный
+/// `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`, поэтому
+/// заглушка обязана стоять в `PATH` раньше системных каталогов, а не просто
+/// отсутствовать в нём. `notify-send` закрывает тот же маршрут на Linux-хосте.
+fn notification_stubs(root: &Path) -> PathBuf {
+    let bin = root.join("notification-stubs");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["powershell.exe", "notify-send"] {
+        let stub = bin.join(name);
+        fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    bin
+}
+
+/// `PATH` с заглушками уведомления перед унаследованным `PATH`.
+fn notification_path(root: &Path) -> OsString {
+    let mut entries = vec![notification_stubs(root)];
+    if let Some(existing) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(entries).unwrap()
+}
+
+/// Изолированные `XDG_STATE_HOME` и `XDG_CONFIG_HOME` рядом с кэшем проверки:
+/// `clean --apply` записывает снимок последней попытки, и без этих переменных он
+/// попадает в домашний каталог запускающего, заменяя настоящий результат GC.
+fn isolated_state_dirs(cache_home: &Path) -> (PathBuf, PathBuf) {
+    let state = cache_home.with_file_name("state-home");
+    let config = cache_home.with_file_name("config-home");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&config).unwrap();
+    (state, config)
+}
+
+/// Путь снимка последней попытки внутри изолированного состояния.
+fn isolated_snapshot(cache_home: &Path) -> PathBuf {
+    cache_home
+        .with_file_name("state-home")
+        .join("anki-decks/gc-last-attempt.json")
 }
 
 fn invoke(root: &Path, policy: &Path, temp_root: &Path, cache_home: &Path, apply: bool) -> Output {
@@ -1039,6 +1176,7 @@ fn invoke_with_legacy(
     cleanup_legacy: bool,
 ) -> Output {
     let mut command = Command::new(BINARY);
+    let (state_home, config_home) = isolated_state_dirs(cache_home);
     command
         .args([
             "clean",
@@ -1051,7 +1189,10 @@ fn invoke_with_legacy(
             "--json",
         ])
         .env("XDG_CACHE_HOME", cache_home)
+        .env("XDG_STATE_HOME", state_home)
+        .env("XDG_CONFIG_HOME", config_home)
         .env_remove("XDG_RUNTIME_DIR")
+        .env("PATH", notification_path(root))
         .env("TMPDIR", temp_root);
     if apply {
         command.arg("--apply");

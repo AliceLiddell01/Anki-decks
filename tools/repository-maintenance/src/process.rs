@@ -41,6 +41,14 @@ trait ProcessReader {
     fn fd_reference(&self, pid: u32, target: &Path) -> io::Result<Option<String>>;
 }
 
+// После открытия /proc PID может исчезнуть: ядро возвращает ESRCH при чтении
+// stat, тогда как отсутствие записи при поиске даёт ENOENT. Другие ошибки не
+// доказывают завершение процесса и должны сохранять неизвестное состояние.
+fn process_disappeared(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
 struct ProcFs;
 
 impl ProcessReader for ProcFs {
@@ -64,7 +72,7 @@ impl ProcessReader for ProcFs {
     fn identity(&self, pid: u32) -> io::Result<Option<ProcessIdentity>> {
         match fs::read(process_dir(pid).join("stat")) {
             Ok(stat) => parse_identity(&stat).map(Some),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) if process_disappeared(&error) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -167,7 +175,7 @@ fn check_processes(
         match reader.uid(pid) {
             Ok(process_uid) if process_uid != uid => continue,
             Ok(_) => (),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => {
                 return unknown(format!("не удалось проверить UID процесса {pid}: {error}"));
             }
@@ -175,7 +183,7 @@ fn check_processes(
         let initial = match reader.identity(pid) {
             Ok(Some(identity)) if identity.is_live() => identity,
             Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => {
                 return unknown(format!(
                     "не удалось проверить идентичность процесса {pid}: {error}"
@@ -193,7 +201,7 @@ fn check_processes(
             Ok(Some(current))
                 if current.is_live() && current.start_ticks == initial.start_ticks => {}
             Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if process_disappeared(&error) => continue,
             Err(error) => {
                 return unknown(format!("не удалось повторно проверить PID {pid}: {error}"));
             }
@@ -398,6 +406,8 @@ mod tests {
         exe: PathBuf,
         fd: Option<PathBuf>,
         fd_error: Option<io::ErrorKind>,
+        uid_errno: Option<i32>,
+        identity_errno: Option<(usize, i32)>,
         // После первого чтения идентичности моделирует исчезновение PID, повторное
         // использование PID или переход процесса в состояние «зомби».
         next_identity: Option<Option<ProcessIdentity>>,
@@ -417,6 +427,8 @@ mod tests {
                 exe: PathBuf::from("/usr/bin").join(name),
                 fd: None,
                 fd_error: None,
+                uid_errno: None,
+                identity_errno: None,
                 next_identity: None,
                 identity_reads: Cell::new(0),
             }
@@ -427,13 +439,21 @@ mod tests {
         fn pids(&self) -> io::Result<Vec<u32>> {
             Ok(self.processes.keys().copied().collect())
         }
-        fn uid(&self, _pid: u32) -> io::Result<u32> {
+        fn uid(&self, pid: u32) -> io::Result<u32> {
+            if let Some(errno) = self.processes.get(&pid).and_then(|p| p.uid_errno) {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
             Ok(UID)
         }
         fn identity(&self, pid: u32) -> io::Result<Option<ProcessIdentity>> {
             let process = &self.processes[&pid];
             let reads = process.identity_reads.get();
             process.identity_reads.set(reads + 1);
+            if let Some((at, errno)) = process.identity_errno
+                && at == reads
+            {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
             Ok(if reads > 0 {
                 process.next_identity.unwrap_or(Some(process.identity))
             } else {
@@ -626,5 +646,31 @@ mod tests {
         std::assert_matches!(result, ProcessCheck::Busy { pid, .. } if pid == child.id(),
             "живой процесс, использующий каталог `target`, должен блокировать очистку: {result:?}"
         );
+    }
+    #[test]
+    fn vanished_process_errno_is_clear_but_access_and_io_errors_remain_unknown() {
+        use rustix::io::Errno;
+        for errno in [Errno::SRCH, Errno::NOENT, Errno::ACCESS, Errno::IO] {
+            for stage in ["uid", "initial", "final"] {
+                let mut process = FakeProcess::new("cargo", "/workspace");
+                match stage {
+                    "uid" => process.uid_errno = Some(errno.raw_os_error()),
+                    "initial" => process.identity_errno = Some((0, errno.raw_os_error())),
+                    _ => process.identity_errno = Some((1, errno.raw_os_error())),
+                }
+                let result = check([(43, process)]);
+                if matches!(errno, Errno::SRCH | Errno::NOENT) {
+                    assert!(
+                        matches!(result, ProcessCheck::Clear),
+                        "{errno:?}/{stage}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, ProcessCheck::Unknown { .. }),
+                        "{errno:?}/{stage}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 }

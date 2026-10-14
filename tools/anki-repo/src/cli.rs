@@ -53,7 +53,7 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, visual-report, maintenance",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report формирует отдельный отчёт.\n\
@@ -61,8 +61,11 @@ pub enum MatchArg {
                   create добавляет заметки в существующие колоды и модели.\n\
                   retire помечает заметки тегом вместо физического удаления.\n\
                   migrate-media переводит только доказанные ссылки с legacy-имени домена.\n\
-                  Все изменяющие команды по умолчанию выполняют dry-run; запись возможна\n\
+                  Изменяющие экспорт команды по умолчанию выполняют dry-run; запись возможна\n\
                   только с явным --apply и после проверок предусловий.\n\
+                  maintenance не обращается к экспорту: status только читает состояние,\n\
+                  enable и disable по явной команде настраивают пользовательский\n\
+                  таймер systemd и приватные предпочтения.\n\
                   edit и retire меняют только канонический deck.json. create меняет\n\
                   deck.json и размещает только проверенные файлы, разрешённые явными\n\
                   правилами домена. migrate-media меняет deck.json, размещает проверенный\n\
@@ -87,6 +90,7 @@ impl Cli {
     pub const fn command_name(&self) -> &'static str {
         match &self.command {
             Command::Inspect { .. } => "inspect",
+            Command::Maintenance { .. } => "maintenance",
             Command::Find { .. } => "find",
             Command::Stats { .. } => "stats",
             Command::Validate { .. } => "validate",
@@ -106,6 +110,14 @@ impl Cli {
 /// Поддерживаемые команды.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Настройка и диагностика автоматической очистки (не меняет карточки).
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceAction,
+        /// Корень Cargo workspace; по умолчанию определяется автоматически.
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+    },
     /// Компактное описание структуры экспорта.
     #[command(visible_alias = "describe")]
     Inspect {
@@ -468,6 +480,16 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum MaintenanceAction {
+    /// Текущий факт работы, объёмы, последняя попытка и диагностика.
+    Status,
+    /// Явное согласие и попытка установки таймера.
+    Enable,
+    /// Явный отказ и удаление только принадлежащего этому checkout таймера.
+    Disable,
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -481,9 +503,15 @@ mod cli_tests {
             .map(|sub| sub.get_name())
             .collect();
         assert!(names.contains(&"review"));
+        assert!(names.contains(&"maintenance"));
         assert!(names.contains(&"review-check"));
         assert!(!names.contains(&"code-review"));
         assert!(!names.contains(&"language"));
+        let status = Cli::try_parse_from(["anki-repo", "--json", "maintenance", "status"]).unwrap();
+        assert!(status.json);
+        assert_eq!(status.command_name(), "maintenance");
+        assert!(Cli::try_parse_from(["anki-repo", "maintenance", "enable"]).is_ok());
+        assert!(Cli::try_parse_from(["anki-repo", "maintenance", "disable"]).is_ok());
         assert!(Cli::try_parse_from(["anki-repo", "code-review"]).is_err());
         assert!(Cli::try_parse_from(["anki-repo", "language"]).is_err());
     }

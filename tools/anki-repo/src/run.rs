@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::cli::{Cli, Command, MatchArg};
+use crate::cli::{Cli, Command, MaintenanceAction, MatchArg};
 use crate::error::{DomainError, ErrorCode};
 use crate::index::ExportIndex;
 use crate::loader::load_export;
@@ -38,6 +38,7 @@ use crate::ops::visual_report as visual_report_op;
 use crate::ops::visual_report::ReportRequest;
 use crate::proposal;
 use crate::render::{human, json};
+use repository_maintenance::care;
 
 /// Полностью подготовленный к печати результат команды.
 #[derive(Debug)]
@@ -62,6 +63,33 @@ pub fn execute_cli(cli: &Cli) -> Result<Rendered, DomainError> {
 /// Выполняет команду и готовит результат без обращения к стандартным потокам.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
     match &cli.command {
+        Command::Maintenance {
+            action,
+            workspace_root,
+        } => {
+            let root =
+                repository_maintenance::policy::workspace_root(workspace_root.as_deref(), false)
+                    .map_err(|e| DomainError::new(ErrorCode::InputUnreadable, e))?;
+            match action {
+                MaintenanceAction::Status => (),
+                MaintenanceAction::Enable => {
+                    care::enable(&root).map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?
+                }
+                MaintenanceAction::Disable => {
+                    care::disable(&root).map_err(|e| DomainError::new(ErrorCode::WriteFailed, e))?
+                }
+            }
+            let status = care::inspect(&root);
+            Ok(Rendered {
+                command: "maintenance",
+                stdout: if cli.json {
+                    json::generic_json("maintenance", &status)
+                } else {
+                    care::render_text(&status)
+                },
+                exit: 0,
+            })
+        }
         Command::Inspect {
             export_dir,
             verbose,
@@ -676,6 +704,19 @@ pub fn render_error(command: &str, json_mode: bool, error: &DomainError) -> (Str
             ),
         )
     }
+}
+
+/// Ближайший родительский каталог экспорта, который является репозиторием.
+///
+/// Владение экспортом определяется его расположением, а не текущим каталогом
+/// процесса: иначе команда над экспортом одного репозитория работала бы с
+/// границами другого.
+pub fn export_repository_root(export_dir: &Path) -> Option<std::path::PathBuf> {
+    let export = std::fs::canonicalize(export_dir).ok()?;
+    export
+        .ancestors()
+        .find(|directory| directory.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 #[cfg(test)]

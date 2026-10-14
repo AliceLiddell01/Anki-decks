@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 asset-store = { path = "../asset-store" }
+repository-maintenance = { path = "../repository-maintenance" }
 serde_yaml = { package = "yaml_serde", version = "0.10" }
 rustix = { version = "1.1", features = ["fs"] }
 
