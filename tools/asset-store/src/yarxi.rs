@@ -825,6 +825,35 @@ fn send_parallel_event(
         .map_err(|_| parallel_protocol_error("канал координатора закрыт"))
 }
 
+fn relay_parallel_item_event(
+    sender: &mpsc::UnboundedSender<ParallelMessage>,
+    context: &mut ParallelWorkerContext,
+    index: usize,
+    event: AcquisitionEvent,
+) -> Result<(), AssetError> {
+    let event = match event {
+        // Координатор сообщает о всём назначении, включая подготовку сессии.
+        AcquisitionEvent::Heartbeat { .. } => return Ok(()),
+        AcquisitionEvent::RetryStarted { attempt, .. } => {
+            context.attempt = attempt;
+            AcquisitionEvent::RetryStarted { index, attempt }
+        }
+        AcquisitionEvent::RetryRecoveryStarted { attempt, .. } => {
+            context.attempt = attempt;
+            AcquisitionEvent::RetryRecoveryStarted { index, attempt }
+        }
+        event => event,
+    };
+    send_parallel_event(sender, context, AcquisitionWorkerEventKind::Provider(event)).map_err(
+        |error| {
+            AssetError::new(
+                crate::error::ErrorCode::InvalidTransition,
+                error.into_message(),
+            )
+        },
+    )
+}
+
 async fn acknowledge_parallel_event(
     sender: &mpsc::UnboundedSender<ParallelMessage>,
     context: &ParallelWorkerContext,
@@ -988,39 +1017,7 @@ impl ParallelDriver for ParallelBrowserDriver {
             }),
         )?;
         // Индекс 0 относится к локальному массиву поколений, внешний индекс — к исходной границе обхода.
-        let mut events = |event| {
-            let event = match event {
-                AcquisitionEvent::RetryStarted { attempt, .. } => {
-                    context.attempt = attempt;
-                    AcquisitionEvent::RetryStarted {
-                        index: job.index,
-                        attempt,
-                    }
-                }
-                AcquisitionEvent::RetryRecoveryStarted { attempt, .. } => {
-                    context.attempt = attempt;
-                    AcquisitionEvent::RetryRecoveryStarted {
-                        index: job.index,
-                        attempt,
-                    }
-                }
-                AcquisitionEvent::Heartbeat { attempt, .. } => {
-                    context.attempt = attempt;
-                    AcquisitionEvent::Heartbeat {
-                        index: job.index,
-                        attempt,
-                    }
-                }
-                event => event,
-            };
-            send_parallel_event(sender, context, AcquisitionWorkerEventKind::Provider(event))
-                .map_err(|error| {
-                    AssetError::new(
-                        crate::error::ErrorCode::InvalidTransition,
-                        error.into_message(),
-                    )
-                })
-        };
+        let mut events = |event| relay_parallel_item_event(sender, context, job.index, event);
         let (outcome, stop) = driver.acquire(0, &job.character, &mut events).await?;
         let diagnostics = driver.take_diagnostics();
         // Неисправный CDP или возраст сессии до доказанного результата не создаёт попытку владельца.
@@ -6246,6 +6243,91 @@ mod parallel_pool_tests {
             event.event,
             AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted { .. })
         )
+    }
+
+    #[test]
+    fn item_relay_suppresses_heartbeats_and_preserves_retry_context() {
+        let (sender, mut messages) = mpsc::unbounded_channel();
+        let job = jobs(8).pop_back().unwrap();
+        let mut context = ParallelWorkerContext {
+            worker_id: 2,
+            session: 3,
+            browser_session: Some(203),
+            attempt: 1,
+            job: Some(job.clone()),
+        };
+        for attempt in 2..=3 {
+            relay_parallel_item_event(
+                &sender,
+                &mut context,
+                job.index,
+                AcquisitionEvent::RetryStarted { index: 0, attempt },
+            )
+            .unwrap();
+            relay_parallel_item_event(
+                &sender,
+                &mut context,
+                job.index,
+                AcquisitionEvent::Heartbeat { index: 0, attempt },
+            )
+            .unwrap();
+            relay_parallel_item_event(
+                &sender,
+                &mut context,
+                job.index,
+                AcquisitionEvent::RetryRecoveryStarted { index: 0, attempt },
+            )
+            .unwrap();
+            for recovery in [false, true] {
+                let ParallelMessage::Event(event, ack) = messages.try_recv().unwrap() else {
+                    panic!("ожидалось событие попытки");
+                };
+                assert!(ack.is_none());
+                assert_eq!(
+                    (event.worker_id, event.session, event.browser_session),
+                    (2, 3, Some(203))
+                );
+                assert_eq!(
+                    (
+                        event.index,
+                        event.generation,
+                        event.owner_attempt,
+                        event.attempt
+                    ),
+                    (Some(7), Some(7), Some(2), attempt)
+                );
+                match event.event {
+                    AcquisitionWorkerEventKind::Provider(AcquisitionEvent::RetryStarted {
+                        index,
+                        attempt: observed,
+                    }) if !recovery => assert_eq!((index, observed), (7, attempt)),
+                    AcquisitionWorkerEventKind::Provider(
+                        AcquisitionEvent::RetryRecoveryStarted {
+                            index,
+                            attempt: observed,
+                        },
+                    ) if recovery => assert_eq!((index, observed), (7, attempt)),
+                    unexpected => panic!("лишнее или неверное событие: {unexpected:?}"),
+                }
+            }
+            assert!(matches!(
+                messages.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        drop(messages);
+        assert!(
+            relay_parallel_item_event(
+                &sender,
+                &mut context,
+                job.index,
+                AcquisitionEvent::RetryStarted {
+                    index: 0,
+                    attempt: 4
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
