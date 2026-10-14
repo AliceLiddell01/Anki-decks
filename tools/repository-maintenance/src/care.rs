@@ -489,7 +489,9 @@ pub(crate) fn record_failure_with_lock(
             managed_inventory_complete: Some(false),
             fatal_errors: Some(1),
             mode: None,
-            message: message.into(),
+            // Ошибка парсинга конфигурации может включать длинную исходную
+            // строку; снимок краткий, исходная ошибка GC возвращается целиком.
+            message: message.chars().take(2000).collect(),
             items: Vec::new(),
             omitted_items: 0,
         },

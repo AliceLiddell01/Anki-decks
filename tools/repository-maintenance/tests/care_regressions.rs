@@ -779,3 +779,43 @@ fn non_utf8_checkout_is_diagnosed_without_panic_or_lossy_snapshot() {
         "ошибка сериализации сохраняет прежний точный snapshot"
     );
 }
+
+#[test]
+fn long_config_failure_replaces_success_snapshot_and_preserves_original_error() {
+    for message in [
+        "длинная ошибка 🦀\n".repeat(10_000),
+        "\u{1}\n\\\"".repeat(20_000),
+    ] {
+        let h = Harness::new();
+        let seed = h.invoke("record");
+        assert!(seed["result"]["Ok"].is_object(), "{seed}");
+        let snapshot = h.path("state/anki-decks/gc-last-attempt.json");
+        let before: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        assert_eq!(before["outcome"], "success");
+        fs::create_dir_all(h.root.join(".cargo")).unwrap();
+        fs::write(
+            h.root.join(".cargo/config.toml"),
+            format!("[build]\nbuild-dir = \"{}", message.replace('\n', " ")),
+        )
+        .unwrap();
+        let result = h.invoke("record");
+        let error = result["result"]["Err"].as_str().unwrap();
+        assert!(error.chars().count() > 2000);
+        assert!(
+            result["snapshot_error"].is_null(),
+            "ошибка GC записана независимо от длины диагностического текста"
+        );
+        let bytes = fs::read(&snapshot).unwrap();
+        assert!(bytes.len() <= 32 * 1024);
+        let stored: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(stored["outcome"], "failed");
+        assert_eq!(stored["errors"], 1);
+        assert_eq!(
+            stored["workspace_root"].as_str().unwrap(),
+            h.root.to_str().unwrap()
+        );
+        let prefix: String = error.chars().take(2000).collect();
+        assert_eq!(stored["message"], prefix);
+        assert_eq!(h.status()["last_attempt"]["outcome"], "failed");
+    }
+}
