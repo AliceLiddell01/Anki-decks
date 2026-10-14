@@ -11,6 +11,8 @@ mod browser_acquisition_diagnostics_contract;
 mod cli_contract;
 #[path = "domain_semantics_regression.rs"]
 mod domain_semantics_regression;
+#[path = "kanji_ocr_contract.rs"]
+mod kanji_ocr_contract;
 #[path = "pitch_cli_contract.rs"]
 mod pitch_cli_contract;
 #[path = "pitch_corpus_trust_contract.rs"]

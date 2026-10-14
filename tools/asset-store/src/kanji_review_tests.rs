@@ -14,6 +14,7 @@ fn snapshot() -> ReviewSnapshot {
                 sha256: "a".repeat(64),
                 candidate_path: format!("candidates/{}.gif", "a".repeat(64)),
                 filename: format!("{character}-{}.gif", "a".repeat(64)),
+                ocr: None,
             })
             .collect(),
     }

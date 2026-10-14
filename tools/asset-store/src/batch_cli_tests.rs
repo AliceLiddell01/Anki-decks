@@ -3264,13 +3264,16 @@ impl super::super::review_ui::ReviewInteraction for ReviewSpy {
         self.asks += 1;
         Ok(self.answers.pop_front().unwrap_or(false))
     }
-    fn open(&mut self, _: &std::path::Path, decisions: &std::path::Path) -> Result<(), AssetError> {
+    fn open(
+        &mut self,
+        request: &super::super::review_ui::ReviewOpen<'_>,
+    ) -> Result<(), AssetError> {
         self.opens += 1;
         if self.fail_open {
             return Err(invalid("редактор недоступен"));
         }
         if self.fill {
-            fill_review(decisions, &["y"]);
+            fill_review(request.decisions, &["y"]);
         }
         Ok(())
     }
@@ -3329,6 +3332,31 @@ fn actual_dispatch_has_no_prompt_or_launcher_without_opt_in_or_in_json_or_headle
             serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap();
         }
         assert_eq!(fixture.load("review-gate"), original);
+    }
+}
+
+#[test]
+fn explicit_review_command_refuses_json_and_ineligible_terminal_without_prompt() {
+    let fixture = review_fixture("review-explicit-gate", &['保']);
+    let original = fixture.load("review-explicit-gate");
+    for (output, eligible) in [(OutputFormat::Json, true), (OutputFormat::Human, false)] {
+        let mut interaction = spy();
+        interaction.eligible = eligible;
+        let mut progress = CapturedProgress::default();
+        let result = execute_with_progress_and_interaction(
+            &fixture.store,
+            fixture.summary(),
+            &BatchCommand::ReviewInteractive {
+                batch_id: "review-explicit-gate".into(),
+            },
+            output,
+            false,
+            &mut progress,
+            &mut interaction,
+        );
+        assert_ne!(result.exit_code, 0);
+        assert_eq!((interaction.asks, interaction.opens), (0, 0));
+        assert_eq!(fixture.load("review-explicit-gate"), original);
     }
 }
 

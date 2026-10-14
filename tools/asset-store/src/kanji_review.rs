@@ -25,11 +25,13 @@ pub(crate) struct ReviewRow {
     pub sha256: String,
     pub candidate_path: String,
     pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr: Option<crate::kanji_ocr::OcrSuggestion>,
 }
 
 impl ReviewRow {
     fn columns(&self) -> String {
-        format!(
+        let mut columns = format!(
             "{}\t{}\t{}\t{}\t{}\t{}",
             self.identity.key,
             self.filename,
@@ -37,7 +39,17 @@ impl ReviewRow {
             self.generation,
             self.attempts,
             self.candidate_path
-        )
+        );
+        if let Some(ocr) = &self.ocr {
+            columns.push_str(&format!(
+                "\t{}\t{}\t{}\t{}",
+                ocr.observed.as_deref().unwrap_or("-"),
+                ocr.matches_expected,
+                ocr.failure.as_deref().unwrap_or("-"),
+                ocr.key()
+            ));
+        }
+        columns
     }
 }
 
@@ -95,6 +107,7 @@ pub(crate) fn prepare(
 ) -> Result<ReviewBundle, AssetError> {
     state.validate()?;
     let mut rows = Vec::new();
+    let suggestions = crate::kanji_ocr::saved_suggestions(runtime)?;
     for item in state.review_queue() {
         let Some(hash) = &item.current_sha256 else {
             continue;
@@ -106,6 +119,10 @@ pub(crate) fn prepare(
             sha256: hash.clone(),
             candidate_path: String::new(),
             filename: String::new(),
+            ocr: suggestions
+                .get(&item.identity)
+                .filter(|ocr| &ocr.source_sha256 == hash)
+                .cloned(),
         };
         let selected = item
             .attempts
@@ -132,6 +149,7 @@ pub(crate) fn prepare(
     if rows.is_empty() {
         return Err(invalid("нет кандидатов, ожидающих решения человека"));
     }
+    rows.sort_by_key(|row| row.ocr.as_ref().map_or(3, |ocr| ocr.group()));
     let snapshot = ReviewSnapshot {
         schema_version: SCHEMA,
         batch_id: state.batch_id.clone(),
@@ -170,6 +188,7 @@ pub(crate) fn prepare(
         }
         Err(error) => return Err(error),
     }
+    write_preview(&directory, &snapshot)?;
     Ok(ReviewBundle {
         id,
         decisions: directory.path.join("decisions.tsv"),
@@ -193,6 +212,15 @@ pub(crate) fn read(
         return Err(invalid("неверная схема или batch_id файла review"));
     }
     for row in &snapshot.rows {
+        if row
+            .ocr
+            .as_ref()
+            .is_some_and(|ocr| ocr.identity != row.identity || ocr.source_sha256 != row.sha256)
+        {
+            return Err(invalid(
+                "предложение OCR не принадлежит точным байтам review",
+            ));
+        }
         if sha256_hex(&directory.read(&row.filename)?) != row.sha256 {
             return Err(invalid("SHA копии изображения review не совпадает"));
         }
@@ -269,6 +297,34 @@ fn parse(
         return Err(invalid("лишние или повторяющиеся строки review"));
     }
     Ok(decisions)
+}
+
+fn write_preview(
+    directory: &crate::batch_runtime::ArtifactDirectory,
+    snapshot: &ReviewSnapshot,
+) -> Result<(), AssetError> {
+    use crate::batch::html_escape;
+    let mut html = String::from(
+        "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self'; style-src 'unsafe-inline'\"><title>Ручная проверка</title><style>body{font-family:system-ui;margin:2rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>Предложения OCR и решения человека</h1><p>Просмотрите изображения. OCR может ошибаться при совпадении метки. Только явное решение человека подтверждает байты.</p>",
+    );
+    let mut group = None;
+    for row in &snapshot.rows {
+        let next_group = row.ocr.as_ref().map_or(3, |ocr| ocr.group());
+        if group != Some(next_group) {
+            html.push_str(match next_group {
+                0 => "<h2>Совпадения OCR — требуют просмотра</h2>",
+                1 => "<h2>Несовпадения Unicode</h2>",
+                2 => "<h2>Не распознано / отказ</h2>",
+                _ => "<h2>Без OCR</h2>",
+            });
+            group = Some(next_group);
+        }
+        html.push_str(&format!("<article><h3>{}</h3><img src=\"{}\" alt=\"{}\"><pre>SHA: {}\nПоколение: {}\n{}</pre></article>",
+            html_escape(&row.identity.key), html_escape(&row.filename), html_escape(&row.identity.key), row.sha256, row.generation,
+            html_escape(&row.ocr.as_ref().map_or_else(|| "Без OCR".into(), |ocr| ocr.summary()))));
+    }
+    html.push_str("</html>");
+    directory.write("index.html", html.as_bytes())
 }
 
 #[cfg(test)]

@@ -1289,7 +1289,15 @@ impl BatchRuntime {
             state.revision
         )
         .expect("запись в строку не может завершиться ошибкой");
-        for item in state.review_queue() {
+        let suggestions = crate::kanji_ocr::saved_suggestions(self)?;
+        let mut review_queue = state.review_queue();
+        review_queue.sort_by_key(|item| {
+            suggestions
+                .get(&item.identity)
+                .filter(|ocr| item.current_sha256.as_ref() == Some(&ocr.source_sha256))
+                .map_or(3, |ocr| ocr.group())
+        });
+        for item in review_queue {
             write!(
                 &mut html,
                 "<article><h2>{} · U+{:04X}</h2><p>Состояние: {}; попыток получения: {}; поколение: {}; разных допустимых SHA-256: {}</p>",
@@ -1305,6 +1313,17 @@ impl BatchRuntime {
                 let candidate = find_candidate(item, hash)
                     .ok_or_else(|| invalid("кандидат для проверки отсутствует"))?;
                 self.read_candidate(candidate)?;
+                if let Some(ocr) = suggestions
+                    .get(&item.identity)
+                    .filter(|ocr| &ocr.source_sha256 == hash)
+                {
+                    write!(
+                        &mut html,
+                        "<h3>Предложение OCR (не решение человека)</h3><pre>{}</pre>",
+                        html_escape(&ocr.summary())
+                    )
+                    .expect("запись в строку");
+                }
                 write!(
                     &mut html,
                     "<img alt=\"{}\" src=\"{}\"><p>Точный SHA-256: <code>{}</code>; формат: {}; автоматический результат: {}; техническая проверка пройдена: {}</p>",
@@ -1456,7 +1475,7 @@ impl BatchRuntime {
     }
 }
 
-fn html_escape(value: &str) -> String {
+pub(crate) fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")

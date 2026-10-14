@@ -69,6 +69,23 @@ pub enum BatchCommand {
         #[arg(long)]
         batch_id: String,
     },
+    /// Слепой OCR сохранённых Uncertain; предложения не меняют доверие.
+    Ocr {
+        #[arg(long)]
+        batch_id: String,
+        #[command(flatten)]
+        options: crate::kanji_ocr::OcrOptions,
+    },
+    /// Подтверждает просмотренные совпадения OCR из точного review-снимка.
+    ReviewConfirmMatches {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        review_id: String,
+        /// Явное заявление человека: изображения группы просмотрены.
+        #[arg(long, required = true)]
+        confirm_reviewed: bool,
+    },
     /// Проверяет целиком и применяет только decisions.tsv указанного снимка.
     ReviewApply {
         #[arg(long)]
@@ -133,6 +150,8 @@ impl BatchCommand {
             Self::Review { .. } => "batch_review",
             Self::Revalidate { .. } => "batch_revalidate",
             Self::ReviewExport { .. } => "batch_review_export",
+            Self::Ocr { .. } => "batch_ocr",
+            Self::ReviewConfirmMatches { .. } => "batch_review_confirm_matches",
             Self::ReviewApply { .. } => "batch_review_apply",
             Self::ReviewInteractive { .. } => "batch_review_interactive",
             Self::Decide { .. } => "batch_decide",
@@ -148,6 +167,8 @@ impl BatchCommand {
             | Self::Review { batch_id }
             | Self::Revalidate { batch_id }
             | Self::ReviewExport { batch_id }
+            | Self::Ocr { batch_id, .. }
+            | Self::ReviewConfirmMatches { batch_id, .. }
             | Self::ReviewApply { batch_id, .. }
             | Self::ReviewInteractive { batch_id }
             | Self::Decide { batch_id, .. }
@@ -161,7 +182,13 @@ pub(super) fn prevalidate(command: &BatchCommand) -> Result<(), AssetError> {
         crate::batch::validate_batch_id(id)?;
     }
     match command {
-        BatchCommand::ReviewApply { review_id, .. } => crate::batch::validate_hash(review_id)?,
+        BatchCommand::ReviewApply { review_id, .. }
+        | BatchCommand::ReviewConfirmMatches { review_id, .. } => {
+            crate::batch::validate_hash(review_id)?
+        }
+        BatchCommand::Ocr { options, .. } => {
+            options.validate()?;
+        }
         BatchCommand::Start { characters, .. } => {
             for character in characters {
                 parse_character(character)?;
@@ -259,6 +286,8 @@ struct BatchResponse {
     review_decisions: Option<ReviewApplied>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic_log: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ocr_summary: Option<crate::kanji_ocr::OcrScanReport>,
     /// Источник истины предметной области остаётся в сохранённом состоянии владельца.
     batch: KanjiBatch,
 }
@@ -1467,6 +1496,67 @@ fn execute_command_with_snapshots_and_progress(
             );
             response.review_id = Some(bundle.id);
             Ok((response, 0))
+        }
+        BatchCommand::Ocr { batch_id, options } => {
+            let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
+            let mut state = load_required(&mut runtime)?;
+            check_current_validator(&state)?;
+            let initial_revision = state.revision;
+            let owner = reader.capture(store);
+            let mut issues = Vec::new();
+            reconcile_owner_trust(&owner, &mut state, &mut issues)?;
+            reuse_existing(&owner, &mut state)?;
+            if state.revision != initial_revision {
+                runtime.save(&state)?;
+            }
+            let mut report = crate::kanji_ocr::scan(&mut runtime, &mut state, options)?;
+            issues.extend(std::mem::take(&mut report.failures).into_iter().map(
+                |(identity, message)| BatchIssue {
+                    identity,
+                    code: "ocr_provider_failure".into(),
+                    message,
+                },
+            ));
+            let artifact = runtime.write_review(&state)?.display().to_string();
+            let code = if issues.is_empty() { 0 } else { 3 };
+            let changed = state.revision != initial_revision || report.saved > 0;
+            let mut response = batch_response(
+                operation,
+                summary,
+                state,
+                changed,
+                issues,
+                Some(artifact),
+                "ocr_suggestions_saved",
+            );
+            response.ocr_summary = Some(report);
+            Ok((response, code))
+        }
+        BatchCommand::ReviewConfirmMatches {
+            batch_id,
+            review_id,
+            confirm_reviewed,
+        } => {
+            if !confirm_reviewed {
+                return Err(invalid(
+                    "нужно явное --confirm-reviewed после просмотра группы",
+                ));
+            }
+            let (state, issues, applied) =
+                apply_review_with_matches(store, batch_id, review_id, true)?;
+            let mut response = batch_response(
+                operation,
+                summary,
+                state,
+                applied.changed,
+                issues,
+                None,
+                "ok",
+            );
+            response.review_id = Some(review_id.clone());
+            response.review_decisions = Some(applied);
+            let code = if response.issues.is_empty() { 0 } else { 3 };
+            Ok((response, code))
         }
         BatchCommand::ReviewApply {
             batch_id,
@@ -3580,6 +3670,7 @@ fn batch_response(
         review_id: None,
         review_decisions: None,
         diagnostic_log: None,
+        ocr_summary: None,
         batch,
     }
 }
@@ -3914,11 +4005,39 @@ fn apply_review(
     batch_id: &str,
     review_id: &str,
 ) -> Result<(KanjiBatch, Vec<BatchIssue>, ReviewApplied), AssetError> {
+    apply_review_with_matches(store, batch_id, review_id, false)
+}
+
+fn apply_review_with_matches(
+    store: &AssetStore,
+    batch_id: &str,
+    review_id: &str,
+    confirm_matches: bool,
+) -> Result<(KanjiBatch, Vec<BatchIssue>, ReviewApplied), AssetError> {
     let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
     let mut state = load_required(&mut runtime)?;
     let initial_revision = state.revision;
     check_current_validator(&state)?;
-    let (review, decisions) = crate::kanji_review::read(&runtime, review_id)?;
+    let (review, mut decisions) = crate::kanji_review::read(&runtime, review_id)?;
+    if confirm_matches {
+        for (row, decision) in review.rows.iter().zip(&mut decisions) {
+            if decision.is_none() && row.ocr.as_ref().is_some_and(|ocr| ocr.group() == 0) {
+                *decision = Some(HumanBatchDecision {
+                    identity: row.identity.clone(),
+                    candidate_sha256: row.sha256.clone(),
+                    action: HumanBatchAction::Confirm,
+                    reason: "explicitly_reviewed_ocr_matching_group".into(),
+                });
+            }
+        }
+        if !review
+            .rows
+            .iter()
+            .any(|row| row.ocr.as_ref().is_some_and(|ocr| ocr.group() == 0))
+        {
+            return Err(invalid("в снимке нет совпавших предложений OCR"));
+        }
+    }
     if review.validator != state.policy.validator {
         return Err(invalid("валидатор review устарел"));
     }
@@ -4024,7 +4143,12 @@ fn finish_interactive_review(
     }; // Блокировка освобождена до редактора и ожидания пользователя.
     response.review_id = Some(bundle.id.clone());
     response.review_artifact = Some(bundle.decisions.display().to_string());
-    interaction.open(&bundle.directory, &bundle.decisions)?;
+    interaction.open(&super::review_ui::ReviewOpen {
+        batch_id: &response.batch_id,
+        review_id: &bundle.id,
+        folder: &bundle.directory,
+        decisions: &bundle.decisions,
+    })?;
     if !interaction
         .ask("Сохраните decisions.tsv. Применить сохранённый файл? (y для применения)")?
     {
