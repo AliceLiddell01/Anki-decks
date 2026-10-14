@@ -53,7 +53,7 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, visual-report",
+    about = "Анализ CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, visual-report, maintenance",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report формирует отдельный отчёт.\n\
@@ -61,8 +61,11 @@ pub enum MatchArg {
                   create добавляет заметки в существующие колоды и модели.\n\
                   retire помечает заметки тегом вместо физического удаления.\n\
                   migrate-media переводит только доказанные ссылки с legacy-имени домена.\n\
-                  Все изменяющие команды по умолчанию выполняют dry-run; запись возможна\n\
+                  Изменяющие экспорт команды по умолчанию выполняют dry-run; запись возможна\n\
                   только с явным --apply и после проверок предусловий.\n\
+                  maintenance не обращается к экспорту: status только читает состояние,\n\
+                  enable и disable по явной команде настраивают пользовательский\n\
+                  таймер systemd и приватные предпочтения.\n\
                   edit и retire меняют только канонический deck.json. create меняет\n\
                   deck.json и размещает только проверенные файлы, разрешённые явными\n\
                   правилами домена. migrate-media меняет deck.json, размещает проверенный\n\

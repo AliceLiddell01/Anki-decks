@@ -1961,3 +1961,23 @@ fn redacted_maintenance_path(path: &std::path::Path) -> String {
     path.to_string_lossy()
         .replace(&format!("anki-decks-{uid}"), "anki-decks-<uid>")
 }
+
+#[test]
+fn maintenance_missing_workspace_returns_input_unreadable() {
+    let fixture = TempDir::new("maintenance-input-contract");
+    let output = Command::new(cli_binary())
+        .args(["--json", "maintenance", "--workspace-root"])
+        .arg(fixture.path().join("missing-checkout"))
+        .arg("status")
+        .env("HOME", fixture.path().join("home"))
+        .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+        .env("XDG_STATE_HOME", fixture.path().join("state"))
+        .env("XDG_CACHE_HOME", fixture.path().join("cache"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "input_unreadable");
+    assert!(!fixture.path().join("config").exists());
+    assert!(!fixture.path().join("state").exists());
+}

@@ -26,28 +26,6 @@ fn care_scenario_helper() {
         "disable" => json!(care::disable(&root)),
         "yes" => json!(care::set_choice("yes")),
         "no" => json!(care::set_choice("no")),
-        "legacy-disable" => {
-            timer::uninstall_for(&root).unwrap();
-            assert_eq!(timer::inspect().state, "disabled");
-            let sandbox = PathBuf::from(std::env::var_os("CARE_SANDBOX").unwrap());
-            fs::write(sandbox.join("entered"), "").unwrap();
-            wait_file(&sandbox.join("release"));
-            json!(care::set_choice("no"))
-        }
-        "legacy-record" => {
-            let policy = repository_maintenance::policy::Policy::defaults().unwrap();
-            let opts = repository_maintenance::RunOptions {
-                apply: true,
-                mode: "apply",
-                temp_root: PathBuf::from(std::env::var_os("TMPDIR").unwrap()),
-                ..Default::default()
-            };
-            let report = repository_maintenance::run(&root, &policy, &opts).unwrap();
-            let sandbox = PathBuf::from(std::env::var_os("CARE_SANDBOX").unwrap());
-            fs::write(sandbox.join("entered"), "").unwrap();
-            wait_file(&sandbox.join("release"));
-            json!(care::record_report(&report))
-        }
         "record" => {
             let policy = repository_maintenance::policy::Policy::defaults().unwrap();
             let opts = repository_maintenance::RunOptions {
@@ -501,35 +479,17 @@ fn status_is_read_only_including_mtime_and_permissions() {
 }
 
 #[test]
-fn gc_snapshot_race_is_reproduced_and_atomic_recording_prevents_it() {
-    // Прежняя последовательность CLI: run -> освобождение lock -> record_report.
+fn gc_snapshot_is_atomic_and_rejected_contender_preserves_previous_attempt() {
     let mut h = Harness::new();
-    let older = h.root.clone();
-    let output = h.path("old.json");
-    let mut first = h.command("legacy-record", &output).spawn().unwrap();
-    wait_file(&h.path("entered"));
+    assert!(h.invoke("record")["result"]["Ok"].is_object());
+    let snapshot = h.path("state/anki-decks/gc-last-attempt.json");
     let newer = h.owner.path().join("new-checkout");
     fs::create_dir_all(&newer).unwrap();
     fs::write(newer.join("Cargo.toml"), "[workspace]\n").unwrap();
     h.root = newer.clone();
-    assert!(h.invoke("record")["result"]["Ok"].is_object());
-    let snapshot = h.path("state/anki-decks/gc-last-attempt.json");
-    assert_eq!(
-        serde_json::from_slice::<Value>(&fs::read(&snapshot).unwrap()).unwrap()["workspace_root"],
-        json!(newer)
-    );
-    h.flag("release", true);
-    assert!(first.wait().unwrap().success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&fs::read(&snapshot).unwrap()).unwrap()["workspace_root"],
-        json!(older),
-        "старый отчёт перезаписал новую завершённую попытку"
-    );
 
     // Новый CLI удерживает lock вплоть до snapshot. Конкурентная попытка не
     // выполняет GC и не перезаписывает результат уже выполняющегося владельца.
-    h.flag("release", false);
-    h.flag("entered", false);
     h.flag("barrier-gc", true);
     let before = fs::read(&snapshot).unwrap();
     let output = h.path("atomic.json");
@@ -639,24 +599,6 @@ fn missing_gc_binary_keeps_consent_and_can_be_retried() {
     assert_eq!(h.status()["preference"], "yes");
     fs::copy(env!("CARGO_BIN_EXE_anki-repository-maintenance"), binary).unwrap();
     h.enable();
-}
-
-#[test]
-fn former_disable_sequence_can_overwrite_concurrent_enable_consent() {
-    let h = Harness::new();
-    h.enable();
-    let output = h.path("old-disable.json");
-    let mut child = h.command("legacy-disable", &output).spawn().unwrap();
-    wait_file(&h.path("entered"));
-    h.enable();
-    h.flag("release", true);
-    assert!(child.wait().unwrap().success());
-    let s = h.status();
-    assert_eq!(s["preference"], "no");
-    assert_eq!(s["automatic"], "enabled");
-    diagnostic(&s, "preference_mismatch");
-    assert_eq!(h.invoke("disable"), json!({"Ok":null}));
-    assert_eq!(h.status()["automatic"], "disabled");
 }
 
 #[test]
