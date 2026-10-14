@@ -351,23 +351,26 @@ pub fn last_attempt() -> Result<Option<LastAttempt>, String> {
     Ok(Some(entry))
 }
 
-fn record(entry: &LastAttempt, _lock: &MaintenanceLock) -> Result<(), String> {
+fn snapshot_bytes(entry: &LastAttempt) -> Result<Vec<u8>, String> {
     // Snapshot хранит точные рабочие пути; маскировка применяется только к
     // внешнему JSON. Это сохраняет сопоставление checkout после чтения.
     let mut stored = serde_json::to_value(entry).map_err(|e| e.to_string())?;
-    stored["workspace_root"] = serde_json::json!(entry.workspace_root);
+    stored["workspace_root"] =
+        serde_json::to_value(&entry.workspace_root).map_err(|e| e.to_string())?;
     for (value, item) in stored["items"]
         .as_array_mut()
-        .unwrap()
+        .ok_or("snapshot: поле items не является массивом")?
         .iter_mut()
         .zip(&entry.items)
     {
-        value["path"] = serde_json::json!(item.path);
+        value["path"] = serde_json::to_value(&item.path).map_err(|e| e.to_string())?;
     }
-    write_private(
-        &state_path()?,
-        &serde_json::to_vec_pretty(&stored).map_err(|e| e.to_string())?,
-    )
+    serde_json::to_vec_pretty(&stored).map_err(|e| e.to_string())
+}
+
+fn record(entry: &LastAttempt, _lock: &MaintenanceLock) -> Result<(), String> {
+    let bytes = snapshot_bytes(entry)?;
+    write_private(&state_path()?, &bytes)
 }
 
 /// Только кандидаты текущего Report; общий /tmp инвентаризируется, но не
@@ -892,9 +895,20 @@ fn inspect_with_policy(
         ));
     }
     // Все исполняемые рекомендации привязаны к диагностируемому checkout.
-    let quoted = format!("'{}'", root.to_string_lossy().replace('\'', "'\\''"));
+    let quoted = root
+        .to_str()
+        .map(|root| format!("'{}'", root.replace('\'', "'\\''")));
     for diagnostic in &mut diagnostics {
         if let Some(action) = &mut diagnostic.action {
+            // JSON-диагностика может показать lossy-путь, но исполняемая команда
+            // обязана использовать точные байты checkout.
+            let needs_root = action.starts_with("anki-repository-maintenance ")
+                || action.starts_with("anki-repo maintenance ");
+            if needs_root && quoted.is_none() {
+                diagnostic.action = None;
+            }
+        }
+        if let (Some(action), Some(quoted)) = (&mut diagnostic.action, &quoted) {
             if let Some(tail) = action.strip_prefix("anki-repository-maintenance ") {
                 let (verb, args) = tail.split_once(' ').unwrap_or((tail, ""));
                 *action =
@@ -915,12 +929,12 @@ fn inspect_with_policy(
             diagnostic.context["timer_enabled"] = serde_json::json!(timer.enabled);
             diagnostic.context["timer_active"] = serde_json::json!(timer.active);
             diagnostic.context["service_active"] = serde_json::json!(timer.service_active);
-            diagnostic.context["installed_workspace"] = serde_json::json!(
-                timer
-                    .installed_root
-                    .as_deref()
-                    .map(crate::redact_temp_namespace_uid)
-            );
+            diagnostic.context["installed_workspace"] =
+                serde_json::json!(timer.installed_root.as_deref().map(|path| {
+                    crate::redact_temp_namespace_uid(path)
+                        .to_string_lossy()
+                        .into_owned()
+                }));
         }
         if diagnostic.code == "last_gc_problem"
             && let Some(last) = &last_attempt
@@ -930,7 +944,7 @@ fn inspect_with_policy(
             diagnostic.context["message"] = serde_json::json!(last.message);
         }
         diagnostic.context["workspace_root"] =
-            serde_json::json!(crate::redact_temp_namespace_uid(root));
+            serde_json::json!(crate::redact_temp_namespace_uid(root).to_string_lossy());
     }
     CareStatus {
         schema_version: 1,
@@ -1189,6 +1203,43 @@ pub fn render_text(status: &CareStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_preserves_exact_utf8_paths_and_rejects_non_utf8_roots_and_items() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = PathBuf::from("/tmp/anki-decks-123/checkout");
+        let mut entry = LastAttempt {
+            schema_version: 1,
+            workspace_root: root.clone(),
+            timestamp: 1,
+            outcome: "success".into(),
+            bytes_freed: Some(0),
+            errors: 0,
+            inventory_complete: true,
+            managed_inventory_complete: Some(true),
+            fatal_errors: Some(0),
+            mode: Some("scan".into()),
+            message: "проверка".into(),
+            items: vec![GcItem {
+                category: "target".into(),
+                path: root.join("target"),
+                action: "keep".into(),
+                result: "kept".into(),
+                bytes_freed: 0,
+                reason: "проверка".into(),
+            }],
+            omitted_items: 0,
+        };
+        let stored: LastAttempt = serde_json::from_slice(&snapshot_bytes(&entry).unwrap()).unwrap();
+        assert_eq!(stored.workspace_root, root);
+        assert_eq!(stored.items[0].path, root.join("target"));
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/path-\xff".to_vec()));
+        entry.workspace_root = invalid.clone();
+        assert!(snapshot_bytes(&entry).unwrap_err().contains("UTF-8"));
+        entry.workspace_root = root;
+        entry.items[0].path = invalid;
+        assert!(snapshot_bytes(&entry).unwrap_err().contains("UTF-8"));
+    }
+
     #[test]
     fn diagnostic_codes_are_stable_and_rendered() {
         let d = diag(

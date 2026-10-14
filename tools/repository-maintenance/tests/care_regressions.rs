@@ -26,6 +26,7 @@ fn care_scenario_helper() {
         "disable" => json!(care::disable(&root)),
         "yes" => json!(care::set_choice("yes")),
         "no" => json!(care::set_choice("no")),
+        "record-failure" => json!(care::record_failure(&root, "проверяемая ошибка")),
         "record" => {
             let policy = repository_maintenance::policy::Policy::defaults().unwrap();
             let opts = repository_maintenance::RunOptions {
@@ -725,4 +726,56 @@ fn busy_lock_defers_without_alert_but_invalid_lock_directory_alerts() {
         "ошибка безопасности блокировки остаётся существенным сбоем"
     );
     assert!(!h.path("state/anki-decks/gc-last-attempt.json").exists());
+}
+
+#[test]
+fn non_utf8_checkout_is_diagnosed_without_panic_or_lossy_snapshot() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut h = Harness::new();
+    assert_eq!(h.invoke("record-failure"), json!({"Ok":null}));
+    let snapshot = h.path("state/anki-decks/gc-last-attempt.json");
+    let before = fs::read(&snapshot).unwrap();
+    let root = h
+        .path("")
+        .join(std::ffi::OsString::from_vec(b"checkout-\xff".to_vec()));
+    fs::rename(&h.root, &root).unwrap();
+    h.root = root;
+    let status = h.status();
+    assert!(
+        status["workspace_root"]
+            .as_str()
+            .unwrap()
+            .contains('\u{fffd}')
+    );
+    let setup = status["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "setup_required")
+        .unwrap();
+    assert!(setup["action"].is_null());
+    for d in status["diagnostics"].as_array().unwrap() {
+        assert!(
+            d["context"]["workspace_root"]
+                .as_str()
+                .unwrap()
+                .contains('\u{fffd}')
+        );
+        assert!(
+            !d["action"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("anki-repo") && a.contains("--workspace-root"))
+        );
+    }
+    assert!(
+        h.invoke("record-failure")["Err"]
+            .as_str()
+            .unwrap()
+            .contains("UTF-8")
+    );
+    assert_eq!(
+        fs::read(snapshot).unwrap(),
+        before,
+        "ошибка сериализации сохраняет прежний точный snapshot"
+    );
 }
