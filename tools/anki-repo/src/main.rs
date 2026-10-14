@@ -184,9 +184,16 @@ fn maybe_offer_maintenance(cli: &Cli) {
     if matches!(answer.as_str(), "y" | "yes" | "д" | "да") {
         match care::enable(&root) {
             Ok(()) => eprintln!("Автоочистка подтверждена: таймер установлен и активен."),
-            Err(e) => eprintln!(
-                "Не удалось включить GC: {e}. Согласие сохранено; проверьте anki-repo maintenance status."
-            ),
+            Err(e) => {
+                let consent = match care::choice() {
+                    Ok(choice) if choice == "yes" => "Согласие сохранено",
+                    Ok(_) => "Согласие не сохранено",
+                    Err(_) => "Состояние согласия неизвестно",
+                };
+                eprintln!(
+                    "Не удалось включить GC: {e}. {consent}; проверьте anki-repo maintenance status."
+                );
+            }
         }
     } else if matches!(answer.as_str(), "" | "n" | "no" | "н" | "нет") {
         if let Err(e) = care::set_choice("no") {

@@ -1826,10 +1826,22 @@ esac
         parse_json(&String::from_utf8(output.stdout).unwrap())
     };
 
+    std::fs::create_dir_all(cache.join("anki-decks")).unwrap();
+    let lock = repository_maintenance::guard::MaintenanceLock::acquire_at(
+        &cache.join("anki-decks/maintenance-lock"),
+    )
+    .unwrap();
+    let blocked = launch_pty(b"y\n");
+    assert!(blocked.contains("Согласие не сохранено"), "{blocked}");
+    assert!(!blocked.contains("Согласие сохранено"), "{blocked}");
+    assert!(!config.join("anki-decks/gc-preference.json").exists());
+    drop(lock);
+
     let failed_marker = active_marker.with_file_name("fake-timer-active.fail");
     std::fs::write(&failed_marker, "").unwrap();
     let failed = launch_pty(b"y\n");
     assert!(failed.contains("Не удалось включить GC"), "{failed}");
+    assert!(failed.contains("Согласие сохранено"), "{failed}");
     assert!(!active_marker.exists());
     assert_eq!(invoke("status")["result"]["preference"], "yes");
     std::fs::remove_file(failed_marker).unwrap();

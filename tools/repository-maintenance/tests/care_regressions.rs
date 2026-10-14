@@ -728,3 +728,59 @@ fn gc_snapshot_and_exit_survive_notification_timeout_and_lock_is_already_release
     let pid = fs::read_to_string(h.path("notify-pid")).unwrap();
     assert!(!Path::new("/proc").join(pid).exists());
 }
+
+#[test]
+fn busy_lock_defers_without_alert_but_invalid_lock_directory_alerts() {
+    let h = Harness::new();
+    h.script(
+        "powershell.exe",
+        "#!/bin/sh\nprintf '%s' delivered > \"$CARE_SANDBOX/alert\"\nexit 0\n",
+    );
+    let directory = h.path("cache/anki-decks/maintenance-lock");
+    fs::create_dir_all(directory.parent().unwrap()).unwrap();
+    let lock = repository_maintenance::guard::MaintenanceLock::acquire_at(&directory).unwrap();
+    let invoke = || {
+        let env = h.command("inspect", &h.path("unused"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_anki-repository-maintenance"));
+        command
+            .args(["clean", "--apply", "--json", "--workspace-root"])
+            .arg(&h.root)
+            .arg("--temp-root")
+            .arg(h.path("tmp"))
+            .env_clear()
+            .env("WSL_DISTRO_NAME", "synthetic-wsl");
+        for (key, value) in env.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        command.output().unwrap()
+    };
+    let deferred = invoke();
+    assert_eq!(deferred.status.code(), Some(2));
+    let json: Value = serde_json::from_slice(&deferred.stdout).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("очистка отложена:")
+    );
+    assert!(!h.path("alert").exists());
+    assert!(!h.path("state/anki-decks/gc-last-attempt.json").exists());
+    drop(lock);
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    let failed = invoke();
+    assert_eq!(failed.status.code(), Some(2));
+    let json: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert!(
+        !json["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("очистка отложена:")
+    );
+    assert!(
+        h.path("alert").exists(),
+        "ошибка безопасности блокировки остаётся существенным сбоем"
+    );
+    assert!(!h.path("state/anki-decks/gc-last-attempt.json").exists());
+}

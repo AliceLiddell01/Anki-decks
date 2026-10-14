@@ -7,7 +7,7 @@ use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use clap::{Args, Parser, Subcommand};
 use repository_maintenance::care;
 use repository_maintenance::policy::{Policy, workspace_root};
-use repository_maintenance::{RunOptions, render_json, render_text};
+use repository_maintenance::{RunFailure, RunOptions, render_json, render_text};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -211,12 +211,12 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
             i32::from(report.fatal_errors > 0)
         }
         Err(error) => {
-            if apply {
+            if apply && !matches!(error, RunFailure::Deferred(_)) {
                 care::desktop_alert(
                     "Не удалось выполнить GC; проверьте anki-repo maintenance status",
                 );
             }
-            fail(&error, args.json)
+            fail(&error.to_string(), args.json)
         }
     }
 }

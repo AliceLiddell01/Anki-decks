@@ -157,25 +157,49 @@ pub fn run(root: &Path, policy: &Policy, options: &RunOptions) -> Result<Report,
     run_with_lock(root, policy, options, lock.as_ref())
 }
 
+/// Отсрочка конкурента отличается от ошибки выполнения или инфраструктуры GC.
+#[derive(Debug)]
+pub enum RunFailure {
+    Deferred(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deferred(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for RunFailure {}
+
+// Сохраняем форму ошибки в существующих машинных результатах: JSON-строка.
+impl Serialize for RunFailure {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// Применение, повторные замеры и snapshot фиксируются под одной блокировкой.
 /// Внешнее уведомление вызывающий код выполняет после возврата и снятия lock.
 pub fn run_and_record(
     root: &Path,
     policy: &Policy,
     options: &RunOptions,
-) -> (Result<Report, String>, Option<String>) {
+) -> (Result<Report, RunFailure>, Option<String>) {
     if !options.apply {
-        return (run(root, policy, options), None);
+        return (run(root, policy, options).map_err(RunFailure::Failed), None);
     }
     let lock = match guard::MaintenanceLock::acquire() {
         Ok(lock) => lock,
         Err(e) => {
-            return (
-                Err(format!(
-                    "очистка отложена: не удалось получить общую блокировку обслуживания: {e}"
-                )),
-                None,
-            );
+            let message = format!("не удалось получить общую блокировку обслуживания: {e}");
+            let failure = if e.kind() == std::io::ErrorKind::WouldBlock {
+                RunFailure::Deferred(format!("очистка отложена: {message}"))
+            } else {
+                RunFailure::Failed(message)
+            };
+            return (Err(failure), None);
         }
     };
     let result = run_with_lock(root, policy, options, Some(&lock));
@@ -183,7 +207,7 @@ pub fn run_and_record(
         Ok(report) => care::record_report_with_lock(report, &lock),
         Err(e) => care::record_failure_with_lock(root, e, &lock),
     };
-    (result, snapshot.err())
+    (result.map_err(RunFailure::Failed), snapshot.err())
 }
 
 fn run_with_lock(
