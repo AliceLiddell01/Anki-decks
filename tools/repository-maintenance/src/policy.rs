@@ -1,5 +1,4 @@
 use std::fs;
-use std::io;
 use std::path::Path;
 use std::time::Duration;
 
@@ -142,35 +141,7 @@ fn canonical_workspace(path: &Path) -> Result<std::path::PathBuf, String> {
 }
 
 fn installed_root_config() -> Result<Option<std::path::PathBuf>, String> {
-    let Some(config_home) = config_home() else {
-        return Ok(None);
-    };
-    let path = config_home.join("anki-decks/repository-maintenance-install.toml");
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("не удалось прочитать {}: {error}", path.display())),
-    };
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct InstalledRoot {
-        managed_by: String,
-        schema: u32,
-        repository_root: std::path::PathBuf,
-    }
-    let config: InstalledRoot = toml::from_str(&text).map_err(|error| {
-        format!(
-            "повреждена конфигурация установки {}: {error}",
-            path.display()
-        )
-    })?;
-    if config.schema != 1 || config.managed_by != "repository-maintenance" {
-        return Err(format!(
-            "неподдерживаемая версия конфигурации установки {}",
-            path.display()
-        ));
-    }
-    Ok(Some(config.repository_root))
+    crate::timer::installed_root()
 }
 
 pub fn config_home() -> Option<std::path::PathBuf> {

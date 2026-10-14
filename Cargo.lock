@@ -24,6 +24,7 @@ dependencies = [
  "asset-store",
  "clap",
  "getrandom 0.4.3",
+ "repository-maintenance",
  "rustix",
  "serde",
  "serde_json",

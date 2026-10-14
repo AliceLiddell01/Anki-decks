@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 
 use clap::{Args, Parser, Subcommand};
+use repository_maintenance::care;
 use repository_maintenance::policy::{Policy, workspace_root};
-use repository_maintenance::{RunOptions, render_json, render_text, run};
+use repository_maintenance::{RunFailure, RunOptions, render_json, render_text};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,8 @@ enum Command {
     Timer(TimerArgs),
     /// Учёт и использование принадлежащего проекту внешнего кэша Cargo.
     Cache(CacheArgs),
+    /// Отправить тестовое уведомление, не запуская очистку или таймер.
+    NotifyTest,
 }
 
 #[derive(Debug, Args)]
@@ -137,6 +140,21 @@ fn main() {
         }
         Command::Timer(args) => timer(args),
         Command::Cache(args) => cache(args),
+        Command::NotifyTest => {
+            match care::try_desktop_alert("Проверка уведомления; очистка не запускалась.")
+            {
+                Ok(channel) => {
+                    println!(
+                        "Запрос уведомления принят обработчиком: {channel}. Видимость окна проверяется отдельно."
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("Не удалось отправить тестовое уведомление: {error}");
+                    1
+                }
+            }
+        }
     };
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -167,8 +185,21 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
         temp_root: args.temp_root,
         top_entries: args.top.unwrap_or(policy.tmp_top_entries),
     };
-    match run(&root, &policy, &options) {
+    let (result, snapshot_error) = repository_maintenance::run_and_record(&root, &policy, &options);
+    if let Some(error) = snapshot_error {
+        eprintln!("Не удалось сохранить последний результат GC: {error}");
+    }
+    match result {
         Ok(report) => {
+            if apply {
+                // Частичный обзор чужих каталогов /tmp — не сбой очистки
+                // и не основание тревожить пользователя при каждом запуске таймера.
+                if report.fatal_errors > 0 {
+                    care::desktop_alert(
+                        "Ошибка автоматической очистки; проверьте anki-repo maintenance status",
+                    );
+                }
+            }
             if args.json {
                 match render_json(&report) {
                     Ok(json) => println!("{json}"),
@@ -179,7 +210,14 @@ fn execute(args: RunArgs, apply: bool, mode: &'static str, cleanup_legacy: bool)
             }
             i32::from(report.fatal_errors > 0)
         }
-        Err(error) => fail(&error, args.json),
+        Err(error) => {
+            if apply && !matches!(error, RunFailure::Deferred(_)) {
+                care::desktop_alert(
+                    "Не удалось выполнить GC; проверьте anki-repo maintenance status",
+                );
+            }
+            fail(&error.to_string(), args.json)
+        }
     }
 }
 
