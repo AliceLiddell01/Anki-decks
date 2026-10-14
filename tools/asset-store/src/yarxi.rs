@@ -9,8 +9,8 @@ use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer, runtime_s
 #[cfg(test)]
 use crate::browser_runtime::TrackedRequest;
 use crate::browser_runtime::{
-    self, BrowserLaunchError, BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor,
-    DeviceMetrics, NetworkOutcome, RetryTrigger, RuntimeSnapshot,
+    self, BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor, DeviceMetrics, NetworkOutcome,
+    RetryTrigger, RuntimeSnapshot,
 };
 pub use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
 use crate::error::AssetError;
@@ -904,14 +904,7 @@ impl ParallelBrowserDriver {
             self.workspace.as_ref().expect("worker workspace").path(),
         )
         .await
-        .map_err(|error| match error {
-            BrowserLaunchError::Setup(message) => {
-                AcquisitionStreamError::Provider(format!("browser_worker_session_fault: {message}"))
-            }
-            error => {
-                AcquisitionStreamError::Provider(format!("browser_worker_launch_fatal: {error}"))
-            }
-        })?;
+        .map_err(|error| AcquisitionStreamError::Provider(error.to_string()))?;
         context.browser_session = Some(session.diagnostic_session_id());
         self.monitor = Some(BrowserEvidenceMonitor::new(session.telemetry().clone()));
         self.session = Some(session);
@@ -931,7 +924,7 @@ impl ParallelBrowserDriver {
         );
         let setup = tokio::select! {
             biased;
-            setup = setup => setup.map_err(|error| AcquisitionStreamError::Provider(format!("browser_worker_session_fault: {error}"))),
+            setup = setup => setup.map_err(AcquisitionStreamError::Provider),
             signal = &mut self.interrupt => return Err(signal_error(signal)),
         }?;
         self.tls_exception = setup.map(|approved| approved.provenance);
@@ -1094,7 +1087,7 @@ impl ParallelDriver for ParallelBrowserDriver {
 const PARALLEL_RECOVERY_BUDGET: u8 = MAX_SESSION_SETUP_RECREATIONS + 1;
 
 fn parallel_recoverable(error: &AcquisitionStreamError) -> bool {
-    matches!(error, AcquisitionStreamError::Provider(message) if message.starts_with("browser_worker_session_fault:"))
+    matches!(error, AcquisitionStreamError::Provider(message) if message.starts_with(SESSION_SETUP_RUNTIME_FAILURE_PREFIX))
 }
 
 fn parallel_session_fault(stop: &SessionStopReason) -> bool {
@@ -6103,6 +6096,7 @@ mod parallel_pool_tests {
     enum SyntheticMode {
         Terminal,
         Fault,
+        SetupFailure(&'static str),
         CleanupFailure,
         TerminalSessionFault,
         AlternatingHealthy,
@@ -6158,9 +6152,12 @@ mod parallel_pool_tests {
                 }
             }
             match self.mode {
-                SyntheticMode::Fault => Err(AcquisitionStreamError::Provider(
-                    "browser_worker_session_fault: injected".into(),
-                )),
+                SyntheticMode::Fault => Err(AcquisitionStreamError::Provider(format!(
+                    "{SESSION_SETUP_RUNTIME_FAILURE_PREFIX} injected"
+                ))),
+                SyntheticMode::SetupFailure(message) => {
+                    Err(AcquisitionStreamError::Provider(message.into()))
+                }
                 SyntheticMode::Panic => panic!("injected worker panic"),
                 mode => Ok(ParallelAcquired {
                     outcome: Some(Err("gif_unknown: synthetic terminal failure".into())),
@@ -6516,6 +6513,63 @@ mod parallel_pool_tests {
         assert!(deferred > 0);
         completed.sort_unstable();
         assert_eq!(completed, (0..12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn permanent_setup_errors_preserve_cause_without_requeue_or_pool_exhaustion() {
+        for message in [
+            "запуск браузера: исполняемый файл не найден",
+            "tls_interstitial: строгий режим запрещает исключение TLS",
+            "provider_host_mismatch: загрузка ушла с www.yarxi.su",
+            "browser_worker_session_fault: постоянный отказ запуска",
+            "browser_worker_cleanup_failed: ошибка очистки",
+        ] {
+            let (cancel, _) = watch::channel(None);
+            let cleanup = Arc::new(Mutex::new(Vec::new()));
+            let mut assigned = 0;
+            let mut deferred = 0;
+            let mut rotated = 0;
+            let mut retired = 0;
+            let mut terminal = 0;
+            let error = coordinate_parallel(
+                vec![driver(
+                    SyntheticMode::SetupFailure(message),
+                    &cancel,
+                    &cleanup,
+                )],
+                jobs(3),
+                futures::future::pending(),
+                cancel,
+                &mut |event| {
+                    match event.event {
+                        AcquisitionWorkerEventKind::Assigned => assigned += 1,
+                        AcquisitionWorkerEventKind::Deferred { .. }
+                        | AcquisitionWorkerEventKind::Requeued { .. } => deferred += 1,
+                        AcquisitionWorkerEventKind::WorkerRetired { .. } => retired += 1,
+                        AcquisitionWorkerEventKind::Provider(
+                            AcquisitionEvent::SessionRotated { .. },
+                        ) => rotated += 1,
+                        AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                            ..
+                        }) => terminal += 1,
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, AcquisitionStreamError::Provider(ref cause) if cause == message),
+                "{error:?}"
+            );
+            assert_eq!(assigned, 1);
+            assert_eq!((deferred, rotated, retired, terminal), (0, 0, 0, 0));
+            assert_eq!(
+                *cleanup.lock().unwrap(),
+                ["session_closed", "workspace_closed"]
+            );
+        }
     }
 
     #[tokio::test]
