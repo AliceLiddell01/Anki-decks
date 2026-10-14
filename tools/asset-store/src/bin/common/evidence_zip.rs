@@ -12,7 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use asset_store::diagnostics::{OutputMode, RunLogGuard, safe_message, safe_route};
 use asset_store::hashing::sha256_hex;
 use asset_store::temp_workspace::{
-    TempWorkspace, cleanup_legacy_orphans, cleanup_orphans, snapshot,
+    TempWorkspace, cleanup_legacy_orphans_under, cleanup_orphans_under, selected_temp_root,
+    snapshot_under,
 };
 use serde_json::{Value, json};
 use zip::write::SimpleFileOptions;
@@ -43,8 +44,15 @@ pub struct EvidenceRun {
     output: PathBuf,
     before: Value,
     startup_gc: Value,
+    temp_root: PathBuf,
     started: u64,
     tool: &'static str,
+}
+
+fn evidence_gc(root: &Path) -> io::Result<Value> {
+    let runs = cleanup_orphans_under(root, ORPHAN_MIN_AGE)?;
+    let legacy = cleanup_legacy_orphans_under(root, ORPHAN_MIN_AGE)?;
+    Ok(json!({"root":root, "runs":runs, "legacy":legacy}))
 }
 
 impl EvidenceRun {
@@ -53,10 +61,19 @@ impl EvidenceRun {
         output: Option<&Path>,
         checkout: &Path,
     ) -> Result<Self, Error> {
-        // Validate output without creating it; failures must precede provider work.
-        let before = serde_json::to_value(snapshot()?)?;
-        let startup_gc = json!({"runs": cleanup_orphans(ORPHAN_MIN_AGE)?, "legacy":cleanup_legacy_orphans(ORPHAN_MIN_AGE)?});
-        let workspace = TempWorkspace::create(tool)?;
+        Self::start_under(tool, output, checkout, selected_temp_root()?)
+    }
+
+    fn start_under(
+        tool: &'static str,
+        output: Option<&Path>,
+        checkout: &Path,
+        temp_root: PathBuf,
+    ) -> Result<Self, Error> {
+        // Корень закреплён на весь запуск: отчёты и фактическая уборка совпадают.
+        let before = serde_json::to_value(snapshot_under(&temp_root)?)?;
+        let startup_gc = evidence_gc(&temp_root)?;
+        let workspace = TempWorkspace::create_under(&temp_root, tool)?;
         let result = (|| {
             let output = resolve_output(output, checkout, workspace.path(), tool)?;
             // Проверяем поддержку unnamed staging до запуска сетевого provider.
@@ -87,6 +104,7 @@ impl EvidenceRun {
             output,
             before,
             startup_gc,
+            temp_root,
             started: now(),
             tool,
         };
@@ -197,17 +215,14 @@ impl EvidenceRun {
                 json!({"stage":"evidence", "code":"evidence_zip_failed", "message":safe_message(&error.to_string()),"diagnostic":"evidence не опубликован"})
             );
         }
-        // An error is emitted before deleting the only unpacked diagnostic information.
+        // Сообщаем об ошибке до удаления единственного распакованного экземпляра диагностики.
         let cleanup = self
             .workspace
             .take()
             .expect("owner существует до close")
             .close();
-        let final_gc = cleanup_orphans(ORPHAN_MIN_AGE).and_then(|runs| {
-            cleanup_legacy_orphans(ORPHAN_MIN_AGE)
-                .map(|legacy| json!({"runs":runs,"legacy":legacy}))
-        });
-        let after = snapshot();
+        let final_gc = evidence_gc(&self.temp_root);
+        let after = snapshot_under(&self.temp_root);
         if let Err(error) = &cleanup {
             eprintln!(
                 "{}",
@@ -834,6 +849,51 @@ mod tests {
             .filter(|name| name != ".anki-decks-owner.json")
             .collect();
         assert_eq!(remaining, vec!["evidence.zip"]);
+    }
+
+    #[test]
+    fn evidence_gc_records_the_pinned_root_at_start_and_finish() {
+        let owner = TempWorkspace::create("evidence-selected-root").unwrap();
+        let selected = owner.path().join("selected");
+        let independent = owner.path().join("independent");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&independent).unwrap();
+        fs::write(independent.join("keep"), b"independent").unwrap();
+        let output = owner.path().join("selected.zip");
+        let run = EvidenceRun::start_under(
+            "selected-root",
+            Some(&output),
+            Path::new("."),
+            selected.clone(),
+        )
+        .unwrap();
+        assert!(run.path().starts_with(&selected));
+        assert_eq!(run.startup_gc["root"], json!(selected));
+        let log = run.log_guard().unwrap();
+        run.finish(Ok(()), log.finish()).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(fs::read(output).unwrap())).unwrap();
+        let mut raw = String::new();
+        archive
+            .by_name("hygiene.json")
+            .unwrap()
+            .read_to_string(&mut raw)
+            .unwrap();
+        let hygiene: Value = serde_json::from_str(&raw).unwrap();
+        for phase in ["startup_gc", "final_gc"] {
+            assert_eq!(hygiene[phase]["root"], json!(selected));
+            assert_eq!(hygiene[phase]["runs"]["root"], json!(selected));
+            assert_eq!(hygiene[phase]["legacy"]["root"], json!(selected));
+        }
+        assert_eq!(fs::read(independent.join("keep")).unwrap(), b"independent");
+        assert!(
+            fs::read_dir(selected.join(format!(
+                "anki-decks-{}",
+                fs::metadata("/proc/self").unwrap().uid()
+            )))
+            .unwrap()
+            .next()
+            .is_none()
+        );
     }
 
     #[test]

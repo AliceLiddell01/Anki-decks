@@ -713,7 +713,7 @@ fn parallel_frontier_checkpoints_out_of_order_before_worker_reassignment() {
             assert_eq!(checkpoint.items[1].attempts.len(), 1);
             assert!(checkpoint.items[2].attempts.is_empty());
 
-            // Worker 2 получает новый элемент только после возврата callback
+            // Обработчик 2 получает новый элемент только после возврата callback
             // выше, то есть после синхронного durable checkpoint элемента 漢.
             on_event(worker_event(2, 2, AcquisitionWorkerEventKind::Assigned))
                 .map_err(AcquisitionStreamError::Consumer)?;
@@ -759,6 +759,20 @@ fn parallel_frontier_checkpoints_out_of_order_before_worker_reassignment() {
             .map(|event| event.identity.as_ref().unwrap().key.as_str())
             .collect::<Vec<_>>(),
         ["漢", "字", "元"]
+    );
+    for item in &state.items {
+        let BatchAttemptInput::Failed { message, .. } = &item.attempts[0].result else {
+            panic!("ожидалась сохранённая ошибка именно этого символа");
+        };
+        assert!(
+            message.contains(&item.identity.key),
+            "{}: {message}",
+            item.identity.key
+        );
+    }
+    assert_eq!(
+        progress.events.iter().map(|event| event.in_flight).max(),
+        Some(2)
     );
     let first = progress
         .events
@@ -872,7 +886,7 @@ fn parallel_frontier_rejects_duplicate_terminal_and_incomplete_success() {
             .filter(|event| event.event == "round_started")
             .count(),
         1,
-        "следующий round нельзя начать до terminal checkpoint всего frontier"
+        "следующий раунд нельзя начать до сохранения результата всей границы обхода"
     );
 }
 
@@ -2737,17 +2751,351 @@ fn browser_item_cancelled_before_checkpoint_remains_interrupted_and_resumable() 
 }
 
 #[test]
-fn parallel_progress_events_have_human_labels() {
-    for event in [
-        "worker_assigned",
-        "browser_session_bootstrap_started",
-        "browser_session_recovery_started",
-        "item_deferred",
-        "item_requeued",
-        "worker_retired",
-        "worker_stopped",
-        "worker_exhausted",
+fn parallel_progress_events_have_exact_human_labels_and_optional_context() {
+    let mut event = BatchProgressEvent {
+        schema_version: 1,
+        operation: "batch_run",
+        event: "worker_assigned",
+        batch_id: "human-progress".into(),
+        elapsed_ms: 0,
+        round: Some(1),
+        round_limit: 1,
+        round_completed: 0,
+        round_total: 1,
+        run_completed: 0,
+        batch_total: 1,
+        workers: 2,
+        in_flight: 1,
+        identity: Some(identity('漢')),
+        session: Some(3),
+        worker_id: Some(2),
+        browser_session_id: Some(17),
+        attempt: None,
+        generation: Some(4),
+        owner_attempt: Some(5),
+        item_elapsed_ms: None,
+        stage_timings: None,
+        outcome: None,
+        reason: None,
+    };
+    for (name, expected) in [
+        ("worker_assigned", "элемент назначен обработчику"),
+        (
+            "browser_session_bootstrap_started",
+            "подготовка сессии браузера",
+        ),
+        (
+            "browser_session_recovery_started",
+            "восстановление сессии браузера",
+        ),
+        ("item_deferred", "элемент отложен"),
+        ("item_requeued", "элемент возвращён в очередь"),
+        ("worker_retired", "обработчик выведен из пула"),
+        ("worker_stopped", "обработчик остановлен"),
+        ("worker_exhausted", "пул обработчиков исчерпан"),
     ] {
-        assert_ne!(progress_event_label(event), "событие прогресса", "{event}");
+        event.event = name;
+        assert_eq!(progress_event_label(name), expected);
+        let mut output = Vec::new();
+        write_progress_event(&event, OutputFormat::Human, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        for fragment in [
+            expected,
+            "обработчик=2",
+            "сессия=3",
+            "браузер=17",
+            "поколение=4",
+            "попытка владельца=5",
+        ] {
+            assert!(output.contains(fragment), "{output}");
+        }
+        let mut machine = Vec::new();
+        write_progress_event(&event, OutputFormat::Json, &mut machine).unwrap();
+        let machine: serde_json::Value = serde_json::from_slice(&machine).unwrap();
+        assert_eq!(machine["event"], name);
+        assert_eq!(machine["worker_id"], 2);
+        assert_eq!(machine["browser_session_id"], 17);
     }
+    event.worker_id = None;
+    event.session = None;
+    event.browser_session_id = None;
+    event.generation = None;
+    event.owner_attempt = None;
+    event.event = "worker_stopped";
+    event.reason = Some("finished".into());
+    let mut output = Vec::new();
+    write_progress_event(&event, OutputFormat::Human, &mut output).unwrap();
+    let output = String::from_utf8(output).unwrap();
+    for fragment in [
+        "обработчик=",
+        "сессия=",
+        "браузер=",
+        "поколение=",
+        "попытка владельца=",
+        "finished",
+    ] {
+        assert!(!output.contains(fragment), "{output}");
+    }
+    assert!(output.contains("работа завершена"));
+    let mut machine = Vec::new();
+    write_progress_event(&event, OutputFormat::Json, &mut machine).unwrap();
+    let machine: serde_json::Value = serde_json::from_slice(&machine).unwrap();
+    assert_eq!(machine["reason"], "finished");
+    assert!(machine.get("worker_id").is_none());
+}
+
+#[test]
+fn kanji_workers_default_and_range_are_enforced_by_cli_and_batch_entry() {
+    let parsed = <crate::cli::Cli as clap::Parser>::try_parse_from([
+        "kanji-assets",
+        "batch",
+        "run",
+        "--batch-id",
+        "worker-default",
+    ])
+    .unwrap();
+    assert!(matches!(
+        parsed.command,
+        crate::cli::Command::Batch {
+            command: BatchCommand::Run { workers: 4, .. }
+        }
+    ));
+    for workers in ["0", "5"] {
+        assert!(
+            <crate::cli::Cli as clap::Parser>::try_parse_from([
+                "kanji-assets",
+                "batch",
+                "run",
+                "--batch-id",
+                "worker-range",
+                "--workers",
+                workers
+            ])
+            .is_err()
+        );
+    }
+    let fixture = Fixture::new();
+    fixture.start("worker-range", &['漢']);
+    for workers in [0, 5] {
+        let mut progress = CapturedProgress::default();
+        assert!(
+            run_batch_with_worker_stream_and_progress(
+                &fixture.store,
+                "worker-range",
+                1,
+                workers,
+                |_, _, _, _, _| panic!("невалидное число обработчиков не допускает запуск"),
+                &mut StoreSnapshotReader,
+                &mut progress
+            )
+            .is_err()
+        );
+        assert!(progress.events.is_empty());
+        assert!(fixture.load("worker-range").items[0].attempts.is_empty());
+    }
+}
+
+#[test]
+fn parallel_frontier_rejects_invalid_worker_ownership_and_tokens_before_checkpoint() {
+    for case in [
+        "zero",
+        "out-of-range",
+        "busy",
+        "generation",
+        "attempt",
+        "foreign-terminal",
+        "wrong-index",
+    ] {
+        let fixture = Fixture::new();
+        fixture.start("worker-protocol", &['漢', '字']);
+        let mut progress = CapturedProgress::default();
+        let result = run_batch_with_worker_stream_and_progress(
+            &fixture.store,
+            "worker-protocol",
+            1,
+            2,
+            |_, _, _, _, on_event| {
+                if matches!(case, "busy" | "foreign-terminal" | "wrong-index") {
+                    on_event(worker_event(1, 0, AcquisitionWorkerEventKind::Assigned))
+                        .map_err(AcquisitionStreamError::Consumer)?;
+                }
+                let mut event = worker_event(
+                    1,
+                    if case == "busy" { 1 } else { 0 },
+                    AcquisitionWorkerEventKind::Assigned,
+                );
+                let BatchAcquisitionEvent::Worker(ref mut worker) = event else {
+                    unreachable!()
+                };
+                match case {
+                    "zero" => worker.worker_id = 0,
+                    "out-of-range" => worker.worker_id = 3,
+                    "generation" => worker.generation = Some(1),
+                    "attempt" => worker.owner_attempt = Some(2),
+                    "foreign-terminal" | "wrong-index" => {
+                        if case == "foreign-terminal" {
+                            worker.worker_id = 2;
+                        }
+                        worker.event =
+                            AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                                index: if case == "wrong-index" { 1 } else { 0 },
+                                outcome: Box::new(Err("не должен быть записан".into())),
+                                diagnostics: None,
+                            });
+                    }
+                    _ => (),
+                }
+                on_event(event).map_err(AcquisitionStreamError::Consumer)
+            },
+            &mut StoreSnapshotReader,
+            &mut progress,
+        );
+        assert!(result.is_err(), "{case}");
+        assert!(
+            fixture
+                .load("worker-protocol")
+                .items
+                .iter()
+                .all(|item| item.attempts.is_empty()),
+            "{case}"
+        );
+        assert!(
+            !progress
+                .events
+                .iter()
+                .any(|event| event.event == "item_checkpointed"),
+            "{case}"
+        );
+        assert!(progress.events.iter().all(|event| event.in_flight <= 2));
+    }
+}
+
+#[test]
+fn parallel_distinct_media_out_of_order_preserves_identity_bytes_and_cas() {
+    let fixture = Fixture::new();
+    fixture.start("parallel-media", &['漢', '字']);
+    let mut progress = CapturedProgress::default();
+    let (state, _, _) = run_batch_with_worker_stream_and_progress(
+        &fixture.store,
+        "parallel-media",
+        1,
+        2,
+        |characters, _, _, _, on_event| {
+            for index in 0..2 {
+                on_event(worker_event(
+                    index + 1,
+                    index,
+                    AcquisitionWorkerEventKind::Assigned,
+                ))
+                .map_err(AcquisitionStreamError::Consumer)?;
+            }
+            for index in [1, 0] {
+                let character = &characters[index];
+                on_event(worker_event(
+                    index + 1,
+                    index,
+                    AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                        index,
+                        outcome: Box::new(Ok(media(
+                            character,
+                            glyph(character.chars().next().unwrap()),
+                        ))),
+                        diagnostics: None,
+                    }),
+                ))
+                .map_err(AcquisitionStreamError::Consumer)?;
+            }
+            Ok(())
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    )
+    .unwrap();
+    for item in &state.items {
+        assert_eq!(item.attempts.len(), 1);
+        let BatchAttemptInput::Candidate { candidate } = &item.attempts[0].result else {
+            panic!("ожидался кандидат именно этого кандзи");
+        };
+        let expected = glyph(item.identity.key.chars().next().unwrap());
+        assert_eq!(candidate.sha256, crate::hashing::sha256_hex(&expected));
+        let bytes = fs::read(
+            fixture
+                .store
+                .root()
+                .join(".runtime/batches/parallel-media")
+                .join(&candidate.storage_path),
+        )
+        .unwrap();
+        assert_eq!(bytes, expected);
+    }
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.event == "item_checkpointed")
+            .map(|event| event.identity.as_ref().unwrap().key.as_str())
+            .collect::<Vec<_>>(),
+        ["字", "漢"]
+    );
+}
+
+#[test]
+fn parallel_stale_outcome_cannot_append_to_a_concurrently_changed_attempt() {
+    let fixture = Fixture::new();
+    fixture.start("parallel-stale", &['漢']);
+    let mut progress = CapturedProgress::default();
+    let (state, _, _) = run_batch_with_worker_stream_and_progress(
+        &fixture.store,
+        "parallel-stale",
+        1,
+        2,
+        |_, _, _, _, on_event| {
+            on_event(worker_event(1, 0, AcquisitionWorkerEventKind::Assigned))
+                .map_err(AcquisitionStreamError::Consumer)?;
+            {
+                let mut runtime =
+                    BatchRuntime::open(fixture.store.root(), "parallel-stale").unwrap();
+                let mut current = runtime.load().unwrap().unwrap();
+                current
+                    .record_attempt(
+                        &identity('漢'),
+                        BatchAttemptInput::Failed {
+                            code: "concurrent".into(),
+                            message: "исход другого запуска".into(),
+                        },
+                    )
+                    .unwrap();
+                runtime.save(&current).unwrap();
+            }
+            on_event(worker_event(
+                1,
+                0,
+                AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted {
+                    index: 0,
+                    outcome: Box::new(Err("устаревший исход".into())),
+                    diagnostics: None,
+                }),
+            ))
+            .map_err(AcquisitionStreamError::Consumer)
+        },
+        &mut StoreSnapshotReader,
+        &mut progress,
+    )
+    .unwrap();
+    assert_eq!(state.items[0].attempts.len(), 1);
+    assert!(
+        matches!(&state.items[0].attempts[0].result, BatchAttemptInput::Failed { code, .. } if code == "concurrent")
+    );
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.event == "item_discarded_stale")
+    );
+    assert!(
+        !progress
+            .events
+            .iter()
+            .any(|event| event.event == "item_checkpointed")
+    );
 }

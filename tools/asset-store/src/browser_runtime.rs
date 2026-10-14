@@ -2014,7 +2014,7 @@ mod tests {
             .join("SingletonSocket");
         assert!(
             socket_path.as_os_str().as_bytes().len() < 108,
-            "Unix socket path is {} bytes: {}",
+            "путь Unix-сокета занимает {} байт: {}",
             socket_path.as_os_str().as_bytes().len(),
             socket_path.display()
         );

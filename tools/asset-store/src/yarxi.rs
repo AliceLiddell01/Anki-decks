@@ -737,7 +737,7 @@ pub enum AcquisitionEvent {
     },
 }
 
-/// Контекст единственного назначения; provider attempt отличается от owner attempt.
+/// Контекст единственного назначения; попытка поставщика отличается от попытки владельца.
 #[derive(Debug)]
 pub struct AcquisitionWorkerEvent {
     pub worker_id: usize,
@@ -853,6 +853,9 @@ trait ParallelDriver {
         context: &mut ParallelWorkerContext,
         sender: &mpsc::UnboundedSender<ParallelMessage>,
     ) -> Result<ParallelAcquired, AcquisitionStreamError>;
+    async fn after_checkpoint(
+        &mut self,
+    ) -> Result<Option<SessionStopReason>, AcquisitionStreamError>;
     async fn rotate(&mut self) -> Result<(), AcquisitionStreamError>;
     fn finish(&mut self) -> Result<(), AcquisitionStreamError>;
 }
@@ -991,7 +994,7 @@ impl ParallelDriver for ParallelBrowserDriver {
                 index: job.index,
             }),
         )?;
-        // Индекс 0 соответствует локальному массиву generation, внешний индекс — исходному frontier.
+        // Индекс 0 относится к локальному массиву поколений, внешний индекс — к исходной границе обхода.
         let mut events = |event| {
             let event = match event {
                 AcquisitionEvent::RetryStarted { attempt, .. } => {
@@ -1027,7 +1030,7 @@ impl ParallelDriver for ParallelBrowserDriver {
         };
         let (outcome, stop) = driver.acquire(0, &job.character, &mut events).await?;
         let diagnostics = driver.take_diagnostics();
-        // Неисправный CDP/возраст сессии до доказанного результата не является attempt владельца.
+        // Неисправный CDP или возраст сессии до доказанного результата не создаёт попытку владельца.
         let deferred = outcome.is_err()
             && matches!(
                 stop,
@@ -1049,6 +1052,18 @@ impl ParallelDriver for ParallelBrowserDriver {
             diagnostics,
             stop,
         })
+    }
+
+    async fn after_checkpoint(
+        &mut self,
+    ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+        if self.interrupt.is_finished() {
+            return Err(signal_error((&mut self.interrupt).await));
+        }
+        let monitor = self.monitor.as_ref().ok_or_else(|| {
+            parallel_protocol_error("после сохранения результата отсутствует монитор сессии")
+        })?;
+        Ok(monitor_stop_reason(monitor))
     }
 
     async fn rotate(&mut self) -> Result<(), AcquisitionStreamError> {
@@ -1104,6 +1119,9 @@ async fn run_parallel_worker(
     };
     let mut consecutive_failures = 0u8;
     let mut session_processed = 0usize;
+    // Последующий здоровый checkpoint доказывает восстановление. Без него
+    // завершение очереди должно сохранить отказ последнего монитора.
+    let mut checkpoint_fault = None;
     let result = AssertUnwindSafe(async {
         loop {
             sender
@@ -1112,7 +1130,15 @@ async fn run_parallel_worker(
             let job = tokio::select! {
                 biased;
                 _ = cancellation.changed() => break,
-                job = commands.recv() => match job { Some(job) => job, None => break },
+                job = commands.recv() => match job {
+                    Some(job) => job,
+                    None => {
+                        if let Some(message) = checkpoint_fault.take() {
+                            return Err(AcquisitionStreamError::Provider(message));
+                        }
+                        break;
+                    },
+                },
             };
             if cancellation.borrow().is_some() {
                 break;
@@ -1121,17 +1147,12 @@ async fn run_parallel_worker(
             context.attempt = 1;
             send_parallel_event(&sender, &context, AcquisitionWorkerEventKind::Assigned)?;
             let acquired = driver.acquire(&job, &mut context, &sender).await;
-            let stop;
+            let mut stop;
             match acquired {
                 Ok(mut acquired) => {
                     stop = acquired.stop.take();
                     if let Some(outcome) = acquired.outcome.take() {
-                        // Доказанный item outcome без отказа session либо успешные байты
-                        // подтверждают здоровую работу. Серия terminal timeout/recovery
-                        // failures продолжает расходовать бюджет даже после checkpoint.
-                        if outcome.is_ok() || !stop.as_ref().is_some_and(parallel_session_fault) {
-                            consecutive_failures = 0;
-                        }
+                        let successful = outcome.is_ok();
                         session_processed += 1;
                         acknowledge_parallel_event(
                             &sender,
@@ -1143,6 +1164,19 @@ async fn run_parallel_worker(
                             }),
                         )
                         .await?;
+                        // Проверяем здоровье после подтверждённой записи, включая последний
+                        // элемент. Отказ сессии не отменяет результат и не создаёт новую попытку.
+                        let health_stop = driver.after_checkpoint().await?;
+                        checkpoint_fault = match &health_stop {
+                            Some(SessionStopReason::RuntimeFailure(message)) => {
+                                Some(message.clone())
+                            }
+                            _ => None,
+                        };
+                        stop = health_stop.or(stop);
+                        if successful || !stop.as_ref().is_some_and(parallel_session_fault) {
+                            consecutive_failures = 0;
+                        }
                     } else {
                         if let Some(diagnostics) = acquired.diagnostics.take() {
                             diagnostics.timing.interrupt("session_fault_deferred", None);
@@ -1223,6 +1257,11 @@ async fn run_parallel_worker(
                             reason: reason.summary(),
                         },
                     )?;
+                    if commands.is_closed()
+                        && let Some(message) = checkpoint_fault.take()
+                    {
+                        return Err(AcquisitionStreamError::Provider(message));
+                    }
                     break;
                 }
                 send_parallel_event(
@@ -1265,7 +1304,7 @@ async fn run_parallel_worker(
                 stage = "worker_cancel",
                 code = "browser_worker_cancelled",
                 cancellation_reason = "coordinator_failure",
-                "Worker остановлен отказом координатора"
+                "Обработчик остановлен отказом координатора"
             );
         }
         if let Err(error) = send_parallel_event(
@@ -1284,7 +1323,7 @@ async fn run_parallel_worker(
         result = Err(AcquisitionStreamError::Provider(format!(
             "{}; {}",
             result.err().map_or_else(
-                || "worker stopped".into(),
+                || "обработчик остановлен".into(),
                 AcquisitionStreamError::into_message
             ),
             cleanup.into_message()
@@ -1300,7 +1339,7 @@ async fn run_parallel_worker(
         result = Err(AcquisitionStreamError::Provider(format!(
             "{}; {}",
             result.err().map_or_else(
-                || "worker stopped".into(),
+                || "обработчик остановлен".into(),
                 AcquisitionStreamError::into_message
             ),
             cleanup.into_message()
@@ -1334,7 +1373,7 @@ impl ParallelAssignments {
             .worker_id
             .checked_sub(1)
             .filter(|slot| *slot < self.active.len())
-            .ok_or_else(|| parallel_protocol_error("неизвестный worker"))?;
+            .ok_or_else(|| parallel_protocol_error("неизвестный обработчик"))?;
         let expected = self.active[slot]
             .as_ref()
             .ok_or_else(|| parallel_protocol_error("результат без назначения"))?;
@@ -1362,7 +1401,7 @@ impl ParallelAssignments {
             };
             command
                 .send(job.clone())
-                .map_err(|_| parallel_protocol_error("worker не принимает назначение"))?;
+                .map_err(|_| parallel_protocol_error("обработчик не принимает назначение"))?;
             self.active[slot] = Some(job);
             self.ready[slot] = false;
         }
@@ -1459,7 +1498,7 @@ async fn coordinate_parallel<D: ParallelDriver>(
                         ParallelMessage::Event(event, ack) => {
                             let worker = event.worker_id;
                             let slot = worker.checked_sub(1).filter(|slot| *slot < count)
-                                .ok_or_else(|| parallel_protocol_error("неизвестный worker события"))?;
+                                .ok_or_else(|| parallel_protocol_error("неизвестный обработчик события"))?;
                             contexts[slot] = ParallelWorkerContext {
                                 worker_id: worker, session: event.session,
                                 browser_session: event.browser_session, attempt: event.attempt,
@@ -1474,9 +1513,9 @@ async fn coordinate_parallel<D: ParallelDriver>(
                             }
                             if matches!(event.event, AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionStarted { .. })) { sessions += 1; }
                             if matches!(event.event, AcquisitionWorkerEventKind::WorkerRetired { .. } | AcquisitionWorkerEventKind::WorkerStopped { .. }) { state.retired[worker - 1] = true; }
-                            // После отказа callback принятые результаты соседей продолжают checkpoint.
-                            // Не ждём join-error: сосед уже может прислать Ready.
-                            // Fatal stop закрывает dispatch в обработке этого же сообщения.
+                            // После отказа потребителя принятые результаты соседей продолжают сохраняться.
+                            // Не ждём ошибки завершения задачи: сосед уже может прислать Ready.
+                            // Неисправимое завершение прекращает назначения при обработке этого же сообщения.
                             let stopped_failure = stopped_parallel_failure(&event);
                             let requeue_reason = match &event.event {
                                 AcquisitionWorkerEventKind::Deferred { reason } => reason.clone(),
@@ -1501,7 +1540,7 @@ async fn coordinate_parallel<D: ParallelDriver>(
                     if error.is_none() { error = Some(next); }
                     request_parallel_cancellation(&cancellation, ParallelCancellationReason::CoordinatorFailure);
                 }
-                // Сигнал, полученный в callback checkpoint, проверяется до refill.
+                // Сигнал, полученный при записи контрольной точки, проверяется до нового назначения.
                 if !interrupted && let Some(signal) = interrupt.as_mut().now_or_never() {
                     interrupted = true;
                     let cancellation_reason = if matches!(&signal, AcquisitionStreamError::Interrupted) {
@@ -1561,7 +1600,7 @@ async fn coordinate_parallel<D: ParallelDriver>(
                                 tracing::warn!(
                                     stage = "worker_stop",
                                     message = %crate::diagnostics::safe_message(&next.into_message()),
-                                    "Вторичная ошибка worker после первичной"
+                                    "Вторичная ошибка обработчика после первичной"
                                 );
                                 original
                             }
@@ -1595,7 +1634,7 @@ async fn coordinate_parallel<D: ParallelDriver>(
 }
 
 impl AcquisitionRun {
-    /// Получает один frontier: раунды и CAS остаются у единственного потребителя.
+    /// Получает одну границу обхода: раунды и CAS остаются у единственного потребителя.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn acquire_with_generations_parallel<F>(
         &mut self,
@@ -1615,7 +1654,7 @@ impl AcquisitionRun {
             || owner_attempts.contains(&0)
         {
             return Err(parallel_protocol_error(
-                "некорректное число workers или owner tokens",
+                "некорректное число обработчиков или токены владельца",
             ));
         }
         let mut unique = HashSet::new();
@@ -1694,7 +1733,7 @@ impl AcquisitionRun {
 }
 
 /// Передаёт единственный таймер элемента от браузера к потребителю результата.
-/// Пакет завершает его после проверки и надёжного checkpoint; самостоятельный
+/// Пакет завершает его после проверки и надёжной контрольной точки; самостоятельный
 /// потребитель — после приёма результата получения.
 pub struct AcquisitionItemDiagnostics {
     pub(crate) timing: BrowserItemTimer,
@@ -6069,6 +6108,9 @@ mod parallel_pool_tests {
         AlternatingHealthy,
         FaultCleanupFailure,
         Panic,
+        PostCheckpointFault,
+        PostCheckpointFaultOnce,
+        PostCheckpointInterrupt,
     }
 
     struct SyntheticDriver {
@@ -6132,6 +6174,26 @@ mod parallel_pool_tests {
                 }),
             }
         }
+        async fn after_checkpoint(
+            &mut self,
+        ) -> Result<Option<SessionStopReason>, AcquisitionStreamError> {
+            self.cleanup.lock().unwrap().push("health_checked");
+            match self.mode {
+                SyntheticMode::PostCheckpointFault | SyntheticMode::PostCheckpointFaultOnce
+                    if matches!(self.mode, SyntheticMode::PostCheckpointFault)
+                        || self.acquisitions == 1 =>
+                {
+                    Ok(monitor_stop_reason(&BrowserEvidenceMonitor::new(
+                        CdpRuntimeMonitor::from_snapshot_for_test(RuntimeSnapshot {
+                            monitor_failed: true,
+                            ..RuntimeSnapshot::default()
+                        }),
+                    )))
+                }
+                SyntheticMode::PostCheckpointInterrupt => Err(AcquisitionStreamError::Interrupted),
+                _ => Ok(None),
+            }
+        }
         async fn rotate(&mut self) -> Result<(), AcquisitionStreamError> {
             self.cleanup.lock().unwrap().push("session_closed");
             if matches!(
@@ -6155,7 +6217,7 @@ mod parallel_pool_tests {
         (0..count)
             .map(|index| ParallelJob {
                 index,
-                character: "漢".into(),
+                character: char::from_u32(0x4e00 + index as u32).unwrap().to_string(),
                 generation: 7,
                 owner_attempt: 2,
             })
@@ -6196,13 +6258,122 @@ mod parallel_pool_tests {
             job: Some(job),
             ..ParallelWorkerContext::default()
         };
-        let mut stale = context.event(AcquisitionWorkerEventKind::Assigned);
-        stale.generation = Some(8);
-        assert!(assignments.accept(&stale).is_err());
-        assert!(assignments.active[0].is_some());
+        for invalid in [
+            "generation",
+            "attempt",
+            "index",
+            "zero-worker",
+            "outside-worker",
+        ] {
+            let mut stale = context.event(AcquisitionWorkerEventKind::Assigned);
+            match invalid {
+                "generation" => stale.generation = Some(8),
+                "attempt" => stale.owner_attempt = Some(3),
+                "index" => stale.index = Some(1),
+                "zero-worker" => stale.worker_id = 0,
+                "outside-worker" => stale.worker_id = 2,
+                _ => unreachable!(),
+            }
+            assert!(assignments.accept(&stale).is_err(), "{invalid}");
+            assert!(assignments.active[0].is_some());
+        }
         let current = context.event(AcquisitionWorkerEventKind::Assigned);
         assert!(assignments.accept(&current).is_ok());
         assert!(assignments.accept(&current).is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_health_barrier_reports_last_and_intermediate_fault_without_reassignment() {
+        for (mode, count) in [
+            (SyntheticMode::PostCheckpointFault, 1),
+            (SyntheticMode::PostCheckpointFault, 2),
+            (SyntheticMode::PostCheckpointFault, 3),
+            (SyntheticMode::PostCheckpointFaultOnce, 2),
+            (SyntheticMode::Terminal, 1),
+            (SyntheticMode::PostCheckpointInterrupt, 1),
+        ] {
+            let (cancel, _) = watch::channel(None);
+            let cleanup = Arc::new(Mutex::new(Vec::new()));
+            let mut completed = Vec::new();
+            let mut ended = Vec::new();
+            let mut deferred = 0;
+            let result = coordinate_parallel(
+                vec![driver(mode, &cancel, &cleanup)],
+                jobs(count),
+                futures::future::pending(),
+                cancel,
+                &mut |event| {
+                    if completion(&event) {
+                        completed.push((
+                            event.index.unwrap(),
+                            event.generation,
+                            event.owner_attempt,
+                        ));
+                        cleanup.lock().unwrap().push("checkpoint_saved");
+                    }
+                    if let AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionEnded {
+                        stop_reason,
+                        ..
+                    }) = event.event
+                    {
+                        ended.push(stop_reason);
+                    } else if matches!(event.event, AcquisitionWorkerEventKind::Deferred { .. }) {
+                        deferred += 1;
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(
+                completed,
+                (0..count)
+                    .map(|index| (index, Some(7), Some(2)))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                deferred, 0,
+                "сохранённый результат нельзя возвращать в очередь"
+            );
+            if matches!(mode, SyntheticMode::PostCheckpointInterrupt) {
+                assert!(matches!(result, Err(AcquisitionStreamError::Interrupted)));
+            } else if matches!(mode, SyntheticMode::PostCheckpointFault) {
+                assert!(
+                    matches!(result, Err(AcquisitionStreamError::Provider(ref message))
+                    if message.contains("browser_network_runtime_failure")),
+                    "{result:?}"
+                );
+                assert_eq!(ended.len(), count);
+                assert!(ended.iter().all(
+                    |reason| matches!(reason, Some(SessionStopReason::RuntimeFailure(message))
+                    if message.starts_with("browser_network_runtime_failure:"))
+                ));
+            } else {
+                assert_eq!(result.unwrap().processed, count);
+                if matches!(mode, SyntheticMode::PostCheckpointFaultOnce) {
+                    assert!(matches!(
+                        &ended[0],
+                        Some(SessionStopReason::RuntimeFailure(_))
+                    ));
+                    assert_eq!(ended[1], None);
+                } else {
+                    assert_eq!(ended, [None]);
+                }
+            }
+            let trace = cleanup.lock().unwrap();
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|stage| **stage == "health_checked")
+                    .count(),
+                count
+            );
+            for (index, stage) in trace.iter().enumerate() {
+                if *stage == "health_checked" {
+                    assert_eq!(trace[index - 1], "checkpoint_saved");
+                }
+            }
+            assert_eq!(trace.last(), Some(&"workspace_closed"));
+        }
     }
 
     #[tokio::test]
@@ -6300,7 +6471,7 @@ mod parallel_pool_tests {
         assert_eq!(summary.processed, 6);
         assert_eq!(
             rotations, 4,
-            "each worker rotates twice before its fault budget retires it"
+            "каждый обработчик меняет сессию дважды до исчерпания бюджета восстановления"
         );
         assert_eq!(retired, 2);
         assert_eq!(bootstraps[&1], [(1, 101), (2, 102), (3, 103)]);
@@ -6309,7 +6480,7 @@ mod parallel_pool_tests {
             bootstraps[&1]
                 .iter()
                 .all(|(_, browser)| !bootstraps[&2].iter().any(|(_, other)| browser == other)),
-            "browser session identifiers remain worker-local across rotations"
+            "идентификаторы сессий сохраняют привязку к обработчику при смене сессии"
         );
     }
 

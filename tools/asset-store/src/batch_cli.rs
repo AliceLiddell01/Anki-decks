@@ -38,7 +38,7 @@ pub enum BatchCommand {
         batch_id: String,
         #[arg(long, default_value_t = MAX_ACQUISITION_ROUNDS)]
         rounds: u32,
-        /// Число изолированных браузерных обработчиков; значение по умолчанию выбрано по live benchmark.
+        /// Число изолированных браузерных обработчиков; значение по умолчанию выбрано по сетевому замеру производительности.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=4))]
         workers: u8,
         /// Только в приёмочной сборке: менять сессию браузера после N сохранённых элементов.
@@ -164,7 +164,7 @@ pub(super) fn prevalidate(command: &BatchCommand) -> Result<(), AssetError> {
             )));
         }
         BatchCommand::Run { workers, .. } if !(1..=4).contains(workers) => {
-            return Err(invalid("число workers должно быть от 1 до 4"));
+            return Err(invalid("число обработчиков должно быть от 1 до 4"));
         }
         _ => {}
     }
@@ -527,9 +527,27 @@ fn write_progress_event(
                 .as_deref()
                 .map(progress_outcome_label)
                 .unwrap_or("-");
-            let reason = event.reason.as_deref().unwrap_or("");
+            let reason = match event.reason.as_deref().unwrap_or("") {
+                "finished" => "работа завершена",
+                reason => reason,
+            };
+            let mut context = String::new();
+            for (label, value) in [
+                ("обработчик", event.worker_id.map(|value| value as u64)),
+                ("сессия", event.session.map(u64::from)),
+                ("браузер", event.browser_session_id),
+                ("поколение", event.generation.map(u64::from)),
+                (
+                    "попытка владельца",
+                    event.owner_attempt.map(|value| value as u64),
+                ),
+            ] {
+                if let Some(value) = value {
+                    context.push_str(&format!(" · {label}={value}"));
+                }
+            }
             format!(
-                "Прогресс: {} · раунд {}/{} · запуск {} · всего {} · {:.1} с · символ={} · результат={} {}",
+                "Прогресс: {} · раунд {}/{} · запуск {} · всего {} · {:.1} с · символ={} · результат={}{} {}",
                 progress_event_label(event.event),
                 event.round_completed,
                 event.round_total,
@@ -538,6 +556,7 @@ fn write_progress_event(
                 event.elapsed_ms as f64 / 1000.0,
                 identity,
                 outcome,
+                context,
                 reason
             )
         }
@@ -1574,7 +1593,7 @@ where
         )));
     }
     if !(1..=4).contains(&workers) {
-        return Err(invalid("число workers должно быть от 1 до 4"));
+        return Err(invalid("число обработчиков должно быть от 1 до 4"));
     }
     let mut issues = Vec::new();
     let (initial_revision, batch_total) = {
@@ -1717,7 +1736,7 @@ where
                             || active_workers.contains_key(&0)
                         {
                             return Err(invalid(
-                                "поставщик повторно назначил или повторно запустил элемент frontier",
+                                "поставщик повторно назначил или повторно запустил элемент границы обхода",
                             ));
                         }
                         frontier_state[index] = FrontierItemState::Active { worker_id: 0 };
@@ -2346,7 +2365,7 @@ where
                         None,
                         None,
                         None,
-                        Some("поставщик завершился без terminal результата".into()),
+                        Some("поставщик завершился без окончательного результата".into()),
                         (worker_id != 0).then_some(worker_id),
                         None,
                         Some(generations[*index].0),
