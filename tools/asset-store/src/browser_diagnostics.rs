@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+use serde::Serialize;
 use tracing::Dispatch;
 
 use crate::browser_runtime::RuntimeSnapshot;
@@ -72,11 +73,18 @@ impl BrowserItemContext {
 #[derive(Debug)]
 struct ItemState {
     context: BrowserItemContext,
+    stage_timings: Vec<BrowserStageTiming>,
     runtime_snapshot: Option<String>,
     stop_reason: Option<String>,
     interruption_code: Option<String>,
     interruption_reason: Option<String>,
     interruption_retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserStageTiming {
+    pub stage: String,
+    pub duration_ms: u64,
 }
 
 /// Владелец времени всего элемента, включая повторы и паузы перед ними.
@@ -94,6 +102,7 @@ impl BrowserItemTimer {
         Self {
             state: Arc::new(Mutex::new(ItemState {
                 context,
+                stage_timings: Vec::new(),
                 runtime_snapshot: None,
                 stop_reason: None,
                 interruption_code: None,
@@ -149,6 +158,10 @@ impl BrowserItemTimer {
     /// Все этапы видят последние безопасные данные, в том числе при Drop.
     pub fn record_runtime_snapshot(&self, snapshot: &RuntimeSnapshot) {
         record_snapshot(&self.state, snapshot);
+    }
+
+    pub fn stage_timings(&self) -> Vec<BrowserStageTiming> {
+        lock(&self.state).stage_timings.clone()
     }
 
     pub fn finish_success(self) {
@@ -357,11 +370,17 @@ struct Event<'a> {
 }
 
 fn emit(event: Event<'_>) {
-    let state = lock(event.state);
-    let context = &state.context;
+    let mut state = lock(event.state);
     let now = Instant::now();
     let stage_duration_ms = millis(now.saturating_duration_since(event.started));
     let item_duration_ms = millis(now.saturating_duration_since(event.item_started));
+    if event.event == "browser_acquisition_stage" {
+        state.stage_timings.push(BrowserStageTiming {
+            stage: event.stage.to_owned(),
+            duration_ms: stage_duration_ms,
+        });
+    }
+    let context = &state.context;
     let failure_code = event.failure.map(safe_token);
     let outcome = safe_token(event.outcome);
     let runtime_snapshot = (event.failure.is_some() || state.stop_reason.is_some())
