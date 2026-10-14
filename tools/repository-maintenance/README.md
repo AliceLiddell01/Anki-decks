@@ -205,9 +205,9 @@ checkout; `clean` в рекомендациях является предвар�
 необязательное уведомление: в обычном Linux — через D-Bus и `notify-send`,
 в WSL2 — в нативный центр уведомлений Windows через `powershell.exe` и уже
 установленный у пользователя Windows модуль `BurntToast`.
-Установка модулей в процессе GC **не производится**. Для стандартной WSL2
-расположение Windows PowerShell определяется по `PATH`, либо по пути
-`/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`.
+Установка модулей в процессе GC **не производится**. В WSL2 сначала ищется
+`powershell.exe` в `PATH`, затем под `[automount] root` из `/etc/wsl.conf`
+(по умолчанию `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`).
 При недоступном Windows interop, отсутствии BurntToast, графической сессии
 или отказе доставки очистка не прерывается; результат доступен через журнал
 systemd, `maintenance status` и snapshot. Полученный от обработчика код 0
