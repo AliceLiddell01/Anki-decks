@@ -28,6 +28,7 @@ pub use crate::batch_runtime::{
 
 pub const BATCH_SCHEMA_VERSION: u32 = 1;
 pub const AGGREGATE_POLICY_VERSION: &str = "kanji-distinct-mean-v2";
+pub const SINGLE_CANDIDATE_POLICY_VERSION: &str = "kanji-single-candidate-v1";
 pub const MAX_ACQUISITION_ROUNDS: u32 = 5;
 pub(crate) const MAX_HUMAN_REASON_BYTES: usize = 4096;
 const MAX_REVIEW_HTML_BYTES: u64 = MAX_RUNTIME_STATE_BYTES;
@@ -43,6 +44,13 @@ pub struct AggregatePolicy {
 }
 
 impl AggregatePolicy {
+    pub fn single_candidate(validator: ValidatorIdentity) -> Self {
+        Self {
+            version: SINGLE_CANDIDATE_POLICY_VERSION.into(),
+            ..Self::current(validator)
+        }
+    }
+
     pub fn current(validator: ValidatorIdentity) -> Self {
         let (maximum_expected_distance, minimum_margin) =
             crate::kanji_validator::registered_aggregate_thresholds();
@@ -174,6 +182,7 @@ pub struct AggregateEvidence {
 pub enum BatchItemStatus {
     Unresolved,
     AwaitingHuman,
+    Rejected,
     Reacquire,
     AutoVerified,
     HumanVerified,
@@ -205,6 +214,8 @@ pub enum BatchTrustSource {
 pub enum HumanBatchAction {
     Confirm,
     Reject,
+    /// Отказ без автоматического повторного получения.
+    RejectAndHold,
     Reacquire,
 }
 
@@ -302,7 +313,7 @@ impl KanjiBatch {
         Ok(Self {
             schema_version: BATCH_SCHEMA_VERSION,
             batch_id,
-            policy: AggregatePolicy::current(validator),
+            policy: AggregatePolicy::single_candidate(validator),
             revision: 0,
             items,
         })
@@ -431,7 +442,10 @@ impl KanjiBatch {
         if let Some(decision) = &owner_rejection {
             validate_hash(&decision.candidate_sha256)?;
             if &decision.identity != identity
-                || decision.action != HumanBatchAction::Reject
+                || !matches!(
+                    decision.action,
+                    HumanBatchAction::Reject | HumanBatchAction::RejectAndHold
+                )
                 || decision.reason.trim().is_empty()
                 || decision.reason.len() > MAX_HUMAN_REASON_BYTES
             {
@@ -481,9 +495,13 @@ impl KanjiBatch {
             ));
         }
         let item = self.item_mut(identity)?;
-        if item.status != BatchItemStatus::AwaitingHuman || item.current_sha256.is_some() {
+        if !matches!(
+            item.status,
+            BatchItemStatus::AwaitingHuman | BatchItemStatus::Rejected
+        ) || item.current_sha256.is_some()
+        {
             return Err(invalid(
-                "повторное получение без кандидата разрешено только после технических сбоев",
+                "повторное получение без кандидата разрешено после технических сбоев или явного отказа",
             ));
         }
         item.generation = item
@@ -573,7 +591,11 @@ impl KanjiBatch {
             item.publication_source = None;
             item.review_reason = None;
         } else {
-            item.status = BatchItemStatus::Reacquire;
+            item.status = if decision.action == HumanBatchAction::RejectAndHold {
+                BatchItemStatus::Rejected
+            } else {
+                BatchItemStatus::Reacquire
+            };
             item.generation = item
                 .generation
                 .checked_add(1)
@@ -644,6 +666,47 @@ impl KanjiBatch {
             .ok_or_else(|| invalid("идентификатор отсутствует в пакете"))
     }
 
+    /// Явная смена политики на тех же сохранённых байтах, без сетевых попыток.
+    /// Вызывающий слой предоставляет повторную проверку владельцем валидатора.
+    pub fn revalidate_candidates(
+        &mut self,
+        validator: ValidatorIdentity,
+        mut validate: impl FnMut(
+            &AssetIdentity,
+            &BatchCandidate,
+        ) -> Result<ValidationRecord, AssetError>,
+    ) -> Result<(), AssetError> {
+        self.validate()?;
+        let mut next = self.clone();
+        next.policy = AggregatePolicy::single_candidate(validator);
+        for item in &mut next.items {
+            for attempt in &mut item.attempts {
+                if let BatchAttemptInput::Candidate { candidate } = &mut attempt.result {
+                    candidate.automated = validate(&item.identity, candidate)?;
+                    candidate.technically_valid = candidate.technically_valid
+                        && candidate.automated.status != SemanticStatus::Corrupt;
+                }
+            }
+            if let Some(candidate) = &mut item.existing_candidate {
+                candidate.automated = validate(&item.identity, candidate)?;
+                candidate.technically_valid = candidate.technically_valid
+                    && candidate.automated.status != SemanticStatus::Corrupt;
+            }
+            if !matches!(
+                item.status,
+                BatchItemStatus::HumanVerified | BatchItemStatus::ExistingVerified
+            ) {
+                item.published_sha256 = None;
+                item.publication_source = None;
+                refresh_item(item, &next.policy);
+            }
+        }
+        next.revision += 1;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
     /// Отказывает при подмене вычисленных свидетельств, неизвестной политике,
     /// версии схемы или ссылках на данные.
     pub fn validate(&self) -> Result<(), AssetError> {
@@ -659,7 +722,9 @@ impl KanjiBatch {
             self.policy.validator.version.clone(),
         )
         .map_err(invalid)?;
-        if self.policy != AggregatePolicy::current(self.policy.validator.clone()) {
+        if self.policy != AggregatePolicy::current(self.policy.validator.clone())
+            && self.policy != AggregatePolicy::single_candidate(self.policy.validator.clone())
+        {
             return Err(invalid(
                 "политика агрегации и пороги не соответствуют зарегистрированной версии",
             ));
@@ -731,8 +796,10 @@ impl KanjiBatch {
                 )));
             }
             if item.observed_owner_rejections.iter().any(|decision| {
-                decision.action != HumanBatchAction::Reject
-                    || !item.human_decisions.contains(decision)
+                !matches!(
+                    decision.action,
+                    HumanBatchAction::Reject | HumanBatchAction::RejectAndHold
+                ) || !item.human_decisions.contains(decision)
             }) {
                 return Err(invalid(
                     "зафиксированный отказ владельца не имеет точного семантического свидетельства Reject",
@@ -944,7 +1011,14 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     if generation_attempt_count(item) == 0 {
         item.aggregate = empty_aggregate();
         item.current_sha256 = None;
-        item.status = if item.generation > 0 {
+        item.status = if item.status == BatchItemStatus::Rejected
+            && item
+                .human_decisions
+                .last()
+                .is_some_and(|decision| decision.action == HumanBatchAction::RejectAndHold)
+        {
+            BatchItemStatus::Rejected
+        } else if item.generation > 0 {
             BatchItemStatus::Reacquire
         } else {
             BatchItemStatus::Unresolved
@@ -954,7 +1028,12 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     let rejected: BTreeSet<_> = item
         .human_decisions
         .iter()
-        .filter(|decision| decision.action == HumanBatchAction::Reject)
+        .filter(|decision| {
+            matches!(
+                decision.action,
+                HumanBatchAction::Reject | HumanBatchAction::RejectAndHold
+            )
+        })
         .map(|decision| decision.candidate_sha256.as_str())
         .collect();
     let mut seen = BTreeSet::new();
@@ -995,9 +1074,10 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
         MetricSummary::calculate(samples.iter().map(|(_, metrics)| metrics.expected_distance));
     let margin = MetricSummary::calculate(samples.iter().map(|(_, metrics)| metrics.margin));
     let selected_aggregate = samples.first();
-    let accepted = expected_distance
-        .as_ref()
-        .is_some_and(|metric| metric.mean <= policy.maximum_expected_distance)
+    let accepted = policy.version == AGGREGATE_POLICY_VERSION
+        && expected_distance
+            .as_ref()
+            .is_some_and(|metric| metric.mean <= policy.maximum_expected_distance)
         && margin
             .as_ref()
             .is_some_and(|metric| metric.mean >= policy.minimum_margin)
@@ -1041,17 +1121,26 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     if individually_verified.is_some() || accepted {
         item.status = BatchItemStatus::AutoVerified;
         item.review_reason = None;
-    } else if generation_attempt_count(item) >= MAX_ACQUISITION_ROUNDS {
+    } else if (policy.version == SINGLE_CANDIDATE_POLICY_VERSION
+        && selected.is_some_and(|candidate| candidate.technically_valid))
+        || generation_attempt_count(item) >= MAX_ACQUISITION_ROUNDS
+    {
         item.status = BatchItemStatus::AwaitingHuman;
-        item.review_reason = Some(if samples.is_empty() {
-            format!(
-                "достигнут предел числа попыток получения ({MAX_ACQUISITION_ROUNDS}) без пригодных независимых семантических образцов"
-            )
-        } else {
-            format!(
-                "достигнут предел числа попыток получения ({MAX_ACQUISITION_ROUNDS}); среднее разных образцов не достигает неизменённых порогов проверки изображений"
-            )
-        });
+        item.review_reason = Some(
+            if policy.version == SINGLE_CANDIDATE_POLICY_VERSION
+                && selected.is_some_and(|candidate| candidate.technically_valid)
+            {
+                "кандидат сохранён; повтор той же картинки не добавляет независимого свидетельства; требуется решение человека".into()
+            } else if samples.is_empty() {
+                format!(
+                    "достигнут предел числа попыток получения ({MAX_ACQUISITION_ROUNDS}) без пригодных независимых семантических образцов"
+                )
+            } else {
+                format!(
+                    "достигнут предел числа попыток получения ({MAX_ACQUISITION_ROUNDS}); среднее разных образцов не достигает неизменённых порогов проверки изображений"
+                )
+            },
+        );
     } else {
         item.status = if item.generation > 0 {
             BatchItemStatus::Reacquire
@@ -1138,6 +1227,12 @@ pub struct BatchRuntime {
 }
 
 impl BatchRuntime {
+    pub(crate) fn artifact_directory(
+        &self,
+        name: &str,
+    ) -> Result<crate::batch_runtime::ArtifactDirectory, AssetError> {
+        self.runtime.artifact_directory(name)
+    }
     pub fn open(store_root: &Path, batch_id: &str) -> Result<Self, AssetError> {
         Ok(Self {
             runtime: SafeBatchRuntime::open(store_root, batch_id)?,
@@ -1374,6 +1469,7 @@ fn review_item_status(status: BatchItemStatus) -> &'static str {
     match status {
         BatchItemStatus::Unresolved => "не обработан",
         BatchItemStatus::AwaitingHuman => "ожидает решения человека",
+        BatchItemStatus::Rejected => "отклонён человеком; повтор только явно",
         BatchItemStatus::Reacquire => "ожидает повторного получения",
         BatchItemStatus::AutoVerified => "проверен автоматически",
         BatchItemStatus::HumanVerified => "подтверждён человеком",

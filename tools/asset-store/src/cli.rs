@@ -22,6 +22,9 @@ use crate::yarxi::{AcquiredMedia, SelectionResult, acquire_many};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+#[path = "review_ui.rs"]
+mod review_ui;
+
 #[path = "batch_cli.rs"]
 mod batch_cli;
 pub use batch_cli::{BatchActionArg, BatchCommand};
@@ -270,7 +273,9 @@ pub fn execute(cli: Cli) -> CliOutput {
             .collect::<Result<Vec<_>, _>>()
             .map(|_| (None, None))
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message)),
-        Command::Batch { command } => batch_cli::prevalidate(command).map(|_| (None, None)),
+        Command::Batch { command } => batch_cli::prevalidate(command)
+            .and_then(|()| batch_cli::prevalidate_output(command, cli.output))
+            .map(|_| (None, None)),
         Command::Validate { .. } => Ok((None, None)),
         _ => Ok((None, None)),
     };
@@ -304,6 +309,10 @@ pub fn execute(cli: Cli) -> CliOutput {
                 command: BatchCommand::Run { .. }
                     | BatchCommand::Status { .. }
                     | BatchCommand::Review { .. }
+                    | BatchCommand::Revalidate { .. }
+                    | BatchCommand::ReviewExport { .. }
+                    | BatchCommand::ReviewApply { .. }
+                    | BatchCommand::ReviewInteractive { .. }
                     | BatchCommand::Decide { .. }
                     | BatchCommand::Retry { .. }
             }

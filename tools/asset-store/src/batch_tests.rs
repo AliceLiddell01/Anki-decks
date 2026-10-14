@@ -11,13 +11,32 @@ fn identity(character: char) -> AssetIdentity {
     AssetIdentity::new("kanji", character.to_string()).unwrap()
 }
 
+// Историческая политика остаётся читаемой и проверяется независимо от новых пакетов.
 fn batch(characters: &[char]) -> KanjiBatch {
-    KanjiBatch::new(
+    let mut state = KanjiBatch::new(
         "synthetic-batch".into(),
         characters.iter().copied().map(identity).collect(),
         validator(),
     )
-    .unwrap()
+    .unwrap();
+    state.policy = AggregatePolicy::current(validator());
+    state
+}
+
+#[test]
+fn new_batches_hold_a_valid_uncertain_candidate_without_aggregate_promotion_or_redownload() {
+    let mut state =
+        KanjiBatch::new("single-candidate".into(), vec![identity('漢')], validator()).unwrap();
+    let uncertain = candidate("retained", SemanticStatus::Uncertain, 0.005, 0.010);
+    acquire(&mut state, '漢', uncertain.clone());
+    assert_eq!(state.items[0].status, BatchItemStatus::AwaitingHuman);
+    assert!(!state.items[0].aggregate.accepted);
+    assert_eq!(
+        state.items[0].current_sha256.as_deref(),
+        Some(uncertain.sha256.as_str())
+    );
+    assert!(state.next_round().is_empty());
+    state.validate().unwrap();
 }
 
 fn bytes(label: &str) -> Vec<u8> {

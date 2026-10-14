@@ -20,6 +20,7 @@ pub mod hashing;
 pub mod jpdb;
 pub mod kanji_domain;
 pub mod kanji_mask;
+mod kanji_review;
 pub mod kanji_validator;
 pub mod model;
 pub mod pitch_accent;

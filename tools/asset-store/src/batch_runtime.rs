@@ -92,7 +92,33 @@ pub struct SafeBatchRuntime {
     verified_blob_keys: BTreeSet<(String, String, u64, Option<String>)>,
 }
 
+/// Изолированный каталог производных артефактов. Все имена — одиночные
+/// компоненты, чтение ограничено и не следует символическим ссылкам.
+pub(crate) struct ArtifactDirectory {
+    directory: File,
+    pub path: PathBuf,
+}
+
+impl ArtifactDirectory {
+    pub fn write(&self, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
+        atomic_write(&self.directory, name, bytes, MAX_RUNTIME_STATE_BYTES)
+    }
+
+    pub fn read(&self, name: &str) -> Result<Vec<u8>, AssetError> {
+        validate_leaf_name(name)?;
+        read_file(&self.directory, name, MAX_RUNTIME_STATE_BYTES)
+    }
+}
+
 impl SafeBatchRuntime {
+    pub(crate) fn artifact_directory(&self, name: &str) -> Result<ArtifactDirectory, AssetError> {
+        self.require_lock()?;
+        validate_leaf_name(name)?;
+        Ok(ArtifactDirectory {
+            directory: ensure_directory(&self.directory, name)?,
+            path: self.directory_path.join(name),
+        })
+    }
     /// Корень должен принадлежать вызывающему владельцу хранилища.
     pub fn open(store_root: &Path, batch_id: &str) -> Result<Self, AssetError> {
         validate_batch_id(batch_id)?;
@@ -593,8 +619,8 @@ fn validate_leaf_name(name: &str) -> Result<(), AssetError> {
         || name == ".."
         || name.starts_with(".tmp-")
         || name
-            .bytes()
-            .any(|byte| !byte.is_ascii_alphanumeric() && !b"._-".contains(&byte))
+            .chars()
+            .any(|character| !character.is_alphanumeric() && !"._-".contains(character))
     {
         return Err(path_error());
     }

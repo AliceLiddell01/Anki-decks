@@ -1395,7 +1395,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
     // Кандидат REJECTED показывает, что другой эталон Unicode ближе, поэтому он
     // не считается независимым пригодным образцом этого символа.
     assert!(state.items[1].aggregate.distinct_valid_hashes.is_empty());
-    assert_eq!(state.items[1].attempts.len(), 5);
+    assert_eq!(state.items[1].attempts.len(), 1);
     let confirm_hash = state.items[1].current_sha256.clone().unwrap();
     let (state, issues) = decide_exact(
         &fixture.store,
@@ -1467,7 +1467,7 @@ fn human_confirm_reject_and_targeted_reacquire_cross_owner_boundaries() {
     assert!(state.items[1].is_ready());
     // Новый кандидат может получить индивидуальный VERIFIED или ждать уточнения;
     // целевой повтор не должен запускать получение для уже готовых соседей.
-    assert_eq!(state.items[2].attempts.len(), 6);
+    assert_eq!(state.items[2].attempts.len(), 2);
 }
 
 #[test]
@@ -1554,71 +1554,39 @@ fn exact_source_cas_fails_before_manifest_mutation() {
 }
 
 #[test]
-fn aggregate_publication_is_exact_versioned_and_decoded() {
+fn legacy_metrics_do_not_publish_under_pair_policy() {
     let fixture = Fixture::new();
     fixture.start("aggregate", &['漢']);
-    // Байты должны приниматься рабочим валидатором: агрегат не повышает кандидата
-    // REJECTED, поэтому синтетика строится на эталоне 漢, а независимые метрики
-    // задаются сохранёнными свидетельствами.
-    let first = glyph('漢');
-    let mut image = image::load_from_memory(&first).unwrap().to_rgba8();
-    image.put_pixel(0, 0, image::Rgba([254, 255, 255, 255]));
-    let mut encoded = Cursor::new(Vec::new());
-    image
-        .write_to(&mut encoded, image::ImageFormat::Png)
-        .unwrap();
-    let second = encoded.into_inner();
+    let bytes = glyph('漢');
     let mut runtime = BatchRuntime::open(fixture.store.root(), "aggregate").unwrap();
     let mut state = runtime.load().unwrap().unwrap();
-    for (bytes, distance, margin) in [(&first, 0.025, 0.010), (&second, 0.005, 0.005)] {
-        let record = ValidationRecord {
-            status: SemanticStatus::Uncertain,
-            validator: KanjiImageValidator::validator_identity(),
-            content_sha256: sha256_hex(bytes),
-            evidence: vec![ValidationEvidence {
-                kind: "pixel_reference_comparison".into(),
-                summary: "синтетические независимые метрики".into(),
-                details: Some(
-                    serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "元"}),
-                ),
-            }],
-        };
-        let candidate = runtime.persist_candidate(bytes, record, true).unwrap();
-        state
-            .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
-            .unwrap();
-    }
+    let record = ValidationRecord {
+        status: SemanticStatus::Uncertain,
+        validator: KanjiImageValidator::validator_identity(),
+        content_sha256: sha256_hex(&bytes),
+        evidence: vec![ValidationEvidence {
+            kind: "pixel_reference_comparison".into(),
+            summary: "устаревшие метрики".into(),
+            details: Some(
+                serde_json::json!({"expected_distance":0.005,"nearest_margin":0.01,"nearest_other":"元"}),
+            ),
+        }],
+    };
+    let candidate = runtime.persist_candidate(&bytes, record, true).unwrap();
+    state
+        .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
+        .unwrap();
     runtime.save(&state).unwrap();
-    assert!(!state.is_resolved());
     drop(runtime);
     let (state, _, issues) = run_batch(&fixture.store, "aggregate", 5, |_| {
-        panic!("публикация агрегата должна продолжиться с точных байтов")
+        panic!("сохранённый неопределённый кандидат не скачивается снова")
     })
     .unwrap();
     assert!(issues.is_empty());
-    assert!(state.is_resolved());
-    assert_eq!(
-        state.items[0].publication_source,
-        Some(BatchTrustSource::Aggregate)
-    );
-    let read = read_kanji_verified(
-        fixture.store.root(),
-        &[identity('漢')],
-        &KanjiImageValidator::validator_identity(),
-    )
-    .unwrap();
-    assert_eq!(read[0].bytes, second);
-    let evidence = &read[0].record.validation.as_ref().unwrap().evidence;
-    assert!(
-        evidence
-            .iter()
-            .any(|evidence| evidence.kind == "kanji_batch_aggregate")
-    );
-    assert!(
-        evidence
-            .iter()
-            .any(|evidence| evidence.kind == "pixel_reference_comparison")
-    );
+    assert_eq!(state.items[0].status, BatchItemStatus::AwaitingHuman);
+    assert!(!state.items[0].aggregate.accepted);
+    assert!(state.items[0].published_sha256.is_none());
+    assert_eq!(state.items[0].attempts.len(), 1);
 }
 
 #[test]
@@ -1657,7 +1625,7 @@ fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
     ];
     let mut runtime = BatchRuntime::open(fixture.store.root(), "rejected").unwrap();
     let mut state = runtime.load().unwrap().unwrap();
-    for (bytes, (status, distance, margin)) in variants.iter().zip(plan) {
+    for (bytes, (status, distance, margin)) in variants.iter().zip(plan).take(1) {
         let record = ValidationRecord {
             status,
             validator: KanjiImageValidator::validator_identity(),
@@ -1684,14 +1652,14 @@ fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
     .unwrap();
     let item = &state.items[0];
     assert!(!item.aggregate.accepted);
-    assert_eq!(item.aggregate.distinct_valid_hashes.len(), 4);
+    assert_eq!(item.aggregate.distinct_valid_hashes.len(), 0);
     assert!(
         !item
             .aggregate
             .distinct_valid_hashes
             .contains(&rejected_hash)
     );
-    assert_ne!(
+    assert_eq!(
         item.aggregate.selected_sha256.as_deref(),
         Some(rejected_hash.as_str())
     );
@@ -2426,6 +2394,7 @@ fn run_error_response_exposes_a_flushed_per_run_diagnostic_log() {
         batch_id: "diagnostic-missing-batch".into(),
         rounds: 1,
         workers: 1,
+        interactive_review: false,
         #[cfg(feature = "session-rotation-acceptance")]
         acceptance_rotate_after_items: None,
     };
@@ -2475,6 +2444,7 @@ fn successful_run_response_exposes_a_flushed_per_run_diagnostic_log() {
         batch_id: "diagnostic-success".into(),
         rounds: 1,
         workers: 1,
+        interactive_review: false,
         #[cfg(feature = "session-rotation-acceptance")]
         acceptance_rotate_after_items: None,
     };
@@ -3097,5 +3067,626 @@ fn parallel_stale_outcome_cannot_append_to_a_concurrently_changed_attempt() {
             .events
             .iter()
             .any(|event| event.event == "item_checkpointed")
+    );
+}
+
+fn review_fixture(id: &str, characters: &[char]) -> Fixture {
+    let fixture = Fixture::new();
+    fixture.start(id, characters);
+    let bytes = glyph('元');
+    let (state, _, _) = run_batch(&fixture.store, id, 1, |characters| {
+        Ok(characters
+            .iter()
+            .map(|character| Ok(media(character, bytes.clone())))
+            .collect())
+    })
+    .unwrap();
+    assert_eq!(state.review_queue().len(), characters.len());
+    assert!(state.items.iter().all(|item| item.attempts.len() == 1));
+    fixture
+}
+
+fn review_bundle(fixture: &Fixture, id: &str) -> crate::kanji_review::ReviewBundle {
+    let mut runtime = BatchRuntime::open(fixture.store.root(), id).unwrap();
+    let state = runtime.load().unwrap().unwrap();
+    crate::kanji_review::prepare(&runtime, &state).unwrap()
+}
+
+fn fill_review(path: &std::path::Path, actions: &[&str]) {
+    let original = fs::read_to_string(path).unwrap();
+    let mut index = 0;
+    let text = original
+        .lines()
+        .map(|line| {
+            if let Some(columns) = line.strip_prefix("-\t") {
+                let next = format!("{}\t{columns}", actions[index]);
+                index += 1;
+                next
+            } else {
+                line.into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    fs::write(path, format!("\u{feff}{text}\r\n")).unwrap();
+}
+
+#[test]
+fn review_applies_atomic_intents_exact_bytes_and_idempotent_recovery() {
+    let fixture = review_fixture("review-actions", &['保', '倉', '点', '門']);
+    let bundle = review_bundle(&fixture, "review-actions");
+    fill_review(&bundle.decisions, &["y", "e", "侏", "-"]);
+    let (state, issues, counts) =
+        apply_review(&fixture.store, "review-actions", &bundle.id).unwrap();
+    assert!(issues.is_empty());
+    assert_eq!(
+        (counts.confirmed, counts.rejected, counts.skipped),
+        (1, 2, 1)
+    );
+    assert_eq!(state.items[0].status, BatchItemStatus::HumanVerified);
+    assert!(state.items[0].is_ready());
+    assert_eq!(state.items[1].status, BatchItemStatus::Rejected);
+    assert_eq!(state.items[2].status, BatchItemStatus::Rejected);
+    assert!(
+        state.items[2]
+            .human_decisions
+            .last()
+            .unwrap()
+            .reason
+            .contains("actual_character=侏")
+    );
+    assert!(state.next_round().is_empty());
+    let hash = state.items[0].current_sha256.clone().unwrap();
+    let verified = read_kanji_verified(
+        fixture.store.root(),
+        &[identity('保')],
+        &state.policy.validator,
+    )
+    .unwrap();
+    assert_eq!(verified[0].record.sha256, hash);
+    assert_eq!(
+        verified[0].record.current_human_decision(),
+        Some(HumanDecision::Approve)
+    );
+    let revision = state.revision;
+    let (repeated, issues, counts) =
+        apply_review(&fixture.store, "review-actions", &bundle.id).unwrap();
+    assert!(issues.is_empty());
+    assert_eq!(
+        (counts.applied, counts.already_applied, counts.skipped),
+        (0, 3, 1)
+    );
+    assert_eq!(repeated.revision, revision);
+    assert_eq!(fixture.load("review-actions"), repeated);
+    // Отказ из файла сам не повторяется; пользовательский retry снимает hold.
+    execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Retry {
+            batch_id: "review-actions".into(),
+            character: "倉".into(),
+            sha256: None,
+            reason: state.items[1]
+                .human_decisions
+                .last()
+                .unwrap()
+                .reason
+                .clone(),
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.load("review-actions").next_round(),
+        [identity('倉')]
+    );
+    assert!(apply_review(&fixture.store, "review-actions", &bundle.id).is_err());
+}
+
+#[test]
+fn review_preflight_rejects_bad_later_row_without_partial_confirmation() {
+    let fixture = review_fixture("review-preflight", &['保', '倉']);
+    let bundle = review_bundle(&fixture, "review-preflight");
+    fill_review(&bundle.decisions, &["y", "unknown"]);
+    let before = fixture.load("review-preflight");
+    let manifest = fs::read(fixture.store.root().join("manifest.json")).unwrap();
+    assert!(apply_review(&fixture.store, "review-preflight", &bundle.id).is_err());
+    assert_eq!(fixture.load("review-preflight"), before);
+    assert_eq!(
+        fs::read(fixture.store.root().join("manifest.json")).unwrap(),
+        manifest
+    );
+    // Резервная копия редактора не считается решением.
+    fs::write(
+        bundle.directory.join("decisions.tsv~"),
+        fs::read(&bundle.decisions).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&bundle.decisions).unwrap();
+    assert!(apply_review(&fixture.store, "review-preflight", &bundle.id).is_err());
+}
+
+#[test]
+fn review_rejects_symlinks_and_preserves_editor_contents_on_export() {
+    use std::os::unix::fs::symlink;
+    let fixture = review_fixture("review-symlink", &['保']);
+    let bundle = review_bundle(&fixture, "review-symlink");
+    fill_review(&bundle.decisions, &["y"]);
+    let text = fs::read(&bundle.decisions).unwrap();
+    let same = review_bundle(&fixture, "review-symlink");
+    assert_eq!(same.id, bundle.id);
+    assert_eq!(fs::read(&same.decisions).unwrap(), text);
+    let outside = fixture.directory().join("outside.tsv");
+    fs::write(&outside, &text).unwrap();
+    fs::remove_file(&bundle.decisions).unwrap();
+    symlink(&outside, &bundle.decisions).unwrap();
+    assert!(apply_review(&fixture.store, "review-symlink", &bundle.id).is_err());
+    assert_eq!(fs::read(&outside).unwrap(), text);
+    assert!(apply_review(&fixture.store, "review-symlink", "../outside").is_err());
+}
+
+#[test]
+fn review_recovers_saved_confirm_intent_without_applying_new_bytes() {
+    let fixture = review_fixture("review-recovery", &['保']);
+    let bundle = review_bundle(&fixture, "review-recovery");
+    fill_review(&bundle.decisions, &["y"]);
+    {
+        let mut runtime = BatchRuntime::open(fixture.store.root(), "review-recovery").unwrap();
+        let mut state = runtime.load().unwrap().unwrap();
+        let (snapshot, decisions) = crate::kanji_review::read(&runtime, &bundle.id).unwrap();
+        let bytes = runtime
+            .read_candidate(crate::kanji_review::candidate(&state, &snapshot.rows[0]).unwrap())
+            .unwrap();
+        state.decide(decisions[0].clone().unwrap(), &bytes).unwrap();
+        runtime.save(&state).unwrap(); // точка остановки после durable intent, до publish
+    }
+    let (state, issues, counts) =
+        apply_review(&fixture.store, "review-recovery", &bundle.id).unwrap();
+    assert!(issues.is_empty());
+    assert_eq!(counts.already_applied, 1);
+    assert!(state.items[0].is_ready());
+    assert_eq!(state.items[0].human_decisions.len(), 1);
+}
+
+struct ReviewSpy {
+    eligible: bool,
+    answers: std::collections::VecDeque<bool>,
+    asks: usize,
+    opens: usize,
+    fail_open: bool,
+    fill: bool,
+}
+impl super::super::review_ui::ReviewInteraction for ReviewSpy {
+    fn eligible(&self) -> bool {
+        self.eligible
+    }
+    fn ask(&mut self, _: &str) -> Result<bool, AssetError> {
+        self.asks += 1;
+        Ok(self.answers.pop_front().unwrap_or(false))
+    }
+    fn open(&mut self, _: &std::path::Path, decisions: &std::path::Path) -> Result<(), AssetError> {
+        self.opens += 1;
+        if self.fail_open {
+            return Err(invalid("редактор недоступен"));
+        }
+        if self.fill {
+            fill_review(decisions, &["y"]);
+        }
+        Ok(())
+    }
+}
+fn spy() -> ReviewSpy {
+    ReviewSpy {
+        eligible: true,
+        answers: [true, true].into(),
+        asks: 0,
+        opens: 0,
+        fail_open: false,
+        fill: false,
+    }
+}
+
+#[test]
+fn actual_dispatch_has_no_prompt_or_launcher_without_opt_in_or_in_json_or_headless() {
+    let fixture = review_fixture("review-gate", &['保']);
+    let original = fixture.load("review-gate");
+    for (opt_in, output, eligible) in [
+        (false, OutputFormat::Human, true),
+        (false, OutputFormat::Json, true),
+        (true, OutputFormat::Json, true),
+        (true, OutputFormat::Human, false),
+    ] {
+        let mut spy = spy();
+        spy.eligible = eligible;
+        let command = Cli::try_parse_from(if opt_in {
+            vec![
+                "kanji-assets",
+                "batch",
+                "run",
+                "--batch-id",
+                "review-gate",
+                "--interactive-review",
+            ]
+        } else {
+            vec!["kanji-assets", "batch", "run", "--batch-id", "review-gate"]
+        })
+        .unwrap();
+        let Command::Batch { command } = command.command else {
+            unreachable!()
+        };
+        let mut progress = CapturedProgress::default();
+        let result = execute_with_progress_and_interaction(
+            &fixture.store,
+            fixture.summary(),
+            &command,
+            output,
+            false,
+            &mut progress,
+            &mut spy,
+        );
+        assert_eq!((spy.asks, spy.opens), (0, 0));
+        if output == OutputFormat::Json {
+            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap();
+        }
+        assert_eq!(fixture.load("review-gate"), original);
+    }
+}
+
+#[test]
+fn interactive_decline_failure_cancel_and_explicit_apply_preserve_saved_work() {
+    for case in ["decline", "eof", "editor-failure", "cancel", "apply"] {
+        let fixture = review_fixture(case, &['保']);
+        let original = fixture.load(case);
+        let mut spy = spy();
+        if case == "decline" {
+            spy.answers = [false].into();
+        }
+        if case == "eof" {
+            spy.answers.clear();
+        }
+        if case == "cancel" {
+            spy.answers = [true, false].into();
+        }
+        spy.fail_open = case == "editor-failure";
+        spy.fill = case == "apply";
+        let command = BatchCommand::ReviewInteractive {
+            batch_id: case.into(),
+        };
+        let mut progress = CapturedProgress::default();
+        let result = execute_with_progress_and_interaction(
+            &fixture.store,
+            fixture.summary(),
+            &command,
+            OutputFormat::Human,
+            false,
+            &mut progress,
+            &mut spy,
+        );
+        assert_eq!(spy.opens, usize::from(!matches!(case, "decline" | "eof")));
+        if case == "apply" {
+            assert_eq!(result.exit_code, 0);
+            assert!(fixture.load(case).items[0].is_ready());
+        } else {
+            assert_eq!(fixture.load(case), original);
+        }
+    }
+    let fixture = Fixture::new();
+    fixture.start("empty-review", &['保']);
+    let mut spy = spy();
+    let mut progress = CapturedProgress::default();
+    execute_with_progress_and_interaction(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::ReviewInteractive {
+            batch_id: "empty-review".into(),
+        },
+        OutputFormat::Human,
+        false,
+        &mut progress,
+        &mut spy,
+    );
+    assert_eq!((spy.asks, spy.opens), (0, 0));
+}
+
+#[test]
+fn review_rejects_changed_gallery_and_stale_same_sha_generation() {
+    let fixture = review_fixture("review-stale", &['保']);
+    let bundle = review_bundle(&fixture, "review-stale");
+    fill_review(&bundle.decisions, &["y"]);
+    let gallery = fs::read_dir(&bundle.directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "png"))
+        .unwrap();
+    let bytes = fs::read(&gallery).unwrap();
+    fs::write(&gallery, b"changed").unwrap();
+    assert!(apply_review(&fixture.store, "review-stale", &bundle.id).is_err());
+    assert!(
+        fixture.load("review-stale").items[0]
+            .human_decisions
+            .is_empty()
+    );
+    fs::write(&gallery, &bytes).unwrap();
+    let hash = fixture.load("review-stale").items[0]
+        .current_sha256
+        .clone()
+        .unwrap();
+    decide_exact(
+        &fixture.store,
+        "review-stale",
+        HumanBatchDecision {
+            identity: identity('保'),
+            candidate_sha256: hash,
+            action: HumanBatchAction::Reacquire,
+            reason: "новое поколение".into(),
+        },
+    )
+    .unwrap();
+    run_batch(&fixture.store, "review-stale", 1, |characters| {
+        Ok(characters
+            .iter()
+            .map(|character| Ok(media(character, bytes.clone())))
+            .collect())
+    })
+    .unwrap();
+    assert!(apply_review(&fixture.store, "review-stale", &bundle.id).is_err());
+    assert!(
+        fixture.load("review-stale").items[0]
+            .human_decisions
+            .iter()
+            .all(|decision| decision.action != HumanBatchAction::Confirm)
+    );
+}
+
+#[test]
+fn revalidate_migrates_legacy_candidates_without_network_attempts_or_inheriting_old_auto() {
+    let fixture = Fixture::new();
+    let bytes = glyph('元');
+    let old = ValidatorIdentity::new("previous-validator", "v0").unwrap();
+    let mut state =
+        KanjiBatch::new("review-migration".into(), vec![identity('保')], old.clone()).unwrap();
+    state.policy = crate::batch::AggregatePolicy::current(old.clone());
+    {
+        let mut runtime = BatchRuntime::open(fixture.store.root(), "review-migration").unwrap();
+        for _ in 0..MAX_ACQUISITION_ROUNDS {
+            let record = ValidationRecord {
+                status: SemanticStatus::Uncertain,
+                validator: old.clone(),
+                content_sha256: sha256_hex(&bytes),
+                evidence: vec![ValidationEvidence {
+                    kind: "previous-evidence".into(),
+                    summary: "предыдущее свидетельство".into(),
+                    details: None,
+                }],
+            };
+            let candidate = runtime.persist_candidate(&bytes, record, true).unwrap();
+            state
+                .record_attempt(&identity('保'), BatchAttemptInput::Candidate { candidate })
+                .unwrap();
+        }
+        runtime.save(&state).unwrap();
+    }
+    let (response, code) = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Revalidate {
+            batch_id: "review-migration".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let state = response.batch;
+    assert_eq!(
+        state.policy.validator,
+        KanjiImageValidator::validator_identity()
+    );
+    assert_eq!(state.policy.version, "kanji-single-candidate-v1");
+    assert_eq!(
+        state.items[0].attempts.len(),
+        MAX_ACQUISITION_ROUNDS as usize
+    );
+    assert!(state.next_round().is_empty());
+    assert_eq!(
+        state.items[0].current_sha256.as_deref(),
+        Some(sha256_hex(&bytes).as_str())
+    );
+    for attempt in &state.items[0].attempts {
+        let BatchAttemptInput::Candidate { candidate } = &attempt.result else {
+            unreachable!()
+        };
+        assert_eq!(candidate.automated.validator, state.policy.validator);
+        assert_ne!(candidate.automated.status, SemanticStatus::Verified);
+    }
+}
+
+#[test]
+fn failed_run_never_enters_opted_in_review_phase() {
+    let fixture = Fixture::new();
+    let mut spy = spy();
+    let command = Cli::try_parse_from([
+        "kanji-assets",
+        "batch",
+        "run",
+        "--batch-id",
+        "missing-review",
+        "--interactive-review",
+    ])
+    .unwrap();
+    let Command::Batch { command } = command.command else {
+        unreachable!()
+    };
+    let mut progress = CapturedProgress::default();
+    let output = execute_with_progress_and_interaction(
+        &fixture.store,
+        fixture.summary(),
+        &command,
+        OutputFormat::Human,
+        false,
+        &mut progress,
+        &mut spy,
+    );
+    assert_ne!(output.exit_code, 0);
+    assert_eq!((spy.asks, spy.opens), (0, 0));
+}
+
+// Совместимость сохранённых v2-пакетов проверяется настоящим путём публикации.
+#[test]
+fn legacy_aggregate_publication_is_exact_versioned_and_decoded() {
+    let fixture = Fixture::new();
+    fixture.start("aggregate", &['漢']);
+    // Байты должны приниматься рабочим валидатором: агрегат не повышает кандидата
+    // REJECTED, поэтому синтетика строится на эталоне 漢, а независимые метрики
+    // задаются сохранёнными свидетельствами.
+    let first = glyph('漢');
+    let mut image = image::load_from_memory(&first).unwrap().to_rgba8();
+    image.put_pixel(0, 0, image::Rgba([254, 255, 255, 255]));
+    let mut encoded = Cursor::new(Vec::new());
+    image
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    let second = encoded.into_inner();
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "aggregate").unwrap();
+    let mut state = runtime.load().unwrap().unwrap();
+    state.policy = crate::batch::AggregatePolicy::current(state.policy.validator.clone());
+    for (bytes, distance, margin) in [(&first, 0.025, 0.010), (&second, 0.005, 0.005)] {
+        let record = ValidationRecord {
+            status: SemanticStatus::Uncertain,
+            validator: KanjiImageValidator::validator_identity(),
+            content_sha256: sha256_hex(bytes),
+            evidence: vec![ValidationEvidence {
+                kind: "pixel_reference_comparison".into(),
+                summary: "синтетические независимые метрики".into(),
+                details: Some(
+                    serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "元"}),
+                ),
+            }],
+        };
+        let candidate = runtime.persist_candidate(bytes, record, true).unwrap();
+        state
+            .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
+            .unwrap();
+    }
+    runtime.save(&state).unwrap();
+    assert!(!state.is_resolved());
+    drop(runtime);
+    let (state, _, issues) = run_batch(&fixture.store, "aggregate", 5, |_| {
+        panic!("публикация агрегата должна продолжиться с точных байтов")
+    })
+    .unwrap();
+    assert!(issues.is_empty());
+    assert!(state.is_resolved());
+    assert_eq!(
+        state.items[0].publication_source,
+        Some(BatchTrustSource::Aggregate)
+    );
+    let read = read_kanji_verified(
+        fixture.store.root(),
+        &[identity('漢')],
+        &KanjiImageValidator::validator_identity(),
+    )
+    .unwrap();
+    assert_eq!(read[0].bytes, second);
+    let evidence = &read[0].record.validation.as_ref().unwrap().evidence;
+    assert!(
+        evidence
+            .iter()
+            .any(|evidence| evidence.kind == "kanji_batch_aggregate")
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|evidence| evidence.kind == "pixel_reference_comparison")
+    );
+}
+
+// Совместимость сохранённых v2-пакетов проверяется настоящим путём публикации.
+#[test]
+fn legacy_rejected_candidate_never_votes_or_publishes_as_aggregate() {
+    let fixture = Fixture::new();
+    fixture.start("rejected", &['漢']);
+    let base = glyph('漢');
+    let variants: Vec<Vec<u8>> = (0..5u8)
+        .map(|index| {
+            let mut image = image::load_from_memory(&base).unwrap().to_rgba8();
+            image.put_pixel(0, 0, image::Rgba([index + 1, 111, 222, 255]));
+            let mut encoded = Cursor::new(Vec::new());
+            image
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .unwrap();
+            encoded.into_inner()
+        })
+        .collect();
+    let mut hashes: Vec<_> = variants.iter().map(sha256_hex).collect();
+    hashes.sort();
+    hashes.dedup();
+    assert_eq!(
+        hashes.len(),
+        5,
+        "синтетические кандидаты должны различаться"
+    );
+    // Один REJECTED с привлекательными метриками и четыре UNCERTAIN: прежний
+    // фильтр включал REJECTED в среднее, поэтому порог проходился, а выбирался
+    // именно отклонённый кандидат с минимальной дистанцией.
+    let plan = [
+        (SemanticStatus::Rejected, 0.015, -0.015),
+        (SemanticStatus::Uncertain, 0.021, 0.009),
+        (SemanticStatus::Uncertain, 0.021, 0.009),
+        (SemanticStatus::Uncertain, 0.021, 0.009),
+        (SemanticStatus::Uncertain, 0.021, 0.009),
+    ];
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "rejected").unwrap();
+    let mut state = runtime.load().unwrap().unwrap();
+    state.policy = crate::batch::AggregatePolicy::current(state.policy.validator.clone());
+    for (bytes, (status, distance, margin)) in variants.iter().zip(plan) {
+        let record = ValidationRecord {
+            status,
+            validator: KanjiImageValidator::validator_identity(),
+            content_sha256: sha256_hex(bytes),
+            evidence: vec![ValidationEvidence {
+                kind: "pixel_reference_comparison".into(),
+                summary: "синтетические независимые метрики".into(),
+                details: Some(
+                    serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "漠"}),
+                ),
+            }],
+        };
+        let candidate = runtime.persist_candidate(bytes, record, true).unwrap();
+        state
+            .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
+            .unwrap();
+    }
+    let rejected_hash = sha256_hex(&variants[0]);
+    runtime.save(&state).unwrap();
+    drop(runtime);
+    let (state, _, _) = run_batch(&fixture.store, "rejected", 5, |_| {
+        panic!("возобновление не должно запускать получение")
+    })
+    .unwrap();
+    let item = &state.items[0];
+    assert!(!item.aggregate.accepted);
+    assert_eq!(item.aggregate.distinct_valid_hashes.len(), 4);
+    assert!(
+        !item
+            .aggregate
+            .distinct_valid_hashes
+            .contains(&rejected_hash)
+    );
+    assert_ne!(
+        item.aggregate.selected_sha256.as_deref(),
+        Some(rejected_hash.as_str())
+    );
+    assert_ne!(item.status, BatchItemStatus::AutoVerified);
+    assert!(item.published_sha256.is_none());
+    assert_eq!(item.status, BatchItemStatus::AwaitingHuman);
+    assert!(
+        fixture
+            .store
+            .verify_integrity()
+            .unwrap()
+            .iter()
+            .all(|record| record.sha256 != rejected_hash),
+        "отклонённые байты не должны попасть в канонический корпус"
     );
 }

@@ -50,6 +50,11 @@ pub(crate) fn registered_aggregate_thresholds() -> (f64, f64) {
     )
 }
 
+// Консервативная политика 1:1: оба ограничения относятся к одной паре.
+// Малое среднее расстояние само по себе может скрыть лишний/потерянный штрих.
+const PAIR_MAX_DISTANCE: f32 = 0.002;
+const PAIR_MAX_INK_DISAGREEMENT: f32 = 0.08;
+
 type ReferenceMap = BTreeMap<char, ReferenceTemplate>;
 type FontReferenceMap = BTreeMap<char, ReferenceTemplate>;
 
@@ -105,11 +110,23 @@ struct NormalizedMask {
 
 /// Валидатор изображений кандзи в формате PNG/GIF.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct KanjiImageValidator;
+pub struct KanjiImageValidator {
+    expected_pair: bool,
+}
 
 impl KanjiImageValidator {
     pub const fn new() -> Self {
-        Self
+        Self {
+            expected_pair: false,
+        }
+    }
+
+    /// Консервативная проверка 1:1 для отдельной оценки. Не заменяет v6
+    /// по умолчанию: пригодность порогов на реальных GIF пока не доказана.
+    pub const fn expected_pair() -> Self {
+        Self {
+            expected_pair: true,
+        }
     }
 
     /// Возвращает текущий неизменный идентификатор валидатора для решений в манифесте.
@@ -123,7 +140,16 @@ impl KanjiImageValidator {
 
 impl SemanticValidator for KanjiImageValidator {
     fn identity(&self) -> ValidatorIdentity {
-        Self::validator_identity()
+        if self.expected_pair {
+            ValidatorIdentity {
+                id: "kanji-expected-pair".into(),
+                version:
+                    "kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-pair-v1"
+                        .into(),
+            }
+        } else {
+            Self::validator_identity()
+        }
     }
 
     fn validate(
@@ -212,60 +238,171 @@ impl SemanticValidator for KanjiImageValidator {
         } else {
             None
         };
-        let (
-            expected_distance,
-            kanjivg_expected_distance,
-            font_expected_distance,
-            nearest_other,
-            other_distance,
-            margin,
-        ) = compare_against_catalog(
-            &raster.mask,
-            expected,
-            expected_template,
-            font_catalog,
-            catalog,
-        );
-        let status = classify_distance(expected_distance, other_distance, margin);
-        Ok(decision(
-            status,
-            "pixel_reference_comparison",
-            match status {
-                SemanticStatus::Verified => {
-                    "эталон ожидаемого символа Unicode уверенно ближе остальных по пикселям"
-                }
-                SemanticStatus::Rejected => "другой эталон Unicode заметно ближе к изображению",
-                SemanticStatus::Uncertain => {
-                    "пиксельные данные не достигают заданных порогов уверенности"
-                }
-                SemanticStatus::Corrupt => unreachable!(),
-            },
-            json!({
-                "expected": expected.to_string(),
-                "expected_distance": expected_distance,
-                "kanjivg_expected_distance": kanjivg_expected_distance,
-                "noto_font_expected_distance": font_expected_distance,
-                "nearest_other": nearest_other.to_string(),
-                "nearest_other_distance": other_distance,
-                "nearest_margin": margin,
-                "max_distance": VERIFIED_MAX_DISTANCE,
-                "minimum_margin": VERIFIED_MIN_MARGIN,
-                "rejection_gap": REJECT_MIN_GAP,
-                "dimensions": [raster.width, raster.height],
-                "actual_format": raster.format,
-                "frame_count": raster.frame_count,
-                "representative_frame": raster.representative_frame,
-                "foreground_pixels": raster.foreground_pixels,
-                "background_luma": raster.background_luma,
-                "foreground_polarity": raster.foreground_polarity.as_str(),
-                "excluded_border_components": raster.excluded_border_components,
-                "reference_version": KANJIVG_REFERENCE_VERSION,
-                "font_reference_version": font_catalog.map(|_| YARXI_FONT_REFERENCE_VERSION),
-                "comparison": "симметричное расстояние Шамфера между центрированными бинарными масками переднего плана 64×64; при уменьшении кандидата выбираются центры ячеек пикселей; ожидаемое расстояние и расстояние до ближайшего другого символа ищутся по всем применимым закреплённым пиксельным каталогам эталонов",
-                "segmentation": "оценка фона по медиане в углах, адаптивный выбор полярности, подавление компонентов рамки у края",
-            }),
-        ))
+        if !self.expected_pair {
+            let (
+                expected_distance,
+                kanjivg_expected_distance,
+                font_expected_distance,
+                nearest_other,
+                other_distance,
+                margin,
+            ) = compare_against_catalog(
+                &raster.mask,
+                expected,
+                expected_template,
+                font_catalog,
+                catalog,
+            );
+            let status = classify_distance(expected_distance, other_distance, margin);
+            Ok(decision(
+                status,
+                "pixel_reference_comparison",
+                match status {
+                    SemanticStatus::Verified => {
+                        "эталон ожидаемого символа Unicode уверенно ближе остальных по пикселям"
+                    }
+                    SemanticStatus::Rejected => "другой эталон Unicode заметно ближе к изображению",
+                    SemanticStatus::Uncertain => {
+                        "пиксельные данные не достигают заданных порогов уверенности"
+                    }
+                    SemanticStatus::Corrupt => unreachable!(),
+                },
+                json!({
+                    "expected": expected.to_string(),
+                    "expected_distance": expected_distance,
+                    "kanjivg_expected_distance": kanjivg_expected_distance,
+                    "noto_font_expected_distance": font_expected_distance,
+                    "nearest_other": nearest_other.to_string(),
+                    "nearest_other_distance": other_distance,
+                    "nearest_margin": margin,
+                    "max_distance": VERIFIED_MAX_DISTANCE,
+                    "minimum_margin": VERIFIED_MIN_MARGIN,
+                    "rejection_gap": REJECT_MIN_GAP,
+                    "dimensions": [raster.width, raster.height],
+                    "actual_format": raster.format,
+                    "frame_count": raster.frame_count,
+                    "representative_frame": raster.representative_frame,
+                    "foreground_pixels": raster.foreground_pixels,
+                    "background_luma": raster.background_luma,
+                    "foreground_polarity": raster.foreground_polarity.as_str(),
+                    "excluded_border_components": raster.excluded_border_components,
+                    "reference_version": KANJIVG_REFERENCE_VERSION,
+                    "font_reference_version": font_catalog.map(|_| YARXI_FONT_REFERENCE_VERSION),
+                    "comparison": "симметричное расстояние Шамфера между центрированными бинарными масками переднего плана 64×64; при уменьшении кандидата выбираются центры ячеек пикселей; ожидаемое расстояние и расстояние до ближайшего другого символа ищутся по всем применимым закреплённым пиксельным каталогам эталонов",
+                    "segmentation": "оценка фона по медиане в углах, адаптивный выбор полярности, подавление компонентов рамки у края",
+                }),
+            ))
+        } else {
+            let distances = distance_transform(&raster.mask);
+            let mut templates = vec![("KanjiVG", expected_template)];
+            if let Some(template) = font_catalog.and_then(|catalog| catalog.get(&expected)) {
+                templates.push(("Noto Serif JP", template));
+            }
+            let comparisons: Vec<_> = templates
+                .iter()
+                .map(|(source, template)| {
+                    let distance = symmetric_distance_quantized(
+                        &raster.mask,
+                        &distances,
+                        &template.mask,
+                        &template.distances_sixteenths,
+                    );
+                    let disagreement = ink_disagreement(&raster.mask, &template.mask);
+                    (*source, distance, disagreement)
+                })
+                .collect();
+            // Тождественные маски разных Unicode потеряли смысловое различие при
+            // нормализации. Это свойство каталога, а не поиск символа по кандидату.
+            let ambiguous =
+                ambiguous_reference_characters(catalog, font_catalog).contains(&expected);
+            let matched = comparisons.iter().find(|(_, distance, disagreement)| {
+                !ambiguous
+                    && *distance <= PAIR_MAX_DISTANCE
+                    && *disagreement <= PAIR_MAX_INK_DISAGREEMENT
+            });
+            let status = if matched.is_some() {
+                SemanticStatus::Verified
+            } else {
+                SemanticStatus::Uncertain
+            };
+            let expected_distance = comparisons
+                .iter()
+                .map(|(_, distance, _)| *distance)
+                .fold(f32::INFINITY, f32::min);
+
+            Ok(decision(
+                status,
+                "expected_pair_comparison",
+                if matched.is_some() {
+                    "пиксели соответствуют эталону ожидаемого Unicode по двум ограничениям формы"
+                } else {
+                    "соответствие ожидаемому Unicode не доказано; требуется решение человека"
+                },
+                json!({
+                    "schema_version": 1,
+                    "expected": expected.to_string(),
+                    "expected_distance": expected_distance,
+                    "references": comparisons.iter().map(|(source, distance, disagreement)| json!({
+                        "source": source, "distance": distance, "ink_disagreement": disagreement
+                    })).collect::<Vec<_>>(),
+                    "matched_reference": matched.map(|(source, _, _)| *source),
+                    "ambiguous_reference": ambiguous,
+                    "max_distance": PAIR_MAX_DISTANCE,
+                    "max_ink_disagreement": PAIR_MAX_INK_DISAGREEMENT,
+                    "dimensions": [raster.width, raster.height],
+                    "actual_format": raster.format,
+                    "frame_count": raster.frame_count,
+                    "representative_frame": raster.representative_frame,
+                    "foreground_pixels": raster.foreground_pixels,
+                    "background_luma": raster.background_luma,
+                    "foreground_polarity": raster.foreground_polarity.as_str(),
+                    "excluded_border_components": raster.excluded_border_components,
+                    "reference_version": KANJIVG_REFERENCE_VERSION,
+                    "font_reference_version": font_catalog.map(|_| YARXI_FONT_REFERENCE_VERSION),
+                    "comparison": "1:1; симметричное расстояние Шамфера и доля XOR/union пикселей одной и той же пары масок ожидаемого Unicode; альтернативные Unicode по кандидату не ищутся",
+                    "segmentation": "оценка фона по медиане в углах, адаптивный выбор полярности, подавление компонентов рамки у края",
+                }),
+            ))
+        }
     }
+}
+
+fn ink_disagreement(left: &Mask, right: &Mask) -> f32 {
+    let (mut difference, mut union) = (0u32, 0u32);
+    for (&left, &right) in left.iter().zip(right) {
+        difference += (left ^ right).count_ones();
+        union += (left | right).count_ones();
+    }
+    if union == 0 {
+        1.0
+    } else {
+        difference as f32 / union as f32
+    }
+}
+
+fn ambiguous_reference_characters(
+    catalog: &ReferenceMap,
+    font: Option<&FontReferenceMap>,
+) -> &'static std::collections::BTreeSet<char> {
+    static LIGHT: OnceLock<std::collections::BTreeSet<char>> = OnceLock::new();
+    static DARK: OnceLock<std::collections::BTreeSet<char>> = OnceLock::new();
+    let cache = if font.is_some() { &DARK } else { &LIGHT };
+    cache.get_or_init(|| {
+        let mut masks = BTreeMap::<Mask, char>::new();
+        let mut ambiguous = std::collections::BTreeSet::new();
+        for (&character, template) in catalog
+            .iter()
+            .chain(font.into_iter().flat_map(|map| map.iter()))
+        {
+            if let Some(previous) = masks.insert(template.mask, character)
+                && previous != character
+            {
+                ambiguous.insert(previous);
+                ambiguous.insert(character);
+            }
+        }
+        ambiguous
+    })
 }
 
 fn decision(
@@ -1457,5 +1594,51 @@ mod tests {
         let (max_distance, minimum_margin) = registered_aggregate_thresholds();
         assert_eq!(max_distance, f64::from(VERIFIED_MAX_DISTANCE));
         assert_eq!(minimum_margin, f64::from(VERIFIED_MIN_MARGIN));
+    }
+    #[test]
+    fn separate_pair_policy_compares_expected_pixels_and_keeps_distinct_trust_identity() {
+        let pair = KanjiImageValidator::expected_pair();
+        assert_ne!(pair.identity(), KanjiImageValidator::validator_identity());
+        for (actual, wrong) in [
+            ('保', '侏'),
+            ('倉', '介'),
+            ('点', '攴'),
+            ('門', '鬥'),
+            ('参', '參'),
+            ('未', '末'),
+            ('土', '士'),
+        ] {
+            let png = synthetic_reference_png(actual);
+            let expected = pair
+                .validate(
+                    &synthetic_png_asset(actual, png.len()),
+                    &mut Cursor::new(&png),
+                )
+                .unwrap();
+            assert_eq!(expected.status, SemanticStatus::Verified);
+            let evidence = expected.evidence[0].details.as_ref().unwrap();
+            assert_eq!(evidence["expected"], actual.to_string());
+            assert!(evidence.get("nearest_other").is_none());
+            assert!(evidence.get("nearest_margin").is_none());
+            let wrong = pair
+                .validate(
+                    &synthetic_png_asset(wrong, png.len()),
+                    &mut Cursor::new(&png),
+                )
+                .unwrap();
+            assert_eq!(wrong.status, SemanticStatus::Uncertain);
+        }
+        let corrupt = pair
+            .validate(&synthetic_png_asset('保', 6), &mut Cursor::new(b"GIF89a"))
+            .unwrap();
+        assert_eq!(corrupt.status, SemanticStatus::Corrupt);
+        let png = synthetic_reference_png('保');
+        let missing = pair
+            .validate(
+                &synthetic_png_asset('𠀀', png.len()),
+                &mut Cursor::new(&png),
+            )
+            .unwrap();
+        assert_eq!(missing.status, SemanticStatus::Uncertain);
     }
 }

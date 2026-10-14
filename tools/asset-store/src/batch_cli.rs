@@ -41,6 +41,9 @@ pub enum BatchCommand {
         /// Число изолированных браузерных обработчиков; значение по умолчанию выбрано по сетевому замеру производительности.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=4))]
         workers: u8,
+        /// После получения предложить ручную проверку; только полный TTY, без JSON/CI.
+        #[arg(long)]
+        interactive_review: bool,
         /// Только в приёмочной сборке: менять сессию браузера после N сохранённых элементов.
         #[cfg(feature = "session-rotation-acceptance")]
         #[arg(long, value_name = "N")]
@@ -51,8 +54,30 @@ pub enum BatchCommand {
         #[arg(long)]
         batch_id: String,
     },
-    /// Создаёт локальную HTML-страницу со всеми неразрешёнными кандидатами после достижения лимита.
+    /// Создаёт локальную HTML-страницу с сохранёнными неразрешёнными кандидатами.
     Review {
+        #[arg(long)]
+        batch_id: String,
+    },
+    /// Повторно проверяет сохранённые байты текущим валидатором без получения.
+    Revalidate {
+        #[arg(long)]
+        batch_id: String,
+    },
+    /// Экспортирует UTF-8 TSV и проверенные копии текущих кандидатов; не запускает приложения.
+    ReviewExport {
+        #[arg(long)]
+        batch_id: String,
+    },
+    /// Проверяет целиком и применяет только decisions.tsv указанного снимка.
+    ReviewApply {
+        #[arg(long)]
+        batch_id: String,
+        #[arg(long)]
+        review_id: String,
+    },
+    /// Явно предлагает открыть редактор и папку сохранённых кандидатов.
+    ReviewInteractive {
         #[arg(long)]
         batch_id: String,
     },
@@ -106,6 +131,10 @@ impl BatchCommand {
             Self::Run { .. } => "batch_run",
             Self::Status { .. } => "batch_status",
             Self::Review { .. } => "batch_review",
+            Self::Revalidate { .. } => "batch_revalidate",
+            Self::ReviewExport { .. } => "batch_review_export",
+            Self::ReviewApply { .. } => "batch_review_apply",
+            Self::ReviewInteractive { .. } => "batch_review_interactive",
             Self::Decide { .. } => "batch_decide",
             Self::Retry { .. } => "batch_retry",
         }
@@ -117,6 +146,10 @@ impl BatchCommand {
             Self::Run { batch_id, .. }
             | Self::Status { batch_id }
             | Self::Review { batch_id }
+            | Self::Revalidate { batch_id }
+            | Self::ReviewExport { batch_id }
+            | Self::ReviewApply { batch_id, .. }
+            | Self::ReviewInteractive { batch_id }
             | Self::Decide { batch_id, .. }
             | Self::Retry { batch_id, .. } => Some(batch_id),
         }
@@ -128,6 +161,7 @@ pub(super) fn prevalidate(command: &BatchCommand) -> Result<(), AssetError> {
         crate::batch::validate_batch_id(id)?;
     }
     match command {
+        BatchCommand::ReviewApply { review_id, .. } => crate::batch::validate_hash(review_id)?,
         BatchCommand::Start { characters, .. } => {
             for character in characters {
                 parse_character(character)?;
@@ -186,6 +220,7 @@ struct BatchCounts {
     human_verified: usize,
     existing_verified: usize,
     awaiting_human: usize,
+    rejected: usize,
     scheduled_for_reacquire: usize,
     pending_publication: usize,
     unresolved: usize,
@@ -218,6 +253,10 @@ struct BatchResponse {
     issues: Vec<BatchIssue>,
     blockers: Vec<String>,
     review_artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_decisions: Option<ReviewApplied>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic_log: Option<String>,
     /// Источник истины предметной области остаётся в сохранённом состоянии владельца.
@@ -636,6 +675,63 @@ fn execute_with_progress(
     allow_insecure_tls: bool,
     progress: &mut dyn BatchProgressSink,
 ) -> CliOutput {
+    execute_with_progress_and_interaction(
+        store,
+        summary,
+        command,
+        output,
+        allow_insecure_tls,
+        progress,
+        &mut super::review_ui::SystemReviewInteraction,
+    )
+}
+
+fn interactive_requested(command: &BatchCommand) -> bool {
+    matches!(
+        command,
+        BatchCommand::Run {
+            interactive_review: true,
+            ..
+        } | BatchCommand::ReviewInteractive { .. }
+    )
+}
+
+pub(super) fn prevalidate_output(
+    command: &BatchCommand,
+    output: OutputFormat,
+) -> Result<(), AssetError> {
+    if interactive_requested(command) && output == OutputFormat::Json {
+        return Err(invalid(
+            "интерактивная проверка несовместима с --output json",
+        ));
+    }
+    Ok(())
+}
+
+fn execute_with_progress_and_interaction(
+    store: &AssetStore,
+    summary: StoreSummary,
+    command: &BatchCommand,
+    output: OutputFormat,
+    allow_insecure_tls: bool,
+    progress: &mut dyn BatchProgressSink,
+    interaction: &mut dyn super::review_ui::ReviewInteraction,
+) -> CliOutput {
+    let eligibility = prevalidate_output(command, output).and_then(|()| {
+        if interactive_requested(command) && !interaction.eligible() {
+            Err(invalid("интерактивная проверка требует полного TTY и отключённого CI; используйте review-export/review-apply"))
+        } else { Ok(()) }
+    });
+    if let Err(error) = eligibility {
+        return render_error(
+            command.operation().into(),
+            None,
+            error,
+            summary,
+            output,
+            false,
+        );
+    }
     let mut diagnostic_log = None;
     let mut diagnostic_guard = None;
     let mut log_creation_error = None;
@@ -768,57 +864,77 @@ fn execute_with_progress(
             progress,
         )
     };
+    let execution = execution.and_then(|(mut response, mut exit_code)| {
+        if interactive_requested(command) {
+            finish_interactive_review(store, &mut response, interaction)?;
+            if !response.issues.is_empty() {
+                exit_code = 3;
+            }
+            if matches!(command, BatchCommand::Run { .. }) {
+                exit_code = if response.batch.is_resolved() { 0 } else { 3 };
+            }
+        }
+        Ok((response, exit_code))
+    });
     match execution {
-        Ok((response, exit_code)) => match output {
-            OutputFormat::Json => {
-                let mut response = response;
-                response.diagnostic_log = diagnostic_log;
-                CliOutput {
-                    stdout: format!(
-                        "{}\n",
-                        serde_json::to_string_pretty(&response)
-                            .expect("ответ пакета содержит конечные сериализуемые значения")
-                    ),
-                    stderr: String::new(),
-                    exit_code,
+        Ok((response, exit_code)) => {
+            match output {
+                OutputFormat::Json => {
+                    let mut response = response;
+                    response.diagnostic_log = diagnostic_log;
+                    CliOutput {
+                        stdout: format!(
+                            "{}\n",
+                            serde_json::to_string_pretty(&response)
+                                .expect("ответ пакета содержит конечные сериализуемые значения")
+                        ),
+                        stderr: String::new(),
+                        exit_code,
+                    }
+                }
+                OutputFormat::Human => {
+                    let mut text = format!(
+                        "Операция: {}; результат: {}; пакет: {}\n",
+                        localized_operation(&response.operation),
+                        localized_outcome(response.outcome),
+                        response.batch_id
+                    );
+                    for item in &response.items {
+                        text.push_str(&format!(
+                            "{}  {}  {}  попыток_получения={} разных_кандидатов_SHA-256={}\n",
+                            item.identity,
+                            localized_item_outcome(item.item_outcome),
+                            item.candidate_sha256.as_deref().unwrap_or("-"),
+                            item.acquisition_attempts,
+                            item.distinct_valid_hashes
+                        ));
+                    }
+                    if let Some(id) = &response.review_id {
+                        text.push_str(&format!("Review ID: {id}\n"));
+                    }
+                    if let Some(applied) = &response.review_decisions {
+                        text.push_str(&format!("Решения: подтверждено={}, отклонено={}, пропущено={}, уже применено={}\n", applied.confirmed, applied.rejected, applied.skipped, applied.already_applied));
+                    }
+                    if let Some(path) = response.review_artifact {
+                        text.push_str(&format!("Файл проверки: {path}\n"));
+                    }
+                    if let Some(path) = response.diagnostic_log {
+                        text.push_str(&format!("Диагностический журнал: {path}\n"));
+                    }
+                    for issue in &response.issues {
+                        text.push_str(&format!(
+                            "{}: {}: {}\n",
+                            issue.identity, issue.code, issue.message
+                        ));
+                    }
+                    CliOutput {
+                        stdout: text,
+                        stderr: String::new(),
+                        exit_code,
+                    }
                 }
             }
-            OutputFormat::Human => {
-                let mut text = format!(
-                    "Операция: {}; результат: {}; пакет: {}\n",
-                    localized_operation(&response.operation),
-                    localized_outcome(response.outcome),
-                    response.batch_id
-                );
-                for item in &response.items {
-                    text.push_str(&format!(
-                        "{}  {}  {}  попыток_получения={} разных_кандидатов_SHA-256={}\n",
-                        item.identity,
-                        localized_item_outcome(item.item_outcome),
-                        item.candidate_sha256.as_deref().unwrap_or("-"),
-                        item.acquisition_attempts,
-                        item.distinct_valid_hashes
-                    ));
-                }
-                if let Some(path) = response.review_artifact {
-                    text.push_str(&format!("Страница проверки: {path}\n"));
-                }
-                if let Some(path) = response.diagnostic_log {
-                    text.push_str(&format!("Диагностический журнал: {path}\n"));
-                }
-                for issue in &response.issues {
-                    text.push_str(&format!(
-                        "{}: {}: {}\n",
-                        issue.identity, issue.code, issue.message
-                    ));
-                }
-                CliOutput {
-                    stdout: text,
-                    stderr: String::new(),
-                    exit_code,
-                }
-            }
-        },
+        }
         Err(error) if matches!(command, BatchCommand::Run { .. }) => render_batch_error(
             store,
             summary,
@@ -961,6 +1077,10 @@ fn localized_operation(operation: &str) -> &str {
         "batch_run" => "обработка пакета",
         "batch_status" => "просмотр состояния пакета",
         "batch_review" => "создание страницы проверки",
+        "batch_review_export" => "экспорт файла решений",
+        "batch_review_apply" => "применение файла решений",
+        "batch_review_interactive" => "интерактивная проверка",
+        "batch_revalidate" => "повторная проверка сохранённых байтов",
         "batch_decide" => "решение человека",
         "batch_retry" => "повторное получение",
         other => other,
@@ -978,6 +1098,7 @@ fn localized_outcome(outcome: &str) -> &str {
         "publication_blocked" => "публикация заблокирована",
         "reacquire_scheduled" => "повторное получение запланировано",
         "ok" => "успешно",
+        "revalidated" => "повторная проверка завершена",
         other => other,
     }
 }
@@ -988,6 +1109,7 @@ fn localized_item_outcome(outcome: &str) -> &str {
         "pending_publication" => "ожидает публикации",
         "awaiting_human" => "ожидает решения человека",
         "reacquire_scheduled" => "ожидает повторного получения",
+        "rejected" => "отклонён человеком; повтор только явно",
         "unresolved" => "не разрешён",
         other => other,
     }
@@ -1167,6 +1289,7 @@ fn execute_command_with_snapshots_and_progress(
             batch_id,
             rounds,
             workers,
+            interactive_review: _,
             #[cfg(feature = "session-rotation-acceptance")]
             acceptance_rotate_after_items,
         } => {
@@ -1269,7 +1392,9 @@ fn execute_command_with_snapshots_and_progress(
                 if resolved { 0 } else { 3 },
             ))
         }
-        BatchCommand::Status { batch_id } | BatchCommand::Review { batch_id } => {
+        BatchCommand::Status { batch_id }
+        | BatchCommand::Review { batch_id }
+        | BatchCommand::ReviewInteractive { batch_id } => {
             let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
             let mut state = load_required(&mut runtime)?;
             let revision = state.revision;
@@ -1289,6 +1414,72 @@ fn execute_command_with_snapshots_and_progress(
                 batch_response(operation, summary, state, changed, issues, artifact, "ok"),
                 0,
             ))
+        }
+        BatchCommand::Revalidate { batch_id } => {
+            let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
+            let mut state = load_required(&mut runtime)?;
+            let validator = KanjiImageValidator::new();
+            let mut cache = BTreeMap::<(AssetIdentity, String), ValidationRecord>::new();
+            state.revalidate_candidates(validator.identity(), |identity, candidate| {
+                let key = (identity.clone(), candidate.sha256.clone());
+                if let Some(record) = cache.get(&key) {
+                    return Ok(record.clone());
+                }
+                let bytes = runtime.read_candidate(candidate)?;
+                let asset =
+                    candidate_asset_record(identity, &bytes, candidate.acquisition.as_deref())?;
+                let decision = validator
+                    .validate(&asset, &mut Cursor::new(&bytes))
+                    .map_err(|failure| {
+                        AssetError::new(ErrorCode::ValidatorFailure, failure.message)
+                    })?;
+                let record = ValidationRecord {
+                    validator: validator.identity(),
+                    content_sha256: candidate.sha256.clone(),
+                    status: decision.status,
+                    evidence: decision.evidence,
+                };
+                cache.insert(key, record.clone());
+                Ok(record)
+            })?;
+            let mut issues = Vec::new();
+            let owner = reader.capture(store);
+            reconcile_owner_trust(&owner, &mut state, &mut issues)?;
+            runtime.save(&state)?;
+            Ok((
+                batch_response(operation, summary, state, true, issues, None, "revalidated"),
+                0,
+            ))
+        }
+        BatchCommand::ReviewExport { batch_id } => {
+            let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
+            let state = load_required(&mut runtime)?;
+            check_current_validator(&state)?;
+            let bundle = crate::kanji_review::prepare(&runtime, &state)?;
+            let mut response = batch_response(
+                operation,
+                summary,
+                state,
+                false,
+                Vec::new(),
+                Some(bundle.decisions.display().to_string()),
+                "ok",
+            );
+            response.review_id = Some(bundle.id);
+            Ok((response, 0))
+        }
+        BatchCommand::ReviewApply {
+            batch_id,
+            review_id,
+        } => {
+            let (state, issues, applied) = apply_review(store, batch_id, review_id)?;
+            let changed = applied.changed;
+            let mut response =
+                batch_response(operation, summary, state, changed, issues, None, "ok");
+            response.review_id = Some(review_id.clone());
+            response.review_decisions = Some(applied);
+            let code = if response.issues.is_empty() { 0 } else { 3 };
+            Ok((response, code))
         }
         BatchCommand::Decide {
             batch_id,
@@ -2773,7 +2964,10 @@ fn publish_pending(
     snapshot.checked()?;
     for item in state.items.clone() {
         if let Some(decision) = item.human_decisions.last()
-            && decision.action == HumanBatchAction::Reject
+            && matches!(
+                decision.action,
+                HumanBatchAction::Reject | HumanBatchAction::RejectAndHold
+            )
             && !item.observed_owner_rejections.contains(decision)
         {
             let current = snapshot.current(&item.identity);
@@ -2989,7 +3183,10 @@ fn decide_exact(
     let mut issues = Vec::new();
     if decision.action == HumanBatchAction::Confirm {
         publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
-    } else if decision.action == HumanBatchAction::Reject {
+    } else if matches!(
+        decision.action,
+        HumanBatchAction::Reject | HumanBatchAction::RejectAndHold
+    ) {
         // Сохраняем у общего владельца и семантические свидетельства, и отказ человека.
         if let Err(error) = apply_rejection(
             store,
@@ -3315,6 +3512,11 @@ fn batch_response(
         human_verified: ready(BatchItemStatus::HumanVerified),
         existing_verified: ready(BatchItemStatus::ExistingVerified),
         awaiting_human: batch.review_queue().len(),
+        rejected: batch
+            .items
+            .iter()
+            .filter(|item| item.status == BatchItemStatus::Rejected)
+            .count(),
         scheduled_for_reacquire: batch
             .items
             .iter()
@@ -3350,6 +3552,8 @@ fn batch_response(
                 "pending_publication"
             } else if item.status == BatchItemStatus::AwaitingHuman {
                 "awaiting_human"
+            } else if item.status == BatchItemStatus::Rejected {
+                "rejected"
             } else if item.status == BatchItemStatus::Reacquire {
                 "reacquire_scheduled"
             } else {
@@ -3373,6 +3577,8 @@ fn batch_response(
         issues,
         blockers,
         review_artifact: artifact,
+        review_id: None,
+        review_decisions: None,
         diagnostic_log: None,
         batch,
     }
@@ -3395,7 +3601,7 @@ fn check_current_validator(state: &KanjiBatch) -> Result<(), AssetError> {
     if state.policy.validator != KanjiImageValidator::validator_identity() {
         return Err(AssetError::new(
             ErrorCode::InvalidValidatorIdentity,
-            "закреплённый в пакете валидатор отличается от текущего; требуется новый пакет",
+            "закреплённый в пакете валидатор отличается от текущего; выполните batch revalidate на сохранённых байтах",
         ));
     }
     Ok(())
@@ -3671,7 +3877,7 @@ mod candidate_cost_tests {
         .unwrap();
         let reads = CANDIDATE_FILE_READS.with(std::cell::Cell::get);
         assert_eq!(state.items.len(), ITEMS as usize);
-        assert!(state.items.iter().all(|item| item.attempts.len() == 2));
+        assert!(state.items.iter().all(|item| item.attempts.len() == 1));
         // Линейный обход требует несколько чтений на символ; прежний
         // квадратичный путь давал ITEMS^2 = 40000.
         assert!(
@@ -3691,4 +3897,162 @@ mod candidate_cost_tests {
             .unwrap();
         encoded.into_inner()
     }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ReviewApplied {
+    applied: usize,
+    confirmed: usize,
+    rejected: usize,
+    skipped: usize,
+    already_applied: usize,
+    changed: bool,
+}
+
+fn apply_review(
+    store: &AssetStore,
+    batch_id: &str,
+    review_id: &str,
+) -> Result<(KanjiBatch, Vec<BatchIssue>, ReviewApplied), AssetError> {
+    let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
+    let mut state = load_required(&mut runtime)?;
+    let initial_revision = state.revision;
+    check_current_validator(&state)?;
+    let (review, decisions) = crate::kanji_review::read(&runtime, review_id)?;
+    if review.validator != state.policy.validator {
+        return Err(invalid("валидатор review устарел"));
+    }
+    let mut owner = StoreSnapshotReader.capture(store);
+    owner.checked()?;
+    let mut next = state.clone();
+    let mut applied = ReviewApplied::default();
+    // Вся синтаксическая и предметная проверка, включая декодирование,
+    // заканчивается до единственной атомарной записи всех намерений.
+    for (row, decision) in review.rows.iter().zip(decisions) {
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.identity == row.identity)
+            .ok_or_else(|| invalid("review ссылается на чужой Unicode"))?;
+        let candidate = crate::kanji_review::candidate(&state, row)?;
+        let bytes = runtime.read_candidate(candidate)?;
+        let repeated = decision.as_ref().is_some_and(|decision| {
+            item.human_decisions.last() == Some(decision)
+                && item.attempts.len() == row.attempts
+                && if decision.action == HumanBatchAction::Confirm {
+                    item.generation == row.generation
+                        && item.current_sha256.as_ref() == Some(&row.sha256)
+                        && item.status == BatchItemStatus::HumanVerified
+                } else {
+                    row.generation.checked_add(1) == Some(item.generation)
+                        && item.current_sha256.is_none()
+                        && item.status == BatchItemStatus::Rejected
+                }
+        });
+        if repeated {
+            applied.already_applied += 1;
+            continue;
+        }
+        if item.status != BatchItemStatus::AwaitingHuman
+            || item.generation != row.generation
+            || item.attempts.len() != row.attempts
+            || item.current_sha256.as_ref() != Some(&row.sha256)
+        {
+            return Err(invalid(
+                "review устарел: статус, поколение, попытка или текущий SHA изменились",
+            ));
+        }
+        if let Some(decision) = decision {
+            if decision.action == HumanBatchAction::Confirm {
+                validate_image_decode(&bytes)?;
+                applied.confirmed += 1;
+            } else {
+                applied.rejected += 1;
+            }
+            next.decide(decision, &bytes)?;
+            applied.applied += 1;
+        } else {
+            applied.skipped += 1;
+        }
+    }
+    next.validate()?;
+    if applied.applied > 0 {
+        runtime.save(&next)?;
+    }
+    state = next;
+    let mut issues = Vec::new();
+    // KanjiBatch.human_decisions — сохраняемый журнал. Сбой после save
+    // возобновляется здесь или через batch run; чужие байты не подтверждаются.
+    publish_pending(store, &mut runtime, &mut state, &mut issues, &mut owner)?;
+    let owner = StoreSnapshotReader.capture(store);
+    reconcile_owner_trust(&owner, &mut state, &mut issues)?;
+    runtime.save(&state)?;
+    applied.changed = state.revision != initial_revision;
+    Ok((state, issues, applied))
+}
+
+fn finish_interactive_review(
+    store: &AssetStore,
+    response: &mut BatchResponse,
+    interaction: &mut dyn super::review_ui::ReviewInteraction,
+) -> Result<(), AssetError> {
+    if !interaction.eligible() {
+        return Err(invalid("интерактивное окружение больше недоступно"));
+    }
+    if response
+        .batch
+        .review_queue()
+        .iter()
+        .all(|item| item.current_sha256.is_none())
+    {
+        return Ok(());
+    }
+    let message = format!(
+        "Получение завершено; подтверждено: {}/{}; ожидают решения: {}. Открыть пакет ручной проверки?",
+        response.counts.effective_verified,
+        response.counts.requested,
+        response.counts.awaiting_human
+    );
+    if !interaction.ask(&message)? {
+        return Ok(());
+    }
+    let bundle = {
+        let mut runtime = BatchRuntime::open(store.root(), &response.batch_id)?;
+        let state = load_required(&mut runtime)?;
+        check_current_validator(&state)?;
+        crate::kanji_review::prepare(&runtime, &state)?
+    }; // Блокировка освобождена до редактора и ожидания пользователя.
+    response.review_id = Some(bundle.id.clone());
+    response.review_artifact = Some(bundle.decisions.display().to_string());
+    interaction.open(&bundle.directory, &bundle.decisions)?;
+    if !interaction
+        .ask("Сохраните decisions.tsv. Применить сохранённый файл? (y для применения)")?
+    {
+        return Ok(());
+    }
+    let (state, issues, applied) = apply_review(store, &response.batch_id, &bundle.id)?;
+    let outcome = if response.operation == "batch_run" {
+        if state.is_resolved() {
+            "resolved"
+        } else if state.review_queue().is_empty() {
+            "partial_progress"
+        } else {
+            "awaiting_human"
+        }
+    } else {
+        "ok"
+    };
+    let mut updated = batch_response(
+        &response.operation,
+        response.store.clone(),
+        state,
+        response.changed || applied.changed,
+        issues,
+        response.review_artifact.clone(),
+        outcome,
+    );
+    updated.review_id = Some(bundle.id);
+    updated.review_decisions = Some(applied);
+    *response = updated;
+    Ok(())
 }
