@@ -184,6 +184,7 @@ fn run_body(
         AcquisitionStreamError::Interrupted => json!({"stage":"interrupt","code":"acquisition_interrupted","message":"Получен Ctrl+C; browser закрыт","diagnostic":null}),
         AcquisitionStreamError::Provider(message) => json!({"stage":"acquisition","code":"provider_session_failed","message":message,"diagnostic":null}),
         AcquisitionStreamError::Consumer(error) => json!({"stage":"progress","code":error.code.as_str(),"message":error.message,"diagnostic":null}),
+        AcquisitionStreamError::WorkersExhausted { pending_indices } => json!({"stage":"acquisition","code":"browser_workers_exhausted","message":format!("незавершённые индексы {pending_indices:?}"),"diagnostic":null}),
     });
     let processed_count = acquisitions.len();
     if session_failure.is_some() {

@@ -3,6 +3,7 @@
 //! Все операции обхода и удаления привязаны к дескрипторам каталогов. Маркер
 //! подтверждает назначение, а UID, пространство имён, NOFOLLOW и идентичность процесса ограничивают очистку.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -11,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
@@ -21,6 +22,7 @@ use rustix::fs::{
 use serde::{Deserialize, Serialize};
 
 const TEMP_ROOT: &str = "/tmp";
+pub(crate) const CONFIGURED_TEMP_ROOT_ENV: &str = "ASSET_STORE_TEMP_ROOT";
 const NAMESPACE_PREFIX: &str = "anki-decks";
 const MARKER: &str = ".anki-decks-owner.json";
 const REPOSITORY: &str = "anki-decks";
@@ -28,7 +30,9 @@ const TOOL: &str = "asset-store";
 const SCHEMA: u32 = 2;
 const LEGACY_SCHEMA: u32 = 1;
 const MARKER_LIMIT: u64 = 16 * 1024;
+type CachedGcResult = Result<(), (io::ErrorKind, String)>;
 static STARTUP_GC: OnceLock<Result<(), (io::ErrorKind, String)>> = OnceLock::new();
+static CONFIGURED_ROOT_GC: OnceLock<Mutex<HashMap<PathBuf, CachedGcResult>>> = OnceLock::new();
 pub const DEFAULT_ORPHAN_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,16 +79,21 @@ fn creation_cleanup_failure(original: io::Error, cleanup: io::Error) -> io::Erro
 /// Один раз за время жизни процесса очищает осиротевшие запуски перед работой с временными данными.
 /// Вызывающий код может выполнить очистку без создания нового временного дерева.
 pub(crate) fn cleanup_orphans_on_startup() -> io::Result<()> {
+    let root = selected_temp_root()?;
+    if root != Path::new(TEMP_ROOT) {
+        return cleanup_configured_root_once(&root);
+    }
     STARTUP_GC
         .get_or_init(|| {
             cleanup_orphans(DEFAULT_ORPHAN_MIN_AGE)
-                .map(|report| {
+                .and_then(|report| {
                     tracing::debug!(
                         removed = report.removed,
                         skipped = report.skipped,
                         errors = report.errors,
                         "начальная очистка временных деревьев"
                     );
+                    startup_gc_result(&report)
                 })
                 .map_err(|error| (error.kind(), error.to_string()))
         })
@@ -93,11 +102,26 @@ pub(crate) fn cleanup_orphans_on_startup() -> io::Result<()> {
         .map_err(|(kind, message)| io::Error::new(*kind, message.clone()))
 }
 
+/// Корень неявных операций: ASSET_STORE_TEMP_ROOT либо /tmp.
+pub fn selected_temp_root() -> io::Result<PathBuf> {
+    let root = std::env::var_os(CONFIGURED_TEMP_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(TEMP_ROOT));
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{CONFIGURED_TEMP_ROOT_ENV} должен быть абсолютным путём"),
+        ));
+    }
+    Ok(root)
+}
+
 impl TempWorkspace {
     /// Создаёт закрытое дерево после начальной очистки; TTL действует только для схемы 1.
     pub fn create(purpose: &str) -> io::Result<Self> {
+        let root = selected_temp_root()?;
         cleanup_orphans_on_startup()?;
-        Self::create_under(Path::new(TEMP_ROOT), purpose)
+        Self::create_under(&root, purpose)
     }
 
     /// Создаёт такое же закрытое дерево, принадлежащее проекту, под выбранным временным корнем.
@@ -220,14 +244,70 @@ impl TempWorkspace {
     }
 
     fn remove(&self) -> io::Result<()> {
+        self.remove_with_proc(Path::new("/proc"))
+    }
+
+    fn remove_with_proc(&self, proc_root: &Path) -> io::Result<()> {
         verify_identity(&self.parent, OsStr::new(&self.run_id), &self.directory)?;
-        if has_browser_artifacts(&self.directory)? {
-            Self::ensure_no_live_process_references(&self.path)?;
+        if has_browser_artifacts(&self.directory)?
+            && workspace_has_process_references(proc_root, &self.path, current_uid()?)?
+        {
+            return Err(io::Error::other(
+                "живой процесс всё ещё использует временное дерево",
+            ));
         }
         remove_contents(&self.directory)?;
         verify_identity(&self.parent, OsStr::new(&self.run_id), &self.directory)?;
         unlinkat(&self.parent, self.run_id.as_str(), AtFlags::REMOVEDIR).map_err(Into::into)
     }
+}
+
+fn cleanup_configured_root_once(root: &Path) -> io::Result<()> {
+    cleanup_configured_root_once_with(root, || {
+        let report = cleanup_orphans_under(root, DEFAULT_ORPHAN_MIN_AGE)?;
+        tracing::debug!(
+            removed = report.removed,
+            skipped = report.skipped,
+            errors = report.errors,
+            "начальная очистка временных деревьев"
+        );
+        startup_gc_result(&report)
+    })
+}
+
+fn startup_gc_result(report: &GcReport) -> io::Result<()> {
+    if report.errors != 0 {
+        return Err(io::Error::other(format!(
+            "начальная очистка временного корня {} завершилась с {} ошибками",
+            report.root.display(),
+            report.errors
+        )));
+    }
+    Ok(())
+}
+
+fn cleanup_configured_root_once_with(
+    root: &Path,
+    cleanup: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut results = CONFIGURED_ROOT_GC
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| io::Error::other("кэш начальной очистки временных корней повреждён"))?;
+    if let Some(result) = results.get(root) {
+        return result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|(kind, message)| io::Error::new(*kind, message.clone()));
+    }
+
+    let result = cleanup();
+    let cached = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| (error.kind(), error.to_string()));
+    results.insert(root.to_path_buf(), cached);
+    result
 }
 
 impl Drop for TempWorkspace {
@@ -248,6 +328,7 @@ impl Drop for TempWorkspace {
 
 #[derive(Debug, Default, Serialize)]
 pub struct GcReport {
+    pub root: PathBuf,
     pub removed: usize,
     pub skipped: usize,
     pub errors: usize,
@@ -269,13 +350,13 @@ pub struct GcEntry {
 /// Для схемы 1 дополнительно требуется TTL; схема 2 сверяет точную идентичность процесса.
 /// Ошибки отдельных деревьев отражаются в `errors` и `entries`, после чего GC продолжается.
 pub fn cleanup_orphans(min_age: Duration) -> io::Result<GcReport> {
-    cleanup_orphans_under(Path::new(TEMP_ROOT), min_age)
+    cleanup_orphans_under(&selected_temp_root()?, min_age)
 }
 
 /// Строит план для рабочей области, принадлежность которой подтверждена маркером, не меняя файловую систему.
 /// Каждый кандидат повторно проверяется при последующем `cleanup_orphans`.
 pub fn plan_orphans(min_age: Duration) -> io::Result<GcReport> {
-    plan_orphans_under(Path::new(TEMP_ROOT), min_age)
+    plan_orphans_under(&selected_temp_root()?, min_age)
 }
 
 /// Та же очистка по маркеру и идентичности процесса для явно выбранного временного корня.
@@ -330,7 +411,10 @@ fn cleanup_under_with_sources(
     apply: bool,
 ) -> io::Result<GcReport> {
     let min_age = min_age.max(DEFAULT_ORPHAN_MIN_AGE);
-    let mut report = GcReport::default();
+    let mut report = GcReport {
+        root: temp_root.to_path_buf(),
+        ..GcReport::default()
+    };
     let uid = current_uid()?;
     let Some(parent) = namespace(temp_root, uid, false)? else {
         return Ok(report);
@@ -834,10 +918,7 @@ fn workspace_process_references(
         let comm = match fs::read(process.join("comm")) {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if include_generic
-                    && !fs::symlink_metadata(&process)
-                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                {
+                if !process_has_disappeared(&process) {
                     return Err(error);
                 }
                 continue;
@@ -852,10 +933,7 @@ fn workspace_process_references(
         let cmdline = match fs::read(process.join("cmdline")) {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if include_generic
-                    && !fs::symlink_metadata(&process)
-                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                {
+                if !process_has_disappeared(&process) {
                     return Err(error);
                 }
                 continue;
@@ -879,10 +957,7 @@ fn workspace_process_references(
             let environment = match fs::read(process.join("environ")) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    if include_generic
-                        && !fs::symlink_metadata(&process)
-                            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                    {
+                    if !process_has_disappeared(&process) {
                         return Err(error);
                     }
                     continue;
@@ -894,31 +969,40 @@ fn workspace_process_references(
                     ));
                 }
             };
-            if environment_uses_workspace(&environment, &run_path) {
-                return Ok(true);
+            let referenced = environment_uses_workspace(
+                &environment,
+                || fs::canonicalize(process.join("cwd")),
+                &run_path,
+            );
+            match referenced {
+                Ok(true) => return Ok(true),
+                Ok(false) => (),
+                Err(_) if process_has_disappeared(&process) => continue,
+                Err(error) => return Err(error),
             }
         }
         if include_generic {
             if is_current_process {
                 let environment = fs::read(process.join("environ"))?;
-                if environment_uses_workspace(&environment, &run_path) {
+                if environment_uses_workspace(
+                    &environment,
+                    || fs::canonicalize(process.join("cwd")),
+                    &run_path,
+                )? {
                     return Ok(true);
                 }
             }
             match fs::read_link(process.join("cwd")) {
                 Ok(target) if path_is_within(&target, &run_path) => return Ok(true),
                 Ok(_) => (),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(_) if process_has_disappeared(&process) => continue,
                 Err(error) => return Err(error),
             }
         }
         let descriptors = match fs::read_dir(process.join("fd")) {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if include_generic
-                    && !fs::symlink_metadata(&process)
-                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                {
+                if !process_has_disappeared(&process) {
                     return Err(error);
                 }
                 continue;
@@ -993,13 +1077,76 @@ fn command_uses_workspace(cmdline: &[u8], run_path: &Path) -> bool {
     false
 }
 
-fn environment_uses_workspace(environment: &[u8], run_path: &Path) -> bool {
-    environment.split(|byte| *byte == 0).any(|entry| {
+fn process_has_disappeared(process: &Path) -> bool {
+    fs::symlink_metadata(process).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Разрешает существующие компоненты, включая symlink, до первого отсутствующего.
+/// Остаток допустим только из обычных имён: `..` после отсутствующего предка,
+/// оборванная symlink и отказ доступа не дают доказательства принадлежности.
+fn resolve_possibly_missing_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "требуется абсолютный путь",
+        ));
+    }
+    let mut resolved = PathBuf::from("/");
+    let mut missing = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => (),
+            Component::Normal(name) => {
+                resolved.push(name);
+                if !missing {
+                    match fs::symlink_metadata(&resolved) {
+                        Ok(_) => {
+                            resolved = fs::canonicalize(&resolved)?;
+                            if !fs::metadata(&resolved)?.is_dir() {
+                                return Err(io::Error::other(
+                                    "временный путь содержит компонент, не являющийся каталогом",
+                                ));
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => missing = true,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Component::ParentDir if !missing => {
+                resolved.pop();
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "принадлежность временного пути не доказана",
+                ));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn environment_uses_workspace(
+    environment: &[u8],
+    cwd: impl Fn() -> io::Result<PathBuf>,
+    run_path: &Path,
+) -> io::Result<bool> {
+    for entry in environment.split(|byte| *byte == 0) {
         let Some(value) = entry.strip_prefix(b"TMPDIR=") else {
-            return false;
+            continue;
         };
-        path_is_within(&PathBuf::from(OsString::from_vec(value.to_vec())), run_path)
-    })
+        let path = PathBuf::from(OsString::from_vec(value.to_vec()));
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd()?.join(path)
+        };
+        if path_is_within(&resolve_possibly_missing_path(&path)?, run_path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn is_chromium_process(comm: &[u8], cmdline: &[u8]) -> bool {
@@ -1440,10 +1587,10 @@ pub struct TempSnapshot {
 
 /// Только измерение: сомнительные записи не обходятся и не удаляются.
 pub fn snapshot() -> io::Result<TempSnapshot> {
-    snapshot_under(Path::new(TEMP_ROOT))
+    snapshot_under(&selected_temp_root()?)
 }
 
-fn snapshot_under(root: &Path) -> io::Result<TempSnapshot> {
+pub fn snapshot_under(root: &Path) -> io::Result<TempSnapshot> {
     let mut snapshot = TempSnapshot::default();
     let uid = current_uid()?;
     let namespace_name = namespace_directory_name(uid);
@@ -1501,7 +1648,7 @@ fn measure_entry(
 /// Вызывается явно: начальная очистка в тестовой фикстуре не удаляет старые деревья автоматически.
 /// Для старых каталогов TTL составляет не менее 24 часов; известный живой PID блокирует удаление.
 pub fn cleanup_legacy_orphans(min_age: Duration) -> io::Result<GcReport> {
-    cleanup_legacy_orphans_under(Path::new(TEMP_ROOT), min_age)
+    cleanup_legacy_orphans_under(&selected_temp_root()?, min_age)
 }
 
 /// Удаляет только распознанные старые формы имён каталогов внутри явно выбранного `root`.
@@ -1517,7 +1664,10 @@ pub fn plan_legacy_orphans_under(root: &Path, min_age: Duration) -> io::Result<G
 fn cleanup_legacy_under(root: &Path, min_age: Duration, apply: bool) -> io::Result<GcReport> {
     let uid = current_uid()?;
     let parent = root_directory(root)?;
-    let mut report = GcReport::default();
+    let mut report = GcReport {
+        root: root.to_path_buf(),
+        ..GcReport::default()
+    };
     for name in names(&parent)? {
         let Some(pid) = name.to_str().and_then(legacy_pid) else {
             continue;
@@ -1804,9 +1954,61 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sandbox() -> TempWorkspace {
         TempWorkspace::create_under(Path::new(TEMP_ROOT), "temp-workspace-unit").unwrap()
+    }
+
+    #[test]
+    fn configured_root_initial_gc_runs_once_under_concurrent_creation() {
+        let root = std::env::temp_dir().join(format!("configured-root-gc-{}", random_hex()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let workers = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let calls = Arc::clone(&calls);
+                std::thread::spawn(move || {
+                    cleanup_configured_root_once_with(&root, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let other_root = std::env::temp_dir().join(format!("configured-root-gc-{}", random_hex()));
+        cleanup_configured_root_once_with(&other_root, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn configured_root_initial_gc_caches_and_propagates_first_error() {
+        let root = std::env::temp_dir().join(format!("configured-root-gc-error-{}", random_hex()));
+        let calls = AtomicUsize::new(0);
+        for _ in 0..2 {
+            let error = cleanup_configured_root_once_with(&root, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected configured-root GC failure",
+                ))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "injected configured-root GC failure");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     fn make_orphan(root: &Path, age: Duration) -> PathBuf {
@@ -1938,6 +2140,7 @@ mod tests {
         fs::create_dir_all(process.join("fd")).unwrap();
         fs::write(process.join("comm"), b"fixture-owner\n").unwrap();
         fs::write(process.join("cmdline"), b"fixture-owner\0").unwrap();
+        symlink(Path::new("/"), process.join("cwd")).unwrap();
         fs::write(
             process.join("stat"),
             stat_fixture(pid, b"owner", start_ticks),
@@ -2238,6 +2441,7 @@ mod tests {
                 fs::write(process.join("cmdline"), b"generic\0").unwrap();
             }
             if reference == "generic-cwd" {
+                fs::remove_file(process.join("cwd")).unwrap();
                 symlink(&profile, process.join("cwd")).unwrap();
             }
             let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
@@ -2270,6 +2474,7 @@ mod tests {
                 .unwrap()
         );
         fs::remove_file(process.join("cwd")).unwrap();
+        symlink(Path::new("/"), process.join("cwd")).unwrap();
 
         symlink(&path, process.join("fd/7")).unwrap();
         assert!(
@@ -2281,6 +2486,197 @@ mod tests {
             workspace_process_references(&proc_root, &path, current_uid().unwrap(), true, &[7],)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn browser_tmpdir_resolves_parent_components_before_workspace_check() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (path, _) = exact_orphan(root.path());
+        let temp = path.join("browser-temp");
+        fs::create_dir(&temp).unwrap();
+        let cwd = root.path().join("sibling-cwd");
+        fs::create_dir(&cwd).unwrap();
+        let tmpdir = Path::new("..")
+            .join(path.strip_prefix(root.path()).unwrap())
+            .join("browser-temp");
+        let environment = format!("TMPDIR={}\0", tmpdir.display());
+        let process = fake_chromium_process(
+            &proc_root,
+            300_001,
+            b"chrome\0",
+            environment.as_bytes(),
+            None,
+        );
+        fs::remove_file(process.join("cwd")).unwrap();
+        symlink(&cwd, process.join("cwd")).unwrap();
+
+        assert!(
+            workspace_process_references(&proc_root, &path, current_uid().unwrap(), false, &[],)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn unrelated_missing_browser_tmpdir_does_not_block_gc() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (path, _) = exact_orphan(root.path());
+        let process = fake_chromium_process(
+            &proc_root,
+            300_002,
+            b"chrome\0",
+            format!("TMPDIR={}/missing-browser-temp\0", root.path().display()).as_bytes(),
+            None,
+        );
+        let cwd = root.path().join("sibling-cwd");
+        fs::create_dir(&cwd).unwrap();
+        fs::remove_file(process.join("cwd")).unwrap();
+        symlink(&cwd, process.join("cwd")).unwrap();
+
+        let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.skipped, 0);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn tmpdir_path_proof_handles_symlinks_missing_tails_and_ambiguity() {
+        let root = sandbox();
+        let inside = root.path().join("inside");
+        let outside = root.path().join("outside");
+        fs::create_dir(&inside).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let link = outside.join("link");
+        symlink(&inside, &link).unwrap();
+        let proof = |path: &Path| {
+            environment_uses_workspace(
+                format!("TMPDIR={}\0", path.display()).as_bytes(),
+                || Ok(outside.clone()),
+                &inside,
+            )
+        };
+        assert!(!proof(&outside).unwrap());
+        assert!(!proof(&outside.join("missing/tail")).unwrap());
+        assert!(proof(&inside.join("missing/tail")).unwrap());
+        assert!(proof(&link.join("missing")).unwrap());
+        assert!(proof(Path::new("link/../inside/missing")).unwrap());
+        assert!(proof(Path::new("../inside/missing")).unwrap());
+        assert!(proof(&outside.join("missing/../inside")).is_err());
+        symlink(outside.join("absent"), outside.join("dangling")).unwrap();
+        assert!(proof(&outside.join("dangling")).is_err());
+        symlink("loop", outside.join("loop")).unwrap();
+        assert!(proof(&outside.join("loop")).is_err());
+        fs::write(outside.join("file"), b"x").unwrap();
+        assert!(proof(&outside.join("file/../inside")).is_err());
+        let unreadable = outside.join("unreadable");
+        fs::create_dir(&unreadable).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = proof(&unreadable.join("missing"));
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        if current_uid().unwrap() != 0 {
+            assert_eq!(denied.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        }
+        let denied_cwd = || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "нет доступа к cwd",
+            ))
+        };
+        assert!(
+            !environment_uses_workspace(
+                format!("TMPDIR={}\0", outside.display()).as_bytes(),
+                denied_cwd,
+                &inside
+            )
+            .unwrap()
+        );
+        assert!(environment_uses_workspace(b"TMPDIR=relative\0", denied_cwd, &inside).is_err());
+    }
+
+    #[test]
+    fn unrelated_missing_tmpdir_allows_close_but_active_tree_and_unknown_paths_survive() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let mut free = TempWorkspace::create_under(root.path(), "close-free").unwrap();
+        let held = TempWorkspace::create_under(root.path(), "close-held").unwrap();
+        for run in [&free, &held] {
+            fs::create_dir(run.path().join("t123")).unwrap();
+        }
+        let process = fake_chromium_process(
+            &proc_root,
+            300_003,
+            b"chrome\0",
+            format!("TMPDIR={}/missing\0", held.path().display()).as_bytes(),
+            None,
+        );
+        // Абсолютному TMPDIR не нужен cwd, даже если каталог процесса удалён.
+        fs::remove_file(process.join("cwd")).unwrap();
+        symlink(root.path().join("gone (deleted)"), process.join("cwd")).unwrap();
+        let free_path = free.path().to_path_buf();
+        free.remove_with_proc(&proc_root).unwrap();
+        free.closed = true;
+        assert!(!free_path.exists());
+        assert!(held.remove_with_proc(&proc_root).is_err());
+        assert!(held.path().exists());
+        fs::write(process.join("environ"), b"TMPDIR=relative\0").unwrap();
+        assert!(held.remove_with_proc(&proc_root).is_err());
+        fs::remove_dir_all(process).unwrap();
+        assert!(
+            !workspace_has_process_references(&proc_root, held.path(), current_uid().unwrap())
+                .unwrap()
+        );
+        held.close().unwrap();
+    }
+
+    #[test]
+    fn gc_collects_independent_tree_while_real_browser_tmpdir_holds_its_own_tree() {
+        let root = sandbox();
+        let (proc_root, _) = proc_fixture(root.path());
+        let (held, _) = exact_orphan(root.path());
+        let (free, _) = exact_orphan(root.path());
+        let (unknown, _) = exact_orphan(root.path());
+        let process = fake_chromium_process(
+            &proc_root,
+            300_004,
+            b"chrome\0",
+            format!("TMPDIR={}/missing\0", held.display()).as_bytes(),
+            None,
+        );
+        let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+        assert_eq!(report.root, root.path());
+        assert_eq!(report.removed, 2);
+        assert!(held.exists());
+        assert!(!free.exists());
+        assert!(!unknown.exists());
+        fs::remove_file(process.join("environ")).unwrap();
+        fs::create_dir(process.join("environ")).unwrap();
+        let (unknown, _) = exact_orphan(root.path());
+        let report = cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO).unwrap();
+        assert_eq!(report.removed, 0);
+        assert!(unknown.exists());
+        fs::remove_dir_all(process).unwrap();
+        assert_eq!(
+            cleanup_under_with_proc(root.path(), &proc_root, Duration::ZERO)
+                .unwrap()
+                .removed,
+            2
+        );
+    }
+
+    #[test]
+    fn startup_gc_never_caches_reported_cleanup_errors_as_success() {
+        let root = sandbox();
+        let report = GcReport {
+            root: root.path().to_path_buf(),
+            errors: 1,
+            ..GcReport::default()
+        };
+        let first = cleanup_configured_root_once_with(root.path(), || startup_gc_result(&report))
+            .unwrap_err();
+        let cached = cleanup_configured_root_once_with(root.path(), || Ok(())).unwrap_err();
+        assert_eq!(first.to_string(), cached.to_string());
     }
 
     #[test]
@@ -2353,7 +2749,7 @@ mod tests {
 
     #[test]
     fn missing_process_sources_do_not_prove_absence_of_references() {
-        for source in ["comm", "cmdline", "environ", "fd"] {
+        for source in ["comm", "cmdline", "environ", "fd", "cwd"] {
             let root = sandbox();
             let (proc_root, _) = proc_fixture(root.path());
             let (path, _) = exact_orphan(root.path());
@@ -2499,6 +2895,7 @@ mod tests {
         fs::write(process.join("comm"), b"chrome\n").unwrap();
         fs::write(process.join("cmdline"), cmdline).unwrap();
         fs::write(process.join("environ"), environment).unwrap();
+        symlink(Path::new("/"), process.join("cwd")).unwrap();
         if let Some(target) = fd_target {
             symlink(target, process.join("fd/7")).unwrap();
         }
@@ -2739,6 +3136,33 @@ mod tests {
                 .unwrap()
         );
         fs::remove_dir_all(fd_process).unwrap();
+        proc_root.close().unwrap();
+        run.close().unwrap();
+    }
+
+    #[test]
+    fn browser_process_relative_tmpdir_is_resolved_from_process_cwd() {
+        let run = sandbox();
+        let proc_root = sandbox();
+        let temp = run.path().join(format!("t{}", &random_hex()[..3]));
+        fs::create_dir(&temp).unwrap();
+        let relative_temp = temp.strip_prefix(run.path()).unwrap();
+        let process = fake_chromium_process(
+            proc_root.path(),
+            100_005,
+            b"/usr/bin/chrome\0--type=renderer\0",
+            format!("TMPDIR={}\0", relative_temp.display()).as_bytes(),
+            None,
+        );
+        fs::remove_file(process.join("cwd")).unwrap();
+        symlink(run.path(), process.join("cwd")).unwrap();
+
+        assert!(
+            workspace_has_process_references(proc_root.path(), run.path(), current_uid().unwrap())
+                .unwrap()
+        );
+
+        fs::remove_dir_all(process).unwrap();
         proc_root.close().unwrap();
         run.close().unwrap();
     }

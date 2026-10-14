@@ -387,9 +387,20 @@ fn build_browser_config(
     config: &BrowserRuntimeConfig,
     executable: Option<BrowserExecutableSelection>,
 ) -> Result<BrowserConfig, String> {
+    let configured_temp_root =
+        std::env::var_os(crate::temp_workspace::CONFIGURED_TEMP_ROOT_ENV).map(PathBuf::from);
+    let current_directory = std::env::current_dir().ok();
+    let temp_directory = browser_tmpdir_value(
+        &profile.temp_path,
+        configured_temp_root.as_deref(),
+        current_directory.as_deref(),
+    );
+    let temp_directory = temp_directory
+        .to_str()
+        .ok_or("browser_tmpdir_invalid: путь TMPDIR должен быть UTF-8")?;
     let mut builder = BrowserConfig::builder()
         .user_data_dir(&profile.path)
-        .env("TMPDIR", profile.temp_path.to_string_lossy().into_owned())
+        .env("TMPDIR", temp_directory)
         .incognito()
         .respect_https_errors()
         .launch_timeout(config.launch_timeout)
@@ -400,6 +411,26 @@ fn build_browser_config(
     builder
         .build()
         .map_err(|error| format!("настройка браузера: {error}"))
+}
+
+fn browser_tmpdir_value(
+    temp_path: &Path,
+    configured_root: Option<&Path>,
+    current_directory: Option<&Path>,
+) -> PathBuf {
+    if let (Some(configured_root), Some(current_directory)) = (configured_root, current_directory)
+        && let (Ok(root), Ok(current)) = (
+            fs::canonicalize(configured_root),
+            fs::canonicalize(current_directory),
+        )
+        && root == current
+        && let Ok(temp_path) = fs::canonicalize(temp_path)
+        && let Ok(relative) = temp_path.strip_prefix(&root)
+        && !relative.as_os_str().is_empty()
+    {
+        return relative.to_path_buf();
+    }
+    temp_path.to_path_buf()
 }
 
 fn profile_setup_failure(profile: BrowserProfile, message: String) -> BrowserLaunchError {
@@ -1969,6 +2000,70 @@ mod tests {
         assert_eq!(std::env::var_os("TMPDIR"), before);
         assert!(profile.temp_path.as_os_str().as_bytes().len() < 108);
         profile.close().unwrap();
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn browser_config_preserves_unicode_tmpdir_and_rejects_non_utf8_before_launch() {
+        let parent = TempWorkspace::create("browser-tmpdir-encoding-test").unwrap();
+        for name in ["рабочее".as_bytes(), b"invalid-\xff".as_slice()] {
+            let borrowed = parent.path().join(std::ffi::OsStr::from_bytes(name));
+            fs::create_dir(&borrowed).unwrap();
+            fs::write(borrowed.join("keep"), b"borrowed").unwrap();
+            let profile = BrowserProfile::in_workspace(&borrowed).unwrap();
+            let profile_path = profile.path.clone();
+            let temp_path = profile.temp_path.clone();
+            let executable = BrowserExecutableSelection {
+                path: PathBuf::from("/bin/true"),
+                source: BrowserExecutableSource::PathLookup,
+            };
+            let result =
+                build_browser_config(&profile, &BrowserRuntimeConfig::default(), Some(executable));
+            if let Some(expected) = temp_path.to_str() {
+                let config = result.unwrap();
+                assert_eq!(
+                    config.process_envs.unwrap().get("TMPDIR").unwrap(),
+                    expected
+                );
+                profile.close().unwrap();
+            } else {
+                let message = result.unwrap_err();
+                assert_eq!(
+                    message,
+                    "browser_tmpdir_invalid: путь TMPDIR должен быть UTF-8"
+                );
+                assert!(matches!(
+                    profile_setup_failure(profile, message),
+                    BrowserLaunchError::Setup(_)
+                ));
+            }
+            assert!(!profile_path.exists());
+            assert!(!temp_path.exists());
+            assert_eq!(fs::read(borrowed.join("keep")).unwrap(), b"borrowed");
+        }
+        parent.close().unwrap();
+    }
+
+    #[test]
+    fn browser_tmpdir_is_relative_when_the_configured_root_is_the_process_directory() {
+        let parent = TempWorkspace::create("browser-relative-tmpdir-parent-test").unwrap();
+        let worker = TempWorkspace::create_under(parent.path(), "worker").unwrap();
+        let temp_path = worker.path().join("t00");
+        fs::create_dir(&temp_path).unwrap();
+
+        let relative = browser_tmpdir_value(&temp_path, Some(parent.path()), Some(parent.path()));
+        assert!(relative.is_relative());
+        let socket_path = relative
+            .join("org.chromium.Chromium.XXXXXX")
+            .join("SingletonSocket");
+        assert!(
+            socket_path.as_os_str().as_bytes().len() < 108,
+            "путь Unix-сокета занимает {} байт: {}",
+            socket_path.as_os_str().as_bytes().len(),
+            socket_path.display()
+        );
+
+        worker.close().unwrap();
         parent.close().unwrap();
     }
 
