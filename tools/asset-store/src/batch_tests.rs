@@ -39,6 +39,28 @@ fn new_batches_hold_a_valid_uncertain_candidate_without_aggregate_promotion_or_r
     state.validate().unwrap();
 }
 
+#[test]
+fn single_candidate_corrupt_bytes_are_reacquired_before_human_review() {
+    let mut state = KanjiBatch::new(
+        "single-candidate-corrupt".into(),
+        vec![identity('漢')],
+        validator(),
+    )
+    .unwrap();
+    acquire(
+        &mut state,
+        '漢',
+        candidate_with_validator("corrupt", SemanticStatus::Corrupt, validator(), true),
+    );
+
+    let item = &state.items[0];
+    assert_eq!(item.status, BatchItemStatus::Unresolved);
+    assert!(item.review_reason.is_none());
+    assert_eq!(state.next_round(), vec![identity('漢')]);
+    assert!(state.review_queue().is_empty());
+    state.validate().unwrap();
+}
+
 fn bytes(label: &str) -> Vec<u8> {
     // Здесь проверяются границы состояния и хеша. Полное декодирование GIF проверяет владелец.
     let mut bytes = b"GIF89a".to_vec();
@@ -728,6 +750,68 @@ fn revalidation_preserves_human_confirmation_for_same_technically_valid_sha() {
     assert_eq!(item.current_sha256.as_deref(), Some(sha256.as_str()));
     assert_eq!(item.human_decisions, vec![decision]);
     assert_eq!(item.attempts.len(), attempts_before);
+    assert_eq!(item.published_sha256.as_deref(), Some(sha256.as_str()));
+    assert_eq!(item.publication_source, Some(BatchTrustSource::Human));
+    state.validate().unwrap();
+}
+
+#[test]
+fn revalidation_preserves_confirmation_for_existing_candidate_without_attempts() {
+    let old_validator = ValidatorIdentity::new("legacy-validator", "v0").unwrap();
+    let current_validator = validator();
+    let mut state = KanjiBatch::new(
+        "revalidate-existing-human-same-sha".into(),
+        vec![identity('漢')],
+        old_validator.clone(),
+    )
+    .unwrap();
+    let candidate = candidate_with_validator(
+        "existing-human-same-sha",
+        SemanticStatus::Uncertain,
+        old_validator,
+        true,
+    );
+    let candidate_bytes = bytes("existing-human-same-sha");
+    let sha256 = candidate.sha256.clone();
+    state.mark_existing_ready(&identity('漢'), &sha256).unwrap();
+    state
+        .retain_existing_candidate(&identity('漢'), candidate)
+        .unwrap();
+    let decision = HumanBatchDecision {
+        identity: identity('漢'),
+        candidate_sha256: sha256.clone(),
+        action: HumanBatchAction::Confirm,
+        reason: "подтверждены точные байты канонического кандидата".into(),
+    };
+    state.decide(decision.clone(), &candidate_bytes).unwrap();
+    state
+        .mark_published_ready(&identity('漢'), &sha256, BatchTrustSource::Human)
+        .unwrap();
+
+    state
+        .revalidate_candidates(current_validator.clone(), |_, candidate| {
+            Ok(revalidation(
+                candidate,
+                SemanticStatus::Uncertain,
+                current_validator.clone(),
+                true,
+            ))
+        })
+        .unwrap();
+
+    let item = &state.items[0];
+    assert_eq!(item.status, BatchItemStatus::HumanVerified);
+    assert_eq!(item.current_sha256.as_deref(), Some(sha256.as_str()));
+    assert_eq!(item.human_decisions, vec![decision]);
+    assert!(item.attempts.is_empty());
+    assert_eq!(
+        item.existing_candidate
+            .as_ref()
+            .unwrap()
+            .automated
+            .validator,
+        current_validator
+    );
     assert_eq!(item.published_sha256.as_deref(), Some(sha256.as_str()));
     assert_eq!(item.publication_source, Some(BatchTrustSource::Human));
     state.validate().unwrap();

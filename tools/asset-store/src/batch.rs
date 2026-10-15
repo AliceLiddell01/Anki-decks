@@ -726,30 +726,31 @@ impl KanjiBatch {
                 continue;
             }
 
+            let keeps_human_confirmation = was_human_verified
+                && human_confirmation.as_ref().is_some_and(|decision| {
+                    item.current_sha256.as_deref() == Some(decision.candidate_sha256.as_str())
+                        && find_candidate(item, &decision.candidate_sha256).is_some_and(
+                            |candidate| {
+                                candidate.technically_valid
+                                    && candidate.automated.status != SemanticStatus::Corrupt
+                            },
+                        )
+                });
+            if keeps_human_confirmation {
+                item.review_reason = None;
+                if human_confirmation.as_ref().is_some_and(|decision| {
+                    published_sha256.as_deref() != Some(decision.candidate_sha256.as_str())
+                        || publication_source != Some(BatchTrustSource::Human)
+                }) {
+                    item.published_sha256 = None;
+                    item.publication_source = None;
+                }
+                continue;
+            }
+
             item.published_sha256 = None;
             item.publication_source = None;
             refresh_item(item, &next.policy);
-
-            if was_human_verified
-                && let Some(decision) = human_confirmation
-                && item.current_sha256.as_deref() == Some(decision.candidate_sha256.as_str())
-                && find_candidate(item, &decision.candidate_sha256).is_some_and(|candidate| {
-                    candidate.technically_valid
-                        && candidate.automated.status != SemanticStatus::Corrupt
-                })
-            {
-                // Подтверждение сохраняет силу только для тех же технически
-                // пригодных байтов. Иначе журнал остаётся историей, а статус
-                // заново выводится из текущей проверки.
-                item.status = BatchItemStatus::HumanVerified;
-                item.review_reason = None;
-                if published_sha256.as_deref() == Some(decision.candidate_sha256.as_str())
-                    && publication_source == Some(BatchTrustSource::Human)
-                {
-                    item.published_sha256 = published_sha256;
-                    item.publication_source = publication_source;
-                }
-            }
         }
         next.revision += 1;
         next.validate()?;
@@ -1157,6 +1158,9 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
             })
         });
     let selected_hash = selected.map(|candidate| candidate.sha256.clone());
+    let selected_for_human_review = selected.is_some_and(|candidate| {
+        candidate.technically_valid && candidate.automated.status != SemanticStatus::Corrupt
+    });
     let mut distinct_valid_hashes: Vec<_> = samples
         .iter()
         .map(|(candidate, _)| candidate.sha256.clone())
@@ -1171,15 +1175,12 @@ fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     if individually_verified.is_some() || accepted {
         item.status = BatchItemStatus::AutoVerified;
         item.review_reason = None;
-    } else if (policy.version == SINGLE_CANDIDATE_POLICY_VERSION
-        && selected.is_some_and(|candidate| candidate.technically_valid))
+    } else if (policy.version == SINGLE_CANDIDATE_POLICY_VERSION && selected_for_human_review)
         || generation_attempt_count(item) >= MAX_ACQUISITION_ROUNDS
     {
         item.status = BatchItemStatus::AwaitingHuman;
         item.review_reason = Some(
-            if policy.version == SINGLE_CANDIDATE_POLICY_VERSION
-                && selected.is_some_and(|candidate| candidate.technically_valid)
-            {
+            if policy.version == SINGLE_CANDIDATE_POLICY_VERSION && selected_for_human_review {
                 "кандидат сохранён; повтор той же картинки не добавляет независимого свидетельства; требуется решение человека".into()
             } else if samples.is_empty() {
                 format!(
