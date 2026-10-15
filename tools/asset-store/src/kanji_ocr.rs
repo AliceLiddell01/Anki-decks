@@ -233,8 +233,11 @@ pub(crate) fn saved_suggestions_or_empty(
     }
 }
 
-fn save_suggestion(runtime: &BatchRuntime, suggestion: OcrSuggestion) -> Result<bool, AssetError> {
-    let mut ledger = read_ledger(runtime)?;
+fn save_suggestion(
+    runtime: &BatchRuntime,
+    ledger: &mut Ledger,
+    suggestion: OcrSuggestion,
+) -> Result<bool, AssetError> {
     let key = suggestion.key();
     if ledger.records.get(&key) == Some(&suggestion)
         && ledger.latest.get(&suggestion.identity.key) == Some(&key)
@@ -447,6 +450,7 @@ pub(crate) fn scan(
     *state = runtime
         .reload_cached()?
         .ok_or_else(|| invalid("пакет исчез во время OCR"))?;
+    let mut ledger = read_ledger(runtime)?;
     let mut report = OcrScanReport::default();
     for (identity, generation, candidate) in targets {
         if !still_current(state, &identity, generation, &candidate) {
@@ -465,13 +469,13 @@ pub(crate) fn scan(
         };
         let key = cache_key(&identity, &candidate.sha256, &config);
         if !options.rescan
-            && let Some(saved) = read_ledger(runtime)?.records.get(&key)
+            && let Some(saved) = ledger.records.get(&key).cloned()
         {
             if let Some(failure) = &saved.failure {
                 report.failures.push((identity.clone(), failure.clone()));
             }
             report.cache_hits += 1;
-            report.saved += usize::from(save_suggestion(runtime, saved.clone())?);
+            report.saved += usize::from(save_suggestion(runtime, &mut ledger, saved)?);
             continue;
         }
         let bytes = runtime.read_candidate(&candidate)?;
@@ -506,6 +510,7 @@ pub(crate) fn scan(
                         *state = runtime
                             .reload_cached()?
                             .ok_or_else(|| invalid("пакет исчез во время OCR"))?;
+                        ledger = read_ledger(runtime)?;
                         result
                     }
                     Err(failure) => Err(failure.clone()),
@@ -528,7 +533,7 @@ pub(crate) fn scan(
             if let Some(reason) = &suggestion.failure {
                 report.failures.push((identity.clone(), reason.clone()));
             }
-            report.saved += usize::from(save_suggestion(runtime, suggestion)?);
+            report.saved += usize::from(save_suggestion(runtime, &mut ledger, suggestion)?);
         }
     }
     Ok(report)
