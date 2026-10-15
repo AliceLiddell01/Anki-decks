@@ -4178,7 +4178,24 @@ fn finish_interactive_review(
     {
         return Ok(());
     }
-    let (state, issues, applied) = apply_review(store, &response.batch_id, &bundle.id)?;
+    let (state, apply_issues, applied) = apply_review(store, &response.batch_id, &bundle.id)?;
+    let mut issues = std::mem::take(&mut response.issues);
+    issues.retain(|previous| {
+        state
+            .items
+            .iter()
+            .find(|item| item.identity == previous.identity)
+            .is_none_or(|item| !item.is_ready())
+    });
+    for new_issue in apply_issues {
+        if !issues.iter().any(|previous| {
+            previous.identity == new_issue.identity
+                && previous.code == new_issue.code
+                && previous.message == new_issue.message
+        }) {
+            issues.push(new_issue);
+        }
+    }
     let outcome = if response.operation == "batch_run" {
         if state.is_resolved() {
             "resolved"

@@ -3389,6 +3389,50 @@ fn spy() -> ReviewSpy {
 }
 
 #[test]
+fn interactive_review_keeps_issues_for_pending_items_and_drops_only_ready_identities() {
+    let fixture = review_fixture("review-preserves-issues", &['保', '倉']);
+    let bundle = review_bundle(&fixture, "review-preserves-issues");
+    fill_review(&bundle.decisions, &["y", "-"]);
+
+    let first = identity('保');
+    let second = identity('倉');
+    let prior_error = AssetError::new(
+        ErrorCode::IdentityConflict,
+        "предыдущая проблема публикации",
+    );
+    let issues = vec![issue(&first, &prior_error), issue(&second, &prior_error)];
+    let mut response = batch_response(
+        "batch_run",
+        fixture.summary(),
+        fixture.load("review-preserves-issues"),
+        false,
+        issues,
+        None,
+        "awaiting_human",
+    );
+
+    let mut interaction = spy();
+    finish_interactive_review(&fixture.store, &mut response, &mut interaction).unwrap();
+
+    assert!(response.batch.items[0].is_ready());
+    assert!(!response.batch.items[1].is_ready());
+    assert_eq!(response.issues.len(), 1);
+    assert_eq!(response.issues[0].identity, second);
+    assert_eq!(
+        response.issues[0].code,
+        ErrorCode::IdentityConflict.as_str()
+    );
+    assert_eq!(
+        response.blockers,
+        vec![format!(
+            "{}:{}",
+            second,
+            ErrorCode::IdentityConflict.as_str()
+        )]
+    );
+}
+
+#[test]
 fn actual_dispatch_has_no_prompt_or_launcher_without_opt_in_or_in_json_or_headless() {
     let fixture = review_fixture("review-gate", &['保']);
     let original = fixture.load("review-gate");
