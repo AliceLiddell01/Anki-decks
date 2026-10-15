@@ -1124,8 +1124,7 @@ mod tests {
         );
         assert!(
             report.pruned.iter().any(|path| path.ends_with(GITKEEP)),
-            "снятый placeholder виден в отчёте: {:?}",
-            report.pruned
+            "снятый placeholder должен быть виден в отчёте"
         );
     }
 
