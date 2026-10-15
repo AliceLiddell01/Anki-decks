@@ -3092,6 +3092,33 @@ fn review_bundle(fixture: &Fixture, id: &str) -> crate::kanji_review::ReviewBund
     crate::kanji_review::prepare(&runtime, &state).unwrap()
 }
 
+#[test]
+fn review_export_restores_missing_artifacts_without_overwriting_decisions() {
+    let fixture = review_fixture("review-export-recovery", &['保']);
+    let bundle = review_bundle(&fixture, "review-export-recovery");
+    fill_review(&bundle.decisions, &["y"]);
+    let decisions = fs::read(&bundle.decisions).unwrap();
+    let image_name = {
+        let runtime = BatchRuntime::open(fixture.store.root(), "review-export-recovery").unwrap();
+        let (snapshot, _) = crate::kanji_review::read(&runtime, &bundle.id).unwrap();
+        snapshot.rows[0].filename.clone()
+    };
+    let image_path = bundle.directory.join(&image_name);
+    let image = fs::read(&image_path).unwrap();
+    fs::remove_file(&image_path).unwrap();
+
+    let restored = review_bundle(&fixture, "review-export-recovery");
+    assert_eq!(restored.id, bundle.id);
+    assert_eq!(fs::read(&restored.decisions).unwrap(), decisions);
+    assert_eq!(fs::read(&image_path).unwrap(), image);
+
+    fs::remove_file(&restored.decisions).unwrap();
+    let restored = review_bundle(&fixture, "review-export-recovery");
+    let template = fs::read_to_string(&restored.decisions).unwrap();
+    assert!(template.lines().any(|line| line.starts_with("-\t保\t")));
+    assert!(!template.lines().any(|line| line.starts_with("y\t")));
+}
+
 fn fill_review(path: &std::path::Path, actions: &[&str]) {
     let original = fs::read_to_string(path).unwrap();
     let mut index = 0;

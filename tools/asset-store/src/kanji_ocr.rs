@@ -430,7 +430,7 @@ pub(crate) fn scan(
     let digest = ollama.model_digest();
     runtime.reacquire_lock()?;
     *state = runtime
-        .load()?
+        .reload_cached()?
         .ok_or_else(|| invalid("пакет исчез во время OCR"))?;
     let mut report = OcrScanReport::default();
     for (identity, generation, candidate) in targets {
@@ -489,7 +489,7 @@ pub(crate) fn scan(
                             ollama.recognize(&image.png, digest, &mut report.chat_requests);
                         runtime.reacquire_lock()?;
                         *state = runtime
-                            .load()?
+                            .reload_cached()?
                             .ok_or_else(|| invalid("пакет исчез во время OCR"))?;
                         result
                     }

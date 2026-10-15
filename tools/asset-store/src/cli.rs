@@ -311,6 +311,8 @@ pub fn execute(cli: Cli) -> CliOutput {
                     | BatchCommand::Review { .. }
                     | BatchCommand::Revalidate { .. }
                     | BatchCommand::ReviewExport { .. }
+                    | BatchCommand::Ocr { .. }
+                    | BatchCommand::ReviewConfirmMatches { .. }
                     | BatchCommand::ReviewApply { .. }
                     | BatchCommand::ReviewInteractive { .. }
                     | BatchCommand::Decide { .. }

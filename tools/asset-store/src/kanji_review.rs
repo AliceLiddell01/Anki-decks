@@ -162,11 +162,33 @@ pub(crate) fn prepare(
     // Повторный export не перезаписывает уже заполненный файл редактора.
     match directory.read("snapshot.json") {
         Ok(existing) if existing == encoded => {
-            directory.read("decisions.tsv")?;
             for row in &snapshot.rows {
-                if sha256_hex(&directory.read(&row.filename)?) != row.sha256 {
-                    return Err(invalid("копия изображения review изменена"));
+                match directory.read(&row.filename) {
+                    Ok(bytes) if sha256_hex(&bytes) == row.sha256 => {}
+                    Ok(_) => return Err(invalid("копия изображения review изменена")),
+                    Err(error) if error.code == ErrorCode::MissingAssetFile => {
+                        let bytes = runtime.read_candidate(candidate(state, row)?)?;
+                        if sha256_hex(&bytes) != row.sha256 {
+                            return Err(invalid("исходный кандидат review изменён"));
+                        }
+                        directory.write_if_absent(&row.filename, &bytes)?;
+                        if sha256_hex(&directory.read(&row.filename)?) != row.sha256 {
+                            return Err(invalid("копия изображения review изменена"));
+                        }
+                    }
+                    Err(error) => return Err(error),
                 }
+            }
+            match directory.read("decisions.tsv") {
+                Ok(_) => {}
+                Err(error) if error.code == ErrorCode::MissingAssetFile => {
+                    directory.write_if_absent(
+                        "decisions.tsv",
+                        decisions_template(&snapshot, &id).as_bytes(),
+                    )?;
+                    directory.read("decisions.tsv")?;
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(_) => return Err(invalid("содержимое снимка review не совпадает с его SHA")),
@@ -175,14 +197,10 @@ pub(crate) fn prepare(
                 let bytes = runtime.read_candidate(candidate(state, row)?)?;
                 directory.write(&row.filename, &bytes)?;
             }
-            let mut text = format!(
-                "# YARXI REVIEW v{SCHEMA}\n# y = ожидаемый символ; e = непригодное изображение; другой один Han = фактический символ; - = пропуск\n# Только первая колонка; разделитель TAB. Сохраните файл перед применением.\n@review\t{SCHEMA}\t{}\t{id}\n",
-                snapshot.batch_id
-            );
-            for row in &snapshot.rows {
-                text.push_str(&format!("-\t{}\n", row.columns()));
-            }
-            directory.write("decisions.tsv", text.as_bytes())?;
+            directory.write(
+                "decisions.tsv",
+                decisions_template(&snapshot, &id).as_bytes(),
+            )?;
             // Снимок записывается последним: неполный export безопасно повторяется.
             directory.write("snapshot.json", &encoded)?;
         }
@@ -194,6 +212,17 @@ pub(crate) fn prepare(
         decisions: directory.path.join("decisions.tsv"),
         directory: directory.path,
     })
+}
+
+fn decisions_template(snapshot: &ReviewSnapshot, id: &str) -> String {
+    let mut text = format!(
+        "# YARXI REVIEW v{SCHEMA}\n# y = ожидаемый символ; e = непригодное изображение; другой один Han = фактический символ; - = пропуск\n# Только первая колонка; разделитель TAB. Сохраните файл перед применением.\n@review\t{SCHEMA}\t{}\t{id}\n",
+        snapshot.batch_id
+    );
+    for row in &snapshot.rows {
+        text.push_str(&format!("-\t{}\n", row.columns()));
+    }
+    text
 }
 
 pub(crate) fn read(

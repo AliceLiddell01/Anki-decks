@@ -1460,12 +1460,15 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
 
 # Получить TSV и index.html рядом с ним; все решения изначально '-':
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
-# После просмотра группы совпадений: явное пакетное человеческое решение.
+# После просмотра группы совпадений внесите решения для остальных строк в TSV.
+# Команда применит их вместе с подтверждённой группой совпадений.
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-confirm-matches \
   --batch-id my-kanji --review-id FULL_REVIEW_SHA256 --confirm-reviewed
-# Остальные решения y/e/другой Han/- внесите в TSV и примените:
+# После применения группы создайте новый снимок для оставшихся строк.
+cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
+# Внесите оставшиеся решения и примените с новым review_id:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-apply \
-  --batch-id my-kanji --review-id FULL_REVIEW_SHA256
+  --batch-id my-kanji --review-id NEW_REVIEW_SHA256
 # Явный повтор OCR, включая сохранённые отказы:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' --rescan

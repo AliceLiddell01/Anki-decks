@@ -1475,9 +1475,10 @@ fn execute_command_with_snapshots_and_progress(
             let owner = reader.capture(store);
             reconcile_owner_trust(&owner, &mut state, &mut issues)?;
             runtime.save(&state)?;
+            let code = if issues.is_empty() { 0 } else { 3 };
             Ok((
                 batch_response(operation, summary, state, true, issues, None, "revalidated"),
-                0,
+                code,
             ))
         }
         BatchCommand::ReviewExport { batch_id } => {
