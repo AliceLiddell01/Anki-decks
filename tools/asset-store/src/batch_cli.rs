@@ -3954,6 +3954,9 @@ mod candidate_cost_tests {
         .unwrap();
         let mut runtime = BatchRuntime::open(store.root(), "candidate-cost").unwrap();
         let mut state = runtime.load().unwrap().unwrap();
+        // Агрегатная политика оставляет `Uncertain` в границе обхода,
+        // поэтому запуск проходит через checkpoint каждого кандидата.
+        state.policy = crate::batch::AggregatePolicy::current(state.policy.validator.clone());
         for (index, character) in characters.iter().enumerate() {
             let identity = parse_character(character).unwrap().identity();
             let bytes = synthetic_png(index as u8);
@@ -3989,7 +3992,7 @@ mod candidate_cost_tests {
         .unwrap();
         let reads = CANDIDATE_FILE_READS.with(std::cell::Cell::get);
         assert_eq!(state.items.len(), ITEMS as usize);
-        assert!(state.items.iter().all(|item| item.attempts.len() == 1));
+        assert!(state.items.iter().all(|item| item.attempts.len() == 2));
         // Линейный обход требует несколько чтений на символ; прежний
         // квадратичный путь давал ITEMS^2 = 40000.
         assert!(
