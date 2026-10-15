@@ -457,9 +457,8 @@ fn invocation(
     match candidate {
         Candidate::Explorer => {
             let path = windows_path(host, path)?;
-            let program = explorer_program(host).ok_or_else(|| {
-                invalid("explorer.exe не найдена в PATH или каталоге Windows")
-            })?;
+            let program = explorer_program(host)
+                .ok_or_else(|| invalid("explorer.exe не найдена в PATH или каталоге Windows"))?;
             Ok(Invocation {
                 program: program.into_os_string(),
                 args: vec![path],
