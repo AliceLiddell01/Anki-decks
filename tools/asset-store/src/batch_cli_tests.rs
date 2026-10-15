@@ -3186,6 +3186,7 @@ fn manual_review_pages_survive_invalid_optional_ocr_cache() {
     let bundle = crate::kanji_review::prepare(&runtime, &state).unwrap();
     let preview = fs::read_to_string(bundle.directory.join("index.html")).unwrap();
     assert!(preview.contains("default-src 'none'; img-src 'self' file:"));
+    assert!(preview.contains("src=\"data:image/"));
     let (snapshot, _) = crate::kanji_review::read(&runtime, &bundle.id).unwrap();
     assert!(snapshot.rows.iter().all(|row| row.ocr.is_none()));
 }
