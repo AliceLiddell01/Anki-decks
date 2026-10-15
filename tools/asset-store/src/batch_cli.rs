@@ -4045,8 +4045,10 @@ fn apply_review_with_matches(
     let (review, mut decisions) = crate::kanji_review::read(&runtime, review_id)?;
     if confirm_matches {
         for (row, decision) in review.rows.iter().zip(&mut decisions) {
-            if decision.is_none() && row.ocr.as_ref().is_some_and(|ocr| ocr.group() == 0) {
-                *decision = Some(HumanBatchDecision {
+            if matches!(decision, crate::kanji_review::ParsedDecision::Unspecified)
+                && row.ocr.as_ref().is_some_and(|ocr| ocr.group() == 0)
+            {
+                *decision = crate::kanji_review::ParsedDecision::Apply(HumanBatchDecision {
                     identity: row.identity.clone(),
                     candidate_sha256: row.sha256.clone(),
                     action: HumanBatchAction::Confirm,
@@ -4071,7 +4073,12 @@ fn apply_review_with_matches(
     let mut applied = ReviewApplied::default();
     // Вся синтаксическая и предметная проверка, включая декодирование,
     // заканчивается до единственной атомарной записи всех намерений.
-    for (row, decision) in review.rows.iter().zip(decisions) {
+    for (row, parsed_decision) in review.rows.iter().zip(decisions) {
+        let decision = match parsed_decision {
+            crate::kanji_review::ParsedDecision::Apply(decision) => Some(decision),
+            crate::kanji_review::ParsedDecision::Unspecified
+            | crate::kanji_review::ParsedDecision::Skip => None,
+        };
         let item = state
             .items
             .iter()

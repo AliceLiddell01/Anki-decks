@@ -3164,7 +3164,7 @@ fn review_export_restores_missing_artifacts_without_overwriting_decisions() {
     fs::remove_file(&restored.decisions).unwrap();
     let restored = review_bundle(&fixture, "review-export-recovery");
     let template = fs::read_to_string(&restored.decisions).unwrap();
-    assert!(template.lines().any(|line| line.starts_with("-\t保\t")));
+    assert!(template.lines().any(|line| line.starts_with("\t保\t")));
     assert!(!template.lines().any(|line| line.starts_with("y\t")));
 }
 
@@ -3197,7 +3197,8 @@ fn fill_review(path: &std::path::Path, actions: &[&str]) {
     let text = original
         .lines()
         .map(|line| {
-            if let Some(columns) = line.strip_prefix("-\t") {
+            let columns = line.strip_prefix("-\t").or_else(|| line.strip_prefix('\t'));
+            if let Some(columns) = columns {
                 let next = format!("{}\t{columns}", actions[index]);
                 index += 1;
                 next
@@ -3336,7 +3337,10 @@ fn review_recovers_saved_confirm_intent_without_applying_new_bytes() {
         let bytes = runtime
             .read_candidate(crate::kanji_review::candidate(&state, &snapshot.rows[0]).unwrap())
             .unwrap();
-        state.decide(decisions[0].clone().unwrap(), &bytes).unwrap();
+        let crate::kanji_review::ParsedDecision::Apply(decision) = decisions[0].clone() else {
+            panic!("шаблон содержит явное подтверждение");
+        };
+        state.decide(decision, &bytes).unwrap();
         runtime.save(&state).unwrap(); // точка остановки после durable intent, до publish
     }
     let (state, issues, counts) =

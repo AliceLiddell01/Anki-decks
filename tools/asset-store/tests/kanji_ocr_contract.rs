@@ -331,7 +331,7 @@ fn blind_saved_sha_cache_review_and_explicit_group_confirmation_use_public_cli()
     let review_id = data["review_id"].as_str().unwrap();
     let decisions = Path::new(data["review_artifact"].as_str().unwrap());
     let text = fs::read_to_string(decisions).unwrap();
-    assert!(text.lines().any(|line| line.starts_with("-\t𠀀")));
+    assert!(text.lines().any(|line| line.starts_with("\t𠀀")));
     assert!(!text.lines().any(|line| line.starts_with("y\t")));
     let html = fs::read_to_string(decisions.parent().unwrap().join("index.html")).unwrap();
     assert!(html.contains("observed=𠀀"));
@@ -349,6 +349,21 @@ fn blind_saved_sha_cache_review_and_explicit_group_confirmation_use_public_cli()
     ]);
     assert!(!refusal.status.success());
     assert_eq!(fixture.state(), before);
+
+    fs::write(decisions, text.replacen("\t𠀀", "-\t𠀀", 1)).unwrap();
+    assert_ok(&fixture.cli(&[
+        "batch",
+        "review-confirm-matches",
+        "--batch-id",
+        "ocr",
+        "--review-id",
+        review_id,
+        "--confirm-reviewed",
+    ]));
+    assert_eq!(fixture.state(), before);
+    assert!(fixture.state().items[0].human_decisions.is_empty());
+
+    fs::write(decisions, &text).unwrap();
     let confirm = fixture.cli(&[
         "batch",
         "review-confirm-matches",

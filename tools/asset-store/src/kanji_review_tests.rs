@@ -39,23 +39,48 @@ fn only_explicit_y_confirms_and_windows_text_is_accepted() {
     );
     let parsed = parse(&snapshot, &"b".repeat(64), &text).unwrap();
     assert_eq!(
-        parsed[0].as_ref().unwrap().action,
-        HumanBatchAction::Confirm
+        parsed[0],
+        ParsedDecision::Apply(HumanBatchDecision {
+            identity: snapshot.rows[0].identity.clone(),
+            candidate_sha256: snapshot.rows[0].sha256.clone(),
+            action: HumanBatchAction::Confirm,
+            reason: format!("review:{}; expected_character_confirmed", "b".repeat(64)),
+        })
     );
     assert_eq!(
-        parsed[1].as_ref().unwrap().action,
-        HumanBatchAction::RejectAndHold
+        parsed[1],
+        ParsedDecision::Apply(HumanBatchDecision {
+            identity: snapshot.rows[1].identity.clone(),
+            candidate_sha256: snapshot.rows[1].sha256.clone(),
+            action: HumanBatchAction::RejectAndHold,
+            reason: format!(
+                "review:{}; unusable_image; explicit retry required",
+                "b".repeat(64)
+            ),
+        })
     );
-    assert!(
-        parsed[2]
-            .as_ref()
-            .unwrap()
-            .reason
-            .contains("actual_character=侏")
-    );
-    assert!(parsed[3].is_none());
+    assert!(matches!(
+        &parsed[2],
+        ParsedDecision::Apply(decision) if decision.reason.contains("actual_character=侏")
+    ));
+    assert_eq!(parsed[3], ParsedDecision::Skip);
     let parsed = parse(&snapshot, &"b".repeat(64), &text.replace("y\t", "\t")).unwrap();
-    assert!(parsed[0].is_none());
+    assert_eq!(parsed[0], ParsedDecision::Unspecified);
+}
+
+#[test]
+fn blank_decision_and_explicit_skip_are_distinct() {
+    let snapshot = snapshot();
+    let parsed = parse(
+        &snapshot,
+        &"b".repeat(64),
+        &text(&snapshot, &["", "-", "", "-"]),
+    )
+    .unwrap();
+    assert_eq!(parsed[0], ParsedDecision::Unspecified);
+    assert_eq!(parsed[1], ParsedDecision::Skip);
+    assert_eq!(parsed[2], ParsedDecision::Unspecified);
+    assert_eq!(parsed[3], ParsedDecision::Skip);
 }
 #[test]
 fn edited_metadata_duplicates_paths_and_unknown_decisions_reject_entire_file() {

@@ -69,6 +69,13 @@ pub(crate) struct ReviewBundle {
     pub decisions: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedDecision {
+    Unspecified,
+    Skip,
+    Apply(HumanBatchDecision),
+}
+
 fn invalid(message: impl Into<String>) -> AssetError {
     AssetError::new(ErrorCode::InvalidTransition, message)
 }
@@ -217,11 +224,11 @@ pub(crate) fn prepare(
 
 fn decisions_template(snapshot: &ReviewSnapshot, id: &str) -> String {
     let mut text = format!(
-        "# YARXI REVIEW v{SCHEMA}\n# y = ожидаемый символ; e = непригодное изображение; другой один Han = фактический символ; - = пропуск\n# Только первая колонка; разделитель TAB. Сохраните файл перед применением.\n@review\t{SCHEMA}\t{}\t{id}\n",
+        "# YARXI REVIEW v{SCHEMA}\n# y = ожидаемый символ; e = непригодное изображение; другой один Han = фактический символ; пусто = без решения; - = пропуск\n# Только первая колонка; разделитель TAB. Сохраните файл перед применением.\n@review\t{SCHEMA}\t{}\t{id}\n",
         snapshot.batch_id
     );
     for row in &snapshot.rows {
-        text.push_str(&format!("-\t{}\n", row.columns()));
+        text.push_str(&format!("\t{}\n", row.columns()));
     }
     text
 }
@@ -229,7 +236,7 @@ fn decisions_template(snapshot: &ReviewSnapshot, id: &str) -> String {
 pub(crate) fn read(
     runtime: &BatchRuntime,
     id: &str,
-) -> Result<(ReviewSnapshot, Vec<Option<HumanBatchDecision>>), AssetError> {
+) -> Result<(ReviewSnapshot, Vec<ParsedDecision>), AssetError> {
     crate::batch::validate_hash(id)?;
     let directory = runtime.artifact_directory(&format!("review-{id}"))?;
     let encoded = directory.read("snapshot.json")?;
@@ -266,7 +273,7 @@ fn parse(
     snapshot: &ReviewSnapshot,
     id: &str,
     text: &str,
-) -> Result<Vec<Option<HumanBatchDecision>>, AssetError> {
+) -> Result<Vec<ParsedDecision>, AssetError> {
     let mut lines = text
         .trim_start_matches('\u{feff}')
         .lines()
@@ -290,8 +297,12 @@ fn parse(
             return Err(invalid(format!("изменены метаданные строки {}", index + 1)));
         }
         let (action, reason) = match action {
-            "" | "-" => {
-                decisions.push(None);
+            "" => {
+                decisions.push(ParsedDecision::Unspecified);
+                continue;
+            }
+            "-" => {
+                decisions.push(ParsedDecision::Skip);
                 continue;
             }
             "y" => (
@@ -316,7 +327,7 @@ fn parse(
                 )
             }
         };
-        decisions.push(Some(HumanBatchDecision {
+        decisions.push(ParsedDecision::Apply(HumanBatchDecision {
             identity: row.identity.clone(),
             candidate_sha256: row.sha256.clone(),
             action,

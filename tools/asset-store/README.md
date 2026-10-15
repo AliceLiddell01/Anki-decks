@@ -1480,9 +1480,10 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
   --endpoint 'http://192.168.1.2:11434' --allow-remote
 
-# Получить TSV и index.html рядом с ним; все решения изначально '-':
+# Получить TSV и index.html рядом с ним; решения изначально пустые, '-' означает явный пропуск:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
-# После просмотра группы совпадений внесите решения для остальных строк в TSV.
+# После просмотра группы совпадений оставьте подтверждаемые строки пустыми, '-' поставьте для пропуска;
+# внесите явные решения для остальных строк в TSV.
 # Команда применит их вместе с подтверждённой группой совпадений.
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-confirm-matches \
   --batch-id my-kanji --review-id FULL_REVIEW_SHA256 --confirm-reviewed
@@ -1500,8 +1501,8 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
 их состояние изменилось, прежний снимок содержит уже применённые строки.
 `review-confirm-matches` использует ту же полную проверку TSV, SHA, generation,
 копий и атомарный журнал `human_decisions`, что `review-apply`. Он добавляет
-подтверждения для ещё незаполненных строк совпавшей группы; явно заполненные
-решения TSV тоже применяются. `--confirm-reviewed` означает, что человек просмотрел
+подтверждения только для пустых строк совпавшей группы; `-` явно пропускает строку.
+Явно заполненные решения TSV тоже применяются. `--confirm-reviewed` означает, что человек просмотрел
 изображения, включая возможность ошибочного совпадения OCR. Создание или открытие
 отчёта не подтверждает ничего. Порядок строк — совпадения, несовпадения,
 нераспознанные/отказы, без OCR. Дополнительные TSV-колонки — `observed`, совпадение,
