@@ -443,8 +443,9 @@ struct Invocation {
 /// Дополнительный путь преобразуется через wslpath, чтобы учитывать нестандартный
 /// каталог монтирования Windows, и проверяется как исполняемый файл.
 fn windows_system_program(host: &dyn Host, name: &str, windows_location: &str) -> Option<PathBuf> {
-    if let Some(program) = host.resolve(name) {
-        return Some(program);
+    if host.resolve(name).is_some() {
+        // Сохраняем прежний запуск по имени, если PATH уже настроен.
+        return Some(PathBuf::from(name));
     }
     let converted = convert_path(host, "-u", Path::new(windows_location)).ok()?;
     let path = PathBuf::from(converted);
@@ -1080,7 +1081,12 @@ mod tests {
 
         fn resolve(&self, program: &str) -> Option<PathBuf> {
             if self.resolved.borrow().iter().any(|name| name == program) {
-                Some(PathBuf::from(format!("/usr/bin/{program}")))
+                let path = PathBuf::from(program);
+                Some(if path.is_absolute() {
+                    path
+                } else {
+                    PathBuf::from(format!("/usr/bin/{program}"))
+                })
             } else {
                 None
             }
