@@ -18,7 +18,7 @@
 //! 3. **WSL2** — Windows Explorer и Windows-редактор остаются **дополнительным**
 //!    путём и выбираются только при доказанном межсистемном взаимодействии:
 //!    включённый ядром флаг `binfmt_misc/WSLInterop*`, а для каталога также
-//!    разрешимый в `PATH` `explorer.exe`. Одного `WSL_DISTRO_NAME` недостаточно. Путь
+//!    доступный `explorer.exe` в `PATH` или проверенный путь к Windows Explorer через `wslpath`. Одного `WSL_DISTRO_NAME` недостаточно. Путь
 //!    передаётся в формате Windows через `wslpath -w`; при отказе остаются
 //!    Linux-ассоциация, настроенный редактор или ручной способ;
 //! 4. **резервный безопасный путь** — печать путей каталога и `decisions.tsv` и
@@ -132,15 +132,21 @@ impl Host for SystemHost {
     }
 
     fn resolve(&self, program: &str) -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|directory| directory.join(program))
-            .find(|candidate| {
-                use std::os::unix::fs::PermissionsExt;
-                candidate.metadata().is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
+        let requested = Path::new(program);
+        let candidates: Vec<_> = if requested.is_absolute() {
+            vec![requested.to_path_buf()]
+        } else {
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(program))
+                .collect()
+        };
+        candidates.into_iter().find(|candidate| {
+            use std::os::unix::fs::PermissionsExt;
+            candidate.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             })
+        })
     }
 
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
@@ -425,6 +431,22 @@ struct Invocation {
     tolerate_exit_one: bool,
 }
 
+/// На WSL Explorer может отсутствовать в PATH даже при включённом interop.
+/// Дополнительный путь преобразуется через wslpath, чтобы учитывать нестандартный
+/// каталог монтирования Windows, и проверяется как исполняемый файл.
+fn explorer_program(host: &dyn Host) -> Option<PathBuf> {
+    if let Some(program) = host.resolve("explorer.exe") {
+        return Some(program);
+    }
+    let converted = convert_path(host, "-u", Path::new(r"C:\Windows\explorer.exe")).ok()?;
+    let path = PathBuf::from(converted);
+    if path.is_absolute() {
+        host.resolve(path.to_str()?)
+    } else {
+        None
+    }
+}
+
 /// Собирает команду шага. `path` — путь той цели, которой адресован кандидат.
 fn invocation(
     host: &dyn Host,
@@ -435,11 +457,11 @@ fn invocation(
     match candidate {
         Candidate::Explorer => {
             let path = windows_path(host, path)?;
-            if host.resolve("explorer.exe").is_none() {
-                return Err(invalid("explorer.exe не найдена в PATH"));
-            }
+            let program = explorer_program(host).ok_or_else(|| {
+                invalid("explorer.exe не найдена в PATH или каталоге Windows")
+            })?;
             Ok(Invocation {
-                program: OsString::from("explorer.exe"),
+                program: program.into_os_string(),
                 args: vec![path],
                 tolerate_exit_one: true,
             })
@@ -665,7 +687,14 @@ fn windows_editor(program: &OsStr) -> bool {
 }
 
 fn windows_path(host: &dyn Host, path: &Path) -> Result<OsString, AssetError> {
-    convert_path(host, "-w", path)
+    let translated = convert_path(host, "-w", path)?;
+    let short = translated
+        .to_str()
+        .and_then(|path| path.strip_prefix(r"\\wsl.localhost\"))
+        .map(|suffix| format!("\\\\wsl$\\{suffix}"));
+    // Оба UNC-варианта поддерживаются Windows; короткий адрес уменьшает
+    // риск MAX_PATH у Windows-редакторов, не копируя файл решений.
+    Ok(short.map_or(translated, OsString::from))
 }
 
 fn convert_path(host: &dyn Host, direction: &str, path: &Path) -> Result<OsString, AssetError> {
@@ -1414,6 +1443,70 @@ mod tests {
         let text = text(&diagnostics);
         assert!(text.contains("/tmp/review-fixture/decisions.tsv"), "{text}");
         assert!(!host.programs().iter().any(|name| name == "notepad.exe"));
+    }
+
+    #[test]
+    fn wsl_without_windows_in_path_discovers_explorer_through_wslpath() {
+        let host = FakeHost::default();
+        host.replies(
+            "wslpath",
+            &["-u", r"C:\Windows\explorer.exe"],
+            true,
+            "/mnt/c/Windows/explorer.exe\n",
+        );
+        host.resolves("/mnt/c/Windows/explorer.exe");
+        host.exits("/mnt/c/Windows/explorer.exe", 1);
+        host.replies(
+            "wslpath",
+            &["-w", "/tmp/review-fixture"],
+            true,
+            "\\\\wsl.localhost\\archlinux\\tmp\\review-fixture\n",
+        );
+        let environment = Environment {
+            editor: None,
+            desktop: false,
+            wsl: true,
+            wsl_interop: true,
+            text_association: None,
+        };
+        let mut diagnostics = Vec::new();
+        open_with(
+            &host,
+            &environment,
+            &request(
+                Path::new("/tmp/review-fixture"),
+                Path::new("/tmp/review-fixture/decisions.tsv"),
+            ),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(host.programs(), ["/mnt/c/Windows/explorer.exe"]);
+        assert_eq!(host.argv(0), [r"\\wsl$\archlinux\tmp\review-fixture"]);
+    }
+
+    #[test]
+    fn windows_path_shortens_only_wsl_localhost_unc() {
+        let host = FakeHost::default();
+        host.replies(
+            "wslpath",
+            &["-w", "/tmp/日本/decisions.tsv"],
+            true,
+            "\\\\wsl.localhost\\archlinux\\tmp\\日本\\decisions.tsv\n",
+        );
+        assert_eq!(
+            windows_path(&host, Path::new("/tmp/日本/decisions.tsv")).unwrap(),
+            OsString::from(r"\\wsl$\archlinux\tmp\日本\decisions.tsv")
+        );
+        host.replies(
+            "wslpath",
+            &["-w", "/mnt/c/review/decisions.tsv"],
+            true,
+            "C:\\review\\decisions.tsv\n",
+        );
+        assert_eq!(
+            windows_path(&host, Path::new("/mnt/c/review/decisions.tsv")).unwrap(),
+            OsString::from(r"C:\review\decisions.tsv")
+        );
     }
 
     #[test]

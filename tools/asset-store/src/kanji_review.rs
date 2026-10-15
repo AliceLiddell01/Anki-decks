@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{
@@ -328,15 +329,33 @@ fn parse(
     Ok(decisions)
 }
 
+/// HTML для ручного просмотра остаётся переносимым при длинных UNC-путях WSL.
+/// Объём встроенных изображений ограничен, чтобы крупный пакет не создавал
+/// неограниченный HTML; после исчерпания бюджета остаются относительные ссылки.
+fn preview_image_source(filename: &str, bytes: &[u8], remaining: &mut usize) -> String {
+    let mime = match filename.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("gif") => "image/gif",
+        Some("png") => "image/png",
+        _ => return crate::batch::html_escape(filename),
+    };
+    if bytes.len() > *remaining {
+        return crate::batch::html_escape(filename);
+    }
+    *remaining -= bytes.len();
+    format!("data:{mime};base64,{}", STANDARD.encode(bytes))
+}
+
 fn write_preview(
     directory: &crate::batch_runtime::ArtifactDirectory,
     snapshot: &ReviewSnapshot,
 ) -> Result<(), AssetError> {
     use crate::batch::html_escape;
     let mut html = String::from(
-        "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self' file:; style-src 'unsafe-inline'\"><title>Ручная проверка</title><style>body{font-family:system-ui;margin:2rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>Предложения OCR и решения человека</h1><p>Просмотрите изображения. OCR может ошибаться при совпадении метки. Только явное решение человека подтверждает байты.</p>",
+        "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self' file: data:; style-src 'unsafe-inline'\"><title>Ручная проверка</title><style>body{font-family:system-ui;margin:2rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>Предложения OCR и решения человека</h1><p>Просмотрите изображения. OCR может ошибаться при совпадении метки. Только явное решение человека подтверждает байты.</p>",
     );
     let mut group = None;
+    // 32 МиБ исходных изображений: бюджет применяется к данным до base64.
+    let mut inline_budget = 32 * 1024 * 1024;
     for row in &snapshot.rows {
         let next_group = row.ocr.as_ref().map_or(3, |ocr| ocr.group());
         if group != Some(next_group) {
@@ -348,8 +367,10 @@ fn write_preview(
             });
             group = Some(next_group);
         }
+        let image = directory.read(&row.filename)?;
+        let source = preview_image_source(&row.filename, &image, &mut inline_budget);
         html.push_str(&format!("<article><h3>{}</h3><img src=\"{}\" alt=\"{}\"><pre>SHA: {}\nПоколение: {}\n{}</pre></article>",
-            html_escape(&row.identity.key), html_escape(&row.filename), html_escape(&row.identity.key), row.sha256, row.generation,
+            html_escape(&row.identity.key), source, html_escape(&row.identity.key), row.sha256, row.generation,
             html_escape(&row.ocr.as_ref().map_or_else(|| "Без OCR".into(), |ocr| ocr.summary()))));
     }
     html.push_str("</html>");

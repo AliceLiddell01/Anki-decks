@@ -90,3 +90,15 @@ fn edited_metadata_duplicates_paths_and_unknown_decisions_reject_entire_file() {
         assert!(parse(&snapshot, &"b".repeat(64), &text).is_err(), "{text}");
     }
 }
+
+#[test]
+fn preview_embeds_small_images_and_preserves_fallback_when_budget_is_exhausted() {
+    let gif = preview_image_source("漢-abc.gif", b"GIF89a", &mut 8);
+    assert_eq!(gif, "data:image/gif;base64,R0lGODlh");
+    let mut budget = 8;
+    let png = preview_image_source("字-abc.png", b"\x89PNG\r\n\x1a\n", &mut budget);
+    assert!(png.starts_with("data:image/png;base64,"));
+    assert_eq!(budget, 0);
+    let fallback = preview_image_source("字-abc.png", b"123", &mut budget);
+    assert_eq!(fallback, "字-abc.png");
+}
