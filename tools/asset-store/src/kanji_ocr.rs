@@ -468,7 +468,8 @@ pub(crate) fn scan(
             generation: GENERATION,
         };
         let key = cache_key(&identity, &candidate.sha256, &config);
-        if !options.rescan
+        if digest.is_ok()
+            && !options.rescan
             && let Some(saved) = ledger.records.get(&key).cloned()
         {
             if let Some(failure) = &saved.failure {
@@ -478,7 +479,6 @@ pub(crate) fn scan(
             report.saved += usize::from(save_suggestion(runtime, &mut ledger, saved)?);
             continue;
         }
-        let bytes = runtime.read_candidate(&candidate)?;
         let mut suggestion = OcrSuggestion {
             identity: identity.clone(),
             source_sha256: candidate.sha256.clone(),
@@ -495,14 +495,15 @@ pub(crate) fn scan(
                 .map_err(|error| invalid(error.to_string()))?
                 .as_secs(),
         };
-        let prepared = prepare_ocr_image(&bytes);
-        let observed = match prepared {
-            Ok(image) if image.format == candidate.format => {
-                suggestion.representative_frame = Some(image.frame);
-                suggestion.dimensions = Some(image.dimensions);
-                suggestion.prepared_sha256 = Some(sha256_hex(&image.png));
-                match &digest {
-                    Ok(digest) => {
+        let observed = match &digest {
+            Err(failure) => Err(failure.clone()),
+            Ok(digest) => {
+                let bytes = runtime.read_candidate(&candidate)?;
+                match prepare_ocr_image(&bytes) {
+                    Ok(image) if image.format == candidate.format => {
+                        suggestion.representative_frame = Some(image.frame);
+                        suggestion.dimensions = Some(image.dimensions);
+                        suggestion.prepared_sha256 = Some(sha256_hex(&image.png));
                         runtime.release_lock()?;
                         let result =
                             ollama.recognize(&image.png, digest, &mut report.chat_requests);
@@ -513,11 +514,10 @@ pub(crate) fn scan(
                         ledger = read_ledger(runtime)?;
                         result
                     }
-                    Err(failure) => Err(failure.clone()),
+                    Ok(_) => Err("format_mismatch".into()),
+                    Err(reason) => Err(format!("image_prepare_failed: {reason}")),
                 }
             }
-            Ok(_) => Err("format_mismatch".into()),
-            Err(reason) => Err(format!("image_prepare_failed: {reason}")),
         };
         match observed {
             Ok(observed) => {

@@ -155,6 +155,7 @@ struct ServerState {
     requests: Vec<(String, Value)>,
     chat: String,
     digest: String,
+    installed: bool,
     vision: bool,
     delay: Duration,
     http_status: u16,
@@ -171,7 +172,7 @@ impl Mock {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let state = Arc::new(Mutex::new(ServerState { requests: Vec::new(), chat: json!({"done":true,"done_reason":"stop","message":{"content":json!({"observed":observed}).to_string()}}).to_string(), digest: "fixture-digest-1".into(), vision:true, delay:Duration::ZERO, http_status:200, response_gate:None }));
+        let state = Arc::new(Mutex::new(ServerState { requests: Vec::new(), chat: json!({"done":true,"done_reason":"stop","message":{"content":json!({"observed":observed}).to_string()}}).to_string(), digest: "fixture-digest-1".into(), installed:true, vision:true, delay:Duration::ZERO, http_status:200, response_gate:None }));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_state = state.clone();
         let worker_stop = stop.clone();
@@ -226,7 +227,7 @@ impl Mock {
                     let mut state = worker_state.lock().unwrap();
                     state.requests.push((path.clone(), body));
                     let response=match path.as_str() {
-                        "/api/tags" => json!({"models":[{"name":"fixture:vision","digest":state.digest}]}).to_string(),
+                        "/api/tags" => json!({"models":if state.installed {vec![json!({"name":"fixture:vision","digest":state.digest})]} else {vec![]}}).to_string(),
                         "/api/show" => json!({"capabilities":if state.vision {vec!["vision"]}else{vec!["completion"]}}).to_string(),
                         "/api/chat" => state.chat.clone(), other=>panic!("неожиданный endpoint {other}"),
                     };
@@ -508,6 +509,40 @@ fn model_digest_change_makes_a_new_proposal_and_stale_generation_cannot_be_confi
     ]);
     assert!(!output.status.success());
     assert_eq!(fixture.state(), current);
+}
+
+#[test]
+fn unavailable_model_digest_does_not_reuse_a_failure_from_another_environment() {
+    let fixture = Fixture::new();
+    fixture.batch(&['𠀀'], &png());
+    let mock = Mock::new("𠀀");
+
+    mock.state.lock().unwrap().installed = false;
+    assert_eq!(fixture.ocr(&mock, &[]).status.code(), Some(3));
+    let first = fixture.ledger();
+    let first = first["records"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(first["config"]["model_digest"], "unavailable");
+    assert_eq!(first["failure"], "model_not_installed_or_digest_missing");
+    assert_eq!(mock.chats(), 0);
+
+    {
+        let mut server = mock.state.lock().unwrap();
+        server.installed = true;
+        server.vision = false;
+    }
+    assert_eq!(fixture.ocr(&mock, &[]).status.code(), Some(3));
+    let second = fixture.ledger();
+    let records = second["records"].as_object().unwrap();
+    assert_eq!(records.len(), 1);
+    let second = records.values().next().unwrap();
+    assert_eq!(second["config"]["model_digest"], "unavailable");
+    assert_eq!(second["failure"], "model_does_not_support_vision");
+    assert_eq!(mock.chats(), 0);
 }
 
 #[test]

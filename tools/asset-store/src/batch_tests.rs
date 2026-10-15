@@ -20,6 +20,9 @@ fn batch(characters: &[char]) -> KanjiBatch {
     )
     .unwrap();
     state.policy = AggregatePolicy::current(validator());
+    for item in &mut state.items {
+        item.aggregate.policy_version = state.policy.version.clone();
+    }
     state
 }
 
@@ -36,6 +39,33 @@ fn new_batches_hold_a_valid_uncertain_candidate_without_aggregate_promotion_or_r
         Some(uncertain.sha256.as_str())
     );
     assert!(state.next_round().is_empty());
+    state.validate().unwrap();
+}
+
+#[test]
+fn empty_aggregate_uses_the_policy_version_and_accepts_legacy_single_candidate_state() {
+    let mut state = KanjiBatch::new(
+        "single-candidate-empty".into(),
+        vec![identity('漢')],
+        validator(),
+    )
+    .unwrap();
+    assert_eq!(
+        state.items[0].aggregate.policy_version,
+        SINGLE_CANDIDATE_POLICY_VERSION
+    );
+
+    // Старые пакеты записывали для пустого агрегата версию прежней политики.
+    state.items[0].aggregate.policy_version = AGGREGATE_POLICY_VERSION.into();
+    state.validate().unwrap();
+
+    state
+        .revalidate_candidates(validator(), |_, _| unreachable!("кандидатов нет"))
+        .unwrap();
+    assert_eq!(
+        state.items[0].aggregate.policy_version,
+        SINGLE_CANDIDATE_POLICY_VERSION
+    );
     state.validate().unwrap();
 }
 

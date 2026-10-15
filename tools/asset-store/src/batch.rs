@@ -292,6 +292,7 @@ impl KanjiBatch {
     ) -> Result<Self, AssetError> {
         validate_batch_id(&batch_id)?;
         ValidatorIdentity::new(validator.id.clone(), validator.version.clone()).map_err(invalid)?;
+        let policy = AggregatePolicy::single_candidate(validator);
         let mut seen = BTreeSet::new();
         let mut items = Vec::new();
         for identity in identities {
@@ -304,7 +305,7 @@ impl KanjiBatch {
                 status: BatchItemStatus::Unresolved,
                 generation: 0,
                 attempts: Vec::new(),
-                aggregate: empty_aggregate(),
+                aggregate: empty_aggregate(&policy),
                 current_sha256: None,
                 published_sha256: None,
                 existing_candidate: None,
@@ -320,7 +321,7 @@ impl KanjiBatch {
         Ok(Self {
             schema_version: BATCH_SCHEMA_VERSION,
             batch_id,
-            policy: AggregatePolicy::single_candidate(validator),
+            policy,
             revision: 0,
             items,
         })
@@ -461,6 +462,7 @@ impl KanjiBatch {
                 ));
             }
         }
+        let policy = self.policy.clone();
         let item = self.item_mut(identity)?;
         if !item.status.semantic_resolved() {
             return Err(invalid(
@@ -483,7 +485,7 @@ impl KanjiBatch {
         item.current_sha256 = None;
         item.published_sha256 = None;
         item.publication_source = None;
-        item.aggregate = empty_aggregate();
+        item.aggregate = empty_aggregate(&policy);
         item.review_reason = Some(reason);
         self.revision += 1;
         Ok(())
@@ -501,6 +503,7 @@ impl KanjiBatch {
                 "для повторного получения требуется непустая ограниченная причина",
             ));
         }
+        let policy = self.policy.clone();
         let item = self.item_mut(identity)?;
         if !matches!(
             item.status,
@@ -517,7 +520,7 @@ impl KanjiBatch {
             .ok_or_else(|| invalid("превышен предел номера поколения"))?;
         item.status = BatchItemStatus::Reacquire;
         item.review_reason = Some(reason);
-        item.aggregate = empty_aggregate();
+        item.aggregate = empty_aggregate(&policy);
         self.revision += 1;
         Ok(())
     }
@@ -571,6 +574,7 @@ impl KanjiBatch {
                 "байты решения человека не совпадают с точным SHA-256",
             ));
         }
+        let policy = self.policy.clone();
         let item = self.item_mut(&decision.identity)?;
         if item.current_sha256.as_deref() != Some(&decision.candidate_sha256) {
             return Err(invalid(
@@ -611,7 +615,7 @@ impl KanjiBatch {
             item.current_sha256 = None;
             item.published_sha256 = None;
             item.publication_source = None;
-            item.aggregate = empty_aggregate();
+            item.aggregate = empty_aggregate(&policy);
         }
         if !repeated {
             item.human_decisions.push(decision);
@@ -906,7 +910,15 @@ impl KanjiBatch {
             } else {
                 let mut derived = item.clone();
                 refresh_item(&mut derived, &self.policy);
-                if item.aggregate != derived.aggregate
+                let aggregate_matches = item.aggregate == derived.aggregate
+                    || (self.policy.version == SINGLE_CANDIDATE_POLICY_VERSION
+                        && generation_attempt_count(item) == 0
+                        && item.aggregate
+                            == empty_aggregate(&AggregatePolicy::current(
+                                self.policy.validator.clone(),
+                            ))
+                        && derived.aggregate == empty_aggregate(&self.policy));
+                if !aggregate_matches
                     || item.current_sha256 != derived.current_sha256
                     || item.status != derived.status
                 {
@@ -1022,9 +1034,9 @@ fn check_publication_source(item: &BatchItem, source: BatchTrustSource) -> Resul
     }
 }
 
-fn empty_aggregate() -> AggregateEvidence {
+fn empty_aggregate(policy: &AggregatePolicy) -> AggregateEvidence {
     AggregateEvidence {
-        policy_version: AGGREGATE_POLICY_VERSION.into(),
+        policy_version: policy.version.clone(),
         distinct_valid_hashes: Vec::new(),
         expected_distance: None,
         margin: None,
@@ -1060,7 +1072,7 @@ fn find_candidate<'a>(item: &'a BatchItem, hash: &str) -> Option<&'a BatchCandid
 
 fn refresh_item(item: &mut BatchItem, policy: &AggregatePolicy) {
     if generation_attempt_count(item) == 0 {
-        item.aggregate = empty_aggregate();
+        item.aggregate = empty_aggregate(policy);
         item.current_sha256 = None;
         item.status = if item.status == BatchItemStatus::Rejected
             && item
