@@ -483,12 +483,10 @@ fn invocation(
             // Notepad может не поддерживать путь длиннее MAX_PATH даже при
             // успешном запуске процесса: не выдаём такое окно за успех.
             if path.to_string_lossy().encode_utf16().count() >= 260 {
-                return Err(invalid(
-                    concat!(
-                        "путь к decisions.tsv слишком длинный для Windows Notepad;",
-                        " используйте Linux-редактор или короткий путь к хранилищу"
-                    ),
-                ));
+                return Err(invalid(concat!(
+                    "путь к decisions.tsv слишком длинный для Windows Notepad;",
+                    " используйте Linux-редактор или короткий путь к хранилищу"
+                )));
             }
             let program =
                 windows_system_program(host, "notepad.exe", r"C:\Windows\System32\notepad.exe")
