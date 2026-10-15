@@ -15,7 +15,7 @@
 //!    (`xdg-mime query default text/plain` и десктопный запуск `gtk-launch`).
 //!    Общая ассоциация самого файла намеренно не используется: она может
 //!    оказаться табличным редактором, который перепишет формат решений;
-//! 3. **WSL2** — Windows Explorer и Windows-редактор остаются **дополнительным**
+//! 3. **WSL2** — Windows Explorer и резервный Notepad остаются **дополнительными**
 //!    путём и выбираются только при доказанном межсистемном взаимодействии:
 //!    включённый ядром флаг `binfmt_misc/WSLInterop*`, а для каталога также
 //!    доступный `explorer.exe` в `PATH` или проверенный путь к Windows Explorer через `wslpath`. Одного `WSL_DISTRO_NAME` недостаточно. Путь
@@ -361,6 +361,8 @@ fn is_shell_program(program: &str) -> bool {
 enum Candidate {
     /// Windows Explorer (WSL2): путь каталога преобразуется `wslpath -w`.
     Explorer,
+    /// Резервный текстовый редактор Windows при отсутствии редактора Linux.
+    Notepad,
     /// Системная ассоциация Linux по MIME для каталога.
     XdgOpen,
     /// Десктопная ассоциация `text/plain` для файла решений.
@@ -377,6 +379,7 @@ impl Candidate {
     fn label(&self) -> &'static str {
         match self {
             Self::Explorer => "explorer.exe",
+            Self::Notepad => "notepad.exe",
             Self::XdgOpen => "xdg-open",
             Self::TextAssociation { .. } => "ассоциация text/plain",
             Self::Editor { .. } => "настроенный редактор",
@@ -419,6 +422,11 @@ fn plan_open(environment: &Environment) -> Result<OpenPlan, AssetError> {
             desktop: desktop.clone(),
         });
     }
+    // Windows-редактор не является обязательной зависимостью Linux.
+    // Не подменяем им явно заданный редактор пользователя.
+    if environment.wsl && environment.wsl_interop && environment.editor.is_none() {
+        plan.decisions.push(Candidate::Notepad);
+    }
     Ok(plan)
 }
 
@@ -434,17 +442,21 @@ struct Invocation {
 /// На WSL Explorer может отсутствовать в PATH даже при включённом interop.
 /// Дополнительный путь преобразуется через wslpath, чтобы учитывать нестандартный
 /// каталог монтирования Windows, и проверяется как исполняемый файл.
-fn explorer_program(host: &dyn Host) -> Option<PathBuf> {
-    if let Some(program) = host.resolve("explorer.exe") {
+fn windows_system_program(host: &dyn Host, name: &str, windows_location: &str) -> Option<PathBuf> {
+    if let Some(program) = host.resolve(name) {
         return Some(program);
     }
-    let converted = convert_path(host, "-u", Path::new(r"C:\Windows\explorer.exe")).ok()?;
+    let converted = convert_path(host, "-u", Path::new(windows_location)).ok()?;
     let path = PathBuf::from(converted);
     if path.is_absolute() {
         host.resolve(path.to_str()?)
     } else {
         None
     }
+}
+
+fn explorer_program(host: &dyn Host) -> Option<PathBuf> {
+    windows_system_program(host, "explorer.exe", r"C:\Windows\explorer.exe")
 }
 
 /// Собирает команду шага. `path` — путь той цели, которой адресован кандидат.
@@ -463,6 +475,27 @@ fn invocation(
                 program: program.into_os_string(),
                 args: vec![path],
                 tolerate_exit_one: true,
+            })
+        }
+        Candidate::Notepad => {
+            let path = windows_path(host, path)?;
+            // Notepad может не поддерживать путь длиннее MAX_PATH даже при
+            // успешном запуске процесса: не выдаём такое окно за успех.
+            if path.to_string_lossy().encode_utf16().count() >= 260 {
+                return Err(invalid(
+                    "путь к decisions.tsv слишком длинный для Windows Notepad;                      используйте Linux-редактор или короткий путь к хранилищу",
+                ));
+            }
+            let program = windows_system_program(
+                host,
+                "notepad.exe",
+                r"C:\Windows\System32\notepad.exe",
+            )
+            .ok_or_else(|| invalid("notepad.exe недоступен в Windows"))?;
+            Ok(Invocation {
+                program: program.into_os_string(),
+                args: vec![path],
+                tolerate_exit_one: false,
             })
         }
         Candidate::XdgOpen => Ok(Invocation {
@@ -1481,6 +1514,68 @@ mod tests {
         .unwrap();
         assert_eq!(host.programs(), ["/mnt/c/Windows/explorer.exe"]);
         assert_eq!(host.argv(0), [r"\\wsl$\archlinux\tmp\review-fixture"]);
+    }
+
+    #[test]
+    fn wsl_without_linux_editor_opens_windows_notepad_as_fallback() {
+        let host = FakeHost::default();
+        host.replies(
+            "wslpath",
+            &["-u", r"C:\Windows\System32\notepad.exe"],
+            true,
+            "/mnt/c/Windows/System32/notepad.exe\n",
+        );
+        host.resolves("/mnt/c/Windows/System32/notepad.exe");
+        host.replies(
+            "wslpath",
+            &["-w", "/tmp/review/decisions.tsv"],
+            true,
+            "\\\\wsl.localhost\\archlinux\\tmp\\review\\decisions.tsv\n",
+        );
+        let environment = Environment {
+            editor: None,
+            desktop: false,
+            wsl: true,
+            wsl_interop: true,
+            text_association: None,
+        };
+        let mut diagnostics = Vec::new();
+        open_with(
+            &host,
+            &environment,
+            &request(Path::new("/tmp/review"), Path::new("/tmp/review/decisions.tsv")),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(host.programs(), ["/mnt/c/Windows/System32/notepad.exe"]);
+        assert_eq!(host.argv(0), [r"\\wsl$\archlinux\tmp\review\decisions.tsv"]);
+    }
+
+    #[test]
+    fn windows_notepad_rejects_path_above_max_path_before_launch() {
+        let host = FakeHost::default();
+        host.replies(
+            "wslpath",
+            &["-w", "/tmp/review/decisions.tsv"],
+            true,
+            &format!("\\\\wsl.localhost\\archlinux\\{}\n", "x".repeat(270)),
+        );
+        let environment = Environment {
+            editor: None,
+            desktop: false,
+            wsl: true,
+            wsl_interop: true,
+            text_association: None,
+        };
+        let error = invocation(
+            &host,
+            &environment,
+            Path::new("/tmp/review/decisions.tsv"),
+            &Candidate::Notepad,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("слишком длинный"));
+        assert!(host.launches.borrow().is_empty());
     }
 
     #[test]
