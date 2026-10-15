@@ -483,15 +483,15 @@ fn invocation(
             // успешном запуске процесса: не выдаём такое окно за успех.
             if path.to_string_lossy().encode_utf16().count() >= 260 {
                 return Err(invalid(
-                    "путь к decisions.tsv слишком длинный для Windows Notepad;                      используйте Linux-редактор или короткий путь к хранилищу",
+                    concat!(
+                        "путь к decisions.tsv слишком длинный для Windows Notepad;",
+                        " используйте Linux-редактор или короткий путь к хранилищу"
+                    ),
                 ));
             }
-            let program = windows_system_program(
-                host,
-                "notepad.exe",
-                r"C:\Windows\System32\notepad.exe",
-            )
-            .ok_or_else(|| invalid("notepad.exe недоступен в Windows"))?;
+            let program =
+                windows_system_program(host, "notepad.exe", r"C:\Windows\System32\notepad.exe")
+                    .ok_or_else(|| invalid("notepad.exe недоступен в Windows"))?;
             Ok(Invocation {
                 program: program.into_os_string(),
                 args: vec![path],
@@ -1543,7 +1543,10 @@ mod tests {
         open_with(
             &host,
             &environment,
-            &request(Path::new("/tmp/review"), Path::new("/tmp/review/decisions.tsv")),
+            &request(
+                Path::new("/tmp/review"),
+                Path::new("/tmp/review/decisions.tsv"),
+            ),
             &mut diagnostics,
         )
         .unwrap();
