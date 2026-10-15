@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use crate::batch::{
     AggregateResolution, BatchAttemptInput, BatchCandidate, BatchItemStatus, BatchRuntime,
-    BatchTrustSource, HumanBatchAction, HumanBatchDecision, KanjiBatch, MAX_ACQUISITION_ROUNDS,
-    MAX_HUMAN_REASON_BYTES,
+    BatchTrustSource, CandidateRevalidation, HumanBatchAction, HumanBatchDecision, KanjiBatch,
+    MAX_ACQUISITION_ROUNDS, MAX_HUMAN_REASON_BYTES,
 };
 use crate::batch_runtime::SafeBatchRuntime;
 use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
@@ -907,62 +907,7 @@ fn execute_with_progress_and_interaction(
     });
     match execution {
         Ok((response, exit_code)) => {
-            match output {
-                OutputFormat::Json => {
-                    let mut response = response;
-                    response.diagnostic_log = diagnostic_log;
-                    CliOutput {
-                        stdout: format!(
-                            "{}\n",
-                            serde_json::to_string_pretty(&response)
-                                .expect("ответ пакета содержит конечные сериализуемые значения")
-                        ),
-                        stderr: String::new(),
-                        exit_code,
-                    }
-                }
-                OutputFormat::Human => {
-                    let mut text = format!(
-                        "Операция: {}; результат: {}; пакет: {}\n",
-                        localized_operation(&response.operation),
-                        localized_outcome(response.outcome),
-                        response.batch_id
-                    );
-                    for item in &response.items {
-                        text.push_str(&format!(
-                            "{}  {}  {}  попыток_получения={} разных_кандидатов_SHA-256={}\n",
-                            item.identity,
-                            localized_item_outcome(item.item_outcome),
-                            item.candidate_sha256.as_deref().unwrap_or("-"),
-                            item.acquisition_attempts,
-                            item.distinct_valid_hashes
-                        ));
-                    }
-                    if let Some(id) = &response.review_id {
-                        text.push_str(&format!("Review ID: {id}\n"));
-                    }
-                    if let Some(applied) = &response.review_decisions {
-                        text.push_str(&format!("Решения: подтверждено={}, отклонено={}, пропущено={}, уже применено={}\n", applied.confirmed, applied.rejected, applied.skipped, applied.already_applied));
-                    }
-                    if let Some(path) = response.review_artifact {
-                        text.push_str(&format!("Файл проверки: {path}\n"));
-                    }
-                    if let Some(path) = response.diagnostic_log {
-                        text.push_str(&format!("Диагностический журнал: {path}\n"));
-                    }
-                    for issue in &response.issues {
-                        text.push_str(&format!(
-                            "{}: {}: {}\n",
-                            issue.identity, issue.code, issue.message
-                        ));
-                    }
-                    CliOutput {
-                        stdout: text,
-                        stderr: String::new(),
-                        exit_code,
-                    }
-                }
-            }
+            render_batch_response(response, output, exit_code, diagnostic_log)
         }
         Err(error) if matches!(command, BatchCommand::Run { .. }) => render_batch_error(
             store,
@@ -984,6 +929,72 @@ fn execute_with_progress_and_interaction(
             output,
             store.did_mutate_on_open(),
         ),
+    }
+}
+
+fn render_batch_response(
+    mut response: BatchResponse,
+    output: OutputFormat,
+    exit_code: u8,
+    diagnostic_log: Option<String>,
+) -> CliOutput {
+    match output {
+        OutputFormat::Json => {
+            response.diagnostic_log = diagnostic_log;
+            CliOutput {
+                stdout: format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&response)
+                        .expect("ответ пакета содержит конечные сериализуемые значения")
+                ),
+                stderr: String::new(),
+                exit_code,
+            }
+        }
+        OutputFormat::Human => {
+            let mut text = format!(
+                "Операция: {}; результат: {}; пакет: {}\n",
+                localized_operation(&response.operation),
+                localized_outcome(response.outcome),
+                response.batch_id
+            );
+            for item in &response.items {
+                text.push_str(&format!(
+                    "{}  {}  {}  попыток_получения={} разных_кандидатов_SHA-256={}\n",
+                    item.identity,
+                    localized_item_outcome(item.item_outcome),
+                    item.candidate_sha256.as_deref().unwrap_or("-"),
+                    item.acquisition_attempts,
+                    item.distinct_valid_hashes
+                ));
+            }
+            if let Some(id) = &response.review_id {
+                text.push_str(&format!("Идентификатор снимка проверки: {id}\n"));
+            }
+            if let Some(applied) = &response.review_decisions {
+                text.push_str(&format!(
+                    "Решения: подтверждено={}, отклонено={}, пропущено={}, уже применено={}\n",
+                    applied.confirmed, applied.rejected, applied.skipped, applied.already_applied
+                ));
+            }
+            if let Some(path) = response.review_artifact {
+                text.push_str(&format!("Файл проверки: {path}\n"));
+            }
+            if let Some(path) = diagnostic_log {
+                text.push_str(&format!("Диагностический журнал: {path}\n"));
+            }
+            for issue in &response.issues {
+                text.push_str(&format!(
+                    "{}: {}: {}\n",
+                    issue.identity, issue.code, issue.message
+                ));
+            }
+            CliOutput {
+                stdout: text,
+                stderr: String::new(),
+                exit_code,
+            }
+        }
     }
 }
 
@@ -1110,6 +1121,8 @@ fn localized_operation(operation: &str) -> &str {
         "batch_review_apply" => "применение файла решений",
         "batch_review_interactive" => "интерактивная проверка",
         "batch_revalidate" => "повторная проверка сохранённых байтов",
+        "batch_ocr" => "OCR сохранённых кандидатов",
+        "batch_review_confirm_matches" => "подтверждение просмотренных совпадений OCR",
         "batch_decide" => "решение человека",
         "batch_retry" => "повторное получение",
         other => other,
@@ -1128,6 +1141,7 @@ fn localized_outcome(outcome: &str) -> &str {
         "reacquire_scheduled" => "повторное получение запланировано",
         "ok" => "успешно",
         "revalidated" => "повторная проверка завершена",
+        "ocr_suggestions_saved" => "предложения OCR сохранены",
         other => other,
     }
 }
@@ -1448,11 +1462,11 @@ fn execute_command_with_snapshots_and_progress(
             let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
             let mut state = load_required(&mut runtime)?;
             let validator = KanjiImageValidator::new();
-            let mut cache = BTreeMap::<(AssetIdentity, String), ValidationRecord>::new();
+            let mut cache = BTreeMap::<(AssetIdentity, String), CandidateRevalidation>::new();
             state.revalidate_candidates(validator.identity(), |identity, candidate| {
                 let key = (identity.clone(), candidate.sha256.clone());
-                if let Some(record) = cache.get(&key) {
-                    return Ok(record.clone());
+                if let Some(result) = cache.get(&key) {
+                    return Ok(result.clone());
                 }
                 let bytes = runtime.read_candidate(candidate)?;
                 let asset =
@@ -1468,8 +1482,12 @@ fn execute_command_with_snapshots_and_progress(
                     status: decision.status,
                     evidence: decision.evidence,
                 };
-                cache.insert(key, record.clone());
-                Ok(record)
+                let result = CandidateRevalidation {
+                    automated: record,
+                    technically_valid: validate_image_decode(&bytes).is_ok(),
+                };
+                cache.insert(key, result.clone());
+                Ok(result)
             })?;
             let mut issues = Vec::new();
             let owner = reader.capture(store);
@@ -1723,13 +1741,16 @@ fn validate_worker_token(
     frontier: &[AssetIdentity],
     generations: &[(u32, usize)],
 ) -> Result<usize, AssetError> {
-    let index = event_index.ok_or_else(|| invalid("worker event не содержит индекс назначения"))?;
+    let index =
+        event_index.ok_or_else(|| invalid("событие обработчика не содержит индекс назначения"))?;
     let Some((generation, previous_attempts)) = generations.get(index) else {
-        return Err(invalid("worker сообщил индекс вне текущего frontier"));
+        return Err(invalid(
+            "обработчик сообщил индекс вне текущей границы обхода",
+        ));
     };
     if event_generation != Some(*generation) || event_owner_attempt != Some(previous_attempts + 1) {
         return Err(invalid(format!(
-            "worker сообщил устаревший generation/attempt для {}",
+            "обработчик сообщил устаревшее сочетание generation/attempt для {}",
             frontier[index].key
         )));
     }
@@ -2944,8 +2965,7 @@ fn validated_candidate(
         }
     }
     let decision = decision?;
-    let technically_valid =
-        decision.status != SemanticStatus::Corrupt && validate_image_decode(&media.bytes).is_ok();
+    let technically_valid = validate_image_decode(&media.bytes).is_ok();
     let automated = ValidationRecord {
         status: decision.status,
         validator: validator.identity(),

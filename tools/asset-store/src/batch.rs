@@ -129,8 +129,7 @@ pub struct BatchCandidate {
     pub sha256: String,
     pub storage_path: String,
     pub format: DetectedFormat,
-    /// Значение `true` разрешено только после успешной проверки целостности,
-    /// формата и декодирования владельцем.
+    /// Текущие сохранённые байты прошли проверку целостности, формата и декодера.
     pub technically_valid: bool,
     pub automated: ValidationRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +142,14 @@ impl BatchCandidate {
             .then(|| KanjiMetrics::from_validation(&self.automated))
             .flatten()
     }
+}
+
+/// Актуальные результаты технической и семантической проверки сохранённых байтов.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateRevalidation {
+    pub automated: ValidationRecord,
+    /// Рассчитывается заново по текущим байтам, формату и декодеру.
+    pub technically_valid: bool,
 }
 
 /// Сохраняются все реальные результаты получения, включая сетевые сбои.
@@ -667,38 +674,81 @@ impl KanjiBatch {
     }
 
     /// Явная смена политики на тех же сохранённых байтах, без сетевых попыток.
-    /// Вызывающий слой предоставляет повторную проверку владельцем валидатора.
+    /// Вызывающий слой повторно сверяет SHA и отдельно сообщает результат декодирования.
     pub fn revalidate_candidates(
         &mut self,
         validator: ValidatorIdentity,
         mut validate: impl FnMut(
             &AssetIdentity,
             &BatchCandidate,
-        ) -> Result<ValidationRecord, AssetError>,
+        ) -> Result<CandidateRevalidation, AssetError>,
     ) -> Result<(), AssetError> {
         self.validate()?;
         let mut next = self.clone();
         next.policy = AggregatePolicy::single_candidate(validator);
         for item in &mut next.items {
+            let was_human_verified = item.status == BatchItemStatus::HumanVerified;
+            let human_confirmation = item
+                .human_decisions
+                .last()
+                .filter(|decision| decision.action == HumanBatchAction::Confirm)
+                .cloned();
+            let published_sha256 = item.published_sha256.clone();
+            let publication_source = item.publication_source;
             for attempt in &mut item.attempts {
                 if let BatchAttemptInput::Candidate { candidate } = &mut attempt.result {
-                    candidate.automated = validate(&item.identity, candidate)?;
-                    candidate.technically_valid = candidate.technically_valid
-                        && candidate.automated.status != SemanticStatus::Corrupt;
+                    let result = validate(&item.identity, candidate)?;
+                    if result.automated.content_sha256 != candidate.sha256 {
+                        return Err(AssetError::new(
+                            ErrorCode::IntegrityMismatch,
+                            "новая проверка не привязана к точному SHA-256 кандидата",
+                        ));
+                    }
+                    candidate.automated = result.automated;
+                    candidate.technically_valid = result.technically_valid;
                 }
             }
             if let Some(candidate) = &mut item.existing_candidate {
-                candidate.automated = validate(&item.identity, candidate)?;
-                candidate.technically_valid = candidate.technically_valid
-                    && candidate.automated.status != SemanticStatus::Corrupt;
+                let result = validate(&item.identity, candidate)?;
+                if result.automated.content_sha256 != candidate.sha256 {
+                    return Err(AssetError::new(
+                        ErrorCode::IntegrityMismatch,
+                        "новая проверка не привязана к точному SHA-256 кандидата",
+                    ));
+                }
+                candidate.automated = result.automated;
+                candidate.technically_valid = result.technically_valid;
             }
-            if !matches!(
-                item.status,
-                BatchItemStatus::HumanVerified | BatchItemStatus::ExistingVerified
-            ) {
-                item.published_sha256 = None;
-                item.publication_source = None;
-                refresh_item(item, &next.policy);
+
+            if item.status == BatchItemStatus::ExistingVerified {
+                // Готовность этого состояния принадлежит каноническому store;
+                // CLI после миграции сверит её с новым снимком владельца.
+                continue;
+            }
+
+            item.published_sha256 = None;
+            item.publication_source = None;
+            refresh_item(item, &next.policy);
+
+            if was_human_verified
+                && let Some(decision) = human_confirmation
+                && item.current_sha256.as_deref() == Some(decision.candidate_sha256.as_str())
+                && find_candidate(item, &decision.candidate_sha256).is_some_and(|candidate| {
+                    candidate.technically_valid
+                        && candidate.automated.status != SemanticStatus::Corrupt
+                })
+            {
+                // Подтверждение сохраняет силу только для тех же технически
+                // пригодных байтов. Иначе журнал остаётся историей, а статус
+                // заново выводится из текущей проверки.
+                item.status = BatchItemStatus::HumanVerified;
+                item.review_reason = None;
+                if published_sha256.as_deref() == Some(decision.candidate_sha256.as_str())
+                    && publication_source == Some(BatchTrustSource::Human)
+                {
+                    item.published_sha256 = published_sha256;
+                    item.publication_source = publication_source;
+                }
             }
         }
         next.revision += 1;
@@ -1178,12 +1228,6 @@ fn validate_attempt_input(
             if encoded.len() > 128 * 1024 {
                 return Err(invalid(
                     "автоматические свидетельства кандидата превышают 128 КиБ",
-                ));
-            }
-            if candidate.automated.status == SemanticStatus::Corrupt && candidate.technically_valid
-            {
-                return Err(invalid(
-                    "CORRUPT не считается технически допустимым образцом",
                 ));
             }
         }

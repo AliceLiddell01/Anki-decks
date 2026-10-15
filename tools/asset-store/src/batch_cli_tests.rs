@@ -412,6 +412,80 @@ fn human_cli_output_uses_russian_labels() {
 }
 
 #[test]
+fn ocr_and_match_confirmation_localize_human_output_without_changing_json_ids() {
+    let fixture = Fixture::new();
+    let state = KanjiBatch::new(
+        "localized-ocr".into(),
+        vec![identity('漢')],
+        KanjiImageValidator::validator_identity(),
+    )
+    .unwrap();
+
+    let make_ocr_response = || {
+        let mut response = batch_response(
+            "batch_ocr",
+            fixture.summary(),
+            state.clone(),
+            false,
+            Vec::new(),
+            None,
+            "ocr_suggestions_saved",
+        );
+        response.review_id = Some("a".repeat(64));
+        let report = crate::kanji_ocr::OcrScanReport {
+            saved: 1,
+            chat_requests: 1,
+            ..Default::default()
+        };
+        response.ocr_summary = Some(report);
+        response
+    };
+
+    let human = render_batch_response(make_ocr_response(), OutputFormat::Human, 0, None);
+    assert!(
+        human
+            .stdout
+            .contains("Операция: OCR сохранённых кандидатов; результат: предложения OCR сохранены")
+    );
+    assert!(human.stdout.contains("Идентификатор снимка проверки: "));
+    assert!(!human.stdout.contains("Review ID:"));
+
+    let json = render_batch_response(make_ocr_response(), OutputFormat::Json, 0, None);
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(value["operation"], "batch_ocr");
+    assert_eq!(value["outcome"], "ocr_suggestions_saved");
+    assert_eq!(value["review_id"], "a".repeat(64));
+    assert_eq!(value["ocr_summary"]["saved"], 1);
+    assert_eq!(value["ocr_summary"]["chat_requests"], 1);
+
+    let make_confirm_response = || {
+        let mut response = batch_response(
+            "batch_review_confirm_matches",
+            fixture.summary(),
+            state.clone(),
+            false,
+            Vec::new(),
+            None,
+            "ok",
+        );
+        response.review_id = Some("b".repeat(64));
+        response
+    };
+    let human = render_batch_response(make_confirm_response(), OutputFormat::Human, 0, None);
+    assert!(
+        human
+            .stdout
+            .contains("Операция: подтверждение просмотренных совпадений OCR; результат: успешно")
+    );
+    assert!(human.stdout.contains("Идентификатор снимка проверки: "));
+    let json = render_batch_response(make_confirm_response(), OutputFormat::Json, 0, None);
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(value["operation"], "batch_review_confirm_matches");
+    assert_eq!(value["outcome"], "ok");
+    assert_eq!(value["review_id"], "b".repeat(64));
+}
+
+#[test]
 fn start_status_review_are_json_and_idempotent() {
     let fixture = Fixture::new();
     fixture.start("status", &['漢']);
@@ -3551,6 +3625,317 @@ fn revalidate_migrates_legacy_candidates_without_network_attempts_or_inheriting_
         assert_eq!(candidate.automated.validator, state.policy.validator);
         assert_ne!(candidate.automated.status, SemanticStatus::Verified);
     }
+}
+
+#[test]
+fn revalidate_uses_current_decode_to_restore_a_previously_false_validity_flag() {
+    let fixture = Fixture::new();
+    let bytes = glyph('元');
+    let old = ValidatorIdentity::new("previous-validator", "v0").unwrap();
+    let mut state = KanjiBatch::new(
+        "revalidate-decode".into(),
+        vec![identity('元')],
+        old.clone(),
+    )
+    .unwrap();
+    state.policy = crate::batch::AggregatePolicy::single_candidate(old.clone());
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "revalidate-decode").unwrap();
+    let candidate = runtime
+        .persist_candidate(
+            &bytes,
+            ValidationRecord {
+                status: SemanticStatus::Corrupt,
+                validator: old,
+                content_sha256: sha256_hex(&bytes),
+                evidence: vec![ValidationEvidence {
+                    kind: "previous_decode_failure".into(),
+                    summary: "устаревшее свидетельство прежней проверки".into(),
+                    details: None,
+                }],
+            },
+            false,
+        )
+        .unwrap();
+    let sha256 = candidate.sha256.clone();
+    state
+        .record_attempt(&identity('元'), BatchAttemptInput::Candidate { candidate })
+        .unwrap();
+    runtime.save(&state).unwrap();
+    drop(runtime);
+
+    let (response, code) = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Revalidate {
+            batch_id: "revalidate-decode".into(),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(code, 0);
+    let state = response.batch;
+    let item = &state.items[0];
+    let BatchAttemptInput::Candidate { candidate } = &item.attempts[0].result else {
+        unreachable!()
+    };
+    assert_eq!(candidate.sha256, sha256);
+    assert!(candidate.technically_valid);
+    assert_eq!(candidate.automated.content_sha256, sha256);
+    assert_eq!(
+        candidate.automated.validator,
+        KanjiImageValidator::validator_identity()
+    );
+    assert!(matches!(
+        candidate.automated.status,
+        SemanticStatus::Uncertain | SemanticStatus::Verified
+    ));
+    assert_eq!(item.attempts.len(), 1);
+    assert_eq!(item.current_sha256.as_deref(), Some(sha256.as_str()));
+    state.validate().unwrap();
+
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "revalidate-decode").unwrap();
+    let reopened = runtime.load().unwrap().unwrap();
+    assert_eq!(reopened, state);
+    let BatchAttemptInput::Candidate { candidate } = &reopened.items[0].attempts[0].result else {
+        unreachable!()
+    };
+    assert_eq!(runtime.read_candidate(candidate).unwrap(), bytes);
+}
+
+#[test]
+fn revalidate_keeps_human_confirmation_for_the_same_currently_valid_candidate() {
+    let fixture = Fixture::new();
+    let bytes = glyph('元');
+    let old = ValidatorIdentity::new("previous-validator", "v0").unwrap();
+    let mut state = KanjiBatch::new(
+        "revalidate-human-valid".into(),
+        vec![identity('元')],
+        old.clone(),
+    )
+    .unwrap();
+    state.policy = crate::batch::AggregatePolicy::single_candidate(old.clone());
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "revalidate-human-valid").unwrap();
+    let candidate = runtime
+        .persist_candidate(
+            &bytes,
+            ValidationRecord {
+                status: SemanticStatus::Uncertain,
+                validator: old,
+                content_sha256: sha256_hex(&bytes),
+                evidence: vec![ValidationEvidence {
+                    kind: "previous_uncertain_result".into(),
+                    summary: "прежняя версия оставила кандидата человеку".into(),
+                    details: None,
+                }],
+            },
+            true,
+        )
+        .unwrap();
+    let sha256 = candidate.sha256.clone();
+    state
+        .record_attempt(&identity('元'), BatchAttemptInput::Candidate { candidate })
+        .unwrap();
+    let decision = HumanBatchDecision {
+        identity: identity('元'),
+        candidate_sha256: sha256.clone(),
+        action: HumanBatchAction::Confirm,
+        reason: "подтверждение относится к неизменному изображению".into(),
+    };
+    state.decide(decision.clone(), &bytes).unwrap();
+    assert_eq!(state.items[0].status, BatchItemStatus::HumanVerified);
+    assert!(state.items[0].published_sha256.is_none());
+    runtime.save(&state).unwrap();
+    drop(runtime);
+
+    let (response, code) = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Revalidate {
+            batch_id: "revalidate-human-valid".into(),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(code, 0);
+    let item = &response.batch.items[0];
+    assert_eq!(item.status, BatchItemStatus::HumanVerified);
+    assert_eq!(item.current_sha256.as_deref(), Some(sha256.as_str()));
+    assert_eq!(item.human_decisions, vec![decision]);
+    assert!(item.published_sha256.is_none());
+    assert_eq!(item.attempts.len(), 1);
+    let BatchAttemptInput::Candidate { candidate } = &item.attempts[0].result else {
+        unreachable!()
+    };
+    assert!(candidate.technically_valid);
+    assert_eq!(candidate.automated.content_sha256, sha256);
+    response.batch.validate().unwrap();
+}
+
+#[test]
+fn revalidate_saves_corrupt_human_candidate_as_unconfirmed_and_keeps_history() {
+    let fixture = Fixture::new();
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(b"truncated image");
+    let old = ValidatorIdentity::new("previous-validator", "v0").unwrap();
+    let mut state = KanjiBatch::new(
+        "revalidate-human-corrupt".into(),
+        vec![identity('漢')],
+        old.clone(),
+    )
+    .unwrap();
+    state.policy = crate::batch::AggregatePolicy::single_candidate(old.clone());
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "revalidate-human-corrupt").unwrap();
+    let candidate = runtime
+        .persist_candidate(
+            &bytes,
+            ValidationRecord {
+                status: SemanticStatus::Uncertain,
+                validator: old,
+                content_sha256: sha256_hex(&bytes),
+                evidence: vec![ValidationEvidence {
+                    kind: "previous_image_check".into(),
+                    summary: "устаревшая проверка считала байты пригодными".into(),
+                    details: None,
+                }],
+            },
+            true,
+        )
+        .unwrap();
+    let sha256 = candidate.sha256.clone();
+    state
+        .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
+        .unwrap();
+    let decision = HumanBatchDecision {
+        identity: identity('漢'),
+        candidate_sha256: sha256.clone(),
+        action: HumanBatchAction::Confirm,
+        reason: "историческое подтверждение точного SHA".into(),
+    };
+    state.decide(decision.clone(), &bytes).unwrap();
+    state
+        .mark_published_ready(&identity('漢'), &sha256, BatchTrustSource::Human)
+        .unwrap();
+    runtime.save(&state).unwrap();
+    drop(runtime);
+
+    let command = BatchCommand::Revalidate {
+        batch_id: "revalidate-human-corrupt".into(),
+    };
+    let (response, code) =
+        execute_command(&fixture.store, fixture.summary(), &command, false).unwrap();
+    assert_eq!(code, 0);
+    let migrated = response.batch;
+    let item = &migrated.items[0];
+    assert_eq!(item.status, BatchItemStatus::Unresolved);
+    assert_eq!(item.current_sha256.as_deref(), Some(sha256.as_str()));
+    assert_eq!(item.human_decisions, vec![decision.clone()]);
+    assert!(item.published_sha256.is_none());
+    assert!(item.publication_source.is_none());
+    assert_eq!(item.attempts.len(), 1);
+    let BatchAttemptInput::Candidate { candidate } = &item.attempts[0].result else {
+        unreachable!()
+    };
+    assert_eq!(candidate.automated.status, SemanticStatus::Corrupt);
+    assert!(!candidate.technically_valid);
+    assert!(!item.is_ready());
+    migrated.validate().unwrap();
+
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "revalidate-human-corrupt").unwrap();
+    let reopened = runtime.load().unwrap().unwrap();
+    assert_eq!(reopened, migrated);
+    let BatchAttemptInput::Candidate { candidate } = &reopened.items[0].attempts[0].result else {
+        unreachable!()
+    };
+    assert_eq!(runtime.read_candidate(candidate).unwrap(), bytes);
+    drop(runtime);
+
+    let (repeated, repeated_code) =
+        execute_command(&fixture.store, fixture.summary(), &command, false).unwrap();
+    assert_eq!(repeated_code, 0);
+    assert_eq!(repeated.batch.items[0].status, BatchItemStatus::Unresolved);
+    assert_eq!(
+        repeated.batch.items[0].current_sha256.as_deref(),
+        Some(sha256.as_str())
+    );
+    assert_eq!(repeated.batch.items[0].human_decisions, vec![decision]);
+    assert_eq!(repeated.batch.items[0].attempts.len(), 1);
+    assert!(repeated.batch.items[0].published_sha256.is_none());
+    repeated.batch.validate().unwrap();
+    assert!(fixture.store.verify_integrity().unwrap().is_empty());
+}
+
+#[test]
+fn revalidate_preserves_existing_owner_sha_until_owner_trust_changes() {
+    let fixture = Fixture::new();
+    fixture.start("existing-source", &['元']);
+    let (published, _, _) = run_batch(&fixture.store, "existing-source", 1, |characters| {
+        Ok(characters
+            .iter()
+            .map(|character| Ok(media(character, glyph('元'))))
+            .collect())
+    })
+    .unwrap();
+    let sha256 = published.items[0].published_sha256.clone().unwrap();
+    fixture.start("existing-reuse", &['元']);
+    assert_eq!(
+        fixture.load("existing-reuse").items[0].status,
+        BatchItemStatus::ExistingVerified
+    );
+
+    let (revalidated, code) = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Revalidate {
+            batch_id: "existing-reuse".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(
+        revalidated.batch.items[0].status,
+        BatchItemStatus::ExistingVerified
+    );
+    assert_eq!(
+        revalidated.batch.items[0].published_sha256.as_deref(),
+        Some(sha256.as_str())
+    );
+    assert_eq!(revalidated.batch.items[0].attempts.len(), 0);
+
+    let (_, issues) = decide_exact(
+        &fixture.store,
+        "existing-source",
+        HumanBatchDecision {
+            identity: identity('元'),
+            candidate_sha256: sha256,
+            action: HumanBatchAction::Reject,
+            reason: "проверка смены доверия владельца".into(),
+        },
+    )
+    .unwrap();
+    assert!(issues.is_empty());
+
+    let (invalidated, code) = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Revalidate {
+            batch_id: "existing-reuse".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(code, 3);
+    let item = &invalidated.batch.items[0];
+    assert_eq!(item.status, BatchItemStatus::Reacquire);
+    assert!(item.current_sha256.is_none());
+    assert!(item.published_sha256.is_none());
+    assert!(item.publication_source.is_none());
+    assert_eq!(item.attempts.len(), 0);
+    assert_eq!(item.generation, 1);
+    assert!(!item.observed_owner_rejections.is_empty());
+    invalidated.batch.validate().unwrap();
 }
 
 #[test]

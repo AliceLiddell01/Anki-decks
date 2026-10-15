@@ -424,7 +424,7 @@ fn network_failure(error: reqwest::Error) -> String {
 }
 
 /// Клиент создаётся лишь после проверки наличия подходящих сохранённых кандидатов.
-/// Ledger checkpoint после каждого SHA атомарен; Ctrl+C оставляет прошлые записи.
+/// Запись контрольной точки журнала после каждого SHA атомарна; Ctrl+C оставляет предыдущие результаты.
 pub(crate) fn scan(
     runtime: &mut BatchRuntime,
     state: &mut KanjiBatch,
