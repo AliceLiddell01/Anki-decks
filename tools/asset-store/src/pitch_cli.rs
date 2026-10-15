@@ -17,6 +17,7 @@ use crate::browser_runtime::{BrowserLaunchError, BrowserSession};
 use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
+use crate::journal_cli::{JournalKind, JournalReport, parse_operation, report_text};
 use crate::jpdb::{
     JpdbPitchAcquisitionReport, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchProvider,
     JpdbPitchQuery, JpdbPitchRequest, JpdbPitchSelection, JpdbPitchStage,
@@ -99,6 +100,45 @@ pub enum PitchCommand {
         #[command(subcommand)]
         command: PitchBatchCommand,
     },
+    /// Читает и проверяет локальный журнал операций этого хранилища.
+    Journal {
+        #[command(subcommand)]
+        command: JournalCommand,
+    },
+}
+
+/// Команды локального журнала операций.
+#[derive(Debug, Subcommand)]
+pub enum JournalCommand {
+    /// Выводит события журнала по возрастанию `seq`.
+    List {
+        /// Оставляет только последние N событий.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Только события с точным ключом ресурса (`identity` события).
+        #[arg(long)]
+        identity: Option<String>,
+        /// Только события указанной операции, например `verified_published`.
+        #[arg(long)]
+        operation: Option<String>,
+    },
+    /// Проверяет целостность журнала; ненулевой код возврата при найденной проблеме.
+    Check,
+    /// Сверяет незакрытые интенты с фактическим состоянием манифестов.
+    Reconcile,
+    /// Записывает единственное событие `baseline` со снимком текущего состояния.
+    Baseline,
+}
+
+impl JournalCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            Self::List { .. } => "journal_list",
+            Self::Check => "journal_check",
+            Self::Reconcile => "journal_reconcile",
+            Self::Baseline => "journal_baseline",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -336,6 +376,9 @@ struct Response {
     retried_identities: Vec<String>,
     artifact: Option<String>,
     error: Option<ErrorSummary>,
+    /// Машиночитаемая часть ответа команд `journal`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    journal: Option<JournalReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -405,6 +448,9 @@ pub async fn execute(cli: PitchCli) -> PitchCliOutput {
             )
             .await
         }
+        PitchCommand::Journal { command } => {
+            execute_journal(&store, summary, command, cli.output, store_changed)
+        }
         PitchCommand::Batch { command } => {
             execute_batch(&store, summary, command, plan, cli.output, store_changed).await
         }
@@ -415,7 +461,7 @@ fn prevalidate_command(
     command: &PitchCommand,
 ) -> Result<(Option<PitchPlan>, Option<Vec<PitchPlanItem>>), AssetError> {
     match command {
-        PitchCommand::Corpus { .. } => Ok((None, None)),
+        PitchCommand::Corpus { .. } | PitchCommand::Journal { .. } => Ok((None, None)),
         PitchCommand::Ensure {
             plan,
             surface,
@@ -630,6 +676,7 @@ fn operation_name(command: &PitchCommand) -> &'static str {
             CorpusCommand::Check => "corpus_check",
         },
         PitchCommand::Ensure { .. } => "ensure",
+        PitchCommand::Journal { command } => command.operation_name(),
         PitchCommand::Batch { command } => match command {
             PitchBatchCommand::Start { .. } => "batch_start",
             PitchBatchCommand::Run { .. } => "batch_run",
@@ -847,6 +894,7 @@ fn check_corpus(
                 retried_identities: Vec::new(),
                 artifact: None,
                 error: None,
+                journal: None,
             },
             output,
             0,
@@ -887,6 +935,7 @@ fn list_corpus(
                 retried_identities: Vec::new(),
                 artifact: None,
                 error: None,
+                journal: None,
             },
             output,
             0,
@@ -956,6 +1005,9 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> P
             }
             if let Some(path) = response.artifact {
                 stdout.push_str(&format!("Артефакт проверки: {path}\n"));
+            }
+            if let Some(journal) = &response.journal {
+                stdout.push_str(&report_text(journal));
             }
             PitchCliOutput {
                 stdout,
@@ -1050,6 +1102,10 @@ fn human_operation_name(operation: &str) -> &str {
         "batch_retry_technical" => "пакетный повтор технических сбоев",
         "batch_reacquire" => "повторное получение",
         "batch_reject" => "отклонение кандидата",
+        "journal_list" => "список журнала",
+        "journal_check" => "проверка журнала",
+        "journal_reconcile" => "сверка журнала",
+        "journal_baseline" => "baseline журнала",
         _ => operation,
     }
 }
@@ -1064,6 +1120,11 @@ fn human_outcome_name(outcome: &str) -> &str {
         "pending" => "ожидает обработки",
         "review_ready" => "материалы проверки готовы",
         "updated" => "обновлён",
+        "checked" => "проверен",
+        "problems_found" => "найдены проблемы",
+        "reconciled" => "сверен",
+        "no_op" => "изменений нет",
+        "baseline_recorded" => "baseline записан",
         _ => outcome,
     }
 }
@@ -1194,6 +1255,7 @@ fn render_error(
                 message: error.message,
                 details: error.details,
             }),
+            journal: None,
         },
         output,
         exit_code,
@@ -1243,6 +1305,7 @@ fn render_batch_error(
             retried_identities: Vec::new(),
             artifact: None,
             error: Some(error),
+            journal: None,
         },
     };
     render_response(response, output, exit_code)
@@ -1353,6 +1416,129 @@ async fn ensure(
     }
 }
 
+/// Явный `batch_id` команды пакета, если он задан.
+fn pitch_batch_id_of(command: &PitchBatchCommand) -> Option<&str> {
+    match command {
+        PitchBatchCommand::Start { batch_id, .. } => batch_id.as_deref(),
+        PitchBatchCommand::Run { batch_id, .. }
+        | PitchBatchCommand::Resume { batch_id, .. }
+        | PitchBatchCommand::Status { batch_id }
+        | PitchBatchCommand::Review { batch_id }
+        | PitchBatchCommand::Select { batch_id, .. }
+        | PitchBatchCommand::Retry { batch_id, .. }
+        | PitchBatchCommand::RetryTechnical { batch_id, .. }
+        | PitchBatchCommand::Reacquire { batch_id, .. }
+        | PitchBatchCommand::Reject { batch_id, .. } => Some(batch_id.as_str()),
+    }
+}
+
+/// Выполняет команду журнала поверх уже открытого хранилища.
+fn execute_journal(
+    store: &AssetStore,
+    summary: StoreSummary,
+    command: JournalCommand,
+    output: OutputFormat,
+    opened_change: bool,
+) -> PitchCliOutput {
+    let operation = command.operation_name();
+    let result = match command {
+        JournalCommand::List {
+            limit,
+            identity,
+            operation,
+        } => operation
+            .as_deref()
+            .map(parse_operation)
+            .transpose()
+            .and_then(|operation| store.journal_events(limit, identity.as_deref(), operation))
+            .map(|events| {
+                (
+                    "listed",
+                    opened_change,
+                    Vec::new(),
+                    JournalReport {
+                        kind: JournalKind::List,
+                        events,
+                        ..JournalReport::default()
+                    },
+                    0,
+                )
+            }),
+        JournalCommand::Check => store.journal_check().map(|check| {
+            let problems = check.problems.clone();
+            (
+                if problems.is_empty() {
+                    "checked"
+                } else {
+                    "problems_found"
+                },
+                opened_change,
+                problems.clone(),
+                JournalReport {
+                    kind: JournalKind::Check,
+                    check: Some(check),
+                    ..JournalReport::default()
+                },
+                if problems.is_empty() { 0 } else { 3 },
+            )
+        }),
+        JournalCommand::Reconcile => store.reconcile_journal().map(|appended| {
+            let changed = !appended.is_empty() || opened_change;
+            (
+                if appended.is_empty() {
+                    "no_op"
+                } else {
+                    "reconciled"
+                },
+                changed,
+                Vec::new(),
+                JournalReport {
+                    kind: JournalKind::Reconcile,
+                    appended,
+                    ..JournalReport::default()
+                },
+                0,
+            )
+        }),
+        JournalCommand::Baseline => store.journal_baseline().map(|baseline| {
+            (
+                "baseline_recorded",
+                true,
+                Vec::new(),
+                JournalReport {
+                    kind: JournalKind::Baseline,
+                    baseline: Some(baseline),
+                    ..JournalReport::default()
+                },
+                0,
+            )
+        }),
+    };
+    match result {
+        Ok((outcome, changed, blockers, journal, exit_code)) => render_response(
+            Response {
+                schema_version: CLI_SCHEMA_VERSION,
+                operation: operation.to_owned(),
+                outcome: outcome.to_owned(),
+                changed,
+                store: Some(summary),
+                batch_id: None,
+                batch: None,
+                items: Vec::new(),
+                records: Vec::new(),
+                blockers,
+                retried_identities: Vec::new(),
+                artifact: None,
+                error: None,
+                journal: Some(journal),
+            },
+            output,
+            exit_code,
+        ),
+        Err(error) => render_error(operation.to_owned(), None, error, output, opened_change),
+    }
+}
+
 async fn execute_batch(
     store: &AssetStore,
     summary: StoreSummary,
@@ -1361,6 +1547,9 @@ async fn execute_batch(
     output: OutputFormat,
     store_changed: bool,
 ) -> PitchCliOutput {
+    // События журнала, записанные публикацией этого пакета, помечаются его
+    // идентификатором. Пишут их только методы store под эксклюзивной блокировкой.
+    store.set_journal_context(None, pitch_batch_id_of(&command));
     match command {
         PitchBatchCommand::Start { batch_id, .. } => {
             let batch_id = batch_id.unwrap_or_else(generated_batch_id);
@@ -4042,6 +4231,7 @@ fn batch_response(
         retried_identities: Vec::new(),
         artifact,
         error: None,
+        journal: None,
     }
 }
 

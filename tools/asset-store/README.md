@@ -15,24 +15,32 @@ CLI Kanji по умолчанию использует `.asset-store/kanji`. С�
 манифест или каталог `assets/`.
 
 ```text
-.asset-store/
+.asset-store/                          # целиком игнорируется Git (/.asset-store/)
 ├── kanji/
-│   ├── .owner.json                 # отслеживаемый маркер владельца
-│   ├── manifest.json               # отслеживается; только действующие VERIFIED-записи
+│   ├── .owner.json                 # маркер владельца; в Git не публикуется
+│   ├── manifest.json               # только действующие VERIFIED-записи
 │   ├── assets/
 │   │   ├── gif/漢.gif
 │   │   └── png/饅.png
-│   ├── .runtime/                   # игнорируемые кандидаты, карантин, наборы
-│   ├── .tmp/                       # игнорируемая подготовка и маркеры транзакций
-│   └── .lock                       # игнорируется Git
+│   ├── .runtime/                   # кандидаты, карантин, наборы
+│   ├── .journal/events.jsonl       # журнал операций; только дополнение
+│   ├── .tmp/                       # подготовка и маркеры транзакций
+│   └── .lock
 └── pitch-accent/
     ├── .owner.json
     ├── manifest.json
     ├── assets/png/幽霊.png             # consumer_filename:幽霊.pitch.png
     ├── .runtime/
+    ├── .journal/events.jsonl
     ├── .tmp/
     └── .lock
 ```
+
+Корневой `.gitignore` исключает `/.asset-store/`, `/decks/input/` и
+`/decks/output/` целиком: whitelist-исключений внутри этих областей нет, поэтому
+в Git не попадают ни `.owner.json`, ни `manifest.json`, ни байты ресурсов, ни
+`.runtime/`, ни журнал операций. Отсутствие корпуса в чистом clone — нормальное
+состояние, а не повод что-то публиковать.
 
 Внутренний `storage_path` и имя файла для конечного потребителя — разные значения
 манифеста. Например, `assets/gif/漢.gif` имеет `consumer_filename: "漢.gif"` и
@@ -145,13 +153,14 @@ pitch-accent решение человека `Approve` не заменяет а�
 `pitch-assets` владеет обработкой пакетов и публикацией подтверждённых PNG.
 Интеграция с `anki-repo` остаётся отдельной возможностью.
 
-Git отслеживает `.owner.json` и `manifest.json` каждого домена, а также прямые
-пути `assets/gif/*.gif` и `assets/png/*.png` внутри корня kanji и
-`assets/png/*.png` внутри корня pitch-accent. Каталоги с
-разрешённым расширением и их содержимое исключены из Git; вложенные каталоги,
-другие расширения, `.runtime/`, `.tmp/` и `.lock` тоже исключены. Проверить
-правила можно настоящим `git check-ignore` с помощью отдельного регрессионного
-скрипта:
+Пользовательские области не публикуются через Git ни целиком, ни частично:
+корневой `.gitignore` исключает `/.asset-store/`, `/decks/input/` и
+`/decks/output/`, и исключений внутри них нет. Проверить правила можно настоящим
+`git check-ignore` с помощью отдельного регрессионного скрипта — он копирует
+корневой `.gitignore` во временный репозиторий, доказывает игнорирование всех
+путей внутри трёх областей (включая `.owner.json`, `manifest.json`,
+`assets/**`, `.runtime/**`, `.journal/events.jsonl` и вложенные каталоги) и
+проверяет, что после `git add -A` в индексе не остаётся ни одного такого пути:
 
 ```bash
 bash tools/asset-store/tests/gitignore_regression.sh
@@ -175,6 +184,106 @@ cargo run --quiet --locked -p asset-store --bin pitch-corpus-gate
 доказательства валидатора устарели, найдены потерянные байты или повреждено
 состояние среды выполнения. Проверка ничего не меняет и не считает временные данные частью
 канонического корпуса.
+
+## Журнал операций
+
+Журнал объясняет, как хранилище пришло к текущему состоянию. Он лежит в
+`<store-root>/.journal/events.jsonl` рядом с `manifest.json`, но вне
+`.runtime/batches/**`, поэтому переживает удаление локального состояния одного
+пакета. Файл только дополняется: одна строка — один JSON-объект (NDJSON), и
+каталог журнала игнорируется Git вместе с остальным `.asset-store/`.
+
+Журнал — история переходов, а не второй манифест. Источником истины о текущем
+`VERIFIED`-корпусе остаётся `manifest.json`; журнал лишь объясняет, как это
+состояние получилось, и позволяет найти изменение, зафиксированное в манифесте,
+но не закрытое событием результата. В журнале нет токенов, cookie, CDP-дампов,
+HTML-отчётов и изображений: только идентичность, операция, SHA-256, состояние
+жизненного цикла, ревизия манифеста, техническая причина и снимок счётчиков
+`baseline`.
+
+Пример реальной строки:
+
+```json
+{"schema_version":1,"seq":2,"event_id":"c3dca04948e2cecdef3dda4b70c81f8b2268a2844707d64b197ba7e64bd5a96e","event_key":"a143ed00d781b3439a0f0688125f45e9d34f08aa9e75ac91e5e30c67746e4b68","recorded_at":"2026-10-15T22:08:27.113Z","domain":"kanji","namespace":"kanji","identity":"漢","operation":"candidate_written","outcome":"completed","intent_id":"441132dfc6eff6e5cd75a3d55566026727b115bedf2724beb252106874778a14","manifest_revision":1,"previous_sha256":null,"new_sha256":"693d949d8c3fdc7fd4ace7c340b5f177a9f0c5be7bafee8bc93a7d88b7523d75","previous_lifecycle":null,"new_lifecycle":"pending","verified":false,"run_id":null,"batch_id":null,"provenance":"local_import:han.gif","reason":null,"snapshot":null}
+```
+
+| Поле | Значение |
+| --- | --- |
+| `schema_version` | версия формата события (`1`) |
+| `seq` | номер события в файле, строго `+1` |
+| `event_id` | идентификатор события; на него ссылается `intent_id` |
+| `event_key` | ключ идемпотентности: повтор того же ключа не дописывает событие |
+| `recorded_at` | время записи в RFC 3339 UTC |
+| `domain`, `namespace`, `identity` | владелец записи; у событий уровня хранилища `identity` = `*` |
+| `operation` | `candidate_written`, `verified_published`, `verified_reused`, `trust_granted`, `trust_revoked`, `revalidated`, `quarantined`, `removed`, `recovered`, `layout_migrated`, `baseline` |
+| `outcome` | `pending`, `completed`, `refused`, `recovered`, `aborted`, `unknown` |
+| `intent_id` | `event_id` интента, который закрывает это событие |
+| `manifest_revision` | суммарная ревизия канонического и `.runtime` манифестов |
+| `previous_sha256`, `new_sha256`, `previous_lifecycle`, `new_lifecycle` | фактическое состояние записи до и после события |
+| `verified` | `true` — запись `verified` после события; `false` — не `verified` или удалена; `null` — событие не относится к одной записи |
+| `run_id`, `batch_id` | контекст запуска, если он задан |
+| `provenance` | `source_kind:source_name` без пути |
+| `reason` | техническая причина отказа, восстановления или удаления |
+| `snapshot` | снимок `assets`/`verified`/`pending`/`quarantined` у `baseline` |
+
+### Двухфазная запись
+
+Изменение состояния обрамляется двумя событиями. Перед изменением пишется интент
+(`outcome: pending`) с текущим состоянием в `previous_*` и ожидаемым в `new_*`;
+его `event_id` становится `intent_id`. После успешного `save_manifest` пишется
+закрывающее событие с тем же `intent_id`, `outcome: completed` и фактическими
+`manifest_revision`, `new_sha256`, `new_lifecycle`, `verified`. Штатный отказ до
+фиксации закрывает интент событием `outcome: refused` с `reason`, поэтому
+висящих интентов обычная работа не оставляет.
+
+Запись идёт только из точек, которые уже удерживают эксклюзивную блокировку
+store, и только когда запись действительно изменилась. Ни один worker пакета и
+ни один параллельный путь пакетной обработки в журнал не пишет, поэтому
+многоворкерное получение не замедляется.
+
+Событие `verified_reused` пишется только тогда, когда повторное использование уже
+доверенного ресурса с тем же SHA действительно состоялось. Из того, что в
+манифесте уже лежит `VERIFIED`-запись, событие `verified_published` не выводится.
+
+### Сверка
+
+Если процесс умер между `save_manifest` и закрывающим событием, интент остаётся
+висящим. `journal reconcile` под блокировкой читает журнал и сравнивает
+незакрытые интенты с фактическим состоянием канонического и `.runtime`
+манифестов:
+
+- фактическое состояние совпало с ожидаемым `new_*` → `outcome: recovered`;
+- совпало с прежним `previous_*` → `outcome: aborted`;
+- ни то, ни другое → `outcome: unknown` с объясняющим `reason`.
+
+Сверка идемпотентна: повторный вызов не дописывает событий.
+
+### Команды
+
+Оба CLI читают журнал своего store, который задаётся общим `--store`.
+
+```bash
+# События по возрастанию seq; --limit оставляет последние N.
+kanji-assets --store .asset-store/kanji journal list --limit 20
+pitch-assets --store .asset-store/pitch-accent journal list \
+  --identity 幽霊 --operation verified_published
+
+# Целостность: строгая нумерация seq, уникальность event_id, ссылки intent_id,
+# оборванный хвост, битые строки, ревизия не выше фактической.
+# Код возврата 3, если найдена проблема; открытые интенты перечисляются.
+kanji-assets --store .asset-store/kanji journal check
+
+# Сверка незакрытых интентов; печатает дописанные события.
+kanji-assets --store .asset-store/kanji journal reconcile
+
+# Одно событие baseline со снимком текущего состояния; повтор отклоняется.
+kanji-assets --store .asset-store/kanji journal baseline
+```
+
+`journal baseline` пишет ровно одно событие `operation: baseline` с
+`identity: "*"`, фактической ревизией и снимком
+`assets`/`verified`/`pending`/`quarantined`. Оно обозначает начало доверенной
+истории и не переписывается: повторная запись завершается отказом.
 
 ## Получение изображений тонового акцента из JPDB
 

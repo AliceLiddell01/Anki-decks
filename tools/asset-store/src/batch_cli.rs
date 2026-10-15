@@ -685,6 +685,10 @@ pub(super) fn execute(
     output: OutputFormat,
     allow_insecure_tls: bool,
 ) -> CliOutput {
+    // События журнала, записанные путём проверки и публикации этого пакета,
+    // помечаются его идентификатором. Сами события пишутся только из методов
+    // store под эксклюзивной блокировкой, не из worker'ов пакета.
+    store.set_journal_context(None, batch_id_of(command));
     let mut progress = StderrProgressSink { output };
     execute_with_progress(
         store,
@@ -694,6 +698,24 @@ pub(super) fn execute(
         allow_insecure_tls,
         &mut progress,
     )
+}
+
+/// Явный `batch_id` команды пакета, если он задан.
+fn batch_id_of(command: &BatchCommand) -> Option<&str> {
+    match command {
+        BatchCommand::Start { batch_id, .. } => batch_id.as_deref(),
+        BatchCommand::Run { batch_id, .. }
+        | BatchCommand::Status { batch_id }
+        | BatchCommand::Review { batch_id }
+        | BatchCommand::Revalidate { batch_id }
+        | BatchCommand::ReviewExport { batch_id }
+        | BatchCommand::Ocr { batch_id, .. }
+        | BatchCommand::ReviewConfirmMatches { batch_id, .. }
+        | BatchCommand::ReviewApply { batch_id, .. }
+        | BatchCommand::ReviewInteractive { batch_id }
+        | BatchCommand::Decide { batch_id, .. }
+        | BatchCommand::Retry { batch_id, .. } => Some(batch_id.as_str()),
+    }
 }
 
 fn execute_with_progress(
