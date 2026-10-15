@@ -218,6 +218,21 @@ pub(crate) fn saved_suggestions(
         .collect()
 }
 
+pub(crate) fn saved_suggestions_or_empty(
+    runtime: &BatchRuntime,
+) -> BTreeMap<AssetIdentity, OcrSuggestion> {
+    match saved_suggestions(runtime) {
+        Ok(suggestions) => suggestions,
+        Err(error) => {
+            tracing::warn!(
+                code = error.code.as_str(),
+                "OCR-кэш недоступен; страница review будет построена без предложений"
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
 fn save_suggestion(runtime: &BatchRuntime, suggestion: OcrSuggestion) -> Result<bool, AssetError> {
     let mut ledger = read_ledger(runtime)?;
     let key = suggestion.key();

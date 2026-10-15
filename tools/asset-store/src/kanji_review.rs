@@ -107,7 +107,7 @@ pub(crate) fn prepare(
 ) -> Result<ReviewBundle, AssetError> {
     state.validate()?;
     let mut rows = Vec::new();
-    let suggestions = crate::kanji_ocr::saved_suggestions(runtime)?;
+    let suggestions = crate::kanji_ocr::saved_suggestions_or_empty(runtime);
     for item in state.review_queue() {
         let Some(hash) = &item.current_sha256 else {
             continue;
@@ -334,7 +334,7 @@ fn write_preview(
 ) -> Result<(), AssetError> {
     use crate::batch::html_escape;
     let mut html = String::from(
-        "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self'; style-src 'unsafe-inline'\"><title>Ручная проверка</title><style>body{font-family:system-ui;margin:2rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>Предложения OCR и решения человека</h1><p>Просмотрите изображения. OCR может ошибаться при совпадении метки. Только явное решение человека подтверждает байты.</p>",
+        "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self' file:; style-src 'unsafe-inline'\"><title>Ручная проверка</title><style>body{font-family:system-ui;margin:2rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>Предложения OCR и решения человека</h1><p>Просмотрите изображения. OCR может ошибаться при совпадении метки. Только явное решение человека подтверждает байты.</p>",
     );
     let mut group = None;
     for row in &snapshot.rows {

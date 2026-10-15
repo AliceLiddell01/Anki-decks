@@ -1289,7 +1289,7 @@ impl BatchRuntime {
             state.revision
         )
         .expect("запись в строку не может завершиться ошибкой");
-        let suggestions = crate::kanji_ocr::saved_suggestions(self)?;
+        let suggestions = crate::kanji_ocr::saved_suggestions_or_empty(self);
         let mut review_queue = state.review_queue();
         review_queue.sort_by_key(|item| {
             suggestions

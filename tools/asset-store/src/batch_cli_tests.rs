@@ -3119,6 +3119,28 @@ fn review_export_restores_missing_artifacts_without_overwriting_decisions() {
     assert!(!template.lines().any(|line| line.starts_with("y\t")));
 }
 
+#[test]
+fn manual_review_pages_survive_invalid_optional_ocr_cache() {
+    let fixture = review_fixture("review-invalid-ocr-cache", &['保']);
+    let mut runtime = BatchRuntime::open(fixture.store.root(), "review-invalid-ocr-cache").unwrap();
+    let state = runtime.load().unwrap().unwrap();
+    runtime
+        .artifact_directory("ocr")
+        .unwrap()
+        .write("suggestions.json", b"{")
+        .unwrap();
+
+    let html_path = runtime.write_review(&state).unwrap();
+    let html = fs::read_to_string(html_path).unwrap();
+    assert!(html.contains("default-src 'none'; img-src 'self' file:"));
+
+    let bundle = crate::kanji_review::prepare(&runtime, &state).unwrap();
+    let preview = fs::read_to_string(bundle.directory.join("index.html")).unwrap();
+    assert!(preview.contains("default-src 'none'; img-src 'self' file:"));
+    let (snapshot, _) = crate::kanji_review::read(&runtime, &bundle.id).unwrap();
+    assert!(snapshot.rows.iter().all(|row| row.ocr.is_none()));
+}
+
 fn fill_review(path: &std::path::Path, actions: &[&str]) {
     let original = fs::read_to_string(path).unwrap();
     let mut index = 0;
