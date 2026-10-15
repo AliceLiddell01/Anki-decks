@@ -520,12 +520,14 @@ pub(crate) fn scan(
                 suggestion.observed = Some(observed);
             }
             Err(reason) => {
-                report.failures.push((identity.clone(), reason.clone()));
                 suggestion.failure = Some(reason);
             }
         }
         // SHA/generation/current status сверяются после освобождения lock.
         if still_current(state, &identity, generation, &candidate) {
+            if let Some(reason) = &suggestion.failure {
+                report.failures.push((identity.clone(), reason.clone()));
+            }
             report.saved += usize::from(save_suggestion(runtime, suggestion)?);
         }
     }

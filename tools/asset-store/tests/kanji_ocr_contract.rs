@@ -770,6 +770,77 @@ fn interrupted_process_resumes_completed_cache_and_discards_stale_network_result
 }
 
 #[test]
+fn stale_provider_failure_is_not_reported_or_saved_after_candidate_changes() {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let fixture = Fixture::new();
+    fixture.batch(&['𠀀'], &png());
+    let before = fixture.state();
+    let mock = Mock::new("𠀀");
+    let gate = Arc::new(AtomicBool::new(false));
+    {
+        let mut server = mock.state.lock().unwrap();
+        server.http_status = 503;
+        server.response_gate = Some(gate.clone());
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kanji-assets"));
+    command
+        .arg("--store")
+        .arg(fixture.store.root())
+        .arg("--repository-root")
+        .arg(fixture.temp.path().join("repository"))
+        .args([
+            "--output",
+            "json",
+            "batch",
+            "ocr",
+            "--batch-id",
+            "ocr",
+            "--model",
+            "fixture:vision",
+            "--endpoint",
+            &mock.url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    let started = Instant::now();
+    while mock.chats() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        thread::sleep(Duration::from_millis(5));
+    }
+    let sha = before.items[0].current_sha256.as_ref().unwrap();
+    assert_ok(&fixture.cli(&[
+        "batch",
+        "retry",
+        "--batch-id",
+        "ocr",
+        "--character",
+        "𠀀",
+        "--sha256",
+        sha,
+        "--reason",
+        "candidate changed while OCR was waiting",
+    ]));
+    gate.store(true, Ordering::Release);
+    let output = child.wait_with_output().unwrap();
+    assert_ok(&output);
+    let response = value(&output);
+    assert_eq!(response["issues"], json!([]));
+    assert_eq!(response["ocr_summary"]["saved"], 0);
+    assert_eq!(response["ocr_summary"]["chat_requests"], 1);
+    assert!(
+        !fixture
+            .store
+            .root()
+            .join(".runtime/batches/ocr/ocr/suggestions.json")
+            .exists()
+    );
+    assert!(fixture.state().items[0].generation > before.items[0].generation);
+}
+
+#[test]
 fn changed_sha_does_not_inherit_the_old_proposal_or_snapshot() {
     let fixture = Fixture::new();
     fixture.batch(&['𠀀'], &png());

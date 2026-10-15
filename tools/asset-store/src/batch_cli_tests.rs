@@ -1554,7 +1554,7 @@ fn exact_source_cas_fails_before_manifest_mutation() {
 }
 
 #[test]
-fn legacy_metrics_do_not_publish_under_pair_policy() {
+fn single_candidate_uncertain_legacy_metrics_do_not_publish() {
     let fixture = Fixture::new();
     fixture.start("aggregate", &['漢']);
     let bytes = glyph('漢');
@@ -1590,60 +1590,35 @@ fn legacy_metrics_do_not_publish_under_pair_policy() {
 }
 
 #[test]
-fn rejected_candidate_never_votes_or_publishes_as_aggregate() {
+fn single_candidate_rejected_auto_status_waits_for_human() {
     let fixture = Fixture::new();
     fixture.start("rejected", &['漢']);
-    let base = glyph('漢');
-    let variants: Vec<Vec<u8>> = (0..5u8)
-        .map(|index| {
-            let mut image = image::load_from_memory(&base).unwrap().to_rgba8();
-            image.put_pixel(0, 0, image::Rgba([index + 1, 111, 222, 255]));
-            let mut encoded = Cursor::new(Vec::new());
-            image
-                .write_to(&mut encoded, image::ImageFormat::Png)
-                .unwrap();
-            encoded.into_inner()
-        })
-        .collect();
-    let mut hashes: Vec<_> = variants.iter().map(sha256_hex).collect();
-    hashes.sort();
-    hashes.dedup();
-    assert_eq!(
-        hashes.len(),
-        5,
-        "синтетические кандидаты должны различаться"
-    );
-    // Один REJECTED с привлекательными метриками и четыре UNCERTAIN: прежний
-    // фильтр включал REJECTED в среднее, поэтому порог проходился, а выбирался
-    // именно отклонённый кандидат с минимальной дистанцией.
-    let plan = [
-        (SemanticStatus::Rejected, 0.015, -0.015),
-        (SemanticStatus::Uncertain, 0.021, 0.009),
-        (SemanticStatus::Uncertain, 0.021, 0.009),
-        (SemanticStatus::Uncertain, 0.021, 0.009),
-        (SemanticStatus::Uncertain, 0.021, 0.009),
-    ];
+    let mut image = image::load_from_memory(&glyph('漢')).unwrap().to_rgba8();
+    image.put_pixel(0, 0, image::Rgba([1, 111, 222, 255]));
+    let mut encoded = Cursor::new(Vec::new());
+    image
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    let bytes = encoded.into_inner();
+    let rejected_hash = sha256_hex(&bytes);
     let mut runtime = BatchRuntime::open(fixture.store.root(), "rejected").unwrap();
     let mut state = runtime.load().unwrap().unwrap();
-    for (bytes, (status, distance, margin)) in variants.iter().zip(plan).take(1) {
-        let record = ValidationRecord {
-            status,
-            validator: KanjiImageValidator::validator_identity(),
-            content_sha256: sha256_hex(bytes),
-            evidence: vec![ValidationEvidence {
-                kind: "pixel_reference_comparison".into(),
-                summary: "синтетические независимые метрики".into(),
-                details: Some(
-                    serde_json::json!({"expected_distance": distance, "nearest_margin": margin, "nearest_other": "漠"}),
-                ),
-            }],
-        };
-        let candidate = runtime.persist_candidate(bytes, record, true).unwrap();
-        state
-            .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
-            .unwrap();
-    }
-    let rejected_hash = sha256_hex(&variants[0]);
+    let record = ValidationRecord {
+        status: SemanticStatus::Rejected,
+        validator: KanjiImageValidator::validator_identity(),
+        content_sha256: rejected_hash.clone(),
+        evidence: vec![ValidationEvidence {
+            kind: "pixel_reference_comparison".into(),
+            summary: "синтетические независимые метрики".into(),
+            details: Some(
+                serde_json::json!({"expected_distance": 0.015, "nearest_margin": -0.015, "nearest_other": "漠"}),
+            ),
+        }],
+    };
+    let candidate = runtime.persist_candidate(&bytes, record, true).unwrap();
+    state
+        .record_attempt(&identity('漢'), BatchAttemptInput::Candidate { candidate })
+        .unwrap();
     runtime.save(&state).unwrap();
     drop(runtime);
     let (state, _, _) = run_batch(&fixture.store, "rejected", 5, |_| {
