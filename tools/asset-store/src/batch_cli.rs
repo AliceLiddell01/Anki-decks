@@ -685,6 +685,10 @@ pub(super) fn execute(
     output: OutputFormat,
     allow_insecure_tls: bool,
 ) -> CliOutput {
+    // События журнала, записанные путём проверки и публикации этого пакета,
+    // помечаются его идентификатором. Сами события пишутся только из методов
+    // store под эксклюзивной блокировкой, не из worker'ов пакета.
+    store.set_journal_context(None, command.id());
     let mut progress = StderrProgressSink { output };
     execute_with_progress(
         store,

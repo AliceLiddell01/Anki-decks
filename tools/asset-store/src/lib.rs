@@ -17,6 +17,8 @@ pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod hashing;
+pub mod journal;
+pub mod journal_cli;
 pub mod jpdb;
 pub mod kanji_domain;
 pub mod kanji_mask;
