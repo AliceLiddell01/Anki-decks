@@ -6,7 +6,9 @@ use std::str::FromStr;
 
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
-use crate::journal_cli::{JournalKind, JournalReport, parse_operation, report_text};
+use crate::journal_cli::{
+    JournalCommand, JournalKind, JournalReport, parse_operation, report_text,
+};
 use crate::kanji_domain::parse_kanji_character;
 use crate::kanji_validator::KanjiImageValidator;
 use crate::model::{
@@ -112,40 +114,6 @@ pub enum Command {
         #[command(subcommand)]
         command: JournalCommand,
     },
-}
-
-/// Команды локального журнала операций.
-#[derive(Debug, Subcommand)]
-pub enum JournalCommand {
-    /// Выводит события журнала по возрастанию `seq`.
-    List {
-        /// Оставляет только последние N событий.
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Только события с точным ключом ресурса (`identity` события).
-        #[arg(long)]
-        identity: Option<String>,
-        /// Только события указанной операции, например `verified_published`.
-        #[arg(long)]
-        operation: Option<String>,
-    },
-    /// Проверяет целостность журнала; ненулевой код возврата при найденной проблеме.
-    Check,
-    /// Сверяет незакрытые интенты с фактическим состоянием манифестов.
-    Reconcile,
-    /// Записывает единственное событие `baseline` со снимком текущего состояния.
-    Baseline,
-}
-
-impl JournalCommand {
-    fn operation_name(&self) -> &'static str {
-        match self {
-            Self::List { .. } => "journal_list",
-            Self::Check => "journal_check",
-            Self::Reconcile => "journal_reconcile",
-            Self::Baseline => "journal_baseline",
-        }
-    }
 }
 
 /// Человекочитаемый или машиночитаемый вывод.

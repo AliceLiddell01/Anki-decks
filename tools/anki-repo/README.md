@@ -1141,7 +1141,9 @@ anki-repo migrate-layout --root . --apply
 
 Почему перенос доказуем. Перед записью команда перечисляет **все** файлы каждого
 найденного экспорта, их размеры и SHA-256 и сворачивает список в один отпечаток
-содержимого. После переноса отпечаток пересчитывается по назначению и сверяется с
+содержимого. План строится до захвата блокировки, поэтому непосредственно перед
+переносом отпечаток источника пересчитывается: расхождение — отказ до изменения
+раскладки. После переноса отпечаток пересчитывается по назначению и сверяется с
 доказанным: расхождение — ошибка `source_changed`, а не «успешный» перенос. В
 пределах одной файловой системы экспорт переезжает одним `rename`; если `rename`
 невозможен, каталог копируется во временный `.anki-repo-migrate-tmp-*` рядом с
@@ -1158,8 +1160,12 @@ anki-repo migrate-layout --root . --apply
 - источник или элемент внутри него является символической ссылкой —
   `source_is_symlink`, `source_contains_symlink`; назначение-ссылка —
   `target_is_symlink`;
-- имя файла не является корректным UTF-8 — `source_non_utf8_name`;
-- файл невозможно прочитать — `source_unreadable`;
+- имя корня экспорта или файла внутри него не является корректным UTF-8 —
+  `source_non_utf8_name`;
+- источник исчез или не является каталогом — `source_missing`,
+  `source_not_directory`; источник невозможно прочитать — `source_unreadable`;
+- в источнике нет `deck.json` — `deck_json_missing`;
+- назначение существует, но недоступно для чтения — `target_unreadable`;
 - сам `decks/` содержит `deck.json` (`legacy_area_is_export`): переносить корень
   области вместе с `decks/input` и `decks/output` нельзя.
 
@@ -1185,11 +1191,12 @@ Placeholder-файлы прежней раскладки (нулевые `.gitke
 
 | Ключ | Значение |
 |---|---|
-| `root`, `legacy_area`, `output_dir` | корень репозитория и обе области относительно него |
+| `root` | абсолютный корень репозитория; остальные пути отчёта — относительно него |
+| `legacy_area`, `output_dir` | прежняя область раскладки и плоское назначение |
 | `apply`, `applied`, `refused` | запрошена ли запись, выполнена ли она и есть ли хотя бы один отказ |
-| `exports[]` | по каждому экспорту: `name`, `source`, `target`, `action` (`move` / `already_present` / `refused`), `state` (`planned` / `applied` / `refused`), `files`, `bytes`, `content_sha256`, `reason`, `message` |
-| `pruned` | снятые placeholder-файлы и опустевшие каталоги прежней раскладки |
-| `diagnostics` | `symlink_skipped`, `legacy_area_absent`, `nothing_to_migrate`, `legacy_area_retained` |
+| `exports[]` | по каждому экспорту: `name`, `source`, `target` (относительно корня), `action` (`move` / `already_present` / `refused`), `state` (`planned` / `applied` / `refused`), `files`, `bytes`, `content_sha256`, `reason`, `message` |
+| `pruned` | снятые placeholder-файлы и опустевшие каталоги прежней раскладки (относительно корня) |
+| `diagnostics` | `symlink_skipped`, `legacy_area_absent`, `nothing_to_migrate`, `legacy_area_retained`; `paths` — относительно корня |
 | `summary` | `exports`, `planned`, `applied`, `already_present`, `refused`, `files`, `bytes` |
 
 #### Если прежняя раскладка уже отслеживалась Git
@@ -1974,7 +1981,7 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | Код | Код возврата | Когда |
 |---|---|---|
 | `usage` | 2 | Несовместимые аргументы, обнаруженные вне clap |
-| `input_unreadable` | 3 | Не удалось прочитать каталог экспорта, запрос `edit` или документ `review-check`; для `maintenance` — определить рабочую область Cargo по отсутствующему или неразрешимому `--workspace-root` |
+| `input_unreadable` | 3 | Не удалось прочитать каталог экспорта, запрос `edit` или документ `review-check`; `migrate-layout` — обойти прежнюю область или снять отпечаток источника; для `maintenance` — определить рабочую область Cargo по отсутствующему или неразрешимому `--workspace-root` |
 | `deck_json_missing` | 3 | В каталоге нет `deck.json` |
 | `invalid_json` | 3 | `deck.json` не является валидным JSON |
 | `root_not_deck` | 3 | Корень не является CrowdAnki `Deck` |

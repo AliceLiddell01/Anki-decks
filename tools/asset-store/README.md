@@ -208,6 +208,14 @@ HTML-отчётов и изображений: только идентичнос
 {"schema_version":1,"seq":2,"event_id":"c3dca04948e2cecdef3dda4b70c81f8b2268a2844707d64b197ba7e64bd5a96e","event_key":"a143ed00d781b3439a0f0688125f45e9d34f08aa9e75ac91e5e30c67746e4b68","recorded_at":"2026-10-15T22:08:27.113Z","domain":"kanji","namespace":"kanji","identity":"漢","operation":"candidate_written","outcome":"completed","intent_id":"441132dfc6eff6e5cd75a3d55566026727b115bedf2724beb252106874778a14","manifest_revision":1,"previous_sha256":null,"new_sha256":"693d949d8c3fdc7fd4ace7c340b5f177a9f0c5be7bafee8bc93a7d88b7523d75","previous_lifecycle":null,"new_lifecycle":"pending","verified":false,"run_id":null,"batch_id":null,"provenance":"local_import:han.gif","reason":null,"snapshot":null}
 ```
 
+Полное чтение ограничено 256 МиБ. Выше этого предела `journal list`,
+`journal check` и `journal reconcile` завершаются `journal_too_large` (код 4), а
+запись продолжает работать: дописыванию нужны только ключи уже записанных
+событий и номер последнего, поэтому файл обходится потоково. Ротации нет — чтобы
+снова читать историю целиком, `.journal/events.jsonl` архивируют вручную;
+источником истины остаётся `manifest.json`, поэтому архив истории не влияет на
+корпус.
+
 | Поле | Значение |
 | --- | --- |
 | `schema_version` | версия формата события (`1`) |
@@ -272,6 +280,7 @@ pitch-assets --store .asset-store/pitch-accent journal list \
 # Целостность: строгая нумерация seq, уникальность event_id, ссылки intent_id,
 # оборванный хвост, битые строки, ревизия не выше фактической.
 # Код возврата 3, если найдена проблема; открытые интенты перечисляются.
+# Журнал больше предела полного чтения — journal_too_large (код 4).
 kanji-assets --store .asset-store/kanji journal check
 
 # Сверка незакрытых интентов; печатает дописанные события.

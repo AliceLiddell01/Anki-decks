@@ -1,13 +1,54 @@
 //! Общий слой CLI для локального журнала операций.
 //!
 //! Владелец предметных команд — `kanji-assets` и `pitch-assets`; здесь живут
-//! только общий формат машинного ответа, разбор значения `--operation` и русское
-//! представление событий, чтобы оба CLI не расходились.
+//! только описание подкоманды `journal`, общий формат машинного ответа, разбор
+//! значения `--operation` и русское представление событий, чтобы оба CLI не
+//! расходились.
 
+use clap::Subcommand;
 use serde::Serialize;
 
 use crate::error::{AssetError, ErrorCode};
 use crate::journal::{JournalCheck, JournalEvent, JournalOperation};
+
+/// Команды локального журнала операций.
+///
+/// Описание общее для обоих CLI: разойдясь, они перестали бы быть одним
+/// контрактом команды `journal`.
+#[derive(Debug, Subcommand)]
+pub enum JournalCommand {
+    /// Выводит события журнала по возрастанию `seq`.
+    List {
+        /// Оставляет только последние N событий.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Только события с точным ключом ресурса (`identity` события).
+        #[arg(long)]
+        identity: Option<String>,
+        /// Только события указанной операции, например `verified_published`.
+        #[arg(long)]
+        operation: Option<String>,
+    },
+    /// Проверяет целостность журнала; ненулевой код возврата при найденной проблеме.
+    Check,
+    /// Сверяет незакрытые интенты с фактическим состоянием манифестов.
+    Reconcile,
+    /// Записывает единственное событие `baseline` со снимком текущего состояния.
+    Baseline,
+}
+
+impl JournalCommand {
+    /// Имя операции в машинном ответе.
+    #[must_use]
+    pub const fn operation_name(&self) -> &'static str {
+        match self {
+            Self::List { .. } => "journal_list",
+            Self::Check => "journal_check",
+            Self::Reconcile => "journal_reconcile",
+            Self::Baseline => "journal_baseline",
+        }
+    }
+}
 
 /// Вид команды `journal`, определяющий русское представление ответа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

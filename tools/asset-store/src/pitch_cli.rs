@@ -17,7 +17,9 @@ use crate::browser_runtime::{BrowserLaunchError, BrowserSession};
 use crate::diagnostics::{OutputMode as DiagnosticOutputMode, RunLogGuard, safe_message};
 use crate::domain::AssetDomainPolicy;
 use crate::error::{AssetError, ErrorCode};
-use crate::journal_cli::{JournalKind, JournalReport, parse_operation, report_text};
+use crate::journal_cli::{
+    JournalCommand, JournalKind, JournalReport, parse_operation, report_text,
+};
 use crate::jpdb::{
     JpdbPitchAcquisitionReport, JpdbPitchFailure, JpdbPitchOutcome, JpdbPitchProvider,
     JpdbPitchQuery, JpdbPitchRequest, JpdbPitchSelection, JpdbPitchStage,
@@ -105,40 +107,6 @@ pub enum PitchCommand {
         #[command(subcommand)]
         command: JournalCommand,
     },
-}
-
-/// Команды локального журнала операций.
-#[derive(Debug, Subcommand)]
-pub enum JournalCommand {
-    /// Выводит события журнала по возрастанию `seq`.
-    List {
-        /// Оставляет только последние N событий.
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Только события с точным ключом ресурса (`identity` события).
-        #[arg(long)]
-        identity: Option<String>,
-        /// Только события указанной операции, например `verified_published`.
-        #[arg(long)]
-        operation: Option<String>,
-    },
-    /// Проверяет целостность журнала; ненулевой код возврата при найденной проблеме.
-    Check,
-    /// Сверяет незакрытые интенты с фактическим состоянием манифестов.
-    Reconcile,
-    /// Записывает единственное событие `baseline` со снимком текущего состояния.
-    Baseline,
-}
-
-impl JournalCommand {
-    fn operation_name(&self) -> &'static str {
-        match self {
-            Self::List { .. } => "journal_list",
-            Self::Check => "journal_check",
-            Self::Reconcile => "journal_reconcile",
-            Self::Baseline => "journal_baseline",
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]

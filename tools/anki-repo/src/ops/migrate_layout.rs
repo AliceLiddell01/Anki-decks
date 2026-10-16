@@ -351,10 +351,31 @@ fn report(
     legacy: &Path,
     output: &Path,
     apply: bool,
-    exports: Vec<ExportPlan>,
+    mut exports: Vec<ExportPlan>,
     pruned: Vec<String>,
-    diagnostics: Vec<Diagnostic>,
+    mut diagnostics: Vec<Diagnostic>,
 ) -> MigrationReport {
+    // Отчёт покидает процесс и может попасть в PR, поэтому абсолютные локальные
+    // пути пользователя в нём не остаются: и поля-пути, и построенные из них
+    // тексты приводятся к виду относительно корня репозитория.
+    for entry in &mut exports {
+        entry.source = relativize_paths(root, &entry.source);
+        entry.target = entry
+            .target
+            .as_deref()
+            .map(|path| relativize_paths(root, path));
+        entry.message = entry
+            .message
+            .as_deref()
+            .map(|text| relativize_paths(root, text));
+    }
+    for diagnostic in &mut diagnostics {
+        diagnostic.message = relativize_paths(root, &diagnostic.message);
+        for path in &mut diagnostic.paths {
+            *path = relativize_paths(root, path);
+        }
+    }
+
     let mut summary = Summary {
         exports: exports.len(),
         ..Summary::default()
@@ -411,9 +432,15 @@ fn discover_export_roots(
     while let Some(directory) = stack.pop() {
         for path in read_dir_sorted(&directory)? {
             let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| io_error(&path, "read_source", &error))?;
+                .map_err(|error| read_error(&path, "read_source", &error))?;
             let file_type = metadata.file_type();
 
+            // `decks/input` и `decks/output` не просматриваются в любом виде:
+            // проверка ссылки раньше этой ветки заглянула бы внутрь закрытой
+            // области и превратила бы её в кандидата на перенос.
+            if paths_alias(&path, input) || paths_alias(&path, output) {
+                continue;
+            }
             if file_type.is_symlink() {
                 if path.join(DECK_JSON).is_file() {
                     roots.push(path);
@@ -432,9 +459,6 @@ fn discover_export_roots(
             if !file_type.is_dir() {
                 continue;
             }
-            if paths_alias(&path, input) || paths_alias(&path, output) {
-                continue;
-            }
             if path.join(DECK_JSON).is_file() {
                 roots.push(path);
                 continue;
@@ -450,8 +474,10 @@ fn discover_export_roots(
 /// Читает каталог в детерминированном порядке.
 fn read_dir_sorted(directory: &Path) -> Result<Vec<PathBuf>, DomainError> {
     let mut paths = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|error| io_error(directory, "read_dir", &error))? {
-        let entry = entry.map_err(|error| io_error(directory, "read_dir", &error))?;
+    for entry in
+        fs::read_dir(directory).map_err(|error| read_error(directory, "read_dir", &error))?
+    {
+        let entry = entry.map_err(|error| read_error(directory, "read_dir", &error))?;
         paths.push(entry.path());
     }
     paths.sort();
@@ -482,9 +508,11 @@ fn plan_entry(source: &Path, output: &Path) -> ExportPlan {
     };
 
     let Some(name) = name else {
+        // Тот же код, что и у не-UTF-8 имени внутри экспорта: понятие одно, и
+        // плоское имя назначения по нему доказать нельзя.
         return refused_entry(
             source,
-            "source_name_not_utf8",
+            "source_non_utf8_name",
             "имя корня экспорта не является UTF-8",
         );
     };
@@ -781,8 +809,8 @@ fn copy_export(source: &Path, target: &Path, expected: Option<&str>) -> Result<(
 fn copy_tree(source: &Path, target: &Path) -> Result<(), DomainError> {
     fs::create_dir_all(target).map_err(|error| io_error(target, "create_dir", &error))?;
     for path in read_dir_sorted(source)? {
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|error| io_error(&path, "read_source", &error))?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| read_error(&path, "read_source", &error))?;
         let name = path
             .file_name()
             .ok_or_else(|| verification_error(&path, "у элемента нет имени"))?;
@@ -841,16 +869,19 @@ fn prune_legacy_placeholders(
     while let Some(directory) = stack.pop() {
         for path in read_dir_sorted(&directory)? {
             let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| io_error(&path, "read_legacy", &error))?;
+                .map_err(|error| read_error(&path, "read_legacy", &error))?;
             let file_type = metadata.file_type();
+            // Закрытые области не считаются содержимым прежней раскладки ни в
+            // каком виде, в том числе ссылкой: иначе `decks/input` удерживал бы
+            // прежнюю область как «посторонний элемент».
+            if paths_alias(&path, input) || paths_alias(&path, output) {
+                continue;
+            }
             if file_type.is_symlink() {
                 others.push(path);
                 continue;
             }
             if file_type.is_dir() {
-                if paths_alias(&path, input) || paths_alias(&path, output) {
-                    continue;
-                }
                 directories.push(path.clone());
                 stack.push(path);
                 continue;
@@ -920,7 +951,7 @@ fn bytes_to_copy(entries: &[ExportPlan], output: &Path) -> Result<u64, DomainErr
 
 /// Устройство файловой системы, на которой лежит путь.
 fn device_of(path: &Path) -> Result<u64, DomainError> {
-    let metadata = fs::metadata(path).map_err(|error| io_error(path, "read_metadata", &error))?;
+    let metadata = fs::metadata(path).map_err(|error| read_error(path, "read_metadata", &error))?;
     Ok(metadata.dev())
 }
 
@@ -1046,10 +1077,30 @@ fn display_relative(root: &Path, path: &Path) -> String {
     }
 }
 
+/// Убирает абсолютный префикс корня репозитория из пути или текста отчёта.
+fn relativize_paths(root: &Path, text: &str) -> String {
+    let prefix = format!("{}/", root.display());
+    text.replace(&prefix, "")
+}
+
 /// Готовит доменную ошибку отказа файловой системы.
 fn io_error(path: &Path, operation: &str, error: &io::Error) -> DomainError {
     DomainError::with_details(
         ErrorCode::WriteFailed,
+        format!("{}: {operation}: {error}", path.display()),
+        details! {
+            "path" => path.display().to_string(),
+            "operation" => operation,
+            "io_error" => error.to_string(),
+        },
+    )
+}
+
+/// Готовит доменную ошибку чтения входа: обход ничего не пишет, и называть такой
+/// отказ `write_failed` нельзя.
+fn read_error(path: &Path, operation: &str, error: &io::Error) -> DomainError {
+    DomainError::with_details(
+        ErrorCode::InputUnreadable,
         format!("{}: {operation}: {error}", path.display()),
         details! {
             "path" => path.display().to_string(),
@@ -1356,6 +1407,59 @@ mod tests {
         );
         assert!(!root.join("decks/output/Hidden").exists());
         assert!(root.join("decks/output/Words__A/deck.json").is_file());
+    }
+
+    #[test]
+    fn the_report_keeps_paths_relative_to_the_repository_root() {
+        let (_dir, root) = repository("layout-relative-report");
+        write_export(&root, "decks/words/Words__A", b"a");
+
+        let report = migrate(Some(&root), false).expect("план");
+
+        let entry = report.exports.first().expect("экспорт в отчёте");
+        assert_eq!(entry.source, "decks/words/Words__A");
+        assert_eq!(entry.target.as_deref(), Some("decks/output/Words__A"));
+        assert_eq!(report.legacy_area, "decks");
+        assert_eq!(report.output_dir, "decks/output");
+    }
+
+    #[test]
+    fn a_symlinked_closed_area_is_neither_a_candidate_nor_foreign_content() {
+        let (_dir, root) = repository("layout-closed-symlink");
+        write_export(&root, "decks/words/Words__A", b"a");
+
+        // Закрытая область подменена ссылкой на посторонний каталог с deck.json:
+        // обход не должен ни заглядывать внутрь, ни считать её содержимым
+        // прежней раскладки, иначе миграция отказывает целиком.
+        let outside = root.join("outside").join("input");
+        fs::create_dir_all(&outside).expect("посторонний каталог");
+        fs::write(outside.join(DECK_JSON), DECK_JSON_BODY.as_bytes())
+            .expect("посторонний deck.json");
+        std::os::unix::fs::symlink(&outside, root.join("decks").join("input")).expect("ссылка");
+
+        let report = migrate(Some(&root), true).expect("миграция выполнена");
+
+        assert!(!report.refused, "{:?}", report.exports);
+        assert!(
+            !report
+                .exports
+                .iter()
+                .any(|entry| entry.source.contains("decks/input")),
+            "ссылка на закрытую область не становится кандидатом: {:?}",
+            report.exports
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "legacy_area_retained"),
+            "закрытая область не удерживает прежнюю раскладку: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            root.join("decks/output/Words__A/deck.json").is_file(),
+            "экспорт перенесён"
+        );
     }
 
     #[test]

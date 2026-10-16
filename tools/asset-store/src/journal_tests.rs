@@ -351,6 +351,40 @@ fn recovery_describes_the_surviving_record_of_an_overlap() {
 }
 
 #[test]
+fn a_retry_after_a_refusal_starts_a_new_intent() {
+    let fixture = Fixture::new("asset-store-journal-retry-intent");
+    let identity = AssetIdentity::new("kanji", "日").unwrap();
+    fixture.store.fail_next_manifest_write();
+    let error = fixture.publish(&identity, CANDIDATE_BYTES).unwrap_err();
+    assert!(failed_publish(&error), "{error:?}");
+
+    // Состояние записи не изменилось, поэтому повторная попытка повторяет
+    // материал интента: он обязан остаться новым событием, а не закрыться
+    // вторым результатом того же перехода.
+    let outcome = fixture.publish(&identity, CANDIDATE_BYTES).unwrap();
+    assert_eq!(
+        outcome.asset.as_ref().unwrap().lifecycle,
+        LifecycleState::Verified
+    );
+
+    let events = fixture.events();
+    let intents: Vec<_> = events
+        .iter()
+        .filter(|event| event.is_pending_intent())
+        .collect();
+    assert_eq!(intents.len(), 2, "каждая попытка публикации — свой интент");
+    for intent in intents {
+        let closings: Vec<_> = events
+            .iter()
+            .filter(|event| event.intent_id.as_deref() == Some(intent.event_id.as_str()))
+            .collect();
+        assert_eq!(closings.len(), 1, "интент закрыт ровно один раз");
+    }
+    let check = fixture.store.journal_check().unwrap();
+    assert!(check.is_clean(), "{:?}", check.problems);
+}
+
+#[test]
 fn audit_events_distinguish_publication_refusal_and_reuse() {
     let fixture = Fixture::new("asset-store-journal-audit");
     let published_identity = AssetIdentity::new("kanji", "日").unwrap();

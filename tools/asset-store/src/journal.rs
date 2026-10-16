@@ -13,9 +13,9 @@
 //! ни один worker пакета не обращается к журналу, поэтому многоворкерное получение
 //! не замедляется.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,12 +37,39 @@ pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 pub const STORE_WIDE_IDENTITY: &str = "*";
 
 /// Верхняя граница читаемого журнала: защита от неограниченного чтения.
+///
+/// Предел ограничивает только полное чтение событий. Дописыванию нужны лишь
+/// ключи уже записанных событий и номер последнего, поэтому журнал больше
+/// предела продолжает принимать события, а команды, читающие историю целиком,
+/// сообщают `journal_too_large`.
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 /// Верхняя граница сохраняемой технической причины.
 const MAX_REASON_CHARS: usize = 400;
 /// Разделитель компонентов ключа идемпотентности: управляющий символ не встречается
 /// ни в одном доменном значении.
 const FIELD_SEPARATOR: char = '\u{1f}';
+
+#[cfg(test)]
+thread_local! {
+    /// Пониженный предел чтения для проверки поведения на большом журнале.
+    static MAX_JOURNAL_BYTES_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Предел полного чтения журнала.
+fn max_journal_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(limit) = MAX_JOURNAL_BYTES_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_JOURNAL_BYTES
+}
+
+/// Понижает предел чтения журнала на время теста.
+#[cfg(test)]
+pub(crate) fn set_max_journal_bytes_for_test(limit: Option<u64>) {
+    MAX_JOURNAL_BYTES_OVERRIDE.with(|cell| cell.set(limit));
+}
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -366,13 +393,15 @@ impl JournalDraft {
 
     /// Ключ идемпотентности события.
     ///
-    /// В материал входит `outcome`: интент и закрывающее его событие результата
-    /// описывают один и тот же переход одной и той же записи, и при неизменном
-    /// состоянии (отказ до фиксации) их ключи иначе совпали бы, а закрывающее
-    /// событие было бы отброшено как дубликат интента.
+    /// В материал входят `outcome` и `intent_id`: интент и закрывающее его
+    /// событие результата описывают один и тот же переход одной и той же записи,
+    /// и при неизменном состоянии (отказ до фиксации) их ключи иначе совпали бы,
+    /// а закрывающее событие было бы отброшено как дубликат интента. `intent_id`
+    /// разделяет повторные попытки одного перехода: после отказа следующая
+    /// попытка — это новый интент со своим результатом, а не повтор прежнего.
     pub fn event_key(&self) -> String {
         let material = format!(
-            "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
+            "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
             self.domain,
             self.namespace,
             self.identity,
@@ -382,6 +411,7 @@ impl JournalDraft {
             self.new_sha256.as_deref().unwrap_or("-"),
             self.manifest_revision
                 .map_or_else(|| "-".to_owned(), |revision| revision.to_string()),
+            self.intent_id.as_deref().unwrap_or("-"),
             sep = FIELD_SEPARATOR,
         );
         sha256_hex(material.as_bytes())
@@ -422,6 +452,9 @@ struct JournalState {
     last_seq: u64,
     file_size: u64,
     file_modified: Option<SystemTime>,
+    /// Журнал больше предела полного чтения: события не удержаны в памяти, но
+    /// ключи, номер последнего события и оборванный хвост посчитаны.
+    events_omitted: bool,
 }
 
 /// Открытый журнал одного хранилища.
@@ -464,6 +497,7 @@ impl Journal {
     pub fn read(&mut self) -> Result<JournalRead, AssetError> {
         self.refresh()?;
         match &self.state {
+            Some(state) if state.events_omitted => Err(journal_too_large_error(state.file_size)),
             Some(state) => Ok(JournalRead {
                 events: state.events.clone(),
                 torn_tail: state.torn_tail,
@@ -481,22 +515,45 @@ impl Journal {
     /// Дописывает событие и возвращает его; для дубликата возвращается уже
     /// записанное событие, чтобы вызывающий код мог сослаться на его `event_id`.
     pub fn append_and_return(&mut self, draft: &JournalDraft) -> Result<JournalEvent, AssetError> {
-        Ok(self.append_inner(draft)?.0)
+        match self.append_inner(draft)? {
+            (Some(event), _) => Ok(event),
+            // Сюда попадает только дубликат интента в журнале больше предела
+            // чтения: интенты дубликатами не считаются, поэтому их `event_id`
+            // всегда доступен. Состояние диагностируется явно, а не выдуманным
+            // событием.
+            (None, _) => Err(AssetError::new(
+                ErrorCode::JournalTooLarge,
+                "событие уже записано, но журнал превышает предел чтения: его event_id недоступен",
+            )),
+        }
     }
 
-    fn append_inner(&mut self, draft: &JournalDraft) -> Result<(JournalEvent, bool), AssetError> {
+    fn append_inner(
+        &mut self,
+        draft: &JournalDraft,
+    ) -> Result<(Option<JournalEvent>, bool), AssetError> {
         self.refresh()?;
         let event_key = draft.event_key();
-        // `state.keys` уже хранит ключи всех событий: линейный поиск по списку
-        // нужен только тогда, когда дубликат действительно есть.
-        if let Some(state) = self.state.as_ref()
-            && state.keys.contains(&event_key)
-            && let Some(existing) = state
-                .events
-                .iter()
-                .find(|event| event.event_key == event_key)
+        // Интенты не считаются дубликатами: повторная попытка того же перехода —
+        // это новое событие, и закрывать своим результатом чужой интент нельзя.
+        if draft.outcome != JournalOutcome::Pending
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.keys.contains(&event_key))
         {
-            return Ok((existing.clone(), false));
+            // `state.keys` уже хранит ключи всех событий: линейный поиск по списку
+            // нужен только тогда, когда дубликат действительно есть. В журнале
+            // больше предела чтения события не удержаны, и повтор просто
+            // пропускается: он уже записан.
+            let existing = self.state.as_ref().and_then(|state| {
+                state
+                    .events
+                    .iter()
+                    .find(|event| event.event_key == event_key)
+                    .cloned()
+            });
+            return Ok((existing, false));
         }
         let last_seq = self.state.as_ref().map_or(0, |state| state.last_seq);
         let seq = last_seq.checked_add(1).ok_or_else(|| {
@@ -563,9 +620,11 @@ impl Journal {
             state.torn_tail = false;
             state.file_size = file_size;
             state.file_modified = file_modified;
-            state.events.push(event.clone());
+            if !state.events_omitted {
+                state.events.push(event.clone());
+            }
         }
-        Ok((event, true))
+        Ok((Some(event), true))
     }
 
     fn build_event(
@@ -689,11 +748,26 @@ impl Journal {
         {
             return Ok(());
         }
-        if size > MAX_JOURNAL_BYTES {
-            return Err(AssetError::new(
-                ErrorCode::ManifestCorrupt,
-                format!("журнал превышает допустимый размер {MAX_JOURNAL_BYTES} байт"),
-            ));
+        if size > max_journal_bytes() {
+            // Полное чтение удержало бы в памяти сотни тысяч событий, поэтому
+            // журнал обходится потоково: для дописывания достаточно ключей уже
+            // записанных событий и номера последнего. Команды, читающие историю
+            // целиком, в этом состоянии сообщают `journal_too_large`.
+            let Some(mut file) = file else {
+                return Err(journal_too_large_error(size));
+            };
+            let scan = scan_events(&mut file)?;
+            self.state = Some(JournalState {
+                events: Vec::new(),
+                keys: scan.keys,
+                torn_tail: scan.torn_tail,
+                corrupt_lines: Vec::new(),
+                last_seq: scan.last_seq,
+                file_size: size,
+                file_modified: modified,
+                events_omitted: true,
+            });
+            return Ok(());
         }
         let bytes = match file {
             Some(mut file) => {
@@ -718,6 +792,7 @@ impl Journal {
             last_seq,
             file_size: size,
             file_modified: modified,
+            events_omitted: false,
         });
         Ok(())
     }
@@ -782,6 +857,30 @@ pub fn check(read: &JournalRead, manifest_revision_max: u64) -> JournalCheck {
         .iter()
         .filter_map(|event| event.intent_id.as_deref())
         .collect();
+    // Интент закрывается ровно одним событием результата: два закрытия означают,
+    // что повторная попытка сослалась на чужой интент или результат записан
+    // дважды, и по журналу нельзя восстановить исход перехода.
+    let mut closings: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for event in &read.events {
+        if let Some(intent_id) = event.intent_id.as_deref() {
+            closings.entry(intent_id).or_default().push(event.seq);
+        }
+    }
+    for event in read.events.iter().filter(|event| event.is_pending_intent()) {
+        if let Some(seqs) = closings.get(event.event_id.as_str())
+            && seqs.len() > 1
+        {
+            let listed = seqs
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            problems.push(format!(
+                "интент seq={} закрыт более чем одним событием результата: seq {listed}",
+                event.seq
+            ));
+        }
+    }
     let open_intents: Vec<JournalOpenIntent> = read
         .events
         .iter()
@@ -843,6 +942,55 @@ pub fn revision_bound(canonical: &Manifest, runtime: &Manifest) -> u64 {
     canonical.revision.saturating_add(runtime.revision)
 }
 
+/// Итог потокового обхода журнала.
+#[derive(Debug, Default)]
+struct JournalScan {
+    keys: BTreeSet<String>,
+    last_seq: u64,
+    torn_tail: bool,
+}
+
+/// Обходит журнал построчно, удерживая только ключи событий.
+fn scan_events(file: &mut File) -> Result<JournalScan, AssetError> {
+    let mut reader = BufReader::new(file);
+    let mut scan = JournalScan::default();
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        let read = reader
+            .read_until(b'\n', &mut buffer)
+            .map_err(|error| AssetError::io("не удалось прочитать журнал", error))?;
+        if read == 0 {
+            break;
+        }
+        let terminated = buffer.last() == Some(&b'\n');
+        if !terminated {
+            scan.torn_tail = true;
+        }
+        let line = if terminated {
+            &buffer[..buffer.len() - 1]
+        } else {
+            &buffer[..]
+        };
+        if let Some(event) = parse_event(line) {
+            scan.last_seq = scan.last_seq.max(event.seq);
+            scan.keys.insert(event.event_key);
+        }
+        if !terminated {
+            break;
+        }
+    }
+    Ok(scan)
+}
+
+/// Разбирает одну строку журнала в событие.
+fn parse_event(line: &[u8]) -> Option<JournalEvent> {
+    match serde_json::from_slice::<JournalEvent>(line) {
+        Ok(event) if event.schema_version == JOURNAL_SCHEMA_VERSION && event.seq > 0 => Some(event),
+        _ => None,
+    }
+}
+
 fn parse_events(bytes: &[u8]) -> (Vec<JournalEvent>, bool, Vec<u64>) {
     if bytes.is_empty() {
         return (Vec::new(), false, Vec::new());
@@ -851,7 +999,7 @@ fn parse_events(bytes: &[u8]) -> (Vec<JournalEvent>, bool, Vec<u64>) {
     let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
     // Последний элемент — либо пустой хвост после завершающего перевода строки,
     // либо оборванная запись, которая не считается событием.
-    lines.pop();
+    let tail = lines.pop().unwrap_or_default();
     let torn_tail = !ends_with_newline;
     let mut events = Vec::new();
     let mut corrupt_lines = Vec::new();
@@ -861,14 +1009,37 @@ fn parse_events(bytes: &[u8]) -> (Vec<JournalEvent>, bool, Vec<u64>) {
             corrupt_lines.push(number);
             continue;
         }
-        match serde_json::from_slice::<JournalEvent>(line) {
-            Ok(event) if event.schema_version == JOURNAL_SCHEMA_VERSION && event.seq > 0 => {
-                events.push(event);
-            }
-            _ => corrupt_lines.push(number),
+        match parse_event(line) {
+            Some(event) => events.push(event),
+            None => corrupt_lines.push(number),
+        }
+    }
+    if torn_tail && !tail.is_empty() {
+        // Запись без завершающего перевода строки, но целиком разобранная,
+        // остаётся событием: иначе следующее событие получило бы тот же `seq`,
+        // а журнал навсегда остался бы с нарушенной нумерацией.
+        if let Some(event) = parse_event(tail) {
+            events.push(event);
         }
     }
     (events, torn_tail, corrupt_lines)
+}
+
+/// Ошибка полного чтения журнала, превысившего предел.
+fn journal_too_large_error(size: u64) -> AssetError {
+    AssetError::with_details(
+        ErrorCode::JournalTooLarge,
+        format!(
+            "журнал занимает {size} байт и превышает предел полного чтения {} байт: \
+             история доступна только дописыванием, а для полного чтения журнал нужно \
+             заархивировать",
+            max_journal_bytes()
+        ),
+        serde_json::json!({
+            "journal_bytes": size,
+            "max_journal_bytes": max_journal_bytes(),
+        }),
+    )
 }
 
 fn sanitize_reason(reason: &str) -> String {
@@ -995,6 +1166,81 @@ mod tests {
         assert!(!read.torn_tail);
         assert!(read.corrupt_lines.is_empty());
         assert_eq!(read.events, vec![first, second]);
+    }
+
+    #[test]
+    fn a_journal_over_the_read_limit_still_accepts_events() {
+        let fixture = Fixture::new();
+        let completed = draft(JournalOperation::VerifiedReused, JournalOutcome::Completed);
+        let mut journal = fixture.journal();
+        assert!(
+            journal.append(&completed).expect("первое событие записано"),
+            "первое событие новое"
+        );
+        drop(journal);
+
+        // Предел ниже одного события, а перезапуск CLI — это новое чтение:
+        // история целиком недоступна, но дописывание обязано работать.
+        set_max_journal_bytes_for_test(Some(1));
+        let mut reopened = fixture.journal();
+        let duplicate = reopened.append(&completed).expect("дубликат обработан");
+        assert!(
+            !duplicate,
+            "повтор события распознаётся по ключу без удержания событий"
+        );
+        // Интент не считается дубликатом: его event_id нужен закрывающему событию.
+        let intent = reopened
+            .append_and_return(&draft(
+                JournalOperation::CandidateWritten,
+                JournalOutcome::Pending,
+            ))
+            .expect("интент записан");
+        assert_eq!(intent.seq, 2);
+        assert_eq!(fixture.read_events().len(), 2);
+
+        let error = reopened.read().expect_err("история целиком недоступна");
+        assert_eq!(error.code, ErrorCode::JournalTooLarge);
+        assert!(error.details["journal_bytes"].as_u64().is_some());
+        assert_eq!(error.details["max_journal_bytes"].as_u64(), Some(1));
+        set_max_journal_bytes_for_test(None);
+    }
+
+    #[test]
+    fn a_complete_event_without_the_final_newline_stays_an_event() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        journal
+            .append_and_return(&draft(
+                JournalOperation::CandidateWritten,
+                JournalOutcome::Pending,
+            ))
+            .expect("интент записан");
+
+        // Сбой записи потерял только завершающий перевод строки: событие записано
+        // целиком и обязано остаться событием, иначе следующее получит тот же seq.
+        let mut bytes = fs::read(fixture.events_file()).expect("журнал прочитан");
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(fixture.events_file(), &bytes).expect("хвост без перевода строки");
+
+        let mut reopened = fixture.journal();
+        let read = reopened.read().expect("журнал перечитывается");
+        assert!(read.torn_tail, "оборванный хвост диагностируется");
+        assert_eq!(read.events.len(), 1, "разобранная запись остаётся событием");
+        assert!(read.corrupt_lines.is_empty());
+
+        let next = journal
+            .append(&draft(
+                JournalOperation::VerifiedReused,
+                JournalOutcome::Completed,
+            ))
+            .expect("следующее событие записано");
+        assert!(next);
+        let seqs: Vec<u64> = fixture
+            .read_events()
+            .iter()
+            .map(|event| event.seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2], "нумерация продолжается, а не повторяется");
     }
 
     #[test]
@@ -1137,6 +1383,30 @@ mod tests {
         );
         assert_eq!(check.open_intents.len(), 1);
         assert_eq!(check.open_intents[0].seq, 1);
+    }
+
+    #[test]
+    fn check_reports_an_intent_with_two_closing_events() {
+        let read = JournalRead {
+            events: vec![
+                event(1, "id-1", None, JournalOutcome::Pending),
+                event(2, "id-2", Some("id-1"), JournalOutcome::Refused),
+                event(3, "id-3", Some("id-1"), JournalOutcome::Completed),
+            ],
+            torn_tail: false,
+            corrupt_lines: Vec::new(),
+        };
+        let check = check(&read, 5);
+        assert!(!check.is_clean());
+        assert!(
+            check
+                .problems
+                .iter()
+                .any(|problem| problem.contains("более чем одним событием результата")),
+            "двойное закрытие обнаружено: {:?}",
+            check.problems
+        );
+        assert!(check.open_intents.is_empty(), "интент считается закрытым");
     }
 
     #[test]
