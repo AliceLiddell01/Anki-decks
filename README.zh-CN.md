@@ -118,7 +118,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 
 - [`anki-repo` — 检查、质量保证、受限修改与可视化报告](tools/anki-repo/README.md)
 - [`asset-store` 与 `kanji-assets` — 资源生命周期与验证](tools/asset-store/README.md)
-- [`repository-maintenance` — 磁盘内容盘点与安全垃圾回收](tools/repository-maintenance/README.md)
+- [`repository-maintenance` — 磁盘内容盘点与安全垃圾回收](tools/repository-maintenance/README.zh-CN.md)
 
 ## 工具
 
@@ -147,7 +147,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 
 专为 Linux/WSL 设计的独立工具，负责盘点 Cargo 的 `target` 目录、归项目所有的外部构建缓存，以及 `/tmp` 下的所有内容。`scan` 只统计占用情况；`clean` 默认使用 `dry-run`，实际写入必须传入 `--apply`。不属于本工具管理或来源不明的临时条目只会显示在报告中，不会被删除。
 
-[查看策略、来源审计、命令及限制 →](tools/repository-maintenance/README.md)
+[查看策略、来源审计、命令及限制 →](tools/repository-maintenance/README.zh-CN.md)
 
 ### `asset-store` / `kanji-assets`
 

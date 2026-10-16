@@ -118,7 +118,7 @@ Detailed commands and machine-readable contracts are documented in the tool-spec
 
 - [`anki-repo` — inspection, QA, constrained changes, and visual reports](tools/anki-repo/README.md)
 - [`asset-store` and `kanji-assets` — asset lifecycle and verification](tools/asset-store/README.md)
-- [`repository-maintenance` — disk inventory and safe garbage collection](tools/repository-maintenance/README.md)
+- [`repository-maintenance` — disk inventory and safe garbage collection](tools/repository-maintenance/README.en.md)
 
 ## Tools
 
@@ -147,7 +147,7 @@ All mutating commands run in `dry-run` mode by default and write only after vali
 
 A separate Linux/WSL utility that accounts for Cargo `target` directories, project-owned external build caches, and all entries under `/tmp`. `scan` only measures usage; `clean` defaults to `dry-run` and requires `--apply` to write. Unowned and unknown temporary files are reported but never deleted.
 
-[Policy, source audit, commands, and limitations →](tools/repository-maintenance/README.md)
+[Policy, source audit, commands, and limitations →](tools/repository-maintenance/README.en.md)
 
 ### `asset-store` / `kanji-assets`
 
