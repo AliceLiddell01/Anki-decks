@@ -2,6 +2,8 @@
 
 # Anki Deck Toolkit — инструменты для Anki и CrowdAnki JSON
 
+**Русский** · [English](README.en.md) · [简体中文](README.zh-CN.md)
+
 **Rust CLI для анализа, проверки, точечного редактирования и визуального сравнения экспортов CrowdAnki JSON.**
 
 [![Проверки репозитория](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml)
