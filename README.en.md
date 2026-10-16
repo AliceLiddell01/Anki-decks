@@ -4,6 +4,8 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
+<!-- i18n-source-git-blob: a8fdb96a13158e6f1828e0a58f4717180c5d9e4b -->
+
 **Rust CLI tools for inspecting and validating CrowdAnki JSON exports, making targeted edits, and visually comparing versions.**
 
 [![Repository checks](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml)

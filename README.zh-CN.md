@@ -4,6 +4,8 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
+<!-- i18n-source-git-blob: a8fdb96a13158e6f1828e0a58f4717180c5d9e4b -->
+
 **基于 Rust 的命令行工具，用于检查、验证、定向修改和可视化对比 CrowdAnki JSON 导出数据。**
 
 [![仓库检查](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml)
