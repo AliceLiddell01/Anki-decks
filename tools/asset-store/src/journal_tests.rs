@@ -291,6 +291,38 @@ fn a_standard_refusal_closes_its_intent_with_a_reason() {
 }
 
 #[test]
+fn an_error_after_the_canonical_commit_leaves_the_intent_to_reconciliation() {
+    let fixture = Fixture::new("asset-store-journal-after-commit");
+    let identity = AssetIdentity::new("kanji", "日").unwrap();
+    fixture.ingest_candidate(&identity, CANDIDATE_BYTES);
+    FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.set(true));
+    let error = fixture.publish(&identity, CANDIDATE_BYTES).unwrap_err();
+    assert!(failed_publish(&error), "{error:?}");
+
+    // Канонический манифест уже содержит проверенную запись, поэтому отказ с
+    // прежними фактами был бы ложью о состоянии хранилища.
+    let events = fixture.events_for(&identity);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.outcome == JournalOutcome::Refused),
+        "переход зафиксировал запись: закрывать интент отказом нельзя"
+    );
+    assert_eq!(
+        fixture.store.journal_check().unwrap().open_intents.len(),
+        1,
+        "интент ждёт сверки"
+    );
+
+    // Сверка разбирает его по фактическому состоянию манифеста.
+    let appended = fixture.store.reconcile_journal().unwrap();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(appended[0].outcome, JournalOutcome::Recovered);
+    assert_eq!(appended[0].new_lifecycle.as_deref(), Some("verified"));
+    assert!(fixture.store.journal_check().unwrap().is_clean());
+}
+
+#[test]
 fn audit_events_distinguish_publication_refusal_and_reuse() {
     let fixture = Fixture::new("asset-store-journal-audit");
     let published_identity = AssetIdentity::new("kanji", "日").unwrap();

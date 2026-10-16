@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -673,7 +674,7 @@ fn apply_entries(
 
     fs::create_dir_all(output).map_err(|error| io_error(output, "create_output_dir", &error))?;
 
-    let needed: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let needed = bytes_to_copy(entries, output)?;
     let available = available_bytes(output)?;
     if available < needed {
         return Err(DomainError::with_details(
@@ -885,6 +886,29 @@ fn prune_legacy_placeholders(
         }
     }
     Ok((removed, None))
+}
+
+/// Объём, который действительно будет скопирован в назначение.
+///
+/// Перенос в пределах одной файловой системы выполняется одним `rename` и места
+/// не требует, а уже существующее назначение только снимает источник. Поэтому
+/// свободное место считается только по тем записям, которые пройдут через
+/// [`copy_export`] при `CrossesDevices`, а не по полному объёму миграции.
+fn bytes_to_copy(entries: &[ExportPlan], output: &Path) -> Result<u64, DomainError> {
+    let output_device = device_of(output)?;
+    let mut needed = 0_u64;
+    for entry in entries.iter().filter(|entry| entry.action == "move") {
+        if device_of(&entry.source_path)? != output_device {
+            needed = needed.saturating_add(entry.bytes);
+        }
+    }
+    Ok(needed)
+}
+
+/// Устройство файловой системы, на которой лежит путь.
+fn device_of(path: &Path) -> Result<u64, DomainError> {
+    let metadata = fs::metadata(path).map_err(|error| io_error(path, "read_metadata", &error))?;
+    Ok(metadata.dev())
 }
 
 /// Свободное место на файловой системе каталога.
@@ -1193,6 +1217,56 @@ mod tests {
         );
         assert!(root.join("decks/other/WORDS__a/deck.json").is_file());
         assert!(!root.join("decks/output").exists());
+    }
+
+    #[test]
+    fn a_refused_apply_is_reported_as_a_refusal_in_human_output() {
+        let (_dir, root) = repository("layout-human-refused");
+        write_export(&root, "decks/words/Words__A", b"a");
+        write_export(&root, "decks/other/WORDS__a", b"b");
+
+        let report = migrate(Some(&root), true).expect("план");
+        assert!(report.refused);
+
+        let human = crate::render::human::migrate_layout(&report);
+        assert!(
+            human.contains("перенос отклонён целиком"),
+            "отказ обязан называться отказом: {human}"
+        );
+        assert!(
+            !human.contains("перенос не требовался"),
+            "отвергнутый план — не отсутствие работы: {human}"
+        );
+    }
+
+    #[test]
+    fn a_same_device_move_needs_no_free_space() {
+        let (_dir, root) = repository("layout-space");
+        let source = write_export(&root, "decks/words/Words__A", &vec![7_u8; 4096]);
+        let output = root.join("decks/output");
+        fs::create_dir_all(&output).expect("каталог назначения");
+
+        let entry = |action: &'static str| ExportPlan {
+            name: Some("Words__A".to_owned()),
+            source: "decks/words/Words__A".to_owned(),
+            target: Some("decks/output/Words__A".to_owned()),
+            action,
+            state: "planned",
+            files: 2,
+            bytes: 4096,
+            content_sha256: None,
+            reason: None,
+            message: None,
+            source_path: source.clone(),
+            target_path: Some(output.join("Words__A")),
+            manifest: None,
+        };
+
+        // Перенос внутри одной файловой системы идёт одним `rename`, а уже
+        // существующее назначение только снимает источник: свободное место
+        // нужно только для копирования между файловыми системами.
+        let entries = vec![entry("move"), entry("already_present")];
+        assert_eq!(bytes_to_copy(&entries, &output).expect("объём"), 0);
     }
 
     #[test]

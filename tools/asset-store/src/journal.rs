@@ -487,14 +487,16 @@ impl Journal {
     fn append_inner(&mut self, draft: &JournalDraft) -> Result<(JournalEvent, bool), AssetError> {
         self.refresh()?;
         let event_key = draft.event_key();
-        if let Some(existing) = self.state.as_ref().and_then(|state| {
-            state
+        // `state.keys` уже хранит ключи всех событий: линейный поиск по списку
+        // нужен только тогда, когда дубликат действительно есть.
+        if let Some(state) = self.state.as_ref()
+            && state.keys.contains(&event_key)
+            && let Some(existing) = state
                 .events
                 .iter()
                 .find(|event| event.event_key == event_key)
-                .cloned()
-        }) {
-            return Ok((existing, false));
+        {
+            return Ok((existing.clone(), false));
         }
         let last_seq = self.state.as_ref().map_or(0, |state| state.last_seq);
         let seq = last_seq.checked_add(1).ok_or_else(|| {
@@ -737,6 +739,14 @@ pub fn check(read: &JournalRead, manifest_revision_max: u64) -> JournalCheck {
         problems.push(format!("строка {line} журнала не разбирается"));
     }
 
+    // Множество всех `event_id` собирается один раз: журнал только дополняется и
+    // растёт до сотен тысяч событий, поэтому поиск `intent_id` по списку на
+    // каждом событии дал бы квадратичное время.
+    let known_ids: BTreeSet<&str> = read
+        .events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect();
     let mut seen_ids = BTreeSet::new();
     for (index, event) in read.events.iter().enumerate() {
         let expected = index as u64 + 1;
@@ -750,10 +760,7 @@ pub fn check(read: &JournalRead, manifest_revision_max: u64) -> JournalCheck {
             problems.push(format!("event_id {} повторяется", event.event_id));
         }
         if let Some(intent_id) = &event.intent_id
-            && !read
-                .events
-                .iter()
-                .any(|candidate| &candidate.event_id == intent_id)
+            && !known_ids.contains(intent_id.as_str())
         {
             problems.push(format!(
                 "событие seq={} ссылается на отсутствующий intent_id {intent_id}",

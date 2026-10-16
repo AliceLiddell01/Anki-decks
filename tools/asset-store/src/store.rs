@@ -2139,12 +2139,49 @@ impl AssetStore {
         self.record_journal(draft)
     }
 
+    /// Совпадает ли фактическое состояние записи с прежним состоянием интента.
+    ///
+    /// Тело перехода может отказать уже после фиксации манифеста, поэтому исход
+    /// определяется фактическими записями, а не самим фактом ошибки. Проверяются
+    /// обе области: запись, оставшаяся в `.runtime` или уже попавшая в
+    /// канонический манифест, — это изменение состояния, а не прежнее состояние.
+    fn intent_state_unchanged(
+        &self,
+        identity: &AssetIdentity,
+        intent: &JournalEvent,
+    ) -> Result<bool, AssetError> {
+        let canonical = load_manifest(&self.root_handle)?;
+        let runtime = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        let mut present = false;
+        for record in canonical.assets.iter().chain(runtime.assets.iter()) {
+            if record.identity.namespace != identity.namespace
+                || record.identity.key != identity.key
+            {
+                continue;
+            }
+            present = true;
+            if Some(record.sha256.as_str()) != intent.previous_sha256.as_deref()
+                || Some(record.lifecycle.as_str()) != intent.previous_lifecycle.as_deref()
+            {
+                return Ok(false);
+            }
+        }
+        if present {
+            return Ok(true);
+        }
+        // Записи нет вовсе: это прежнее состояние только тогда, когда его и
+        // описывал интент.
+        Ok(intent.previous_sha256.is_none() && intent.previous_lifecycle.is_none())
+    }
+
     /// Обрамляет изменение состояния двумя событиями журнала: интентом до него и
     /// результатом после.
     ///
     /// Штатный отказ закрывает интент событием `Refused`, поэтому обычная работа
-    /// висящих интентов не оставляет. Если процесс умер между фиксацией и
-    /// закрывающим событием, интент разбирает [`Self::reconcile_journal`].
+    /// висящих интентов не оставляет. Отказ тела перехода после уже выполненной
+    /// фиксации — не отказ: интент остаётся открытым, и его разбирает
+    /// [`Self::reconcile_journal`]. Так же разбирается интент, оставшийся после
+    /// смерти процесса между фиксацией и закрывающим событием.
     fn journal_transition<T>(
         &self,
         intent: JournalDraft,
@@ -2171,16 +2208,29 @@ impl AssetStore {
                 Ok(value)
             }
             Err(error) => {
+                // Тело перехода могло отказать уже после фиксации манифеста:
+                // исход определяется фактическим состоянием, а не самим фактом
+                // ошибки. Отказ с прежними фактами записывается только тогда,
+                // когда прежнее состояние действительно сохранилось; иначе
+                // интент остаётся открытым для сверки. Ошибка чтения манифеста
+                // тоже оставляет интент открытым — неизвестное состояние не
+                // выдаётся за отказ.
+                //
                 // Ошибка записи самого журнала не подменяет исходную ошибку
                 // операции: незакрытый интент разберёт сверка.
-                let _ = self.close_journal_intent(
-                    &intent_event,
-                    operation,
-                    identity,
-                    JournalOutcome::Refused,
-                    &JournalStateFacts::unchanged(&intent_event),
-                    Some(&error.message),
-                );
+                if self
+                    .intent_state_unchanged(identity, &intent_event)
+                    .unwrap_or(false)
+                {
+                    let _ = self.close_journal_intent(
+                        &intent_event,
+                        operation,
+                        identity,
+                        JournalOutcome::Refused,
+                        &JournalStateFacts::unchanged(&intent_event),
+                        Some(&error.message),
+                    );
+                }
                 Err(error)
             }
         }

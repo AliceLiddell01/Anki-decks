@@ -1539,7 +1539,9 @@ pub fn migrate_layout(result: &MigrationReport) -> String {
         result.legacy_area, result.output_dir
     ));
     out.line(if result.apply {
-        if result.applied {
+        if result.refused {
+            "Режим: --apply, перенос отклонён целиком".to_string()
+        } else if result.applied {
             "Режим: --apply, перенос выполнен".to_string()
         } else {
             "Режим: --apply, перенос не требовался".to_string()

@@ -49,9 +49,10 @@ assert_included() {
 }
 
 # Пользовательские данные не публикуются через Git — ни целиком, ни частично.
-# Whitelist-исключений внутри этих трёх областей нет: игнорируется всё, включая
+# Whitelist-исключений внутри этих областей нет: игнорируется всё, включая
 # owner-маркер, манифест, байты ресурсов, локальное состояние `.runtime` и
-# приватный журнал операций.
+# приватный журнал операций. Имена экспортов здесь синтетические: проверка
+# принадлежит `.gitignore`, а не составу рабочих колод пользователя.
 ignored_paths=(
   '.asset-store/kanji/.owner.json'
   '.asset-store/kanji/manifest.json'
@@ -73,9 +74,12 @@ ignored_paths=(
   '.asset-store/pitch-accent/.lock'
   'decks/input/raw/anything.json'
   'decks/input/nested/deeper/file.bin'
-  'decks/output/Words__N5/deck.json'
-  'decks/output/Words__N5/media/漢.gif'
-  'decks/output/Words__N5/nested/deeper/file.txt'
+  'decks/output/example-export/deck.json'
+  'decks/output/example-export/media/漢.gif'
+  'decks/output/example-export/nested/deeper/file.txt'
+  # Прежняя раскладка с каталогами группировки — тоже пользовательские данные,
+  # хотя и не `decks/input/` или `decks/output/`.
+  'decks/legacy/words/example-export/deck.json'
 )
 
 directory_paths=(
@@ -86,7 +90,8 @@ directory_paths=(
   'decks/input/'
   'decks/input/nested/'
   'decks/output/'
-  'decks/output/Words__N5/'
+  'decks/output/example-export/'
+  'decks/legacy/'
 )
 
 # Контрольные пути вне пользовательских областей. Без них проверка была бы
@@ -121,7 +126,7 @@ done
 # только контрольные пути.
 git -C "$tmp_repo" add -A
 tracked="$(git -C "$tmp_repo" ls-files)"
-leaked="$(printf '%s\n' "$tracked" | grep -E '^(decks/(input|output)/|\.asset-store/)' || true)"
+leaked="$(printf '%s\n' "$tracked" | grep -E '^(decks/|\.asset-store/)' || true)"
 if [[ -n "$leaked" ]]; then
   printf 'ОШИБКА: пользовательские данные попали в индекс:\n%s\n' "$leaked" >&2
   exit 1
@@ -134,5 +139,5 @@ for path in "${included_paths[@]}"; do
   fi
 done
 
-printf 'Проверка .gitignore пройдена: %s игнорируемых путей и %s игнорируемых каталогов внутри `decks/input/`, `decks/output/` и `.asset-store/`; индекс содержит только %s контрольных путей.\n' \
+printf 'Проверка .gitignore пройдена: %s игнорируемых путей и %s игнорируемых каталогов внутри `decks/` и `.asset-store/`; индекс содержит только %s контрольных путей.\n' \
   "${#ignored_paths[@]}" "${#directory_paths[@]}" "${#included_paths[@]}"

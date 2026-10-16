@@ -2,10 +2,12 @@
 """Guard: user data must never be tracked by Git (stdlib only).
 
 Пользовательские данные репозитория — локальные колоды и локальное доверенное
-хранилище ресурсов — живут в трёх игнорируемых областях:
+хранилище ресурсов — живут в игнорируемых Git областях:
 
-* ``decks/input/``   — закрытая область будущего доверенного загрузчика;
-* ``decks/output/``  — плоский список рабочих локальных колод;
+* ``decks/``         — пользовательские данные целиком: ``decks/input/`` —
+  закрытая область будущего доверенного загрузчика, ``decks/output/`` —
+  плоский список рабочих локальных колод. Отслеживаемым внутри ``decks/``
+  не может быть ни один путь, а не только эти две подобласти;
 * ``.asset-store/``  — локальное доверенное хранилище ресурсов.
 
 ``.gitignore`` сам по себе не защищает: он не отменяет уже добавленный индекс и
@@ -21,17 +23,12 @@ from pathlib import Path
 
 # Области, которые не могут быть отслеживаемыми ни при каких условиях.
 FORBIDDEN_PREFIXES = (
-    "decks/input/",
-    "decks/output/",
+    "decks/",
     ".asset-store/",
 )
 
-# Экспорт, лежащий в самом корне `decks/`, означал бы, что `decks/` целиком
-# является колодой, а не областью раскладки.
-FORBIDDEN_EXACT = ("decks/deck.json",)
-
 # Правила, которые обязаны присутствовать в корневом `.gitignore`.
-REQUIRED_IGNORE_RULES = ("/decks/input/", "/decks/output/", "/.asset-store/")
+REQUIRED_IGNORE_RULES = ("/decks/", "/.asset-store/")
 
 # Маркер повторного включения в `.gitignore`.
 NEGATION = "!"
@@ -46,7 +43,7 @@ def tracked_user_data(tracked_paths):
         # с точки, и вырезание множества символов уничтожило бы его имя.
         if normalized.startswith("./"):
             normalized = normalized[2:]
-        if normalized in FORBIDDEN_EXACT or normalized.startswith(FORBIDDEN_PREFIXES):
+        if normalized.startswith(FORBIDDEN_PREFIXES):
             violations.append(normalized)
     return violations
 

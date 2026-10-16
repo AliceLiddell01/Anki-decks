@@ -10,8 +10,7 @@ from check_local_data_untracked import (
 
 GITIGNORE = """
 # Пользовательские данные никогда не публикуются.
-/decks/input/
-/decks/output/
+/decks/
 /.asset-store/
 """
 
@@ -25,6 +24,11 @@ class TrackedUserDataTests(unittest.TestCase):
             ".asset-store/kanji/manifest.json",
             ".asset-store/kanji/assets/png/x.png",
             "decks/deck.json",
+            # Любой путь внутри `decks/` — пользовательские данные, а не только
+            # две названные подобласти: прежняя раскладка с каталогами
+            # группировки тоже не публикуется.
+            "decks/legacy/words/Words__N5/deck.json",
+            "decks/README.md",
         ]
         self.assertEqual(tracked_user_data(tracked), tracked)
 
@@ -32,7 +36,6 @@ class TrackedUserDataTests(unittest.TestCase):
         tracked = [
             "README.md",
             "tools/anki-repo/src/layout.rs",
-            "decks/README.md",
             "docs/asset-store.md",
             "tools/asset-store/src/store.rs",
         ]
@@ -58,7 +61,12 @@ class IgnoreRuleTests(unittest.TestCase):
     def test_missing_rule_is_reported(self):
         text = "/decks/input/\n/.asset-store/\n"
         problems = ignore_rule_problems(text)
-        self.assertTrue(any("/decks/output/" in problem for problem in problems))
+        self.assertTrue(any("/decks/" in problem for problem in problems))
+
+    def test_narrow_rule_does_not_cover_the_whole_area(self):
+        text = "/decks/input/\n/decks/output/\n/.asset-store/\n"
+        problems = ignore_rule_problems(text)
+        self.assertTrue(any("/decks/" in problem for problem in problems))
 
     def test_re_inclusion_is_reported(self):
         text = GITIGNORE + "!/.asset-store/kanji/manifest.json\n"

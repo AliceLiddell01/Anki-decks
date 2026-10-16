@@ -324,9 +324,11 @@ anki-repo migrate-layout --root . --apply --json     # повтор: summary.exp
   данных репозитория: регрессионные тесты `.github/scripts/test_*.py` и проверка
   метаданных и ссылок Agent Skills; затем `cargo fmt --all --check` и
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-- «Код и тесты» — `cargo test --workspace --locked --profile ci`,
-  проверки verified-only корпусов кандзи и pitch-accent, а также
-  структурная `validate` каждого найденного `decks/**/deck.json`.
+- «Код и тесты» — `cargo test --workspace --locked --profile ci`, а также
+  `python3 .github/scripts/check_local_data_untracked.py`: постоянная граница
+  пользовательских данных по фактическому индексу Git. Проверок содержимого
+  пользовательских областей здесь нет намеренно: в чистом clone их не существует,
+  а свой экспорт и свой корпус проверяются локально.
 - «Заявленная MSRV» — читает `rust_version` через Cargo metadata, требует
   единого значения у участников workspace и выполняет
   `cargo +<msrv> check --workspace --all-targets --all-features --locked`.
@@ -355,8 +357,8 @@ cargo test --workspace --locked
 дополнительно включает `--all-features`. Строгая локальная репетиция
 обязательного CI — те же команды с этими флагами.
 
-Содержимое пользовательских областей CI не проверяет: в чистом clone `decks/input/`,
-`decks/output/` и `.asset-store/` отсутствуют, и шаг, который «проверил» бы их
+Содержимое пользовательских областей CI не проверяет: в чистом clone `decks/`
+и `.asset-store/` отсутствуют, и шаг, который «проверил» бы их
 отсутствие, выдал бы пустоту за проверку личных данных. Свой экспорт проверяют
 локально (`anki-repo validate` по каталогу `decks/output/<имя_экспорта>`,
 `kanji-corpus-gate`, `pitch-corpus-gate`). Вместо этого CI постоянно проверяет
