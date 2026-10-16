@@ -3562,6 +3562,10 @@ fn reconcile_runtime_boundary(
         .filter(|asset| asset.lifecycle != LifecycleState::Verified)
         .cloned()
         .collect();
+    // Идентичности, перенесённые этим циклом, описываются одним событием:
+    // удаление их прежней записи ниже — часть того же переноса, а не отдельный
+    // прерванный переход.
+    let mut migrated_legacy: BTreeSet<AssetIdentity> = BTreeSet::new();
     for candidate in legacy_candidates {
         if local
             .assets
@@ -3581,6 +3585,7 @@ fn reconcile_runtime_boundary(
             policy,
             |root, manifest| save_manifest(root, manifest, false),
         )?;
+        migrated_legacy.insert(candidate.identity.clone());
         facts.push(RecoveryFact::new(
             candidate.identity.clone(),
             Some(candidate.sha256.clone()),
@@ -3610,16 +3615,21 @@ fn reconcile_runtime_boundary(
             && marker.identity == previous.identity
             && matches!(marker.target, TransitionTarget::Canonical)
         {
-            let target = canonical
+            let survivor = canonical
                 .assets
                 .iter()
-                .find(|asset| asset.identity == marker.identity);
-            if target.is_none_or(|asset| asset.sha256 != marker.sha256) {
+                .find(|asset| asset.identity == marker.identity)
+                .cloned();
+            if survivor
+                .as_ref()
+                .is_none_or(|asset| asset.sha256 != marker.sha256)
+            {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
                     "transition marker не совпадает с canonical asset",
                 ));
             }
+            let survivor = survivor.expect("совпадение проверено выше");
             let previous_runtime = local
                 .assets
                 .iter()
@@ -3632,22 +3642,32 @@ fn reconcile_runtime_boundary(
                     )
                 })?;
             remove_record_from_area(runtime, &mut local, &previous_runtime, policy)?;
+            // Идентичность остаётся живой записью в каноническом манифесте,
+            // поэтому событие описывает её фактическое состояние, а не удаление.
             facts.push(RecoveryFact::new(
                 previous_runtime.identity.clone(),
                 Some(previous_runtime.sha256.clone()),
-                None,
-                None,
+                Some(survivor.sha256.clone()),
+                Some(survivor.lifecycle),
                 "прерванный переход к канонической записи завершён: локальная запись удалена",
             ));
         } else {
             remove_record_from_area(root, &mut canonical, &previous, policy)?;
-            facts.push(RecoveryFact::new(
-                previous.identity.clone(),
-                Some(previous.sha256.clone()),
-                None,
-                None,
-                "прерванный переход к локальной записи завершён: опубликованная запись удалена",
-            ));
+            if !migrated_legacy.contains(&previous.identity) {
+                // Запись остаётся в `.runtime`, поэтому событие описывает её
+                // фактическое состояние в другой области.
+                let survivor = local
+                    .assets
+                    .iter()
+                    .find(|asset| asset.identity == previous.identity);
+                facts.push(RecoveryFact::new(
+                    previous.identity.clone(),
+                    Some(previous.sha256.clone()),
+                    survivor.map(|asset| asset.sha256.clone()),
+                    survivor.map(|asset| asset.lifecycle),
+                    "прерванный переход к локальной записи завершён: опубликованная запись удалена",
+                ));
+            }
         }
     }
 

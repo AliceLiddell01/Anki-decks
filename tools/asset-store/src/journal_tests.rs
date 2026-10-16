@@ -323,6 +323,34 @@ fn an_error_after_the_canonical_commit_leaves_the_intent_to_reconciliation() {
 }
 
 #[test]
+fn recovery_describes_the_surviving_record_of_an_overlap() {
+    let fixture = Fixture::new("asset-store-journal-overlap-recovery");
+    let identity = AssetIdentity::new("kanji", "日").unwrap();
+    let sha256 = fixture
+        .ingest_candidate(&identity, CANDIDATE_BYTES)
+        .asset
+        .sha256;
+    FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.set(true));
+    let error = fixture.publish(&identity, CANDIDATE_BYTES).unwrap_err();
+    assert!(failed_publish(&error), "{error:?}");
+
+    // Переоткрытие завершает прерванный переход: запись остаётся в каноническом
+    // манифесте, поэтому событие обязано описывать её фактическое состояние, а
+    // не исчезновение идентичности.
+    let reopened = fixture.reopen();
+    let recovered: Vec<_> = reopened
+        .journal_events(None, Some(identity.key.as_str()), None)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.operation == JournalOperation::Recovered)
+        .collect();
+    assert_eq!(recovered.len(), 1, "одно событие о завершённом переходе");
+    assert_eq!(recovered[0].new_sha256.as_deref(), Some(sha256.as_str()));
+    assert_eq!(recovered[0].new_lifecycle.as_deref(), Some("verified"));
+    assert_eq!(recovered[0].verified, Some(true));
+}
+
+#[test]
 fn audit_events_distinguish_publication_refusal_and_reuse() {
     let fixture = Fixture::new("asset-store-journal-audit");
     let published_identity = AssetIdentity::new("kanji", "日").unwrap();

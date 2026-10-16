@@ -712,6 +712,19 @@ fn move_export(entry: &mut ExportPlan) -> Result<(), DomainError> {
         .as_ref()
         .map(|manifest| manifest.digest.clone());
 
+    // План строится до захвата блокировки, поэтому источник перепроверяется
+    // непосредственно перед переносом. Расхождение — отказ до изменения
+    // раскладки: иначе перенос уже состоялся бы, а команда сообщила бы об
+    // ошибке при фактически выполненной работе.
+    let current = scan_export(&source)
+        .map_err(|failure| verification_error(&source, &failure.message(&source)))?;
+    if Some(&current.digest) != expected.as_ref() {
+        return Err(verification_error(
+            &source,
+            "источник изменился между планированием и переносом: перенос отменён",
+        ));
+    }
+
     match fs::rename(&source, &target) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
@@ -1236,6 +1249,32 @@ mod tests {
         assert!(
             !human.contains("перенос не требовался"),
             "отвергнутый план — не отсутствие работы: {human}"
+        );
+    }
+
+    #[test]
+    fn a_source_changed_after_planning_is_refused_before_the_move() {
+        let (_dir, root) = repository("layout-source-changed");
+        let export = write_export(&root, "decks/words/Words__A", b"a");
+        let output = root.join("decks/output");
+        fs::create_dir_all(&output).expect("каталог назначения");
+
+        let mut entry = plan_entry(&export, &output);
+        assert_eq!(entry.action, "move");
+
+        // Источник изменился между планированием и переносом: отпечаток плана
+        // больше не описывает его содержимое.
+        fs::write(export.join("media").join("a.bin"), b"b").expect("источник изменён");
+
+        let error = move_export(&mut entry).expect_err("перенос обязан отказать");
+        assert_eq!(error.code, ErrorCode::SourceChanged);
+        assert!(
+            export.join(DECK_JSON).is_file(),
+            "отказ не переносит экспорт"
+        );
+        assert!(
+            !output.join("Words__A").exists(),
+            "отказ не создаёт назначение"
         );
     }
 
