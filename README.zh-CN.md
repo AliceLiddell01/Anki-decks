@@ -116,7 +116,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 
 各工具的专门文档介绍了详细命令和机器可读契约：
 
-- [`anki-repo` — 检查、质量保证、受限修改与可视化报告](tools/anki-repo/README.md)
+- [`anki-repo` — 检查、质量保证、受限修改与可视化报告](tools/anki-repo/README.zh-CN.md)
 - [`asset-store` 与 `kanji-assets` — 资源生命周期与验证](tools/asset-store/README.md)
 - [`repository-maintenance` — 磁盘内容盘点与安全垃圾回收](tools/repository-maintenance/README.zh-CN.md)
 
@@ -141,7 +141,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 
 所有修改命令默认以 `dry-run` 方式运行；只有通过验证并显式传入 `--apply` 才会写入数据。`edit` 和 `retire` 只修改 `deck.json`。`create` 只可将已配置资源域中经过验证的文件放入 `media/`，并添加必要的 `media_files` 声明。`migrate-media` 可重写现有笔记中已验证的引用、放置采用规范文件名的资源，并在发布 `deck.json` 后删除不再使用的旧名称文件。
 
-[查看完整的 `anki-repo` 契约 →](tools/anki-repo/README.md)
+[查看完整的 `anki-repo` 契约 →](tools/anki-repo/README.zh-CN.md)
 
 ### `repository-maintenance`
 
@@ -203,7 +203,7 @@ visual-report
 - 写入之前会重新解析并验证候选数据；
 - 定向操作会尽可能证明其只修改了获准修改的部分。
 
-详细保证以[工具集 README](tools/anki-repo/README.md) 为准，而不是本概览文档。
+详细保证以[工具集 README](tools/anki-repo/README.zh-CN.md) 为准，而不是本概览文档。
 
 </details>
 
