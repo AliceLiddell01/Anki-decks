@@ -4,7 +4,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-**Rust CLI for inspecting, validating, precisely editing, and visually comparing CrowdAnki JSON exports.**
+**Rust CLI tools for inspecting and validating CrowdAnki JSON exports, making targeted edits, and visually comparing versions.**
 
 [![Repository checks](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-workspace-000000?logo=rust&logoColor=white)
@@ -15,7 +15,7 @@
 
 A toolkit for Anki deck maintainers and developers: inspect exports, validate structure and media references, review note quality, perform safe edits with `dry-run`, create notes using existing note models, and generate HTML before/after reports. The tools do not call LLM APIs but support an auditable workflow with external AI agents.
 
-**This is not a catalog of ready-made decks.** User CrowdAnki exports, media files, and local asset corpora are not published through Git.
+**This is not a catalog of ready-made decks.** Users' CrowdAnki exports, media files, and local asset corpora are not published through Git.
 
 [Who it's for](#who-its-for) · [Features](#features) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Tools](#tools) · [Repository layout](#repository-layout) · [License](#license)
 
@@ -36,7 +36,7 @@ The central idea is simple:
 
 > **Decks remain ordinary CrowdAnki data, while everything around them that can be checked and automated is checked and automated.**
 
-This repository contains tooling and agent workflows for local decks, not a Git repository of user decks. It is not tied to a particular deck, JLPT level, note model, or field name. Which decks happen to be in use is data, not an architectural contract.
+This repository contains tooling and agent workflows for local decks, not a Git repository of user decks. It is not tied to a particular deck, JLPT level, note model, or field name. The set of working decks is data, not an architectural contract.
 
 ## Features
 
@@ -45,7 +45,7 @@ This repository contains tooling and agent workflows for local decks, not a Git 
 | **Inspect an export** | `inspect`, `find`, `stats`, and `models` provide a compact view of its structure without manually reading a multi-megabyte `deck.json`. |
 | **Validate integrity** | `validate` checks CrowdAnki structure, identifiers, models, fields, media references, and other invariants. |
 | **Quality assurance and content review** | `qa` → `review` → `review-check` turn a large export into compact, verifiable packages for an external agent. |
-| **Make targeted changes to cards** | `edit` changes existing field values; `create` adds notes to existing models; `retire` marks a note as retired with a tag; `migrate-media` migrates proven media references to the current domain filename. |
+| **Make targeted changes to cards** | `edit` changes existing field values; `create` adds notes to existing models; `retire` marks a note as retired with a tag; `migrate-media` migrates verified media references to the canonical filename for their resource domain. |
 | **See the result** | `visual-report` creates a standalone before/after HTML report with card previews based on the model's actual templates. |
 | **Handle kanji images** | `asset-store` and `kanji-assets` retrieve, verify, and store confirmed kanji PNG/GIF files in a program-managed local corpus. |
 | **Work safely with agents** | The repository provides routing context and skills so agents follow the owners of each contract instead of guessing the deck's structure. |
@@ -72,7 +72,7 @@ flowchart LR
 
     J --> K["validate"]
     K --> L["visual-report"]
-    L --> M["Human or agent approval"]
+    L --> M["Human or agent review"]
 ```
 
 The tools deliberately separate **structural operations** from **content decisions**. `anki-repo` does not call an LLM API or attempt to judge whether a card's translation or example is good. It finds the relevant data, validates contracts, constrains changes, and supplies concise evidence to an external agent or a human.
@@ -122,7 +122,7 @@ Detailed commands and machine-readable contracts are documented in the tool-spec
 
 ### `anki-repo`
 
-The repository's primary toolkit for CrowdAnki.
+The repository's main toolkit for working with CrowdAnki exports.
 
 **Commands that do not modify the original export:**
 
@@ -135,7 +135,7 @@ The repository's primary toolkit for CrowdAnki.
 - `edit` — changes existing fields in existing notes;
 - `create` — adds notes to an existing deck and note model;
 - `retire` — adds a retirement tag without physically deleting the note;
-- `migrate-media` — rewrites only verified references to a former domain filename.
+- `migrate-media` — rewrites only verified references to a previous filename within the relevant resource domain.
 
 All mutating commands run in `dry-run` mode by default and write only after validation and an explicit `--apply`. `edit` and `retire` modify only `deck.json`. `create` may add only verified files from configured domains to `media/` and include the required `media_files` declarations. `migrate-media` may rewrite proven references in existing notes, place the canonical file, and remove an unused file under its old name after publishing `deck.json`.
 
@@ -185,7 +185,7 @@ visual-report
 visual approval
 ```
 
-For a field explicitly authorized to use `kanji-assets`, `create` may use only images already verified through `asset-store`. The field schema still comes from the actual export: the toolkit does not treat names such as "Word" or "Pitch Accent" as global contracts.
+For a field explicitly authorized to use `kanji-assets`, `create` may use only images already verified through `asset-store`. The field schema still comes from the actual export: the toolkit does not treat field names such as `Слово` ("Word") or `Ударение` ("Accent") as global contracts.
 
 Authorization can also be configured for `pitch-accent`. In both cases, the rules bind exact note-model UUIDs and field names to a specific domain handler; arbitrary media references remain prohibited. `create` does not create decks or models or assess linguistic content. To modify a media reference in an existing note, use only the narrow `migrate-media` command: it proves the correspondence between an identifier and the former filename, checks consumers in note fields and model templates, and blocks unverified references.
 
@@ -277,7 +277,7 @@ Git ignores all of `decks/`, so no path under it may be tracked—not just the t
 
 The set of working decks can change. New decks may use different models, fields, and structures.
 
-Therefore production code, tests, and CI must not be tied to a particular JLPT level, deck name, model, or field. The tools resolve the actual schema from each CrowdAnki export. The previous `decks/japanese/words/Words__N5/` layout is historical, not contractual: a one-time controlled migration to the flat `decks/output/` layout is available through `anki-repo migrate-layout` (non-writing by default).
+Therefore production code, tests, and CI must not be tied to a particular JLPT level, deck name, model, or field. The tools resolve the actual schema from each CrowdAnki export. The previous `decks/japanese/words/Words__N5/` layout is historical, not contractual: `anki-repo migrate-layout` provides a one-time controlled migration to the flat `decks/output/` layout (dry-run by default).
 
 ### Agent context
 

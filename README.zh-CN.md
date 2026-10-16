@@ -4,7 +4,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-**基于 Rust 的命令行工具，用于检查、验证、精确编辑和可视化对比 CrowdAnki JSON 导出数据。**
+**基于 Rust 的命令行工具，用于检查、验证、定向修改和可视化对比 CrowdAnki JSON 导出数据。**
 
 [![仓库检查](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-workspace-000000?logo=rust&logoColor=white)
@@ -15,7 +15,7 @@
 
 这套工具面向 Anki 牌组维护者和开发者：查看导出数据、验证结构和媒体引用、检查笔记质量、通过 `dry-run` 安全地进行修改、使用现有笔记类型创建笔记，并生成“修改前 / 修改后”的 HTML 对比报告。工具本身不会调用 LLM API，但支持与外部 AI 智能体配合，形成可核查的工作流程。
 
-**这不是现成牌组的下载目录。** 用户的 CrowdAnki 导出数据、媒体文件及本地资源库不会通过 Git 发布。
+**本仓库不提供现成牌组目录。** 用户的 CrowdAnki 导出数据、媒体文件及本地资源库不会通过 Git 发布。
 
 [适用人群](#适用人群) · [功能](#功能) · [工作原理](#工作原理) · [快速开始](#快速开始) · [工具](#工具) · [仓库结构](#仓库结构) · [许可证](#许可证)
 
@@ -45,9 +45,9 @@
 | **检查导出数据** | `inspect`、`find`、`stats` 和 `models` 可提供结构概览，无须手动阅读数 MB 大小的 `deck.json`。 |
 | **验证完整性** | `validate` 检查 CrowdAnki 结构、标识符、笔记类型、字段、媒体引用及其他不变量。 |
 | **质量检查与内容审阅** | `qa` → `review` → `review-check` 将大型导出数据转为简洁、可核查的数据包，供外部智能体审阅。 |
-| **定向修改卡片** | `edit` 修改现有字段的值；`create` 在现有笔记类型中新增笔记；`retire` 通过标签停用笔记；`migrate-media` 将经过确认的媒体引用迁移到当前资源域的文件名。 |
+| **定向修改卡片** | `edit` 修改现有字段的值；`create` 在现有笔记类型中新增笔记；`retire` 通过标签停用笔记；`migrate-media` 将经过验证的媒体引用从旧文件名迁移到所属资源域的规范文件名。 |
 | **可视化查看结果** | `visual-report` 根据笔记类型的实际模板生成独立的“修改前 / 修改后”HTML 报告和卡片预览。 |
-| **处理汉字图片** | `asset-store` 和 `kanji-assets` 获取、验证并在程序管理的本地资源库中保存已确认的汉字 PNG/GIF 文件。 |
+| **处理日语汉字（kanji）图片** | `asset-store` 和 `kanji-assets` 获取、验证并在程序管理的本地资源库中保存已确认的日语汉字 PNG/GIF 文件。 |
 | **安全地使用智能体** | 仓库提供上下文路由和技能定义，让智能体遵循各项契约的权威来源，而不是猜测牌组结构。 |
 
 ## 工作原理
@@ -72,7 +72,7 @@ flowchart LR
 
     J --> K["validate"]
     K --> L["visual-report"]
-    L --> M["人工或智能体验收"]
+    L --> M["人工或智能体检查"]
 ```
 
 这些工具刻意将**结构性操作**与**内容判断**分开。`anki-repo` 不会调用 LLM API，也不会自行判断卡片的翻译或例句是否优秀。它负责定位数据、验证契约、限制修改范围，并为外部智能体或人工审阅者提供简明证据。
@@ -106,7 +106,7 @@ EXPORT=decks/output/<导出名称>
 
 整个 `decks/` 目录都被 Git 忽略，因此新克隆的仓库中不会包含其中的数据。这是正常情况，不代表仓库缺少文件。用户需要自行放入牌组。`decks/output/` 是工作牌组的扁平目录列表，Anki 层级结构通过目录名（如 `Words__N5`）表示。
 
-还可以通过独立的 CLI 获取并验证汉字图片：
+还可以通过独立的 CLI 获取并验证日语汉字图片：
 
 ```bash
 cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
@@ -135,9 +135,9 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 - `edit` — 修改现有笔记的现有字段；
 - `create` — 向现有牌组及笔记类型添加笔记；
 - `retire` — 添加停用标签，而不实际删除笔记；
-- `migrate-media` — 只重写已验证的、指向旧资源域文件名的引用。
+- `migrate-media` — 仅重写已验证的、指向所属资源域中旧文件名的媒体引用。
 
-所有修改命令默认以 `dry-run` 方式运行；只有通过验证并显式传入 `--apply` 才会写入数据。`edit` 和 `retire` 只修改 `deck.json`。`create` 只可将已配置资源域中经过验证的文件放入 `media/`，并添加必要的 `media_files` 声明。`migrate-media` 可重写现有笔记中已确认的引用、放置规范文件，并在发布 `deck.json` 后删除不再使用的旧名称文件。
+所有修改命令默认以 `dry-run` 方式运行；只有通过验证并显式传入 `--apply` 才会写入数据。`edit` 和 `retire` 只修改 `deck.json`。`create` 只可将已配置资源域中经过验证的文件放入 `media/`，并添加必要的 `media_files` 声明。`migrate-media` 可重写现有笔记中已验证的引用、放置采用规范文件名的资源，并在发布 `deck.json` 后删除不再使用的旧名称文件。
 
 [查看完整的 `anki-repo` 契约 →](tools/anki-repo/README.md)
 
@@ -149,7 +149,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 
 ### `asset-store` / `kanji-assets`
 
-这是程序自行管理的独立资源存储。目前，面向特定资源域的 CLI 处理汉字图片：
+这是程序自行管理的独立资源存储。目前，面向特定资源域的 CLI 处理日语汉字图片：
 
 ```text
 Yarxi
@@ -172,7 +172,7 @@ Yarxi
 ```text
 models
   ↓
-实际笔记类型结构
+笔记类型的实际字段结构
   ↓
 create（试运行）
   ↓
@@ -185,7 +185,7 @@ visual-report
 可视化验收
 ```
 
-对于明确获准使用 `kanji-assets` 的字段，`create` 只能使用已经通过 `asset-store` 验证的图片。字段结构仍以实际导出数据为准：工具集不会把“单词”或“音高重音”等字段名当作全局契约。
+对于明确获准使用 `kanji-assets` 的字段，`create` 只能使用已经通过 `asset-store` 验证的图片。字段结构仍以实际导出数据为准：工具集不会把 `Слово`（“单词”）或 `Ударение`（“重音”）等字段名当作全局契约。
 
 也可以为 `pitch-accent` 配置使用权限。在这两种情况下，规则都会将笔记类型的准确 UUID 和字段名称绑定到特定资源域处理器；任意媒体引用仍然不被允许。`create` 不会创建牌组或笔记类型，也不会评价语言内容。修改现有笔记的媒体引用只能使用职责明确的 `migrate-media` 命令：它验证标识符与旧文件名的对应关系、检查笔记字段和笔记类型模板中的引用者，并阻止未经验证的引用。
 
@@ -220,7 +220,7 @@ GitHub Actions 不依赖本地环境，会执行相同的检查，此外还会�
 
 - 验证脚本契约、Agent Skills 元数据及 PR 描述结构；
 - 按照声明的 MSRV 验证 Cargo 工作区，并核对 `rust-toolchain.toml` 与实际编译器是否一致；
-- 仅进行只读操作：作业不会向仓库写入、发布构建产物，也不会执行修改操作。
+- 仅进行只读操作：作业不会向仓库写入、发布产物，也不会执行修改操作。
 
 CI 检查 Git 跟踪的代码、文档和自包含测试夹具。整个 `decks/` 目录和 `.asset-store/` 都是未纳入 Git 的用户数据，因此 CI 不会验证个人牌组或本地资源库，也不会把它们在新克隆仓库中不存在这一事实当作测试通过的证明。CI 持续验证的是数据边界：这些目录中不允许有任何路径被 Git 跟踪，而且忽略规则必须存在（`.github/scripts/check_local_data_untracked.py`）。检查基于实际的 Git 索引，因为 `.gitignore` 不会让已跟踪的文件自动失去跟踪状态，而 `git add -f` 还能绕过忽略规则。
 
@@ -317,7 +317,7 @@ cargo run --quiet --locked -p asset-store --bin kanji-corpus-gate
 
 仓库自有的软件代码、自动化程序、配置及项目文档均采用 **MIT 许可证**。
 
-`decks/` 中的内容、用户媒体文件以及第三方资源或资源库不会自动获得 MIT 许可；它们仍受原始权利人的权利或另行声明的条款约束。用户数据不会通过 Git 发布，也不受本项目的 MIT 许可证涵盖。
+`decks/` 中的内容、用户媒体文件以及第三方资源或资源库不会自动获得 MIT 许可；这些内容仍受原权利人的权利及另行声明的条款约束。用户数据不会通过 Git 发布，也不受本项目的 MIT 许可证涵盖。
 
 [查看完整许可证文本及适用范围 →](LICENSE)
 
@@ -325,6 +325,6 @@ cargo run --quiet --locked -p asset-store --bin kanji-corpus-gate
 
 <div align="center">
 
-**CrowdAnki 始终是数据来源；围绕它构建的工具让修改可观察、可验证、可复现。**
+**CrowdAnki 始终是数据来源；围绕它构建的工具让修改过程和结果可观察、可验证、可复现。**
 
 </div>
