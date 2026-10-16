@@ -516,6 +516,17 @@ impl AssetStore {
         let journal = std::sync::Mutex::new(Journal::open(&root_handle)?);
         let mut recovered = recover_publications(&root_handle, policy.as_ref())?;
         recovered.extend(recover_publications(&runtime_handle, policy.as_ref())?);
+        // Восстановление уже изменило байты и сняло маркеры: следы пишутся до
+        // шагов, которые могут отказать, иначе повторный запуск не восстановит
+        // их и журнал потеряет факт навсегда.
+        write_recovery_facts(
+            &journal,
+            policy.domain_id(),
+            &root_handle,
+            &runtime_handle,
+            &store_id,
+            &recovered,
+        )?;
         recover_layout_migration(&root_handle, policy.as_ref())?;
         recover_layout_migration(&runtime_handle, policy.as_ref())?;
         let mut manifest = load_manifest(&root_handle)?;
@@ -550,20 +561,20 @@ impl AssetStore {
         }
         manifest = load_manifest(&root_handle)?;
         runtime_manifest = load_runtime_manifest(&runtime_handle, &store_id)?;
-        recovered.extend(reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &root_handle,
             &runtime_handle,
             &manifest,
             &runtime_manifest,
             policy.as_ref(),
-        )?);
+        )?;
         write_recovery_facts(
             &journal,
             policy.domain_id(),
             &root_handle,
             &runtime_handle,
             &store_id,
-            &recovered,
+            &reconciled,
         )?;
         manifest = load_manifest(&root_handle)?;
         runtime_manifest = load_runtime_manifest(&runtime_handle, &store_id)?;
@@ -904,16 +915,20 @@ impl AssetStore {
             &self.runtime_handle,
             self.policy.as_ref(),
         )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        recovered.extend(reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
-        )?);
-        self.record_recovery_facts(&recovered)?;
+        )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
@@ -1215,16 +1230,20 @@ impl AssetStore {
             &self.runtime_handle,
             self.policy.as_ref(),
         )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        recovered.extend(reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
-        )?);
-        self.record_recovery_facts(&recovered)?;
+        )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
@@ -1487,16 +1506,20 @@ impl AssetStore {
             &self.runtime_handle,
             self.policy.as_ref(),
         )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        recovered.extend(reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
-        )?);
-        self.record_recovery_facts(&recovered)?;
+        )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
@@ -1681,16 +1704,20 @@ impl AssetStore {
             &self.runtime_handle,
             self.policy.as_ref(),
         )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
-        recovered.extend(reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
-        )?);
-        self.record_recovery_facts(&recovered)?;
+        )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;

@@ -231,7 +231,9 @@ cargo run --quiet --bin anki-repo -- visual-report \
   фактический план медиафайлов),
   `validation.before`/`after` — новых `ERROR` быть не должно; затем
   `git diff --no-index --numstat "$BEFORE/deck.json" "$EXPORT/deck.json"` и
-  `git status` по `media/`. Для явно
+  `git diff --no-index --stat "$BEFORE/media" "$EXPORT/media"`: `decks/` не
+  отслеживается Git, поэтому ни `git status`, ни обычный `git diff` изменения
+  внутри `media/` не показывают. Для явно
   разрешённых медиафайлов
   сверяй точные имена файлов, SHA-256 и объявления из результата `media`; без
   настроенных правил `media/` и `media_files` не меняются.

@@ -323,6 +323,61 @@ fn an_error_after_the_canonical_commit_leaves_the_intent_to_reconciliation() {
 }
 
 #[test]
+fn recovery_facts_survive_a_failing_reconciliation() {
+    let fixture = Fixture::new("asset-store-journal-recovery-before-failure");
+    let removed = AssetIdentity::new("kanji", "一").unwrap();
+    let marker = AssetIdentity::new("kanji", "日").unwrap();
+    let record = fixture
+        .publish(&removed, CANDIDATE_BYTES)
+        .unwrap()
+        .asset
+        .unwrap();
+    fixture.publish(&marker, CANDIDATE_BYTES).unwrap();
+
+    // Смерть процесса между фиксацией удаления и снятием байтов: открытие
+    // завершит удаление и обязано записать событие о нём.
+    {
+        let lock = fixture.store.lock_exclusive().unwrap();
+        let mut manifest = load_manifest(&fixture.store.root_handle).unwrap();
+        FAIL_AFTER_REMOVAL_MANIFEST.with(|hook| hook.set(true));
+        remove_record_from_area(
+            &fixture.store.root_handle,
+            &mut manifest,
+            &record,
+            fixture.store.policy.as_ref(),
+        )
+        .unwrap_err();
+        lock.unlock().unwrap();
+    }
+    // Второй сбой — расхождение transition marker: сверка откажет уже после
+    // того, как восстановление удаления состоялось.
+    begin_transition(
+        &fixture.store.root_handle,
+        &marker,
+        TransitionTarget::Canonical,
+        &"a".repeat(64),
+    )
+    .unwrap();
+
+    let error = AssetStore::open_kanji_existing(StoreOptions::new(&fixture.root)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::IntegrityMismatch, "{error:?}");
+
+    // Факт восстановления остаётся в журнале: повторный запуск маркер удаления
+    // уже не найдёт и восстановить его не сможет.
+    let root = std::fs::File::open(&fixture.root).unwrap();
+    let mut journal = crate::journal::Journal::open(&root).unwrap();
+    let recovered: Vec<_> = journal
+        .read()
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|event| event.operation == JournalOperation::Recovered)
+        .collect();
+    assert_eq!(recovered.len(), 1, "событие восстановления записано");
+    assert_eq!(recovered[0].identity, removed.key);
+}
+
+#[test]
 fn recovery_describes_the_surviving_record_of_an_overlap() {
     let fixture = Fixture::new("asset-store-journal-overlap-recovery");
     let identity = AssetIdentity::new("kanji", "日").unwrap();

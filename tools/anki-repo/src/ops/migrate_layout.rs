@@ -287,6 +287,7 @@ pub fn migrate(root: Option<&Path>, apply: bool) -> Result<MigrationReport, Doma
     }
 
     mark_name_collisions(&mut entries);
+    mark_existing_target_collisions(&mut entries, &output)?;
     mark_target_state(&mut entries);
 
     let mut pruned = Vec::new();
@@ -604,6 +605,53 @@ fn mark_name_collisions(entries: &mut [ExportPlan]) {
             );
         }
     }
+}
+
+/// Отмечает источники, чьё плоское имя совпадает с уже лежащим в назначении.
+///
+/// Сравнение не различает регистр и Unicode-нормализацию, как и у имён двух
+/// источников: иначе рядом с существующим `WORDS__a` появился бы второй каталог
+/// `Words__A` с той же колодой. Точное совпадение имени разбирает
+/// [`mark_target_state`]: назначение может оказаться побайтовым дубликатом.
+fn mark_existing_target_collisions(
+    entries: &mut [ExportPlan],
+    output: &Path,
+) -> Result<(), DomainError> {
+    let existing = match fs::read_dir(output) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(read_error(output, "read_output", &error)),
+    };
+    let mut by_key: BTreeMap<String, String> = BTreeMap::new();
+    for entry in existing {
+        let entry = entry.map_err(|error| read_error(output, "read_output", &error))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        by_key.insert(collision_key(name), name.to_owned());
+    }
+
+    for entry in entries.iter_mut().filter(|entry| entry.action == "move") {
+        let Some(name) = entry.name.as_deref() else {
+            continue;
+        };
+        let Some(existing_name) = by_key.get(&collision_key(name)) else {
+            continue;
+        };
+        if existing_name == name {
+            continue;
+        }
+        refuse(
+            entry,
+            "target_name_collision",
+            format!(
+                "плоское имя назначения {name} совпадает с уже существующим {existing_name} с \
+                 точностью до регистра и Unicode-нормализации"
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Отмечает состояние уже существующего назначения.
@@ -1407,6 +1455,27 @@ mod tests {
         );
         assert!(!root.join("decks/output/Hidden").exists());
         assert!(root.join("decks/output/Words__A/deck.json").is_file());
+    }
+
+    #[test]
+    fn an_existing_target_differing_only_by_case_refuses_the_whole_plan() {
+        let (_dir, root) = repository("layout-existing-case-collision");
+        write_export(&root, "decks/words/Words__A", b"a");
+        write_export(&root, "decks/output/WORDS__a", b"b");
+
+        let report = migrate(Some(&root), true).expect("план с отказом");
+
+        assert!(report.refused);
+        let entry = report.exports.first().expect("экспорт в отчёте");
+        assert_eq!(entry.reason, Some("target_name_collision"));
+        assert!(
+            root.join("decks/words/Words__A/deck.json").is_file(),
+            "источник не тронут"
+        );
+        assert!(
+            !root.join("decks/output/Words__A").exists(),
+            "второй каталог с тем же именем не создан"
+        );
     }
 
     #[test]
