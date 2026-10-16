@@ -141,5 +141,14 @@ for path in "${included_paths[@]}"; do
   fi
 done
 
+# Проверка семантики `.gitignore` должна обнаружить повторное включение до того,
+# как пользовательский путь попадёт в индекс.
+python3 "$repo_root/.github/scripts/check_local_data_untracked.py" --root "$tmp_repo" >/dev/null
+printf '\n!/deck*/\n' >> "$tmp_repo/.gitignore"
+if python3 "$repo_root/.github/scripts/check_local_data_untracked.py" --root "$tmp_repo" >/dev/null 2>&1; then
+  printf 'ОШИБКА: обобщённое повторное включение не остановлено до добавления в индекс\n' >&2
+  exit 1
+fi
+
 printf 'Проверка .gitignore пройдена: %s игнорируемых путей и %s игнорируемых каталогов внутри `decks/` и `.asset-store/`; индекс содержит только %s контрольных путей.\n' \
   "${#ignored_paths[@]}" "${#directory_paths[@]}" "${#included_paths[@]}"

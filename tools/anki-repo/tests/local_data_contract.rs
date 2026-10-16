@@ -20,6 +20,8 @@ use common::{TempDir, parse_json, run_cli};
 use serde_json::Value;
 
 use crate::common;
+use anki_repo::error::ErrorCode;
+use anki_repo::ops::edit::{EditRequest, EditSpec};
 
 /// Тело синтетического `deck.json`: постоянное, чтобы одинаковые экспорты
 /// давали один и тот же отпечаток содержимого.
@@ -196,6 +198,77 @@ fn migrate_layout_never_touches_the_closed_input_area() {
 }
 
 #[test]
+fn migrate_layout_rejects_output_redirected_into_input_before_any_write() {
+    let repo = Repo::new("local-data-output-input-alias");
+    let source = repo.export("decks/words/Words__A", b"source");
+    let input = repo.path("decks/input");
+    fs::create_dir_all(&input).expect("закрытая область");
+    fs::write(input.join("sentinel.bin"), b"private").expect("маркер закрытой области");
+    let placeholder = repo.path("decks/.gitkeep");
+    fs::write(&placeholder, b"").expect("placeholder прежней раскладки");
+    let output = repo.path("decks/output");
+    std::os::unix::fs::symlink(&input, &output).expect("назначение перенаправлено в input");
+
+    let (code, value, stderr) = run_migrate(&repo, true);
+
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert_eq!(
+        error_reason(&value),
+        ("invalid_request", "input_area_forbidden")
+    );
+    assert!(source.join("deck.json").is_file(), "источник не перенесён");
+    assert!(placeholder.is_file(), "placeholder не удалён");
+    assert_eq!(
+        fs::read(input.join("sentinel.bin")).expect("закрытая область не изменена"),
+        b"private"
+    );
+    assert!(
+        fs::symlink_metadata(&output)
+            .expect("ссылка назначения сохранена")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        !input.join("Words__A").exists(),
+        "в input ничего не записано"
+    );
+}
+
+#[test]
+fn migrate_layout_rejects_a_symlinked_intermediate_decks_component() {
+    let repo = Repo::new("local-data-decks-intermediate-alias");
+    let decks = repo.path("decks");
+    let external_decks = repo.path("outside/decks");
+    fs::create_dir_all(external_decks.parent().expect("родитель decks")).expect("внешний каталог");
+    fs::rename(&decks, &external_decks).expect("перенести каталог для symlink-фикстуры");
+    let source = external_decks.join("words/Words__A");
+    fs::create_dir_all(source.join("media")).expect("экспорт");
+    fs::write(source.join("deck.json"), DECK_JSON_BODY).expect("deck.json");
+    fs::write(source.join("media/a.bin"), b"source").expect("media");
+    let input = external_decks.join("input");
+    fs::create_dir_all(&input).expect("закрытая область");
+    fs::write(input.join("sentinel.bin"), b"private").expect("маркер закрытой области");
+    let placeholder = external_decks.join(".gitkeep");
+    fs::write(&placeholder, b"").expect("placeholder");
+    std::os::unix::fs::symlink(&external_decks, &decks).expect("промежуточная ссылка decks");
+
+    let (code, value, stderr) = run_migrate(&repo, true);
+
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert_eq!(
+        error_reason(&value),
+        ("invalid_request", "layout_path_is_symlink")
+    );
+    assert!(source.join("deck.json").is_file(), "источник не перенесён");
+    assert!(placeholder.is_file(), "placeholder не удалён");
+    assert_eq!(
+        fs::read(input.join("sentinel.bin")).expect("внешняя область не изменена"),
+        b"private"
+    );
+    assert!(!external_decks.join("output/Words__A").exists());
+}
+
+#[test]
 fn every_export_directory_command_refuses_the_closed_input_area() {
     let repo = Repo::new("local-data-guard");
     let hidden = repo.export("decks/input/Hidden", b"hidden");
@@ -281,6 +354,85 @@ fn a_deck_inside_output_stays_readable() {
     assert_eq!(code, 0, "stderr: {stderr}");
     let value = parse_json(&stdout);
     assert_eq!(value["command"], "validate");
+}
+
+#[test]
+fn the_closed_input_boundary_works_without_git_for_cli_and_library_calls() {
+    let repo = Repo::new("local-data-no-git");
+    fs::remove_dir_all(repo.path(".git")).expect("убрать Git-метаданные");
+    let hidden = repo.export("decks/input/Hidden", b"hidden");
+    fs::create_dir_all(hidden.join(".git")).expect("вложенный Git-каталог");
+    let original = fs::read(hidden.join("deck.json")).expect("исходный deck.json");
+    let path = hidden.display().to_string();
+
+    let (code, stdout, stderr) = run_cli(&[
+        "edit", &path, "--guid", "g", "--field", "f", "--set", "new", "--expect", "old", "--apply",
+        "--json",
+    ]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    let value = parse_json(&stdout);
+    assert_eq!(
+        error_reason(&value),
+        ("invalid_request", "input_area_forbidden")
+    );
+
+    let load_error = anki_repo::loader::load_export(&hidden).expect_err("API чтения закрыт");
+    assert_eq!(load_error.code, ErrorCode::InvalidRequest);
+    assert_eq!(load_error.details["reason"], "input_area_forbidden");
+
+    let request = EditRequest {
+        edits: vec![EditSpec {
+            edit_id: None,
+            guid: "g".to_owned(),
+            field: "f".to_owned(),
+            expected: "old".to_owned(),
+            replacement: "new".to_owned(),
+        }],
+    };
+    let edit_error = anki_repo::ops::edit::edit(&hidden, &request, true)
+        .expect_err("прямой API edit --apply закрыт");
+    assert_eq!(edit_error.code, ErrorCode::InvalidRequest);
+    assert_eq!(edit_error.details["reason"], "input_area_forbidden");
+    assert_eq!(
+        fs::read(hidden.join("deck.json")).expect("deck.json не изменён"),
+        original
+    );
+
+    let external = repo.export("external/SomeExport", b"public");
+    anki_repo::loader::load_export(&external).expect("внешний экспорт остаётся доступным");
+    let external_path = external.display().to_string();
+    let (code, stdout, stderr) = run_cli(&["validate", &external_path, "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(parse_json(&stdout)["command"], "validate");
+}
+
+#[test]
+fn aliases_to_the_closed_area_are_refused_without_git() {
+    let repo = Repo::new("local-data-no-git-alias");
+    fs::remove_dir_all(repo.path(".git")).expect("убрать Git-метаданные");
+    let hidden = repo.export("decks/input/Hidden", b"hidden");
+    let alias = repo.path("external/alias");
+    fs::create_dir_all(alias.parent().expect("родитель alias")).expect("каталог alias");
+    std::os::unix::fs::symlink(&hidden, &alias).expect("внешняя ссылка на закрытый каталог");
+
+    let alias_path = alias.display().to_string();
+    let (code, stdout, stderr) = run_cli(&["inspect", &alias_path, "--json"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert_eq!(
+        error_reason(&parse_json(&stdout)),
+        ("invalid_request", "input_area_forbidden")
+    );
+
+    let dotdot_path = repo
+        .path("decks/unused/../input/Hidden")
+        .display()
+        .to_string();
+    let (code, stdout, stderr) = run_cli(&["inspect", &dotdot_path, "--json"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert_eq!(
+        error_reason(&parse_json(&stdout)),
+        ("invalid_request", "input_area_forbidden")
+    );
 }
 
 #[test]

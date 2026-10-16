@@ -14,7 +14,7 @@
 //! прочитать файл другими средствами; инструмент отвечает только за то, что его
 //! собственные операции не открывают закрытую область.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::cli::Command;
 use crate::details;
@@ -83,18 +83,75 @@ fn candidate_repository_roots(path: &Path) -> Vec<PathBuf> {
     if let Some(explicit) = std::env::var_os("ANKI_REPOSITORY_ROOT") {
         roots.push(canonical_ish(Path::new(&explicit)));
     }
-    if let Ok(current) = std::env::current_dir()
-        && let Some(root) = repository_root_for(&current)
-    {
-        roots.push(root);
+    if let Ok(current) = std::env::current_dir() {
+        roots.extend(repository_roots_for(&current));
     }
-    if let Some(root) = repository_root_for(path) {
-        roots.push(root);
-    }
+    roots.extend(repository_roots_for(path));
 
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// Все корни Git-репозиториев по пути, от ближайшего до внешнего.
+///
+/// Вложенный `.git` внутри закрытой области не отменяет границу внешнего
+/// репозитория. Проверяем также написание пути до раскрытия symlink, чтобы
+/// сохранить исходную связь с родительским каталогом.
+fn repository_roots_for(path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for candidate in [lexical_absolute(path), canonical_ish(path)] {
+        for directory in candidate.ancestors() {
+            if directory.join(".git").exists() {
+                roots.push(canonical_ish(directory));
+            }
+        }
+    }
+    roots
+}
+
+/// Абсолютный путь с разобранными `.` и `..`, без раскрытия символических ссылок.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
+/// Находит закрытую область по самому пути, даже если Git-метаданные недоступны.
+fn input_area_from_path(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    for candidate in [lexical_absolute(path), canonical_ish(path)] {
+        for input in candidate.ancestors() {
+            if input.file_name().is_some_and(|name| name == INPUT_DIR)
+                && input
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == DECKS_DIR)
+                && let Some(root) = input.parent().and_then(Path::parent)
+            {
+                return Some((root.to_path_buf(), input.to_path_buf()));
+            }
+        }
+    }
+    None
 }
 
 /// Отказывает, если путь адресует закрытую область `decks/input`.
@@ -107,25 +164,47 @@ fn candidate_repository_roots(path: &Path) -> Vec<PathBuf> {
 /// Возвращает [`ErrorCode::InvalidRequest`], если путь ведёт внутрь `decks/input`
 /// любого репозитория, чья граница применима к этому пути.
 pub fn guard_local_path(path: &Path, role: &str) -> Result<(), DomainError> {
+    if let Some((root, _input)) = input_area_from_path(path) {
+        return Err(input_area_error(path, role, &root));
+    }
     for root in candidate_repository_roots(path) {
         if is_inside_input(path, &root) {
-            return Err(DomainError::with_details(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "{role} {} адресует закрытую область decks/input: инструмент её не читает и не \
-                     изменяет; для работы с колодами используйте decks/output",
-                    path.display()
-                ),
-                details! {
-                    "path" => path.display().to_string(),
-                    "repository_root" => root.display().to_string(),
-                    "area" => "decks/input",
-                    "reason" => "input_area_forbidden",
-                },
-            ));
+            return Err(input_area_error(path, role, &root));
         }
     }
     Ok(())
+}
+
+/// Проверяет путь относительно известного корня, даже если у корня нет `.git`.
+pub(crate) fn guard_local_path_for_root(
+    path: &Path,
+    trusted_root: &Path,
+    role: &str,
+) -> Result<(), DomainError> {
+    if let Some((root, _input)) = input_area_from_path(path) {
+        return Err(input_area_error(path, role, &root));
+    }
+    if is_inside_input(path, trusted_root) {
+        return Err(input_area_error(path, role, trusted_root));
+    }
+    guard_local_path(path, role)
+}
+
+fn input_area_error(path: &Path, role: &str, root: &Path) -> DomainError {
+    DomainError::with_details(
+        ErrorCode::InvalidRequest,
+        format!(
+            "{role} {} адресует закрытую область decks/input: инструмент её не читает и не \
+             изменяет; для работы с колодами используйте decks/output",
+            path.display()
+        ),
+        details! {
+            "path" => path.display().to_string(),
+            "repository_root" => root.display().to_string(),
+            "area" => "decks/input",
+            "reason" => "input_area_forbidden",
+        },
+    )
 }
 
 /// Проверяет все пути выбранной команды до начала её работы.
@@ -335,6 +414,67 @@ mod tests {
             Some(root.clone())
         );
         assert_eq!(repository_root_for(&detached), None);
+    }
+
+    #[test]
+    fn the_reserved_input_layout_is_closed_without_git_or_inside_nested_git() {
+        let dir = TempDir::new("layout-no-git");
+        let root = repository(&dir);
+        std::fs::remove_dir_all(root.join(".git")).expect("убрать Git-метаданные");
+        std::fs::create_dir_all(root.join("decks/input/hidden/.git"))
+            .expect("вложенный репозиторий");
+
+        for path in [
+            root.join("decks/input/hidden"),
+            root.join("decks/unused/../input/hidden"),
+        ] {
+            let error = guard_local_path(&path, "каталог экспорта")
+                .expect_err("закрытая область не зависит от Git-метаданных");
+            assert_eq!(error.details["reason"], "input_area_forbidden");
+        }
+    }
+
+    #[test]
+    fn aliases_to_and_from_the_reserved_input_layout_are_closed() {
+        let dir = TempDir::new("layout-input-alias");
+        let root = repository(&dir);
+        std::fs::remove_dir_all(root.join(".git")).expect("убрать Git-метаданные");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("внешний каталог");
+
+        let input = root.join("decks/input");
+        std::fs::remove_dir_all(&input).expect("убрать каталог input");
+        std::os::unix::fs::symlink(&outside, &input).expect("ссылка input наружу");
+        assert_eq!(
+            guard_local_path(&input.join("Hidden"), "каталог экспорта")
+                .expect_err("путь через закрытый alias отвергается")
+                .details["reason"],
+            "input_area_forbidden"
+        );
+
+        std::fs::remove_file(&input).expect("убрать ссылку input");
+        std::fs::create_dir_all(&input).expect("вернуть закрытый каталог");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(root.join("decks/input"), &alias)
+            .expect("внешняя ссылка в закрытую область");
+        assert_eq!(
+            guard_local_path(&alias.join("Hidden"), "каталог экспорта")
+                .expect_err("канонический путь через alias отвергается")
+                .details["reason"],
+            "input_area_forbidden"
+        );
+    }
+
+    #[test]
+    fn unrelated_external_paths_remain_allowed_without_git() {
+        let dir = TempDir::new("layout-external");
+        let root = dir.path().join("external");
+        std::fs::create_dir_all(&root).expect("внешний каталог");
+
+        guard_local_path(&root.join("SomeExport"), "каталог экспорта")
+            .expect("обычный внешний экспорт разрешён");
+        guard_local_path(&root.join("decks/output/SomeExport"), "каталог экспорта")
+            .expect("внешняя рабочая раскладка не совпадает с закрытым input");
     }
 
     #[test]

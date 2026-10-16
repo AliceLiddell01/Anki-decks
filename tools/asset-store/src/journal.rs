@@ -400,22 +400,84 @@ impl JournalDraft {
     /// разделяет повторные попытки одного перехода: после отказа следующая
     /// попытка — это новый интент со своим результатом, а не повтор прежнего.
     pub fn event_key(&self) -> String {
-        let material = format!(
-            "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
-            self.domain,
-            self.namespace,
-            self.identity,
-            self.operation.as_str(),
-            self.outcome.as_str(),
-            self.previous_sha256.as_deref().unwrap_or("-"),
-            self.new_sha256.as_deref().unwrap_or("-"),
-            self.manifest_revision
-                .map_or_else(|| "-".to_owned(), |revision| revision.to_string()),
-            self.intent_id.as_deref().unwrap_or("-"),
-            sep = FIELD_SEPARATOR,
-        );
-        sha256_hex(material.as_bytes())
+        event_key_for_fields(EventKeyFields {
+            domain: &self.domain,
+            namespace: &self.namespace,
+            identity: &self.identity,
+            operation: self.operation,
+            outcome: self.outcome,
+            previous_sha256: self.previous_sha256.as_deref(),
+            new_sha256: self.new_sha256.as_deref(),
+            manifest_revision: self.manifest_revision,
+            intent_id: self.intent_id.as_deref(),
+        })
     }
+}
+
+struct EventKeyFields<'a> {
+    domain: &'a str,
+    namespace: &'a str,
+    identity: &'a str,
+    operation: JournalOperation,
+    outcome: JournalOutcome,
+    previous_sha256: Option<&'a str>,
+    new_sha256: Option<&'a str>,
+    manifest_revision: Option<u64>,
+    intent_id: Option<&'a str>,
+}
+
+fn event_key_for_fields(fields: EventKeyFields<'_>) -> String {
+    let material = format!(
+        "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
+        fields.domain,
+        fields.namespace,
+        fields.identity,
+        fields.operation.as_str(),
+        fields.outcome.as_str(),
+        fields.previous_sha256.unwrap_or("-"),
+        fields.new_sha256.unwrap_or("-"),
+        fields
+            .manifest_revision
+            .map_or_else(|| "-".to_owned(), |revision| revision.to_string()),
+        fields.intent_id.unwrap_or("-"),
+        sep = FIELD_SEPARATOR,
+    );
+    sha256_hex(material.as_bytes())
+}
+
+fn expected_event_key(event: &JournalEvent) -> String {
+    event_key_for_fields(EventKeyFields {
+        domain: &event.domain,
+        namespace: &event.namespace,
+        identity: &event.identity,
+        operation: event.operation,
+        outcome: event.outcome,
+        previous_sha256: event.previous_sha256.as_deref(),
+        new_sha256: event.new_sha256.as_deref(),
+        manifest_revision: event.manifest_revision,
+        intent_id: event.intent_id.as_deref(),
+    })
+}
+
+/// Проверяет ключи схемы 1, созданные до включения `intent_id` в хеш.
+/// Версия схемы тогда не менялась, поэтому старые корректные журналы могут
+/// содержать как прежние, так и текущие ключи.
+fn legacy_event_key(event: &JournalEvent) -> String {
+    let material = format!(
+        "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
+        event.domain,
+        event.namespace,
+        event.identity,
+        event.operation.as_str(),
+        event.outcome.as_str(),
+        event.previous_sha256.as_deref().unwrap_or("-"),
+        event.new_sha256.as_deref().unwrap_or("-"),
+        event
+            .manifest_revision
+            .map_or_else(|| "-".to_owned(), |revision| revision.to_string()),
+        sep = FIELD_SEPARATOR,
+    );
+    sha256_hex(material.as_bytes())
 }
 
 /// Разобранный журнал и диагностика чтения.
@@ -577,18 +639,40 @@ impl Journal {
         let directory = self
             .ensure_directory(true)?
             .ok_or_else(|| AssetError::new(ErrorCode::IoFailure, "каталог журнала недоступен"))?;
-        let fd = openat(
+        let (fd, created) = match openat(
             &directory,
             JOURNAL_FILE,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::APPEND
+                | OFlags::CLOEXEC
+                | OFlags::NOFOLLOW,
             Mode::from_raw_mode(0o600),
-        )
-        .map_err(|error| {
-            AssetError::io(
-                "не удалось открыть журнал на дополнение",
-                std::io::Error::from(error),
-            )
-        })?;
+        ) {
+            Ok(fd) => (fd, true),
+            Err(error) if error == rustix::io::Errno::EXIST => (
+                openat(
+                    &directory,
+                    JOURNAL_FILE,
+                    OFlags::WRONLY | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    AssetError::io(
+                        "не удалось открыть журнал на дополнение",
+                        std::io::Error::from(error),
+                    )
+                })?,
+                false,
+            ),
+            Err(error) => {
+                return Err(AssetError::io(
+                    "не удалось создать журнал на дополнение",
+                    std::io::Error::from(error),
+                ));
+            }
+        };
         let mut file = File::from(fd);
         if !file
             .metadata()
@@ -602,8 +686,7 @@ impl Journal {
         }
         file.write_all(&line)
             .map_err(|error| AssetError::io("не удалось записать событие журнала", error))?;
-        file.sync_data()
-            .map_err(|error| AssetError::io("не удалось синхронизировать журнал", error))?;
+        sync_event_append(&file, &directory, created, File::sync_data, sync_directory)?;
         let metadata = file
             .metadata()
             .map_err(|error| AssetError::io("не удалось проверить журнал после записи", error))?;
@@ -798,53 +881,80 @@ impl Journal {
     }
 }
 
+/// Сохраняет данные события и, при первом создании файла, его имя в каталоге.
+fn sync_event_append(
+    file: &File,
+    directory: &File,
+    created: bool,
+    sync_file: impl FnOnce(&File) -> std::io::Result<()>,
+    sync_dir: impl FnOnce(&File) -> Result<(), AssetError>,
+) -> Result<(), AssetError> {
+    sync_file(file).map_err(|error| AssetError::io("не удалось синхронизировать журнал", error))?;
+    if created {
+        sync_dir(directory)?;
+    }
+    Ok(())
+}
+
 /// Проверяет целостность разобранного журнала.
 ///
 /// `manifest_revision_max` — наибольшая ревизия среди фактически присутствующих
 /// манифестов: канонического и `.runtime`. Событие не может ссылаться на ревизию,
 /// которой в хранилище ещё не было.
 pub fn check(read: &JournalRead, manifest_revision_max: u64) -> JournalCheck {
+    inspect(read, manifest_revision_max).check
+}
+
+/// Проверяет структуру истории отдельно от допустимого незакрытого Pending.
+/// Сверка может восстановить только последний случай: повреждённые связи нельзя
+/// исправить дописыванием новых событий.
+pub(crate) fn inspect(read: &JournalRead, manifest_revision_max: u64) -> JournalInspection {
     let mut problems = Vec::new();
+    let mut structurally_valid = true;
     if read.torn_tail {
+        structurally_valid = false;
         problems.push(
             "журнал оканчивается оборванной строкой без завершающего перевода строки".to_owned(),
         );
     }
     for line in &read.corrupt_lines {
+        structurally_valid = false;
         problems.push(format!("строка {line} журнала не разбирается"));
     }
 
-    // Множество всех `event_id` собирается один раз: журнал только дополняется и
-    // растёт до сотен тысяч событий, поэтому поиск `intent_id` по списку на
-    // каждом событии дал бы квадратичное время.
-    let known_ids: BTreeSet<&str> = read
-        .events
-        .iter()
-        .map(|event| event.event_id.as_str())
-        .collect();
+    let mut ids: BTreeMap<&str, Vec<(usize, &JournalEvent)>> = BTreeMap::new();
+    for (index, event) in read.events.iter().enumerate() {
+        ids.entry(event.event_id.as_str())
+            .or_default()
+            .push((index, event));
+    }
     let mut seen_ids = BTreeSet::new();
     for (index, event) in read.events.iter().enumerate() {
         let expected = index as u64 + 1;
         if event.seq != expected {
+            structurally_valid = false;
             problems.push(format!(
                 "нарушена нумерация seq: ожидалось {expected}, получено {}",
                 event.seq
             ));
         }
         if !seen_ids.insert(event.event_id.clone()) {
+            structurally_valid = false;
             problems.push(format!("event_id {} повторяется", event.event_id));
         }
-        if let Some(intent_id) = &event.intent_id
-            && !known_ids.contains(intent_id.as_str())
+        if event.event_key != expected_event_key(event)
+            && event.event_key != legacy_event_key(event)
         {
+            structurally_valid = false;
             problems.push(format!(
-                "событие seq={} ссылается на отсутствующий intent_id {intent_id}",
+                "event_key события seq={} не совпадает с его полями",
                 event.seq
             ));
         }
         if let Some(revision) = event.manifest_revision
             && revision > manifest_revision_max
         {
+            structurally_valid = false;
             problems.push(format!(
                 "событие seq={} ссылается на ревизию {revision} больше текущей {manifest_revision_max}",
                 event.seq
@@ -852,24 +962,106 @@ pub fn check(read: &JournalRead, manifest_revision_max: u64) -> JournalCheck {
         }
     }
 
-    let closed: BTreeSet<&str> = read
-        .events
-        .iter()
-        .filter_map(|event| event.intent_id.as_deref())
-        .collect();
-    // Интент закрывается ровно одним событием результата: два закрытия означают,
-    // что повторная попытка сослалась на чужой интент или результат записан
-    // дважды, и по журналу нельзя восстановить исход перехода.
     let mut closings: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-    for event in &read.events {
-        if let Some(intent_id) = event.intent_id.as_deref() {
-            closings.entry(intent_id).or_default().push(event.seq);
+    let mut closed = BTreeSet::new();
+    for (index, event) in read.events.iter().enumerate() {
+        if event.operation == JournalOperation::Baseline {
+            if event.outcome != JournalOutcome::Completed
+                || event.intent_id.is_some()
+                || event.snapshot.is_none()
+            {
+                structurally_valid = false;
+                problems.push(format!(
+                    "baseline seq={} должен быть однофазным completed-событием со снимком",
+                    event.seq
+                ));
+            }
+        } else if event.snapshot.is_some() {
+            structurally_valid = false;
+            problems.push(format!(
+                "снимок состояния разрешён только для baseline, seq={}",
+                event.seq
+            ));
         }
+
+        if event.outcome == JournalOutcome::Pending {
+            if event.intent_id.is_some() || !supports_pending_intent(event.operation) {
+                structurally_valid = false;
+                problems.push(format!(
+                    "событие seq={} не может быть Pending-интентом операции {}",
+                    event.seq, event.operation
+                ));
+            }
+            continue;
+        }
+
+        let Some(intent_id) = event.intent_id.as_deref() else {
+            if !is_one_phase_event(event) {
+                structurally_valid = false;
+                problems.push(format!(
+                    "событие результата seq={} операции {} не ссылается на Pending-интент",
+                    event.seq, event.operation
+                ));
+            }
+            continue;
+        };
+
+        let Some(matches) = ids.get(intent_id) else {
+            structurally_valid = false;
+            problems.push(format!(
+                "событие seq={} ссылается на отсутствующий intent_id {intent_id}",
+                event.seq
+            ));
+            continue;
+        };
+        if matches.len() != 1 {
+            structurally_valid = false;
+            problems.push(format!(
+                "событие seq={} ссылается на неоднозначный intent_id {intent_id}",
+                event.seq
+            ));
+            continue;
+        }
+
+        let (intent_index, intent) = matches[0];
+        if intent_index >= index || intent.seq >= event.seq {
+            structurally_valid = false;
+            problems.push(format!(
+                "событие seq={} ссылается не на предшествующий intent_id {intent_id}",
+                event.seq
+            ));
+            continue;
+        }
+        if intent.outcome != JournalOutcome::Pending {
+            structurally_valid = false;
+            problems.push(format!(
+                "событие seq={} ссылается на событие seq={}, которое не является Pending-интентом",
+                event.seq, intent.seq
+            ));
+            continue;
+        }
+        if intent.domain != event.domain
+            || intent.namespace != event.namespace
+            || intent.identity != event.identity
+            || intent.operation != event.operation
+        {
+            structurally_valid = false;
+            problems.push(format!(
+                "событие seq={} не совпадает с областью, идентичностью и операцией intent_id {intent_id}",
+                event.seq
+            ));
+            continue;
+        }
+        closings.entry(intent_id).or_default().push(event.seq);
+        closed.insert(intent_id);
     }
+
+    // Интент закрывается ровно одним подходящим событием результата.
     for event in read.events.iter().filter(|event| event.is_pending_intent()) {
         if let Some(seqs) = closings.get(event.event_id.as_str())
             && seqs.len() > 1
         {
+            structurally_valid = false;
             let listed = seqs
                 .iter()
                 .map(u64::to_string)
@@ -901,13 +1093,46 @@ pub fn check(read: &JournalRead, manifest_revision_max: u64) -> JournalCheck {
         ));
     }
 
-    JournalCheck {
-        event_count: read.events.len() as u64,
-        torn_tail: read.torn_tail,
-        corrupt_lines: read.corrupt_lines.clone(),
-        open_intents,
-        problems,
+    JournalInspection {
+        check: JournalCheck {
+            event_count: read.events.len() as u64,
+            torn_tail: read.torn_tail,
+            corrupt_lines: read.corrupt_lines.clone(),
+            open_intents,
+            problems,
+        },
+        structurally_valid,
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct JournalInspection {
+    pub check: JournalCheck,
+    pub structurally_valid: bool,
+}
+
+const fn supports_pending_intent(operation: JournalOperation) -> bool {
+    matches!(
+        operation,
+        JournalOperation::CandidateWritten
+            | JournalOperation::VerifiedPublished
+            | JournalOperation::TrustGranted
+            | JournalOperation::TrustRevoked
+            | JournalOperation::Revalidated
+            | JournalOperation::Quarantined
+    )
+}
+
+fn is_one_phase_event(event: &JournalEvent) -> bool {
+    event.outcome == JournalOutcome::Completed
+        && matches!(
+            event.operation,
+            JournalOperation::VerifiedReused
+                | JournalOperation::Removed
+                | JournalOperation::Recovered
+                | JournalOperation::LayoutMigrated
+                | JournalOperation::Baseline
+        )
 }
 
 /// Снимок текущего состояния обоих манифестов хранилища.
@@ -1169,6 +1394,55 @@ mod tests {
     }
 
     #[test]
+    fn first_event_syncs_file_data_before_the_new_directory_entry() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        journal
+            .append(&draft(
+                JournalOperation::CandidateWritten,
+                JournalOutcome::Pending,
+            ))
+            .expect("первое событие создано");
+        let directory = File::open(fixture.path().join(JOURNAL_DIR)).expect("каталог журнала");
+        let file = File::open(fixture.events_file()).expect("файл журнала");
+        let order = std::cell::RefCell::new(Vec::new());
+
+        sync_event_append(
+            &file,
+            &directory,
+            true,
+            |_| {
+                order.borrow_mut().push("file");
+                Ok(())
+            },
+            |_| {
+                order.borrow_mut().push("directory");
+                Ok(())
+            },
+        )
+        .expect("синхронизация завершена");
+
+        assert_eq!(*order.borrow(), ["file", "directory"]);
+
+        let reused_order = std::cell::RefCell::new(Vec::new());
+        sync_event_append(
+            &file,
+            &directory,
+            false,
+            |_| {
+                reused_order.borrow_mut().push("file");
+                Ok(())
+            },
+            |_| {
+                reused_order.borrow_mut().push("directory");
+                Ok(())
+            },
+        )
+        .expect("повторная запись синхронизирована");
+        assert_eq!(*reused_order.borrow(), ["file"]);
+    }
+
+    #[test]
     fn a_journal_over_the_read_limit_still_accepts_events() {
         let fixture = Fixture::new();
         let completed = draft(JournalOperation::VerifiedReused, JournalOutcome::Completed);
@@ -1410,6 +1684,227 @@ mod tests {
     }
 
     #[test]
+    fn check_accepts_valid_open_intents_and_supported_one_phase_events() {
+        let mut events = vec![event(1, "pending", None, JournalOutcome::Pending)];
+        let operations = [
+            JournalOperation::VerifiedReused,
+            JournalOperation::Removed,
+            JournalOperation::Recovered,
+            JournalOperation::LayoutMigrated,
+            JournalOperation::Baseline,
+        ];
+        for (offset, operation) in operations.into_iter().enumerate() {
+            let mut one_phase = event(
+                offset as u64 + 2,
+                &format!("one-phase-{offset}"),
+                None,
+                JournalOutcome::Completed,
+            );
+            one_phase.operation = operation;
+            if operation == JournalOperation::Baseline {
+                one_phase.snapshot = Some(JournalSnapshot {
+                    assets: 1,
+                    verified: 1,
+                    pending: 0,
+                    quarantined: 0,
+                    manifest_revision: 1,
+                });
+            }
+            one_phase.event_key = expected_event_key(&one_phase);
+            events.push(one_phase);
+        }
+
+        let inspection = inspect(
+            &JournalRead {
+                events,
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(inspection.structurally_valid);
+        assert_eq!(inspection.check.open_intents.len(), 1);
+        assert!(!inspection.check.is_clean());
+    }
+
+    #[test]
+    fn check_accepts_valid_schema_one_keys_from_before_intent_ids_were_hashed() {
+        let mut pending = event(1, "pending", None, JournalOutcome::Pending);
+        pending.event_key = legacy_event_key(&pending);
+        let mut result = event(2, "result", Some("pending"), JournalOutcome::Completed);
+        result.event_key = legacy_event_key(&result);
+        let mut reused = event(3, "reused", None, JournalOutcome::Completed);
+        reused.event_key = legacy_event_key(&reused);
+
+        let inspection = inspect(
+            &JournalRead {
+                events: vec![pending, result, reused],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(inspection.structurally_valid);
+        assert!(
+            inspection.check.is_clean(),
+            "{:?}",
+            inspection.check.problems
+        );
+    }
+
+    #[test]
+    fn check_rejects_redirected_and_malformed_intent_links() {
+        let pending = |seq, id, identity: &str| {
+            let mut intent = event(seq, id, None, JournalOutcome::Pending);
+            intent.identity = identity.to_owned();
+            intent.event_key = expected_event_key(&intent);
+            intent
+        };
+        let mut redirected = event(
+            3,
+            "result",
+            Some("pending-other"),
+            JournalOutcome::Completed,
+        );
+        redirected.identity = "日".to_owned();
+        redirected.event_key = expected_event_key(&redirected);
+        let redirected_inspection = inspect(
+            &JournalRead {
+                events: vec![
+                    pending(1, "pending-right", "日"),
+                    pending(2, "pending-other", "月"),
+                    redirected,
+                ],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(!redirected_inspection.structurally_valid);
+        assert!(redirected_inspection.check.problems.iter().any(|problem| {
+            problem.contains("не совпадает с областью, идентичностью и операцией")
+        }));
+
+        let mut wrong_operation = event(
+            2,
+            "result-operation",
+            Some("pending"),
+            JournalOutcome::Completed,
+        );
+        wrong_operation.operation = JournalOperation::CandidateWritten;
+        wrong_operation.event_key = expected_event_key(&wrong_operation);
+        let operation_inspection = inspect(
+            &JournalRead {
+                events: vec![pending(1, "pending", "日"), wrong_operation],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(!operation_inspection.structurally_valid);
+        assert!(operation_inspection.check.problems.iter().any(|problem| {
+            problem.contains("не совпадает с областью, идентичностью и операцией")
+        }));
+
+        let mut points_to_fact = event(2, "result", Some("fact"), JournalOutcome::Completed);
+        points_to_fact.operation = JournalOperation::Revalidated;
+        points_to_fact.event_key = expected_event_key(&points_to_fact);
+        let non_intent_inspection = inspect(
+            &JournalRead {
+                events: vec![
+                    event(1, "fact", None, JournalOutcome::Completed),
+                    points_to_fact,
+                ],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(!non_intent_inspection.structurally_valid);
+        assert!(
+            non_intent_inspection.check.problems.iter().any(|problem| {
+                problem.contains("не является Pending-интентом")
+            })
+        );
+
+        let mut missing_link = event(2, "result", None, JournalOutcome::Completed);
+        missing_link.operation = JournalOperation::Revalidated;
+        missing_link.event_key = expected_event_key(&missing_link);
+        let missing_link_inspection = inspect(
+            &JournalRead {
+                events: vec![pending(1, "pending", "日"), missing_link],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(!missing_link_inspection.structurally_valid);
+        assert!(
+            missing_link_inspection
+                .check
+                .problems
+                .iter()
+                .any(|problem| {
+                    problem.contains("не ссылается на Pending-интент")
+                })
+        );
+    }
+
+    #[test]
+    fn check_rejects_tampered_event_keys_and_cross_scope_closures() {
+        let intent = event(1, "pending", None, JournalOutcome::Pending);
+        let mut wrong_identity = event(2, "result", Some("pending"), JournalOutcome::Completed);
+        wrong_identity.identity = "月".to_owned();
+        wrong_identity.event_key = expected_event_key(&wrong_identity);
+        let identity_inspection = inspect(
+            &JournalRead {
+                events: vec![intent.clone(), wrong_identity],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(!identity_inspection.structurally_valid);
+
+        let mut wrong_domain = event(
+            2,
+            "result-domain",
+            Some("pending"),
+            JournalOutcome::Completed,
+        );
+        wrong_domain.domain = "pitch".to_owned();
+        wrong_domain.event_key = expected_event_key(&wrong_domain);
+        let domain_inspection = inspect(
+            &JournalRead {
+                events: vec![intent.clone(), wrong_domain],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(!domain_inspection.structurally_valid);
+
+        let mut tampered = event(1, "one-phase", None, JournalOutcome::Completed);
+        tampered.event_key = "not-the-derived-key".to_owned();
+        let key_inspection = inspect(
+            &JournalRead {
+                events: vec![tampered],
+                torn_tail: false,
+                corrupt_lines: Vec::new(),
+            },
+            5,
+        );
+        assert!(!key_inspection.structurally_valid);
+        assert!(
+            key_inspection
+                .check
+                .problems
+                .iter()
+                .any(|problem| problem.contains("event_key") && problem.contains("не совпадает"))
+        );
+    }
+
+    #[test]
     fn check_rejects_revision_beyond_the_manifest() {
         let read = JournalRead {
             events: vec![event(1, "id-1", None, JournalOutcome::Completed)],
@@ -1447,16 +1942,21 @@ mod tests {
         intent_id: Option<&str>,
         outcome: JournalOutcome,
     ) -> JournalEvent {
-        JournalEvent {
+        let operation = if intent_id.is_some() || outcome == JournalOutcome::Pending {
+            JournalOperation::Revalidated
+        } else {
+            JournalOperation::VerifiedReused
+        };
+        let mut event = JournalEvent {
             schema_version: JOURNAL_SCHEMA_VERSION,
             seq,
             event_id: event_id.to_owned(),
-            event_key: format!("key-{seq}-{event_id}"),
+            event_key: String::new(),
             recorded_at: "2024-01-01T00:00:00.000Z".to_owned(),
             domain: "kanji".to_owned(),
             namespace: "kanji".to_owned(),
             identity: "日".to_owned(),
-            operation: JournalOperation::Revalidated,
+            operation,
             outcome,
             intent_id: intent_id.map(str::to_owned),
             manifest_revision: Some(1),
@@ -1470,6 +1970,8 @@ mod tests {
             provenance: None,
             reason: None,
             snapshot: None,
-        }
+        };
+        event.event_key = expected_event_key(&event);
+        event
     }
 }

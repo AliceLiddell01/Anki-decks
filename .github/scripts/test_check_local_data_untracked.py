@@ -1,10 +1,14 @@
-"""Synthetic fixtures for the user-data tracking guard."""
+"""Синтетические фикстуры для проверки границы пользовательских данных."""
 
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 from check_local_data_untracked import (
     ignore_rule_problems,
+    tracked_paths,
     tracked_user_data,
 )
 
@@ -29,6 +33,8 @@ class TrackedUserDataTests(unittest.TestCase):
             # группировки тоже не публикуется.
             "decks/legacy/words/Words__N5/deck.json",
             "decks/README.md",
+            "decks",
+            ".asset-store",
         ]
         self.assertEqual(tracked_user_data(tracked), tracked)
 
@@ -68,10 +74,9 @@ class IgnoreRuleTests(unittest.TestCase):
         problems = ignore_rule_problems(text)
         self.assertTrue(any("/decks/" in problem for problem in problems))
 
-    def test_re_inclusion_is_reported(self):
+    def test_nested_re_inclusion_blocked_by_ignored_parent_is_allowed(self):
         text = GITIGNORE + "!/.asset-store/kanji/manifest.json\n"
-        problems = ignore_rule_problems(text)
-        self.assertTrue(any("повторно включает" in problem for problem in problems))
+        self.assertEqual(ignore_rule_problems(text), [])
 
     def test_unrelated_negation_is_allowed(self):
         text = GITIGNORE + "!*.example\n"
@@ -81,6 +86,29 @@ class IgnoreRuleTests(unittest.TestCase):
         text = GITIGNORE + "# !/.asset-store/\n"
         self.assertEqual(ignore_rule_problems(text), [])
 
+    def test_direct_re_inclusion_is_detected_by_git(self):
+        for rule in ("!/decks/", "!/.asset-store/"):
+            with self.subTest(rule=rule):
+                problems = ignore_rule_problems(GITIGNORE + rule + "\n")
+                self.assertTrue(
+                    any("не игнорируют пользовательский путь" in problem for problem in problems),
+                    problems,
+                )
+
+    def test_generalized_re_inclusion_is_detected_before_indexing(self):
+        problems = ignore_rule_problems(GITIGNORE + "!/deck*/\n")
+        self.assertTrue(
+            any("decks/output/" in problem for problem in problems),
+            problems,
+        )
+
+    def test_rules_do_not_hide_regular_tracked_code(self):
+        problems = ignore_rule_problems(GITIGNORE + "/*\n")
+        self.assertTrue(
+            any("ошибочно игнорируют код" in problem for problem in problems),
+            problems,
+        )
+
 
 class RepositoryStateTests(unittest.TestCase):
     def test_this_repository_passes_its_own_guard(self):
@@ -88,6 +116,26 @@ class RepositoryStateTests(unittest.TestCase):
         from check_local_data_untracked import validate_tree
 
         self.assertEqual(validate_tree(root), [])
+
+    def test_symlinks_named_forbidden_roots_are_detected_in_the_index(self):
+        with tempfile.TemporaryDirectory(prefix="anki-tracked-link-") as temporary:
+            root = Path(temporary)
+            (root / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            target = root / "outside"
+            target.mkdir()
+            os.symlink(target, root / "decks", target_is_directory=True)
+            os.symlink(target, root / ".asset-store", target_is_directory=True)
+            subprocess.run(
+                ["git", "add", "-f", "--", "decks", ".asset-store"],
+                cwd=root,
+                check=True,
+            )
+
+            tracked = tracked_paths(root)
+            self.assertEqual(
+                set(tracked_user_data(tracked)), {"decks", ".asset-store"}
+            )
 
 
 if __name__ == "__main__":

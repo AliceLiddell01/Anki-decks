@@ -21,7 +21,7 @@ use crate::error::{AssetError, ErrorCode};
 use crate::hashing::{encode_lower_hex, sha256_hex};
 use crate::journal::{
     JOURNAL_DIR, Journal, JournalCheck, JournalDraft, JournalEvent, JournalOperation,
-    JournalOutcome, STORE_WIDE_IDENTITY, check, revision_bound, snapshot,
+    JournalOutcome, STORE_WIDE_IDENTITY, check, inspect, revision_bound, snapshot,
 };
 use crate::model::{
     AssetIdentity, AssetRecord, DetectedFormat, HumanAttestation, HumanDecision, LifecycleState,
@@ -2325,8 +2325,15 @@ impl AssetStore {
         let mut records: Vec<AssetRecord> = canonical.assets.clone();
         records.extend(runtime.assets.iter().cloned());
         let read = self.journal_lock().read()?;
+        let inspection = inspect(&read, revision);
+        if !inspection.structurally_valid {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "журнал содержит структурно некорректную историю; сверка не дописала события",
+            ));
+        }
         let mut appended = Vec::new();
-        for intent in check(&read, revision).open_intents {
+        for intent in inspection.check.open_intents {
             let Some(event) = read
                 .events
                 .iter()

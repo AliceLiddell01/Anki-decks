@@ -21,13 +21,19 @@
 //! прежней области не открывает её и не спускается в неё.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustix::fs::{
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, RenameFlags, mkdirat, open, openat, renameat_with,
+    statat, unlinkat,
+};
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
@@ -230,11 +236,15 @@ impl MigrationReport {
 /// при отказе файловой системы. Отказ отдельного экспорта ошибкой не является:
 /// он виден в [`MigrationReport::refused`] и в коде возврата.
 pub fn migrate(root: Option<&Path>, apply: bool) -> Result<MigrationReport, DomainError> {
+    if let Some(path) = root {
+        crate::layout::guard_local_path(path, "корень репозитория")?;
+    }
     let root = resolve_root(root)?;
-    crate::layout::guard_local_path(&root, "корень репозитория")?;
+    crate::layout::guard_local_path_for_root(&root, &root, "корень репозитория")?;
     let legacy = canonical_ish(&root.join(layout::DECKS_DIR));
     let input = layout::input_dir(&root);
     let output = layout::output_dir(&root);
+    validate_output_location(&root, &output)?;
 
     let mut diagnostics = Vec::new();
     if !legacy.is_dir() {
@@ -727,7 +737,7 @@ fn write_plan(
     entries: &mut [ExportPlan],
 ) -> Result<(Vec<String>, Option<Diagnostic>), DomainError> {
     let _lock = ExportLock::acquire(legacy)?;
-    apply_entries(output, entries)?;
+    apply_entries(root, output, entries)?;
     if entries.iter().any(|entry| entry.state == "refused") {
         // Отказ, обнаруженный уже при записи (`target_appeared`), отменяет и
         // снятие placeholder-файлов: отвергнутый план не пишет ничего.
@@ -741,8 +751,158 @@ fn write_plan(
     Ok((pruned, retained))
 }
 
+/// Проверяет, что назначение раскладки остаётся обычным каталогом `decks/output`.
+///
+/// Проверка выполняется до чтения прежней области и повторяется перед записью:
+/// канонический путь назначения не должен совпасть с `decks/input`, а ни один
+/// компонент пути раскладки не должен перенаправлять миграцию через symlink.
+fn validate_output_location(root: &Path, output: &Path) -> Result<(), DomainError> {
+    let requested = root.join(layout::DECKS_DIR).join(layout::OUTPUT_DIR);
+    layout::guard_local_path_for_root(&requested, root, "каталог назначения")?;
+    layout::guard_local_path_for_root(output, root, "каталог назначения")?;
+
+    let current_output = layout::output_dir(root);
+    if current_output != output {
+        return Err(layout_path_error(
+            &requested,
+            "layout_destination_changed",
+            "путь каталога назначения изменился во время планирования",
+        ));
+    }
+
+    let input = layout::input_dir(root);
+    if current_output.starts_with(&input)
+        || input.starts_with(&current_output)
+        || current_output == input
+    {
+        return Err(input_area_error(&requested, root));
+    }
+
+    let decks = root.join(layout::DECKS_DIR);
+    match fs::symlink_metadata(&decks) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(layout_path_error(
+                &decks,
+                "layout_path_is_symlink",
+                "каталог decks перенаправлен символической ссылкой; миграция отказана",
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(&decks, "inspect_layout_path", &error)),
+    }
+
+    let output_path = decks.join(layout::OUTPUT_DIR);
+    match fs::symlink_metadata(&output_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(layout_path_error(
+                &output_path,
+                "layout_path_is_symlink",
+                "каталог назначения перенаправлен символической ссылкой; миграция отказана",
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(layout_path_error(
+                &output_path,
+                "layout_destination_not_directory",
+                "каталог назначения существует, но не является каталогом",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(&output_path, "inspect_layout_path", &error)),
+    }
+    Ok(())
+}
+
+fn input_area_error(path: &Path, root: &Path) -> DomainError {
+    DomainError::with_details(
+        ErrorCode::InvalidRequest,
+        format!(
+            "каталог назначения {} пересекает закрытую область decks/input; миграция отказана",
+            path.display()
+        ),
+        details! {
+            "path" => path.display().to_string(),
+            "repository_root" => root.display().to_string(),
+            "area" => "decks/input",
+            "reason" => "input_area_forbidden",
+        },
+    )
+}
+
+fn layout_path_error(path: &Path, reason: &str, message: &str) -> DomainError {
+    DomainError::with_details(
+        ErrorCode::InvalidRequest,
+        format!("{message}: {}", path.display()),
+        details! {
+            "path" => path.display().to_string(),
+            "reason" => reason,
+        },
+    )
+}
+
+/// Открывает `decks/output` без перехода по symlink на любом компоненте.
+fn open_output_directory(root: &Path, output: &Path, create: bool) -> Result<File, DomainError> {
+    validate_output_location(root, output)?;
+    let root_directory = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| io_error(root, "open_repository_root", &io::Error::from(error)))?;
+    let decks_directory = openat(
+        &root_directory,
+        layout::DECKS_DIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        io_error(
+            &root.join(layout::DECKS_DIR),
+            "open_decks_directory",
+            &io::Error::from(error),
+        )
+    })?;
+
+    if create {
+        match mkdirat(
+            &decks_directory,
+            layout::OUTPUT_DIR,
+            Mode::from_raw_mode(0o755),
+        ) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::EXIST => {}
+            Err(error) => {
+                return Err(io_error(
+                    output,
+                    "create_output_dir",
+                    &io::Error::from(error),
+                ));
+            }
+        }
+    }
+
+    openat(
+        &decks_directory,
+        layout::OUTPUT_DIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| io_error(output, "open_output_dir", &io::Error::from(error)))
+}
+
 /// Выполняет план записи: переносит экспорты, не снимая placeholder-файлы.
-fn apply_entries(output: &Path, entries: &mut [ExportPlan]) -> Result<(), DomainError> {
+fn apply_entries(
+    root: &Path,
+    output: &Path,
+    entries: &mut [ExportPlan],
+) -> Result<(), DomainError> {
+    validate_output_location(root, output)?;
     for entry in entries.iter_mut().filter(|entry| entry.action == "move") {
         if let Some(target) = entry.target_path.clone()
             && fs::symlink_metadata(&target).is_ok()
@@ -763,10 +923,10 @@ fn apply_entries(output: &Path, entries: &mut [ExportPlan]) -> Result<(), Domain
         return Ok(());
     }
 
-    fs::create_dir_all(output).map_err(|error| io_error(output, "create_output_dir", &error))?;
+    let output_directory = open_output_directory(root, output, true)?;
 
-    let needed = bytes_to_copy(entries, output)?;
-    let available = available_bytes(output)?;
+    let needed = bytes_to_copy(entries, &output_directory)?;
+    let available = available_bytes(&output_directory, output)?;
     if available < needed {
         return Err(DomainError::with_details(
             ErrorCode::WriteFailed,
@@ -783,7 +943,7 @@ fn apply_entries(output: &Path, entries: &mut [ExportPlan]) -> Result<(), Domain
 
     for entry in entries.iter_mut() {
         match entry.action {
-            "move" => move_export(entry)?,
+            "move" => move_export(root, output, entry)?,
             "already_present" => remove_duplicate_source(entry)?,
             _ => {}
         }
@@ -792,7 +952,7 @@ fn apply_entries(output: &Path, entries: &mut [ExportPlan]) -> Result<(), Domain
 }
 
 /// Переносит экспорт в назначение и подтверждает отпечаток.
-fn move_export(entry: &mut ExportPlan) -> Result<(), DomainError> {
+fn move_export(root: &Path, output: &Path, entry: &mut ExportPlan) -> Result<(), DomainError> {
     let source = entry.source_path.clone();
     let target = entry
         .target_path
@@ -816,12 +976,46 @@ fn move_export(entry: &mut ExportPlan) -> Result<(), DomainError> {
         ));
     }
 
-    match fs::rename(&source, &target) {
+    validate_output_location(root, output)?;
+    let output_directory = open_output_directory(root, output, false)?;
+    let target_name = target
+        .file_name()
+        .ok_or_else(|| verification_error(&target, "у назначения нет имени каталога"))?;
+    match renameat_with(
+        CWD,
+        &source,
+        &output_directory,
+        target_name,
+        RenameFlags::NOREPLACE,
+    ) {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-            copy_export(&source, &target, expected.as_deref())?;
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            refuse(
+                entry,
+                "target_appeared",
+                format!(
+                    "{} появился перед атомарной публикацией: перезапись запрещена",
+                    target.display()
+                ),
+            );
+            return Ok(());
         }
-        Err(error) => return Err(io_error(&source, "rename_export", &error)),
+        Err(error) if io::Error::from(error).kind() == io::ErrorKind::CrossesDevices => {
+            if !copy_export(root, output, &source, &target, expected.as_deref())? {
+                refuse(
+                    entry,
+                    "target_appeared",
+                    format!(
+                        "{} появился перед атомарной публикацией копии: перезапись запрещена",
+                        target.display()
+                    ),
+                );
+                return Ok(());
+            }
+        }
+        Err(error) => {
+            return Err(io_error(&source, "rename_export", &io::Error::from(error)));
+        }
     }
 
     let actual = scan_export(&target)
@@ -838,18 +1032,52 @@ fn move_export(entry: &mut ExportPlan) -> Result<(), DomainError> {
 }
 
 /// Копирует экспорт в назначение, проверяя отпечаток до публикации.
-fn copy_export(source: &Path, target: &Path, expected: Option<&str>) -> Result<(), DomainError> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| verification_error(target, "у назначения нет родительского каталога"))?;
-    let temporary = parent.join(format!(
-        "{TEMP_PREFIX}{}-{}",
-        std::process::id(),
-        unique_suffix()
-    ));
+fn copy_export(
+    root: &Path,
+    output: &Path,
+    source: &Path,
+    target: &Path,
+    expected: Option<&str>,
+) -> Result<bool, DomainError> {
+    let temporary_name = format!("{TEMP_PREFIX}{}-{}", std::process::id(), unique_suffix());
+    let temporary = output.join(&temporary_name);
+    let target_name = target
+        .file_name()
+        .ok_or_else(|| verification_error(target, "у назначения нет имени каталога"))?;
+    let output_directory = open_output_directory(root, output, false)?;
+    let source_directory = open(
+        source,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| io_error(source, "open_copy_source", &io::Error::from(error)))?;
+    mkdirat(
+        &output_directory,
+        temporary_name.as_str(),
+        Mode::from_raw_mode(0o755),
+    )
+    .map_err(|error| io_error(&temporary, "create_copy_stage", &io::Error::from(error)))?;
+    let temporary_directory = match openat(
+        &output_directory,
+        temporary_name.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(directory) => File::from(directory),
+        Err(error) => {
+            let _ = remove_tree_at(&output_directory, OsStr::new(&temporary_name));
+            return Err(io_error(
+                &temporary,
+                "open_copy_stage",
+                &io::Error::from(error),
+            ));
+        }
+    };
 
-    let outcome = (|| -> Result<(), DomainError> {
-        copy_tree(source, &temporary)?;
+    let outcome = (|| -> Result<CopyPublish, DomainError> {
+        validate_output_location(root, output)?;
+        copy_tree_contents(source, &source_directory, &temporary_directory)?;
         let copied = scan_export(&temporary)
             .map_err(|failure| verification_error(&temporary, &failure.message(&temporary)))?;
         if Some(copied.digest.as_str()) != expected {
@@ -858,33 +1086,167 @@ fn copy_export(source: &Path, target: &Path, expected: Option<&str>) -> Result<(
                 "скопированный экспорт не совпал с доказанным отпечатком источника",
             ));
         }
-        fs::rename(&temporary, target).map_err(|error| io_error(target, "publish_copy", &error))?;
-        fs::remove_dir_all(source).map_err(|error| io_error(source, "remove_source", &error))
+        validate_output_location(root, output)?;
+        let current_output_directory = open_output_directory(root, output, false)?;
+        match renameat_with(
+            &current_output_directory,
+            temporary_name.as_str(),
+            &current_output_directory,
+            target_name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                return Ok(CopyPublish::TargetAppeared);
+            }
+            Err(error) => {
+                return Err(io_error(target, "publish_copy", &io::Error::from(error)));
+            }
+        }
+        fs::remove_dir_all(source).map_err(|error| io_error(source, "remove_source", &error))?;
+        Ok(CopyPublish::Published)
     })();
 
-    if outcome.is_err() {
-        let _ = fs::remove_dir_all(&temporary);
+    match outcome {
+        Ok(CopyPublish::Published) => Ok(true),
+        Ok(CopyPublish::TargetAppeared) => {
+            let _ = remove_tree_at(&output_directory, OsStr::new(&temporary_name));
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = remove_tree_at(&output_directory, OsStr::new(&temporary_name));
+            Err(error)
+        }
     }
-    outcome
 }
 
-/// Рекурсивно копирует каталог, не следуя по символическим ссылкам.
-fn copy_tree(source: &Path, target: &Path) -> Result<(), DomainError> {
-    fs::create_dir_all(target).map_err(|error| io_error(target, "create_dir", &error))?;
-    for path in read_dir_sorted(source)? {
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| read_error(&path, "read_source", &error))?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| verification_error(&path, "у элемента нет имени"))?;
-        let destination = target.join(name);
-        if metadata.is_dir() {
-            copy_tree(&path, &destination)?;
-        } else {
-            fs::copy(&path, &destination).map_err(|error| io_error(&path, "copy_file", &error))?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyPublish {
+    Published,
+    TargetAppeared,
+}
+
+/// Копирует файлы между открытыми каталогами, не следуя по символическим ссылкам.
+fn copy_tree_contents(
+    source_path: &Path,
+    source_directory: &File,
+    target_directory: &File,
+) -> Result<(), DomainError> {
+    for name in directory_names(source_directory)
+        .map_err(|error| read_error(source_path, "read_source", &error))?
+    {
+        let path = source_path.join(&name);
+        let stat = statat(source_directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| read_error(&path, "read_source", &io::Error::from(error)))?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let source_child = openat(
+                    source_directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(|error| {
+                    read_error(&path, "open_source_directory", &io::Error::from(error))
+                })?;
+                mkdirat(target_directory, &name, Mode::from_raw_mode(0o755)).map_err(|error| {
+                    io_error(&path, "create_copy_directory", &io::Error::from(error))
+                })?;
+                let target_child = openat(
+                    target_directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(|error| io_error(&path, "open_copy_directory", &io::Error::from(error)))?;
+                copy_tree_contents(&path, &source_child, &target_child)?;
+            }
+            FileType::RegularFile => {
+                let mut source_file = openat(
+                    source_directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(|error| read_error(&path, "open_source_file", &io::Error::from(error)))?;
+                if !source_file
+                    .metadata()
+                    .map_err(|error| read_error(&path, "read_source", &error))?
+                    .is_file()
+                {
+                    return Err(verification_error(
+                        &path,
+                        "источник перестал быть обычным файлом",
+                    ));
+                }
+                let mut target_file = openat(
+                    target_directory,
+                    &name,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::CLOEXEC
+                        | OFlags::NOFOLLOW,
+                    Mode::from_raw_mode(stat.st_mode & 0o7777),
+                )
+                .map(File::from)
+                .map_err(|error| io_error(&path, "create_copy_file", &io::Error::from(error)))?;
+                io::copy(&mut source_file, &mut target_file)
+                    .map_err(|error| io_error(&path, "copy_file", &error))?;
+                target_file
+                    .sync_data()
+                    .map_err(|error| io_error(&path, "sync_copy_file", &error))?;
+            }
+            FileType::Symlink => {
+                return Err(verification_error(
+                    &path,
+                    "источник содержит символическую ссылку",
+                ));
+            }
+            _ => {
+                return Err(verification_error(
+                    &path,
+                    "источник содержит не обычный файл",
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn directory_names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(directory)? {
+        let entry = entry?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsStr::from_bytes(bytes).to_os_string());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn remove_tree_at(parent: &File, name: &OsStr) -> io::Result<()> {
+    let directory = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let directory = File::from(directory);
+    for child in directory_names(&directory)? {
+        let stat = statat(&directory, &child, AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            remove_tree_at(&directory, &child)?;
+        } else {
+            unlinkat(&directory, &child, AtFlags::empty())?;
+        }
+    }
+    unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
 }
 
 /// Убирает источник, побайтово совпадающий с уже существующим назначением.
@@ -1001,8 +1363,11 @@ fn prune_legacy_placeholders(
 /// не требует, а уже существующее назначение только снимает источник. Поэтому
 /// свободное место считается только по тем записям, которые пройдут через
 /// [`copy_export`] при `CrossesDevices`, а не по полному объёму миграции.
-fn bytes_to_copy(entries: &[ExportPlan], output: &Path) -> Result<u64, DomainError> {
-    let output_device = device_of(output)?;
+fn bytes_to_copy(entries: &[ExportPlan], output: &File) -> Result<u64, DomainError> {
+    let output_device = output
+        .metadata()
+        .map_err(|error| io_error(Path::new("decks/output"), "read_metadata", &error))?
+        .dev();
     let mut needed = 0_u64;
     for entry in entries.iter().filter(|entry| entry.action == "move") {
         if device_of(&entry.source_path)? != output_device {
@@ -1019,8 +1384,8 @@ fn device_of(path: &Path) -> Result<u64, DomainError> {
 }
 
 /// Свободное место на файловой системе каталога.
-fn available_bytes(path: &Path) -> Result<u64, DomainError> {
-    let stat = rustix::fs::statvfs(path).map_err(|error| {
+fn available_bytes(directory: &File, path: &Path) -> Result<u64, DomainError> {
+    let stat = rustix::fs::fstatvfs(directory).map_err(|error| {
         DomainError::with_details(
             ErrorCode::WriteFailed,
             format!(
@@ -1380,7 +1745,7 @@ mod tests {
         // больше не описывает его содержимое.
         fs::write(export.join("media").join("a.bin"), b"b").expect("источник изменён");
 
-        let error = move_export(&mut entry).expect_err("перенос обязан отказать");
+        let error = move_export(&root, &output, &mut entry).expect_err("перенос обязан отказать");
         assert_eq!(error.code, ErrorCode::SourceChanged);
         assert!(
             export.join(DECK_JSON).is_file(),
@@ -1389,6 +1754,85 @@ mod tests {
         assert!(
             !output.join("Words__A").exists(),
             "отказ не создаёт назначение"
+        );
+    }
+
+    #[test]
+    fn a_destination_redirected_after_planning_is_rechecked_before_writing() {
+        let (_dir, root) = repository("layout-output-race");
+        let source = write_export(&root, "decks/words/Words__A", b"a");
+        let legacy = root.join("decks");
+        let input = root.join("decks/input");
+        fs::create_dir_all(&input).expect("закрытая область");
+        fs::write(input.join("sentinel.bin"), b"private").expect("маркер");
+        let output = root.join("decks/output");
+        validate_output_location(&root, &output).expect("исходное назначение безопасно");
+        let mut entries = vec![plan_entry(&source, &output)];
+
+        std::os::unix::fs::symlink(&input, &output).expect("назначение перенаправлено в input");
+        let error = apply_entries(&root, &output, &mut entries)
+            .expect_err("путь повторно проверяется непосредственно перед записью");
+
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(error.details["reason"], "input_area_forbidden");
+        assert!(source.join(DECK_JSON).is_file(), "источник не перенесён");
+        assert_eq!(fs::read(input.join("sentinel.bin")).unwrap(), b"private");
+        assert!(
+            !input.join("Words__A").exists(),
+            "в input ничего не записано"
+        );
+        assert!(legacy.is_dir());
+    }
+
+    #[test]
+    fn an_empty_target_that_appears_at_rename_is_not_replaced() {
+        let (_dir, root) = repository("layout-rename-no-replace");
+        let source = write_export(&root, "decks/words/Words__A", b"source");
+        let output = root.join("decks/output");
+        fs::create_dir_all(&output).expect("каталог назначения");
+        let target = output.join("Words__A");
+        fs::create_dir(&target).expect("пустое назначение появилось конкурентно");
+        let mut entry = plan_entry(&source, &output);
+
+        move_export(&root, &output, &mut entry).expect("конкурентная цель — отказ в отчёте");
+
+        assert_eq!(entry.reason, Some("target_appeared"));
+        assert_eq!(entry.state, "refused");
+        assert!(source.join(DECK_JSON).is_file(), "источник сохранён");
+        assert_eq!(
+            fs::read_dir(&target).unwrap().count(),
+            0,
+            "назначение не заменено"
+        );
+    }
+
+    #[test]
+    fn copy_publication_does_not_replace_a_target_that_appears() {
+        let (_dir, root) = repository("layout-copy-no-replace");
+        let source = write_export(&root, "decks/words/Words__A", b"source");
+        let output = root.join("decks/output");
+        fs::create_dir_all(&output).expect("каталог назначения");
+        let target = output.join("Words__A");
+        fs::create_dir(&target).expect("пустое назначение появилось конкурентно");
+        let expected = scan_export(&source).expect("отпечаток").digest;
+
+        let published = copy_export(&root, &output, &source, &target, Some(&expected))
+            .expect("появившаяся цель не перезаписывается");
+
+        assert!(!published, "публикация отказана на атомарном rename");
+        assert!(source.join(DECK_JSON).is_file(), "источник сохранён");
+        assert_eq!(
+            fs::read_dir(&target).unwrap().count(),
+            0,
+            "назначение не заменено"
+        );
+        assert!(
+            fs::read_dir(&output).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TEMP_PREFIX)),
+            "временная копия очищена"
         );
     }
 
@@ -1419,7 +1863,11 @@ mod tests {
         // существующее назначение только снимает источник: свободное место
         // нужно только для копирования между файловыми системами.
         let entries = vec![entry("move"), entry("already_present")];
-        assert_eq!(bytes_to_copy(&entries, &output).expect("объём"), 0);
+        let output_directory = File::open(&output).expect("каталог назначения");
+        assert_eq!(
+            bytes_to_copy(&entries, &output_directory).expect("объём"),
+            0
+        );
     }
 
     #[test]
@@ -1552,22 +2000,32 @@ mod tests {
 
         let report = migrate(Some(&root), true).expect("миграция выполнена");
 
-        assert!(!report.refused, "{:?}", report.exports);
         assert!(
-            !report
+            !report.refused,
+            "миграция отклонена: {:?}",
+            report
                 .exports
                 .iter()
-                .any(|entry| entry.source.contains("decks/input")),
-            "ссылка на закрытую область не становится кандидатом: {:?}",
-            report.exports
+                .map(|entry| entry.reason.unwrap_or("ok"))
+                .collect::<Vec<_>>()
         );
+        let sources: Vec<&str> = report
+            .exports
+            .iter()
+            .map(|entry| entry.source.as_str())
+            .collect();
         assert!(
-            !report
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "legacy_area_retained"),
-            "закрытая область не удерживает прежнюю раскладку: {:?}",
-            report.diagnostics
+            !sources.iter().any(|source| source.contains("decks/input")),
+            "ссылка на закрытую область не становится кандидатом: {sources:?}"
+        );
+        let diagnostic_codes: Vec<&str> = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert!(
+            !diagnostic_codes.contains(&"legacy_area_retained"),
+            "закрытая область не удерживает прежнюю раскладку: {diagnostic_codes:?}"
         );
         assert!(
             root.join("decks/output/Words__A/deck.json").is_file(),

@@ -193,7 +193,7 @@ fn kanji_journal_records_a_two_phase_transition_and_reads_it_after_restart() {
 }
 
 #[test]
-fn journal_check_fails_on_a_dangling_intent_and_reconcile_closes_it() {
+fn reconcile_refuses_to_mask_a_result_without_its_intent_link() {
     let fixture = Fixture::new("journal-contract-reconcile");
     ingest_kanji_candidate(&fixture);
     let file = fixture.events_file(&fixture.kanji_store());
@@ -219,24 +219,20 @@ fn journal_check_fails_on_a_dangling_intent_and_reconcile_closes_it() {
     assert_eq!(open.len(), 1);
     assert_eq!(open[0]["operation"], "candidate_written");
 
+    let before_reconcile = fs::read(&file).expect("байты повреждённой истории сохранены");
     let reconcile = fixture.kanji(&["--output", "json", "journal", "reconcile"]);
-    assert!(reconcile.status.success(), "{}", stderr(&reconcile));
-    let reconcile = json(&reconcile);
-    assert_eq!(reconcile["outcome"], "reconciled");
-    let appended = reconcile["journal"]["appended"]
-        .as_array()
-        .expect("сверка дописала событие");
-    assert_eq!(appended.len(), 1);
-    assert_eq!(appended[0]["outcome"], "recovered");
-    assert_eq!(appended[0]["operation"], "candidate_written");
+    assert_eq!(reconcile.status.code(), Some(4), "{}", stderr(&reconcile));
+    assert_eq!(json(&reconcile)["error"]["code"], "manifest_corrupt");
+    assert_eq!(
+        fs::read(&file).expect("сверка не меняет файл"),
+        before_reconcile,
+        "структурно повреждённая история не получает новых событий"
+    );
 
     let check = fixture.kanji(&["--output", "json", "journal", "check"]);
-    assert!(check.status.success(), "{}", stderr(&check));
-    assert_eq!(json(&check)["outcome"], "checked");
-
-    let repeated = fixture.kanji(&["--output", "json", "journal", "reconcile"]);
-    assert!(repeated.status.success(), "{}", stderr(&repeated));
-    assert_eq!(json(&repeated)["outcome"], "no_op");
+    assert_eq!(check.status.code(), Some(3), "{}", stderr(&check));
+    assert_eq!(json(&check)["outcome"], "problems_found");
+    assert!(!json(&check)["blockers"].as_array().unwrap().is_empty());
 }
 
 #[test]

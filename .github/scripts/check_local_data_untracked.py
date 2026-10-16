@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard: user data must never be tracked by Git (stdlib only).
+"""Проверка, что пользовательские данные не попадают в индекс Git (только stdlib).
 
 Пользовательские данные репозитория — локальные колоды и локальное доверенное
 хранилище ресурсов — живут в игнорируемых Git областях:
@@ -19,6 +19,7 @@
 import argparse
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Области, которые не могут быть отслеживаемыми ни при каких условиях.
@@ -26,12 +27,18 @@ FORBIDDEN_PREFIXES = (
     "decks/",
     ".asset-store/",
 )
+FORBIDDEN_ROOTS = ("decks", ".asset-store")
 
 # Правила, которые обязаны присутствовать в корневом `.gitignore`.
 REQUIRED_IGNORE_RULES = ("/decks/", "/.asset-store/")
 
-# Маркер повторного включения в `.gitignore`.
-NEGATION = "!"
+IGNORE_PROBES = (
+    "decks/.anki-repository-ignore-probe",
+    "decks/output/.anki-repository-ignore-probe/deck.json",
+    ".asset-store/.anki-repository-ignore-probe",
+    ".asset-store/kanji/.anki-repository-ignore-probe",
+)
+TRACKED_CODE_PROBES = ("README.md", "tools/anki-repo/src/layout.rs")
 
 
 def tracked_user_data(tracked_paths):
@@ -43,13 +50,13 @@ def tracked_user_data(tracked_paths):
         # с точки, и вырезание множества символов уничтожило бы его имя.
         if normalized.startswith("./"):
             normalized = normalized[2:]
-        if normalized.startswith(FORBIDDEN_PREFIXES):
+        if normalized in FORBIDDEN_ROOTS or normalized.startswith(FORBIDDEN_PREFIXES):
             violations.append(normalized)
     return violations
 
 
 def ignore_rule_problems(gitignore_text):
-    """Возвращает проблемы правил игнорирования пользовательских областей."""
+    """Проверяет правила игнорирования по фактическому поведению Git."""
     problems = []
     lines = [line.strip() for line in gitignore_text.splitlines()]
     rules = {line for line in lines if line and not line.startswith("#")}
@@ -58,19 +65,55 @@ def ignore_rule_problems(gitignore_text):
         if rule not in rules:
             problems.append(f"в корневом .gitignore отсутствует правило {rule}")
 
-    for line in lines:
-        if not line or line.startswith("#") or not line.startswith(NEGATION):
-            continue
-        re_included = line[len(NEGATION):].strip().lstrip("/")
-        for prefix in FORBIDDEN_PREFIXES:
-            bare = prefix.rstrip("/")
-            if re_included == bare or re_included.startswith(prefix):
+    # Синтетический репозиторий проверяет именно семантику Git: разбор glob
+    # вручную пропускает обобщённые исключения вроде `!/deck*/`.
+    with tempfile.TemporaryDirectory(prefix="anki-ignore-guard-") as temporary:
+        root = Path(temporary)
+        (root / ".gitignore").write_text(gitignore_text, encoding="utf-8")
+        initialized = subprocess.run(
+            ["git", "init", "--quiet"], cwd=root, capture_output=True, check=False
+        )
+        if initialized.returncode != 0:
+            detail = initialized.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"не удалось создать синтетический Git-репозиторий: {detail}")
+
+        for path in IGNORE_PROBES:
+            if not _git_ignores(root, path):
                 problems.append(
-                    f"правило .gitignore повторно включает пользовательскую область: {line}"
+                    f"правила .gitignore не игнорируют пользовательский путь {path}"
                 )
-                break
+        for path in TRACKED_CODE_PROBES:
+            if _git_ignores(root, path):
+                problems.append(f"правила .gitignore ошибочно игнорируют код {path}")
 
     return problems
+
+
+def _git_ignores(root, path):
+    """Проверяет путь без влияния индекса и глобальных exclude-настроек."""
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.excludesFile=/dev/null",
+            "check-ignore",
+            "--no-index",
+            "--quiet",
+            "--",
+            path,
+        ],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    detail = result.stderr.decode("utf-8", "replace").strip()
+    raise RuntimeError(
+        f"git check-ignore не смог проверить {path}: {detail or result.returncode}"
+    )
 
 
 def tracked_paths(root):
