@@ -1,21 +1,21 @@
 <div align="center">
 
-# Anki-decks — инструменты для Anki и CrowdAnki JSON
+# Anki Deck Toolkit — инструменты для Anki и CrowdAnki JSON
 
 **Rust CLI для анализа, проверки, точечного редактирования и визуального сравнения экспортов CrowdAnki JSON.**
 
-[![Проверки репозитория](https://github.com/AliceLiddell01/Anki-decks/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/Anki-decks/actions/workflows/ci.yml)
+[![Проверки репозитория](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-workspace-000000?logo=rust&logoColor=white)
 ![CrowdAnki JSON](https://img.shields.io/badge/CrowdAnki-JSON-2f81f7)
 ![Платформа Linux](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)
 [![Лицензия: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-2f81f7?logo=readthedocs&logoColor=white)](https://deepwiki.com/AliceLiddell01/Anki-decks)
+[![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-2f81f7?logo=readthedocs&logoColor=white)](https://deepwiki.com/AliceLiddell01/anki-deck-toolkit)
 
 Набор инструментов для владельцев и разработчиков Anki-колод: исследование экспорта, проверка структуры и медиассылок, контроль качества заметок, безопасные правки с `dry-run`, создание заметок в существующих моделях и HTML-отчёт «до / после». Инструменты не вызывают LLM API, но поддерживают проверяемый рабочий процесс с внешними ИИ-агентами.
 
 **Это не каталог готовых колод.** Пользовательские CrowdAnki-экспорты, медиафайлы и локальные корпуса ресурсов через Git не публикуются.
 
-[Что умеет](#что-умеет) · [Как это работает](#как-это-работает) · [Быстрый старт](#быстрый-старт) · [Инструменты](#инструменты) · [Структура](#структура-репозитория) · [Лицензия](#лицензия)
+[Кому подходит](#кому-подходит) · [Что умеет](#что-умеет) · [Как это работает](#как-это-работает) · [Быстрый старт](#быстрый-старт) · [Инструменты](#инструменты) · [Структура](#структура-репозитория) · [Лицензия](#лицензия)
 
 </div>
 
@@ -80,8 +80,8 @@ flowchart LR
 Требуются Linux и набор инструментов Rust. Минимальная поддерживаемая версия Rust объявлена в корневом `Cargo.toml`; отдельной копии версии в документации нет.
 
 ```bash
-git clone https://github.com/AliceLiddell01/Anki-decks.git
-cd Anki-decks
+git clone https://github.com/AliceLiddell01/anki-deck-toolkit.git
+cd anki-deck-toolkit
 
 cargo build --release --workspace
 ./target/release/anki-repo --help
