@@ -292,12 +292,8 @@ pub fn migrate(root: Option<&Path>, apply: bool) -> Result<MigrationReport, Doma
 
     let mut pruned = Vec::new();
     if apply && !entries.is_empty() && entries.iter().all(|entry| entry.state != "refused") {
-        apply_entries(&legacy, &output, &mut entries)?;
-        let (removed, retained) = prune_legacy_placeholders(&legacy, &input, &output)?;
-        pruned = removed
-            .iter()
-            .map(|path| display_relative(&root, path))
-            .collect();
+        let (removed, retained) = write_plan(&root, &legacy, &input, &output, &mut entries)?;
+        pruned = removed;
         if let Some(diagnostic) = retained {
             diagnostics.push(diagnostic);
         }
@@ -718,16 +714,35 @@ fn mark_target_state(entries: &mut [ExportPlan]) {
     }
 }
 
-/// Выполняет план: переносит экспорты и снимает placeholder-файлы прежней раскладки.
-fn apply_entries(
+/// Выполняет запись плана: перенос экспортов и снятие placeholder-файлов.
+///
+/// Блокировка прежней области удерживается на всю запись: и перенос, и снятие
+/// placeholder-файлов меняют одну и ту же область, и вторая миграция не должна
+/// вклиниться между ними.
+fn write_plan(
+    root: &Path,
     legacy: &Path,
+    input: &Path,
     output: &Path,
     entries: &mut [ExportPlan],
-) -> Result<(), DomainError> {
-    // Блокировка прежней области сериализует две одновременные миграции и
-    // закрывает окно между планированием и записью.
+) -> Result<(Vec<String>, Option<Diagnostic>), DomainError> {
     let _lock = ExportLock::acquire(legacy)?;
+    apply_entries(output, entries)?;
+    if entries.iter().any(|entry| entry.state == "refused") {
+        // Отказ, обнаруженный уже при записи (`target_appeared`), отменяет и
+        // снятие placeholder-файлов: отвергнутый план не пишет ничего.
+        return Ok((Vec::new(), None));
+    }
+    let (removed, retained) = prune_legacy_placeholders(legacy, input, output)?;
+    let pruned = removed
+        .iter()
+        .map(|path| display_relative(root, path))
+        .collect();
+    Ok((pruned, retained))
+}
 
+/// Выполняет план записи: переносит экспорты, не снимая placeholder-файлы.
+fn apply_entries(output: &Path, entries: &mut [ExportPlan]) -> Result<(), DomainError> {
     for entry in entries.iter_mut().filter(|entry| entry.action == "move") {
         if let Some(target) = entry.target_path.clone()
             && fs::symlink_metadata(&target).is_ok()
@@ -1455,6 +1470,35 @@ mod tests {
         );
         assert!(!root.join("decks/output/Hidden").exists());
         assert!(root.join("decks/output/Words__A/deck.json").is_file());
+    }
+
+    #[test]
+    fn a_refusal_during_apply_skips_even_the_placeholder_removal() {
+        let (_dir, root) = repository("layout-refusal-during-apply");
+        let legacy = root.join("decks");
+        let input = legacy.join("input");
+        let output = legacy.join("output");
+        let export = write_export(&root, "decks/words/Words__A", b"a");
+        fs::write(legacy.join(".gitkeep"), b"").expect("placeholder прежней раскладки");
+        let mut entries = vec![plan_entry(&export, &output)];
+        // Назначение появилось между планированием и записью: план отвергается
+        // уже внутри записи.
+        fs::create_dir_all(output.join("Words__A")).expect("назначение появилось");
+
+        let (pruned, retained) =
+            write_plan(&root, &legacy, &input, &output, &mut entries).expect("запись");
+
+        assert_eq!(entries[0].reason, Some("target_appeared"));
+        assert!(pruned.is_empty(), "placeholder-файлы не снимаются");
+        assert!(
+            legacy.join(".gitkeep").is_file(),
+            "отвергнутый план ничего не пишет"
+        );
+        assert!(
+            retained.is_none(),
+            "отвергнутый план не сообщает об удержании области: {retained:?}"
+        );
+        assert!(root.join("decks/words/Words__A/deck.json").is_file());
     }
 
     #[test]

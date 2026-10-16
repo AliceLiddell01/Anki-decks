@@ -2172,11 +2172,22 @@ impl AssetStore {
     /// определяется фактическими записями, а не самим фактом ошибки. Проверяются
     /// обе области: запись, оставшаяся в `.runtime` или уже попавшая в
     /// канонический манифест, — это изменение состояния, а не прежнее состояние.
+    ///
+    /// Переход, который не меняет ни SHA-256, ни жизненный цикл, по манифесту
+    /// неотличим от отсутствия перехода: так выглядят решения валидатора и
+    /// доверие человека, меняющие только `validation` и `human_attestation`.
+    /// Утверждать «отказ» в этом случае нельзя — интент остаётся открытым и его
+    /// разбирает [`Self::reconcile_journal`].
     fn intent_state_unchanged(
         &self,
         identity: &AssetIdentity,
         intent: &JournalEvent,
     ) -> Result<bool, AssetError> {
+        if intent.previous_sha256 == intent.new_sha256
+            && intent.previous_lifecycle == intent.new_lifecycle
+        {
+            return Ok(false);
+        }
         let canonical = load_manifest(&self.root_handle)?;
         let runtime = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
         let mut present = false;
@@ -2330,7 +2341,15 @@ impl AssetStore {
             let actual_sha256 = actual.map(|record| record.sha256.clone());
             let actual_lifecycle = actual.map(|record| record.lifecycle);
             let actual_lifecycle_text = actual_lifecycle.map(|state| state.as_str().to_owned());
-            let outcome = if actual_sha256 == event.new_sha256
+            // Решение валидатора и доверие человека не меняют ни SHA-256, ни
+            // жизненный цикл: манифест не различает применённое и неприменённое
+            // изменение, поэтому исход честно остаётся неизвестным, а не
+            // выдаётся за восстановленный.
+            let indistinguishable = event.previous_sha256 == event.new_sha256
+                && event.previous_lifecycle == event.new_lifecycle;
+            let outcome = if indistinguishable {
+                JournalOutcome::Unknown
+            } else if actual_sha256 == event.new_sha256
                 && actual_lifecycle_text == event.new_lifecycle
             {
                 JournalOutcome::Recovered
@@ -2359,10 +2378,18 @@ impl AssetStore {
             )
             .verified(Some(actual_lifecycle == Some(LifecycleState::Verified)));
             if outcome == JournalOutcome::Unknown {
-                draft = draft.reason(&format!(
-                    "фактическое состояние {} не совпало ни с ожидаемым, ни с прежним",
-                    intent.identity
-                ));
+                draft = draft.reason(&if indistinguishable {
+                    format!(
+                        "переход {} не меняет ни SHA-256, ни жизненный цикл: манифест не \
+                         различает применённое и неприменённое изменение",
+                        intent.identity
+                    )
+                } else {
+                    format!(
+                        "фактическое состояние {} не совпало ни с ожидаемым, ни с прежним",
+                        intent.identity
+                    )
+                });
             }
             if read
                 .events

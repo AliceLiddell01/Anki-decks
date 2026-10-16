@@ -125,7 +125,9 @@ done
 # уважает правила игнорирования, поэтому после него индекс обязан содержать
 # только контрольные пути.
 git -C "$tmp_repo" add -A
-tracked="$(git -C "$tmp_repo" ls-files)"
+# Экранирование путей отключено: иначе не-ASCII имя (`漢.gif`, `幽霊.png`) выводится
+# в кавычках с восьмеричными последовательностями и не совпадает с шаблоном утечки.
+tracked="$(git -C "$tmp_repo" -c core.quotePath=false ls-files)"
 leaked="$(printf '%s\n' "$tracked" | grep -E '^(decks/|\.asset-store/)' || true)"
 if [[ -n "$leaked" ]]; then
   printf 'ОШИБКА: пользовательские данные попали в индекс:\n%s\n' "$leaked" >&2

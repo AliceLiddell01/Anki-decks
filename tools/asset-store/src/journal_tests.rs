@@ -74,17 +74,34 @@ impl Fixture {
                 domain_metadata: None,
                 replace_expected_sha256: None,
             },
-            &AcceptValidator,
+            &AcceptValidator::default(),
         )
     }
 }
 
-struct AcceptValidator;
+/// Валидатор с настраиваемой идентичностью: его второе решение меняет
+/// `validation` записи, не меняя её SHA-256 и жизненный цикл.
+#[derive(Default)]
+struct AcceptValidator {
+    id: &'static str,
+}
+
+impl AcceptValidator {
+    fn other() -> Self {
+        Self {
+            id: "journal-fixture-second",
+        }
+    }
+}
 
 impl SemanticValidator for AcceptValidator {
     fn identity(&self) -> ValidatorIdentity {
         ValidatorIdentity {
-            id: "journal-fixture".to_owned(),
+            id: if self.id.is_empty() {
+                "journal-fixture".to_owned()
+            } else {
+                self.id.to_owned()
+            },
             version: "1".to_owned(),
         }
     }
@@ -319,6 +336,69 @@ fn an_error_after_the_canonical_commit_leaves_the_intent_to_reconciliation() {
     assert_eq!(appended.len(), 1);
     assert_eq!(appended[0].outcome, JournalOutcome::Recovered);
     assert_eq!(appended[0].new_lifecycle.as_deref(), Some("verified"));
+    assert!(fixture.store.journal_check().unwrap().is_clean());
+}
+
+#[test]
+fn a_transition_that_changes_only_validation_is_not_called_recovered() {
+    let fixture = Fixture::new("asset-store-journal-validation-only");
+    let identity = AssetIdentity::new("kanji", "日").unwrap();
+    fixture.publish(&identity, CANDIDATE_BYTES).unwrap();
+
+    // Решение второго валидатора меняет только `validation`: SHA-256 и жизненный
+    // цикл остаются прежними, поэтому манифест не различает применённое и
+    // неприменённое изменение.
+    FAIL_BEFORE_JOURNAL_CLOSE.with(|hook| hook.set(true));
+    fixture
+        .store
+        .validate(SelectionMode::Full, &AcceptValidator::other())
+        .expect("повторная проверка");
+
+    let appended = fixture.store.reconcile_journal().unwrap();
+    assert_eq!(appended.len(), 1, "сверка закрыла интент: {appended:?}");
+    assert_eq!(
+        appended[0].outcome,
+        JournalOutcome::Unknown,
+        "исход не выдаётся за восстановленный: {:?}",
+        appended[0]
+    );
+    assert!(
+        appended[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("не различает")),
+        "причина объясняет неизвестность: {:?}",
+        appended[0].reason
+    );
+    assert!(fixture.store.journal_check().unwrap().is_clean());
+}
+
+#[test]
+fn a_refusal_of_a_validation_only_transition_stays_open_for_reconciliation() {
+    let fixture = Fixture::new("asset-store-journal-validation-only-refusal");
+    let identity = AssetIdentity::new("kanji", "日").unwrap();
+    fixture.publish(&identity, CANDIDATE_BYTES).unwrap();
+
+    fixture.store.fail_next_manifest_write();
+    fixture
+        .store
+        .validate(SelectionMode::Full, &AcceptValidator::other())
+        .unwrap_err();
+
+    // Отказ до фиксации неотличим от уже применённого изменения, поэтому интент
+    // не закрывается событием `Refused`, а остаётся сверке.
+    let refused: Vec<_> = fixture
+        .events()
+        .into_iter()
+        .filter(|event| event.outcome == JournalOutcome::Refused)
+        .collect();
+    assert!(refused.is_empty(), "ложного отказа нет: {refused:?}");
+    let check = fixture.store.journal_check().unwrap();
+    assert_eq!(check.open_intents.len(), 1, "интент ждёт сверки");
+
+    let appended = fixture.store.reconcile_journal().unwrap();
+    assert_eq!(appended.len(), 1, "сверка закрыла интент: {appended:?}");
+    assert_eq!(appended[0].outcome, JournalOutcome::Unknown);
     assert!(fixture.store.journal_check().unwrap().is_clean());
 }
 
