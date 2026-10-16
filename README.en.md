@@ -117,7 +117,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 Detailed commands and machine-readable contracts are documented in the tool-specific READMEs:
 
 - [`anki-repo` — inspection, QA, constrained changes, and visual reports](tools/anki-repo/README.en.md)
-- [`asset-store` and `kanji-assets` — asset lifecycle and verification](tools/asset-store/README.md)
+- [`asset-store` and `kanji-assets` — asset lifecycle and verification](tools/asset-store/README.en.md)
 - [`repository-maintenance` — disk inventory and safe garbage collection](tools/repository-maintenance/README.en.md)
 
 ## Tools
@@ -165,7 +165,7 @@ Yarxi
 
 The verified corpus is trusted local state in the working copy. It contains only confirmed assets and their provenance information; the key files are `manifest.json` and `.owner.json`. Unverified candidates never enter the corpus, and it is not published through Git. Each user has their own corpus, and its absence in a fresh clone is normal. `asset-store` does not scan deck media directories under `decks/` or treat user media directories as data sources.
 
-[Full `asset-store` contract →](tools/asset-store/README.md)
+[Full `asset-store` contract →](tools/asset-store/README.en.md)
 
 ## Creating and visually verifying a card
 

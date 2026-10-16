@@ -1203,7 +1203,7 @@ cargo test --workspace --locked
 
 CI（`.github/workflows/ci.yml`）在 `pull_request`、推送到默认分支及手动触发时独立执行相同检查。另会验证用户数据边界：Git 不得跟踪被整体忽略的 `decks/` 或 `.asset-store/` 下任何路径，且忽略规则必须存在，不能通过再次纳入跟踪来削弱（`.github/scripts/check_local_data_untracked.py`）。检查读取真实 Git 索引，因为 `.gitignore` 不能自动取消已跟踪文件，也可能被 `git add -f` 绕过。
 
-CI 有意不验证用户自身的牌组和资源：这些区域在干净克隆中不存在，把“没有私人文件”当作测试成功并没有意义。应在本地通过 `anki-repo validate decks/output/<导出名称>` 检查具体导出，或通过 `kanji-corpus-gate`、`pitch-corpus-gate` 检查本地资源库（参见 [`asset-store` 文档](../asset-store/README.md)）。CI 只读取仓库，改变用户牌组的组成不要求修改 CI 流程。
+CI 有意不验证用户自身的牌组和资源：这些区域在干净克隆中不存在，把“没有私人文件”当作测试成功并没有意义。应在本地通过 `anki-repo validate decks/output/<导出名称>` 检查具体导出，或通过 `kanji-corpus-gate`、`pitch-corpus-gate` 检查本地资源库（参见 [`asset-store` 文档](../asset-store/README.zh-CN.md)）。CI 只读取仓库，改变用户牌组的组成不要求修改 CI 流程。
 
 常规工具测试自行构造合成导出，绝不读取 `decks/**`。
 

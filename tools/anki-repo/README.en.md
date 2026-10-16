@@ -1203,7 +1203,7 @@ cargo test --workspace --locked
 
 CI (`.github/workflows/ci.yml`) runs the same checks independently of local setup on `pull_request`, push to the default branch, and manual dispatch. It also verifies user-data boundaries: no path under the fully ignored `decks/` or `.asset-store/` may be tracked, and ignore rules must exist without re-inclusion (`.github/scripts/check_local_data_untracked.py`). It inspects the actual Git index because `.gitignore` cannot untrack already indexed files and can be bypassed by `git add -f`.
 
-CI deliberately does not validate user-owned content: those areas are absent in a clean checkout, and asserting their absence would not amount to testing private decks. Validate a real export locally with `anki-repo validate decks/output/<export_name>`, or a local corpus using `kanji-corpus-gate` / `pitch-corpus-gate` (see [`asset-store` documentation](../asset-store/README.md)). CI only reads the repository; adding or changing decks does not require CI changes.
+CI deliberately does not validate user-owned content: those areas are absent in a clean checkout, and asserting their absence would not amount to testing private decks. Validate a real export locally with `anki-repo validate decks/output/<export_name>`, or a local corpus using `kanji-corpus-gate` / `pitch-corpus-gate` (see [`asset-store` documentation](../asset-store/README.en.md)). CI only reads the repository; adding or changing decks does not require CI changes.
 
 Ordinary toolkit tests create synthetic exports and never read `decks/**`.
 

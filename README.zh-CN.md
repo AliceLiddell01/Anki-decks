@@ -117,7 +117,7 @@ cargo run --locked --bin kanji-assets -- --output json ensure 漢 字
 各工具的专门文档介绍了详细命令和机器可读契约：
 
 - [`anki-repo` — 检查、质量保证、受限修改与可视化报告](tools/anki-repo/README.zh-CN.md)
-- [`asset-store` 与 `kanji-assets` — 资源生命周期与验证](tools/asset-store/README.md)
+- [`asset-store` 与 `kanji-assets` — 资源生命周期与验证](tools/asset-store/README.zh-CN.md)
 - [`repository-maintenance` — 磁盘内容盘点与安全垃圾回收](tools/repository-maintenance/README.zh-CN.md)
 
 ## 工具
@@ -165,7 +165,7 @@ Yarxi
 
 已验证资源库是工作副本中的可信本地状态：其中仅保存经过确认的资源及其来源信息，关键文件为 `manifest.json` 和 `.owner.json`。未经确认的候选文件不会进入资源库，资源库也不会通过 Git 发布。每个用户都有自己的本地资源库，新克隆仓库时不存在该资源库属于正常情况。`asset-store` 不会扫描 `decks/` 下的牌组媒体目录，也不会将用户的媒体目录作为数据来源。
 
-[查看完整的 `asset-store` 契约 →](tools/asset-store/README.md)
+[查看完整的 `asset-store` 契约 →](tools/asset-store/README.zh-CN.md)
 
 ## 创建卡片并进行可视化验证
 
